@@ -140,6 +140,7 @@ fn reviewer_hook_denies_native_and_unknown_write_routes() {
         "git --no-pager show --no-ext-diff --no-textconv HEAD",
         "GUIDE_LITERAL_0 'cat' source.rs",
         "jj diff",
+        "jj diff --git -- --ignore-working-copy --no-pager",
         "jj --ignore-working-copy --no-pager diff --tool ./writer",
     ] {
         assert_eq!(f.bash(command), "deny", "{command}");
@@ -199,9 +200,9 @@ fn reviewer_retains_source_and_pull_request_inspection() {
         "rg --no-config -n 'unsafe|unwrap' .",
         "rg --no-config --files .",
         "cat source.rs | head -n 10",
-        "git --no-pager show HEAD:source.rs",
-        "git --no-pager diff --no-ext-diff --no-textconv main HEAD",
-        "git --no-pager --git-dir /store/.git show HEAD:source.rs",
+        "git --no-pager show aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:source.rs",
+        "git --no-pager diff --no-ext-diff --no-textconv aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "git --no-pager --git-dir /store/.git show aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:source.rs",
         "git --no-pager log --no-patch --no-show-signature --oneline -n 10",
         "jj --ignore-working-copy --no-pager diff --git -r @",
         "jj --ignore-working-copy --no-pager show --git -r @",
@@ -276,4 +277,145 @@ fn review_result_exception_rejects_symlinks_and_hardlinks() {
     std::fs::hard_link(&source, &artifact).unwrap();
     assert_eq!(f.decide("write", data), "deny");
     assert_eq!(std::fs::read_to_string(source).unwrap(), "original");
+}
+
+#[test]
+fn rendered_batch_submission_is_the_only_permitted_proposal() {
+    use boss_pr_review::*;
+    let f = Fixture::new(true);
+    let artifact = path_for(&default_dir(), &f.run_id, StructuredOutputKind::ReviewResult);
+    let destination = ReviewerReportDestination::builder()
+        .batch_id("batch-review")
+        .pr_url("https://github.com/owner/repo/pull/1")
+        .target_sha("a".repeat(40))
+        .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+        .body_path(artifact.to_str().unwrap())
+        .build();
+    let prompt = render_batch_reviewer_initial_prompt(
+        &ReviewBriefPacket::builder().task_name("Review guard").build(),
+        &destination,
+        ReviewScope::Code,
+        None,
+        "owner/repo",
+    );
+    let command = prompt
+        .lines()
+        .find(|line| line.starts_with("\"$BOSS_BIN\" propose review-report "))
+        .unwrap();
+    assert_eq!(f.bash(command), "allow", "{command}");
+    for bad in [
+        command.replace("review-report", "done"),
+        command.replace("review-report", "review-guide"),
+        command.replace(artifact.to_str().unwrap(), "/tmp/other.json"),
+        format!("{command} --extra"),
+        format!("{command} && touch source.rs"),
+        format!("{command} > source.rs"),
+        format!("{command}\ncat source.rs"),
+        command.replace("batch-review", "$(touch source.rs)"),
+    ] {
+        assert_eq!(f.bash(&bad), "deny", "{bad}");
+    }
+}
+
+#[test]
+fn rendered_inspection_commands_are_permitted() {
+    use boss_pr_review::*;
+    let f = Fixture::new(true);
+    let workspace = f.dir.path().to_str().unwrap();
+    let guide = render_reviewer_claude_md("lease", workspace, "", "");
+    for command in [
+        format!("jj log -R {workspace} --ignore-working-copy --no-pager"),
+        format!("jj show -R {workspace} --ignore-working-copy --no-pager --git"),
+        format!("jj diff -R {workspace} --ignore-working-copy --no-pager --git"),
+    ] {
+        assert!(guide.contains(&command));
+        assert_eq!(f.bash(&command), "allow", "{command}");
+    }
+    let prompt = render_reviewer_initial_prompt(
+        &ReviewBriefPacket::builder().task_name("Review guard").build(),
+        "https://github.com/owner/repo/pull/1",
+        "/tmp/result.json",
+        ReviewScope::Code,
+        None,
+        "owner/repo",
+    );
+    for command in [
+        "gh pr diff https://github.com/owner/repo/pull/1 --repo owner/repo",
+        "gh pr view https://github.com/owner/repo/pull/1 --repo owner/repo",
+    ] {
+        assert!(prompt.contains(command));
+        assert_eq!(f.bash(command), "allow", "{command}");
+        assert_eq!(f.bash(&command.replace("--repo", "-R")), "allow");
+    }
+    for command in [
+        format!("jj diff -R {workspace} --no-pager --git"),
+        format!("jj show -R {workspace} --ignore-working-copy --no-pager --tool writer"),
+        "gh pr edit 1 --repo owner/repo".into(),
+    ] {
+        assert_eq!(f.bash(&command), "deny", "{command}");
+    }
+}
+
+#[test]
+fn git_object_inspection_cannot_execute_clean_or_process_filters() {
+    let f = Fixture::new(true);
+    let repo = f.dir.path();
+    let git = |args: &[&str]| {
+        let output = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init"]);
+    git(&["config", "user.name", "Reviewer fixture"]);
+    git(&["config", "user.email", "reviewer@example.invalid"]);
+    std::fs::write(repo.join(".gitattributes"), "source.rs filter=sentinel\n").unwrap();
+    std::fs::write(repo.join("source.rs"), "original\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "Create filter fixture"]);
+    let sha = git(&["rev-parse", "HEAD"]);
+    // A filter has an observable side effect before attempting any protocol.
+    // The process variant deliberately fails, but Git still executes it.
+    for (kind, script) in [("clean", "touch sentinel; cat"), ("process", "touch sentinel; exit 1")] {
+        git(&["config", &format!("filter.sentinel.{kind}"), script]);
+        std::fs::write(repo.join("source.rs"), "modified and different length\n").unwrap();
+        for command in [
+            format!("git --no-pager -C {} diff --no-ext-diff --no-textconv", repo.display()),
+            format!(
+                "git --no-pager -C {} diff --no-ext-diff --no-textconv {sha}",
+                repo.display()
+            ),
+            format!(
+                "git --no-pager -C {} diff --no-ext-diff --no-textconv --cached {sha}",
+                repo.display()
+            ),
+        ] {
+            assert_eq!(f.bash(&command), "deny", "{command}");
+        }
+        for command in [
+            format!(
+                "git --no-pager -C {} diff --no-ext-diff --no-textconv {sha} {sha}",
+                repo.display()
+            ),
+            format!(
+                "git --no-pager -C {} show --no-ext-diff --no-textconv --no-show-signature {sha}",
+                repo.display()
+            ),
+            format!("git --no-pager -C {} show {sha}:source.rs", repo.display()),
+        ] {
+            assert_eq!(f.bash(&command), "allow", "{command}");
+            let output = Command::new("/bin/sh").args(["-c", &command]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(!repo.join("sentinel").exists(), "{command} executed a filter");
+        }
+        // Prove the rejected working-tree form actually runs this filter.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["--no-pager", "diff", "--no-ext-diff", "--no-textconv"])
+            .output()
+            .unwrap();
+        assert!(repo.join("sentinel").exists(), "{kind} control did not execute");
+        std::fs::remove_file(repo.join("sentinel")).unwrap();
+        git(&["config", "--unset", &format!("filter.sentinel.{kind}")]);
+    }
 }

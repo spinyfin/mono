@@ -70,7 +70,7 @@ def reviewer_read_stage(tokens, payload, piped):
         sub, args = args[0], args[1:]
         if sub == "show" and len(args) == 1 and ":" in args[0] and not args[0].startswith("-"):
             revision, _, path = args[0].partition(":")
-            return bool(revision and path)
+            return bool(re.fullmatch("[0-9a-fA-F]{40}", revision) and guide_object_path(path))
         if sub in ("diff", "show"):
             if args[:2] != ["--no-ext-diff", "--no-textconv"]:
                 return False
@@ -78,20 +78,38 @@ def reviewer_read_stage(tokens, payload, piped):
                 if args[2:3] != ["--no-show-signature"]:
                     return False
                 args = args[:2] + args[3:]
-            return options(args[2:], ("--stat", "--name-only", "--name-status", "--numstat",
-                                      "--patch", "--raw", "--summary", "--check"))
+            # Object IDs cannot resolve to the index or working tree, where
+            # even --no-textconv diffs can execute clean/process filters.
+            operands = [arg for arg in args[2:] if not arg.startswith("-")]
+            required = 2 if sub == "diff" else 1
+            return "--" not in args and len(operands) == required and all(
+                re.fullmatch("[0-9a-fA-F]{40}", arg) for arg in operands
+            ) and options(args[2:], ("--stat", "--name-only", "--name-status", "--numstat",
+                                     "--patch", "--raw", "--summary", "--check"))
         if sub == "log" and args[:2] == ["--no-patch", "--no-show-signature"]:
             return options(args[2:], ("--oneline", "--all"), ("-n", "--max-count", "--format"))
         return False
     if prog == "jj" and not piped:
         # Even jj reads snapshot the checkout without --ignore-working-copy.
-        if args[:2] != ["--ignore-working-copy", "--no-pager"]:
-            return False
-        args = args[2:]
-        if args[:1] == ["-R"]:
-            if len(args) < 3 or not os.path.isabs(args[1]):
+        remaining, protective = [], set()
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--":
+                # Flags after the option terminator are only path operands.
                 return False
-            args = args[2:]
+            if arg in ("--ignore-working-copy", "--no-pager"):
+                protective.add(arg)
+            elif arg in ("-R", "--repository"):
+                if index + 1 == len(args) or not os.path.isabs(args[index + 1]):
+                    return False
+                index += 1
+            else:
+                remaining.append(arg)
+            index += 1
+        if protective != {"--ignore-working-copy", "--no-pager"}:
+            return False
+        args = remaining
         if not args:
             return False
         sub, args = args[0], args[1:]
@@ -114,9 +132,9 @@ def reviewer_read_stage(tokens, payload, piped):
         sub, verb, args = args[0], args[1], args[2:]
         if sub in ("pr", "issue") and verb in ("view", "list"):
             # No --web (launches a browser), editor, extensions or API writes.
-            return options(args, ("--comments",), ("--json", "--jq", "-q", "--state", "--limit", "--base", "--head"))
+            return options(args, ("--comments",), ("--json", "--jq", "-q", "--state", "--limit", "--base", "--head", "--repo", "-R"))
         if sub == "pr" and verb in ("diff", "checks"):
-            return options(args, ("--patch", "--name-only", "--required"), ("--json", "--jq"))
+            return options(args, ("--patch", "--name-only", "--required"), ("--json", "--jq", "--repo", "-R"))
         return False
     if prog == "rg":
         # ripgrep config can inject --pre, an arbitrary executable.
@@ -139,6 +157,21 @@ def artifact_write(data, cwd):
     return not os.path.islink(ARTIFACT)
 
 
+def review_report(data):
+    # Match the rendered command before the read grammar rejects its one
+    # intentional shell expansion. The engine validates batch and target binding.
+    command = data.get("command", "")
+    if not isinstance(command, str):
+        return False
+    match = re.fullmatch(
+        r'"\$BOSS_BIN" propose review-report --batch-id ([A-Za-z0-9_-]+) '
+        r'--target-sha ([0-9a-fA-F]{40}) --body-file "([^"\\$`\n]+)"',
+        command,
+    )
+    return bool(match and os.path.isabs(match[3])
+                and os.path.realpath(match[3]) == os.path.realpath(ARTIFACT))
+
+
 def allowed(payload):
     if not isinstance(payload, dict) or payload.get("toolInputTruncated"):
         return False
@@ -152,7 +185,7 @@ def allowed(payload):
     if tool == "Write":
         return artifact_write(data, cwd)
     if tool == "Bash":
-        return guide_shell_read(payload, reviewer_read_stage)
+        return review_report(data) or guide_shell_read(payload, reviewer_read_stage)
     # New native tools, MCP, subagents and stdin injection must not open an
     # uninspected write path. They require an explicit read-only contract.
     return False
@@ -166,7 +199,7 @@ print(json.dumps({"decision": "approve"} if approved else {
     "decision": "block",
     "reason": "Grok Reviewer is read-only: edits, shell writes and publishing are denied. "
               "Use native read/search tools or cat/head/tail/sed -n; use rg --no-config. "
-              "For Git use --no-pager and diff/show --no-ext-diff --no-textconv; "
+              "For Git use full object IDs, --no-pager and diff/show --no-ext-diff --no-textconv; "
               "for jj use --ignore-working-copy --no-pager and diff/show --git. "
               "Only the native write tool may write this run's review-result JSON."
 }))
