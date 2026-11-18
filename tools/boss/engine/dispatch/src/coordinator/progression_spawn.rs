@@ -177,6 +177,9 @@ impl ExecutionCoordinator {
         let defer_pool_slot_release = matches!(&run_outcome, Ok(outcome) if outcome.slot_id.is_some());
 
         match run_outcome {
+            // The execution is already terminal (cancelled, orphaned, or
+            // another terminal status); the runner has reaped its pane.
+            // Release the workspace without recording a new final status.
             Ok(outcome) if outcome.wait_state == RunWaitState::CancelledDuringSpawn => {
                 self.lifecycle
                     .teardown_driver_workspace(
