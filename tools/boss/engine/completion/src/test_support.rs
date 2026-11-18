@@ -132,12 +132,7 @@ pub fn preserve_test_workspace(db: &WorkDb, execution_id: &str) {
         std::path::Path::new("/tmp").canonicalize().unwrap()
     );
     if !workspace.join(".jj").exists() {
-        let output = std::process::Command::new(JjRepo::binary())
-            .args(["git", "init", "--colocate"])
-            .arg(workspace)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        JjRepo::colocated_into(workspace);
     }
     let record = ExecutionBookmark {
         execution_id: execution_id.to_owned(),

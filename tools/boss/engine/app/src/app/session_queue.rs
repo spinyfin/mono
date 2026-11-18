@@ -635,6 +635,16 @@ impl SessionSink {
         }
     }
 
+    /// Pop an available envelope without waiting for a producer.
+    #[cfg(test)]
+    pub(super) fn try_next(&self) -> Option<FrontendEventEnvelope> {
+        let envelope = self.queue.lock().expect("session queue lock poisoned").pop_front();
+        if envelope.is_some() {
+            self.wakers.drained.notify_one();
+        }
+        envelope
+    }
+
     /// Wait for the next envelope. Returns `None` once the sink is closed
     /// and the queue is drained.
     pub(super) async fn next(&self) -> Option<FrontendEventEnvelope> {

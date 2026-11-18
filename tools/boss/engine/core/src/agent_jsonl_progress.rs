@@ -1260,12 +1260,16 @@ fn revalidate_truncated_stream(
 #[derive(Clone, Default)]
 pub(crate) struct StreamTelemetry {
     registry: Option<Arc<crate::metrics::Registry>>,
+    #[cfg(test)]
+    completed_polls: Option<watch::Sender<u64>>,
 }
 
 impl StreamTelemetry {
     pub(crate) fn new(registry: Arc<crate::metrics::Registry>) -> Self {
         Self {
             registry: Some(registry),
+            #[cfg(test)]
+            completed_polls: None,
         }
     }
 
@@ -1294,6 +1298,10 @@ impl StreamTelemetry {
         let revalidations = root.revalidation_count().saturating_sub(revalidations_before);
         crate::sweep_metrics::AGENT_JSONL_STREAM_ROOT_REVALIDATIONS.inc_by(registry, revalidations);
         timer.finish(registry, usize::try_from(revalidations).unwrap_or(usize::MAX));
+        #[cfg(test)]
+        if let Some(completed) = &self.completed_polls {
+            completed.send_modify(|count| *count += 1);
+        }
     }
 }
 
@@ -1314,6 +1322,7 @@ async fn stream_file_bytes(
         writer,
         halt,
         telemetry,
+        FILE_POLL,
         |_| Ok(()),
         |_| Ok(()),
     )
@@ -1335,6 +1344,7 @@ async fn stream_file_bytes_with_test_hooks<F, G>(
     mut writer: tokio::io::DuplexStream,
     mut halt: watch::Receiver<StreamHalt>,
     telemetry: StreamTelemetry,
+    poll_interval: Duration,
     mut before_descriptor_read: G,
     mut after_rotation_validation: F,
 ) -> Result<(), String>
@@ -1427,7 +1437,7 @@ where
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 telemetry.finish_poll(&prepared.root, poll);
                 tokio::select! {
-                    _ = tokio::time::sleep(FILE_POLL) => continue,
+                    _ = tokio::time::sleep(poll_interval) => continue,
                     changed = halt.changed() => {
                         // Every sender dropped: nothing can ever halt us. End
                         // cleanly rather than spinning the poll loop forever.
@@ -1473,7 +1483,7 @@ where
         }
         telemetry.finish_poll(&prepared.root, poll);
         tokio::select! {
-            _ = tokio::time::sleep(FILE_POLL) => {}
+            _ = tokio::time::sleep(poll_interval) => {}
             changed = halt.changed() => {
                 // Re-run the loop on any change; the top-of-loop check
                 // handles `Cancel`. Every sender dropped is terminal: end

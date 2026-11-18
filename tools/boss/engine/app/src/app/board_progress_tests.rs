@@ -93,7 +93,7 @@ async fn cold_load_publishes_ordered_progress_to_the_product_topic() {
 
     let mut phases = Vec::new();
     let mut stages = Vec::new();
-    while let Ok(Some(envelope)) = tokio::time::timeout(std::time::Duration::from_millis(500), watcher.next()).await {
+    while let Some(envelope) = watcher.try_next() {
         let FrontendEvent::BoardPopulationProgress {
             product_id,
             phase,
@@ -145,8 +145,10 @@ async fn warm_refresh_publishes_no_progress() {
 
     drop(load_with_topic_progress(&state, &product.id).await);
 
-    let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), next_progress(&watcher)).await;
-    assert!(quiet.is_err(), "an incremental refresh must not report a cold build");
+    assert!(
+        watcher.try_next().is_none(),
+        "an incremental refresh must not report a cold build"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -247,7 +249,7 @@ async fn get_work_tree_enqueues_all_progress_before_the_reply() {
 
         let mut progress = 0;
         let mut replies = 0;
-        while let Ok(Some(envelope)) = tokio::time::timeout(std::time::Duration::from_millis(500), sink.next()).await {
+        while let Some(envelope) = sink.try_next() {
             match envelope.payload {
                 FrontendEvent::BoardPopulationProgress { phase, .. } => {
                     assert_eq!(
@@ -289,9 +291,8 @@ async fn broad_input_rebuild_publishes_no_progress() {
     let trace = load_with_topic_progress(&state, &product.id).await;
     drop(trace);
 
-    let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), next_progress(&watcher)).await;
     assert!(
-        quiet.is_err(),
+        watcher.try_next().is_none(),
         "a rebuild of a retained board must not report a cold build"
     );
 }
