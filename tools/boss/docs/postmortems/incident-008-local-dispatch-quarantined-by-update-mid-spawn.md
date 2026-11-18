@@ -145,11 +145,11 @@ The premise in §4.4 is corrected in code and in the design doc ([Unverified loc
 - **§4.1 and §4.2, the scan could not tell a spawn window from a pre-migration row.** It can now. A local run is stamped `tmux_hosted` in the transaction that creates it, and the spawn writes the session identity before tmux receives any command. The scan (`tools/boss/engine/core/src/local_worker_quarantine.rs`, candidate query in `tools/boss/engine/work-db/src/local_worker_quarantine_store.rs`) classifies a stamped run with no identity, no pid, and no sibling run holding a spawn token as a spawn that never reached tmux. Startup fails that execution with a reason saying so and the work item is queued again. It is never held. The verdict comes from durable state, so machine load and timing cannot change it.
 - **§4.3, global.** A held execution now holds only its own work item. Other work items dispatch normally, on the local host too. Only a run inventory that cannot be read at all pauses local dispatch as a whole.
 - **§4.3, sticky.** A hold lasts only while its execution is non-terminal. The storage readers check the execution's current status, so a cancel releases the work item on the next dispatch decision. The scan no longer re-adds a previously held execution regardless of status.
-- **§4.3, startup-only.** The coordinator re-judges the hold before every host selection: it releases an execution whose process is now proven gone, and retries an unreadable inventory. No restart is needed to lift a hold.
+- **§4.3, startup-only.** The coordinator re-judges the hold before every dispatch decision (admission, host selection, and the active-dispatch rescan): it releases an execution whose process is now proven gone, and retries an unreadable inventory. No restart is needed to lift a hold.
 - **§5, the remedy text.** Refusals and the attention item name the held execution and what releases it.
 - **§5, no supported clearing path.** `bossctl dispatch quarantine status|recheck|clear` inspects and releases holds. `clear` requires `--confirm` and refuses a hold whose recorded process is alive. See the [runbook](../runbooks/unverified-local-worker-hold.md).
 
-An engine upgraded from a build with the defect may start with a hold that build recorded. The first startup scan re-judges it under the rules above, so a recorded hold naming a never-started or terminal execution is dropped without operator action.
+An engine upgraded from a build with the defect may start with a hold that build recorded. The first startup scan re-judges it under the rules above, so a recorded hold naming a never-started or terminal execution is dropped automatically.
 
 ### 9.3 Still open from §8
 

@@ -1267,6 +1267,7 @@ impl ExecutionCoordinator {
     /// the rescan is a best-effort opportunistic sweep, not a hard
     /// invariant.
     fn rescan_active_dispatch_after_release(&self) {
+        self.lifecycle.reevaluate_local_worker_holds();
         match self.work_db.rescan_active_dispatch() {
             Ok(redispatched) if !redispatched.is_empty() => {
                 tracing::info!(

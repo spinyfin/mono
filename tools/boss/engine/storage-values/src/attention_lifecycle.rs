@@ -423,7 +423,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::ProducerReconciles,
         "Raised for a local worker with no tmux identity whose process is not proven dead. Startup and every \
          dispatch decision re-judge it and resolve this attention when the hold lifts: the execution is \
-         terminal, its process is proven gone, or an operator releases it.",
+         terminal, its process is proven gone, or a manual `bossctl dispatch quarantine clear` releases it.",
     ),
     entry(
         STALE_WORKER_ATTENTION_KIND,

@@ -522,6 +522,11 @@ impl ExecutionCoordinator {
         mut input: RequestExecutionInput,
         live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
+        // Re-judge before admission, including ordinary requests that never
+        // reach host selection. A stored unreadable-inventory pause and a
+        // hold whose pid has since died both lift here; the storage
+        // transaction below then sees the current record.
+        self.lifecycle.reevaluate_local_worker_holds();
         // Reservation conflict checks take the table lock before querying the DB.
         // Never acquire it from the store predicate, which holds the DB lock.
         // Read reservations before driving runs: the driver takes ownership
