@@ -146,6 +146,7 @@ pub fn local_fallback(name: &str) -> Option<String> {
 /// articles, prepositions, conjunctions, and copulas. When a fragment
 /// must be cut, we walk the cut point back off any of these so the
 /// result doesn't stop mid-clause (e.g. on "the", "for", "is").
+/// Pronouns, negation, and auxiliary verbs also need their following clause.
 const DANGLING_STOPWORDS: &[&str] = &[
     "a", "an", "the", "of", "for", "to", "with", "by", "into", "onto", "on", "in", "and", "or", "but", "from", "as",
     "at", "is", "are", "was", "were", "be", "been", "that", "which", "this", "these", "those", "its", "their", "it",
@@ -183,15 +184,20 @@ fn has_open_delimiter(text: &str) -> bool {
         let prev_alnum = i > 0 && chars[i - 1].is_alphanumeric();
         let next_alnum = chars.get(i + 1).is_some_and(|n| n.is_alphanumeric());
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            '"' => in_double = !in_double,
-            '\u{201c}' => in_double = true,
-            '\u{201d}' => in_double = false,
+            '(' | '[' | '{' if !in_double && !in_single => depth += 1,
+            ')' | ']' | '}' if !in_double && !in_single => depth = (depth - 1).max(0),
+            '"' if !in_single => in_double = !in_double,
+            '\u{201c}' if !in_single => in_double = true,
+            '\u{201d}' if !in_single => in_double = false,
             '\'' | '\u{2018}' | '\u{2019}' if prev_alnum && next_alnum => {}
-            '\'' => in_single = !in_single,
-            '\u{2018}' => in_single = true,
-            '\u{2019}' => in_single = false,
+            '\'' | '\u{2019}'
+                if !in_single
+                    && i > 0
+                    && matches!(chars[i - 1], 's' | 'S')
+                    && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {}
+            '\'' if !in_double => in_single = !in_single,
+            '\u{2018}' if !in_double => in_single = true,
+            '\u{2019}' if !in_double => in_single = false,
             _ => {}
         }
     }
@@ -199,9 +205,9 @@ fn has_open_delimiter(text: &str) -> bool {
 }
 
 /// A word that ends in the middle of an identifier or path (`"foo::"`,
-/// `"src/"`, `"snake_"`, `"a."`-style joiners, `"key="`).
+/// `"src/"`, `"snake_"`, `"key="`).
 fn ends_mid_identifier(word: &str) -> bool {
-    word.ends_with("::") || word.ends_with(['/', '\\', '_', '.', '=', '(', '[', '{', '<', '#', '@'])
+    word.ends_with("::") || word.ends_with(['/', '\\', '_', '=', '(', '[', '{', '<', '#', '@'])
 }
 
 /// Take up to `max_words` words from `task_name` for embedding in a
@@ -210,16 +216,12 @@ fn ends_mid_identifier(word: &str) -> bool {
 /// fixed verb phrase it's spliced into, so it must not be lowercased.
 ///
 /// A name that already fits within `max_words` is returned whole and
-/// unmarked. A name that must be shortened has its cut point walked
-/// back off any trailing article, preposition, conjunction, copula, or
-/// possessive (see [`is_dangling`]), any word that stops mid-identifier,
-/// and any word that leaves a quote or bracket open, so it doesn't stop
-/// mid-clause, and
-/// gets a trailing "…" so the shortening reads as a deliberate
-/// abbreviation rather than data cut off by accident. Trailing `,`,
-/// `;`, `:`, and `-` on the last kept word are stripped before the
-/// ellipsis, and the same marks are ignored when classifying a word as
-/// dangling.
+/// unmarked. For a shortened name, walk the cut point back past:
+/// - dangling articles, prepositions, conjunctions, copulas, or possessives;
+/// - words ending mid-identifier;
+/// - fragments with an open quote or bracket.
+///
+/// Strip trailing clause punctuation and append "…" to mark the abbreviation.
 ///
 /// Returns `None` when the name is empty or reduces to nothing but
 /// dangling words, so the caller can fall back to its fixed short
@@ -418,8 +420,8 @@ pub fn review_guide_summary(task_name: &str, cached_summary: Option<&str>) -> Op
 /// `ConflictResolution`, `CiRemediation` and `Progression` executions bind
 /// `work_item_id` to the implementer's own row. Routing them through
 /// `get_or_generate` would overwrite the implementer's cached summary and
-/// flap both panes. They instead *read* that cache (`cached_summary`, from
-/// [`cached_summary`]) and never write it; no model call is made. `AnswerAgent`'s
+/// flap both panes. They instead read the stored phrase through [`cached_summary`]
+/// and never write it; no model call is made. `AnswerAgent`'s
 /// synthetic row has a different problem (its description is someone else's
 /// comment text), so it keeps a fixed phrase.
 ///
@@ -448,6 +450,34 @@ pub fn derived_title_summary(
         | ExecutionKind::RevisionImplementation
         | ExecutionKind::TaskImplementation => None,
         ExecutionKind::Progression => Some(progression_summary(task_name, cached_summary)),
+    }
+}
+
+/// Resolve the pane spawner's title, including review-guide ownership and the
+/// boundary between read-only derived titles and model-generated summaries.
+pub async fn title_for_spawn(
+    db: &WorkDb,
+    utility: &dyn UtilityModel,
+    kind: &ExecutionKind,
+    review_stage: Option<ReviewStage>,
+    execution_work_item_id: &str,
+    work_item: &WorkItem,
+) -> Option<String> {
+    let owner = (kind == &ExecutionKind::PrReviewGuide).then(|| db.owning_work_item_id(execution_work_item_id));
+    let owner_item = owner.as_deref().and_then(|id| db.get_work_item(id).ok());
+    let subject = if owner.is_some() {
+        owner_item
+            .as_ref()
+            .map(name_and_description)
+            .map(|(name, _)| name)
+            .unwrap_or_default()
+    } else {
+        name_and_description(work_item).0
+    };
+    let cached = cached_summary(db, owner.as_deref().unwrap_or_else(|| item_id(work_item)));
+    match derived_title_summary(kind, review_stage, subject, cached.as_deref()) {
+        Some(summary) => summary,
+        None => get_or_generate(db, utility, work_item).await,
     }
 }
 
@@ -631,6 +661,9 @@ fn clean_summary(raw: &str) -> String {
 }
 
 #[cfg(test)]
+mod derived_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use boss_protocol::{Task, TaskKind, TaskStatus};
@@ -646,7 +679,7 @@ mod tests {
         boss_engine_utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)
     }
 
-    fn sample_task(id: &str, name: &str, description: &str) -> WorkItem {
+    pub(super) fn sample_task(id: &str, name: &str, description: &str) -> WorkItem {
         WorkItem::Task(
             Task::builder()
                 .id(id)
@@ -826,114 +859,6 @@ mod tests {
             pr_review_summary("Ship feature for, extra words remaining", None).as_deref(),
             Some("reviewing the PR for Ship feature…"),
         );
-    }
-
-    const STUCK_ITEM: &str = "Cards show 'Queued \u{2014} reason unknown' for rows the engine has nothing queued for";
-    const CACHED: &str = "fixing queued-reason labels on cards";
-
-    #[test]
-    fn derived_kinds_use_the_cached_summary_when_present() {
-        let cases = [
-            (
-                ExecutionKind::Progression,
-                None,
-                "unsticking: fixing queued-reason labels on cards",
-            ),
-            (
-                ExecutionKind::PrReview,
-                None,
-                "reviewing: fixing queued-reason labels on cards",
-            ),
-            (
-                ExecutionKind::PrReview,
-                Some(ReviewStage::Consolidation),
-                "consolidating review: fixing queued-reason labels on cards",
-            ),
-            (
-                ExecutionKind::CiRemediation,
-                None,
-                "fixing CI: fixing queued-reason labels on cards",
-            ),
-            (
-                ExecutionKind::ConflictResolution,
-                None,
-                "resolving conflicts: fixing queued-reason labels on cards",
-            ),
-            (
-                ExecutionKind::PrReviewGuide,
-                None,
-                "review guide: fixing queued-reason labels on cards",
-            ),
-        ];
-        for (kind, stage, expected) in cases {
-            let title = derived_title_summary(&kind, stage, STUCK_ITEM, Some(CACHED))
-                .unwrap()
-                .unwrap();
-            assert_eq!(title, expected, "{kind:?}");
-            assert!(title.split_whitespace().count() <= 8, "{title}");
-        }
-    }
-
-    #[test]
-    fn derived_kinds_cap_a_long_cached_summary_to_the_word_budget() {
-        let title = progression_summary("x", Some("persisting slot ids on the run record today")).unwrap();
-        assert_eq!(title, "unsticking: persisting slot ids on the run…");
-    }
-
-    #[test]
-    fn derived_kinds_never_end_inside_an_open_quote_or_bracket_without_a_cache() {
-        for kind in [
-            ExecutionKind::Progression,
-            ExecutionKind::PrReview,
-            ExecutionKind::CiRemediation,
-            ExecutionKind::ConflictResolution,
-            ExecutionKind::PrReviewGuide,
-        ] {
-            let title = derived_title_summary(&kind, None, STUCK_ITEM, None).unwrap().unwrap();
-            assert!(!has_open_delimiter(&title), "{kind:?}: {title}");
-            assert!(!title.contains("'Queued"), "{kind:?}: {title}");
-        }
-        assert_eq!(
-            progression_summary(STUCK_ITEM, None).as_deref(),
-            Some("unsticking Cards show…")
-        );
-        assert_eq!(
-            pr_review_summary("Handle (parent and child tasks in the tree", None).as_deref(),
-            Some("reviewing the PR for Handle…"),
-        );
-    }
-
-    #[test]
-    fn fallback_does_not_end_mid_identifier_or_on_filler() {
-        assert_eq!(
-            progression_summary("Fix the engine:: resolver breakage today", None).as_deref(),
-            Some("unsticking Fix…"),
-        );
-        assert_eq!(
-            progression_summary("Rows that are never queued anywhere", None).as_deref(),
-            Some("unsticking Rows…"),
-        );
-        assert!(!has_open_delimiter("don't stop"));
-    }
-
-    #[test]
-    fn derived_title_never_writes_the_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
-        assert_eq!(cached_summary(&db, "task-1"), None);
-        db.set_pane_summary("task-1", CACHED, "basis-1").unwrap();
-        let cached = cached_summary(&db, "task-1");
-        assert_eq!(cached.as_deref(), Some(CACHED));
-        let title = derived_title_summary(&ExecutionKind::Progression, None, STUCK_ITEM, cached.as_deref());
-        assert_eq!(
-            title.unwrap().as_deref(),
-            Some("unsticking: fixing queued-reason labels on cards")
-        );
-        assert_eq!(
-            db.get_pane_summary("task-1").unwrap(),
-            Some((CACHED.to_owned(), "basis-1".to_owned())),
-        );
-        assert_eq!(db.get_pane_summary("task-2").unwrap(), None);
     }
 
     #[test]

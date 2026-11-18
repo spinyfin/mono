@@ -1295,39 +1295,15 @@ impl ExecutionRunner for PaneSpawnRunner {
         // (no credential, API error, cache miss) so a slow or unreachable
         // provider never blocks the spawn.
         let utility = self.cfg.utility.clone();
-        // `derived_title_summary` exhaustively matches `ExecutionKind` (its doc
-        // comment demands this — see `execution.rs`) to decide whether this kind
-        // needs a pure derived phrase or can use the cached/LLM path; see its
-        // doc comment for why some kinds can't share `get_or_generate`.
-        let review_stage = review_batch_member_role.map(ReviewBatchMemberRole::stage);
-        // A review-guide run's synthetic row is named after the PR title; the
-        // title should name the task the guide explains instead.
-        let title_subject = if execution.kind == ExecutionKind::PrReviewGuide {
-            self.work_db
-                .get_work_item(&self.work_db.owning_work_item_id(&execution.work_item_id))
-                .map(|owner| work_item_name(&owner).to_owned())
-                .unwrap_or_default()
-        } else {
-            work_item_name(work_item).to_owned()
-        };
-        // Derived kinds only *read* the implementer's cached summary (never
-        // write it): a review-guide run reads its owning task's slot, every
-        // other kind the slot of its own bound work item.
-        let cache_owner_id = if execution.kind == ExecutionKind::PrReviewGuide {
-            self.work_db.owning_work_item_id(&execution.work_item_id)
-        } else {
-            work_item_id(work_item).to_owned()
-        };
-        let cached_summary = pane_summary::cached_summary(&self.work_db, &cache_owner_id);
-        let title_summary = match pane_summary::derived_title_summary(
+        let title_summary = pane_summary::title_for_spawn(
+            &self.work_db,
+            utility.as_ref(),
             &execution.kind,
-            review_stage,
-            &title_subject,
-            cached_summary.as_deref(),
-        ) {
-            Some(summary) => summary,
-            None => pane_summary::get_or_generate(&self.work_db, utility.as_ref(), work_item).await,
-        };
+            review_batch_member_role.map(ReviewBatchMemberRole::stage),
+            &execution.work_item_id,
+            work_item,
+        )
+        .await;
 
         let work_item_binding = Some(WorkItemBinding {
             work_item_id: work_item_id(work_item).to_owned(),
