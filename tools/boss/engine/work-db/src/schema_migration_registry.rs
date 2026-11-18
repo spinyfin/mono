@@ -386,6 +386,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking::migrate_membership,
         },
         Migration {
+            id: "20261028_1900_pr_head_after_capture".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "pr_head_after_capture")? {
+                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261109_1930_preserved_archive_cleanup".into(),
             legacy_version: None,
             apply: preserved_cleanup::migrate_archive_cleanup,
@@ -507,16 +517,6 @@ pub(super) fn all() -> Vec<Migration> {
             id: "20261110_0730_wait_input_invalidation".into(),
             legacy_version: None,
             apply: board_projection_schema::refine_triggers,
-        },
-        Migration {
-            id: "20261028_1900_pr_head_after_capture".into(),
-            legacy_version: None,
-            apply: |conn| {
-                if !table_has_column(conn, "work_executions", "pr_head_after_capture")? {
-                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")?;
-                }
-                Ok(())
-            },
         },
         Migration {
             id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),

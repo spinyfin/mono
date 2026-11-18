@@ -1,6 +1,60 @@
+use super::pr_flow::CompletionHead;
 use super::*;
 
+#[work_db_boundary::instrument]
 impl WorkDb {
+    /// Record that a worker produced a PR for `execution_id`. In a single
+    /// transaction:
+    ///   - the linked task/chore moves to the column dictated by
+    ///     `target` (`in_review` for an open PR, `done` for a PR that
+    ///     was already merged at Stop time) and gets `pr_url`
+    ///     populated. If the task is already past the target column
+    ///     (`done`, `archived`), its status is left alone — the
+    ///     `pr_url` update still applies.
+    ///   - the execution transitions from `waiting_human` (or `running`)
+    ///     to `completed`, the cube workspace lease columns are
+    ///     cleared, `finished_at` is stamped,
+    ///   - the run summary is updated if a fresh summary is provided
+    ///     and the run hasn't already captured one.
+    ///
+    /// Returns `Ok(None)` if the execution has already been finalised
+    /// (terminal status), making this safe to call from a hook handler
+    /// that may fire repeatedly.
+    ///
+    /// `review_verdict`, when `Some`, is inserted into `pr_review_verdicts`
+    /// inside the SAME transaction as the writes below — see
+    /// [`crate::ReviewVerdictInput`]'s docs. Every non-`pr_review`
+    /// caller passes `None`.
+    pub fn record_worker_pr_completion(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        pr_head_after: Option<&str>,
+        result_summary: Option<&str>,
+        target: WorkerPrCompletionTarget,
+        review_verdict: Option<ReviewVerdictInput>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_with_head(
+            execution_id,
+            pr_url,
+            pr_head_after.map_or(CompletionHead::Unavailable, CompletionHead::Captured),
+            result_summary,
+            target,
+            review_verdict,
+        )
+    }
+
+    /// Local declared completion schedules head capture after releasing the
+    /// worker. Only this entry point may record a pending network audit.
+    pub fn record_declared_worker_pr_completion(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        target: WorkerPrCompletionTarget,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_with_head(execution_id, pr_url, CompletionHead::Pending, None, target, None)
+    }
+
     /// Recheck successful completion under the same write lock as recovery.
     /// Explicit dispatch requests continue to use request_execution.
     pub fn request_orphan_recovery<F: FnOnce(&str) -> bool>(
