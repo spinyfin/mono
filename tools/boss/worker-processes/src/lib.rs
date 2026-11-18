@@ -90,6 +90,43 @@ impl Cleanup {
     }
 }
 
+/// A workspace scan that found processes still inside it, kept as data so a
+/// caller can forward the occupants and their owners instead of prose. Its
+/// message is the wording older hubs parse, so it stays compatible with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occupied {
+    pub occupants: Vec<u32>,
+    pub unknown: Vec<u32>,
+    pub owners: std::collections::BTreeMap<String, Vec<u32>>,
+}
+
+impl Occupied {
+    /// `None` when the scan proves the workspace empty.
+    pub fn of(cleanup: &Cleanup) -> Option<Self> {
+        (!cleanup.empty()).then(|| Self {
+            occupants: cleanup.occupants.clone(),
+            unknown: cleanup.unknown.clone(),
+            owners: cleanup.owners.clone(),
+        })
+    }
+}
+
+impl std::fmt::Display for Occupied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.unknown.is_empty() && self.owners.is_empty() && !self.occupants.is_empty() {
+            write!(f, "unowned workspace occupants {:?}", self.occupants)
+        } else {
+            write!(
+                f,
+                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
+                self.occupants, self.owners, self.unknown
+            )
+        }
+    }
+}
+
+impl std::error::Error for Occupied {}
+
 pub async fn cleanup(key: &str, owner: &str, workspace: &str) -> Result<Cleanup> {
     let output = tokio::process::Command::new("python3")
         .args(["-c", SCRIPT, key, owner, workspace])

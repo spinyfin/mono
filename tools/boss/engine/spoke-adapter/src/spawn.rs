@@ -492,7 +492,7 @@ impl SpokeHostAdapter {
             .await
     }
 
-    fn control_outcome(result: CommandResult) -> ControlOutcome {
+    pub(crate) fn control_outcome(result: CommandResult) -> ControlOutcome {
         let pane = pane_in(&result);
         match ResultCode::try_from(result.code) {
             Ok(ResultCode::Ok) => match pane {
@@ -566,6 +566,22 @@ impl SpokeHostAdapter {
                 Err(outcome) => outcome,
             },
         )
+    }
+
+    /// Stop what the host still holds for this run and scan its workspace. Each
+    /// call is a new command: a stable id would replay the first success, and a
+    /// replayed "empty" says nothing about what occupies the workspace now.
+    pub(crate) async fn ctl_cleanup(
+        &self,
+        execution_id: &str,
+    ) -> Result<std::result::Result<CommandResult, ControlOutcome>> {
+        self.control(
+            execution_id,
+            "stop",
+            self.hub.config.command_deadline,
+            command::Body::Stop(Stop { grace_ms: 0 }),
+        )
+        .await
     }
 
     /// What the host sees of the worker now. `None` when this adapter does not

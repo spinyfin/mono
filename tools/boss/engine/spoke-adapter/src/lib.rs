@@ -44,11 +44,26 @@ use boss_execution_contracts::{
     RunOutcome, WorkerInputKind, WorkerPane,
 };
 use boss_protocol::{WorkExecution, WorkItem};
-use boss_protocol_spoke::v1::{Command, CommandResult, ResultCode, Run, WorkspaceKind, command};
+use boss_protocol_spoke::v1::{
+    Command, CommandResult, ResultCode, Run, WorkspaceKind, WorkspaceOccupancy, command, command_result,
+};
 use boss_spoke_custody::{Collected, Custody};
 use boss_spoke_stream::{CommandOutcome, StreamManager};
 use boss_work_db::{Host, HostTransport, SpokeAssignment, WorkDb};
 use prost::Message;
+
+/// The structured report a host sent in place of prose.
+fn occupied_from(report: &WorkspaceOccupancy) -> boss_execution_contracts::WorkspaceOccupied {
+    boss_execution_contracts::WorkspaceOccupied {
+        occupants: report.occupants.clone(),
+        unreadable: report.unreadable.clone(),
+        owners: report
+            .owners
+            .iter()
+            .map(|(owner, list)| (owner.clone(), list.pids.clone()))
+            .collect(),
+    }
+}
 
 pub use outbox::WorkDbOutbox;
 pub use spawn::{ComposedSpawn, SpawnComposer, SpawnInput};
@@ -946,17 +961,28 @@ impl HostAdapter for SpokeHostAdapter {
     async fn cleanup_execution_processes(&self, execution_id: &str, workspace: &Path) -> Result<Occupancy> {
         match self.route_execution(execution_id).await? {
             Route::Legacy(legacy) => legacy.cleanup_execution_processes(execution_id, workspace).await,
-            Route::Spoke(_) => match self.ctl_stop(execution_id, Duration::ZERO).await? {
-                ControlOutcome::Delivered(_) => Ok(Occupancy::Empty),
-                outcome => {
-                    let reason = format!("{outcome:?}");
-                    // Only unowned processes remain: let the hub bound the wait.
-                    if let Some(unowned) = boss_execution_contracts::UnownedOccupants::from_message(&reason) {
-                        return Err(unowned.into());
-                    }
-                    anyhow::bail!("owning host could not confirm process cleanup: {reason}")
+            Route::Spoke(_) => {
+                let result = match self.ctl_cleanup(execution_id).await? {
+                    Ok(result) => result,
+                    Err(outcome) => bail!("owning host could not confirm process cleanup: {outcome:?}"),
+                };
+                // The host reports occupants as data; the hub classifies them.
+                if let Some(command_result::Value::Occupancy(report)) = &result.value {
+                    return Err(occupied_from(report).into());
                 }
-            },
+                match Self::control_outcome(result) {
+                    ControlOutcome::Delivered(_) => Ok(Occupancy::Empty),
+                    outcome => {
+                        let reason = format!("{outcome:?}");
+                        // A host that predates the structured report words only
+                        // unowned occupants in its reason.
+                        if let Some(unowned) = boss_execution_contracts::UnownedOccupants::from_message(&reason) {
+                            return Err(unowned.into());
+                        }
+                        anyhow::bail!("owning host could not confirm process cleanup: {reason}")
+                    }
+                }
+            }
         }
     }
 

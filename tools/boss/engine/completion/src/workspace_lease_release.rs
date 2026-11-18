@@ -884,6 +884,50 @@ pub fn settled_for(execution: &WorkExecution, secs: i64) -> bool {
     })
 }
 
+/// How an occupancy report reads once its owners are looked up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OccupantVerdict {
+    /// Nothing is inside the workspace.
+    Empty,
+    /// Only processes no known run owns: the ones with no run identity and the
+    /// ones carrying a run id the engine has no record of. These are eligible
+    /// for the bounded release once the run has been over long enough.
+    Unowned(Vec<u32>),
+    /// An unreadable process, or one carrying the id of a run the engine knows
+    /// (live, or terminal with a shell it cannot prove gone): the lease stays.
+    Held,
+}
+
+/// Classify what a workspace scan found, wherever the scan ran. The local scan
+/// and an owning host's report share this, so the same occupants get the same
+/// answer on either.
+pub fn classify_occupants(db: &WorkDb, report: &boss_execution_contracts::WorkspaceOccupied) -> OccupantVerdict {
+    if !report.unreadable.is_empty() {
+        return OccupantVerdict::Held;
+    }
+    let mut unowned = report.unowned();
+    for (owner, pids) in &report.owners {
+        // A lookup that fails for any reason other than "no such run" is not
+        // evidence the run is gone.
+        match db.get_execution(owner) {
+            Ok(_) => return OccupantVerdict::Held,
+            Err(err) if is_unknown_execution(&err) => unowned.extend(pids),
+            Err(_) => return OccupantVerdict::Held,
+        }
+    }
+    unowned.sort_unstable();
+    unowned.dedup();
+    if unowned.is_empty() {
+        OccupantVerdict::Empty
+    } else {
+        OccupantVerdict::Unowned(unowned)
+    }
+}
+
+fn is_unknown_execution(err: &anyhow::Error) -> bool {
+    err.to_string().starts_with("unknown execution")
+}
+
 /// Apply the bounded release for unowned occupants to an owning host's cleanup
 /// report. `result` is what the host adapter returned: when it failed only
 /// because unowned processes remain (see [`boss_execution_contracts::UnownedOccupants`])
@@ -892,6 +936,15 @@ pub fn settled_for(execution: &WorkExecution, secs: i64) -> bool {
 /// owned or unreadable occupant, passes through unchanged and keeps the lease.
 pub fn bound_unowned_occupants(db: &WorkDb, execution: &WorkExecution, result: Result<Occupancy>) -> Result<Occupancy> {
     let Err(err) = result else { return result };
+    // A structured report is classified here, as a local scan is.
+    let err = match err.downcast::<boss_execution_contracts::WorkspaceOccupied>() {
+        Ok(report) => match classify_occupants(db, &report) {
+            OccupantVerdict::Empty => return Ok(Occupancy::Empty),
+            OccupantVerdict::Unowned(occupants) => boss_execution_contracts::UnownedOccupants { occupants }.into(),
+            OccupantVerdict::Held => return Err(report.into()),
+        },
+        Err(err) => err,
+    };
     let Some(unowned) = err
         .downcast_ref::<boss_execution_contracts::UnownedOccupants>()
         .cloned()

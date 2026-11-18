@@ -188,7 +188,22 @@ message CommandResult {
     PaneState pane = 10;
     WorkspaceResult workspace = 11;
     Empty completed = 12;
+    // A stop the host refused because processes still occupy the workspace.
+    WorkspaceOccupancy occupancy = 13;
   }
+}
+// What a host's workspace scan found, as data rather than prose so the hub
+// can classify it exactly as it classifies a scan of its own host.
+message WorkspaceOccupancy {
+  // Processes inside the workspace that carry no run identity.
+  repeated uint32 occupants = 1;
+  // Processes whose identity could not be read.
+  repeated uint32 unreadable = 2;
+  // Occupant pids by the run id they carry.
+  map<string, PidList> owners = 3;
+}
+message PidList {
+  repeated uint32 pids = 1;
 }
 message Inventory {
   string os = 1;

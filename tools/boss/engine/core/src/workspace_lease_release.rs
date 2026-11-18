@@ -63,13 +63,23 @@ impl WorkspaceOccupancy for HostOccupancy {
             if !result.owners.is_empty() {
                 result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
             }
-            if result.stray_only() && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
+            let report = boss_execution_contracts::WorkspaceOccupied {
+                occupants: result.occupants.clone(),
+                unreadable: result.unknown.clone(),
+                owners: result.owners.clone(),
+            };
+            // A scan on another host is classified by the same function, so a
+            // run id the engine has never heard of is bounded here as it is
+            // there, while a live run's processes keep the lease.
+            if let OccupantVerdict::Unowned(unowned) = classify_occupants(db, &report)
+                && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS)
+            {
                 // Nothing in the registry owns these and they are not safe to
                 // signal. Holding the lease forever strands a 10-20 GiB
                 // workspace, so return it loudly, naming the PIDs.
                 tracing::error!(
                     execution_id = %execution.id,
-                    occupants = ?result.occupants,
+                    occupants = ?unowned,
                     "releasing workspace lease with unowned processes still in it"
                 );
                 raise_attention(
@@ -79,7 +89,7 @@ impl WorkspaceOccupancy for HostOccupancy {
                     "Workspace lease released with unowned processes inside",
                     &format!(
                         "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No live run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the engine host and stop them if they are stale.",
-                        result.occupants
+                        unowned
                     ),
                 );
                 return Ok(Occupancy::Empty);

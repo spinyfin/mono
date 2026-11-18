@@ -407,3 +407,58 @@ fn unowned_remote_occupants_are_released_only_after_the_bound_and_owned_ones_nev
         "owned occupants keep the lease"
     );
 }
+
+/// A structured occupancy report is classified like a local scan: a run id the
+/// engine has no record of uses the unowned bound, a run it knows keeps the
+/// lease, and nothing is released while an occupant is unreadable.
+#[test]
+fn structured_occupancy_report_is_classified_like_a_local_scan() {
+    use crate::workspace_lease_release::{Occupancy, UNOWNED_OCCUPANT_BOUND_SECS, bound_unowned_occupants};
+    use boss_execution_contracts::WorkspaceOccupied;
+    let (_dir, db, id) = remote_fixture();
+    let set_finished_ago = |secs: i64| {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![id, (boss_engine_utils::epoch_time::now_epoch_secs() - secs).to_string()],
+            )
+            .unwrap();
+        db.get_execution(&id).unwrap()
+    };
+    let report = |owner: &str, unreadable: Vec<u32>| -> Result<Occupancy> {
+        Err(WorkspaceOccupied {
+            occupants: vec![7, 8],
+            unreadable,
+            owners: [(owner.to_owned(), vec![8])].into(),
+        }
+        .into())
+    };
+
+    // Held, then released after the bound: 7 carries no identity, 8 carries a
+    // run id the engine has never heard of.
+    let fresh = set_finished_ago(5);
+    assert!(bound_unowned_occupants(&db, &fresh, report("exec_never_seen", vec![])).is_err());
+    let settled = set_finished_ago(UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    assert_eq!(
+        bound_unowned_occupants(&db, &settled, report("exec_never_seen", vec![])).unwrap(),
+        Occupancy::Empty
+    );
+    let released = db
+        .list_attention_items(&id)
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND
+        })
+        .expect("the release is loud");
+    assert!(released.body_markdown.contains("[7, 8]"), "{}", released.body_markdown);
+
+    // A run the engine knows keeps the lease however long ago this one ended.
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "other live run");
+    let other = create_ready_chore_execution(&db, chore.id);
+    assert!(bound_unowned_occupants(&db, &settled, report(&other.id, vec![])).is_err());
+    // So does an occupant whose identity could not be read.
+    assert!(bound_unowned_occupants(&db, &settled, report("exec_never_seen", vec![9])).is_err());
+}

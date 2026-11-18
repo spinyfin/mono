@@ -114,6 +114,26 @@ async fn unowned_occupant_holds_the_lease_until_the_bound_then_releases_loudly()
 }
 
 #[tokio::test]
+async fn an_occupant_carrying_an_unknown_run_id_is_bounded_like_an_unowned_one() {
+    let (_dir, db) = open_db();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let execution = orphaned(&db, workspace.path(), "lease-unknown-owner");
+    // The engine has no record of this run id, so nothing will ever claim it.
+    let mut stray = spawn_detached(workspace.path(), Some("exec_never_recorded"));
+
+    set_finished_ago(&db, &execution.id, 5);
+    let kept = release_with_host_occupancy(&db, &execution).await;
+    assert!(matches!(kept, LeaseReleaseOutcome::Kept { .. }), "{kept:?}");
+
+    set_finished_ago(&db, &execution.id, UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    let released = release_with_host_occupancy(&db, &execution).await;
+    assert_eq!(released, LeaseReleaseOutcome::Released);
+    assert!(stray.try_wait().unwrap().is_none(), "never signalled");
+    let _ = stray.kill();
+    let _ = stray.wait();
+}
+
+#[tokio::test]
 async fn reused_shell_pid_does_not_protect_an_old_owners_orphans() {
     let (_dir, db) = open_db();
     let workspace = tempfile::TempDir::new().unwrap();

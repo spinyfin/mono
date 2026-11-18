@@ -19,8 +19,8 @@ use boss_protocol::DriverRuntimeState;
 use boss_protocol_spoke::{
     Validate,
     v1::{
-        Command, CommandResult, Deliver, DeliveryKind, PaneLife, PaneState, ResultCode, Run, Spawn, Stop, command,
-        command_result,
+        Command, CommandResult, Deliver, DeliveryKind, PaneLife, PaneState, PidList, ResultCode, Run, Spawn, Stop,
+        WorkspaceOccupancy, command, command_result,
     },
 };
 use boss_tmux::{
@@ -817,7 +817,14 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             self.tmux
                 .cleanup_run_processes(&record.execution_id, &workspace)
                 .await?;
-            self.tmux.verify_workspace_quiescent(&workspace).await?;
+            // Every stop scans again; nothing about an earlier scan is reused.
+            // Occupants go back as data so the hub classifies them itself.
+            if let Err(error) = self.tmux.verify_workspace_quiescent(&workspace).await {
+                return match error.downcast::<boss_tmux::Occupied>() {
+                    Ok(occupied) => Ok(occupied_outcome(command, &occupied)),
+                    Err(error) => Err(error),
+                };
+            }
         }
         Ok(result)
     }
@@ -1288,6 +1295,26 @@ fn outcome(command: &Command, code: ResultCode, reason: impl Into<String>, pane:
         code: code.into(),
         reason: reason.into(),
         value: pane.map(command_result::Value::Pane),
+    }
+}
+
+/// A stop the host refused because processes still occupy the workspace. The
+/// reason keeps the text older hubs parse; the report is the structured value.
+fn occupied_outcome(command: &Command, occupied: &boss_tmux::Occupied) -> CommandResult {
+    let pids = |pids: &[u32]| PidList { pids: pids.to_vec() };
+    CommandResult {
+        command_id: command.command_id.clone(),
+        code: ResultCode::Rejected.into(),
+        reason: occupied.to_string(),
+        value: Some(command_result::Value::Occupancy(WorkspaceOccupancy {
+            occupants: occupied.occupants.clone(),
+            unreadable: occupied.unknown.clone(),
+            owners: occupied
+                .owners
+                .iter()
+                .map(|(owner, list)| (owner.clone(), pids(list)))
+                .collect(),
+        })),
     }
 }
 
