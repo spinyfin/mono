@@ -1040,10 +1040,8 @@ mod floor_tests {
             (
                 "20261118_1200_execution_force_launched",
                 Box::new(|c| {
-                    c.execute_batch(
-                        "ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0",
-                    )
-                    .unwrap();
+                    c.execute_batch("ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0")
+                        .unwrap();
                 }),
             ),
             (

@@ -18,7 +18,7 @@
 //! and the question stays open.
 
 use super::dispatch_admission::primary_pr_awaits_review;
-use super::pr_flow::RestartAfterAnswer;
+use super::pr_flow::question_restart::RestartAfterAnswer;
 use super::*;
 use boss_protocol::{CREATED_VIA_ENGINE_AUTO, OperatorQuestionView, TaskStatus};
 use chrono::{DateTime, Utc};
@@ -465,6 +465,9 @@ pub(super) fn continue_after_answer(
         match started {
             Ok(resume) => {
                 tx.execute_batch("RELEASE answer_explicit_start")?;
+                if asked_under_force_launch {
+                    super::dispatch::mark_execution_force_launched_in(tx, &resume.id)?;
+                }
                 return Ok(RestartAfterAnswer {
                     minted: true,
                     force_resume_execution_id: (asked_under_force_launch && resume.status == ExecutionStatus::Ready)

@@ -594,4 +594,42 @@ mod tests {
             .unwrap();
         assert_eq!(new_flag, 0, "new admissions default to ordinary dispatch");
     }
+
+    #[test]
+    fn force_launch_migration_upgrades_a_current_database_without_the_column() {
+        let (dir, db) = crate::test_support::open_db();
+        let path = db.path().to_path_buf();
+        {
+            let conn = db.connect().unwrap();
+            assert!(
+                super::super::table_has_column(&conn, "work_executions", "force_launched").unwrap(),
+                "the current fixture already includes force_launched"
+            );
+            conn.execute_batch(
+                "ALTER TABLE work_executions DROP COLUMN force_launched;
+                 DELETE FROM schema_migrations WHERE id = '20261118_1200_execution_force_launched';",
+            )
+            .unwrap();
+            assert!(
+                !super::super::table_has_column(&conn, "work_executions", "force_launched").unwrap(),
+                "the upgrade fixture must start from main's schema without force_launched"
+            );
+        }
+        drop(db);
+        let upgraded = crate::WorkDb::open(path).unwrap();
+        let conn = upgraded.connect().unwrap();
+        assert!(
+            super::super::table_has_column(&conn, "work_executions", "force_launched").unwrap(),
+            "opening a current database that never received force_launched must add the column"
+        );
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE id = '20261118_1200_execution_force_launched'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1, "the upgrade must record the named migration");
+        drop(dir);
+    }
 }

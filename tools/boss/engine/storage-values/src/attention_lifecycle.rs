@@ -171,7 +171,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         QUESTION_RESUME_DISPATCH_FAILED,
         ClearedBy::WorkResumed,
-        "An answered question could not resume dispatch; a subsequent run starting proves the hold cleared.",
+        "An answered question could not resume dispatch; a later start of that same resume proves the hold cleared.",
     ),
     entry(
         EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND,

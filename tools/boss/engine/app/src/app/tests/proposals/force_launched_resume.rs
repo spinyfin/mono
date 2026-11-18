@@ -3,6 +3,7 @@
 use super::*;
 use async_trait::async_trait;
 use boss_engine_dispatch::coordinator::DispatchPauseOrigin;
+use boss_engine_runtime::test_support::release_finished_execution_lease;
 use boss_execution_contracts::{DispatchAdmission, ExecutionRunner, RunOutcome};
 use boss_protocol::{ExecutionStatus, PauseReason, ProposalKind};
 
@@ -42,6 +43,24 @@ impl ExecutionRunner for QuestionRunner {
     }
 }
 
+async fn release_worker_for(state: &Arc<ServerState>, execution_id: &str) {
+    let Some(worker_id) = state
+        .execution_coordinator
+        .worker_pool()
+        .claims()
+        .await
+        .into_iter()
+        .find(|claim| claim.execution_id == execution_id)
+        .map(|claim| claim.worker_id)
+    else {
+        return;
+    };
+    state
+        .execution_coordinator
+        .release_worker_and_kick(&worker_id, execution_id, None)
+        .await;
+}
+
 async fn wait_for_starts(state: &ServerState, runner: &QuestionRunner, count: usize) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while runner.0.load(std::sync::atomic::Ordering::SeqCst) < count {
@@ -68,11 +87,8 @@ async fn force_launched_question() -> (Arc<ServerState>, tempfile::TempDir, Stri
     state.feature_flags.set("run_done_proposals_seam", true).unwrap();
     pause_dispatch(&state);
     let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
-    let task = boss_engine_runtime::test_support::create_test_chore(
-        &state.work_db,
-        product.id,
-        "Force launched question",
-    );
+    let task =
+        boss_engine_runtime::test_support::create_test_chore(&state.work_db, product.id, "Force launched question");
     let task_id = task.id;
     let asking = state
         .work_db
@@ -115,6 +131,9 @@ async fn force_launched_question() -> (Arc<ServerState>, tempfile::TempDir, Stri
     );
     assert!(state.work_db.execution_force_launched(&asking).unwrap());
     assert!(state.work_db.get_execution(&asking).unwrap().status.is_terminal());
+    // The pending runner fake never returns, so teardown never releases the
+    // cube lease. Dispatch holds a successor while that lease is recorded.
+    release_finished_execution_lease(&state.work_db, &asking);
     assert_eq!(
         state.work_db.list_executions(Some(&task_id)).unwrap().len(),
         1,
@@ -148,7 +167,67 @@ async fn answering_a_force_launched_runs_question_resumes_it_past_the_pause() {
             state.execution_coordinator.dispatch_pause()
         )
     );
-    assert!(!state.work_db.execution_force_launched(&resume_id).unwrap());
+    assert!(
+        state.work_db.execution_force_launched(&resume_id).unwrap(),
+        "the force-launch lineage must carry onto the minted resume"
+    );
+    assert!(
+        state.execution_coordinator.is_dispatch_paused(),
+        "the pause itself is untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_second_question_on_the_resumed_run_still_bypasses_the_operator_pause() {
+    let (state, _dir, asking, task_id, runner) = force_launched_question().await;
+    assert!(matches!(
+        answer_question(&state, &task_id, true).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    let first_resume = resume_execution(&state, &task_id, &asking).id;
+    wait_for_starts(&state, &runner, 2).await;
+    assert!(state.work_db.execution_force_launched(&first_resume).unwrap());
+    release_worker_for(&state, &asking).await;
+
+    state
+        .worker_registry
+        .register(std::process::id() as libc::pid_t, first_resume.clone());
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(&first_resume, ProposalKind::RunDone, operator_question_payload()),
+        )
+        .await,
+    );
+    assert!(state.work_db.get_execution(&first_resume).unwrap().status.is_terminal());
+    release_finished_execution_lease(&state.work_db, &first_resume);
+    release_worker_for(&state, &first_resume).await;
+
+    assert!(matches!(
+        answer_question(&state, &task_id, true).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    let second_resume = state
+        .work_db
+        .list_executions(Some(&task_id))
+        .unwrap()
+        .into_iter()
+        .find(|execution| execution.id != asking && execution.id != first_resume)
+        .expect("the second Yes answer mints another resume")
+        .id;
+    wait_for_starts(&state, &runner, 3).await;
+    assert_eq!(
+        state.work_db.get_execution(&second_resume).unwrap().status,
+        ExecutionStatus::Running,
+        "the second resume must start without another force launch: {:?}",
+        (
+            state.work_db.list_executions(Some(&task_id)).unwrap(),
+            state.work_db.list_attention_items(&second_resume).unwrap(),
+            state.execution_coordinator.dispatch_pause()
+        )
+    );
+    assert!(state.work_db.execution_force_launched(&second_resume).unwrap());
     assert!(
         state.execution_coordinator.is_dispatch_paused(),
         "the pause itself is untouched"
@@ -194,7 +273,10 @@ async fn unpaused_answer_uses_normal_dispatch() {
     ));
     let resume = resume_execution(&state, &task_id, &asking);
     assert_eq!(resume.status, ExecutionStatus::Ready);
-    assert!(!state.work_db.execution_force_launched(&resume.id).unwrap());
+    assert!(
+        state.work_db.execution_force_launched(&resume.id).unwrap(),
+        "lineage is recorded even when the pause is already clear"
+    );
     assert!(state.work_db.list_attention_items(&resume.id).unwrap().is_empty());
     // The pending runner fake retains the fixture's only worker slot.
     // Model the terminal asker's exit before checking normal admission.
@@ -221,7 +303,7 @@ async fn unpaused_answer_uses_normal_dispatch() {
         ExecutionStatus::Running,
         "normal dispatch must start the answered resume once preflight clears"
     );
-    assert!(!state.work_db.execution_force_launched(&resume.id).unwrap());
+    assert!(state.work_db.execution_force_launched(&resume.id).unwrap());
     assert!(!state.execution_coordinator.is_dispatch_paused());
 }
 
@@ -240,12 +322,15 @@ async fn breaker_pause_holds_answered_resume() {
     ));
     let resume = resume_execution(&state, &task_id, &asking);
     assert_eq!(resume.status, ExecutionStatus::Ready);
-    assert!(!state.work_db.execution_force_launched(&resume.id).unwrap());
+    assert!(
+        state.work_db.execution_force_launched(&resume.id).unwrap(),
+        "the stamp records lineage and does not bypass a breaker pause"
+    );
 }
 
 #[tokio::test]
 async fn failed_resume_admission_has_visible_attention() {
-    let (state, _dir, asking, task_id, _runner) = force_launched_question().await;
+    let (state, _dir, asking, task_id, runner) = force_launched_question().await;
     state
         .execution_coordinator
         .set_dispatch_preflight_block(Some("test runtime unavailable".into()));
@@ -260,7 +345,26 @@ async fn failed_resume_admission_has_visible_attention() {
         attention
             .iter()
             .any(|item| item.kind == "question_resume_dispatch_failed"
+                && item.status == "open"
                 && item.body_markdown.contains("test runtime unavailable"))
+    );
+
+    state.execution_coordinator.set_dispatch_preflight_block(None);
+    state
+        .execution_coordinator
+        .force_dispatch(&resume.id, DispatchAdmission::PauseBypassOverride)
+        .await
+        .unwrap();
+    wait_for_starts(&state, &runner, 2).await;
+    state.work_db.reconcile_stale_attention_signals().unwrap();
+    let attention = state.work_db.list_attention_items(&resume.id).unwrap();
+    assert!(
+        attention
+            .iter()
+            .any(|item| item.kind == "question_resume_dispatch_failed"
+                && item.status == "resolved"
+                && item.resolved_at.is_some()),
+        "starting the same resume must resolve the failed-admission attention: {attention:?}"
     );
 }
 

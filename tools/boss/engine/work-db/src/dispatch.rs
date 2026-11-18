@@ -1329,10 +1329,7 @@ impl WorkDb {
     /// which bypasses the dispatch pause. Idempotent.
     pub fn mark_execution_force_launched(&self, execution_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
-            "UPDATE work_executions SET force_launched = 1 WHERE id = ?1",
-            [execution_id],
-        )?;
+        mark_execution_force_launched_in(&conn, execution_id)?;
         Ok(())
     }
 
@@ -2015,6 +2012,15 @@ fn chain_member_ids_on(conn: &Connection, work_item_id: &str) -> Result<Vec<Stri
     member_ids.push(root_id.clone());
     member_ids.extend(collect_chain_revision_ids_including_deleted(conn, &root_id)?);
     Ok(member_ids)
+}
+
+/// Connection-level half of [`WorkDb::mark_execution_force_launched`].
+pub(crate) fn mark_execution_force_launched_in(conn: &Connection, execution_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE work_executions SET force_launched = 1 WHERE id = ?1",
+        [execution_id],
+    )?;
+    Ok(())
 }
 
 /// Connection-level half of [`WorkDb::execution_force_launched`], shared with
