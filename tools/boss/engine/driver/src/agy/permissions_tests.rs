@@ -592,6 +592,22 @@ fn the_rendered_fences_name_the_engine_data_dir_and_resolved_paths() {
     ] {
         assert!(deny.contains(&expected.as_str()), "missing {expected} in {deny:?}");
     }
+    // The rules fence is this run's `rules-root`, not the shared homes tree
+    // above it, and the production renderer agrees with the live probe.
+    let rules_root = super::super::home::agent_rules_path_for_run("run-fences")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert!(rules_root.ends_with("run-fences/rules-root"), "{rules_root:?}");
+    assert!(
+        deny.contains(&format!("write_file({})", rules_root.display()).as_str()),
+        "missing rules-root fence in {deny:?}"
+    );
+    assert!(
+        !deny.contains(&format!("write_file({})", super::super::home::agy_homes_root().display()).as_str()),
+        "the shared homes dir must not be fenced: {deny:?}"
+    );
 
     // Remote: the forwarded socket's directory is not a Boss data dir.
     let remote = permission_input(WorkerKind::Standard, &workspace, &data_dir, "run-fences", true);
@@ -685,9 +701,40 @@ fn log_check_matches_the_study_line_shape_exactly() {
         "request-review",
     );
     assert_eq!(
-        verify_settings_log(&file, &line).unwrap(),
+        verify_settings_log(&file, &format!("{line}\n{HOOKS_LOADED_LINE}")).unwrap(),
         SettingsLogCheck::ConsistentSoFar
     );
+}
+
+#[test]
+fn log_check_requires_the_hooks_file_to_have_loaded() {
+    let settings = rendered(WorkerKind::Standard);
+    let file = settings.to_json().unwrap();
+    let init = init_line(
+        &settings.allow_rules().join(" "),
+        &settings.deny_rules().join(" "),
+        "request-review",
+    );
+    // Settings alone are not admission: with no hooks the CLI still starts,
+    // in review mode, with no authorization hook and no progress ingress.
+    for log in [
+        init.clone(),
+        format!("{init}\nI1117 hooks_manager.go:54] loaded 0 named hooks from 0 hooks.json file(s)"),
+        format!("{init}\nI1117 hooks_manager.go:54] loaded 0 named hooks from 1 hooks.json file(s)"),
+    ] {
+        assert_eq!(
+            verify_settings_log(&file, &log).unwrap(),
+            SettingsLogCheck::NotYetInitialized,
+            "{log}"
+        );
+    }
+    // A hooks file the CLI cannot parse is a failure, not a wait.
+    let unparseable = format!(
+        "{init}\nE1117 hooks_manager.go:34] failed to parse hooks.json at /h/hooks.json: invalid character\n\
+         I1117 hooks_manager.go:54] loaded 0 named hooks from 1 hooks.json file(s)"
+    );
+    let error = format!("{:#}", verify_settings_log(&file, &unparseable).unwrap_err());
+    assert!(error.contains("no authorization hook is armed"), "{error}");
 }
 
 #[test]
@@ -701,7 +748,7 @@ fn log_check_waits_for_initialisation_and_then_accepts_a_matching_line() {
             "{kind:?}"
         );
         let log = format!(
-            "noise\n{}\nmore noise\n",
+            "noise\n{}\n{HOOKS_LOADED_LINE}\nmore noise\n",
             init_line(
                 &settings.allow_rules().join(" "),
                 &settings.deny_rules().join(" "),
@@ -802,10 +849,13 @@ fn log_check_reads_the_run_files_and_treats_a_missing_log_as_not_yet_initialised
     );
     fs::write(
         &log_path,
-        init_line(
-            &settings.allow_rules().join(" "),
-            &settings.deny_rules().join(" "),
-            "request-review",
+        format!(
+            "{}\n{HOOKS_LOADED_LINE}\n",
+            init_line(
+                &settings.allow_rules().join(" "),
+                &settings.deny_rules().join(" "),
+                "request-review",
+            )
         ),
     )
     .unwrap();

@@ -55,8 +55,10 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
     let attempts = evidence.join("tool-attempts.log");
     fs::write(&attempts, "")?;
     let started = evidence.join("session-started");
-    let hooks = json!({"hooks": {
-        "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": format!("/usr/bin/touch {}", shell_quote(&started.display().to_string()))}]}],
+    // Same shape as production: the top-level key names a hook group, and
+    // `SessionStart` is a bare handler while `PreToolUse` takes a matcher group.
+    let hooks = json!({"boss": {
+        "SessionStart": [{"type": "command", "command": format!("/usr/bin/touch {}", shell_quote(&started.display().to_string()))}],
         "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": deny_command(&attempts)}]}]
     }});
     fs::write(
@@ -82,7 +84,7 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
             .workspace(&fs::canonicalize(&workspace)?)
             .hooks_dir(&runtime.process_home.join(".gemini/config"))
             .control_dir(runtime.session_settings_path.parent().context("control directory")?)
-            .rules_root(rules_path.ancestors().nth(3).context("rules root")?)
+            .rules_root(rules_path.parent().context("rules root")?)
             .build(),
     )?;
     fs::write(&settings, rendered.to_json()?)?;

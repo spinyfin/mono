@@ -2014,6 +2014,15 @@ pub trait AgentDriver: Send + Sync {
         Vec::new()
     }
 
+    /// Screen text that, shortly after the brief is submitted, means the CLI
+    /// discarded it without starting a turn (a vendor error with no hook to
+    /// follow). The initial-brief launcher watches for these after the submit
+    /// and exits non-zero, so the spawn fails explicitly instead of waiting on
+    /// a hook that will never fire. The default, none, watches nothing.
+    fn post_submit_failure_markers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Optional post-spawn settings-log admission. When `Some`, the
     /// initial-brief launcher waits for a matching initialization line
     /// (plus a settle period) before pasting, and the host supervisor

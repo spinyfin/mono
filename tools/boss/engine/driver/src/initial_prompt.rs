@@ -184,6 +184,7 @@ pub fn launcher_config(driver: &dyn crate::AgentDriver) -> Result<String> {
         "agent_markers": spec.agent_markers,
         "starting_markers": starting_markers,
         "paste_landed_markers": driver.paste_landed_markers(),
+        "post_submit_failure_markers": driver.post_submit_failure_markers(),
         "check_settings_log": driver.settings_log_check().is_some(),
     }))?)
 }

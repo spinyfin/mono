@@ -148,6 +148,14 @@ pub(super) fn transcript_containment_root(run_id: &str) -> anyhow::Result<Option
 /// Global-root hook directory, relative to the per-run `HOME`.
 const HOOKS_DIR_RELATIVE: &str = ".gemini/config";
 const CONTROL_LEAF: &str = "control";
+/// Rules-only directory passed to the CLI with `--add-dir`.
+const RULES_ROOT_LEAF: &str = "rules-root";
+/// Boss worker rules, at the root of the `--add-dir` directory. `agy` loads
+/// `AGENTS.md` there as an always-on rule. A file under `.agents/rules/` is
+/// not: it needs `trigger: always_on` frontmatter, which the shared rules
+/// renderer does not emit, and without it the rule is silently never loaded
+/// (live rules-discovery probe, `agy` 1.5.9).
+const RULES_FILENAME: &str = "AGENTS.md";
 const WORKSPACE_PATH_FILENAME: &str = "boss-workspace-path";
 
 const ONBOARDING_JSON: &str = r#"{"consumerOnboardingComplete": true, "enterpriseOnboardingComplete": false, "onboardingComplete": true}
@@ -317,7 +325,9 @@ pub fn log_file_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
 }
 
 pub fn agent_rules_path_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
-    Ok(agy_run_container_for_run(run_id)?.join("rules-root/.agents/rules/boss.md"))
+    Ok(agy_run_container_for_run(run_id)?
+        .join(RULES_ROOT_LEAF)
+        .join(RULES_FILENAME))
 }
 
 pub fn workspace_path_stamp(control_dir: &Path) -> PathBuf {
@@ -381,14 +391,15 @@ pub fn render_session_settings_json(workspace: &Path) -> String {
     render_trusted_workspaces_json(workspace)
 }
 
+/// The file's top-level key names a hook group and `SessionStart` is a bare
+/// handler, the shape `install_authorization` writes. Any other shape is
+/// rejected by the CLI when the hook runs ("command hook must specify
+/// 'command'") while the session carries on without hooks.
 fn render_provision_hooks_json() -> String {
     r#"{
-  "hooks": {
+  "boss": {
     "SessionStart": [
-      {
-        "matcher": "*",
-        "hooks": [{"type": "command", "command": "true"}]
-      }
+      {"type": "command", "command": "true"}
     ]
   }
 }

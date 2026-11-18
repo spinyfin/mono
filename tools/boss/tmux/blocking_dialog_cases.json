@@ -89,5 +89,104 @@
     "markers": ["Yes, I accept", "Do you want to proceed?"],
     "payload": "",
     "expected_marker": "Yes, I accept"
+  },
+  {
+    "name": "agy trust dialog",
+    "screen": "Accessing workspace:\n/tmp/ws\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder\n  No, exit\n  ↑/↓ Navigate · enter Confirm\n                          Gemini 3.8 Flash ·",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": "Do you trust the contents of this project?"
+  },
+  {
+    "name": "agy settings error",
+    "screen": "⚠ Settings Error\n  ~/.gemini/antigravity-cli/settings.json\n  └ invalid settings: toolPermission: unrecognized value \"paranoid\"\nNothing has been written to your file yet.\n> Exit and fix manually\n  Continue with defaults this session\n  Overwrite the file with defaults",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": "Settings Error"
+  },
+  {
+    "name": "agy trust dialog quoted in transcript",
+    "screen": "Do you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit\n\n> \n  ? for shortcuts",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "agy settings error quoted in transcript",
+    "screen": "⚠ Settings Error\n  ~/.gemini/antigravity-cli/settings.json\n  └ invalid settings: toolPermission: unrecognized value \"paranoid\"\nNothing has been written to your file yet.\n> Exit and fix manually\n  Continue with defaults this session\n  Overwrite the file with defaults\n\n> \n  ? for shortcuts",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "agy trust dialog with No, exit selected",
+    "screen": "Accessing workspace:\n/tmp/ws\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n  Yes, I trust this folder\n> No, exit\n  ↑/↓ Navigate · enter Confirm",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": "Do you trust the contents of this project?"
+  },
+  {
+    "name": "agy settings error with continue selected",
+    "screen": "⚠ Settings Error\n  ~/.gemini/antigravity-cli/settings.json\n  └ invalid settings: toolPermission: unrecognized value \"paranoid\"\nNothing has been written to your file yet.\n  Exit and fix manually\n> Continue with defaults this session\n  Overwrite the file with defaults",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": "Settings Error"
+  },
+  {
+    "name": "agy settings error with overwrite selected",
+    "screen": "⚠ Settings Error\n  ~/.gemini/antigravity-cli/settings.json\n  └ invalid settings: toolPermission: unrecognized value \"paranoid\"\nNothing has been written to your file yet.\n  Exit and fix manually\n  Continue with defaults this session\n> Overwrite the file with defaults",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": "Settings Error"
+  },
+  {
+    "name": "agy trust dialog with No, exit selected quoted in transcript",
+    "screen": "Accessing workspace:\n/tmp/ws\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n  Yes, I trust this folder\n> No, exit\n  ↑/↓ Navigate · enter Confirm\n\n> \n  ? for shortcuts",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "agy settings error with overwrite selected quoted in transcript",
+    "screen": "⚠ Settings Error\n  ~/.gemini/antigravity-cli/settings.json\n  └ invalid settings: toolPermission: unrecognized value \"paranoid\"\nNothing has been written to your file yet.\n  Exit and fix manually\n  Continue with defaults this session\n> Overwrite the file with defaults\n\n> \n  ? for shortcuts",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error"
+    ],
+    "payload": "",
+    "expected_marker": null
   }
 ]

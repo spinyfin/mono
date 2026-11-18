@@ -313,3 +313,94 @@ assert b"input refused" in stderr
     .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn relay_holds_the_brief_until_the_cli_log_shows_the_hooks_loaded() {
+    let root = tempfile::tempdir().unwrap();
+    let settings = render_settings(&SettingsPlan {
+        worker_kind: WorkerKind::Standard,
+        workspace: Path::new("/workspace"),
+        boss_data_dir: None,
+        hooks_dir: Path::new("/private/hooks"),
+        control_dir: Path::new("/private/control"),
+        rules_root: Path::new("/rules-root"),
+    })
+    .unwrap();
+    let expected = expected_initialized_fragment(&settings);
+    fs::write(root.path().join("initial-prompt.py"), LAUNCHER).unwrap();
+    initial_prompt::write_private(&root.path().join("initial-prompt.txt"), b"private sentinel").unwrap();
+    fs::write(
+        root.path().join("initial-prompt.json"),
+        initial_prompt::launcher_config(&crate::agy::AgyDriver::default()).unwrap(),
+    )
+    .unwrap();
+    // The exact check file `write_session_settings` writes: settings plus the hook requirement.
+    fs::write(
+        root.path().join("settings-log-check.json"),
+        serde_json::to_string(&serde_json::json!({
+            "log_path": root.path().join("agy.log"),
+            "expected": expected,
+            "require": [HOOKS_LOADED_LINE],
+            "forbid": [HOOKS_UNPARSEABLE_LINE],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let code = r#"
+import os, pathlib, select, sys, time, tty
+root = pathlib.Path(__file__).parent
+mode = sys.argv[1]
+tty.setraw(0)
+os.write(1, b'\x1b[?2004h? for shortcuts')
+init = 'I1117 cli_setting_manager.go:98] CLI settings initialized: ' + sys.argv[2]
+hooks = {
+    'loaded': 'I1117 hooks_manager.go:54] loaded 1 named hooks from 1 hooks.json file(s)',
+    'absent': 'I1117 hooks_manager.go:54] loaded 0 named hooks from 0 hooks.json file(s)',
+    'unparseable': 'E1117 hooks_manager.go:34] failed to parse hooks.json at /h: bad\nI1117 hooks_manager.go:54] loaded 0 named hooks from 1 hooks.json file(s)',
+    'missing': '',
+}[mode]
+(root / 'agy.log').write_text(init + '\n' + hooks + '\n')
+if mode != 'loaded':
+    assert not select.select([0], [], [], 3.5)[0], 'brief although the hooks did not load'
+    raise SystemExit(7)
+data = b''
+while not data.endswith(b'\x1b[201~'):
+    data += os.read(0, 4096)
+os.write(1, b'\r\nprivate sentinel')
+assert os.read(0, 1) == b'\r'
+"#;
+    fs::write(root.path().join("stub.py"), code).unwrap();
+    for mode in ["loaded", "missing", "absent", "unparseable"] {
+        for name in [
+            "agy.log",
+            initial_prompt::DELIVERED_MARKER,
+            initial_prompt::UNDELIVERED_MARKER,
+        ] {
+            let _ = fs::remove_file(root.path().join(name));
+        }
+        let output = boss_command_runner::output_blocking_timeout(
+            std::process::Command::new("python3")
+                .arg(root.path().join("initial-prompt.py"))
+                .arg("python3")
+                .arg(root.path().join("stub.py"))
+                .arg(mode)
+                .arg(&expected)
+                .stdin(std::process::Stdio::null()),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+        if mode == "loaded" {
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(root.path().join(initial_prompt::DELIVERED_MARKER).exists());
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(initial_prompt::BRIEF_NOT_DELIVERED_EXIT),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!root.path().join(initial_prompt::DELIVERED_MARKER).exists(), "{mode}");
+            assert!(root.path().join(initial_prompt::UNDELIVERED_MARKER).exists(), "{mode}");
+        }
+    }
+}
