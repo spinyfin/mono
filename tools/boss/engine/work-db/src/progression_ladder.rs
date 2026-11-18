@@ -13,7 +13,7 @@
 //! | `ladder_exhausted` | two `progressed` runs in the episode were spent at the item's *current* fingerprint, so a third would face exactly what the second faced |
 //! | `worker_failed_cap` | the item is `blocked: worker_failed` and two `progressed` runs in the episode were spent on `S7_worker_failed`, **whatever the fingerprint was**: every failed redispatch yields a new terminal execution id, so the fingerprint alone never trips |
 //! | `no_action_streak` | the last three runs all judged `no_action` at the current fingerprint; one `no_action` files nothing and only earns the longer cooldown |
-//! | `infrastructure_failure` | the last two runs ended `failed \| orphaned \| abandoned`; the candidate view has already stopped nominating the item |
+//! | `infrastructure_failure` | the last two runs ended `failed \| orphaned \| abandoned`; the candidate view has already stopped nominating the item. A run that failed to launch is not one of them (see "Failed launches") |
 //!
 //! ## The episode
 //!
@@ -40,6 +40,21 @@
 //! whose episode was never recorded (its brief could not be composed) counts as
 //! matching, so a run that cannot be told apart from the last escalates rather
 //! than looping silently.
+//!
+//! ## Failed launches
+//!
+//! A progression run whose agent never started (the spawn or its confirmation
+//! failed) is not an attempt on the item: no agent looked at it. Such a run is
+//! left out of the two runs the `infrastructure_failure` rung counts, so a
+//! driver whose launch is broken cannot turn the stuck items it is given into
+//! questions that blame the items. The item is retried when its cooldown ends,
+//! and the wait is reported by `WorkDb::progression_launch_backoff`.
+//!
+//! A question this rung filed while failed launches were still counted has no
+//! premise once they are not. Each pass withdraws such a question
+//! ([`retract_unwarranted_questions`]) and puts the item back as "keep trying"
+//! would, without the owner having to answer it. A question whose two runs did
+//! start and then died is untouched.
 //!
 //! ## What is stored
 //!
@@ -166,6 +181,10 @@ pub struct LadderRun {
     /// Why it died, for a run that ended `failed | orphaned | abandoned`.
     pub error: Option<String>,
     pub created_at: i64,
+    /// The run's agent never started: the engine failed to launch it. Not an
+    /// attempt on the item, so the infrastructure-failure rung does not count it.
+    #[builder(default)]
+    pub launch_failed: bool,
 }
 
 impl LadderRun {
@@ -369,7 +388,8 @@ fn episode_floor(conn: &Connection, item_id: &str) -> Result<Floor> {
 /// run cancelled before it started, and one the engine withdrew before it ever
 /// started, are not attempts (the candidate view skips them the same way).
 fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<LadderRun>> {
-    let mut stmt = conn.prepare(
+    let launch_failed = crate::progression_candidates::launch_failed_sql("x");
+    let mut stmt = conn.prepare(&format!(
         "SELECT x.id, x.status, x.progression_disposition,
                 (SELECT value FROM metadata WHERE key = 'progression.fingerprint.' || x.id),
                 (SELECT value FROM metadata WHERE key = 'progression.stuck_kind.' || x.id),
@@ -378,15 +398,16 @@ fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<Ladd
                  ORDER BY p.created_at DESC, p.id DESC LIMIT 1),
                 COALESCE(x.last_error, (SELECT r.error_text FROM work_runs r
                                         WHERE r.execution_id = x.id ORDER BY r.created_at DESC, r.id DESC LIMIT 1)),
-                CAST(x.created_at AS INTEGER)
+                CAST(x.created_at AS INTEGER),
+                {launch_failed}
          FROM work_executions x
          WHERE x.work_item_id = ?1 AND x.kind = 'progression'
            AND x.status IN ('completed', 'failed', 'orphaned', 'abandoned')
            AND NOT (x.status = 'abandoned' AND x.started_at IS NULL)
            AND (CAST(x.created_at AS INTEGER) > ?2
                 OR (CAST(x.created_at AS INTEGER) = ?2 AND x.rowid > ?3))
-         ORDER BY x.created_at ASC, x.id ASC",
-    )?;
+         ORDER BY x.created_at ASC, x.id ASC"
+    ))?;
     let rows = stmt.query_map(params![item_id, since.secs, since.rowid], |row| {
         Ok(LadderRun::builder()
             .execution_id(row.get::<_, String>(0)?)
@@ -400,6 +421,7 @@ fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<Ladd
             .maybe_summary(row.get::<_, Option<String>>(5)?)
             .maybe_error(row.get::<_, Option<String>>(6)?)
             .created_at(row.get(7)?)
+            .launch_failed(row.get(8)?)
             .build())
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -498,6 +520,96 @@ pub(crate) fn run_pass<T>(
         }
     }
     Ok(pass)
+}
+
+/// `operator_questions.withdrawn_reason` of a question the engine took back
+/// because the runs it counted were failed launches.
+pub(crate) const WITHDRAWN_LAUNCH_FAILURES_NOT_COUNTED: &str = "launch_failures_not_counted";
+
+/// What [`retract_unwarranted_questions`] did.
+#[derive(Debug, Default)]
+pub(crate) struct LadderRetraction {
+    /// Items whose question was withdrawn and whose state was put back.
+    pub retracted: Vec<String>,
+    /// Items whose question could not be withdrawn, with the reason. The
+    /// question stays open and the next pass tries again.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Withdraw every open `infrastructure_failure` question whose item is no
+/// longer infrastructure-failing, and put the item back the way "keep trying"
+/// does (its pre-question state, the stuck-after grace waived once), in the
+/// pass's transaction.
+///
+/// The one way an asked item stops being infrastructure-failing without an
+/// answer is that the runs the question counted are not counted any more:
+/// they were failed launches, which say nothing about the item (see the module
+/// documentation). The question's premise ("crashed or timed out twice in a row
+/// while looking at this item") was never true of them, so the engine takes
+/// its own question back instead of leaving the item parked on it. The ladder's
+/// reset point is not moved: there is nothing to forgive.
+pub(crate) fn retract_unwarranted_questions(
+    tx: &mut rusqlite::Transaction<'_>,
+    pending: &mut PendingEvents,
+) -> Result<LadderRetraction> {
+    let asked: Vec<(String, String, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT l.work_item_id, l.question_id, l.prior_state_json
+             FROM progression_ladder l
+             JOIN operator_questions q ON q.id = l.question_id AND q.status = 'open'
+             JOIN progression_run_state s ON s.work_item_id = l.work_item_id
+             WHERE l.question_reason = ?1 AND NOT s.infrastructure_failing
+             ORDER BY l.work_item_id",
+        )?;
+        stmt.query_map([LadderReason::InfrastructureFailure.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    let mut retraction = LadderRetraction::default();
+    for (item_id, question_id, prior_json) in asked {
+        let savepoint = tx.savepoint()?;
+        let restored = (|| -> Result<()> {
+            let prior: Option<PriorState> = prior_json.as_deref().map(serde_json::from_str).transpose()?;
+            // Withdrawn here, with its own reason, before the restore below
+            // changes the blocked reason and the task-override trigger would
+            // record it as an owner's edit.
+            savepoint.execute(
+                "UPDATE operator_questions SET status = 'withdrawn', withdrawn_reason = ?2
+                 WHERE id = ?1 AND status = 'open'",
+                params![question_id, WITHDRAWN_LAUNCH_FAILURES_NOT_COUNTED],
+            )?;
+            restore_prior(
+                &savepoint,
+                &item_id,
+                prior.as_ref(),
+                true,
+                crate::task_status_audit::WriteAttribution {
+                    actor: "engine",
+                    provenance: None,
+                },
+            )?;
+            stage_task_board_change(pending, &savepoint, &item_id)?;
+            Ok(())
+        })();
+        match restored {
+            Ok(()) => {
+                savepoint.commit()?;
+                tracing::info!(
+                    work_item_id = %item_id,
+                    %question_id,
+                    "progression ladder: withdrew a question filed for runs that never launched; \
+                     the item is nominated again",
+                );
+                retraction.retracted.push(item_id);
+            }
+            Err(error) => {
+                drop(savepoint);
+                retraction.failed.push((item_id, format!("{error:#}")));
+            }
+        }
+    }
+    Ok(retraction)
 }
 
 /// The result of [`run_pass`].
@@ -703,7 +815,9 @@ pub(crate) fn file_question(
         },
     )?;
     if infrastructure {
-        // The streak that tripped it, not the item's whole history.
+        // The streak that tripped it, not the item's whole history. A failed
+        // launch is not part of the streak (the candidate view skips it too).
+        runs.retain(|run| !run.launch_failed);
         runs.drain(..runs.len().saturating_sub(INFRASTRUCTURE_FAILURE_CAP as usize));
     }
     let execution_id: String = conn

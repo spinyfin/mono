@@ -60,4 +60,6 @@ The replay of original `at_ms` values is understood. The excerpt does not establ
 
 Still unexplained, and not claimed fixed by the slot-ownership change: why the original execution's armed rollout ingress never attached a file, which cleanup invocation first freed the colliding claim (the excerpt has no pool-release events), and why the confirmation future resumed tens of minutes after the paste. Those need the missing engine log lines or a live Codex session this fixture does not launch. This investigation removes one confirmed way a _replacement's_ driver evidence was destroyed.
 
+The first of those is now explained and fixed: Codex never wrote a rollout, because it did not trust the run's working directory, replaced its composer with its folder-trust dialog, and lost the brief that had been delivered. See [codex-progression-spawn-never-attaches-2026-11-17.md](codex-progression-spawn-never-attaches-2026-11-17.md). The other two remain open.
+
 These tests use isolated fixtures and injected tmux responses. They do not launch a live Codex session. The driver-start guard, spawn alert, displaced-entry warning, 120-second discovery-overdue threshold, and 300-second driver-start grace remain in force.

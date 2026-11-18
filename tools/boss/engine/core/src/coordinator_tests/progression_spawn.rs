@@ -297,4 +297,19 @@ async fn a_failed_progression_spawn_fails_the_run_but_not_the_item_and_removes_t
     let scratch = boss_execution_contracts::progression_scratch::scratch_dir_for(&run.id).unwrap();
     assert!(!scratch.exists(), "teardown removes the scratch directory");
     assert!(f.db.list_attention_items(&run.id).unwrap().is_empty());
+
+    // The run is recorded as one that never launched, which is what keeps it
+    // out of the item's infrastructure-failure count and puts the wait before
+    // the next attempt on the launch-backoff report.
+    assert_eq!(f.db.get_execution(&run.id).unwrap().pre_start_failure_count, 1);
+    let clauses = f.db.progression_clauses(&item_id).unwrap().unwrap();
+    assert!(clauses.in_cooldown && !clauses.infrastructure_failing, "{clauses:?}");
+    let backoff =
+        f.db.progression_launch_backoff()
+            .unwrap()
+            .expect("the failed launch is reported as a backoff");
+    assert_eq!(
+        (backoff.waiting_items, backoff.latest_execution_id.as_str()),
+        (1, run.id.as_str())
+    );
 }

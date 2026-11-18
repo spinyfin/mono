@@ -151,6 +151,14 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
             .map(|alert| boss_engine_runtime::pre_start_streak::health_issue_for(alert, streak_now)),
     );
 
+    // Progression waiting out the cooldown after a failed agent launch. Without
+    // this entry that wait looks exactly like progression having stopped.
+    if let Some(backoff) = server_state.progression_launch_backoff.borrow().as_ref() {
+        issues.push(boss_engine_runtime::progression_sweep::launch_backoff_health_issue(
+            backoff, streak_now,
+        ));
+    }
+
     issues.extend(
         server_state
             .tmux_health_issues

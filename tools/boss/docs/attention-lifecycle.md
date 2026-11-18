@@ -47,7 +47,7 @@ Both apply the same rule, so the sweep is never doing anything the inline path w
 
 Attention items are scoped to one execution or one work item. A failure pattern that only exists _across_ executions has no row to live on, so it is raised as an engine-health issue instead.
 
-The one such signal today is `pre_start_spawn_failure_streak` (`engine/core/src/pre_start_streak.rs`). The engine counts pre-start spawn outcomes per (driver, worker kind). Two consecutive failures with no success in between raise one alert for that combination; each further failure updates the same alert with the live count and the latest full error; the combination's next successful spawn clears it. `SlotBusy` rejections are not counted. It never pauses dispatch and changes nothing about how each failure is handled.
+The first such signal is `pre_start_spawn_failure_streak` (`engine/core/src/pre_start_streak.rs`). The engine counts pre-start spawn outcomes per (driver, worker kind). Two consecutive failures with no success in between raise one alert for that combination; each further failure updates the same alert with the live count and the latest full error; the combination's next successful spawn clears it. `SlotBusy` rejections are not counted. It never pauses dispatch and changes nothing about how each failure is handled.
 
 It appears in three places, all rendered from the same engine health report:
 
@@ -58,6 +58,16 @@ It appears in three places, all rendered from the same engine health report:
 Each failed spawn gets an execution-scoped `pane_spawn_failed` item. The work-item attention listing includes it, and resolves a review-guide execution through its source comparison to the series' root task. The product work-tree attention list includes only directly associated items, so execution-scoped spawn failures do not appear as external-tracker sync issues.
 
 State is in memory and starts empty on engine restart; a combination that is still broken re-raises after two more failures.
+
+### Progression launch backoff
+
+The second is `progression_launch_backoff` (`engine/core/src/progression_sweep.rs`), a warning. A progression run whose agent never started is not an attempt on its item: it starts the item's cooldown but never counts toward the two failures after which the engine asks the owner about the item. The item is retried each time its cooldown ends. While any stuck item is waiting out such a cooldown, the report says how many are waiting, when the first is retried, and the latest error.
+
+| Raised by                                                                                                                                        | Lowered by                                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| A progression sweep pass that finds a stuck item whose latest progression run failed to launch and whose cooldown from that run is still running | The first pass after no such item is left: an agent started for it, its cooldown ended, or it stopped being stuck |
+
+It is read from the database on every pass (`WorkDb::progression_launch_backoff`), so it survives an engine restart, and it is pushed on the `engine.health` topic whenever it changes. It is reported only while the `progression_agents` flag is on. It never pauses dispatch.
 
 ## Workspace-lease attention
 

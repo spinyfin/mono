@@ -285,4 +285,33 @@ impl ServerState {
             }
         })
     }
+
+    /// Push a fresh engine-health snapshot whenever the progression sweep
+    /// starts, changes or ends its launch backoff notice. Built like
+    /// [`Self::spawn_spawn_streak_health_broadcaster`], for the same reason:
+    /// the notice is worth nothing if it only reaches the banner on a poll.
+    pub fn spawn_progression_backoff_health_broadcaster(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak_state = Arc::downgrade(self);
+        boss_event_bus::spawn_supervised("engine_progression_backoff_health", move || {
+            let weak_state = weak_state.clone();
+            async move {
+                let Some(state) = weak_state.upgrade() else {
+                    return;
+                };
+                let mut backoff_changes = state.progression_launch_backoff.subscribe();
+                state.broadcast_engine_health().await;
+                drop(state);
+                while backoff_changes.changed().await.is_ok() {
+                    let Some(state) = weak_state.upgrade() else {
+                        return;
+                    };
+                    tracing::debug!(
+                        backing_off = backoff_changes.borrow().is_some(),
+                        "progression launch backoff changed — broadcasting engine health to subscribed frontends",
+                    );
+                    state.broadcast_engine_health().await;
+                }
+            }
+        })
+    }
 }

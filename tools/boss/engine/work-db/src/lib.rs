@@ -1048,7 +1048,7 @@ pub use pr_flow::WorkerFailureBasis;
 pub use pr_flow::insert_question;
 #[cfg(test)]
 pub use products_design::resolve_task_doc_pointer;
-pub use progression_candidates::{ProgressionCandidate, ProgressionClauses, ProgressionMint};
+pub use progression_candidates::{ProgressionCandidate, ProgressionClauses, ProgressionLaunchBackoff, ProgressionMint};
 pub use progression_ladder::{
     ARCHIVE_IT, KEEP_TRYING, LADDER_ATTEMPT_CAP, LadderQuestion, LadderReason, LadderRun, LadderState,
     NO_ACTION_STREAK_CAP, PARK_IT, QUESTION_TEXT, compute_stuck_fingerprint,
