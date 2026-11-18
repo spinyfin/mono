@@ -2,7 +2,7 @@
 //!
 //! Grok and Antigravity both isolate CLI state under a Boss-owned per-run
 //! `HOME` while still needing the host login home's gh, Cube, jj, git, ssh, and
-//! Bazel configuration and caches. Credential access for tools that use the macOS login
+//! Bazel caches. Credential access for tools that use the macOS login
 //! keychain is a filesystem symlink of that one keychain file — never a
 //! keychain API, never the macOS security CLI, and never a copied token.
 //!
@@ -38,7 +38,6 @@ pub(crate) struct HostToolPaths {
     pub(crate) cube_data_dir: PathBuf,
     pub(crate) cube_config_dir: PathBuf,
     pub(crate) login_keychain: Option<PathBuf>,
-    pub(crate) bazelrc: Option<PathBuf>,
     pub(crate) vcs: HostVcsPaths,
     pub(crate) caches: HostCachePaths,
 }
@@ -79,7 +78,6 @@ impl HostToolPaths {
                 "resolving host Cube config for scoped HOME; set CUBE_CONFIG_DIR or ensure HOME is available",
             )?)
             .maybe_login_keychain(resolve_login_keychain_source())
-            .maybe_bazelrc(nonempty_env("HOME").map(|home| home.join(".bazelrc")))
             .vcs(HostVcsPaths {
                 jj_config: resolve_jj_config(),
                 git_config_global: resolve_git_config_global(),
@@ -151,12 +149,6 @@ impl HostToolPaths {
         }
         if let Some(source) = &self.vcs.ssh_dir {
             require_delegate(source, &process_home.join(".ssh"), "SSH configuration")?;
-        }
-        // Bazel discovers machine configuration through HOME, independently of
-        // its cache paths. Keep the native rc lookup for every repository; a
-        // symlink also follows endpoint changes without copying stale settings.
-        if let Some(source) = &self.bazelrc {
-            optional_delegate(source, &process_home.join(".bazelrc"), "Bazel user configuration")?;
         }
         optional_delegate(
             &self.caches.repobin_cache_dir,
@@ -620,67 +612,6 @@ mod tests {
             fs::read_link(process_home.join(BAZEL_DISK_CACHE_LEAF)).unwrap(),
             disk_cache
         );
-    }
-
-    #[test]
-    fn bazelrc_delegation_tracks_machine_configuration_and_reprovisioning() {
-        let tmp = TempDir::new().unwrap();
-        let host = tmp.path().join("host");
-        fs::create_dir_all(&host).unwrap();
-        let source = host.join(".bazelrc");
-        let process_home = tmp.path().join("process-home");
-        let _guard = EnvGuard::set_and_clear(&[("HOME", &host)], &host_clear());
-        let tools = HostToolPaths::resolve().unwrap();
-
-        // A machine without user configuration must still provision normally.
-        tools.provision_into(&process_home).unwrap();
-        assert!(!process_home.join(".bazelrc").exists());
-        fs::write(&source, "build --announce_rc\n").unwrap();
-        tools.provision_into(&process_home).unwrap();
-        let destination = process_home.join(".bazelrc");
-        assert_eq!(fs::read_link(&destination).unwrap(), source);
-        assert_eq!(fs::read_to_string(&destination).unwrap(), "build --announce_rc\n");
-
-        // Atomic replacement (as used by editors) must be visible to workers.
-        let replacement = host.join("new.bazelrc");
-        fs::write(&replacement, "build --jobs=4\n").unwrap();
-        fs::rename(replacement, &source).unwrap();
-        tools.provision_into(&process_home).unwrap();
-        assert_eq!(fs::read_to_string(&destination).unwrap(), "build --jobs=4\n");
-        fs::remove_file(&source).unwrap();
-        tools.provision_into(&process_home).unwrap();
-        assert!(!destination.exists());
-    }
-
-    #[test]
-    fn codex_and_claude_keep_the_inherited_bazelrc() {
-        use crate::{AgentDriver, SpawnRequest, claude::ClaudeDriver, codex::CodexDriver};
-
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join(".bazelrc"), "build --announce_rc\n").unwrap();
-        let _codex = crate::test_support::codex_homes_override(&tmp.path().join("codex-homes"));
-        for driver in [&ClaudeDriver as &dyn AgentDriver, &CodexDriver::default()] {
-            let plan = driver.spawn_invocation(
-                SpawnRequest::builder()
-                    .model("test-model")
-                    .non_opus_auto_mode(false)
-                    .run_id("bazelrc-test")
-                    .build(),
-            );
-            let mut home = Some(tmp.path().to_owned());
-            for directive in plan.env {
-                match directive {
-                    EnvDirective::Set(key, value) if key == "HOME" => home = Some(value.into()),
-                    EnvDirective::Unset(key) if key == "HOME" => home = None,
-                    _ => {}
-                }
-            }
-            assert_eq!(home.as_deref(), Some(tmp.path()), "{}", driver.descriptor().name);
-            assert_eq!(
-                fs::read_to_string(home.unwrap().join(".bazelrc")).unwrap(),
-                "build --announce_rc\n"
-            );
-        }
     }
 
     #[test]

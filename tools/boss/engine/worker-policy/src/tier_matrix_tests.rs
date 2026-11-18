@@ -383,6 +383,7 @@ fn taxonomy_denial_fixtures() -> Vec<(&'static str, WorkerTierDenialReason, Opti
         ("RemoveDependency", MutatingTaxonomy, None),
         ("ReorderProjectTasks", MutatingTaxonomy, None),
         ("RequestCriticalPriority", MutatingTaxonomy, None),
+        ("ResolveWorkerRecoveryAttention", MutatingTaxonomy, None),
         ("ResolveCriticalPriorityRequest", MutatingTaxonomy, None),
         ("RestoreWorkItem", MutatingTaxonomy, None),
         ("SetProductDefaultDriver", MutatingTaxonomy, None),
