@@ -75,8 +75,9 @@ use crate::ssh_transport::shell_quote;
 
 mod deny_rules;
 pub use deny_rules::{
-    answer_agent_allow_rules, answer_agent_deny_rules, progression_allow_rules, progression_deny_rules,
-    review_guide_allow_rules, review_guide_deny_rules, reviewer_deny_rules, triage_deny_rules,
+    answer_agent_allow_rules, answer_agent_deny_rules, claude_absolute_edit_rule, progression_allow_rules,
+    progression_deny_rules, review_guide_allow_rules, review_guide_deny_rules, reviewer_deny_rules, triage_deny_rules,
+    validate_reviewer_workspace,
 };
 mod git_store_guard;
 pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
@@ -484,7 +485,6 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
     if fence == DataDirFence::PathGuardHook
         && let Some(state_dir) = input.events_socket_path.parent()
     {
-        let dir = state_dir.display().to_string();
         // Both the bare directory and the `**` subtree are listed
         // explicitly: glob `**` doesn't match the directory itself in
         // every harness, and we want an `Edit("…/Boss")` attempt to
@@ -517,8 +517,10 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
         // coincidence to be rediscovered later: [`data_dir_fence`] refuses
         // to hand back [`DataDirFence::PathGuardHook`] unless the hook is
         // actually in the rendered file.
-        rules.push(format!("Edit({dir})"));
-        rules.push(format!("Edit({dir}/**)"));
+        // Absolute `//` spelling (see `claude_absolute_edit_rule`): the
+        // single-slash form is project-relative and fences nothing.
+        rules.push(claude_absolute_edit_rule(state_dir, false));
+        rules.push(claude_absolute_edit_rule(state_dir, true));
     }
 
     // `bossctl` is the coordinator's CLI surface (probes, agents
@@ -1802,6 +1804,9 @@ pub fn write_workspace_files(
     input: &WorkerSetupInput,
     driver: &dyn crate::driver::AgentDriver,
 ) -> io::Result<WrittenFiles> {
+    if input.worker_kind == WorkerKind::Reviewer {
+        validate_reviewer_workspace(&input.workspace_path)?;
+    }
     let descriptor = driver.descriptor();
     let config_dir = input.workspace_path.join(descriptor.config_dir);
     std::fs::create_dir_all(&config_dir)?;

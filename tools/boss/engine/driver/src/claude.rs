@@ -825,13 +825,13 @@ impl AgentDriver for ClaudeDriver {
         // positional argument appended after it as a second tool name.
         cmd.push_str(" --disallowedTools=AskUserQuestion");
         if let Some(mode) = permission_mode_override {
-            // Forced mode (e.g. `dontAsk` for the capability-restricted answer
-            // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
-            // branches — both permit calls outside the settings allowlist
-            // unless explicitly denied, defeating deny-by-default. Explicit
-            // denies and PreToolUse blocks still apply in skip-permissions mode.
-            // The CLI flag wins over the
-            // settings-file `defaultMode`, so this is the authoritative mode.
+            // Forced mode (e.g. `dontAsk` for the capability-restricted
+            // answer agent). It suppresses both the `auto` and the
+            // `--dangerously-skip-permissions` branches, so the settings
+            // allowlist stays deny-by-default. Explicit denies and
+            // PreToolUse blocks apply in every mode. The CLI flag overrides
+            // the settings-file `defaultMode`, so this is the authoritative
+            // mode.
             cmd.push_str(" --permission-mode ");
             cmd.push_str(mode);
         } else if claude_model_requires_auto_permissions(model) || non_opus_auto_mode {
@@ -1083,6 +1083,19 @@ impl AgentDriver for ClaudeDriver {
             hooks.push(serde_json::json!({
                 "matcher": "Bash",
                 "hooks": [{"type": "command", "command": REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND}],
+            }));
+            // Publication guard. The literal-prefix `Bash(...)` deny rules do
+            // not match global-option or absolute-path spellings such as
+            // `jj -R <ws> git push` or `gh --repo o/r pr edit`, and reviewers
+            // launched with `--dangerously-skip-permissions` run unmatched
+            // commands without approval. This PreToolUse guard normalises the
+            // command first; it is the same parser Codex reviewers use.
+            hooks.push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": format!(
+                    "python3 -c {}",
+                    shell_quote(&crate::codex::codex_reviewer_publish_guard_script())
+                )}],
             }));
         }
 
@@ -2000,11 +2013,12 @@ mod tests {
             workspace_path: None,
         };
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + git store guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
+        // path guard + git store guard + boss-launch guard + static-analysis guard
+        // + publication guard (no PR redirect, no checkleft)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            4,
-            "reviewer worker must get exactly 4 guards: {:?}",
+            5,
+            "reviewer worker must get exactly 5 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring
@@ -2013,7 +2027,9 @@ mod tests {
             .filter_map(|e| e["hooks"][0]["command"].as_str())
             .collect();
         assert!(
-            !cmds.iter().any(|c| c.contains("jj git push")),
+            !cmds
+                .iter()
+                .any(|c| c.contains("jj git push") && !c.contains("no-write/no-publish guard")),
             "non-standard worker must not have the PR redirect guard: {cmds:?}",
         );
         assert!(
