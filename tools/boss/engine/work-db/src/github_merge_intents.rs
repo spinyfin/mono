@@ -21,8 +21,8 @@ pub struct GithubMergeIntent {
     /// withdrawn), `disarm_pending` (conflict resolution stopped while GitHub
     /// auto-merge was armed; the poller must turn it off) and
     /// `conflict_resolution_stopped` (stopped, nothing left armed).
-    /// `confirmed_revisions` stores the open-revision snapshot taken when the
-    /// person asked to merge (`head_sha` holds a JSON array of ids).
+    /// `rearm_failed` marks a request whose auto-merge could not be turned
+    /// back on after a predecessor's disarm.
     pub status: String,
     pub created_at: String,
 }
@@ -143,9 +143,12 @@ impl WorkDb {
         let rows = conn.execute(
             "UPDATE github_merge_intents
              SET status = ?3
-             WHERE work_item_id = ?1 AND pr_url = ?2 AND status = 'active'",
+             WHERE work_item_id = ?1 AND pr_url = ?2 AND status IN ('active', 'disarm_pending')",
             params![work_item_id, pr_url, status],
         )?;
+        if rows > 0 {
+            crate::merge_conflict_merging::forget_confirmed_revisions(&conn, work_item_id)?;
+        }
         Ok(rows > 0)
     }
 
@@ -177,6 +180,7 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        crate::merge_conflict_merging::forget_confirmed_revisions(&tx, work_item_id)?;
         let prior_merge_queue_state = tx
             .query_row(
                 "SELECT merge_queue_state FROM tasks WHERE id = ?1 AND deleted_at IS NULL",

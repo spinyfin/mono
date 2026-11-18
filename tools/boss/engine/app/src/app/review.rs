@@ -251,6 +251,13 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                 (&product_id2, &work_item_id2, &pr_url2),
                             )
                             .await;
+                            if !conflict_released {
+                                // The refused request never stood, so what it
+                                // confirmed must not carry into a later one.
+                                if let Err(err) = work_db2.forget_confirmed_merge_revisions(&work_item_id2) {
+                                    tracing::warn!(work_item_id = %work_item_id2, ?err, "merge_when_ready: could not drop the refused request's confirmation");
+                                }
+                            }
                             if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
                                 let _ = work_db2.create_attention_item(boss_work_db::CreateAttentionItemInput {
                                     work_item_id: Some(work_item_id2.clone()),

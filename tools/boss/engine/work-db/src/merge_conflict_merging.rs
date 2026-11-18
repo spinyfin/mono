@@ -45,15 +45,19 @@ pub(crate) fn start(conn: &Connection, id: &str, pr_url: &str, base: &str) -> Re
         )
         .optional()?
         .unwrap_or_else(now_string);
-    let mut detail = serde_json::json!({
+    let detail = serde_json::json!({
         "source": "conflict_resolution",
         "requested_at": requested_at,
         "status_label": format!("Resolving conflicts with {base}…"),
         "section_order": boss_engine_storage_values::merge_queue_section::QUEUED_NO_POSITION_SECTION_ORDER,
     });
-    if let Some(ids) = confirmed_revision_ids(conn, id)? {
-        detail["confirmed_revision_ids"] = serde_json::json!(ids);
-    }
+    // A snapshot taken for another PR never belongs to this request. Without
+    // a matching one (a merge armed directly on GitHub, or a rebound PR)
+    // every open revision counts as unconfirmed.
+    conn.execute(
+        "DELETE FROM merge_confirmed_revisions WHERE work_item_id = ?1 AND pr_url != ?2",
+        params![id, pr_url],
+    )?;
     let changed = conn.execute(
         "UPDATE tasks SET merge_queue_state = 'resolving_conflicts', merge_queue_detail = ?3
          WHERE id = ?1 AND pr_url = ?2 AND deleted_at IS NULL
@@ -93,61 +97,57 @@ fn persist_observed_github_arm(
     Ok(())
 }
 
+/// Table holding the open revisions the person confirmed when asking to merge.
+/// One row per work item, bound to the PR it was taken for and dropped
+/// whenever the request ends (refused, stopped, cancelled or retired).
+pub(crate) const CONFIRMED_REVISIONS_MIGRATION_ID: &str = "20261118_1200_merge_confirmed_revisions";
+
+pub(crate) fn migrate_confirmed_revisions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS merge_confirmed_revisions (
+            work_item_id TEXT PRIMARY KEY,
+            pr_url       TEXT NOT NULL,
+            revision_ids TEXT NOT NULL,
+            created_at   TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 fn remember_confirmed_merge_revisions_in_tx(
     conn: &Connection,
     id: &str,
     pr_url: &str,
     revisions: &[OpenMergeRevision],
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM github_merge_intents WHERE work_item_id = ?1 AND status = ?2",
-        params![id, CONFIRMED_REVISIONS],
-    )?;
     let ids: Vec<&str> = revisions.iter().map(|revision| revision.id.as_str()).collect();
     conn.execute(
-        "INSERT INTO github_merge_intents (id, work_item_id, pr_url, head_sha, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            next_id("gmi"),
-            id,
-            pr_url,
-            serde_json::to_string(&ids)?,
-            CONFIRMED_REVISIONS,
-            now_string()
-        ],
+        "INSERT OR REPLACE INTO merge_confirmed_revisions (work_item_id, pr_url, revision_ids, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id, pr_url, serde_json::to_string(&ids)?, now_string()],
     )?;
     Ok(())
 }
 
+/// Drop any confirmation snapshot for the work item: its request ended.
+pub(crate) fn forget_confirmed_revisions(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM merge_confirmed_revisions WHERE work_item_id = ?1", [id])?;
+    Ok(())
+}
+
+/// The confirmation snapshot of the live request: only one taken for the PR
+/// the card is bound to counts.
 fn confirmed_revision_ids(conn: &Connection, id: &str) -> Result<Option<Vec<String>>> {
-    let from_detail: Option<String> = conn
+    let stored: Option<String> = conn
         .query_row(
-            "SELECT CASE WHEN json_valid(merge_queue_detail)
-                    THEN json_extract(merge_queue_detail, '$.confirmed_revision_ids') END
-             FROM tasks WHERE id = ?1",
+            "SELECT c.revision_ids FROM merge_confirmed_revisions c
+             INNER JOIN tasks t ON t.id = c.work_item_id AND t.pr_url = c.pr_url
+             WHERE c.work_item_id = ?1",
             [id],
             |row| row.get(0),
         )
-        .optional()?
-        .flatten();
-    if let Some(text) = from_detail.filter(|text| !text.is_empty() && text != "null")
-        && let Ok(ids) = serde_json::from_str::<Vec<String>>(&text)
-    {
-        return Ok(Some(ids));
-    }
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT head_sha FROM github_merge_intents
-             WHERE work_item_id = ?1 AND status = ?2
-             ORDER BY created_at DESC LIMIT 1",
-            params![id, CONFIRMED_REVISIONS],
-            |row| row.get(0),
-        )
         .optional()?;
-    match stored {
-        Some(text) => Ok(Some(serde_json::from_str(&text).unwrap_or_default())),
-        None => Ok(None),
-    }
+    Ok(stored.and_then(|ids| serde_json::from_str(&ids).ok()))
 }
 
 fn restore_paused_merge_label(conn: &Connection, id: &str) -> Result<bool> {
@@ -200,11 +200,9 @@ fn truncate_disarm_error(error: &str) -> String {
 /// engine still owes GitHub a `--disable-auto` before the stop is real.
 pub const DISARM_PENDING: &str = "disarm_pending";
 
-/// Snapshot of the open revisions the person confirmed when they asked to
-/// merge, stored as a `github_merge_intents` row whose `head_sha` is a JSON
-/// array of revision ids. Written before the GitHub call so a revision that
-/// opens while that call is in flight is not treated as confirmed.
-pub const CONFIRMED_REVISIONS: &str = "confirmed_revisions";
+/// Intent status for a request retired because GitHub auto-merge could not be
+/// turned back on for it.
+const REARM_FAILED: &str = "rearm_failed";
 
 const DISARM_ERROR_LABEL_MAX: usize = 120;
 
@@ -246,6 +244,7 @@ pub(crate) fn stop(conn: &Connection, id: &str, reason: &str) -> Result<bool> {
             "UPDATE github_merge_intents SET status = ?2 WHERE work_item_id = ?1 AND status = 'active'",
             params![id, DISARM_PENDING],
         )?;
+        forget_confirmed_revisions(conn, id)?;
     }
     Ok(changed)
 }
@@ -283,6 +282,7 @@ pub(crate) fn cancel(conn: &Connection, id: &str) -> Result<()> {
             [id],
         )?;
     }
+    forget_confirmed_revisions(conn, id)?;
     Ok(())
 }
 
@@ -375,6 +375,13 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Drop the confirmation snapshot: the request it was taken for was
+    /// refused before GitHub accepted it.
+    pub fn forget_confirmed_merge_revisions(&self, id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        forget_confirmed_revisions(&conn, id)
+    }
+
     /// Open revisions that were not in the confirmation snapshot. A missing
     /// snapshot treats every currently open revision as unconfirmed.
     pub fn unconfirmed_merge_revisions(&self, id: &str) -> Result<Vec<OpenMergeRevision>> {
@@ -399,7 +406,7 @@ impl WorkDb {
             "SELECT t.id, t.product_id, i.pr_url
              FROM github_merge_intents i
              INNER JOIN tasks t ON t.id = i.work_item_id
-             WHERE i.status = ?1 AND t.deleted_at IS NULL
+             WHERE i.status = ?1 AND t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
              ORDER BY i.created_at ASC",
         )?;
         let rows = stmt.query_map([DISARM_PENDING], |row| {
@@ -520,16 +527,96 @@ impl WorkDb {
         )? > 0)
     }
 
-    /// A GitHub merge succeeded but could not be recorded: keep a durable
-    /// disarm obligation for this PR until auto-merge is turned off.
-    pub fn record_unrecorded_merge_disarm(&self, id: &str, pr_url: &str, head_sha: &str) -> Result<()> {
+    /// The PR reached a terminal state (`merged` or `closed`) before the
+    /// disarm landed, so there is no auto-merge left to turn off. Ends the
+    /// obligation and clears a stale "couldn't turn off auto-merge" label.
+    /// Returns whether a pending disarm was retired.
+    pub fn retire_pending_merge_disarm(&self, id: &str, pr_url: &str, status: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute(
+        let retired = tx.execute(
+            "UPDATE github_merge_intents SET status = ?3
+             WHERE work_item_id = ?1 AND pr_url = ?2 AND status = ?4",
+            params![id, pr_url, status, DISARM_PENDING],
+        )? > 0;
+        if retired {
+            restore_paused_merge_label(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(retired)
+    }
+
+    /// A newer merge request was recorded while its predecessor's disarm was
+    /// running, and turning GitHub auto-merge back on for it failed. GitHub
+    /// has nothing armed, so the card must not keep saying the merge is
+    /// queued: the request is retired (`rearm_failed`) and the card says why.
+    pub fn record_merge_rearm_failure(&self, id: &str, pr_url: &str, error: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let retired = tx.execute(
             "UPDATE github_merge_intents SET status = ?3
              WHERE work_item_id = ?1 AND pr_url = ?2 AND status = 'active'",
-            params![id, pr_url, DISARM_PENDING],
+            params![id, pr_url, REARM_FAILED],
+        )? > 0;
+        if !retired {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let detail = serde_json::json!({
+            "source": "conflict_resolution",
+            "status_label": format!(
+                "Merge not queued: couldn't turn auto-merge back on after the earlier request was stopped ({})",
+                truncate_disarm_error(error)
+            ),
+            "rearm_error": error,
+        });
+        tx.execute(
+            "UPDATE tasks SET merge_queue_state = NULL, merge_queue_detail = ?2
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![id, detail.to_string()],
         )?;
+        forget_confirmed_revisions(&tx, id)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// A GitHub merge succeeded but could not be recorded: keep a durable
+    /// disarm obligation for this PR until auto-merge is turned off.
+    ///
+    /// `prior_intent` is the active request the continuation started from
+    /// (captured before it called GitHub). A different active request for
+    /// this PR is a newer one the person made meanwhile: it owns GitHub's
+    /// armed state and is left alone.
+    pub fn record_unrecorded_merge_disarm(
+        &self,
+        id: &str,
+        pr_url: &str,
+        head_sha: &str,
+        prior_intent: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let active: Option<String> = tx
+            .query_row(
+                "SELECT id FROM github_merge_intents
+                 WHERE work_item_id = ?1 AND pr_url = ?2 AND status = 'active'",
+                params![id, pr_url],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match active {
+            Some(active) if Some(active.as_str()) == prior_intent => {
+                tx.execute(
+                    "UPDATE github_merge_intents SET status = ?2 WHERE id = ?1",
+                    params![active, DISARM_PENDING],
+                )?;
+            }
+            Some(_) => {
+                tx.commit()?;
+                return Ok(());
+            }
+            None => {}
+        }
         let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM github_merge_intents
              WHERE work_item_id = ?1 AND pr_url = ?2 AND status = ?3)",
@@ -920,6 +1007,105 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, newer);
         assert_ne!(open[0].id, confirmed);
+    }
+
+    fn confirmed_open_revision(db: &WorkDb, product: &str, id: &str) -> String {
+        let confirmed = add_open_revision(db, product, id, "1");
+        db.remember_confirmed_merge_revisions(
+            id,
+            PR,
+            &[OpenMergeRevision {
+                id: confirmed.clone(),
+                label: "r1".into(),
+                status: "active".into(),
+            }],
+        )
+        .unwrap();
+        confirmed
+    }
+
+    #[test]
+    fn a_confirmation_does_not_carry_over_to_a_rebound_pr() {
+        let (db, product, id, _) = fixture(true);
+        let confirmed = confirmed_open_revision(&db, &product, &id);
+        let other = "https://github.com/example/repo/pull/43";
+        db.update_work_item(
+            &id,
+            WorkItemPatch {
+                pr_url: Some(other.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(db.start_merge_conflict_resolution(&id, other, "main").unwrap());
+        let open = db.unconfirmed_merge_revisions(&id).unwrap();
+        assert_eq!(
+            open.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![confirmed.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_request_confirmation_does_not_cover_a_later_armed_merge() {
+        let (db, product, id, _) = fixture(true);
+        let confirmed = confirmed_open_revision(&db, &product, &id);
+        db.start_merge_conflict_resolution(&id, PR, "main").unwrap();
+        assert!(db.unconfirmed_merge_revisions(&id).unwrap().is_empty());
+        cancel(&db.connect().unwrap(), &id).unwrap();
+        // Armed again directly on GitHub: nothing was confirmed for it.
+        assert!(db.start_merge_conflict_resolution(&id, PR, "main").unwrap());
+        let open = db.unconfirmed_merge_revisions(&id).unwrap();
+        assert_eq!(
+            open.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![confirmed.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_refused_request_confirmation_is_dropped() {
+        let (db, product, id, _) = fixture(true);
+        let confirmed = confirmed_open_revision(&db, &product, &id);
+        db.forget_confirmed_merge_revisions(&id).unwrap();
+        db.start_merge_conflict_resolution(&id, PR, "main").unwrap();
+        let open = db.unconfirmed_merge_revisions(&id).unwrap();
+        assert_eq!(
+            open.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![confirmed.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_pending_disarm_is_retired_once_the_pr_finishes() {
+        let (db, _, id, _) = fixture(true);
+        db.start_merge_conflict_resolution(&id, PR, "main").unwrap();
+        assert!(db.stop_merge_conflict_resolution(&id, "manual_abandon").unwrap());
+        assert_eq!(db.list_pending_merge_disarms().unwrap().len(), 1);
+        assert!(db.retire_pending_merge_disarm(&id, PR, "merged").unwrap());
+        assert!(db.list_pending_merge_disarms().unwrap().is_empty());
+        assert!(!db.merge_disarm_pending(&id, PR).unwrap());
+    }
+
+    #[test]
+    fn a_newer_active_request_is_not_converted_into_a_disarm() {
+        let (db, _, id, _) = fixture(true);
+        let prior = db.get_active_github_merge_intent(&id, PR).unwrap().unwrap().id;
+        db.start_merge_conflict_resolution(&id, PR, "main").unwrap();
+        db.stop_merge_conflict_resolution(&id, "manual_abandon").unwrap();
+        db.record_github_merge_intent(
+            GithubMergeIntentInsertInput::builder()
+                .work_item_id(&id)
+                .pr_url(PR)
+                .head_sha("fresh")
+                .build(),
+            "{}",
+        )
+        .unwrap();
+        db.record_unrecorded_merge_disarm(&id, PR, "resolved", Some(&prior))
+            .unwrap();
+        assert_eq!(
+            db.get_active_github_merge_intent(&id, PR).unwrap().unwrap().head_sha,
+            "fresh"
+        );
     }
 
     #[test]

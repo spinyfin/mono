@@ -146,6 +146,13 @@ pub trait DirectMergeExecutor: Send + Sync {
 #[derive(Debug, Default)]
 pub struct CommandDirectMergeExecutor;
 
+/// Whether a `--disable-auto` failure only says there is nothing to turn off,
+/// so the disarm obligation is already met and must not retry forever.
+fn auto_merge_already_off(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.contains("auto merge is not enabled") || text.contains("auto-merge is not enabled")
+}
+
 /// Finish stopping a merge request whose GitHub auto-merge was still armed
 /// when conflict resolution gave up: turn auto-merge off. A failure is shown
 /// on the card (the pause is not real yet) and retried on the next sweep.
@@ -181,17 +188,16 @@ pub async fn disarm_stopped_merge(
                                 work_item_id = %candidate.work_item_id,
                                 pr_url = %candidate.pr_url,
                                 ?err,
-                                "turned off auto-merge while a newer merge request was in flight"
+                                "turned off auto-merge while a newer merge request was in flight, and could not turn it back on"
                             );
                             let _ = db.complete_merge_disarm(&candidate.work_item_id, &candidate.pr_url)?;
                             Ok(db
-                                .record_merge_disarm_failure(
+                                .record_merge_rearm_failure(
                                     &candidate.work_item_id,
-                                    &format!(
-                                        "turned off auto-merge while a newer merge request was in flight: {err:#}"
-                                    ),
+                                    &candidate.pr_url,
+                                    &format!("{err:#}"),
                                 )?
-                                .then_some("merge_disarm_failed"))
+                                .then_some("merge_rearm_failed"))
                         }
                     }
                 } else {
@@ -200,6 +206,9 @@ pub async fn disarm_stopped_merge(
                         .then_some("merge_disarm_completed"))
                 }
             }
+            Err(err) if auto_merge_already_off(&err) => Ok(db
+                .complete_merge_disarm(&candidate.work_item_id, &candidate.pr_url)?
+                .then_some("merge_disarm_completed")),
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
@@ -260,6 +269,11 @@ pub async fn resume_after_conflict(
         if !db.merge_conflict_resolution_ready(&candidate.work_item_id, &candidate.pr_url)? {
             return Ok(false);
         }
+        // The request this continuation serves; a different active request
+        // seen after the GitHub call is a newer one the person made meanwhile.
+        let prior_intent = db
+            .get_active_github_merge_intent(&candidate.work_item_id, &candidate.pr_url)?
+            .map(|intent| intent.id);
         match executor.execute(&candidate.pr_url).await {
             Ok(success) => {
                 match db.finish_merge_conflict_resolution(&candidate.work_item_id, &candidate.pr_url, &success.head_sha)
@@ -274,6 +288,7 @@ pub async fn resume_after_conflict(
                             &candidate.work_item_id,
                             &candidate.pr_url,
                             &success.head_sha,
+                            prior_intent.as_deref(),
                         )?;
                         return Ok(false);
                     }
@@ -282,6 +297,7 @@ pub async fn resume_after_conflict(
                             &candidate.work_item_id,
                             &candidate.pr_url,
                             &success.head_sha,
+                            prior_intent.as_deref(),
                         ) {
                             tracing::warn!(
                                 work_item_id = %candidate.work_item_id,
@@ -655,6 +671,208 @@ mod tests {
         disarm_stopped_merge(&db, &NoopExecutionPublisher, &candidate, &retry).await;
         assert!(!db.merge_disarm_pending(&task.id, &candidate.pr_url).unwrap());
         assert_eq!(retry.disarms.load(Ordering::SeqCst), 2);
+    }
+
+    /// Records a fresh merge request while the continuation's GitHub call is in
+    /// flight, after the earlier request was stopped.
+    struct FreshRequestDuringExecute<'a> {
+        db: &'a WorkDb,
+        id: &'a str,
+        pr_url: &'a str,
+    }
+
+    #[async_trait]
+    impl DirectMergeExecutor for FreshRequestDuringExecute<'_> {
+        async fn execute(&self, _: &str) -> Result<DirectMergeSuccess> {
+            self.db
+                .stop_merge_conflict_resolution(self.id, "Stopped during merge")?;
+            self.db.record_github_merge_intent(
+                boss_work_db::GithubMergeIntentInsertInput::builder()
+                    .work_item_id(self.id)
+                    .pr_url(self.pr_url)
+                    .head_sha("fresh-head")
+                    .build(),
+                "{}",
+            )?;
+            Ok(DirectMergeSuccess {
+                head_sha: "resolved-head".into(),
+            })
+        }
+
+        async fn disarm(&self, _: &str) -> Result<()> {
+            anyhow::bail!("disarm must not run for a newer request")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_newer_request_made_during_the_continuation_is_never_disarmed() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = boss_work_db::test_support::create_test_product_named(&db, "Newer request");
+        let task = boss_work_db::test_support::create_test_chore_manual(&db, product.id.clone(), "Merge");
+        let candidate = PendingMergeCheck {
+            work_item_id: task.id.clone(),
+            product_id: product.id.clone(),
+            pr_url: "https://github.com/example/repo/pull/42".into(),
+        };
+        db.update_work_item(
+            &task.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(candidate.pr_url.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.start_merge_conflict_resolution(&task.id, &candidate.pr_url, "main")
+            .unwrap();
+        resume_after_conflict(
+            &db,
+            &NoopExecutionPublisher,
+            &candidate,
+            &FreshRequestDuringExecute {
+                db: &db,
+                id: &task.id,
+                pr_url: &candidate.pr_url,
+            },
+        )
+        .await;
+        assert_eq!(
+            db.get_active_github_merge_intent(&task.id, &candidate.pr_url)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            "fresh-head",
+            "the newer request keeps its active intent"
+        );
+        assert!(!db.merge_disarm_pending(&task.id, &candidate.pr_url).unwrap());
+        assert!(db.list_pending_merge_disarms().unwrap().is_empty());
+        let counting = ResumeExecutor::new(false);
+        disarm_stopped_merge(&db, &NoopExecutionPublisher, &candidate, &counting).await;
+        assert_eq!(counting.disarms.load(Ordering::SeqCst), 0);
+    }
+
+    /// A fresh request lands while the disarm runs, then GitHub refuses to
+    /// turn auto-merge back on for it.
+    struct RearmFails<'a> {
+        db: &'a WorkDb,
+        id: &'a str,
+        pr_url: &'a str,
+    }
+
+    #[async_trait]
+    impl DirectMergeExecutor for RearmFails<'_> {
+        async fn execute(&self, _: &str) -> Result<DirectMergeSuccess> {
+            anyhow::bail!("gh pr merge failed: not allowed")
+        }
+
+        async fn disarm(&self, _: &str) -> Result<()> {
+            self.db.record_github_merge_intent(
+                boss_work_db::GithubMergeIntentInsertInput::builder()
+                    .work_item_id(self.id)
+                    .pr_url(self.pr_url)
+                    .head_sha("fresh-head")
+                    .build(),
+                "{}",
+            )?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_rearm_after_a_disarm_retires_the_request_and_says_so() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = boss_work_db::test_support::create_test_product_named(&db, "Rearm");
+        let task = boss_work_db::test_support::create_test_chore_manual(&db, product.id.clone(), "Merge");
+        let pr_url = "https://github.com/example/repo/pull/42".to_owned();
+        db.update_work_item(
+            &task.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.record_github_merge_intent(
+            boss_work_db::GithubMergeIntentInsertInput::builder()
+                .work_item_id(&task.id)
+                .pr_url(&pr_url)
+                .head_sha("head")
+                .build(),
+            "{}",
+        )
+        .unwrap();
+        db.mark_chore_blocked_merge_conflict(&task.id, &pr_url).unwrap();
+        db.stop_merge_conflict_resolution(&task.id, "manual_abandon").unwrap();
+        let candidate = PendingMergeCheck {
+            work_item_id: task.id.clone(),
+            product_id: product.id.clone(),
+            pr_url: pr_url.clone(),
+        };
+        let executor = RearmFails {
+            db: &db,
+            id: &task.id,
+            pr_url: &pr_url,
+        };
+        disarm_stopped_merge(&db, &NoopExecutionPublisher, &candidate, &executor).await;
+        assert!(db.get_active_github_merge_intent(&task.id, &pr_url).unwrap().is_none());
+        assert!(!db.merge_disarm_pending(&task.id, &pr_url).unwrap());
+        let card = db
+            .get_work_tree(&product.id)
+            .unwrap()
+            .chores
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert_eq!(card.merge_queue_state, None, "the card must not claim a queued merge");
+        let detail = card.merge_queue_detail.unwrap();
+        assert!(detail.contains("turn auto-merge back on"), "{detail}");
+        assert!(!detail.contains("turn off auto-merge"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn auto_merge_that_is_already_off_completes_the_disarm() {
+        struct AlreadyOff;
+        #[async_trait]
+        impl DirectMergeExecutor for AlreadyOff {
+            async fn execute(&self, _: &str) -> Result<DirectMergeSuccess> {
+                anyhow::bail!("unused")
+            }
+            async fn disarm(&self, _: &str) -> Result<()> {
+                anyhow::bail!("gh pr merge --disable-auto failed: Pull request Auto merge is not enabled")
+            }
+        }
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = boss_work_db::test_support::create_test_product_named(&db, "Already off");
+        let task = boss_work_db::test_support::create_test_chore_manual(&db, product.id.clone(), "Merge");
+        let pr_url = "https://github.com/example/repo/pull/42".to_owned();
+        db.update_work_item(
+            &task.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.record_github_merge_intent(
+            boss_work_db::GithubMergeIntentInsertInput::builder()
+                .work_item_id(&task.id)
+                .pr_url(&pr_url)
+                .head_sha("head")
+                .build(),
+            "{}",
+        )
+        .unwrap();
+        db.mark_chore_blocked_merge_conflict(&task.id, &pr_url).unwrap();
+        db.stop_merge_conflict_resolution(&task.id, "manual_abandon").unwrap();
+        let candidate = PendingMergeCheck {
+            work_item_id: task.id.clone(),
+            product_id: product.id.clone(),
+            pr_url: pr_url.clone(),
+        };
+        disarm_stopped_merge(&db, &NoopExecutionPublisher, &candidate, &AlreadyOff).await;
+        assert!(db.list_pending_merge_disarms().unwrap().is_empty());
     }
 
     // --- MergeAction::as_str ---

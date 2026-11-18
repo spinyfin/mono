@@ -94,6 +94,7 @@ pub use host::{
 
 mod classify;
 mod deferred_review_admission;
+mod disarm_drain;
 mod merge_queue;
 mod poll_metrics;
 mod post_merge_review;

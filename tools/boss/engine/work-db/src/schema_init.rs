@@ -1019,6 +1019,10 @@ mod floor_tests {
                 Box::new(|c| task_status_audit::migrate_execution_abandon(c).unwrap()),
             ),
             (
+                super::super::merge_conflict_merging::CONFIRMED_REVISIONS_MIGRATION_ID,
+                Box::new(|c| super::super::merge_conflict_merging::migrate_confirmed_revisions(c).unwrap()),
+            ),
+            (
                 stuck_snapshot::MIGRATION_ID,
                 Box::new(|c| stuck_snapshot::migrate(c).unwrap()),
             ),
