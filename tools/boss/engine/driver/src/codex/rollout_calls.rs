@@ -45,8 +45,8 @@ use std::collections::{HashMap, VecDeque};
 
 use boss_engine_codex_rollout::cell::{
     CellOutcome, CellOutput, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk,
-    payload_is_truncated_output, payload_reports_exit_code, payload_session_id, wait_target_cell_id,
-    write_stdin_session_id,
+    payload_is_truncated_output, payload_reports_exit_code, payload_session_id, value_is_running_chunk,
+    value_reports_exit_code, wait_target_cell_id, write_stdin_session_id,
 };
 use boss_engine_codex_rollout::{CanonicalRolloutToolOutput, canonical_rollout_tool_output, flatten_tool_output_text};
 use serde_json::Value;
@@ -441,7 +441,7 @@ impl RolloutCallTracker {
             .then(|| {
                 session_id
                     .clone()
-                    .or(call_session_id)
+                    .or_else(|| call_session_id.clone())
                     .and_then(|session_id| self.sessions.get(&session_id).cloned())
             })
             .flatten()
@@ -509,27 +509,31 @@ impl RolloutCallTracker {
                 // a bare running chunk, unified-exec "still running" prose,
                 // or a poll error must leave it open.
                 if origin != call_id {
-                    let text = flatten_tool_output_text(output);
-                    if !command_output_is_terminal(&text) {
-                        self.calls.remove(call_id);
-                        if payload_is_running_chunk(&text) || prose_reports_process_running(&text) {
+                    match command_output_kind(output) {
+                        CommandOutputKind::Terminal => {}
+                        CommandOutputKind::Running => {
+                            self.calls.remove(call_id);
                             return Ok(OutputDisposition::StillRunning { cell_id: None });
                         }
-                        let call = self
-                            .calls
-                            .get(&origin)
-                            .expect("origin call presence was just checked")
-                            .clone();
-                        return Ok(OutputDisposition::UnconfirmedResult(call));
+                        CommandOutputKind::Unconfirmed => {
+                            self.calls.remove(call_id);
+                            let call = self
+                                .calls
+                                .get(&origin)
+                                .expect("origin call presence was just checked")
+                                .clone();
+                            return Ok(OutputDisposition::UnconfirmedResult(call));
+                        }
                     }
                 }
             }
         }
+        let bound_session = session_id.or(call_session_id);
         let call = self
             .calls
             .remove(&origin)
             .expect("origin call presence was just checked");
-        if let Some(session_id) = session_id {
+        if let Some(session_id) = bound_session {
             self.sessions.remove(&session_id);
         }
         if origin != call_id {
@@ -582,9 +586,46 @@ impl RolloutCallTracker {
     }
 }
 
-/// Whether non-cell tool output is positive evidence the *command* finished.
-fn command_output_is_terminal(text: &str) -> bool {
-    payload_reports_exit_code(text) || payload_is_truncated_output(text) || prose_reports_process_exit(text)
+/// Command-status evidence on a non-cell tool output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandOutputKind {
+    Terminal,
+    Running,
+    Unconfirmed,
+}
+
+/// Shared normaliser for direct (non-cell-envelope) poll results.
+///
+/// Inspect the raw JSON value first: flattening a chunk object keeps only a
+/// `text` field and would drop `exit_code` / `chunk_id`. Unified-exec prose
+/// is then read from the header *before* the first `Output:` line, so a
+/// still-running header is never overridden by an exit-looking stdout line.
+fn command_output_kind(output: &Value) -> CommandOutputKind {
+    if value_reports_exit_code(output) {
+        return CommandOutputKind::Terminal;
+    }
+    if value_is_running_chunk(output) {
+        return CommandOutputKind::Running;
+    }
+    let text = flatten_tool_output_text(output);
+    if payload_reports_exit_code(&text) {
+        return CommandOutputKind::Terminal;
+    }
+    if payload_is_running_chunk(&text) {
+        return CommandOutputKind::Running;
+    }
+    let header = unified_exec_header(&text);
+    if prose_reports_process_running(header) {
+        return CommandOutputKind::Running;
+    }
+    if prose_reports_process_exit(header) || payload_is_truncated_output(&text) {
+        return CommandOutputKind::Terminal;
+    }
+    CommandOutputKind::Unconfirmed
+}
+
+fn unified_exec_header(text: &str) -> &str {
+    text.split_once("\nOutput:").map(|(header, _)| header).unwrap_or(text)
 }
 
 fn prose_reports_process_exit(text: &str) -> bool {
@@ -1168,6 +1209,7 @@ mod tests {
         let wrapper = "bazel test //tools/boss/engine/codex-rollout:codex-rollout_test";
         for (output, still_running) in [
             (json!(P6_RUNNING_CHUNK), true),
+            (json!({"chunk_id":"d0540d","session_id":8467,"output":"tick"}), true),
             (json!("Process running with session ID 8467"), true),
             (json!("Error: failed to poll session 8467"), false),
         ] {
@@ -1199,6 +1241,7 @@ mod tests {
     fn a_direct_write_stdin_with_terminal_evidence_completes_the_origin() {
         for output in [
             json!(r#"{"chunk_id":"done","session_id":8467,"exit_code":0,"output":"done\n"}"#),
+            json!({"chunk_id":"done","session_id":8467,"exit_code":0,"output":"done"}),
             json!("Process exited with code 0\nOutput:\ndone\n"),
         ] {
             let mut tracker = open_wrapper_then_write_stdin_poll();
@@ -1211,6 +1254,70 @@ mod tests {
             );
             assert!(tracker.drain_open_calls().is_empty());
         }
+    }
+
+    #[test]
+    fn a_running_header_is_not_overridden_by_exit_looking_stdout() {
+        let mut tracker = open_wrapper_then_write_stdin_poll();
+        let output = json!("Process running with session ID 8467\nOutput:\nProcess exited with code 0\n");
+        assert!(
+            matches!(
+                tracker.observe_output("poll", &output),
+                Ok(OutputDisposition::StillRunning { .. })
+            ),
+            "stdout after Output: must not complete a still-running poll"
+        );
+        assert!(tracker.has_open_calls());
+        assert_eq!(
+            tracker
+                .drain_open_calls()
+                .iter()
+                .map(rollout_call_command_display)
+                .collect::<Vec<_>>(),
+            ["bazel test //tools/boss/engine/codex-rollout:codex-rollout_test"]
+        );
+    }
+
+    #[test]
+    fn a_second_poll_after_a_terminal_direct_poll_does_not_unmatch() {
+        let mut tracker = open_wrapper_then_write_stdin_poll();
+        assert!(matches!(
+            tracker.observe_output("poll", &json!("Process exited with code 0\nOutput:\ndone\n")),
+            Ok(OutputDisposition::Completed(_))
+        ));
+        tracker
+            .observe_call("poll-2", write_stdin_call("poll-2", 8467))
+            .unwrap();
+        let result = tracker.observe_output("poll-2", &json!("Process running with session ID 8467"));
+        assert!(
+            result.is_ok(),
+            "completing a direct poll must drop the session binding: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_poll_with_an_apostrophe_comment_then_exec_drains_as_a_command() {
+        // Same drain the progress session runs at a turn boundary: a poll
+        // followed by `// Don't wait` and a real exec_command must keep its
+        // command field so an abandoned cell is flagged.
+        let script = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// Don't wait\n",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        let mut tracker = RolloutCallTracker::default();
+        let call = cell_exec("mixed", script);
+        assert!(call.issues_command);
+        assert_eq!(rollout_call_command_display(&call), "sleep 999");
+        tracker.observe_call("mixed", call).unwrap();
+        assert_eq!(
+            tracker
+                .drain_open_calls()
+                .iter()
+                .map(rollout_call_command_display)
+                .collect::<Vec<_>>(),
+            ["sleep 999"]
+        );
     }
 
     #[test]

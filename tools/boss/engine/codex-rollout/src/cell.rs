@@ -40,7 +40,9 @@
 //! `wait` continuation is the consumer's job — see
 //! `boss_engine_driver::codex::rollout_calls`.
 
-use serde_json::Value;
+use std::iter::Peekable;
+
+use serde_json::{Map, Value};
 
 use crate::coerce_command_to_string;
 
@@ -189,17 +191,36 @@ fn is_wall_time_line(line: &str) -> bool {
 /// be still-running here. A bare `7` projection (`text(r.exit_code)`) and
 /// truncation-warning prose are not chunks at all.
 pub fn payload_is_running_chunk(payload: &str) -> bool {
-    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
-        return false;
-    };
-    chunk.contains_key("chunk_id") && !payload_reports_exit_code(payload)
+    value_is_running_chunk(&parse_json_value(payload))
 }
 
 /// Whether a structured harness chunk reports the command's exit status.
 pub fn payload_reports_exit_code(payload: &str) -> bool {
-    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
-        return false;
-    };
+    value_reports_exit_code(&parse_json_value(payload))
+}
+
+/// Whether `output` is already a structured object that reports `exit_code`.
+///
+/// Direct `write_stdin` polls sometimes carry the chunk as a JSON object
+/// rather than a JSON string. Flattening that object keeps only a `text`
+/// field, so callers must inspect the raw value before flattening.
+pub fn value_reports_exit_code(value: &Value) -> bool {
+    value.as_object().is_some_and(object_reports_exit_code)
+}
+
+/// Whether `output` is already a structured running chunk (`chunk_id`, no
+/// `exit_code`). Same object-form gap as [`value_reports_exit_code`].
+pub fn value_is_running_chunk(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|chunk| chunk.contains_key("chunk_id") && !object_reports_exit_code(chunk))
+}
+
+fn parse_json_value(payload: &str) -> Value {
+    serde_json::from_str(payload).unwrap_or(Value::Null)
+}
+
+fn object_reports_exit_code(chunk: &Map<String, Value>) -> bool {
     chunk.contains_key("exit_code")
         || chunk
             .get("metadata")
@@ -349,21 +370,41 @@ fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
 }
 
 /// Byte offset of `name(` at an identifier boundary, skipping string
-/// literals. `.` may precede the name so `tools.write_stdin(` matches;
-/// `spawnshell(` and a quoted `"shell("` do not.
+/// literals and comments. `.` may precede the name so `tools.write_stdin(`
+/// matches; `spawnshell(`, a quoted `"shell("`, and a commented-out
+/// `shell(` do not.
 fn find_js_call(source: &str, name: &str) -> Option<usize> {
-    let mut needle = String::with_capacity(name.len() + 1);
-    needle.push_str(name);
-    needle.push('(');
-    let mut search_from = 0;
-    while let Some(rel) = source.get(search_from..)?.find(&needle) {
-        let at = search_from + rel;
-        if js_ident_boundary_at(source, at) && !js_position_is_in_string(source, at) {
-            return Some(at);
+    let mut chars = source.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        match ch {
+            '/' => match chars.peek().map(|&(_, next)| next) {
+                Some('/') => {
+                    chars.next();
+                    skip_js_line_comment(&mut chars);
+                }
+                Some('*') => {
+                    chars.next();
+                    skip_js_block_comment(&mut chars);
+                }
+                _ if js_call_at(source, at, name) => return Some(at),
+                _ => {}
+            },
+            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
+            '`' => skip_js_quoted_string(&mut chars, ch, true),
+            _ if js_call_at(source, at, name) => return Some(at),
+            _ => {}
         }
-        search_from = at.checked_add(1)?;
     }
     None
+}
+
+fn js_call_at(source: &str, at: usize, name: &str) -> bool {
+    let Some(rest) = source.get(at..) else {
+        return false;
+    };
+    rest.starts_with(name)
+        && rest.get(name.len()..).is_some_and(|tail| tail.starts_with('('))
+        && js_ident_boundary_at(source, at)
 }
 
 fn js_ident_boundary_at(source: &str, at: usize) -> bool {
@@ -373,34 +414,46 @@ fn js_ident_boundary_at(source: &str, at: usize) -> bool {
     !preceding.is_ascii_alphanumeric() && preceding != '_' && preceding != '$'
 }
 
-fn js_position_is_in_string(source: &str, target: usize) -> bool {
-    let mut in_string = false;
-    let mut quote = '\0';
-    let mut escaped = false;
-    for (index, ch) in source.char_indices() {
-        if index >= target {
-            return in_string;
-        }
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == quote {
-                in_string = false;
-            }
-            continue;
-        }
-        if ch == '"' || ch == '\'' || ch == '`' {
-            in_string = true;
-            quote = ch;
+fn skip_js_line_comment(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>) {
+    for (_, ch) in chars.by_ref() {
+        if ch == '\n' {
+            break;
         }
     }
-    in_string
+}
+
+fn skip_js_block_comment(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>) {
+    let mut prev_star = false;
+    for (_, ch) in chars.by_ref() {
+        if prev_star && ch == '/' {
+            return;
+        }
+        prev_star = ch == '*';
+    }
+}
+
+/// Skip a JS string whose opening quote has already been consumed.
+/// Single and double quoted strings end at an unescaped newline (they are
+/// a SyntaxError in JS; treating the newline as the end keeps later code
+/// visible). Template literals may contain newlines.
+fn skip_js_quoted_string(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>, quote: char, allow_newline: bool) {
+    let mut escaped = false;
+    for (_, ch) in chars.by_ref() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            break;
+        }
+        if !allow_newline && (ch == '\n' || ch == '\r') {
+            break;
+        }
+    }
 }
 
 /// A string/number field on a JSON object or a JavaScript object literal
@@ -417,7 +470,8 @@ fn object_literal_string_field(object: &str, field: &str) -> Option<String> {
 }
 
 /// Take the balanced `{…}` object literal at the start of `source` (after
-/// any leading whitespace), respecting quoted string literals and escapes.
+/// any leading whitespace), respecting quoted string literals, comments,
+/// and escapes.
 fn balanced_object_literal(source: &str) -> Option<&str> {
     let trimmed = source.trim_start();
     let offset = source.len() - trimmed.len();
@@ -425,20 +479,22 @@ fn balanced_object_literal(source: &str) -> Option<&str> {
         return None;
     }
     let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in trimmed.char_indices() {
-        if let Some(delimiter) = quote {
-            match ch {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                ch if ch == delimiter => quote = None,
-                _ => {}
-            }
-            continue;
-        }
+    let mut chars = trimmed.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
         match ch {
-            '"' | '\'' => quote = Some(ch),
+            '/' => match chars.peek().map(|&(_, next)| next) {
+                Some('/') => {
+                    chars.next();
+                    skip_js_line_comment(&mut chars);
+                }
+                Some('*') => {
+                    chars.next();
+                    skip_js_block_comment(&mut chars);
+                }
+                _ => {}
+            },
+            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
+            '`' => skip_js_quoted_string(&mut chars, ch, true),
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -788,5 +844,68 @@ mod tests {
         );
         assert!(script_is_continuation_only(poll));
         assert!(!script_issues_command(poll));
+    }
+
+    #[test]
+    fn an_apostrophe_in_a_comment_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// Don't wait\n",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_dont_comment_before_a_lone_exec_command_still_recovers_the_cmd() {
+        let source = concat!("// don't\n", r#"await tools.exec_command({cmd:"echo hi"});"#);
+        assert!(script_issues_command(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn a_pure_poll_with_commented_out_shell_text_is_still_a_continuation() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// await tools.shell({cmd:\"echo hi\"});\n",
+            "/* also didn't run exec_command({cmd:\"sleep 1\"}); */",
+        );
+        assert!(!script_issues_command(source));
+        assert!(script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source), None);
+    }
+
+    #[test]
+    fn js_quoted_cmd_decodes_unicode_and_hex_escapes() {
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd:"echo \u0041\u{42}\x43"});"#).as_deref(),
+            Some("echo ABC")
+        );
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd:'a\0b\tc'});"#).as_deref(),
+            Some("a\0b\tc")
+        );
+        let unknown = r#"await tools.exec_command({cmd:"echo \q"});"#;
+        assert_eq!(cell_script_command(unknown), None);
+        assert!(script_issues_command(unknown));
+    }
+
+    #[test]
+    fn value_helpers_read_object_form_exit_and_running_chunks() {
+        assert!(value_reports_exit_code(
+            &json!({"chunk_id":"done","session_id":8467,"exit_code":0,"output":"done"})
+        ));
+        assert!(!value_is_running_chunk(
+            &json!({"chunk_id":"done","session_id":8467,"exit_code":0,"output":"done"})
+        ));
+        assert!(value_is_running_chunk(
+            &json!({"chunk_id":"d0540d","session_id":8467,"output":"tick"})
+        ));
+        assert!(!value_reports_exit_code(
+            &json!({"chunk_id":"d0540d","session_id":8467,"output":"tick"})
+        ));
+        assert!(!value_reports_exit_code(&json!({"type":"output_text","text":"done"})));
     }
 }

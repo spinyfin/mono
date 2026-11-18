@@ -409,6 +409,46 @@ mod tests {
         assert_eq!(call.tool_input.get("session_id").and_then(Value::as_str), Some("8467"));
     }
 
+    fn canonical_exec_script(source: &str) -> CanonicalRolloutToolCall {
+        let payload = json!({"name": "exec", "call_id": "c-script", "input": source})
+            .as_object()
+            .unwrap()
+            .clone();
+        canonical_rollout_tool_call("custom_tool_call", &payload).expect("call")
+    }
+
+    #[test]
+    fn apostrophe_comment_does_not_drop_a_following_exec_command() {
+        let call = canonical_exec_script(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// Don't wait\n",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
+    }
+
+    #[test]
+    fn dont_comment_before_exec_command_still_recovers_the_cmd() {
+        let call = canonical_exec_script(concat!("// don't\n", r#"await tools.exec_command({cmd:"echo hi"});"#,));
+        assert!(call.issues_command);
+        assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some("echo hi"));
+    }
+
+    #[test]
+    fn commented_out_shell_in_a_poll_cell_stays_a_continuation() {
+        let call = canonical_exec_script(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// await tools.shell({cmd:\"echo hi\"});",
+        ));
+        assert!(!call.issues_command);
+        assert_eq!(call.tool_input.get("command"), None);
+        assert_eq!(call.tool_input.get("session_id").and_then(Value::as_str), Some("8467"));
+    }
+
     #[test]
     fn functions_exec_alias_reshapes_like_exec() {
         let payload = json!({
@@ -468,6 +508,19 @@ mod tests {
         // someone else's session.
         assert!(exec_input_issues_command(&json!({"argv": ["echo", "hi"]})));
         assert!(exec_input_issues_command(&json!(["sleep", "999"])));
+        assert!(exec_input_issues_command(&json!(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// Don't wait\n",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ))));
+        assert!(exec_input_issues_command(&json!(concat!(
+            "// don't\n",
+            r#"await tools.exec_command({cmd:"echo hi"});"#,
+        ))));
+        assert!(!exec_input_issues_command(&json!(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// await tools.shell({cmd:\"echo hi\"});",
+        ))));
     }
 
     #[test]
