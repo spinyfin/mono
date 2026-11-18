@@ -275,17 +275,24 @@ struct PrCiIndicator: View {
 /// the CI marker; a conflicting PR therefore never looks ready.
 struct PrConflictIndicator: View {
     var prMergeableState: String?
+    var resolutionDeferred: Bool = false
 
     var isVisible: Bool { PrMergeability.isConflicting(prMergeableState) }
-
-    var tooltipText: String { "PR has merge conflicts" }
+    var labelText: String { resolutionDeferred ? "Conflicts — resolves on merge" : "conflicts" }
+    var systemImage: String { resolutionDeferred ? "info.circle" : "exclamationmark.triangle.fill" }
+    var tint: Color { resolutionDeferred ? .secondary : .red }
+    var tooltipText: String {
+        resolutionDeferred
+            ? "PR has merge conflicts. The engine will resolve them automatically when you request a merge."
+            : "PR has merge conflicts"
+    }
 
     var body: some View {
         if isVisible {
-            Label("conflicts", systemImage: "exclamationmark.triangle.fill")
+            Label(labelText, systemImage: systemImage)
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.red)
-                .lineLimit(1)
+                .foregroundStyle(tint)
+                .fixedSize(horizontal: false, vertical: true)
                 .help(tooltipText)
                 .accessibilityLabel(tooltipText)
         }

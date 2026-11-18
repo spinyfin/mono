@@ -87,6 +87,16 @@ pub(super) fn attach_board_derivations(
     // has at least one descendant revision that
     // `TaskStatus::can_still_change_pr`.
     attach_in_progress_revision_flag(&mut tasks, chores);
+    let ids: Vec<_> = tasks.iter().chain(chores.iter()).map(|task| task.id.as_str()).collect();
+    match super::conflict_deferral::open_deferrals_among(conn, &ids) {
+        Ok(deferred) => {
+            let deferred: std::collections::HashSet<_> = deferred.into_iter().collect();
+            for task in tasks.iter_mut().chain(chores.iter_mut()) {
+                task.conflict_resolution_deferred = deferred.contains(&task.id);
+            }
+        }
+        Err(err) => tracing::warn!(?err, "{caller}: failed to attach conflict deferral; ignoring"),
+    }
     // Compute ready_for_review for every Review-lane task that is
     // waiting on the operator and nothing else (no block, no
     // in-progress revision, CI green, no merge conflict). Must run

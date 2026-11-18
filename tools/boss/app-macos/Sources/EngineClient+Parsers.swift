@@ -242,6 +242,7 @@ extension EngineClient {
             mergeQueueState: payload["merge_queue_state"] as? String,
             mergeQueueDetail: payload["merge_queue_detail"] as? String,
             prMergeableState: payload["pr_mergeable_state"] as? String,
+            conflictResolutionDeferred: payload["conflict_resolution_deferred"] as? Bool ?? false,
             externalRef: parseExternalRef(payload["external_ref"]),
             parentTaskId: payload["parent_task_id"] as? String,
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,

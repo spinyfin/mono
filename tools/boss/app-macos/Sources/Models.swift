@@ -136,6 +136,7 @@ struct WorkTask: Identifiable, Hashable {
     /// `prMergeableState == "conflicting"` simultaneously (mono#2303).
     /// Mirrors `Task.pr_mergeable_state` on the wire.
     var prMergeableState: String? = nil
+    var conflictResolutionDeferred: Bool = false
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil

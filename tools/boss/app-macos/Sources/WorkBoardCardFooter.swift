@@ -18,6 +18,7 @@ struct WorkBoardCardFooterSlice: Equatable {
     let ciRequiredState: String?
     let ciRequiredDetail: String?
     let prMergeableState: String?
+    let conflictResolutionDeferred: Bool
     let ambiguousRepoNames: Set<String>
     let hasInProgressRevision: Bool
     let inRevisionBlockedOnly: Bool
@@ -39,6 +40,7 @@ struct WorkBoardCardFooterSlice: Equatable {
         self.ciRequiredState = snapshot.ciRequiredState
         self.ciRequiredDetail = snapshot.ciRequiredDetail
         self.prMergeableState = snapshot.prMergeableState
+        self.conflictResolutionDeferred = snapshot.conflictResolutionDeferred
         self.ambiguousRepoNames = snapshot.ambiguousRepoNames
         self.hasInProgressRevision = snapshot.hasInProgressRevision
         self.inRevisionBlockedOnly = snapshot.inRevisionBlockedOnly
@@ -51,6 +53,10 @@ struct WorkBoardCardFooterSlice: Equatable {
         self.hasStandaloneShortID = snapshot.hasStandaloneShortID
         self.hasInReviewRevisions = snapshot.hasInReviewRevisions
         self.inReviewRevisions = snapshot.inReviewRevisions
+    }
+
+    var showsDeferredConflict: Bool {
+        conflictResolutionDeferred && PrMergeability.isConflicting(prMergeableState)
     }
 
     /// True when any footer section would render content.
@@ -119,8 +125,12 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if slice.hasPRRow, let prURL = slice.prURL {
+                if slice.showsDeferredConflict {
+                    PrConflictIndicator(prMergeableState: slice.prMergeableState, resolutionDeferred: true)
+                }
                 HStack(alignment: .center, spacing: 6) {
-                    if let mergeQueueState = slice.mergeQueueState {
+                    if let mergeQueueState = slice.mergeQueueState,
+                       !slice.showsDeferredConflict {
                         MergeQueueBadge(
                             mergeQueueState: mergeQueueState,
                             detail: slice.mergeQueueDetail,
@@ -135,7 +145,9 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                                 detail: slice.ciRequiredDetail
                             )
                         }
-                        PrConflictIndicator(prMergeableState: slice.prMergeableState)
+                        if !slice.showsDeferredConflict {
+                            PrConflictIndicator(prMergeableState: slice.prMergeableState)
+                        }
                     }
                     PRURLLink(
                         urlString: prURL,

@@ -974,6 +974,11 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_mergeable_state: Option<String>,
 
+    /// Open conflict deferral, independent of review progress. Resolution starts on merge request.
+    #[serde(default)]
+    #[builder(default)]
+    pub conflict_resolution_deferred: bool,
+
     /// Explicit model slug override. `None` → resolve via the design's
     /// Q3 precedence (effort default → product default → engine default).
     /// Stored verbatim — the engine does not validate the slug.

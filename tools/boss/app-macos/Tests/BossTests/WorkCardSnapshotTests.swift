@@ -82,6 +82,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "mergeQueueState",
         "mergeQueueDetail",
         "prMergeableState",
+        "conflictResolutionDeferred",
         "reviewGuideLifecycle",
         "reviewGuideReadableVersionId",
         "reviewGuideStaleSource",
@@ -829,6 +830,14 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.mergeQueueDetail = "{\"position\":2}"; return t
+                }
+            ),
+            Case(
+                name: "conflictResolutionDeferred",
+                context: backlog,
+                base: { Self.makeTask(id: "task_1") },
+                mutate: {
+                    var t = $0; t.conflictResolutionDeferred = true; return t
                 }
             ),
             Case(

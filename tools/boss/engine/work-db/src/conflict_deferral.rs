@@ -709,6 +709,21 @@ mod tests {
                 serde_json::to_value(db.get_work_tree_at(&product, 100).unwrap()).unwrap(),
                 "the incremental board must match a full rebuild"
             );
+            let card = tree
+                .tasks
+                .iter()
+                .chain(&tree.chores)
+                .find(|card| card.id == item)
+                .unwrap();
+            assert_eq!(
+                card.conflict_resolution_deferred,
+                db.open_conflict_deferral(&item).unwrap().is_some()
+            );
+            let payload = serde_json::to_value(card).unwrap();
+            assert_eq!(
+                payload["conflict_resolution_deferred"],
+                card.conflict_resolution_deferred
+            );
             tree.task_runtimes
                 .iter()
                 .find(|runtime| runtime.work_item_id == item)
@@ -718,11 +733,37 @@ mod tests {
 
         recorded(db.record_conflict_deferral(input(&product, &item, "h1")).unwrap());
         assert_eq!(card_wait().as_deref(), Some("conflict_deferred"));
+        // The explicit card signal survives other review work taking precedence.
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET review_required_state = 'pending' WHERE id = ?1",
+                [&item],
+            )
+            .unwrap();
+        card_wait();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET review_required_state = 'approved' WHERE id = ?1",
+                [&item],
+            )
+            .unwrap();
 
         db.end_conflict_deferral(&item, ConflictDeferralEnd::ConflictCleared)
             .unwrap()
             .unwrap();
         assert_eq!(card_wait().as_deref(), Some("awaiting_merge"));
+        let attempt = db
+            .insert_conflict_resolution(input(&product, &item, "h2"))
+            .unwrap()
+            .unwrap();
+        db.mark_conflict_resolution_failed(&attempt.id, "rebase_failed")
+            .unwrap();
+        db.stamp_conflict_resolution_deferral_arm(&attempt.id, "deferred")
+            .unwrap();
+        // A failed resolution in the deferred arm is not an open deferral.
+        card_wait();
     }
 
     /// The stuck-work handling must see a deferred conflict for what it is:

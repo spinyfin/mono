@@ -13,6 +13,8 @@ final class RevisionFooterRenderTests: XCTestCase {
         let rollups: Bool
         var parentPR = false
         var ownPR = true
+        var conflictDeferred = false
+        var mergeArmed = false
     }
 
     private func render(_ fixture: Fixture) throws -> (height: CGFloat, idFrames: [CGRect], png: Data) {
@@ -31,6 +33,8 @@ final class RevisionFooterRenderTests: XCTestCase {
         }
         task.ciRequiredState = "in_progress"
         task.prMergeableState = "conflicting"
+        task.conflictResolutionDeferred = fixture.conflictDeferred
+        if fixture.mergeArmed { task.mergeQueueState = "auto_merge_enabled" }
         task.hasInProgressRevision = fixture.inRevision
         if fixture.review {
             task.reviewRequiredState = "required"
@@ -63,6 +67,20 @@ final class RevisionFooterRenderTests: XCTestCase {
             try data.write(to: URL(fileURLWithPath: output).appendingPathComponent(fixture.name + ".png"))
         }
         return (host.bounds.height, idFrames, data)
+    }
+
+    func testDeferredConflictRendersAtColumnWidth() throws {
+        for armed in [false, true] {
+            var fixture = Fixture(name: armed ? "deferred-conflict-merge-armed" : "deferred-conflict",
+                                  inRevision: false, review: false, rollups: false)
+            fixture.conflictDeferred = true
+            fixture.mergeArmed = armed
+            let result = try render(fixture)
+            XCTAssertFalse(result.png.isEmpty)
+            let frame = try XCTUnwrap(result.idFrames.first)
+            XCTAssertEqual(frame.maxX, 254, accuracy: 1)
+            XCTAssertLessThan(frame.maxY, result.height)
+        }
     }
 
     func testReviewCardsRender() throws {
