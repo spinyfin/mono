@@ -88,6 +88,9 @@ struct WaitState {
     active: Option<WaitRecord>,
     total_granted_secs: u64,
     expiry_logged: bool,
+    /// Incremented on each accepted declaration so park/resume bookkeeping
+    /// can tell a later wait from the one a slot already parked on.
+    generation: u64,
 }
 
 /// In-memory `execution_id -> WaitState` registry. Thread-safe; cheap to
@@ -187,6 +190,7 @@ impl WaitRegistry {
             .maybe_declared_after_seq(declared_after_seq)
             .build();
         state.total_granted_secs = state.total_granted_secs.saturating_add(duration_secs);
+        state.generation = state.generation.saturating_add(1);
         state.active = Some(record.clone());
         state.expiry_logged = false;
         tracing::info!(
@@ -278,6 +282,18 @@ impl boss_engine_live_worker_state::DeclaredWaitSource for WaitRegistry {
         } else {
             DeclaredWait::None
         }
+    }
+
+    fn wait_identity(&self, run_id: &str) -> Option<boss_engine_live_worker_state::DeclaredWaitIdentity> {
+        let guard = self.inner.lock().expect("WaitRegistry mutex poisoned");
+        let state = guard.get(run_id)?;
+        let record = state.active.as_ref()?;
+        Some(boss_engine_live_worker_state::DeclaredWaitIdentity {
+            generation: state.generation,
+            declared_at_epoch: record.declared_at_epoch,
+            expires_at_epoch: record.expires_at_epoch,
+            declared_after_seq: record.declared_after_seq,
+        })
     }
 }
 
@@ -407,6 +423,22 @@ mod tests {
         assert_eq!(record.reason, "bazel");
         assert_eq!(record.expires_at_epoch, 1_060);
         assert_eq!(record.granted_secs, 60);
+    }
+
+    #[test]
+    fn wait_identity_tracks_generation_across_renewals() {
+        use boss_engine_live_worker_state::DeclaredWaitSource;
+        let registry = WaitRegistry::new();
+        assert!(registry.wait_identity("exec_a").is_none());
+        registry.declare("exec_a", "first".into(), None, 60, 1_000).unwrap();
+        let first = registry.wait_identity("exec_a").expect("declared");
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.declared_at_epoch, 1_000);
+        registry.declare("exec_a", "second".into(), None, 60, 1_010).unwrap();
+        let second = registry.wait_identity("exec_a").expect("renewed");
+        assert_eq!(second.generation, 2);
+        assert_eq!(second.declared_at_epoch, 1_010);
+        assert_ne!(first.generation, second.generation);
     }
 
     #[test]

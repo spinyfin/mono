@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use boss_protocol::StopReason;
@@ -37,21 +36,67 @@ const IDLE_PROMPT: &str = "Claude is waiting for your input";
 /// two hook events without sleeping (the registry reads the wall clock when
 /// a hook arrives).
 #[derive(Default)]
-struct StubWaits(AtomicU8);
+struct StubWaits(Mutex<StubWait>);
+
+#[derive(Default)]
+struct StubWait {
+    wait: DeclaredWait,
+    identity: Option<DeclaredWaitIdentity>,
+    next_generation: u64,
+}
 
 impl StubWaits {
     fn set(&self, wait: DeclaredWait) {
-        self.0.store(wait as u8, Ordering::SeqCst);
+        self.set_after(wait, None);
+    }
+
+    fn declare_after(&self, seq: u64) {
+        self.set_after(DeclaredWait::Live, Some(seq));
+    }
+
+    fn set_after(&self, wait: DeclaredWait, declared_after_seq: Option<u64>) {
+        let mut inner = self.0.lock().expect("stub waits mutex");
+        inner.wait = wait;
+        match wait {
+            DeclaredWait::None => inner.identity = None,
+            DeclaredWait::Live => {
+                inner.next_generation += 1;
+                let now = now();
+                inner.identity = Some(DeclaredWaitIdentity {
+                    generation: inner.next_generation,
+                    declared_at_epoch: now,
+                    expires_at_epoch: now + 3_600,
+                    declared_after_seq,
+                });
+            }
+            DeclaredWait::Lapsed => {
+                if let Some(identity) = inner.identity.as_mut() {
+                    identity.expires_at_epoch = now();
+                    if declared_after_seq.is_some() {
+                        identity.declared_after_seq = declared_after_seq;
+                    }
+                } else {
+                    inner.next_generation += 1;
+                    let now = now();
+                    inner.identity = Some(DeclaredWaitIdentity {
+                        generation: inner.next_generation,
+                        declared_at_epoch: now,
+                        expires_at_epoch: now,
+                        declared_after_seq,
+                    });
+                }
+            }
+        }
     }
 }
 
 impl DeclaredWaitSource for StubWaits {
     fn declared_wait(&self, _run_id: &str, _now_epoch_secs: i64) -> DeclaredWait {
-        match self.0.load(Ordering::SeqCst) {
-            x if x == DeclaredWait::Live as u8 => DeclaredWait::Live,
-            x if x == DeclaredWait::Lapsed as u8 => DeclaredWait::Lapsed,
-            _ => DeclaredWait::None,
-        }
+        self.0.lock().expect("stub waits mutex").wait
+    }
+
+    fn wait_identity(&self, _run_id: &str) -> Option<DeclaredWaitIdentity> {
+        self.0.lock().expect("stub waits mutex").identity
     }
 }
 
@@ -335,4 +380,105 @@ fn resumed_wait_preserves_classification_but_cannot_hide_a_blocking_prompt() {
             assert!(reg.reconcile_declared_waits(now()).is_empty());
         }
     }
+}
+
+fn subagent_working(seq: u64) -> (HookOrigin, WorkerEvent) {
+    (
+        HookOrigin {
+            ingress_seq: Some(seq),
+            from_subagent: true,
+            observed_at_ms: None,
+        },
+        working(),
+    )
+}
+
+#[test]
+fn a_main_session_resume_overtaken_by_a_subagent_hook_still_needs_a_human() {
+    let (reg, waits) = fixture();
+    reg.apply_sequenced_event(1, Some(1), &working());
+    waits.declare_after(1);
+    reg.apply_sequenced_event(1, Some(2), &stop());
+    waits.set(DeclaredWait::Lapsed);
+    reg.reconcile_declared_waits(now());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+
+    let (origin, event) = subagent_working(4);
+    reg.apply_hook_event(1, origin, &event);
+    let late = reg.apply_sequenced_event(1, Some(3), &working());
+    assert!(matches!(late, ApplyEventOutcome::Stale { last_applied_seq: 4 }));
+
+    reg.apply_sequenced_event(1, Some(5), &stop());
+    reg.apply_sequenced_event(1, Some(6), &notification(IDLE_PROMPT));
+    let parked = reg.get(1).unwrap();
+    assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+    assert!(parked.activity.needs_human());
+}
+
+#[test]
+fn a_late_resume_reclassifies_an_already_applied_later_park() {
+    let (reg, waits) = fixture();
+    reg.apply_sequenced_event(1, Some(1), &working());
+    waits.declare_after(1);
+    reg.apply_sequenced_event(1, Some(2), &stop());
+    waits.set(DeclaredWait::Lapsed);
+    reg.reconcile_declared_waits(now());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+
+    reg.apply_sequenced_event(1, Some(4), &stop());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+    let late = reg.apply_sequenced_event(1, Some(3), &working());
+    assert!(matches!(late, ApplyEventOutcome::Stale { last_applied_seq: 4 }));
+    let parked = reg.get(1).unwrap();
+    assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+    assert!(parked.activity.needs_human());
+}
+
+#[test]
+fn a_stop_overtaken_by_resumed_main_session_activity_still_needs_a_human() {
+    let (reg, waits) = fixture();
+    reg.apply_sequenced_event(1, Some(1), &working());
+    waits.declare_after(1);
+    reg.apply_sequenced_event(1, Some(3), &working());
+    waits.set(DeclaredWait::Lapsed);
+    let late = reg.apply_sequenced_event(1, Some(2), &stop());
+    assert!(matches!(late, ApplyEventOutcome::Stale { last_applied_seq: 3 }));
+
+    reg.apply_sequenced_event(1, Some(4), &stop());
+    reg.apply_sequenced_event(1, Some(5), &notification(IDLE_PROMPT));
+    let parked = reg.get(1).unwrap();
+    assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+    assert!(parked.activity.needs_human());
+}
+
+#[test]
+fn a_new_wait_after_resume_can_still_go_overdue() {
+    let (reg, waits) = fixture();
+    reg.apply_sequenced_event(1, Some(1), &working());
+    waits.declare_after(1);
+    reg.apply_sequenced_event(1, Some(2), &stop());
+    waits.set(DeclaredWait::Lapsed);
+    reg.reconcile_declared_waits(now());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+
+    reg.apply_sequenced_event(1, Some(3), &working());
+    waits.declare_after(3);
+    waits.set(DeclaredWait::Lapsed);
+    reg.apply_sequenced_event(1, Some(4), &stop());
+    reg.apply_sequenced_event(1, Some(5), &notification(IDLE_PROMPT));
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+}
+
+#[test]
+fn declaring_mid_turn_and_working_past_expiry_needs_input_not_overdue() {
+    let (reg, waits) = fixture();
+    reg.apply_sequenced_event(1, Some(1), &working());
+    waits.declare_after(1);
+    reg.apply_sequenced_event(1, Some(2), &working());
+    waits.set(DeclaredWait::Lapsed);
+    reg.apply_sequenced_event(1, Some(3), &stop());
+    reg.apply_sequenced_event(1, Some(4), &notification(IDLE_PROMPT));
+    let parked = reg.get(1).unwrap();
+    assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+    assert!(parked.activity.needs_human());
 }
