@@ -1502,6 +1502,32 @@ impl WorkDb {
         let now = now_string();
         let mut recovered = Vec::new();
         for (work_item_id, product_id, pr_url, blocked_attempt_id, attempt_status, rung) in candidates {
+            if let Some(attempt_id) = blocked_attempt_id.as_deref()
+                && let Some(attempt) = query_conflict_resolution(&tx, attempt_id)?
+                && attempt
+                    .ladder_outcomes
+                    .as_ref()
+                    .is_some_and(|outcomes| outcomes.iter().any(|outcome| outcome.outcome == "halted_for_signoff"))
+            {
+                crate::blocking::mark_deletion_signoff_in_tx(&tx, &work_item_id, &pr_url)?;
+                mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, attempt_id, None, rung.unwrap_or(0))?;
+                recovered.push(RecoveredConflictLadderAttempt {
+                    work_item_id,
+                    product_id,
+                    pr_url,
+                    attempt_id: blocked_attempt_id,
+                    rung,
+                });
+                continue;
+            }
+            // An interrupted mechanical rung may have pushed an unverified head.
+            if rung.is_some() {
+                crate::merge_conflict_merging::stop(
+                    &tx,
+                    &work_item_id,
+                    "Resolution interrupted before safety verification",
+                )?;
+            }
             // Abandon the orphaned attempt when it still exists, freeing its
             // UNIQUE (work_item_id, base_sha_at_trigger, head_sha_before)
             // slot so the fall-through re-detect can insert a fresh attempt

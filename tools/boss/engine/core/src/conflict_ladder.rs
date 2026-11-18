@@ -28,7 +28,7 @@ use boss_deterministic_resolvers::{
     ConflictRecipesStore, ConflictRules, ConflictedFile, DeclinedFile, FailedFile, RegistryResolution, ResolvedFile,
     ResolverRegistry,
 };
-use boss_protocol::{CreateAttentionItemInput, FrontendEvent};
+use boss_protocol::FrontendEvent;
 
 use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
@@ -1348,16 +1348,6 @@ async fn halt_attempt_for_deletion_signoff(
         tracing::error!(attempt_id = %attempt.id, ?err, "could not persist atomic deletion-signoff halt");
         return;
     }
-
-    let _ = work_db.create_attention_item(CreateAttentionItemInput {
-        work_item_id: Some(candidate.work_item_id.clone()),
-        kind: crate::merge_parent_deletion::SIGNOFF_ATTENTION_KIND.to_owned(),
-        title: crate::merge_parent_deletion::SIGNOFF_ATTENTION_TITLE.to_owned(),
-        body_markdown: crate::merge_parent_deletion::render_signoff_attention_body(deletions, &candidate.pr_url),
-        execution_id: None,
-        status: None,
-        resolved_at: None,
-    });
 
     publisher
         .publish_work_item_changed(

@@ -75,8 +75,8 @@ pub(crate) fn clear_resolved_signal_in_tx(
         );
         return Ok(ClearResolvedSignal::Nothing);
     }
-    // Recover the old two-commit rejection window before a clean observation
-    // can clear its conflict block. The recorded safety verdict survives a crash.
+    // Complete a recorded deletion-tripwire rejection when a crash or failed
+    // write prevented the atomic halt, before a clean probe lifts the block.
     if !ci {
         let rejected: Option<String> = conn
             .query_row(
@@ -84,6 +84,9 @@ pub(crate) fn clear_resolved_signal_in_tx(
              WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
                AND cr.id = (SELECT id FROM conflict_resolutions WHERE work_item_id = ?1 AND pr_url = ?2
                             ORDER BY created_at DESC, id DESC LIMIT 1)
+               AND (cr.status != 'succeeded' OR EXISTS (
+                   SELECT 1 FROM tasks t WHERE t.id = ?1
+                     AND t.status = 'blocked' AND t.blocked_reason = 'merge_conflict'))
                AND EXISTS (SELECT 1 FROM json_each(COALESCE(cr.ladder_outcomes, '[]'))
                            WHERE json_extract(value, '$.outcome') = 'halted_for_signoff')
              ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
@@ -91,9 +94,8 @@ pub(crate) fn clear_resolved_signal_in_tx(
                 |row| row.get(0),
             )
             .optional()?;
-        if let Some(id) = rejected
-            && crate::blocking::mark_deletion_signoff_in_tx(conn, item, pr)?.is_some()
-        {
+        if let Some(id) = rejected {
+            crate::blocking::mark_deletion_signoff_in_tx(conn, item, pr)?;
             let attempt = query_conflict_resolution(conn, &id)?.expect("selected conflict attempt");
             let rung = attempt
                 .resolved_by_rung

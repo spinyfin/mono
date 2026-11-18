@@ -2359,10 +2359,39 @@ pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str,
                 AND deleted_at IS NULL",
         params![work_item_id, pr_url, now],
     )?;
+    crate::merge_conflict_merging::stop(conn, work_item_id, "Resolution needs approval for deleted files")?;
     if rows == 0 {
         return Ok(None);
     }
-    crate::merge_conflict_merging::stop(conn, work_item_id, "Resolution needs approval for deleted files")?;
+    let kind = boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND;
+    if crate::attention_filing::reraise_open_work_item_attention(conn, work_item_id, kind)?.is_none() {
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(value, '$.reason') FROM conflict_resolutions cr,
+                    json_each(COALESCE(cr.ladder_outcomes, '[]'))
+             WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
+               AND json_extract(value, '$.outcome') = 'halted_for_signoff'
+             ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
+                params![work_item_id, pr_url],
+                |row| row.get(0),
+            )
+            .optional()?;
+        crate::workitems::insert_attention_item_row(
+            conn,
+            &CreateAttentionItemInput {
+                work_item_id: Some(work_item_id.to_owned()),
+                kind: kind.to_owned(),
+                title: boss_engine_storage_values::merge_parent_signoff::SIGNOFF_ATTENTION_TITLE.to_owned(),
+                body_markdown: boss_engine_storage_values::merge_parent_signoff::render_signoff_attention_body(
+                    &[reason.unwrap_or_else(|| "Deletion tripwire requires operator sign-off".to_owned())],
+                    pr_url,
+                ),
+                execution_id: None,
+                status: None,
+                resolved_at: None,
+            },
+        )?;
+    }
     // Leaving the merge_conflict state for deletion_signoff — clear the
     // side-table signal, mirroring `clear_chore_blocked_merge_conflict`.
     conn.execute(
