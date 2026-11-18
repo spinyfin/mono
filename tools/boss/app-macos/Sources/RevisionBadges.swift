@@ -100,7 +100,7 @@ struct RevisionRollupLine: View {
                     .foregroundStyle(Color.accentColor)
             }
             if let reason = revision.blockedReason {
-                Text("Blocked: " + reason.replacingOccurrences(of: "_", with: " "))
+                Text("Blocked: \(WorkBlockedBadge.label(forReason: reason))")
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }

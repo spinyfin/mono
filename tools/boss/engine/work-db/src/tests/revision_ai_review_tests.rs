@@ -345,3 +345,79 @@ fn a_review_started_before_the_latest_implementation_does_not_count() {
     assert!(held.db.list_revisions_under_ai_review().unwrap().is_empty());
     assert!(!projected_revision(&held).ai_reviewing);
 }
+
+#[test]
+fn a_batch_created_before_the_implementation_is_finalized_still_counts() {
+    let held = held_revision("revision-ai-review-finalized-after-batch");
+    let batch = start_review_batch(&held);
+    let exec = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+        held.db.connect().unwrap().execute(sql, params).unwrap();
+    };
+    // The implementation's finish time is written after the push's batch exists.
+    exec(
+        "UPDATE work_executions SET finished_at = CAST(CAST(created_at AS INTEGER) + 5 AS TEXT)
+         WHERE kind = 'revision_implementation'",
+        &[],
+    );
+    // No reviewer process running: only the batch itself keeps the card active.
+    exec(
+        "UPDATE work_executions SET status = 'orphaned' WHERE kind = 'pr_review'",
+        &[],
+    );
+    for (status, stage) in [
+        ("collecting", "reviewers"),
+        ("supervising", "consolidation"),
+        ("applying", "applying"),
+    ] {
+        exec(
+            "UPDATE pr_review_batches SET status = ?2 WHERE id = ?1",
+            &[&batch, &status],
+        );
+        assert_eq!(
+            held.db.list_revisions_under_ai_review().unwrap(),
+            vec![held.revision_id.clone()],
+            "{status}"
+        );
+        let projected = projected_revision(&held);
+        assert!(projected.ai_reviewing, "{status}");
+        assert_eq!(projected.ai_review_stage.as_deref(), Some(stage), "{status}");
+    }
+    // A failed generation with a started member stays reviewing until re-admitted.
+    exec(
+        "UPDATE pr_review_batches SET status = 'failed' WHERE id = ?1",
+        &[&batch],
+    );
+    assert!(projected_revision(&held).ai_reviewing);
+}
+
+#[test]
+fn only_review_phase_revision_states_are_folded_by_the_engine() {
+    let held = held_revision("revision-fold-negatives");
+    let set = |status: &str, reason: Option<&str>| {
+        held.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2, blocked_reason = ?3 WHERE id = ?1",
+                rusqlite::params![held.revision_id, status, reason],
+            )
+            .unwrap();
+        projected_revision(&held).board_folded_revision
+    };
+    for status in ["in_review", "done"] {
+        assert!(set(status, None), "{status}");
+    }
+    for status in ["todo", "active"] {
+        assert!(!set(status, None), "{status}");
+    }
+    for reason in ["dependency", "awaiting_operator_answer", "worker_failed"] {
+        assert!(!set("blocked", Some(reason)), "{reason}");
+    }
+    assert!(!set("blocked", None));
+    // Non-revision kinds are never folded.
+    let root = match held.db.get_work_item(&held.root_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("unexpected row {other:?}"),
+    };
+    assert!(!root.board_folded_revision);
+}
