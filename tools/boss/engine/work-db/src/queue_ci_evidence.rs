@@ -433,6 +433,7 @@ pub(crate) fn record_delivery(conn: &Connection, execution_id: &str, payload: &R
                 evidence.queue_entry_enqueued_at.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp())
             ],
         )?;
+        crate::blocking::log_ci_remediation_abandoned(&attempt, "verified_requeue");
         conn.execute(
             "UPDATE task_blocked_signals SET cleared_at = ?2 WHERE work_item_id = ?1
              AND reason IN ('ci_failure', 'ci_failure_exhausted', 'ci_flaky_retriggered') AND cleared_at IS NULL

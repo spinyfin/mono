@@ -25,6 +25,27 @@ pub(crate) fn mark_ci_remediation_succeeded_in_tx(
     query_ci_remediation(conn, attempt_id)
 }
 
+/// Record a `ci_remediations` attempt leaving the active set as `abandoned`.
+///
+/// Called by every writer that sets `status = 'abandoned'` (the two below and
+/// the verified-requeue delivery in `queue_ci_evidence`), so the engine log
+/// alone answers "when and why did this attempt retire?". It matters most for
+/// an attempt with a linked revision: once the attempt is terminal the
+/// revision reconciler stops dispatching that revision, and without this line
+/// the log shows the revision settling with no record of what retired the
+/// attempt underneath it.
+pub(crate) fn log_ci_remediation_abandoned(attempt: &CiRemediation, reason: &str) {
+    tracing::info!(
+        attempt_id = %attempt.id,
+        work_item_id = %attempt.work_item_id,
+        pr_url = %attempt.pr_url,
+        reason,
+        revision_task_id = attempt.revision_task_id.as_deref().unwrap_or(""),
+        failure_kind = attempt.failure_kind.as_deref().unwrap_or(""),
+        "ci_remediations: attempt abandoned",
+    );
+}
+
 pub(crate) fn abandon_active_ci_remediations_for_work_item_in_tx(
     conn: &Connection,
     work_item_id: &str,
@@ -66,6 +87,7 @@ pub(crate) fn abandon_active_ci_remediations_for_work_item_in_tx(
     let mut abandoned = Vec::with_capacity(ids.len());
     for id in &ids {
         if let Some(row) = query_ci_remediation(conn, id)? {
+            log_ci_remediation_abandoned(&row, reason);
             abandoned.push(row);
         }
     }
@@ -1995,7 +2017,11 @@ impl WorkDb {
                 AND status IN ('pending', 'running')",
             params![attempt_id, reason, now, head_sha_after],
         )?;
-        finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)
+        let abandoned = finish_attempt_update(tx, rows, attempt_id, query_ci_remediation)?;
+        if let Some(attempt) = abandoned.as_ref() {
+            log_ci_remediation_abandoned(attempt, reason);
+        }
+        Ok(abandoned)
     }
 
     /// Stamp the soft-FK from a `ci_remediations` trigger-ledger row to the

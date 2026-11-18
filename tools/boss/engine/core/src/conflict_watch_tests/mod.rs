@@ -2,6 +2,7 @@
 //! the concern each module exercises. Shared fixtures live in [`helpers`].
 
 mod churn;
+mod ci_restart_during_conflict;
 mod deferral;
 mod detection;
 mod escalation;

@@ -386,6 +386,152 @@ fn manual_start_of_ci_fix_revision_refused_when_parent_pr_closed() {
     );
 }
 
+fn insert_pending_conflict_attempt(db: &WorkDb, product_id: &str, chore_id: &str, pr_url: &str, head: &str) -> String {
+    db.insert_conflict_resolution(ConflictResolutionInsertInput {
+        product_id: product_id.to_owned(),
+        work_item_id: chore_id.to_owned(),
+        pr_url: pr_url.to_owned(),
+        pr_number: 3150,
+        head_branch: "feature".into(),
+        base_branch: "main".into(),
+        base_sha_at_trigger: Some("base-1".into()),
+        head_sha_before: Some(head.to_owned()),
+    })
+    .unwrap()
+    .unwrap()
+    .id
+}
+
+/// Conflict pre-empts CI: while a merge-conflict attempt is active for the
+/// parent PR, conflict detection abandons any active CI-fix attempt and
+/// closes its revision on its next tick. An explicit start that re-opened a
+/// CI-fix attempt in that window would be undone at once, so it is refused
+/// with the reason and changes nothing. The settled card says so, and the
+/// same start is accepted once the conflict attempt has retired.
+#[test]
+fn manual_start_of_ci_fix_revision_refused_while_conflict_resolution_is_active() {
+    let db = WorkDb::open(temp_db_path("ci-fix-manual-start-conflict-active")).unwrap();
+    let product_id = make_revision_product(&db, "ci-fix-conflict-active");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3150";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+    let (rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 3150);
+
+    db.reconcile_product_executions(&product_id).unwrap();
+    db.mark_ci_remediation_abandoned(&rem_id, "superseded_by_conflict")
+        .unwrap()
+        .expect("conflict detection supersedes the CI-fix attempt");
+    let crz_id = insert_pending_conflict_attempt(&db, &product_id, &chore_id, pr_url, "head-1");
+
+    // The gate settles the row, and the card names the conflict as the
+    // reason an explicit start will not be accepted yet.
+    db.reconcile_product_executions(&product_id).unwrap();
+    assert_eq!(task_status(&db, &revision_id), "blocked");
+    let (reason, detail) = blocked_fields(&db, &revision_id);
+    assert_eq!(reason.as_deref(), Some("spawning_attempt_retired_unsuccessfully"));
+    let detail = detail.expect("the settled card must explain itself");
+    assert!(
+        detail.contains("abandoned: superseded_by_conflict") && detail.contains("once the conflict is resolved"),
+        "detail must name what ended and that the conflict comes first: {detail}",
+    );
+    let settled = executions_for(&db, &revision_id);
+
+    let err = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
+        .expect_err("re-opening a CI-fix attempt under an active conflict attempt must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("cannot start {revision_id}")) && message.contains(&crz_id),
+        "refusal must name the item and the conflict attempt: {message}",
+    );
+    assert!(
+        message.contains("merge-conflict resolution is in progress") && message.contains("conflict is resolved"),
+        "refusal must say why and when to retry: {message}",
+    );
+    let attempt = db.get_ci_remediation(&rem_id).unwrap().unwrap();
+    assert_eq!(
+        attempt.status, "abandoned",
+        "a refused start must not re-open the attempt"
+    );
+    assert_eq!(attempt.failure_reason.as_deref(), Some("superseded_by_conflict"));
+    assert_eq!(
+        executions_for(&db, &revision_id),
+        settled,
+        "a refused start must not strand an execution",
+    );
+    assert_eq!(
+        blocked_fields(&db, &revision_id),
+        (Some("spawning_attempt_retired_unsuccessfully".to_owned()), Some(detail)),
+        "a refused start must leave the settled card as it was",
+    );
+
+    // The conflict is resolved: the same explicit start now resumes the run.
+    db.mark_conflict_resolution_succeeded(&crz_id, Some("head-2"))
+        .unwrap()
+        .expect("conflict attempt retires");
+    let exec = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    assert_eq!(db.get_ci_remediation(&rem_id).unwrap().unwrap().status, "pending");
+    assert_eq!(blocked_fields(&db, &revision_id), (None, None));
+    db.reconcile_product_executions(&product_id).unwrap();
+    assert!(
+        executions_for(&db, &revision_id)
+            .iter()
+            .any(|(id, status)| id == &exec.id && status == "ready"),
+        "the resumed run must survive the next tick",
+    );
+}
+
+/// The pre-emption is one-directional. Re-opening a retired merge-conflict
+/// attempt is the conflict side resuming, so another active conflict attempt
+/// on the same PR does not refuse it, and its card is not told to wait for
+/// conflict resolution.
+#[test]
+fn conflict_preemption_only_refuses_ci_fix_reopens() {
+    let db = WorkDb::open(temp_db_path("crz-manual-start-conflict-active")).unwrap();
+    let product_id = make_revision_product(&db, "crz-conflict-active");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3151";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+    let retired_crz = insert_pending_conflict_attempt(&db, &product_id, &chore_id, pr_url, "head-1");
+    let revision_id = insert_conflict_revision_row(&db, &product_id, &chore_id, &retired_crz);
+    db.set_conflict_resolution_revision_task_id(&retired_crz, &revision_id)
+        .unwrap();
+    db.mark_conflict_resolution_failed(&retired_crz, "resolver gave up")
+        .unwrap();
+    insert_pending_conflict_attempt(&db, &product_id, &chore_id, pr_url, "head-2");
+
+    db.reconcile_product_executions(&product_id).unwrap();
+    let detail = blocked_fields(&db, &revision_id).1.expect("settled card detail");
+    assert!(
+        !detail.contains("once the conflict is resolved"),
+        "a merge-conflict revision is not told to wait for conflict resolution: {detail}",
+    );
+    let exec = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(&revision_id)
+                .explicit_start(true)
+                .build(),
+        )
+        .expect("a merge-conflict revision's own attempt is re-opened as before");
+    assert_eq!(exec.status, ExecutionStatus::Ready);
+    assert_eq!(
+        db.get_conflict_resolution(&retired_crz).unwrap().unwrap().status,
+        "pending"
+    );
+}
+
 /// An `active` CI-fix revision whose worker is gone and whose spawning
 /// attempt retired underneath it (failed or succeeded), with no reconcile
 /// tick in between — the live-worker-lost shape the automatic recovery

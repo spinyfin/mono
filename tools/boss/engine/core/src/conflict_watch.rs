@@ -1442,6 +1442,15 @@ pub(crate) fn retire_moot_conflict_revisions(
 /// (it defers to an active `conflict_resolutions` attempt), so this is the
 /// symmetric enforcement from the conflict side. Called unconditionally by
 /// [`on_conflict_detected`] right before it commits to owning the PR.
+///
+/// This runs on every detection tick that reaches the insert step, not only
+/// the first: a conflict attempt that is still `pending` with no revision
+/// re-enters here each tick. An explicit start therefore refuses to re-open a
+/// CI-fix attempt while a conflict attempt is active for the work item
+/// (`conflict_attempt_preempting_ci_reopen` in `boss_work_db`); otherwise the
+/// next tick would abandon the re-opened attempt and close its revision
+/// before the run the owner asked for could start. The abandon itself is
+/// logged by the ledger write.
 fn supersede_stale_ci_remediation(work_db: &WorkDb, candidate: &PendingMergeCheck) {
     let Ok(Some(stale)) = work_db.active_ci_remediation_for_work_item(&candidate.work_item_id) else {
         return;

@@ -1183,18 +1183,67 @@ pub(crate) fn reopen_retired_spawning_attempt(
     Ok((rows > 0).then_some(retired))
 }
 
+/// The active merge-conflict attempt that pre-empts re-opening `retired`,
+/// if there is one.
+///
+/// Conflict pre-empts CI (merge-conflict design §Q1). While a
+/// `conflict_resolutions` attempt is `pending` / `running` for a work item,
+/// `ci_watch` declines to start CI remediation for it, and every
+/// `conflict_watch` detection tick that reaches its supersede step abandons
+/// the work item's active `ci_remediations` attempt and closes that attempt's
+/// revision. A CI-fix attempt re-opened in that window is retired again by
+/// the next tick, taking the revision and its queued run with it, so an
+/// explicit start refuses instead of re-opening.
+///
+/// `Ok(None)` unless `retired` is a `ci_remediations` attempt whose work item
+/// has an active conflict attempt. A retired `conflict_resolutions` attempt
+/// is never pre-empted: re-opening it is the conflict side resuming.
+pub(crate) fn conflict_attempt_preempting_ci_reopen(
+    conn: &Connection,
+    retired: &RetiredSpawningAttempt,
+) -> Result<Option<String>> {
+    if retired.table != "ci_remediations" {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT crz.id
+           FROM ci_remediations rem
+           JOIN conflict_resolutions crz ON crz.work_item_id = rem.work_item_id
+          WHERE rem.id = ?1
+            AND crz.status IN ('pending', 'running')
+          ORDER BY crz.created_at DESC, crz.id DESC
+          LIMIT 1",
+        [retired.attempt_id.as_str()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// The `blocked_detail` the revision reconciler writes when it settles an
 /// engine-spawned revision to [`BLOCKED_REASON_SPAWNING_ATTEMPT_RETIRED`]:
-/// what ended, and exactly how to resume it.
-pub(crate) fn spawning_attempt_retired_blocked_detail(attempt: &RetiredSpawningAttempt) -> String {
-    format!(
+/// what ended, and exactly how to resume it. `conflict_in_progress` adds
+/// that an explicit start is refused until the parent PR's conflict is
+/// resolved (see [`conflict_attempt_preempting_ci_reopen`]).
+pub(crate) fn spawning_attempt_retired_blocked_detail(
+    attempt: &RetiredSpawningAttempt,
+    conflict_in_progress: bool,
+) -> String {
+    let mut detail = format!(
         "The engine's {} attempt that spawned this revision ended ({}) before a fix landed, so the \
          engine will not dispatch it on its own. Start it explicitly — drag the card to Doing, run \
          `bossctl work start`, or answer its open question with Yes — to re-open the attempt and \
          retry on the same branch.",
         attempt.kind_label(),
         attempt.outcome_label(),
-    )
+    );
+    if conflict_in_progress {
+        detail.push_str(
+            " Merge-conflict resolution on the parent PR comes first: an explicit start is refused \
+             while it is in progress, so start this once the conflict is resolved.",
+        );
+    }
+    detail
 }
 
 /// Dispatch arm for `kind = 'revision'` tasks.
@@ -1321,7 +1370,11 @@ pub fn reconcile_revision_execution(
     // work start` or an affirmative answer re-opens the retired attempt
     // (`reopen_retired_spawning_attempt`) before minting its execution, so
     // this gate does not fire for a run a human deliberately started. The
-    // `blocked_detail` written below names that path.
+    // `blocked_detail` written below names that path. The one start that
+    // funnel refuses is a CI-fix re-open while a merge-conflict attempt is
+    // active for the same PR (`conflict_attempt_preempting_ci_reopen`); the
+    // detail says so, and the row stays settled here until the conflict is
+    // resolved and the start is repeated.
     if let Some(attempt) = retired_spawning_attempt(conn, task)? {
         let now = now_string();
         abandon_pending_item_work_executions(pending, conn, &task.id, &now)?;
@@ -1343,7 +1396,8 @@ pub fn reconcile_revision_execution(
                     params![task.id, now],
                 )?
             } else {
-                let detail = spawning_attempt_retired_blocked_detail(&attempt);
+                let conflict_in_progress = conflict_attempt_preempting_ci_reopen(conn, &attempt)?.is_some();
+                let detail = spawning_attempt_retired_blocked_detail(&attempt, conflict_in_progress);
                 crate::task_status_audit::execute(
                     conn,
                     "reconcile_revision_execution",
@@ -1892,6 +1946,23 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
                      its next reconcile; file a new chore for further work",
                     root.id,
                     root.status,
+                );
+            }
+            // Conflict pre-empts CI: a CI-fix attempt re-opened while the
+            // parent PR's conflict is still being resolved is abandoned
+            // again by the next conflict-detection tick, which also closes
+            // this revision and strands the run minted below. Refuse with
+            // the reason; the retired attempt and the revision are left
+            // as they are, so the same start works once the conflict is
+            // resolved.
+            if let Some(retired) = retired_spawning_attempt(conn, &task)?
+                && let Some(conflict_attempt_id) = conflict_attempt_preempting_ci_reopen(conn, &retired)?
+            {
+                bail!(
+                    "cannot start {work_item_id}: merge-conflict resolution is in progress on its parent \
+                     PR (attempt {conflict_attempt_id}) and comes before CI fixing, so the engine would \
+                     retire this CI-fix run again on its next conflict check — start it again once the \
+                     conflict is resolved"
                 );
             }
             // The reconciler's second gate: a retired spawning attempt. An
