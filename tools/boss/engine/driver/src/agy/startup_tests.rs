@@ -114,7 +114,9 @@ fn startup_refuses_missing_disabled_malformed_and_changed_configuration() {
     write_exec(&fx.forwarder(), "#!/bin/sh\ncat >/dev/null\n");
     write_exec(&fx.path_guard(), approve_guard());
     fx.install(WorkerKind::Standard);
-    fs::set_permissions(fx.forwarder(), fs::Permissions::from_mode(0o600)).unwrap();
+    // Install binds a run-private copy of the forwarder; disable that copy.
+    let private_forwarder = private_forwarder_config(&fx.process_home, &fx.obs()).forwarder_binary;
+    fs::set_permissions(private_forwarder, fs::Permissions::from_mode(0o600)).unwrap();
     assert_startup_err(
         &fx.input(WorkerKind::Standard),
         "forwarder is not executable",
