@@ -293,6 +293,7 @@ impl ExecutionCoordinator {
                         .execution_status(ExecutionStatus::Failed)
                         .run_status("failed")
                         .error_text(err_detail.as_str())
+                        .launch_failed(true)
                         .increment_pre_start_failure_count(!slot_busy)
                         .record_last_error(true)
                         .build(),

@@ -247,3 +247,31 @@ fn registry_entries_are_sorted_by_name() {
         "schema_migration_registry entries must be in name order so concurrent additions insert at different lines. Keep the frozen 00000000_0000_vNNN_* block first in version order, then insert named entries by the suffix after YYYYMMDD_HHMM_, not at the end of the list."
     );
 }
+
+#[test]
+fn launch_failure_migration_preserves_started_runs_and_is_applied_once() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(CREATE_LEDGER).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE work_executions (id TEXT PRIMARY KEY, status TEXT, started_at TEXT);
+         INSERT INTO work_executions VALUES ('started', 'failed', '123');",
+    )
+    .unwrap();
+    let migration = registry::all()
+        .into_iter()
+        .find(|m| m.id == "20261118_0258_execution_launch_failed")
+        .unwrap();
+    for _ in 0..2 {
+        let tx = conn.transaction().unwrap();
+        apply(&tx, std::slice::from_ref(&migration), None).unwrap();
+        tx.commit().unwrap();
+    }
+    let row: (String, String, bool) = conn
+        .query_row(
+            "SELECT status, started_at, launch_failed FROM work_executions WHERE id = 'started'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("failed".into(), "123".into(), false));
+}

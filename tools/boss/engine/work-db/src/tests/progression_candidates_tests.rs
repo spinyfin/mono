@@ -736,9 +736,15 @@ fn clause_5_a_stale_waiver_does_not_survive_into_a_new_stuck_state() {
 // ── Clause 6: cooldown and failure budget ─────────────────────────────────
 
 fn finished_progression_run(f: &Fixture, id: &str, status: ExecutionStatus, finished_ago: i64) -> String {
+    let started = !matches!(status, ExecutionStatus::Abandoned | ExecutionStatus::Cancelled);
     let run = f.execution(id, ExecutionKind::Progression, status);
     f.sql(&format!(
-        "UPDATE work_executions SET created_at = {t}, finished_at = {t} WHERE id = '{run}'",
+        "UPDATE work_executions SET created_at = {t}, finished_at = {t}, started_at = {started_at} WHERE id = '{run}'",
+        started_at = if started {
+            (now() - finished_ago).to_string()
+        } else {
+            "NULL".to_owned()
+        },
         t = now() - finished_ago
     ));
     run
@@ -1404,20 +1410,32 @@ fn a_run_the_engine_withdrew_before_it_started_is_not_a_failure_or_a_cooldown() 
 }
 
 #[test]
-fn a_run_that_died_before_it_started_still_counts_as_an_infrastructure_failure() {
-    // A spawn that fails before start (`failed`) or loses its worker (`orphaned`)
-    // is a real infrastructure failure even with no `started_at`: only the
-    // engine's own withdrawal (`abandoned`) is exempt. Not counting these would
-    // let the sweep re-nominate the item on every tick.
+fn failed_launches_retry_after_cooldown_but_orphaned_runs_count_as_infrastructure_failures() {
     for status in [ExecutionStatus::Failed, ExecutionStatus::Orphaned] {
         let f = fixture();
         let id = f.stuck_chore("Died before start");
-        finished_progression_run(&f, &id, status.clone(), 20 * HOUR);
+        let first = finished_progression_run(&f, &id, status.clone(), 20 * HOUR);
+        f.sql(&format!(
+            "UPDATE work_executions SET started_at = NULL WHERE id = '{first}'"
+        ));
         assert!(!f.clauses(&id).infrastructure_failing, "one failure is retried");
-        finished_progression_run(&f, &id, status.clone(), 30 * HOUR);
+        let second = finished_progression_run(&f, &id, status.clone(), 30 * HOUR);
+        f.sql(&format!(
+            "UPDATE work_executions SET started_at = NULL WHERE id = '{second}'"
+        ));
         let clauses = f.clauses(&id);
-        assert!(clauses.infrastructure_failing, "{status:?}: {clauses:?}");
-        f.assert_candidate(&id, false);
+        let orphaned = status == ExecutionStatus::Orphaned;
+        assert_eq!(clauses.infrastructure_failing, orphaned, "{status:?}: {clauses:?}");
+        f.assert_candidate(&id, !orphaned);
+        if !orphaned {
+            f.sql(&format!(
+                "UPDATE work_executions SET finished_at = {} WHERE id = '{first}'",
+                now()
+            ));
+            f.assert_candidate(&id, false);
+            assert!(f.clauses(&id).in_cooldown, "failed launches still back off");
+            assert_eq!(f.db.progression_launch_backoff().unwrap().unwrap().waiting_items, 1);
+        }
     }
 }
 
@@ -1432,4 +1450,25 @@ fn the_report_shows_a_dead_run_as_stuck_not_as_being_handled() {
         "UPDATE work_executions SET status = 'completed' WHERE id = '{run}'"
     ));
     assert_eq!(bucket(&f.db, &id), Some(StuckBucket::ProgressionInFlight));
+}
+
+#[test]
+fn torn_down_driver_failures_count_toward_the_cap_without_launch_backoff() {
+    for session in [Some("driver-session"), None] {
+        let f = fixture();
+        let id = f.stuck_chore("Driver stopped");
+        for error in ["driver error", "no disposition"] {
+            let execution = f.execution(&id, ExecutionKind::Progression, ExecutionStatus::Ready);
+            f.db.start_progression_run_on_local_host(&execution, "progression-41", "/tmp/scratch", true)
+                .unwrap();
+            if let Some(session) = session {
+                f.db.claim_run_progress_session_identity(&execution, session).unwrap();
+            }
+            f.db.clear_run_progress_session_identity(&execution).unwrap();
+            f.db.fail_progression_execution(&execution, error).unwrap().unwrap();
+            assert!(f.db.progression_launch_backoff().unwrap().is_none());
+        }
+        assert!(f.clauses(&id).infrastructure_failing);
+        f.assert_candidate(&id, false);
+    }
 }

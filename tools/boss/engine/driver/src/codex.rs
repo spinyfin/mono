@@ -763,8 +763,9 @@ impl CodexRuntimeState {
 
 /// Render the non-hook portion of the per-run user `config.toml`.
 ///
-/// - Stamps the cube workspace as trusted so the first-run trust dialog never
-///   blocks a headless worker.
+/// - Stamps the workspace as trusted, under every spelling Codex may resolve
+///   it to ([`crate::scoped_home::trust_path_variants`]), so the first-run
+///   trust dialog never blocks a headless worker.
 /// - Suppresses the external-agent (Claude Code) config-migration notice for
 ///   this home and this project, and pins the underlying memory-import
 ///   feature off, so a co-located `.claude/` from a prior Claude worker is
@@ -873,9 +874,37 @@ fn render_read_only_socket_profile(workspace: &Path, socket: &Path, profile: &st
     config
 }
 
+/// The question Codex's folder-trust dialog asks, as rendered by codex-cli
+/// 0.160.1 and 0.169.0 (`Trust this folder? Codex can read, edit, and run
+/// files here, …`). The rest of the dialog differs between those releases
+/// (`2. Quit` became `2. Back to Agent Command Center`), so only the question
+/// is matched.
+const CODEX_FOLDER_TRUST_DIALOG_MARKER: &str = "Trust this folder?";
+
 fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> String {
+    // Every spelling Codex may look the workspace up under, not only the
+    // engine's. Codex keys `[projects]` by the working directory it resolves
+    // for itself, which is the physical path, and the two differ whenever the
+    // engine's path crosses a symlink. A cube workspace never does, but a
+    // progression run works in engine scratch under the system temp directory,
+    // and on macOS that is `/var/folders/…`, a symlink to
+    // `/private/var/folders/…`. Stamping only the engine's spelling left Codex
+    // with no trust entry for the directory it was in, so it opened its
+    // "Trust this folder?" dialog instead of the composer and the brief was
+    // pasted into the dialog and lost (measured on codex-cli 0.160.1 and
+    // 0.169.0; see
+    // `docs/investigations/codex-progression-spawn-never-attaches-2026-11-17.md`).
+    //
     // TOML basic-string escape for paths that may contain backslashes or quotes.
-    let workspace_key = toml_basic_string(&workspace.display().to_string());
+    let trust_keys: Vec<String> = crate::scoped_home::trust_path_variants(workspace)
+        .iter()
+        .map(|key| toml_basic_string(key))
+        .collect();
+    let migration_notice_projects: String = trust_keys.iter().map(|key| format!("{key} = true\n")).collect();
+    let trusted_projects: String = trust_keys
+        .iter()
+        .map(|key| format!("[projects.{key}]\ntrust_level = \"trusted\"\n\n"))
+        .collect();
     let config = format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
@@ -899,7 +928,7 @@ fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> Stri
          home = true\n\
          \n\
          [notice.external_config_migration_prompts.projects]\n\
-         {workspace_key} = true\n\
+         {migration_notice_projects}\
          \n\
          [features]\n\
          external_agent_memory_import = false\n\
@@ -917,9 +946,7 @@ fn render_config_toml(workspace: &Path, sandbox_workspace_write: String) -> Stri
          experimental_use_profile = false\n\
          \n\
          {sandbox_workspace_write}\
-         [projects.{workspace_key}]\n\
-         trust_level = \"trusted\"\n\
-         \n"
+         {trusted_projects}"
     );
     config
 }
@@ -1907,12 +1934,25 @@ impl AgentDriver for CodexDriver {
 
     fn launcher_starting_markers(&self) -> Vec<String> {
         // Recorded from the isolated Codex 0.161.0 onboarding picker.
+        //
+        // `Trust this folder?` is the folder-trust dialog, measured on
+        // 0.160.1 and 0.169.0. Its selected row is `› 1. Trust and continue`,
+        // and `›` is an agent marker, so without this entry the launcher
+        // takes the dialog for the composer: it pastes the brief into the
+        // dialog, which discards it, and its Return then accepts the dialog.
+        //
+        // This holds delivery only once the dialog is on screen. Codex draws
+        // a provisional composer first and replaces it with the dialog, and a
+        // brief delivered into that composer is lost all the same. What keeps
+        // the dialog away is the trust the engine pre-stamps
+        // (`render_config_toml`).
         [
             "Sign in with ChatGPT",
             "Sign in with Device Code",
             "Provide your own API key",
             "Sign in from another device",
             "Complete sign-in in your browser",
+            CODEX_FOLDER_TRUST_DIALOG_MARKER,
         ]
         .map(String::from)
         .to_vec()

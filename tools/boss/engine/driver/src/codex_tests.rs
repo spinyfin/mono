@@ -28,6 +28,82 @@ fn progression_profile_is_read_only_with_the_engine_socket_and_github_hosts_only
     assert_eq!(proxy_domains.len(), 2);
 }
 
+/// The projects a rendered config trusts.
+fn trusted_projects(config: &str) -> Vec<String> {
+    let config: toml::Value = toml::from_str(config).unwrap();
+    let projects = config["projects"].as_table().unwrap();
+    for (project, entry) in projects {
+        assert_eq!(entry["trust_level"].as_str(), Some("trusted"), "{project}");
+    }
+    let notices = config["notice"]["external_config_migration_prompts"]["projects"]
+        .as_table()
+        .unwrap();
+    assert_eq!(
+        notices.keys().collect::<Vec<_>>(),
+        projects.keys().collect::<Vec<_>>(),
+        "the migration notice must be suppressed for exactly the trusted spellings"
+    );
+    projects.keys().cloned().collect()
+}
+
+/// Codex keys project trust by the directory it resolves for itself, which is
+/// the physical path. A progression run's scratch directory lives under the
+/// system temp directory, and on macOS that path crosses a symlink
+/// (`/var/folders` -> `/private/var/folders`), so a config trusting only the
+/// engine's spelling would leave Codex asking "Trust this folder?" instead of taking its brief.
+#[test]
+fn a_workspace_reached_through_a_symlink_is_trusted_under_its_physical_path_too() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let physical = root.join("real").join("ws");
+    fs::create_dir_all(&physical).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+    let logical = root.join("link").join("ws");
+
+    for config in [
+        render_base_config_toml(&logical),
+        render_progression_config(&logical, &root.join("frontend.sock")),
+        render_review_guide_config(&logical, &root.join("guide.sock")),
+    ] {
+        let trusted = trusted_projects(&config);
+        for spelling in [&logical, &physical] {
+            assert!(
+                trusted.contains(&spelling.display().to_string()),
+                "{} must be trusted: {trusted:?}",
+                spelling.display()
+            );
+        }
+    }
+
+    // A path with one spelling keeps its one entry, resolvable or not.
+    assert_eq!(
+        trusted_projects(&render_base_config_toml(Path::new("/no/such/workspace"))),
+        vec!["/no/such/workspace".to_owned()]
+    );
+}
+
+/// The folder-trust dialog's selected row starts with `›`, an agent marker, so
+/// the launcher must hold the brief while the dialog is on screen.
+#[test]
+fn the_launcher_holds_the_brief_while_the_folder_trust_dialog_is_on_screen() {
+    let config: serde_json::Value =
+        serde_json::from_str(&crate::initial_prompt::launcher_config(&CodexDriver::default()).unwrap()).unwrap();
+    let starting: Vec<&str> = config["starting_markers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|marker| marker.as_str().unwrap())
+        .collect();
+    assert!(starting.contains(&CODEX_FOLDER_TRUST_DIALOG_MARKER), "{starting:?}");
+    // Launcher-only: the pane monitor must not read a trust dialog as "starting".
+    assert!(
+        !pane_monitor::spec()
+            .starting_markers
+            .iter()
+            .any(|marker| marker == CODEX_FOLDER_TRUST_DIALOG_MARKER)
+    );
+}
+
 #[test]
 fn guide_sandbox_is_read_only_with_only_the_proposal_socket() {
     for enforced in [false, true] {

@@ -36,6 +36,27 @@
 //!   queue gauges (`dispatch.queue_depth.progression`,
 //!   `dispatch.queue_oldest_wait_seconds.progression`) show the backlog.
 //!
+//! ## Failed launches and the backoff
+//!
+//! A progression run whose agent never started is not an attempt on its item
+//! (`progression_ladder`, "Failed launches"): it starts the item's cooldown,
+//! which is the backoff between launch attempts, but it never files the
+//! ladder's question, so a driver whose launch is broken cannot park the items
+//! it is given on the owner. Each item is nominated again when its cooldown
+//! ends, with no limit on how many times.
+//!
+//! That wait must not be silent. After every pass the sweep reads
+//! [`WorkDb::progression_launch_backoff`] and publishes it on the
+//! [`LaunchBackoffSignal`] the engine health report renders
+//! ([`launch_backoff_health_issue`]): how many items are waiting, the error,
+//! and when the next attempt is due. It is derived from the database on each
+//! pass, so an engine restart does not lose it, and it clears on the first pass
+//! after an agent starts or the last such cooldown ends.
+//!
+//! A pass also withdraws any infrastructure-failure question that was filed
+//! for failed launches before they stopped being counted, so those items are
+//! nominated again without the owner answering each one.
+//!
 //! ## Gating
 //!
 //! The `progression_agents` feature flag (default off) is re-checked on every
@@ -48,8 +69,78 @@ use std::time::Duration;
 use boss_engine_storage_values::progression::{
     METADATA_KEY_SWEEP_INTERVAL_SECS, PROGRESSION_AGENTS_FLAG, ProgressionSettings,
 };
+use boss_protocol::EngineHealthIssue;
 
-use crate::work::WorkDb;
+use crate::work::{ProgressionLaunchBackoff, WorkDb};
+
+/// Where the sweep publishes progression's launch backoff for the engine
+/// health report: `Some` while stuck items are waiting out the cooldown a
+/// failed launch started, `None` otherwise. A watch channel so the health
+/// broadcaster pushes a fresh report on every change without polling.
+pub type LaunchBackoffSignal = tokio::sync::watch::Sender<Option<ProgressionLaunchBackoff>>;
+
+/// A [`LaunchBackoffSignal`] that reports no backoff until a pass says so.
+pub fn launch_backoff_signal() -> Arc<LaunchBackoffSignal> {
+    Arc::new(tokio::sync::watch::channel(None).0)
+}
+
+/// Wake health rendering on changes, and once a minute during an unchanged
+/// cooldown so relative retry and failure ages keep advancing.
+pub async fn wait_for_backoff_health_refresh(
+    changes: &mut tokio::sync::watch::Receiver<Option<ProgressionLaunchBackoff>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    let active = changes.borrow().is_some();
+    tokio::select! {
+        changed = changes.changed() => changed,
+        _ = tokio::time::sleep(Duration::from_secs(60)), if active => Ok(()),
+    }
+}
+
+/// `EngineHealthIssue::kind` of the backoff notice in the engine health report.
+pub const LAUNCH_BACKOFF_ISSUE_KIND: &str = "progression_launch_backoff";
+
+/// "in about 3 hours", "in about 5 minutes", or "now" for a moment that has
+/// arrived. Banner text never carries a raw timestamp.
+fn due_phrase(epoch_s: i64, now_epoch_secs: i64) -> String {
+    let secs = epoch_s.saturating_sub(now_epoch_secs);
+    let plural = |n: i64, unit: &str| format!("in about {n} {unit}{}", if n == 1 { "" } else { "s" });
+    match secs {
+        ..=0 => "now".to_owned(),
+        1..=59 => "in under a minute".to_owned(),
+        60..=5399 => plural((secs + 30) / 60, "minute"),
+        _ => plural((secs + 1800) / 3600, "hour"),
+    }
+}
+
+/// Render the backoff as the engine-health issue the app banner and `bossctl`
+/// show. The engine owns the wording; the app renders it verbatim.
+pub fn launch_backoff_health_issue(backoff: &ProgressionLaunchBackoff, now_epoch_secs: i64) -> EngineHealthIssue {
+    let items = match backoff.waiting_items {
+        1 => "1 stuck item".to_owned(),
+        n => format!("{n} stuck items"),
+    };
+    let next = due_phrase(backoff.next_attempt_epoch_s, now_epoch_secs);
+    let failed = boss_engine_utils::iso8601::format_paused_since_phrase(backoff.latest_failure_epoch_s, now_epoch_secs);
+    let failed = if failed.is_empty() {
+        "just now".to_owned()
+    } else {
+        failed
+    };
+    EngineHealthIssue {
+        kind: LAUNCH_BACKOFF_ISSUE_KIND.to_owned(),
+        severity: "warning".to_owned(),
+        title: format!("Progression is backing off: its agent failed to start for {items}; next attempt {next}"),
+        body: format!(
+            "Latest error ({failed}, execution {execution}):\n{error}\n\n\
+             Boss could not start a progression agent for {items}, so nothing is working them. No agent \
+             looked at those items, so the failed starts are not counted against them and nothing is asked \
+             of you. Each item is tried again when its cooldown after the failed start ends; the next attempt \
+             is due {next}. This notice clears itself once an agent starts, or when no item is waiting.",
+            execution = backoff.latest_execution_id,
+            error = backoff.latest_error,
+        ),
+    }
+}
 
 /// Counters from one sweep pass.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -61,11 +152,17 @@ pub struct ProgressionSweepOutcome {
     /// Items the escalation ladder asked the owner about instead of minting a
     /// run for.
     pub asked: usize,
+    /// Items whose infrastructure-failure question the engine withdrew because
+    /// the runs it counted never launched.
+    pub retracted: usize,
+    /// Progression's launch backoff after this pass, if any item is waiting on
+    /// one.
+    pub launch_backoff: Option<ProgressionLaunchBackoff>,
 }
 
 impl crate::sweep_loop::SweepOutcome for ProgressionSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.minted > 0 || self.failed > 0 || self.asked > 0
+        self.minted > 0 || self.failed > 0 || self.asked > 0 || self.retracted > 0
     }
 
     fn log(&self) {
@@ -73,6 +170,7 @@ impl crate::sweep_loop::SweepOutcome for ProgressionSweepOutcome {
             minted = self.minted,
             failed = self.failed,
             asked = self.asked,
+            retracted = self.retracted,
             "progression sweep: pass complete",
         );
     }
@@ -84,12 +182,15 @@ impl crate::sweep_loop::SweepOutcome for ProgressionSweepOutcome {
 ///
 /// `kick_fn` runs whenever a pass minted at least one execution, so the
 /// scheduler picks it up at once rather than on its next heartbeat.
-/// `feature_flags` is re-checked every pass.
+/// `feature_flags` is re-checked every pass. `launch_backoff` receives the
+/// backoff each pass found (`None` while the flag is off: nothing is being
+/// retried, so nothing is backing off).
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     settings: ProgressionSettings,
     kick_fn: Arc<dyn Fn() + Send + Sync>,
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    launch_backoff: Arc<LaunchBackoffSignal>,
 ) -> tokio::task::JoinHandle<()> {
     let initialized = false;
     let cadence_db = work_db.clone();
@@ -100,6 +201,7 @@ pub fn spawn_loop(
             let feature_flags = feature_flags.clone();
             let kick_fn = kick_fn.clone();
             let initialized = initialized.clone();
+            let launch_backoff = launch_backoff.clone();
             async move {
                 use std::sync::atomic::Ordering;
                 if !initialized.load(Ordering::Relaxed) {
@@ -134,6 +236,27 @@ pub fn spawn_loop(
                     };
                 if outcome.minted > 0 {
                     kick_fn();
+                }
+                let changed = launch_backoff.send_if_modified(|published| {
+                    let changed = *published != outcome.launch_backoff;
+                    if changed {
+                        published.clone_from(&outcome.launch_backoff);
+                    }
+                    changed
+                });
+                if let Some(backoff) = &outcome.launch_backoff {
+                    if changed {
+                        tracing::warn!(
+                            waiting_items = backoff.waiting_items,
+                            next_attempt_epoch_s = backoff.next_attempt_epoch_s,
+                            latest_execution_id = %backoff.latest_execution_id,
+                            latest_error = %backoff.latest_error,
+                            "progression sweep: backing off after failed agent launches; each waiting item is \
+                             retried when its cooldown ends",
+                        );
+                    } else {
+                        tracing::debug!(?backoff, "progression sweep: launch backoff unchanged");
+                    }
                 }
                 let interval = work_db
                     .progression_limit(METADATA_KEY_SWEEP_INTERVAL_SECS, settings.sweep_interval_secs)
@@ -213,7 +336,7 @@ fn run_one_pass_blocking(work_db: &WorkDb) -> ProgressionSweepOutcome {
         tracing::warn!(
             work_item_id = %item,
             %reason,
-            "progression sweep: failed to ask the owner about an item the ladder ruled out; will retry",
+            "progression sweep: the ladder could not file or withdraw its question for an item; will retry",
         );
     }
     for (candidate, reason) in &mint.failed {
@@ -224,6 +347,19 @@ fn run_one_pass_blocking(work_db: &WorkDb) -> ProgressionSweepOutcome {
             "progression sweep: failed to queue a progression run",
         );
     }
+    for item in &mint.retracted {
+        outcome.retracted += 1;
+        tracing::info!(
+            work_item_id = %item,
+            "progression sweep: withdrew the question filed for runs that never launched; the item is \
+             nominated again",
+        );
+    }
+    // Read after the mint: an item just given a run is no longer waiting.
+    outcome.launch_backoff = work_db.progression_launch_backoff().unwrap_or_else(|error| {
+        tracing::warn!(?error, "progression sweep: failed to read the launch backoff");
+        None
+    });
     outcome
 }
 
@@ -324,6 +460,138 @@ mod tests {
         assert_eq!(progression_runs(&db, &oldest).len(), 1);
     }
 
+    /// A stuck item whose progression agent failed to start an hour ago is
+    /// neither given up on nor silently skipped: the pass reports the backoff,
+    /// the loop publishes it for the health report, and it reads as a plain
+    /// sentence with no raw timestamp.
+    #[tokio::test]
+    async fn a_pass_reports_the_launch_backoff_and_the_loop_publishes_it() {
+        const ERROR: &str = "no driver hook or session event arrived within 120s after prompt delivery";
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db).id;
+        let id = stuck(&db, &product, "Its agent failed to start", 3);
+        let run = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Failed)
+                    .build(),
+            )
+            .unwrap();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET pre_start_failure_count = 1, last_error = ?3,
+                    created_at = ?2, started_at = ?2, finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![run.id, now - 3600, ERROR],
+            )
+            .unwrap();
+        let db = Arc::new(db);
+
+        let outcome = run_one_pass(db.clone()).await;
+
+        assert_eq!(
+            (outcome.minted, outcome.asked),
+            (0, 0),
+            "inside the cooldown: {outcome:?}"
+        );
+        let backoff = outcome.launch_backoff.clone().expect("the pass reports the backoff");
+        assert_eq!(
+            (backoff.waiting_items, backoff.latest_execution_id.as_str()),
+            (1, run.id.as_str())
+        );
+        assert!(!crate::sweep_loop::SweepOutcome::has_activity(&outcome));
+
+        let issue = launch_backoff_health_issue(&backoff, now);
+        assert_eq!(
+            (issue.kind.as_str(), issue.severity.as_str()),
+            (LAUNCH_BACKOFF_ISSUE_KIND, "warning")
+        );
+        assert_eq!(
+            issue.title,
+            "Progression is backing off: its agent failed to start for 1 stuck item; next attempt in about 5 hours"
+        );
+        for expected in [ERROR, run.id.as_str(), "1 hour ago", "nothing is asked of you"] {
+            assert!(issue.body.contains(expected), "{expected}: {}", issue.body);
+        }
+        assert!(!issue.title.contains('Z') && !issue.body.contains("1970"), "{issue:?}");
+
+        // On: the loop's first pass publishes it. Off: nothing is being
+        // retried, so nothing is backing off.
+        let signal = launch_backoff_signal();
+        let mut changes = signal.subscribe();
+        for (enabled, published) in [(true, Some(backoff)), (false, None)] {
+            let (_flags_dir, store) = flags(enabled);
+            let handle = spawn_loop(
+                db.clone(),
+                ProgressionSettings::default(),
+                Arc::new(|| {}),
+                store,
+                signal.clone(),
+            );
+            tokio::time::timeout(Duration::from_secs(10), changes.changed())
+                .await
+                .expect("the loop publishes the change")
+                .unwrap();
+            handle.abort();
+            assert_eq!(*signal.borrow(), published, "flag on: {enabled}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_backoff_refreshes_the_relative_retry_estimate() {
+        let now = 1_000_000;
+        let backoff = ProgressionLaunchBackoff {
+            waiting_items: 1,
+            next_attempt_epoch_s: now + 6 * 3600,
+            latest_execution_id: "exec_waiting".to_owned(),
+            latest_failure_epoch_s: now,
+            latest_error: "slot occupied".to_owned(),
+        };
+        let signal = launch_backoff_signal();
+        signal.send_replace(Some(backoff.clone()));
+        let mut changes = signal.subscribe();
+        let before = launch_backoff_health_issue(&backoff, now);
+        let started = tokio::time::Instant::now();
+        for _ in 0..60 {
+            wait_for_backoff_health_refresh(&mut changes).await.unwrap();
+        }
+        assert_eq!(*changes.borrow(), Some(backoff.clone()));
+        assert!(!changes.has_changed().unwrap(), "no sweep update was needed");
+        let after = launch_backoff_health_issue(&backoff, now + started.elapsed().as_secs() as i64);
+        assert!(before.title.contains("in about 6 hours"), "{before:?}");
+        assert!(after.title.contains("in about 5 hours"), "{after:?}");
+        assert!(after.body.contains("1 hour ago"), "{after:?}");
+
+        signal.send_replace(None);
+        wait_for_backoff_health_refresh(&mut changes).await.unwrap();
+        assert!(changes.borrow().is_none(), "clearing the notice wakes immediately");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(120), wait_for_backoff_health_refresh(&mut changes))
+                .await
+                .is_err(),
+            "inactive backoff does not refresh periodically"
+        );
+    }
+
+    #[test]
+    fn the_next_attempt_reads_as_a_rounded_wait_never_a_timestamp() {
+        for (secs, phrase) in [
+            (-5, "now"),
+            (0, "now"),
+            (20, "in under a minute"),
+            (60, "in about 1 minute"),
+            (300, "in about 5 minutes"),
+            (5399, "in about 90 minutes"),
+            (5400, "in about 2 hours"),
+            (6 * 3600, "in about 6 hours"),
+        ] {
+            assert_eq!(due_phrase(1_000 + secs, 1_000), phrase, "{secs}s");
+        }
+    }
+
     #[tokio::test]
     async fn a_pass_asks_the_owner_instead_of_queueing_a_run_the_ladder_has_ruled_out() {
         let (_dir, db) = open_db();
@@ -390,7 +658,13 @@ mod tests {
         // Off (the default): nothing is minted and the scheduler is not kicked.
         let (_off_dir, off) = flags(false);
         assert!(!off.is_enabled(PROGRESSION_AGENTS_FLAG));
-        let handle = spawn_loop(db.clone(), ProgressionSettings::default(), kick.clone(), off);
+        let handle = spawn_loop(
+            db.clone(),
+            ProgressionSettings::default(),
+            kick.clone(),
+            off,
+            launch_backoff_signal(),
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
         handle.abort();
         assert!(progression_runs(&db, &id).is_empty());
@@ -398,7 +672,13 @@ mod tests {
 
         // On: the first pass fires immediately.
         let (_on_dir, on) = flags(true);
-        let handle = spawn_loop(db.clone(), ProgressionSettings::default(), kick, on);
+        let handle = spawn_loop(
+            db.clone(),
+            ProgressionSettings::default(),
+            kick,
+            on,
+            launch_backoff_signal(),
+        );
         for _ in 0..100 {
             // The kick follows the mint, so wait for both before aborting.
             if !progression_runs(&db, &id).is_empty() && kicks.load(Ordering::SeqCst) > 0 {
@@ -422,7 +702,13 @@ mod tests {
             .unwrap();
         let db = Arc::new(db);
         let (_flags_dir, on) = flags(true);
-        let handle = spawn_loop(db.clone(), ProgressionSettings::default(), Arc::new(|| {}), on);
+        let handle = spawn_loop(
+            db.clone(),
+            ProgressionSettings::default(),
+            Arc::new(|| {}),
+            on,
+            launch_backoff_signal(),
+        );
         for _ in 0..100 {
             if !progression_runs(&db, &id).is_empty() {
                 break;
@@ -442,7 +728,7 @@ mod tests {
             .cooldown_secs(11 * 3600)
             .build();
         let (_flags_dir, off) = flags(false);
-        let handle = spawn_loop(db.clone(), settings, Arc::new(|| {}), off);
+        let handle = spawn_loop(db.clone(), settings, Arc::new(|| {}), off, launch_backoff_signal());
         for _ in 0..100 {
             if db.get_metadata(METADATA_KEY_COOLDOWN_SECS).unwrap().as_deref() == Some("39600") {
                 break;

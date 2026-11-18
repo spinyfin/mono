@@ -502,6 +502,9 @@ pub struct FinishExecutionRunInput {
     /// retryable pre-start failure.
     #[builder(default)]
     pub increment_pre_start_failure_count: bool,
+    /// Persist pre-start launch failure, including slot collisions, through teardown.
+    #[builder(default)]
+    pub launch_failed: bool,
     /// Write `error_text` onto `work_executions.last_error`. Decoupled from
     /// [`Self::increment_pre_start_failure_count`] so every pre-pane failure
     /// (including `SlotBusy`) persists the reason even when the counter is

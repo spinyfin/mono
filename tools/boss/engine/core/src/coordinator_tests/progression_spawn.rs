@@ -277,24 +277,48 @@ async fn a_progression_run_on_a_gated_item_still_spawns() {
 
 #[tokio::test]
 async fn a_failed_progression_spawn_fails_the_run_but_not_the_item_and_removes_the_scratch_dir() {
-    let f = fixture();
-    let (item_id, run) = f.stuck_item_with_progression_run();
-    let before = item_snapshot(&f.db, &item_id);
-    let (coordinator, cube, _runner) = f.coordinator(FakeExecutionRunner {
-        fail: true,
-        ..FakeExecutionRunner::default()
-    });
+    for (slot_busy, pre_start_failure_count) in [(false, 1), (true, 0)] {
+        let f = fixture();
+        let (item_id, run) = f.stuck_item_with_progression_run();
+        let before = item_snapshot(&f.db, &item_id);
+        let (coordinator, cube, _runner) = f.coordinator(FakeExecutionRunner {
+            fail: true,
+            slot_busy,
+            ..FakeExecutionRunner::default()
+        });
 
-    coordinator.drain_ready_queue_for_test().await;
-    wait_for_execution_status(&f.db, &run.id, ExecutionStatus::Failed).await;
+        coordinator.drain_ready_queue_for_test().await;
+        wait_for_execution_status(&f.db, &run.id, ExecutionStatus::Failed).await;
 
-    assert_no_cube_call(&cube).await;
-    assert_eq!(
-        item_snapshot(&f.db, &item_id),
-        before,
-        "a failed run never demotes the item"
-    );
-    let scratch = boss_execution_contracts::progression_scratch::scratch_dir_for(&run.id).unwrap();
-    assert!(!scratch.exists(), "teardown removes the scratch directory");
-    assert!(f.db.list_attention_items(&run.id).unwrap().is_empty());
+        assert_no_cube_call(&cube).await;
+        assert_eq!(
+            item_snapshot(&f.db, &item_id),
+            before,
+            "a failed run never demotes the item"
+        );
+        let scratch = boss_execution_contracts::progression_scratch::scratch_dir_for(&run.id).unwrap();
+        assert!(!scratch.exists(), "teardown removes the scratch directory");
+        assert!(f.db.list_attention_items(&run.id).unwrap().is_empty());
+
+        // The run is recorded as one that never launched, which is what keeps it
+        // out of the item's infrastructure-failure count and puts the wait before
+        // the next attempt on the launch-backoff report.
+        assert_eq!(
+            f.db.get_execution(&run.id).unwrap().pre_start_failure_count,
+            pre_start_failure_count
+        );
+        let clauses = f.db.progression_clauses(&item_id).unwrap().unwrap();
+        assert!(clauses.in_cooldown && !clauses.infrastructure_failing, "{clauses:?}");
+        let backoff =
+            f.db.progression_launch_backoff()
+                .unwrap()
+                .expect("the failed launch is reported as a backoff");
+        assert_eq!(
+            (backoff.waiting_items, backoff.latest_execution_id.as_str()),
+            (1, run.id.as_str())
+        );
+        if slot_busy {
+            assert!(coordinator.pre_start_streaks().active_alerts().is_empty());
+        }
+    }
 }

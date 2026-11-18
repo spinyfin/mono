@@ -2477,7 +2477,9 @@ async fn serve_scoped(
         cfg.work.progression,
         Arc::new(move || coord_for_progression.kick()),
         server_state.feature_flags.clone(),
+        server_state.progression_launch_backoff.clone(),
     );
+    let _progression_backoff_health_handle = server_state.spawn_progression_backoff_health_broadcaster();
 
     // Automation scheduler (maintenance-tasks.md, Maint task 5): each tick,
     // for every enabled `schedule` automation that is due, compute its

@@ -299,6 +299,18 @@ pub(super) fn all() -> Vec<Migration> {
             apply: progression_candidates::migrate_execution_provenance,
         },
         Migration {
+            id: "20261118_0258_execution_launch_failed".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "launch_failed")? {
+                    conn.execute_batch(
+                        "ALTER TABLE work_executions ADD COLUMN launch_failed INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: execution_wait_history::MIGRATION_ID.into(),
             legacy_version: None,
             apply: execution_wait_history::migrate,

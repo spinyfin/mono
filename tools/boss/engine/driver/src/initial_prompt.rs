@@ -337,6 +337,53 @@ launcher.run([sys.executable, str(root / "stub.py")], sys.argv[2].encode(), [b"C
         steps.iter().map(|step| step.step.as_str()).collect()
     }
 
+    /// A driver that stays on a startup screen is reported with the screen it
+    /// was showing, not only as slow; one that shows nothing known is not
+    /// given a screen it never drew.
+    #[test]
+    fn a_driver_that_never_becomes_ready_is_reported_with_the_startup_screen_that_held_it() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("initial-prompt.py"), LAUNCHER).unwrap();
+        fs::write(
+            temp.path().join("stub.py"),
+            "import os, time, tty\n\
+             tty.setraw(0)\n\
+             os.write(1, b'\\x1b[?2004hClaude Code\\r\\nQuick safety check:')\n\
+             time.sleep(60)\n",
+        )
+        .unwrap();
+        let code = r#"
+import importlib.util, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("launcher", root / "initial-prompt.py")
+launcher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher)
+errors = []
+for starting in ([b"Quick safety check:"], []):
+    try:
+        launcher.run([sys.executable, str(root / "stub.py")], b"brief", [b"Claude Code"], starting,
+                     readiness_timeout=1 if starting else 0.1)
+    except Exception as error:
+        errors.append(f"{type(error).__name__}: {error}")
+(root / "errors.txt").write_text("\n".join(errors))
+"#;
+        let output = boss_command_runner::output_blocking_timeout(
+            std::process::Command::new("python3")
+                .args(["-c", code])
+                .arg(temp.path())
+                .stdin(std::process::Stdio::null()),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("errors.txt")).unwrap(),
+            "TimeoutError: driver did not become ready for initial brief within 1s; it was still showing \
+             'Quick safety check:'\n\
+             TimeoutError: driver did not become ready for initial brief within 0.1s"
+        );
+    }
+
     #[test]
     fn return_is_sent_when_a_short_brief_appears_in_the_composer() {
         // A short paste is shown as its own text, not as a placeholder.
@@ -573,6 +620,10 @@ for fixture in json.loads(r'''[
 for driver, text in [("codex", "› Sign in with ChatGPT"),
                      ("codex", "› Sign in with Device Code"),
                      ("codex", "› Provide your own API key"),
+                     # The folder-trust dialog as codex-cli 0.160.1 and 0.169.0 draw it:
+                     # its selected row carries the composer's `›`.
+                     ("codex", "  Trust this folder? Codex can read, edit, and run files here\r\n\r\n"
+                               "› 1. Trust and continue\r\n  2. Quit\r\n\r\n  enter continue · esc quit"),
                      ("grok", "Grok 4 Waiting for approval...")]:
     config = configs[driver]
     view = launcher.TerminalTail()

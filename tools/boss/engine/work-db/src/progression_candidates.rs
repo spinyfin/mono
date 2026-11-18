@@ -76,6 +76,16 @@
 //!    there is a refusal so the agent can ask); an item that arrives at the
 //!    sweep already over budget is not nominated again.
 //!
+//!    A run whose agent never started ([`launch_failed_sql`]) starts the
+//!    cooldown like any other, which is the backoff between launch attempts,
+//!    but it is not one of the runs the infrastructure-failure cap counts. The
+//!    cap is the engine admitting it cannot unstick *this item*; a failed
+//!    launch says nothing about the item, and every item given the same
+//!    driver fails the same way while that driver's launch is broken. Such an
+//!    item is retried each time its cooldown ends, and
+//!    [`WorkDb::progression_launch_backoff`] reports the wait so it is never
+//!    silent.
+//!
 //! ## Keeping the views current
 //!
 //! [`views_sql`] interpolates the same Rust helpers the stuck report uses
@@ -175,6 +185,27 @@ const LIVE_OR_PENDING: &str = "('queued','ready','waiting_dependency','claimed',
 
 /// Execution statuses of a progression run that died rather than reported.
 const INFRASTRUCTURE_FAILED: &str = "('failed','orphaned','abandoned')";
+
+/// Whether progression execution `x` failed before its driver started. The
+/// durable marker includes slot collisions without counting them in the
+/// driver's pre-start streak. Session identities are transient teardown state.
+/// Keep the start-time and pre-start-count fallbacks for older executions.
+pub(crate) fn launch_failed_sql(x: &str) -> String {
+    format!(
+        "({x}.status = 'failed' AND ({x}.launch_failed = 1
+          OR {x}.pre_start_failure_count > 0 OR {x}.started_at IS NULL))"
+    )
+}
+
+/// The progression runs of item `a` that count as attempts, as a `WHERE`
+/// fragment over execution alias `x`: not cancelled, and not withdrawn by the
+/// engine before it ever started.
+fn attempt_sql(x: &str, a: &str) -> String {
+    format!(
+        "{x}.work_item_id = {a}.id AND {x}.kind = 'progression' AND {x}.status <> 'cancelled'
+         AND NOT ({x}.status = 'abandoned' AND {x}.started_at IS NULL)"
+    )
+}
 
 pub(crate) fn limit_sql(key: &str, default: i64) -> String {
     format!("COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key = '{key}'), {default})")
@@ -494,7 +525,7 @@ pub(crate) fn create_budget_used_sql(a: &str, window: &str) -> String {
 /// run that was cancelled before it started does not start one, a run the engine
 /// withdrew before it ever started (`abandoned` with no `started_at`) is not an
 /// attempt at all, while a never-started `failed` or `orphaned` run still counts
-/// (a spawn that fails before start is a genuine infrastructure failure, and not
+/// (a spawn that fails before start still has to be backed off from, and not
 /// counting it would let the sweep re-nominate the item every tick), and a
 /// run that judged the item not stuck (`no_changes_needed`) earns the longer cooldown. `completed_only` restricts
 /// the runs to ones that reached `completed`: the cooldown the stuck report
@@ -518,14 +549,17 @@ fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
 /// Whether the item's last [`INFRASTRUCTURE_FAILURE_CAP`] progression runs all
 /// ended in infrastructure failure, so the sweep stops nominating it (and the
 /// engine asks the owner: `progression_ladder`). Runs from before the owner's
-/// last "keep trying" answer (`progression_ladder.reset_at`) do not count.
+/// last "keep trying" answer (`progression_ladder.reset_at`) do not count, and
+/// neither does a run that failed to launch ([`launch_failed_sql`]): its agent
+/// never looked at the item, so it is no evidence about the item.
 fn infrastructure_failing_sql(a: &str) -> String {
+    let attempt = attempt_sql("fx", a);
+    let launch_failed = launch_failed_sql("fx");
     (0..INFRASTRUCTURE_FAILURE_CAP)
         .map(|offset| {
             format!(
                 "COALESCE((SELECT fx.status FROM work_executions fx
-                           WHERE fx.work_item_id = {a}.id AND fx.kind = 'progression' AND fx.status <> 'cancelled'
-                             AND NOT (fx.status = 'abandoned' AND fx.started_at IS NULL)
+                           WHERE {attempt} AND NOT {launch_failed}
                              AND (CAST(fx.created_at AS INTEGER) >
                                   COALESCE((SELECT l.reset_at FROM progression_ladder l
                                             WHERE l.work_item_id = {a}.id), 0)
@@ -543,21 +577,39 @@ fn infrastructure_failing_sql(a: &str) -> String {
         .join(" AND ")
 }
 
+/// When the cooldown after the item's latest progression attempt ends, if that
+/// attempt failed to launch and the cooldown is still running; NULL otherwise.
+/// This is progression backing off on the item: nothing is wrong with the
+/// item, and the next attempt is made as soon as this moment passes.
+fn launch_backoff_until_sql(a: &str, cooldown: &str) -> String {
+    let attempt = attempt_sql("bx", a);
+    let launch_failed = launch_failed_sql("bx");
+    let until = format!("COALESCE(CAST(bx.finished_at AS INTEGER), CAST(bx.created_at AS INTEGER)) + ({cooldown})");
+    format!(
+        "(SELECT CASE WHEN {launch_failed} AND {until} > {NOW} THEN {until} END
+          FROM work_executions bx WHERE {attempt}
+          ORDER BY bx.created_at DESC, bx.id DESC LIMIT 1)"
+    )
+}
+
 /// The progression-run facts about one item: whether a run is live or pending,
-/// whether the item is inside the cooldown after a run, and whether the last
-/// runs all died. They depend only on the item's own progression executions, so
+/// whether the item is inside the cooldown after a run, whether the last
+/// runs all died, and until when progression is backing off after a failed
+/// launch. They depend only on the item's own progression executions, so
 /// the stuck report reads them from their own cheap view.
 fn run_state_select(cooldown: &str) -> String {
     let in_cooldown = in_cooldown_sql("t", cooldown, false);
     let in_completed_cooldown = in_cooldown_sql("t", cooldown, true);
     let infrastructure_failing = infrastructure_failing_sql("t");
+    let launch_backoff_until = launch_backoff_until_sql("t", cooldown);
     format!(
         "EXISTS (SELECT 1 FROM work_executions lx
                  WHERE lx.work_item_id = t.id AND lx.kind = 'progression'
                    AND lx.status IN {LIVE_OR_PENDING}) AS progression_live,
          {in_cooldown} AS in_cooldown,
          {in_completed_cooldown} AS in_completed_cooldown,
-         ({infrastructure_failing}) AS infrastructure_failing"
+         ({infrastructure_failing}) AS infrastructure_failing,
+         {launch_backoff_until} AS launch_backoff_until"
     )
 }
 
@@ -646,7 +698,8 @@ fn views_sql() -> String {
                 {c6} AS c6_cooldown_and_budget_clear,
                 s.progression_live AS progression_live,
                 s.in_cooldown AS in_cooldown,
-                s.infrastructure_failing AS infrastructure_failing
+                s.infrastructure_failing AS infrastructure_failing,
+                s.launch_backoff_until AS launch_backoff_until
          FROM (
              SELECT t.id AS work_item_id,
                     {stuck_kind} AS stuck_kind,
@@ -681,6 +734,7 @@ fn views_sql() -> String {
                 b.progression_live AS progression_live,
                 b.in_cooldown AS in_cooldown,
                 b.infrastructure_failing AS infrastructure_failing,
+                b.launch_backoff_until AS launch_backoff_until,
                 x.dependency_held AS dependency_held
          FROM progression_candidate_base b
          JOIN tasks t ON t.id = b.work_item_id
@@ -801,6 +855,62 @@ impl ProgressionClauses {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Whether progression is backing off after failed launches, and until
+    /// when. `None` when no item is waiting on one.
+    ///
+    /// An item counts when its latest progression run failed to launch
+    /// ([`launch_failed_sql`]), the cooldown from that run is still running,
+    /// and every other clause that does not depend on time or on the run
+    /// history holds, so the cooldown is the one thing between the item and
+    /// its next run. An item that stopped being stuck, was parked, or picked
+    /// up live work in the meantime is not waiting on progression at all.
+    pub fn progression_launch_backoff(&self) -> Result<Option<ProgressionLaunchBackoff>> {
+        let conn = self.connect()?;
+        // The run-state view is cheap; the clause view is the expensive one,
+        // so it is only read when some item is inside such a cooldown.
+        let any: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM progression_run_state WHERE launch_backoff_until IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !any {
+            return Ok(None);
+        }
+        let attempt = attempt_sql("x", "c");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT c.launch_backoff_until, x.id,
+                    COALESCE(CAST(x.finished_at AS INTEGER), CAST(x.created_at AS INTEGER)),
+                    COALESCE(x.last_error, '')
+             FROM (SELECT work_item_id AS id, launch_backoff_until FROM progression_candidate_clauses
+                   WHERE launch_backoff_until IS NOT NULL AND NOT progression_live AND stuck_kind IS NOT NULL
+                     AND c1_eligible AND c2_no_live_work AND c2_no_inflight_ladder
+                     AND c3_not_capacity_wait AND c4_dependency_clear) c
+             JOIN work_executions x ON x.id = (SELECT x.id FROM work_executions x WHERE {attempt}
+                                               ORDER BY x.created_at DESC, x.id DESC LIMIT 1)
+             ORDER BY 3 DESC, x.id DESC"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some((_, latest_execution_id, latest_failure_epoch_s, latest_error)) = rows.first().cloned() else {
+            return Ok(None);
+        };
+        Ok(Some(ProgressionLaunchBackoff {
+            waiting_items: rows.len(),
+            next_attempt_epoch_s: rows.iter().map(|row| row.0).min().unwrap_or_default(),
+            latest_execution_id,
+            latest_failure_epoch_s,
+            latest_error,
+        }))
+    }
+
     /// The progression candidates, oldest-stuck first. `limit` bounds how many
     /// are returned; `None` returns them all.
     pub fn list_progression_candidates(&self, limit: Option<usize>) -> Result<Vec<ProgressionCandidate>> {
@@ -863,6 +973,10 @@ impl WorkDb {
     pub fn mint_progression_executions(&self) -> Result<ProgressionMint> {
         let mut conn = self.connect()?;
         let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        // Before the candidates are read: an item whose question is withdrawn
+        // here is a candidate again in this same pass.
+        let retraction = crate::progression_ladder::retract_unwarranted_questions(&mut tx, &mut pending)?;
         let candidates = {
             let mut stmt = tx.prepare(
                 "SELECT c.work_item_id, c.stuck_kind, c.stuck_since, c.grace_waived,
@@ -874,13 +988,16 @@ impl WorkDb {
             let rows = stmt.query_map([], |row| Ok((read_candidate(row)?, row.get::<_, String>(4)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut mint = ProgressionMint::default();
-        let mut pending = PendingEvents::new();
+        let mut mint = ProgressionMint {
+            retracted: retraction.retracted,
+            ladder_failed: retraction.failed,
+            ..Default::default()
+        };
         // The ladder first: an item whose attempts have run out is asked about
         // (and parked on the question) instead of being given another run.
         let pass = crate::progression_ladder::run_pass(&mut tx, &mut pending, candidates)?;
         mint.asked = pass.asked;
-        mint.ladder_failed = pass.failed;
+        mint.ladder_failed.extend(pass.failed);
         let mut minted_families = HashSet::new();
         for (candidate, family_key) in pass.mintable {
             if minted_families.contains(&family_key) {
@@ -918,9 +1035,14 @@ pub struct ProgressionMint {
     /// run for (`progression_ladder`).
     pub asked: Vec<crate::progression_ladder::LadderQuestion>,
     /// Items the ladder meant to ask about and could not (the question could
-    /// not be filed), with the reason. They are not minted a run either: that
+    /// not be filed), or whose unwarranted question it could not withdraw,
+    /// with the reason. They are not minted a run either: that
     /// would be the attempt the ladder ruled out. The next pass tries again.
     pub ladder_failed: Vec<(String, String)>,
+    /// Items whose infrastructure-failure question the engine withdrew because
+    /// the runs it counted never launched (`progression_ladder`). They are
+    /// candidates again, in this pass when their cooldown allows.
+    pub retracted: Vec<String>,
 }
 
 fn read_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProgressionCandidate> {
@@ -953,6 +1075,25 @@ fn insert_progression_execution(conn: &Connection, work_item_id: &str) -> Result
         [work_item_id],
     )?;
     Ok(execution)
+}
+
+/// Progression backing off after its agents failed to launch: the stuck items
+/// that would be given a run now but for the cooldown a failed launch started.
+/// Nothing is asked of the owner and nothing is given up: each item is retried
+/// when its cooldown ends. See [`WorkDb::progression_launch_backoff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressionLaunchBackoff {
+    /// Items waiting out that cooldown.
+    pub waiting_items: usize,
+    /// Epoch seconds at which the first of those cooldowns ends, which is when
+    /// the next launch is attempted.
+    pub next_attempt_epoch_s: i64,
+    /// The most recent failed launch among those items.
+    pub latest_execution_id: String,
+    /// Epoch seconds at which it failed.
+    pub latest_failure_epoch_s: i64,
+    /// Why it failed, as recorded on the execution.
+    pub latest_error: String,
 }
 
 /// A progression run's footprint on one item; see `progression_run_state`.

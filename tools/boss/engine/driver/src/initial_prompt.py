@@ -490,8 +490,12 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     submitting = True
                     stage, deadline = "submit", now + readiness_timeout
             elif stage != "delivered" and now >= deadline:
+                # Name the startup screen that held delivery back, so the failure
+                # says what the driver was showing instead of only that it was slow.
+                held = next((marker for marker in starting_markers if marker in view.tail()), None)
                 raise TimeoutError({
-                    "ready": f"driver did not become ready for initial brief within {readiness_timeout}s",
+                    "ready": f"driver did not become ready for initial brief within {readiness_timeout}s"
+                             + (f"; it was still showing {held.decode('utf-8', 'replace')!r}" if held else ""),
                     "paste": f"driver did not read the initial brief within {readiness_timeout}s",
                     "submit": f"driver did not read the submit key within {readiness_timeout}s",
                 }[stage])

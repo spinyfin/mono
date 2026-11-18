@@ -791,6 +791,9 @@ struct ServerState {
     tmux_preflight: Arc<std::sync::RwLock<boss_engine_runtime::tmux_preflight::TmuxPreflight>>,
     #[builder(default)]
     tmux_health_issues: std::sync::RwLock<Vec<boss_protocol::EngineHealthIssue>>,
+    /// Progression's launch backoff, published by the progression sweep.
+    #[builder(default = boss_engine_runtime::progression_sweep::launch_backoff_signal())]
+    progression_launch_backoff: Arc<boss_engine_runtime::progression_sweep::LaunchBackoffSignal>,
     /// What the startup pass that retries pre-start-failed review guides
     /// did. Set once, before the engine serves requests; empty until then.
     #[builder(default)]

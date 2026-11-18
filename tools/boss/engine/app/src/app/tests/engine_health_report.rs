@@ -43,6 +43,49 @@ async fn tmux_warning_is_in_the_health_wire_report_and_clears_when_fixed() {
     }
 }
 
+/// Progression waiting out the cooldown after a failed agent launch must be
+/// visible on the health report, and must clear when the sweep stops reporting
+/// it. Without the entry that wait is indistinguishable from progression
+/// having stopped.
+#[tokio::test]
+async fn progression_launch_backoff_is_on_the_health_report_until_the_sweep_clears_it() {
+    let (state, _dir) = test_server_state();
+    let kind = boss_engine_runtime::progression_sweep::LAUNCH_BACKOFF_ISSUE_KIND;
+    let reported = |state: &Arc<ServerState>| {
+        build_engine_health_report(state)
+            .issues
+            .into_iter()
+            .find(|issue| issue.kind == kind)
+    };
+    assert!(reported(&state).is_none());
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    state
+        .progression_launch_backoff
+        .send_replace(Some(boss_work_db::ProgressionLaunchBackoff {
+            waiting_items: 4,
+            next_attempt_epoch_s: now + 20 * 60,
+            latest_execution_id: "exec_progression_4".to_owned(),
+            latest_failure_epoch_s: now - 2 * 3600,
+            latest_error: "no driver hook or session event arrived within 120s".to_owned(),
+        }));
+    let issue = reported(&state).expect("the backoff reaches the health report");
+    assert_eq!(issue.severity, "warning");
+    assert!(
+        issue.title.contains("4 stuck items") && issue.title.contains("in about 20 minutes"),
+        "{}",
+        issue.title
+    );
+    assert!(
+        issue.body.contains("no driver hook or session event") && issue.body.contains("exec_progression_4"),
+        "{}",
+        issue.body
+    );
+
+    state.progression_launch_backoff.send_replace(None);
+    assert!(reported(&state).is_none());
+}
+
 /// The engine-health helper must surface a
 /// `missing_anthropic_api_key` issue when the agent config
 /// resolved with no key — that's exactly the case the macOS app

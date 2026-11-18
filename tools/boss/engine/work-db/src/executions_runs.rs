@@ -1817,6 +1817,7 @@ impl WorkDb {
             error_text,
             clear_workspace_lease,
             increment_pre_start_failure_count,
+            launch_failed,
             record_last_error,
             worker_failure_basis,
             attention,
@@ -1883,6 +1884,7 @@ impl WorkDb {
                  workspace_path = CASE WHEN ?3 THEN NULL ELSE workspace_path END,
                  finished_at = ?4,
                  pre_start_failure_count = pre_start_failure_count + CASE WHEN ?5 THEN 1 ELSE 0 END,
+                 launch_failed = ?8,
                  last_error = CASE WHEN ?7 THEN COALESCE(?6, last_error) ELSE last_error END
              WHERE id = ?1",
             params![
@@ -1893,6 +1895,7 @@ impl WorkDb {
                 increment_pre_start_failure_count,
                 normalized_error_text.as_deref(),
                 record_last_error,
+                launch_failed,
             ],
         )?;
 

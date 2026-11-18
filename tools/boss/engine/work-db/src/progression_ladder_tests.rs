@@ -13,6 +13,8 @@ use serde_json::json;
 const HOUR: i64 = 3600;
 const S5: &str = "S5_merge_conflict";
 const S7: &str = "S7_worker_failed";
+/// The error a Codex progression spawn recorded while its launch was broken.
+const LAUNCH_ERROR: &str = "refusing to complete codex spawn: no driver hook or session event arrived within 120s";
 
 fn now() -> i64 {
     boss_engine_utils::epoch_time::now_epoch_secs()
@@ -151,6 +153,22 @@ impl Fx {
             .id;
         self.finish(&run, status, disposition, ago, fingerprint, kind);
         run
+    }
+
+    /// A finished progression run whose agent never started: the dispatcher
+    /// records a failed spawn as `failed` with the pre-start failure counted.
+    fn failed_launch(&self, id: &str, ago: i64) -> String {
+        let run = self.past_run(id, "failed", None, ago, "fp", S5);
+        self.fail_to_launch(&run);
+        run
+    }
+
+    /// Mark `run` (already `failed`) as never having launched.
+    fn fail_to_launch(&self, run: &str) {
+        self.sql(&format!(
+            "UPDATE work_executions
+             SET pre_start_failure_count = 1, last_error = '{LAUNCH_ERROR}' WHERE id = '{run}'"
+        ));
     }
 
     fn open_question(&self, id: &str) -> Option<OperatorQuestionRecord> {
@@ -572,6 +590,306 @@ fn two_infrastructure_failures_stop_the_nominations_and_file_the_question_with_t
     ));
     assert_eq!(fx.pass().asked.len(), 0);
     assert!(fx.open_question(&healed).is_none());
+}
+
+// ── failed launches ──────────────────────────────────────────────────────────
+
+/// A progression agent that fails to start says nothing about the item it was
+/// sent to, so such runs never stop nominations or file the question. The item
+/// is retried after each cooldown.
+#[test]
+fn failed_launches_are_retried_after_each_cooldown_and_never_file_the_question() {
+    let fx = fx();
+    let id = fx.conflicted("Its agent never starts");
+    fx.failed_launch(&id, 30 * HOUR);
+    fx.failed_launch(&id, 20 * HOUR);
+
+    for attempt in 3..=4 {
+        let pass = fx.pass();
+        assert_eq!(
+            (pass.minted.len(), pass.asked.len()),
+            (1, 0),
+            "attempt {attempt}: {pass:?}"
+        );
+        let clauses = fx.db.progression_clauses(&id).unwrap().unwrap();
+        assert!(!clauses.infrastructure_failing, "{clauses:?}");
+        let run = pass.minted[0].1.id.clone();
+        fx.finish(&run, "failed", None, 10 * HOUR, "fp", S5);
+        fx.fail_to_launch(&run);
+    }
+    assert!(fx.open_question(&id).is_none());
+    assert_eq!(fx.task(&id).blocked_reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(fx.progression_runs(&id).len(), 4);
+
+    // Inside the cooldown after a failed launch the item is not nominated: the
+    // backoff between attempts is unchanged.
+    let cooling = fx.conflicted("Failed to launch an hour ago");
+    fx.failed_launch(&cooling, HOUR);
+    assert!(!fx.is_candidate(&cooling));
+    let clauses = fx.db.progression_clauses(&cooling).unwrap().unwrap();
+    assert!(clauses.in_cooldown && !clauses.infrastructure_failing, "{clauses:?}");
+}
+
+#[test]
+fn slot_collisions_back_off_without_filing_a_question_and_retry_after_cooldown() {
+    let fx = fx();
+    let id = fx.conflicted("Slot occupied");
+    for ago in [2 * HOUR, HOUR] {
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let (_, run) = fx
+            .db
+            .start_progression_run_on_local_host(&execution.id, "progression-41", "/tmp/scratch", true)
+            .unwrap();
+        fx.db
+            .finish_execution_run(
+                boss_protocol::FinishExecutionRunInput::builder()
+                    .execution_id(&execution.id)
+                    .run_id(&run.id)
+                    .execution_status(ExecutionStatus::Failed)
+                    .run_status("failed")
+                    .launch_failed(true)
+                    .error_text("slot busy")
+                    .record_last_error(true)
+                    .build(),
+            )
+            .unwrap();
+        fx.finish(&execution.id, "failed", None, ago, "fp", S5);
+        assert_eq!(fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count, 0);
+    }
+    let pass = fx.pass();
+    assert!(pass.minted.is_empty() && pass.asked.is_empty(), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+    assert!(!fx.db.progression_clauses(&id).unwrap().unwrap().infrastructure_failing);
+    assert_eq!(fx.db.progression_launch_backoff().unwrap().unwrap().waiting_items, 1);
+    fx.sql(&format!(
+        "UPDATE work_executions SET finished_at = finished_at - {} WHERE work_item_id = '{id}'",
+        6 * HOUR
+    ));
+    assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+}
+
+#[test]
+fn failed_runs_with_driver_sessions_still_file_the_infrastructure_question() {
+    let fx = fx();
+    let id = fx.conflicted("Driver started and died");
+    for (ago, error) in [(2 * HOUR, "driver error"), (HOUR, "no disposition")] {
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        fx.db
+            .start_progression_run_on_local_host(&execution.id, "progression-41", "/tmp/scratch", true)
+            .unwrap();
+        fx.db
+            .claim_run_progress_session_identity(&execution.id, "driver-session")
+            .unwrap();
+        fx.db.clear_run_progress_session_identity(&execution.id).unwrap();
+        fx.db.fail_progression_execution(&execution.id, error).unwrap().unwrap();
+        fx.finish(&execution.id, "failed", None, ago, "fp", S5);
+    }
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (0, 1), "{pass:?}");
+    assert_eq!(pass.asked[0].reason, LadderReason::InfrastructureFailure);
+    let question = fx.open_question(&id).unwrap();
+    let next = fx.pass();
+    assert!(next.retracted.is_empty(), "{next:?}");
+    assert_eq!(fx.open_question(&id).unwrap().question.id, question.question.id);
+    assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+}
+
+#[test]
+fn a_question_filed_for_unstarted_runs_without_a_driver_streak_is_withdrawn() {
+    let fx = fx();
+    let id = fx.conflicted("Launch never began");
+    for ago in [20 * HOUR, 10 * HOUR] {
+        fx.past_run(&id, "failed", None, ago, "fp", S5);
+    }
+    assert_eq!(fx.pass().asked.len(), 1);
+    fx.sql(&format!(
+        "UPDATE work_executions SET started_at = NULL WHERE work_item_id = '{id}'"
+    ));
+    let pass = fx.pass();
+    assert_eq!(pass.retracted, vec![id.clone()]);
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+}
+
+#[test]
+fn a_failed_launch_between_two_runs_that_died_neither_counts_nor_hides_them() {
+    let fx = fx();
+    let id = fx.conflicted("Started twice and died, with a failed launch between");
+    let first = fx.past_run(&id, "orphaned", None, 30 * HOUR, "fp", S5);
+    let never_launched = fx.failed_launch(&id, 20 * HOUR);
+    let second = fx.past_run(&id, "orphaned", None, 10 * HOUR, "fp", S5);
+
+    let pass = fx.pass();
+
+    assert_eq!((pass.minted.len(), pass.asked.len()), (0, 1), "{pass:?}");
+    assert_eq!(pass.asked[0].reason, LadderReason::InfrastructureFailure);
+    let explanation = fx.open_question(&id).unwrap().question.explanation;
+    for run in [&first, &second] {
+        assert!(explanation.contains(run.as_str()), "{run}: {explanation}");
+    }
+    assert!(!explanation.contains(never_launched.as_str()), "{explanation}");
+
+    // One dead run and one failed launch is one counted failure, not two.
+    let once = fx.conflicted("Died once, then failed to launch");
+    fx.past_run(&once, "orphaned", None, 30 * HOUR, "fp", S5);
+    fx.failed_launch(&once, 20 * HOUR);
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+}
+
+/// An item already parked on a question that was filed for two failed
+/// launches, while those still counted. The next pass takes the question back
+/// and nominates the item again, with nothing asked of the owner.
+#[test]
+fn a_question_filed_for_failed_launches_is_withdrawn_and_the_item_runs_again() {
+    let fx = fx();
+    let id = fx.conflicted("Asked about because its agent never started");
+    fx.sql(&format!("UPDATE tasks SET autostart = 1 WHERE id = '{id}'"));
+    // Filed while a failed launch was still counted like any other failure.
+    let runs = [
+        fx.past_run(&id, "failed", None, 30 * HOUR, "fp", S5),
+        fx.past_run(&id, "failed", None, 20 * HOUR, "fp", S5),
+    ];
+    assert_eq!(fx.pass().asked.len(), 1);
+    let question = fx.open_question(&id).expect("question filed");
+    assert_eq!(fx.task(&id).blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+    for run in &runs {
+        fx.fail_to_launch(run);
+    }
+
+    let pass = fx.pass();
+
+    assert_eq!(pass.retracted, vec![id.clone()], "{pass:?}");
+    assert_eq!(
+        (pass.minted.len(), pass.asked.len()),
+        (1, 0),
+        "retried in the same pass: {pass:?}"
+    );
+    assert!(pass.ladder_failed.is_empty(), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+    let withdrawn = fx
+        .db
+        .list_operator_questions(&id)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.question.id == question.question.id)
+        .unwrap();
+    assert_eq!(withdrawn.status, OperatorQuestionStatus::Withdrawn);
+    assert_eq!(
+        withdrawn.withdrawn_reason.as_deref(),
+        Some(WITHDRAWN_LAUNCH_FAILURES_NOT_COUNTED)
+    );
+    let task = fx.task(&id);
+    assert_eq!(
+        (
+            task.status.to_string().as_str(),
+            task.blocked_reason.as_deref(),
+            task.autostart
+        ),
+        ("blocked", Some("merge_conflict"), true),
+        "back in the state it was stuck in"
+    );
+    // The withdrawal is a one-off: the next pass has nothing to take back.
+    assert!(fx.pass().retracted.is_empty());
+}
+
+#[test]
+fn a_question_filed_for_runs_that_started_and_died_stays_open() {
+    let fx = fx();
+    let id = fx.conflicted("Its agent started twice and died twice");
+    fx.past_run(&id, "failed", None, 30 * HOUR, "fp", S5);
+    fx.past_run(&id, "orphaned", None, 20 * HOUR, "fp", S5);
+    assert_eq!(fx.pass().asked.len(), 1);
+    let question = fx.open_question(&id).expect("question filed");
+
+    let pass = fx.pass();
+
+    assert!(pass.retracted.is_empty() && pass.minted.is_empty(), "{pass:?}");
+    assert_eq!(
+        fx.open_question(&id).map(|open| open.question.id),
+        Some(question.question.id)
+    );
+    assert_eq!(fx.task(&id).blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+}
+
+/// The backoff after a failed launch is reported, not silent: how many stuck
+/// items are waiting, when the first is retried, and the latest error.
+#[test]
+fn the_launch_backoff_names_the_waiting_items_the_next_attempt_and_the_error() {
+    let fx = fx();
+    assert_eq!(fx.db.progression_launch_backoff().unwrap(), None);
+    let cooldown = 6 * HOUR;
+
+    let older = fx.conflicted("Failed to launch two hours ago");
+    fx.failed_launch(&older, 2 * HOUR);
+    let newer = fx.conflicted("Failed to launch an hour ago");
+    let latest = fx.failed_launch(&newer, HOUR);
+    // Not waiting on a launch: its cooldown is over, it stopped being stuck,
+    // its run completed, or its run started and then died.
+    let due = fx.conflicted("Cooldown over");
+    fx.failed_launch(&due, 7 * HOUR);
+    let healed = fx.conflicted("No longer stuck");
+    fx.failed_launch(&healed, HOUR);
+    fx.sql(&format!(
+        "UPDATE tasks SET status = 'in_review', blocked_reason = NULL WHERE id = '{healed}'"
+    ));
+    let acted = fx.conflicted("Acted an hour ago");
+    fx.past_run(&acted, "completed", Some("progressed"), HOUR, "fp", S5);
+    let died = fx.conflicted("Started and died an hour ago");
+    fx.past_run(&died, "orphaned", None, HOUR, "fp", S5);
+
+    let backoff = fx.db.progression_launch_backoff().unwrap().expect("backing off");
+    assert_eq!(backoff.waiting_items, 2, "{backoff:?}");
+    assert_eq!(backoff.latest_execution_id, latest);
+    assert_eq!(backoff.latest_error, LAUNCH_ERROR);
+    let (failed_ago, next_in) = (
+        now() - backoff.latest_failure_epoch_s,
+        backoff.next_attempt_epoch_s - now(),
+    );
+    assert!((HOUR..HOUR + 60).contains(&failed_ago), "{backoff:?}");
+    let first_due = cooldown - 2 * HOUR;
+    assert!((first_due - 60..=first_due).contains(&next_in), "{backoff:?}");
+
+    // The item whose cooldown is over is given its run; the two still inside
+    // theirs are what the report keeps naming.
+    let pass = fx.pass();
+    assert_eq!(
+        pass.minted
+            .iter()
+            .map(|(candidate, _)| candidate.work_item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![due.as_str()]
+    );
+    assert_eq!(fx.db.progression_launch_backoff().unwrap().unwrap().waiting_items, 2);
+
+    // Once their cooldowns end nothing is backing off: they are candidates.
+    fx.sql(&format!(
+        "UPDATE work_executions SET finished_at = finished_at - {cooldown}
+         WHERE kind = 'progression' AND work_item_id IN ('{older}', '{newer}')"
+    ));
+    assert_eq!(fx.db.progression_launch_backoff().unwrap(), None);
+    assert!(fx.is_candidate(&older) && fx.is_candidate(&newer));
 }
 
 // ── the answers ──────────────────────────────────────────────────────────────
