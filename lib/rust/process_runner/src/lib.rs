@@ -63,7 +63,20 @@ pub fn output_bounded(
         command.process_group(0);
     }
     let program = command.get_program().to_string_lossy().into_owned();
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    // A freshly written executable can be briefly "text file busy" when another
+    // thread forked while its write descriptor was still open; that clears as
+    // soon as the forked child execs, so retry for a short bounded time.
+    let mut attempts = 0;
+    let mut child = loop {
+        match command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    };
     on_spawn(child.id());
     let kill = |child: &mut std::process::Child| {
         #[cfg(unix)]
