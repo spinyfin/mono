@@ -11,6 +11,9 @@ fn main() -> anyhow::Result<()> {
     // This standalone process has no threads yet; never mutate engine globals.
     unsafe {
         std::env::set_var("BOSS_AGY_HOMES_DIR", directory.join("homes"));
+        // Provisioning links the run's transcripts into the durable store;
+        // keep the probe's inside its own evidence directory, never Boss's.
+        std::env::set_var("BOSS_WORKER_TRANSCRIPTS_ROOT", directory.join("transcripts"));
         std::env::remove_var("BOSS_AGY_SKIP_BINARY_ASSERT");
         std::env::remove_var("BOSS_AGY_SKIP_POSTURE_ASSERT");
     }

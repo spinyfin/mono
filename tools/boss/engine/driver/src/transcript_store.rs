@@ -1,8 +1,12 @@
-//! Durable, transcript-only storage for isolated agent homes.
+//! Durable storage for the transcripts of isolated agent homes.
 //!
-//! Codex and Grok retain their session JSONL under Boss's state root while
-//! keeping credentials, hooks, and all other per-run state in their temporary
-//! homes. The per-execution layout mirrors Boss's other durable artifacts.
+//! Codex, Grok and Antigravity (`agy`) retain their session records under
+//! Boss's state root while keeping credentials, hooks, and all other per-run
+//! state in their temporary homes. The per-execution layout mirrors Boss's
+//! other durable artifacts. Codex and Grok link a dedicated `sessions`
+//! directory that holds nothing but session JSONL; `agy` has no such
+//! directory (its transcript lives inside the per-conversation `brain/` tree),
+//! so it links `brain` itself — see [`AGY_BRAIN_LEAF`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,12 +16,24 @@ use anyhow::{Context, bail};
 // Default leaf names of the per-run homes roots, reused directly so a rename
 // of either original cannot silently desync this rewrite from where the homes
 // actually live.
-use crate::agy::AGY_HOMES_DIR_NAME as AGY_HOMES_DIR_MARKER;
+use crate::agy::{
+    AGY_HOMES_DIR_NAME as AGY_HOMES_DIR_MARKER, GEMINI_DIR as AGY_GEMINI_DIR,
+    PROCESS_HOME_LEAF as AGY_PROCESS_HOME_LEAF, STATE_DIR as AGY_STATE_DIR,
+};
 use crate::codex::CODEX_HOMES_DIR_NAME as CODEX_HOMES_DIR_MARKER;
 use crate::grok::GROK_HOMES_DIR_NAME as GROK_HOMES_DIR_MARKER;
 
 /// Test/operator override for the Boss-owned worker transcript-store root.
 pub const WORKER_TRANSCRIPTS_ROOT_ENV: &str = "BOSS_WORKER_TRANSCRIPTS_ROOT";
+
+/// The `agy` directory that is linked into the durable store, relative to a
+/// per-run `HOME`: `.gemini/antigravity-cli/brain`. Every conversation's
+/// transcript (`brain/<cid>/.system_generated/logs/transcript_full.jsonl`)
+/// lives beneath it, so one link covers conversations whose ids are not known
+/// until the CLI has started.
+pub const AGY_BRAIN_LEAF: &str = "brain";
+/// The driver slug `agy` files its transcripts under.
+pub const AGY_TRANSCRIPT_DRIVER: &str = "agy";
 
 /// Resolve Boss's durable worker transcript store.
 ///
@@ -52,32 +68,47 @@ pub fn provision_durable_sessions_in(
     driver: &str,
     run_id: &str,
 ) -> anyhow::Result<PathBuf> {
+    provision_durable_link_in(&home.join("sessions"), store_root, driver, run_id)
+}
+
+/// Make `link` a symlink to `driver`'s durable transcript directory for
+/// `run_id`, creating that directory first.
+///
+/// The general form of [`provision_durable_sessions_in`]: Codex and Grok link
+/// `<home>/sessions`, `agy` links `<home>/.gemini/antigravity-cli/brain`. The
+/// link's parent must already exist. An existing link is verified rather than
+/// replaced; an empty directory is replaced; a non-empty one is refused.
+pub fn provision_durable_link_in(
+    link: &Path,
+    store_root: &Path,
+    driver: &str,
+    run_id: &str,
+) -> anyhow::Result<PathBuf> {
     let destination = durable_sessions_dir(store_root, driver, run_id)?;
     fs::create_dir_all(&destination)
         .with_context(|| format!("creating durable worker transcript directory {}", destination.display()))?;
 
-    let sessions = home.join("sessions");
-    match fs::symlink_metadata(&sessions) {
+    match fs::symlink_metadata(link) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            verified_durable_sessions_dir(home, store_root, driver, run_id)?;
+            verified_durable_link(link, store_root, driver, run_id)?;
         }
         Ok(metadata) if metadata.is_dir() => {
             // A reused home or a driver that started first may leave this
             // directory behind. Never relocate a non-empty one: that could
             // hide an already-written transcript instead of retaining it.
-            if fs::read_dir(&sessions)?.next().is_some() {
+            if fs::read_dir(link)?.next().is_some() {
                 bail!(
-                    "refusing to replace non-empty temporary sessions directory {}",
-                    sessions.display()
+                    "refusing to replace non-empty temporary transcript directory {}",
+                    link.display()
                 );
             }
-            fs::remove_dir(&sessions)
-                .with_context(|| format!("removing empty temporary sessions directory {}", sessions.display()))?;
-            symlink_dir(&destination, &sessions)?;
+            fs::remove_dir(link)
+                .with_context(|| format!("removing empty temporary transcript directory {}", link.display()))?;
+            symlink_dir(&destination, link)?;
         }
-        Ok(_) => bail!("refusing unexpected sessions path {}", sessions.display()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => symlink_dir(&destination, &sessions)?,
-        Err(err) => return Err(err).with_context(|| format!("stat sessions path {}", sessions.display())),
+        Ok(_) => bail!("refusing unexpected transcript path {}", link.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => symlink_dir(&destination, link)?,
+        Err(err) => return Err(err).with_context(|| format!("stat transcript path {}", link.display())),
     }
     Ok(destination)
 }
@@ -93,16 +124,40 @@ pub fn durable_sessions_dir(store_root: &Path, driver: &str, run_id: &str) -> an
         .join("sessions"))
 }
 
+/// Resolve a verified durable link, including after its home is reclaimed.
+/// Legacy directories and stat failures leave containment to the caller.
+pub(crate) fn durable_transcript_containment_root(
+    link: &Path,
+    driver: &str,
+    run_id: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    match fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            verified_durable_link(link, &transcript_store_root()?, driver, run_id).map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let durable = durable_sessions_dir(&transcript_store_root()?, driver, run_id)?;
+            Ok(fs::canonicalize(durable).ok().filter(|canonical| canonical.is_dir()))
+        }
+        Err(error) => {
+            tracing::debug!(?error, path = %link.display(), "stat of transcript link failed; falling back to legacy containment");
+            Ok(None)
+        }
+        Ok(_) => Ok(None),
+    }
+}
+
 /// Rewrite a driver-stamped transcript path onto Boss's durable store.
 ///
-/// Codex and Grok provision `home/sessions` as a symlink into
+/// Codex and Grok provision `home/sessions`, and `agy` provisions
+/// `home/.gemini/antigravity-cli/brain`, as a symlink into
 /// `<state>/executions/<run_id>/transcripts/<driver>/sessions`. Hook payloads
 /// stamp the path *through* that link, which dies when the per-run home is
 /// reclaimed. The bytes are already in the durable directory; this returns
 /// that location so `work_runs.transcript_path` survives reclaim.
 ///
 /// Paths that are not under a provisioned ephemeral home (Claude, or a
-/// Grok/Codex stamp that is already durable) are returned unchanged.
+/// stamp that is already durable) are returned unchanged.
 pub fn persistable_transcript_path(path: &Path) -> PathBuf {
     if let Some(rewritten) = rewrite_through_sessions_symlink(path) {
         return rewritten;
@@ -131,7 +186,8 @@ fn rewrite_through_sessions_symlink(path: &Path) -> Option<PathBuf> {
         let Some(name) = ancestor.file_name() else {
             continue;
         };
-        if name != "sessions" {
+        let agy_brain = name == AGY_BRAIN_LEAF && is_agy_state_dir(ancestor.parent());
+        if name != "sessions" && !agy_brain {
             continue;
         }
         let Ok(meta) = fs::symlink_metadata(ancestor) else {
@@ -143,10 +199,35 @@ fn rewrite_through_sessions_symlink(path: &Path) -> Option<PathBuf> {
         let Ok(target) = fs::canonicalize(ancestor) else {
             continue;
         };
+        // `brain` is a name any tool might use for a symlink, and a stamped
+        // path is data the agent's CLI produced. Only follow it when it lands
+        // inside Boss's own transcript store, so a redirected link can never
+        // make `work_runs.transcript_path` point at an arbitrary directory.
+        if agy_brain && !is_inside_transcript_store(&target) {
+            continue;
+        }
         let suffix = path.strip_prefix(ancestor).ok()?;
         return Some(target.join(suffix));
     }
     None
+}
+
+/// Whether `dir` is an `agy` `.gemini/antigravity-cli` state directory.
+fn is_agy_state_dir(dir: Option<&Path>) -> bool {
+    dir.is_some_and(|dir| {
+        dir.file_name().is_some_and(|name| name == AGY_STATE_DIR)
+            && dir
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == AGY_GEMINI_DIR)
+    })
+}
+
+fn is_inside_transcript_store(canonical_target: &Path) -> bool {
+    transcript_store_root()
+        .ok()
+        .and_then(|root| fs::canonicalize(root).ok())
+        .is_some_and(|root| canonical_target.starts_with(root))
 }
 
 /// The run id segment recovered here is read back out of the path itself, so
@@ -157,15 +238,26 @@ fn rewrite_through_sessions_symlink(path: &Path) -> Option<PathBuf> {
 /// though production always calls it with the raw run id elsewhere. This is
 /// a no-op today because every run id Boss issues (`exec_<hex>`) is already
 /// a fixed point of the sanitizer, but if that ever stops holding, this
-/// reconstructs a directory that was never provisioned.
+/// reconstructs a directory that was never provisioned. `agy` has no such
+/// gap: it provisions its durable directory from the sanitized container name
+/// in the first place (`agy::home::durable_run_id`).
 fn rewrite_known_ephemeral_layout(path: &Path) -> Option<PathBuf> {
     let comps: Vec<_> = path.iter().collect();
     let marker_idx = comps
         .iter()
-        .position(|c| *c == GROK_HOMES_DIR_MARKER || *c == CODEX_HOMES_DIR_MARKER)?;
+        .position(|c| *c == GROK_HOMES_DIR_MARKER || *c == CODEX_HOMES_DIR_MARKER || *c == AGY_HOMES_DIR_MARKER)?;
     let marker = comps[marker_idx];
     let run_id = comps.get(marker_idx + 1)?.to_str()?;
-    let (driver, sessions_idx) = if marker == GROK_HOMES_DIR_MARKER {
+    let (driver, sessions_idx) = if marker == AGY_HOMES_DIR_MARKER {
+        // `<homes>/<run>/process-home/.gemini/antigravity-cli/brain/<cid>/…`
+        let layout = [AGY_PROCESS_HOME_LEAF, AGY_GEMINI_DIR, AGY_STATE_DIR, AGY_BRAIN_LEAF];
+        for (offset, expected) in layout.iter().enumerate() {
+            if *comps.get(marker_idx + 2 + offset)? != *expected {
+                return None;
+            }
+        }
+        (AGY_TRANSCRIPT_DRIVER, marker_idx + 2 + layout.len() - 1)
+    } else if marker == GROK_HOMES_DIR_MARKER {
         let grok_home = *comps.get(marker_idx + 2)?;
         let sessions = *comps.get(marker_idx + 3)?;
         if grok_home != "grok-home" || sessions != "sessions" {
@@ -197,21 +289,25 @@ pub fn verified_durable_sessions_dir(
     driver: &str,
     run_id: &str,
 ) -> anyhow::Result<PathBuf> {
-    let sessions = home.join("sessions");
-    let metadata =
-        fs::symlink_metadata(&sessions).with_context(|| format!("stat sessions path {}", sessions.display()))?;
+    verified_durable_link(&home.join("sessions"), store_root, driver, run_id)
+}
+
+/// Resolve and verify `link` against `driver`'s per-execution durable
+/// destination for `run_id`. The general form of
+/// [`verified_durable_sessions_dir`].
+pub fn verified_durable_link(link: &Path, store_root: &Path, driver: &str, run_id: &str) -> anyhow::Result<PathBuf> {
+    let metadata = fs::symlink_metadata(link).with_context(|| format!("stat transcript link {}", link.display()))?;
     if !metadata.file_type().is_symlink() {
-        bail!("expected durable sessions link at {}", sessions.display());
+        bail!("expected durable transcript link at {}", link.display());
     }
-    let actual =
-        fs::canonicalize(&sessions).with_context(|| format!("resolving sessions link {}", sessions.display()))?;
+    let actual = fs::canonicalize(link).with_context(|| format!("resolving transcript link {}", link.display()))?;
     let destination = durable_sessions_dir(store_root, driver, run_id)?;
     let expected = fs::canonicalize(&destination)
         .with_context(|| format!("resolving durable transcript directory {}", destination.display()))?;
     if actual != expected {
         bail!(
-            "sessions link {} targets {}; expected {}",
-            sessions.display(),
+            "transcript link {} targets {}; expected {}",
+            link.display(),
             actual.display(),
             expected.display()
         );
@@ -379,12 +475,123 @@ mod tests {
         )));
     }
 
+    /// The stamped path of an `agy` conversation under `home`.
+    fn agy_stamp(home: &Path) -> PathBuf {
+        home.join(".gemini/antigravity-cli/brain/cid-1/.system_generated/logs/transcript_full.jsonl")
+    }
+
+    fn agy_brain(home: &Path) -> PathBuf {
+        home.join(".gemini/antigravity-cli").join(AGY_BRAIN_LEAF)
+    }
+
     #[test]
-    fn persistable_path_leaves_agy_stamps_unchanged_until_durable_store_exists() {
-        let stamped = PathBuf::from("/tmp")
-            .join(AGY_HOMES_DIR_MARKER)
-            .join("exec-1/process-home/.gemini/antigravity-cli/brain/cid/.system_generated/logs/transcript_full.jsonl");
-        assert_eq!(persistable_transcript_path(&stamped), stamped);
+    fn agy_brain_link_retains_the_transcript_after_the_home_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("process-home");
+        let store = tmp.path().join("executions");
+        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        fs::write(home.join(".gemini/antigravity-cli/settings.json"), "credential").unwrap();
+
+        let durable = provision_durable_link_in(&agy_brain(&home), &store, AGY_TRANSCRIPT_DRIVER, "exec-agy").unwrap();
+        assert_eq!(durable, store.join("exec-agy/transcripts/agy/sessions"));
+        let stamped = agy_stamp(&home);
+        fs::create_dir_all(stamped.parent().unwrap()).unwrap();
+        fs::write(&stamped, "{\"step_index\":0}\n").unwrap();
+
+        fs::remove_dir_all(&home).unwrap();
+        assert_eq!(
+            fs::read_to_string(durable.join("cid-1/.system_generated/logs/transcript_full.jsonl")).unwrap(),
+            "{\"step_index\":0}\n",
+            "the conversation transcript must outlive the reclaimed per-run home",
+        );
+    }
+
+    #[test]
+    fn persistable_path_rewrites_an_agy_stamp_through_the_brain_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("executions");
+        let _store = crate::test_support::transcript_store_override(&store);
+        let home = tmp.path().join("process-home");
+        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        let durable = provision_durable_link_in(&agy_brain(&home), &store, AGY_TRANSCRIPT_DRIVER, "exec-agy").unwrap();
+        let stamped = agy_stamp(&home);
+        fs::create_dir_all(stamped.parent().unwrap()).unwrap();
+        fs::write(&stamped, "live\n").unwrap();
+
+        let recorded = persistable_transcript_path(&stamped);
+
+        assert_eq!(
+            recorded,
+            fs::canonicalize(&durable)
+                .unwrap()
+                .join("cid-1/.system_generated/logs/transcript_full.jsonl")
+        );
+        fs::remove_dir_all(&home).unwrap();
+        assert_eq!(fs::read_to_string(&recorded).unwrap(), "live\n");
+    }
+
+    #[test]
+    fn persistable_path_does_not_follow_an_agy_brain_link_that_leaves_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _store = crate::test_support::transcript_store_override(&tmp.path().join("executions"));
+        let home = tmp.path().join("process-home");
+        let elsewhere = tmp.path().join("somewhere-else");
+        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        fs::create_dir_all(elsewhere.join("cid-1/.system_generated/logs")).unwrap();
+        symlink_dir(&elsewhere, &agy_brain(&home)).unwrap();
+        let stamped = agy_stamp(&home);
+        fs::write(&stamped, "x\n").unwrap();
+
+        assert_eq!(
+            persistable_transcript_path(&stamped),
+            stamped,
+            "a redirected brain link must not become a recorded transcript path"
+        );
+    }
+
+    #[test]
+    fn persistable_path_rewrites_a_known_agy_layout_after_the_home_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("executions");
+        let _store = crate::test_support::transcript_store_override(&store);
+        let run_id = "exec-agy-backfill";
+        let durable = durable_sessions_dir(&store, AGY_TRANSCRIPT_DRIVER, run_id)
+            .unwrap()
+            .join("cid-1/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(durable.parent().unwrap()).unwrap();
+        fs::write(&durable, "durable\n").unwrap();
+
+        let stamped = PathBuf::from(format!(
+            "/var/folders/xx/T/{AGY_HOMES_DIR_MARKER}/{run_id}/process-home/.gemini/antigravity-cli/brain/cid-1/.system_generated/logs/transcript_full.jsonl"
+        ));
+        assert!(!stamped.exists(), "precondition: ephemeral stamp is already gone");
+        assert_eq!(persistable_transcript_path(&stamped), durable);
+    }
+
+    #[test]
+    fn persistable_path_leaves_a_legacy_agy_brain_directory_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _store = crate::test_support::transcript_store_override(&tmp.path().join("executions"));
+        let home = tmp.path().join(AGY_HOMES_DIR_MARKER).join("exec-legacy/process-home");
+        let stamped = agy_stamp(&home);
+        fs::create_dir_all(stamped.parent().unwrap()).unwrap();
+        fs::write(&stamped, "only copy\n").unwrap();
+
+        assert_eq!(
+            persistable_transcript_path(&stamped),
+            stamped,
+            "a home provisioned before the durable store existed still holds the only copy"
+        );
+    }
+
+    #[test]
+    fn agy_layout_rewrite_ignores_paths_that_are_not_the_brain_tree() {
+        let store = tempfile::tempdir().unwrap();
+        let _store = crate::test_support::transcript_store_override(store.path());
+        let conversations = PathBuf::from(format!(
+            "/var/folders/xx/T/{AGY_HOMES_DIR_MARKER}/exec-1/process-home/.gemini/antigravity-cli/conversations/cid-1.db"
+        ));
+        assert_eq!(persistable_transcript_path(&conversations), conversations);
     }
 
     #[test]

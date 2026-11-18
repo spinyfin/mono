@@ -1,6 +1,8 @@
 //! Retention adapter for recorded Antigravity run containers.
 //! Reclaims the parent of process-home, including control and rules directories.
-//! Containers holding transcript evidence are retained regardless of age or byte cap.
+//! Containers holding transcript evidence that has no durable copy (a legacy home whose
+//! `brain/` is a real directory) are retained regardless of age or byte cap; a home linked
+//! to the durable transcript store is an ordinary reclaim candidate.
 //! Interactive ~/.gemini is never scanned.
 pub use boss_engine_driver_home_retention::{OwnedHome as OwnedAgyHome, RetentionPolicy, directory_size_bytes};
 use std::path::Path;

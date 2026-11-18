@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use super::environment::{AgyProcessEnvironment, resolve_agy_binary, skip_binary_assert};
 #[cfg(test)]
 use crate::scoped_home::LOGIN_KEYCHAIN_LEAF;
+use crate::transcript_store::{
+    AGY_BRAIN_LEAF, AGY_TRANSCRIPT_DRIVER, durable_transcript_containment_root, provision_durable_link_in,
+    transcript_store_root, verified_durable_link,
+};
 
 /// Process-global lock for tests that mutate [`AGY_HOMES_ROOT_ENV`]. Shared
 /// with Grok via [`crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK`] so the
@@ -32,15 +36,32 @@ pub const AGY_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_AGY_SKIP_POSTURE_ASSERT";
 /// Default leaf under the system temp when [`AGY_HOMES_ROOT_ENV`] is unset.
 pub(crate) const AGY_HOMES_DIR_NAME: &str = "boss-agy-homes";
 
-const PROCESS_HOME_LEAF: &str = "process-home";
-/// Transcript paths relative to the container, shared by teardown and retention.
+pub(crate) const GEMINI_DIR: &str = ".gemini";
+pub(crate) const STATE_DIR: &str = "antigravity-cli";
+pub(crate) const PROCESS_HOME_LEAF: &str = "process-home";
+/// Transcript paths relative to the container, for homes provisioned **before**
+/// the durable store existed. Their transcripts exist only here, so teardown
+/// and retention keep them. A home whose `brain` is the durable link (every
+/// home [`provision_agy_home`] creates) holds no such evidence; see
+/// [`contains_agy_transcripts`].
 pub const AGY_TRANSCRIPT_PATHS: &[&[&str]] = &[
     &[PROCESS_HOME_LEAF, ".gemini", "antigravity-cli", "conversations"],
-    &[PROCESS_HOME_LEAF, ".gemini", "antigravity-cli", "brain"],
+    &[PROCESS_HOME_LEAF, ".gemini", "antigravity-cli", AGY_BRAIN_LEAF],
 ];
-/// Fail closed when transcript evidence cannot be read.
+
+/// Whether reclaiming `container` would destroy transcript evidence that has
+/// no other copy. Fails closed when transcript evidence cannot be read.
+///
+/// A home provisioned with the durable store links `brain` into
+/// `<state>/executions/<run>/transcripts/agy/sessions`, so the transcript
+/// survives the home and the home is freely reclaimable — including its
+/// `conversations/` database, which is CLI state, not Boss evidence. Only a
+/// legacy home (a real `brain/` directory) is protected.
 pub fn contains_agy_transcripts(container: &Path) -> bool {
     if container.is_file() {
+        return false;
+    }
+    if brain_link_is_symlink(&container.join(PROCESS_HOME_LEAF)) {
         return false;
     }
     AGY_TRANSCRIPT_PATHS.iter().any(|parts| {
@@ -50,6 +71,79 @@ pub fn contains_agy_transcripts(container: &Path) -> bool {
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     })
+}
+
+/// `<process-home>/.gemini/antigravity-cli`.
+fn agy_state_dir(process_home: &Path) -> PathBuf {
+    process_home.join(GEMINI_DIR).join(STATE_DIR)
+}
+
+/// The path of the durable-transcript link: `<process-home>/.gemini/antigravity-cli/brain`.
+pub(super) fn brain_link(process_home: &Path) -> PathBuf {
+    agy_state_dir(process_home).join(AGY_BRAIN_LEAF)
+}
+
+fn brain_link_is_symlink(process_home: &Path) -> bool {
+    fs::symlink_metadata(brain_link(process_home)).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// The run-id segment this home's durable transcripts are filed under: the
+/// container directory's name, i.e. the *sanitized* run id. Deriving it from
+/// the path rather than from the caller's raw run id keeps provisioning,
+/// verification, containment and the stamped-path rewrite in agreement even
+/// for a run id the sanitizer changes.
+fn durable_run_id(process_home: &Path) -> anyhow::Result<String> {
+    process_home
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_owned)
+        .with_context(|| format!("agy process HOME {} has no run container name", process_home.display()))
+}
+
+/// Link `brain` to this run's durable transcript directory.
+///
+/// A provisioning error, never a best-effort completion step: a worker that is
+/// killed or orphaned is still writing through the link, and a failed setup
+/// must be visible before the CLI starts.
+fn provision_durable_brain(process_home: &Path) -> anyhow::Result<PathBuf> {
+    let run_id = durable_run_id(process_home)?;
+    let store_root = transcript_store_root()?;
+    provision_durable_link_in(&brain_link(process_home), &store_root, AGY_TRANSCRIPT_DRIVER, &run_id).with_context(
+        || {
+            format!(
+                "linking durable transcript storage into agy HOME {}",
+                process_home.display()
+            )
+        },
+    )
+}
+
+/// Verify an installed `brain` link targets exactly this run's durable
+/// directory. A link that targets anything else is refused, never followed.
+fn verify_durable_brain(process_home: &Path) -> anyhow::Result<PathBuf> {
+    let run_id = durable_run_id(process_home)?;
+    let store_root = transcript_store_root()?;
+    verified_durable_link(&brain_link(process_home), &store_root, AGY_TRANSCRIPT_DRIVER, &run_id)
+}
+
+/// The canonical directory a local `agy` transcript for `run_id` must remain
+/// beneath at every read.
+///
+/// `Ok(Some)` for a home provisioned with the durable store — whether the home
+/// still exists (the link is verified) or has been reclaimed (the durable
+/// directory outlives it). `Ok(None)` for a legacy home whose `brain` is a real
+/// directory, or a run that never provisioned one: the stamped path stays
+/// authoritative there. A link that targets anything but this run's durable
+/// directory is an `Err`, so a retargeted link makes consumers reject the
+/// transcript rather than read through it.
+pub(super) fn transcript_containment_root(run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+    let process_home = process_home_for_run(run_id)?;
+    durable_transcript_containment_root(
+        &brain_link(&process_home),
+        AGY_TRANSCRIPT_DRIVER,
+        &durable_run_id(&process_home)?,
+    )
 }
 /// Global-root hook directory, relative to the per-run `HOME`.
 const HOOKS_DIR_RELATIVE: &str = ".gemini/config";
@@ -100,9 +194,27 @@ pub(super) fn validate_private_layout(process_home: &Path) -> anyhow::Result<()>
         check_private_entry(&path)?;
     }
     // Reject symlinks and shared hard links under the run’s .gemini, control and rules trees.
-    check_private_tree(&process_home.join(".gemini"))?;
-    check_private_tree(&process_home.parent().context("run container")?.join(CONTROL_LEAF))?;
-    check_private_tree(&process_home.parent().context("run container")?.join("rules-root"))?;
+    // The one exception is the `brain` link Boss itself installs into the
+    // durable transcript store: it must target exactly this run's durable
+    // directory, and is not descended into (what lies beyond it is the store's,
+    // not this private tree's).
+    let brain_is_durable_link = brain_link_is_symlink(process_home);
+    if brain_is_durable_link {
+        verify_durable_brain(process_home)?;
+    }
+    let brain = brain_link(process_home);
+    check_private_tree(
+        &process_home.join(".gemini"),
+        brain_is_durable_link.then_some(brain.as_path()),
+    )?;
+    check_private_tree(
+        &process_home.parent().context("run container")?.join(CONTROL_LEAF),
+        None,
+    )?;
+    check_private_tree(
+        &process_home.parent().context("run container")?.join("rules-root"),
+        None,
+    )?;
     Ok(())
 }
 
@@ -118,11 +230,14 @@ pub(super) fn check_private_entry(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn check_private_tree(path: &Path) -> anyhow::Result<()> {
+fn check_private_tree(path: &Path, verified_durable_link: Option<&Path>) -> anyhow::Result<()> {
+    if verified_durable_link == Some(path) {
+        return Ok(());
+    }
     check_private_entry(path)?;
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
-            check_private_tree(&entry?.path())?;
+            check_private_tree(&entry?.path(), verified_durable_link)?;
         }
     }
     Ok(())
@@ -304,6 +419,11 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     let antigravity = gemini.join("antigravity-cli");
     fs::create_dir_all(antigravity.join("cache"))
         .with_context(|| format!("creating antigravity-cli cache under {}", antigravity.display()))?;
+    // `brain/<cid>/.system_generated/logs/transcript_full.jsonl` is the file
+    // every hook payload stamps as `transcriptPath`. Link it into the durable
+    // per-execution store now, before the CLI can write a conversation, so the
+    // transcript outlives this home.
+    provision_durable_brain(&process_home)?;
     let hooks_dir = process_home.join(HOOKS_DIR_RELATIVE);
     fs::create_dir_all(&hooks_dir).with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
@@ -450,15 +570,23 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove run state while keeping conversation and transcript paths readable
-/// after teardown. `conversations/` is the conversation store; `brain/` holds
-/// `<cid>/.system_generated/logs/transcript_full.jsonl`, the path the Stop
-/// payload's transcriptPath stamps.
+/// Remove run state at teardown.
+///
+/// A home provisioned with the durable store keeps nothing: `brain/` is a link
+/// whose target — the `transcript_full.jsonl` the Stop payload's
+/// `transcriptPath` names — lives under the per-execution store, and removing
+/// the link leaves that target untouched. A legacy home (a real `brain/`
+/// directory, provisioned before the store existed) still keeps `brain/` and
+/// `conversations/`, because they hold the only copy.
 pub fn reclaim_agy_run(process_home: &Path) -> anyhow::Result<()> {
     let container = process_home.parent().context("agy run container")?;
     assert_agy_home_safe_to_delete(container)?;
     validate_private_layout(process_home)?;
-    let keep: Vec<Vec<&str>> = AGY_TRANSCRIPT_PATHS.iter().map(|path| path.to_vec()).collect();
+    let keep: Vec<Vec<&str>> = if brain_link_is_symlink(process_home) {
+        Vec::new()
+    } else {
+        AGY_TRANSCRIPT_PATHS.iter().map(|path| path.to_vec()).collect()
+    };
     retain_paths(container, &keep)
 }
 
