@@ -257,6 +257,7 @@ impl CodexRolloutProgressSession {
         self.calls
             .drain_open_calls()
             .into_iter()
+            .filter(|call| call.issues_command)
             .filter(|call| call.tool_input.get("command").and_then(Value::as_str).is_some())
             .map(|call| WorkerEvent::Notification {
                 session_id: session_id.to_owned(),
@@ -1326,11 +1327,15 @@ mod tests {
     }
 
     fn cell_exec_call(call_id: &str, script: &str) -> Value {
+        cell_exec_call_named("exec", call_id, script)
+    }
+
+    fn cell_exec_call_named(name: &str, call_id: &str, script: &str) -> Value {
         json!({
             "type":"response_item",
             "payload":{
                 "type":"custom_tool_call",
-                "name":"exec",
+                "name":name,
                 "call_id":call_id,
                 "input":script
             }
@@ -1658,6 +1663,134 @@ mod tests {
                     session_id: "thread-cell".into(),
                     message: crate::codex::unobserved_command_notification(
                         "cube pr create --branch boss/exec_1 --title T"
+                    ),
+                },
+                WorkerEvent::Stop {
+                    session_id: "thread-cell".into(),
+                    stop_hook_active: false,
+                    stop_reason: StopReason::Completed,
+                },
+            ]
+        );
+    }
+
+    const WRAPPER_POLL_SCRIPT: &str = concat!(
+        r#"let r = await tools.exec_command({cmd: "bazel test //tools/boss/engine/codex-rollout:codex-rollout_test", yield_time_ms: 30000});"#,
+        r#"while (!("exit_code" in r)) { r = await tools.write_stdin({session_id: r.session_id, chars: "", yield_time_ms: 300000}); }"#,
+        "text(JSON.stringify(r));",
+    );
+
+    #[test]
+    fn a_completed_functions_exec_wrapper_is_not_flagged_unobserved() {
+        let mut session = cell_harness_session();
+        session
+            .normalize_progress_events(&cell_exec_call_named(
+                "functions.exec",
+                "call-wrap",
+                WRAPPER_POLL_SCRIPT,
+            ))
+            .unwrap();
+        let completed = session
+            .normalize_progress_events(&cell_completed_output(
+                "call-wrap",
+                r#"{"chunk_id":"done","session_id":8467,"exit_code":0,"output":"2 tests passed\n"}"#,
+            ))
+            .unwrap();
+        assert!(
+            matches!(completed.as_slice(), [WorkerEvent::PostToolUse { tool_name, tool_input, .. }]
+                if tool_name == "Bash"
+                    && tool_input.get("command").and_then(Value::as_str)
+                        == Some("bazel test //tools/boss/engine/codex-rollout:codex-rollout_test")),
+            "got {completed:?}"
+        );
+        let boundary = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","last_agent_message":"done","error":null}
+            }))
+            .unwrap();
+        assert!(
+            matches!(boundary.as_slice(), [WorkerEvent::Stop { .. }]),
+            "a wrapper that forwarded exit_code must not be flagged unobserved: {boundary:?}"
+        );
+    }
+
+    #[test]
+    fn asynchronous_write_stdin_polling_observes_the_originating_wrapper() {
+        let mut session = cell_harness_session();
+        session
+            .normalize_progress_events(&cell_exec_call_named(
+                "functions.exec",
+                "call-wrap",
+                WRAPPER_POLL_SCRIPT,
+            ))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_completed_output("call-wrap", P6_RUNNING_CHUNK))
+            .unwrap();
+        let poll = session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "name":"write_stdin",
+                    "call_id":"call-poll",
+                    "arguments":"{\"session_id\":8467,\"chars\":\"\"}"
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            poll,
+            vec![WorkerEvent::ToolPoll {
+                session_id: "thread-cell".into(),
+                awaiting_model: false
+            }]
+        );
+        let completed = session
+            .normalize_progress_events(&cell_completed_output(
+                "call-poll",
+                r#"{"chunk_id":"done","session_id":8467,"exit_code":0,"output":"2 tests passed\n"}"#,
+            ))
+            .unwrap();
+        assert!(matches!(completed.as_slice(), [WorkerEvent::PostToolUse { .. }]));
+        let boundary = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","last_agent_message":"done","error":null}
+            }))
+            .unwrap();
+        assert!(
+            matches!(boundary.as_slice(), [WorkerEvent::Stop { .. }]),
+            "a later write_stdin poll that reports exit_code must close the wrapper: {boundary:?}"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_functions_exec_wrapper_is_still_flagged() {
+        let mut session = cell_harness_session();
+        session
+            .normalize_progress_events(&cell_exec_call_named(
+                "functions.exec",
+                "call-wrap",
+                WRAPPER_POLL_SCRIPT,
+            ))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_completed_output("call-wrap", P6_RUNNING_CHUNK))
+            .unwrap();
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","last_agent_message":"done","error":null}
+            }))
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                WorkerEvent::Notification {
+                    session_id: "thread-cell".into(),
+                    message: crate::codex::unobserved_command_notification(
+                        "bazel test //tools/boss/engine/codex-rollout:codex-rollout_test"
                     ),
                 },
                 WorkerEvent::Stop {
@@ -2411,8 +2544,11 @@ mod tests {
             WorkerEvent::SessionStart { session_id, .. } if session_id == "thread-0160"
         ));
         assert!(matches!(&events[1], WorkerEvent::UserPromptSubmit { .. }));
-        // The cell parser decodes static JavaScript argument objects, including
-        // unquoted keys, so the event carries the inner shell command.
+        // The code-mode `exec` cell surfaces as a Bash call. Both 0.153.4 and
+        // 0.160.1 write the cell's argument object in JavaScript shorthand
+        // (`{cmd:"…"}`, unquoted key); the cell parser recovers that `cmd`
+        // so live status and abandoned-command detection see the shell
+        // command, not the wrapping JavaScript.
         let command_1 = "echo hello-boss-qual";
         assert_eq!(
             events[2],

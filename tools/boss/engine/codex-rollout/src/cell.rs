@@ -74,9 +74,20 @@ const WALL_TIME_SUFFIX: &str = " seconds";
 /// Marker line separating the harness's own header from the cell's output.
 const OUTPUT_MARKER: &str = "\nOutput:";
 
+/// Strip the OpenAI `functions.` qualifier some rollouts put on tool names
+/// (`functions.exec`, `functions.wait`, `functions.write_stdin`).
+pub fn dialect_tool_name(tool_name: &str) -> &str {
+    tool_name.strip_prefix("functions.").unwrap_or(tool_name)
+}
+
 /// Whether `tool_name` is the cell harness's continuation poll.
 pub fn is_cell_wait_tool(tool_name: &str) -> bool {
-    tool_name == CELL_WAIT_TOOL
+    dialect_tool_name(tool_name) == CELL_WAIT_TOOL
+}
+
+/// Whether `tool_name` is a `write_stdin` poll of an existing shell session.
+pub fn is_write_stdin_tool(tool_name: &str) -> bool {
+    dialect_tool_name(tool_name) == "write_stdin"
 }
 
 /// The cell id a `wait` call targets, from its canonicalised tool input
@@ -230,18 +241,40 @@ pub fn payload_session_id(payload: &str) -> Option<String> {
         })
 }
 
+/// Whether `source` contains a command-bearing `exec_command` / `shell` call,
+/// even when the argument object cannot be parsed far enough to recover the
+/// command string. Used to distinguish a command cell from a pure
+/// `write_stdin` continuation (or a compute-only cell) without requiring
+/// JSON-quoted keys.
+pub fn script_issues_command(source: &str) -> bool {
+    next_command_bearing_call(source).is_some()
+}
+
+/// Whether `source` is a cell that only polls an existing shell session.
+///
+/// A wrapper that starts a command and then polls it with `write_stdin` is
+/// command-bearing, not this. A plain argv/string `exec` input (`echo hi`)
+/// is also not this: it never mentions `write_stdin` and still issues a
+/// command.
+pub fn script_is_continuation_only(source: &str) -> bool {
+    source.contains("write_stdin(") && !script_issues_command(source)
+}
+
 /// The shell command(s) a cell script issues, in source order.
 ///
 /// The cell's tool input is JavaScript source, so it never parses as JSON
 /// and the command lives inside a `tools.exec_command({…})` argument. That
-/// argument object is extracted by brace balancing and decoded as static
-/// literals, including bare JavaScript property names and single-quoted
-/// strings. Dynamic expressions yield nothing rather than a guessed command.
+/// argument object is JSON in some transcripts and JavaScript object
+/// shorthand (`{cmd:"echo hi"}`) in the 0.160.1 dialect; both are recovered
+/// here by decoding static literals, including bare property names and
+/// single-quoted strings. Dynamic expressions yield nothing rather than a
+/// guessed command.
 ///
-/// Empty means "no command-bearing call in this script": a pure
+/// Empty means "no recoverable command string in this script": a pure
 /// continuation cell (`tools.write_stdin`), a `store`/`load` cell, or a
-/// shape this parser does not recognise. Callers must not read that as
-/// "the cell ran no command".
+/// command-bearing call whose argument this parser does not recognise.
+/// [`script_issues_command`] is the "did this cell start a command" bit;
+/// callers must not read an empty vec as "the cell ran no command".
 pub fn commands_from_cell_script(source: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut rest = source;
@@ -258,6 +291,37 @@ pub fn commands_from_cell_script(source: &str) -> Vec<String> {
     commands
 }
 
+/// The shell-session id a `write_stdin` cell script polls, when the argument
+/// object names one. Used to bind a continuation cell to the command that
+/// started the session even when the cell's output dropped `session_id`
+/// (`text(p.output)`).
+pub fn write_stdin_session_id_from_script(source: &str) -> Option<String> {
+    let mut rest = source;
+    while let Some(at) = rest.find("write_stdin(") {
+        let after = &rest[at + "write_stdin(".len()..];
+        if let Some(object) = balanced_object_literal(after)
+            && let Some(session_id) = object_literal_string_field(object, "session_id")
+        {
+            return Some(session_id);
+        }
+        rest = after;
+    }
+    None
+}
+
+/// `session_id` on a canonicalised `write_stdin` tool input (JSON args, or
+/// the id recovered from a continuation cell script).
+pub fn write_stdin_session_id(tool_input: &Value) -> Option<String> {
+    match tool_input.get("session_id") {
+        Some(Value::String(text)) => Some(text.trim().to_owned()).filter(|text| !text.is_empty()),
+        Some(Value::Number(number)) => Some(number.to_string()),
+        _ => tool_input
+            .get("script")
+            .and_then(Value::as_str)
+            .and_then(write_stdin_session_id_from_script),
+    }
+}
+
 /// A single display/gate string for the commands a cell script issues, or
 /// `None` when it issues none.
 ///
@@ -271,16 +335,30 @@ pub fn cell_script_command(source: &str) -> Option<String> {
     (!commands.is_empty()).then(|| commands.join("\n"))
 }
 
-/// Offset and needle length of the earliest `tools.<fn>(` call in `source`
-/// that runs a command, so a script mixing helpers is read in source order.
+/// Offset and needle length of the earliest command-bearing call in
+/// `source`. Matches `tools.exec_command(` and the bare `exec_command(`
+/// form some cells emit, so a script mixing helpers is read in source order.
 fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
     COMMAND_BEARING_CELL_CALLS
         .iter()
         .filter_map(|name| {
-            let needle = format!("tools.{name}(");
+            let needle = format!("{name}(");
             source.find(&needle).map(|at| (at, needle.len()))
         })
         .min_by_key(|(at, _)| *at)
+}
+
+/// A string/number field on a JSON object or a JavaScript object literal
+/// (`{cmd:"echo hi"}`, `{session_id:8467}`). Nested objects/arrays are
+/// skipped; a missing or non-scalar field yields `None`.
+fn object_literal_string_field(object: &str, field: &str) -> Option<String> {
+    let parsed = cell_object::parse_literal_object(object)?;
+    match parsed.get(field)? {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        other => Some(coerce_command_to_string(other)),
+    }
+    .filter(|text| !text.is_empty())
 }
 
 /// Take the balanced `{…}` object literal at the start of `source` (after
@@ -384,8 +462,20 @@ mod tests {
     fn javascript_bare_property_name_preserves_the_literal_command() {
         let source = r#"await tools.exec_command({cmd: "echo hi"});"#;
         assert_eq!(cell_script_command(source).as_deref(), Some("echo hi"));
+        assert!(script_issues_command(source));
         let source = r#"await tools.exec_command({cmd: 'echo }', yield_time_ms: 1000});"#;
         assert_eq!(cell_script_command(source).as_deref(), Some("echo }"));
+        let compact = r#"text(await tools.exec_command({cmd:"echo hello-boss-qual"}));"#;
+        assert_eq!(cell_script_command(compact).as_deref(), Some("echo hello-boss-qual"));
+    }
+
+    #[test]
+    fn javascript_object_shorthand_survives_sibling_fields() {
+        let source = r#"text(await tools.exec_command({cmd:"sleep 45 && echo late-output",yield_time_ms:1000}));"#;
+        assert_eq!(
+            cell_script_command(source).as_deref(),
+            Some("sleep 45 && echo late-output")
+        );
     }
 
     #[test]
@@ -397,6 +487,33 @@ mod tests {
         ] {
             assert_eq!(cell_script_command(source), None);
         }
+    }
+
+    #[test]
+    fn bare_exec_command_call_without_tools_prefix_is_still_command_bearing() {
+        let source = r#"const r = await exec_command({"cmd":"jj status"});"#;
+        assert_eq!(cell_script_command(source).as_deref(), Some("jj status"));
+        assert!(script_issues_command(source));
+    }
+
+    #[test]
+    fn write_stdin_session_id_reads_json_and_shorthand_object_literals() {
+        assert_eq!(
+            write_stdin_session_id_from_script(r#"const p = await tools.write_stdin({"session_id":8467,"chars":""});"#)
+                .as_deref(),
+            Some("8467")
+        );
+        assert_eq!(
+            write_stdin_session_id_from_script(
+                r#"text(await tools.write_stdin({session_id:80143,chars:"",yield_time_ms:30000}));"#
+            )
+            .as_deref(),
+            Some("80143")
+        );
+        assert_eq!(
+            write_stdin_session_id_from_script("const r = await tools.exec_command({cmd:\"echo hi\"});"),
+            None
+        );
     }
 
     #[test]
@@ -555,9 +672,36 @@ mod tests {
     }
 
     #[test]
-    fn wait_is_the_only_recognised_continuation_tool() {
+    fn wait_and_write_stdin_are_the_recognised_continuation_tools() {
         assert!(is_cell_wait_tool(CELL_WAIT_TOOL));
+        assert!(is_cell_wait_tool("functions.wait"));
         assert!(!is_cell_wait_tool("Bash"));
         assert!(!is_cell_wait_tool("wait_agent"));
+        assert!(is_write_stdin_tool("write_stdin"));
+        assert!(is_write_stdin_tool("functions.write_stdin"));
+        assert!(!is_write_stdin_tool("exec"));
+    }
+
+    #[test]
+    fn continuation_only_script_does_not_issue_a_command() {
+        let source = concat!(
+            "const r = load(\"run\");\n",
+            r#"const p = await tools.write_stdin({"session_id":r.session_id,"chars":"","yield_time_ms":30000});"#,
+        );
+        assert!(!script_issues_command(source));
+        assert!(script_is_continuation_only(source));
+        assert!(!script_is_continuation_only("echo rollout"));
+        assert!(!script_is_continuation_only("sleep 999"));
+        let wrapper = concat!(
+            r#"let r = await tools.exec_command({cmd: "bazel test //tools/boss/engine/...", yield_time_ms: 30000});"#,
+            r#"while (!("exit_code" in r)) { r = await tools.write_stdin({session_id: r.session_id, chars: ""}); }"#,
+            "text(JSON.stringify(r));",
+        );
+        assert!(script_issues_command(wrapper));
+        assert!(!script_is_continuation_only(wrapper));
+        assert_eq!(
+            cell_script_command(wrapper).as_deref(),
+            Some("bazel test //tools/boss/engine/...")
+        );
     }
 }
