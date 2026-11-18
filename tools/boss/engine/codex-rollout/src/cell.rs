@@ -52,9 +52,9 @@ pub const CELL_WAIT_TOOL: &str = "wait";
 
 /// `tools.*` helpers inside a cell script that run a shell command, in the
 /// order they are searched. `write_stdin` is deliberately absent: it
-/// continues an existing shell session whose id only ever appears in a
-/// prior cell's *output*, so it carries no command of its own and cannot be
-/// attributed to one from the script text alone.
+/// continues an existing shell session and carries no command of its own.
+/// Its literal session id, when the script names one, is read by
+/// [`write_stdin_session_id_from_script`].
 const COMMAND_BEARING_CELL_CALLS: &[&str] = &["exec_command", "shell"];
 
 /// Header line prefix of a yield placeholder, followed by the cell id.
@@ -257,7 +257,7 @@ pub fn script_issues_command(source: &str) -> bool {
 /// is also not this: it never mentions `write_stdin` and still issues a
 /// command.
 pub fn script_is_continuation_only(source: &str) -> bool {
-    source.contains("write_stdin(") && !script_issues_command(source)
+    find_js_call(source, "write_stdin").is_some() && !script_issues_command(source)
 }
 
 /// The shell command(s) a cell script issues, in source order.
@@ -297,7 +297,7 @@ pub fn commands_from_cell_script(source: &str) -> Vec<String> {
 /// (`text(p.output)`).
 pub fn write_stdin_session_id_from_script(source: &str) -> Option<String> {
     let mut rest = source;
-    while let Some(at) = rest.find("write_stdin(") {
+    while let Some(at) = find_js_call(rest, "write_stdin") {
         let after = &rest[at + "write_stdin(".len()..];
         if let Some(object) = balanced_object_literal(after)
             && let Some(session_id) = object_literal_string_field(object, "session_id")
@@ -338,14 +338,69 @@ pub fn cell_script_command(source: &str) -> Option<String> {
 /// Offset and needle length of the earliest command-bearing call in
 /// `source`. Matches `tools.exec_command(` and the bare `exec_command(`
 /// form some cells emit, so a script mixing helpers is read in source order.
+/// Requires an identifier boundary before the name (`.` is allowed) and
+/// ignores matches inside string literals, so `spawnshell(` and `"shell("`
+/// in a string are not command-bearing.
 fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
     COMMAND_BEARING_CELL_CALLS
         .iter()
-        .filter_map(|name| {
-            let needle = format!("{name}(");
-            source.find(&needle).map(|at| (at, needle.len()))
-        })
+        .filter_map(|name| find_js_call(source, name).map(|at| (at, name.len() + 1)))
         .min_by_key(|(at, _)| *at)
+}
+
+/// Byte offset of `name(` at an identifier boundary, skipping string
+/// literals. `.` may precede the name so `tools.write_stdin(` matches;
+/// `spawnshell(` and a quoted `"shell("` do not.
+fn find_js_call(source: &str, name: &str) -> Option<usize> {
+    let mut needle = String::with_capacity(name.len() + 1);
+    needle.push_str(name);
+    needle.push('(');
+    let mut search_from = 0;
+    while let Some(rel) = source.get(search_from..)?.find(&needle) {
+        let at = search_from + rel;
+        if js_ident_boundary_at(source, at) && !js_position_is_in_string(source, at) {
+            return Some(at);
+        }
+        search_from = at.checked_add(1)?;
+    }
+    None
+}
+
+fn js_ident_boundary_at(source: &str, at: usize) -> bool {
+    let Some(preceding) = source.get(..at).and_then(|prefix| prefix.chars().next_back()) else {
+        return true;
+    };
+    !preceding.is_ascii_alphanumeric() && preceding != '_' && preceding != '$'
+}
+
+fn js_position_is_in_string(source: &str, target: usize) -> bool {
+    let mut in_string = false;
+    let mut quote = '\0';
+    let mut escaped = false;
+    for (index, ch) in source.char_indices() {
+        if index >= target {
+            return in_string;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == quote {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' || ch == '`' {
+            in_string = true;
+            quote = ch;
+        }
+    }
+    in_string
 }
 
 /// A string/number field on a JSON object or a JavaScript object literal
@@ -703,5 +758,35 @@ mod tests {
             cell_script_command(wrapper).as_deref(),
             Some("bazel test //tools/boss/engine/...")
         );
+    }
+
+    #[test]
+    fn javascript_object_expressions_are_not_guessed_as_a_command() {
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd: "cd " + dir + " && make"});"#),
+            None
+        );
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd: `cd ${dir}`});"#),
+            None
+        );
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd: cond ? "a" : "b"});"#),
+            None
+        );
+        assert!(script_issues_command(
+            r#"await tools.exec_command({cmd: "cd " + dir + " && make"});"#
+        ));
+    }
+
+    #[test]
+    fn command_bearing_calls_require_an_identifier_boundary() {
+        assert!(!script_issues_command(r#"await tools.spawnshell({cmd:"x"});"#));
+        let poll = concat!(
+            r#"const p = await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#"const note = "shell(";"#,
+        );
+        assert!(script_is_continuation_only(poll));
+        assert!(!script_issues_command(poll));
     }
 }
