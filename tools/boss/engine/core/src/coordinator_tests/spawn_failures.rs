@@ -2659,11 +2659,12 @@ const INGRESS_PRECONDITION: &str = "/tmp/boss-test-missing/sessions is not a rea
 async fn pane_spawn_precondition_failure_reaches_all_three_operator_surfaces() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         progress_ingress_failure: Some(INGRESS_PRECONDITION.to_owned()),
         ..FakeExecutionRunner::default()
@@ -2676,6 +2677,7 @@ async fn pane_spawn_precondition_failure_reaches_all_three_operator_surfaces() {
     let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+    wait_for_spawn_dispatch_finished(&coordinator).await;
 
     // ── Surface 1: the work item's own attention list ───────────────────
     // This is `ListAttentionItemsForWorkItem` — `boss chore show` /
@@ -2712,6 +2714,14 @@ async fn pane_spawn_precondition_failure_reaches_all_three_operator_surfaces() {
         .unwrap_or_else(|| panic!("expected a spawn_failed:error event; got {events:#?}"));
     assert_eq!(spawn_failed.details["spawn_failure"]["class"], "progress_ingress");
     assert_eq!(spawn_failed.details["spawn_failure"]["cause"], INGRESS_PRECONDITION);
+    let pane_failed = events
+        .iter()
+        .find(|event| event.stage == "pane_spawned" && event.outcome == "error")
+        .expect("spawn failure must also emit pane_spawned:error");
+    assert_eq!(
+        pane_failed.details["spawn_failure"],
+        spawn_failed.details["spawn_failure"]
+    );
     assert!(
         spawn_failed
             .error_message
@@ -2750,11 +2760,12 @@ async fn pane_spawn_precondition_failure_reaches_all_three_operator_surfaces() {
 async fn a_repeat_pane_spawn_failure_does_not_resolve_the_previous_signal() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     db.reconcile_product_executions(&product.id).unwrap();
 
-    let cube = Arc::new(FakeCubeClient::default());
+    let cube = Arc::new(FakeCubeClient::default().with_real_workspace(dir.path()));
     let runner = Arc::new(FakeExecutionRunner {
         progress_ingress_failure: Some(INGRESS_PRECONDITION.to_owned()),
         ..FakeExecutionRunner::default()
@@ -2769,6 +2780,7 @@ async fn a_repeat_pane_spawn_failure_does_not_resolve_the_previous_signal() {
     let first = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &first, ExecutionStatus::Failed).await;
+    wait_for_spawn_dispatch_finished(&coordinator).await;
 
     // The operator (or the reconciler) puts the item back in flight; the
     // host precondition is still broken, so it fails identically.
@@ -2779,6 +2791,7 @@ async fn a_repeat_pane_spawn_failure_does_not_resolve_the_previous_signal() {
     assert_ne!(second, first);
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &second, ExecutionStatus::Failed).await;
+    wait_for_spawn_dispatch_finished(&coordinator).await;
 
     let outcome = db.reconcile_stale_attention_signals().unwrap();
 
@@ -2794,4 +2807,16 @@ async fn a_repeat_pane_spawn_failure_does_not_resolve_the_previous_signal() {
         "a redispatch that failed the same way is not evidence the condition ended \
          (reconcile outcome: {outcome:?}); got {spawn_items:#?}",
     );
+}
+
+async fn wait_for_spawn_dispatch_finished(coordinator: &ExecutionCoordinator) {
+    // The failed row is committed before the item is parked and the slot is
+    // released. A deliberate retry must wait for that entire dispatch to finish.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !coordinator.inflight_dispatches().is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed spawn dispatch must finish cleanup");
 }

@@ -478,12 +478,9 @@ impl LifecycleServices for CoreLifecycleServices {
         crate::execution_publisher::notify_review_guide_changed(&self.work_db, publisher, root_task_id, reason).await;
     }
 
-    fn spawn_failure_classification(&self, err: &anyhow::Error) -> Option<serde_json::Value> {
+    fn spawn_failure_classification(&self, err: &anyhow::Error) -> Option<(&'static str, String)> {
         let failure = err.chain().find_map(|cause| cause.downcast_ref::<StartWorkerError>())?;
-        Some(serde_json::json!({
-            "class": failure.class(),
-            "cause": failure.cause_detail(),
-        }))
+        Some((failure.class(), failure.cause_detail()))
     }
 
     fn is_unconfirmed_spawn_abort(&self, err: &anyhow::Error) -> bool {

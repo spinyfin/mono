@@ -519,7 +519,10 @@ impl ExecutionCoordinator {
                 // spawn step (prompt composition, driver provision, permission
                 // config, the initial-input script, or tmux session creation).
                 let err_detail = format!("{err:#}");
-                let spawn_failure = self.lifecycle.spawn_failure_classification(&err);
+                let spawn_failure = self
+                    .lifecycle
+                    .spawn_failure_classification(&err)
+                    .map(|(class, cause)| serde_json::json!({ "class": class, "cause": cause }));
                 let slot_id = slot_id_from_worker_id(&worker_id);
                 // Reconciliation already retried stale occupants. A remaining
                 // rejection must be recorded as a spawn failure.
@@ -730,6 +733,7 @@ impl ExecutionCoordinator {
                         let mut error_details = serde_json::json!({
                             "run_id": run.id,
                             "attention_item_id": attention_item_id,
+                            "spawn_failure": spawn_failure,
                             "released_workspace": released,
                             "slot_id": slot_id,
                             "page": slot_id.and_then(worker_page_label),
@@ -1675,7 +1679,7 @@ mod conflict_diagnosis_for_attempt_tests {
                 .push((product_id.to_owned(), conflict_class.to_owned()));
         }
         async fn notify_review_guide_changed(&self, _: &Arc<dyn ExecutionPublisher>, _: &str, _: &str) {}
-        fn spawn_failure_classification(&self, _: &anyhow::Error) -> Option<serde_json::Value> {
+        fn spawn_failure_classification(&self, _: &anyhow::Error) -> Option<(&'static str, String)> {
             None
         }
 

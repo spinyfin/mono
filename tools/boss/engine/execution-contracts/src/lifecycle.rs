@@ -320,7 +320,7 @@ pub trait LifecycleServices: Send + Sync {
     );
 
     /// Structured spawn-step diagnostics supplied by the host implementation.
-    fn spawn_failure_classification(&self, err: &anyhow::Error) -> Option<serde_json::Value>;
+    fn spawn_failure_classification(&self, err: &anyhow::Error) -> Option<(&'static str, String)>;
 
     fn is_unconfirmed_spawn_abort(&self, err: &anyhow::Error) -> bool;
 

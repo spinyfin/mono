@@ -53,7 +53,12 @@ const PROGRESS_INGRESS_MARKER: &str = "preparing progress ingress: ";
 /// not know still produces a finding — at P1, with whatever cause the event
 /// carried — rather than being dropped, so a class added engine-side is
 /// under-ranked, never invisible.
-const DETERMINISTIC_PRECONDITION_CLASSES: &[&str] = &["progress_ingress", "write_files", "response_kind_mismatch"];
+const DETERMINISTIC_PRECONDITION_CLASSES: &[&str] = &[
+    "progress_ingress",
+    "write_files",
+    "progress_fidelity",
+    "response_kind_mismatch",
+];
 
 /// What the spawn step refused, as `(class, cause)`.
 ///
@@ -220,6 +225,20 @@ mod tests {
             "recovery must name the precondition even on the fallback path; got {:?}",
             findings[0].recovery,
         );
+    }
+
+    #[test]
+    fn progress_fidelity_rejection_is_a_deterministic_precondition() {
+        let event = spawn_failed_event(
+            serde_json::json!({
+                "spawn_failure": { "class": "progress_fidelity", "cause": "driver reports Minimal" },
+            }),
+            "local dispatch requires Rich progress fidelity",
+        );
+        let findings = match_sig_i_spawn_precondition(&[event], &scope_all());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::P0);
+        assert!(findings[0].recovery.contains("driver reports Minimal"));
     }
 
     #[test]
