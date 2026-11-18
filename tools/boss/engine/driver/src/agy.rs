@@ -635,10 +635,9 @@ mod tests {
         assert_eq!(d.config_dir, ".agy");
         assert_eq!(d.agent_rules_filename, "AGENTS.md");
         assert_eq!(d.initial_prompt_filename, "initial-prompt.txt");
-        assert_eq!(
-            driver.transcript_containment_root("exec_contain").unwrap().as_deref(),
-            Some(process_home_for_run("exec_contain").unwrap().as_path())
-        );
+        // Containment is the durable transcript store, which only exists once
+        // a home has been provisioned; the provisioned case is covered below.
+        assert_eq!(driver.transcript_containment_root("exec_contain").unwrap(), None);
         assert!(driver.settings_log_check().is_some());
         assert_eq!(d.model_menu.engine_default, model_menu::STANDARD_FAMILY);
         assert_eq!(

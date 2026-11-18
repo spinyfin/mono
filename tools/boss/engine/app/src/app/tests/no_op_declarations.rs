@@ -260,7 +260,7 @@ async fn completed_but_failed_empty_error_does_not_latch_or_refuse_no_op() {
         )
         .unwrap();
     let driver = boss_engine_driver::agy::AgyDriver::default();
-    let home = driver.transcript_containment_root(&execution_id).unwrap().unwrap();
+    let home = provisioned_agy_containment_root(&driver, &execution_id);
     std::fs::create_dir_all(&home).unwrap();
     let transcript = home.join("completed-failure.jsonl");
     std::fs::write(
@@ -805,7 +805,7 @@ async fn refused_tool_attention_body(transcript_in_process_home: bool) -> String
         .unwrap();
     let driver = boss_engine_driver::agy::AgyDriver::default();
     let dir_for_transcript = if transcript_in_process_home {
-        driver.transcript_containment_root(&execution_id).unwrap().unwrap()
+        provisioned_agy_containment_root(&driver, &execution_id)
     } else {
         dir.path().join("outside-process-home")
     };
@@ -859,4 +859,14 @@ async fn refused_tool_attention_reports_uncontained_transcript_as_unavailable() 
     let body = refused_tool_attention_body(false).await;
     assert!(body.contains("Transcript corroboration unavailable"), "{body}");
     assert!(!body.contains("blocked by deny rule"), "{body}");
+}
+
+/// The directory an agy run's transcripts must stay under: its durable
+/// transcript store. Containment only exists once that store does, so create
+/// it the way provisioning would before asking the driver to resolve it.
+fn provisioned_agy_containment_root(driver: &boss_engine_driver::agy::AgyDriver, run_id: &str) -> std::path::PathBuf {
+    let store = boss_engine_driver::transcript_store::transcript_store_root().unwrap();
+    let durable = boss_engine_driver::transcript_store::durable_sessions_dir(&store, "agy", run_id).unwrap();
+    std::fs::create_dir_all(durable).unwrap();
+    driver.transcript_containment_root(run_id).unwrap().unwrap()
 }
