@@ -7,7 +7,11 @@ struct NavigatorRowPresentation {
 
     var showsSecondaryIndicators: Bool { width >= 340 }
     var health: (label: String, symbol: String)? {
-        if row.task.prMergeableState == "conflicting" { return ("Merge conflict", "arrow.triangle.branch") }
+        if row.task.prMergeableState == "conflicting" {
+            return row.task.conflictResolutionDeferred
+                ? ("Conflict — resolves on merge", "info.circle")
+                : ("Merge conflict", "arrow.triangle.branch")
+        }
         if row.task.ciRequiredState == "fail" { return ("CI failed", "xmark.circle") }
         if row.task.reviewRequiredState == "changes_requested" { return ("Review changes requested", "text.bubble") }
         if row.task.ciRequiredState == "in_progress" { return ("CI pending", "clock") }
@@ -16,7 +20,8 @@ struct NavigatorRowPresentation {
         return nil
     }
     var healthFacts: [String] {
-        [row.task.prMergeableState == "conflicting" ? "Merge conflict" : nil,
+        [row.task.prMergeableState == "conflicting"
+            ? (row.task.conflictResolutionDeferred ? "Conflict resolves on merge" : "Merge conflict") : nil,
          row.task.ciRequiredState.map { "CI \($0.replacingOccurrences(of: "_", with: " "))" },
          row.task.reviewRequiredState.map { "Review \($0.replacingOccurrences(of: "_", with: " "))" }]
             .compactMap { $0 }

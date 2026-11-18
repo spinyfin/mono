@@ -676,6 +676,29 @@ mod tests {
         assert_eq!(status, "in_review");
     }
 
+    /// The single-item read and the update projection must ship the same
+    /// deferral flag as the board, or a card flips back to the error
+    /// presentation on any edit.
+    #[test]
+    fn single_item_projection_carries_the_deferral_flag() {
+        let (db, product, item) = db_with_review_item();
+        let flag = |db: &WorkDb| match db.get_work_item(&item).unwrap() {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task.conflict_resolution_deferred,
+            _ => panic!("expected a task"),
+        };
+        assert!(!flag(&db));
+        recorded(db.record_conflict_deferral(input(&product, &item, "h1")).unwrap());
+        assert!(flag(&db));
+        let mut task = match db.get_work_item(&item).unwrap() {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task,
+            _ => panic!("expected a task"),
+        };
+        task.conflict_resolution_deferred = false;
+        let conn = db.connect().unwrap();
+        crate::products_design::project_for_work_item_updated(&conn, &mut task, "test");
+        assert!(task.conflict_resolution_deferred);
+    }
+
     /// The card's wait phrase is read through the incremental board
     /// projection, which only re-reads a card when one of its inputs is
     /// journaled as changed. A deferral starting or ending must be one.

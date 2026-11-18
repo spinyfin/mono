@@ -292,7 +292,8 @@ struct PrConflictIndicator: View {
             Label(labelText, systemImage: systemImage)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(tint)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(resolutionDeferred ? nil : 1)
+                .fixedSize(horizontal: false, vertical: resolutionDeferred)
                 .help(tooltipText)
                 .accessibilityLabel(tooltipText)
         }
