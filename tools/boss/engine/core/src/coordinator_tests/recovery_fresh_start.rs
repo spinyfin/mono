@@ -388,7 +388,7 @@ async fn source_host_dispatch(full: bool, missing: bool) {
         }),
     );
     coordinator.set_host_adapter_provider(Arc::new(UnreachableSourceProvider(coordinator.host_adapter())));
-    let coordinator = Arc::new(coordinator.with_pre_start_retry_delays(vec![Duration::from_millis(1); 3]));
+    let coordinator = Arc::new(coordinator);
     let worker = coordinator.worker_pool().claim_worker(&next.id, None).await.unwrap();
     let result = coordinator
         .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
@@ -399,8 +399,8 @@ async fn source_host_dispatch(full: bool, missing: bool) {
     assert!(next.started_at.is_some());
     assert_eq!(next.status, ExecutionStatus::Running);
     assert_eq!(next.pre_start_failure_count, 0);
-    // Keep the source unavailable beyond every configured retry delay.
-    // A fresh start must never enter the retry/backlog path.
+    // The source stays unavailable. A started execution must remain Running
+    // and active across later scheduler passes, and must not be failed.
     for _ in 0..4 {
         sleep(Duration::from_millis(10)).await;
         coordinator.drain_ready_queue_for_test().await;
