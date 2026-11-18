@@ -81,8 +81,9 @@ use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{
     CHURN_GUARD_DISPATCH_FAILED_REASON, DELIBERATE_PARK_DISPATCH_FAILED_REASON,
     DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD, DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_WINDOW_SECS,
-    DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS, ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD,
-    ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
+    DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS, EXECUTION_CANCELLED_DISPATCH_FAILED_REASON,
+    ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+    ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb,
 };
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
@@ -96,6 +97,11 @@ pub struct DispatchFailureRecoverySweepOutcome {
     /// a human decision this sweep never auto-retries, regardless of churn
     /// count or cooldown. See the module doc.
     pub deliberate_park_excluded: usize,
+    /// Candidates excluded because they carry
+    /// `dispatch_failed_reason = EXECUTION_CANCELLED_DISPATCH_FAILED_REASON`
+    /// — their governing execution was deliberately cancelled, which this
+    /// sweep must never undo.
+    pub execution_cancelled_excluded: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for DispatchFailureRecoverySweepOutcome {
@@ -109,6 +115,7 @@ impl crate::sweep_loop::SweepOutcome for DispatchFailureRecoverySweepOutcome {
             churn_skipped = self.churn_skipped,
             no_worker_skipped = self.no_worker_skipped,
             deliberate_park_excluded = self.deliberate_park_excluded,
+            execution_cancelled_excluded = self.execution_cancelled_excluded,
             "dispatch-failure recovery sweep: pass complete",
         );
     }
@@ -189,6 +196,15 @@ pub async fn run_one_pass(
         // for automatic retry regardless of how the churn count looks.
         if dispatch_failed_reason.as_deref() == Some(DELIBERATE_PARK_DISPATCH_FAILED_REASON) {
             outcome.deliberate_park_excluded += 1;
+            continue;
+        }
+        // A row parked because its governing execution was *cancelled*
+        // (`park_work_item_after_cancel`) is a stop-until-asked decision in
+        // exactly the same sense: the execution was explicitly cancelled,
+        // and only an explicit `bossctl work start` / drag-to-Doing may
+        // resume it. Retrying it here would silently undo the cancel.
+        if dispatch_failed_reason.as_deref() == Some(EXECUTION_CANCELLED_DISPATCH_FAILED_REASON) {
+            outcome.execution_cancelled_excluded += 1;
             continue;
         }
 
@@ -603,6 +619,50 @@ mod tests {
         assert_eq!(
             task.dispatch_failed_reason.as_deref(),
             Some(crate::work::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
+        );
+    }
+
+    /// A row parked because its governing execution was cancelled
+    /// (`dispatch_failed_reason = EXECUTION_CANCELLED_DISPATCH_FAILED_REASON`)
+    /// is a stop-until-asked decision exactly like a deliberate park: this
+    /// sweep must never retry it, however old the stamp.
+    #[tokio::test]
+    async fn execution_cancelled_park_is_never_auto_retried() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("cancelled chore")
+                    .build(),
+            )
+            .unwrap();
+        let work_item_id = chore.id;
+        let execution = create_ready_chore_execution(&db, work_item_id.clone());
+        db.cancel_execution(&execution.id).unwrap();
+        assert_eq!(
+            get_task(&db, &work_item_id).dispatch_failed_reason.as_deref(),
+            Some(crate::work::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON),
+            "setup must produce a cancel-parked row"
+        );
+        make_failure_old(&db, &work_item_id, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS + 60);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+
+        assert_eq!(outcome.execution_cancelled_excluded, 1);
+        assert_eq!(outcome.redispatched, 0, "a cancel park must never be auto-retried");
+        assert!(!outcome.has_activity());
+        assert!(sink.events().await.is_empty());
+        let task = get_task(&db, &work_item_id);
+        assert!(!task.autostart);
+        assert_eq!(
+            task.dispatch_failed_reason.as_deref(),
+            Some(crate::work::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON),
         );
     }
 

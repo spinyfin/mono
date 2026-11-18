@@ -572,7 +572,14 @@ impl TestHarness {
     /// lease-release gate.
     pub fn with_pane(db: Arc<WorkDb>, detector: Arc<dyn PrDetector>, pane: Arc<RecordingPaneReleaser>) -> Self {
         let probes = Arc::new(RecordingProbeQueuer::default());
-        Self::build(db, detector, pane, probes.clone(), probes)
+        Self::build(
+            db,
+            detector,
+            pane,
+            probes.clone(),
+            probes,
+            Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new()),
+        )
     }
 
     /// Same as [`TestHarness::new`] but nudging through a caller-supplied
@@ -585,7 +592,29 @@ impl TestHarness {
             Arc::new(RecordingPaneReleaser::default()),
             queuer,
             Arc::new(RecordingProbeQueuer::default()),
+            Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new()),
         )
+    }
+
+    /// [`TestHarness::new`] that also hands back the handler's structured
+    /// dispatch-event sink, for tests asserting the per-execution timeline
+    /// (e.g. `execution_cancelled` provenance).
+    #[cfg(test)]
+    fn with_recording_dispatch_events(
+        db: Arc<WorkDb>,
+        detector: Arc<dyn PrDetector>,
+    ) -> (Self, Arc<crate::dispatch_events::RecordingDispatchEventSink>) {
+        let sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let harness = Self::build(
+            db,
+            detector,
+            Arc::new(RecordingPaneReleaser::default()),
+            probes.clone(),
+            probes,
+            sink.clone(),
+        );
+        (harness, sink)
     }
 
     fn build(
@@ -594,6 +623,7 @@ impl TestHarness {
         pane: Arc<RecordingPaneReleaser>,
         queuer: Arc<dyn ProbeQueuer>,
         probes: Arc<RecordingProbeQueuer>,
+        dispatch_events: Arc<crate::dispatch_events::RecordingDispatchEventSink>,
     ) -> Self {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
@@ -606,6 +636,7 @@ impl TestHarness {
             queuer,
             CompletionCollaborators::noop(),
         )
+        .with_dispatch_events(dispatch_events)
         // PR-completion terminalization records a fresh head. Keep the shared
         // harness hermetic; tests that exercise branch-specific behaviour
         // replace this with their own verifier.
@@ -2068,6 +2099,8 @@ mod review_guide_submission {
         );
     }
 }
+#[cfg(test)]
+mod cancel_provenance_tests;
 #[cfg(test)]
 mod t01;
 #[cfg(test)]

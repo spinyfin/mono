@@ -1998,6 +1998,9 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 reason: Some("moot after work completed elsewhere".to_owned()),
                 queued_only: true,
                 record_failure_reason: false,
+                keep_work_item_schedulable: false,
+                actor: StatusActor::Engine,
+                peer_pid: None,
             },
         )
         .unwrap();
@@ -2016,6 +2019,9 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 reason: Some("requested host became ineligible: inner cause".to_owned()),
                 queued_only: true,
                 record_failure_reason: true,
+                keep_work_item_schedulable: false,
+                actor: StatusActor::Engine,
+                peer_pid: None,
             },
         )
         .unwrap();
@@ -2041,6 +2047,9 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 reason: Some("should refuse".to_owned()),
                 queued_only: true,
                 record_failure_reason: false,
+                keep_work_item_schedulable: false,
+                actor: StatusActor::Engine,
+                peer_pid: None,
             },
         )
         .unwrap_err()

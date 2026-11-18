@@ -30,6 +30,7 @@ impl TopicFilter {
             EventKind::ProjectImplDrained,
             EventKind::ExecutionTerminal,
             EventKind::ExecutionStatusChanged,
+            EventKind::ExecutionCancelled,
             EventKind::PrMerged,
             EventKind::HostDisabled,
             EventKind::DependencyPrereqsSatisfied,
