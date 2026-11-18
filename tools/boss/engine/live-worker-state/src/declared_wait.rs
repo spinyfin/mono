@@ -15,7 +15,8 @@
 //! | --------------------------------------------------------- | ---------------- |
 //! | blocking prompt (permission, elicitation, …)              | `WaitingForInput` |
 //! | idle prompt / `Stop`, declared wait still live            | `WaitingOnWork`  |
-//! | idle prompt / `Stop`, unconsumed wait has lapsed           | `WaitOverdue`    |
+//! | idle prompt / `Stop`, wait lapsed with no re-wake         | `WaitOverdue`    |
+//! | idle prompt / `Stop` after a re-wake; earlier wait lapsed | `WaitingForInput` |
 //! | idle prompt, no wait                                      | `WaitingForInput` |
 //! | `Stop`, no wait                                           | `WaitingForInput`           |
 //!
@@ -55,12 +56,25 @@ pub(super) fn is_idle_prompt_message(message: &str) -> bool {
     message.to_ascii_lowercase().contains("waiting for your input")
 }
 
+/// A lapsed wait is overdue only for the park it applied to. Once the
+/// main session has resumed a turn after that park, the expired record is
+/// no longer a live wait and classifies as [`DeclaredWait::None`].
+pub(super) fn effective_wait(wait: DeclaredWait, resumed_after_wait_park: bool) -> DeclaredWait {
+    if wait == DeclaredWait::Lapsed && resumed_after_wait_park {
+        DeclaredWait::None
+    } else {
+        wait
+    }
+}
+
 /// Settle the activity of a worker that the raw reducer parked as `raw`
 /// (`Idle` or `WaitingForInput`).
 ///
 /// A pending `blocking_prompt` needs a person, whatever the wait says.
 ///
-/// Declarations survive resumed turns until their bounded deadline.
+/// Live declarations survive resumed turns until their bounded deadline.
+/// Callers fold [`effective_wait`] in first so a lapsed wait from an earlier
+/// park cannot poison a later Stop.
 pub(super) fn settle_parked(raw: WorkerActivity, blocking_prompt: bool, wait: DeclaredWait) -> WorkerActivity {
     if raw == WorkerActivity::WaitingForInput && blocking_prompt {
         return raw;
@@ -182,5 +196,13 @@ mod tests {
         assert!(is_idle_prompt_message("Claude is waiting for your input"));
         assert!(!is_idle_prompt_message("Claude needs your permission to use Bash"));
         assert!(!is_idle_prompt_message(""));
+    }
+
+    #[test]
+    fn a_lapsed_wait_after_resume_reads_as_none() {
+        assert_eq!(effective_wait(DeclaredWait::Lapsed, true), DeclaredWait::None);
+        assert_eq!(effective_wait(DeclaredWait::Lapsed, false), DeclaredWait::Lapsed);
+        assert_eq!(effective_wait(DeclaredWait::Live, true), DeclaredWait::Live);
+        assert_eq!(effective_wait(DeclaredWait::None, true), DeclaredWait::None);
     }
 }

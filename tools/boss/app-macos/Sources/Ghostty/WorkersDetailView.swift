@@ -593,12 +593,19 @@ struct WorkerSlotView: View, @MainActor Equatable {
             }
         } else if let wait = snapshot.live?.waitCaption {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Image(systemName: "clock")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if snapshot.live?.activity == .waitOverdue {
+                    WorkerWaitingIndicator(
+                        activity: snapshot.live?.activity,
+                        lastEventAt: snapshot.live?.lastEventAt
+                    )
+                } else {
+                    Image(systemName: "clock")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Text(wait)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(snapshot.live?.activity == .waitOverdue ? .yellow : .secondary)
                     .lineLimit(1)
                     .help(snapshot.runId ?? "")
                     .accessibilityLabel(wait)

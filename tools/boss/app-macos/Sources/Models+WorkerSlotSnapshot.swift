@@ -320,6 +320,7 @@ struct WorkerSlotSnapshot: @MainActor Equatable {
 
     var statusPillLabel: String? {
         if isPlaceholder { return "Finished" }
+        if live?.activity == .waitOverdue { return "Wait overdue" }
         if live?.isWaitingOnJob == true { return "Waiting" }
         if live?.hungSince != nil { return "Hung" }
         return live?.activity.agentsPaneLabel

@@ -1036,7 +1036,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // the same liveness check as model-generated summaries.
         if matches!(
             trigger,
-            Trigger::ActivityChanged(WorkerActivity::Errored | WorkerActivity::WaitingForInput)
+            Trigger::ActivityChanged(
+                WorkerActivity::Errored
+                    | WorkerActivity::WaitingForInput
+                    | WorkerActivity::WaitingOnWork
+                    | WorkerActivity::WaitOverdue
+            )
         ) && permit != WorkerRefreshPermit::Refresh
         {
             continue;
@@ -1050,10 +1055,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     WorkerActivity::Idle => Some(Instant::now()),
                     _ => None,
                 };
-                let prior = registry.get(slot_id).and_then(|s| s.live_status);
-                let subtitle = live_status::activity_subtitle(new_activity, prior.as_deref());
-                if subtitle != prior && registry.set_live_status(slot_id, subtitle) {
-                    broadcaster.broadcast_live_worker_states().await;
+                if permit == WorkerRefreshPermit::Refresh {
+                    let prior = registry.get(slot_id).and_then(|s| s.live_status);
+                    let subtitle = live_status::activity_subtitle(new_activity, prior.as_deref());
+                    if subtitle != prior && registry.set_live_status(slot_id, subtitle) {
+                        broadcaster.broadcast_live_worker_states().await;
+                    }
                 }
                 match new_activity {
                     WorkerActivity::Errored => {

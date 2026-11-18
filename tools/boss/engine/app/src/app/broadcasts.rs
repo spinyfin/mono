@@ -111,7 +111,13 @@ impl ServerState {
                     progress.turn_condition
                         == boss_engine_live_worker_state::semantic_progress::SemanticTurnCondition::InTurn
                 });
-            if let Some(wait) = self.wait_registry.active(&state.run_id, now)
+            if state.activity == boss_protocol::WorkerActivity::WaitOverdue {
+                if let Some(wait) = self.wait_registry.lapsed_record(&state.run_id, now) {
+                    state.wait_reason = Some(wait.reason);
+                    state.wait_expires_at =
+                        Some(boss_engine_utils::iso8601::format_epoch_iso8601(wait.expires_at_epoch));
+                }
+            } else if let Some(wait) = self.wait_registry.active(&state.run_id, now)
                 && !in_turn
             {
                 state.wait_reason = Some(wait.reason);

@@ -154,7 +154,27 @@ fn a_wake_up_after_expiry_returns_to_working() {
     reg.apply_event(1, &working());
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
     reg.apply_event(1, &stop());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+}
+
+#[test]
+fn woken_after_expiry_then_asks_a_question_needs_input() {
+    let (reg, waits) = fixture();
+    reg.apply_event(1, &working());
+    declare(&waits);
+    reg.apply_event(1, &stop());
+    waits.set(DeclaredWait::Lapsed);
+    reg.reconcile_declared_waits(now());
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+
+    reg.apply_event(1, &working());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+    reg.apply_event(1, &stop());
+    reg.apply_event(1, &notification(IDLE_PROMPT));
+    let parked = reg.get(1).unwrap();
+    assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+    assert!(parked.activity.needs_human());
+    assert!(reg.reconcile_declared_waits(now()).is_empty());
 }
 
 #[test]
@@ -208,7 +228,7 @@ fn expiry_before_stop_or_first_reconcile_is_overdue() {
 fn published_subtitle_matches_activity_before_async_loop_runs() {
     let (reg, waits) = fixture();
     reg.apply_event(1, &working());
-    reg.set_live_status(1, Some(crate::AWAITING_INPUT_SUBTITLE.into()));
+    reg.set_live_status(1, Some(crate::AWAITING_INPUT_LITERAL.into()));
     declare(&waits);
     reg.apply_event(1, &stop());
     assert_eq!(
@@ -219,7 +239,7 @@ fn published_subtitle_matches_activity_before_async_loop_runs() {
     reg.apply_event(1, &notification("Permission required"));
     assert_eq!(
         reg.snapshot()[0].live_status.as_deref(),
-        Some(crate::AWAITING_INPUT_SUBTITLE)
+        Some(crate::AWAITING_INPUT_LITERAL)
     );
     reg.apply_event(1, &working());
     assert_eq!(reg.snapshot()[0].live_status, None);
@@ -311,7 +331,7 @@ fn resumed_wait_preserves_classification_but_cannot_hide_a_blocking_prompt() {
             let parked = &reg.snapshot()[0];
             assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
             assert!(parked.activity.needs_human());
-            assert_eq!(parked.live_status.as_deref(), Some(crate::AWAITING_INPUT_SUBTITLE));
+            assert_eq!(parked.live_status.as_deref(), Some(crate::AWAITING_INPUT_LITERAL));
             assert!(reg.reconcile_declared_waits(now()).is_empty());
         }
     }
