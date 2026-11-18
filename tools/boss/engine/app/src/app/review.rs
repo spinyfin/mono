@@ -80,7 +80,10 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        match work_db.open_merge_revisions(&work_item_id) {
+        // The open revisions the person confirmed with this request. They are
+        // stored with the request only once it is about to reach GitHub, so
+        // every refusal before that point leaves nothing behind.
+        let confirmed_now = match work_db.open_merge_revisions(&work_item_id) {
             Ok(revisions) if revisions.iter().any(|revision| !confirmed_revisions.contains(revision)) => {
                 send_response(
                     &sink,
@@ -92,17 +95,12 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 );
                 return;
             }
-            Ok(revisions) => {
-                if let Err(err) = work_db.remember_confirmed_merge_revisions(&work_item_id, &pr_url, &revisions) {
-                    refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
-                    return;
-                }
-            }
+            Ok(revisions) => revisions,
             Err(err) => {
                 refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
                 return;
             }
-        }
+        };
         let product = match work_db.get_product(&product_id) {
             Ok(Some(product)) => product,
             Ok(None) => {
@@ -146,6 +144,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let product_slug = product.slug.clone();
                 let publisher = server_state.publisher.clone();
                 let product_id2 = product_id.clone();
+                let confirmed_revisions_now = confirmed_now;
                 tracing::info!(%request_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request preflight completed");
                 boss_task_scope::spawn(async move {
                     tracing::info!(
@@ -153,6 +152,19 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                         pr_url = %pr_url2,
                         "merge_when_ready: requesting GitHub-native merge",
                     );
+                    // Persist what the person confirmed, bound to this request,
+                    // before GitHub is called so the continuation can compare.
+                    let confirmation = match work_db2.remember_confirmed_merge_revisions(
+                        &work_item_id2,
+                        &pr_url2,
+                        &confirmed_revisions_now,
+                    ) {
+                        Ok(confirmation) => confirmation,
+                        Err(err) => {
+                            refuse_merge_when_ready(&sink2, &request_id2, &work_item_id2, err.to_string());
+                            return;
+                        }
+                    };
                     let external_started = std::time::Instant::now();
                     match direct_merge_executor.execute(&pr_url2).await {
                         Ok(success) => {
@@ -173,12 +185,16 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                     .work_item_id(work_item_id2.clone())
                                     .pr_url(pr_url2.clone())
                                     .head_sha(success.head_sha.clone())
+                                    .confirmation_request_id(confirmation.clone())
                                     .build(),
                                 &detail,
                             );
                             let record = match record {
                                 Ok(record) => record,
                                 Err(err) => {
+                                    if let Err(forget) = work_db2.forget_confirmed_merge_revisions(&confirmation) {
+                                        tracing::warn!(work_item_id = %work_item_id2, ?forget, "merge_when_ready: could not drop the unrecorded request's confirmation");
+                                    }
                                     tracing::error!(
                                         work_item_id = %work_item_id2,
                                         pr_url = %pr_url2,
@@ -251,10 +267,17 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                 (&product_id2, &work_item_id2, &pr_url2),
                             )
                             .await;
-                            if !conflict_released {
+                            // A released conflict becomes the standing request,
+                            // which keeps what this request confirmed.
+                            let confirmation_kept = conflict_released
+                                && work_db2
+                                    .attach_confirmed_merge_revisions(&work_item_id2, &pr_url2, &confirmation)
+                                    .unwrap_or(false);
+                            if !confirmation_kept {
                                 // The refused request never stood, so what it
                                 // confirmed must not carry into a later one.
-                                if let Err(err) = work_db2.forget_confirmed_merge_revisions(&work_item_id2) {
+                                // Only this request's snapshot goes.
+                                if let Err(err) = work_db2.forget_confirmed_merge_revisions(&confirmation) {
                                     tracing::warn!(work_item_id = %work_item_id2, ?err, "merge_when_ready: could not drop the refused request's confirmation");
                                 }
                             }

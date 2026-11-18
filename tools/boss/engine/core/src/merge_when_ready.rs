@@ -137,6 +137,14 @@ pub trait DirectMergeExecutor: Send + Sync {
     /// Turn off the auto-merge a successful [`Self::execute`] armed, so a PR
     /// the engine has stopped merging cannot be merged by GitHub anyway.
     async fn disarm(&self, pr_url: &str) -> Result<()>;
+
+    /// Whether GitHub currently has auto-merge armed for the PR. Consulted
+    /// when [`Self::disarm`] fails, to tell "nothing was left to turn off"
+    /// from a real failure. Executors that cannot tell report an error, which
+    /// is treated as "still armed".
+    async fn auto_merge_enabled(&self, _pr_url: &str) -> Result<bool> {
+        Err(anyhow!("this executor cannot read auto-merge state"))
+    }
 }
 
 /// `DirectMergeExecutor` that shells out to `gh pr merge --auto --squash`
@@ -145,13 +153,6 @@ pub trait DirectMergeExecutor: Send + Sync {
 /// `direct_merge_executor_override`.
 #[derive(Debug, Default)]
 pub struct CommandDirectMergeExecutor;
-
-/// Whether a `--disable-auto` failure only says there is nothing to turn off,
-/// so the disarm obligation is already met and must not retry forever.
-fn auto_merge_already_off(err: &anyhow::Error) -> bool {
-    let text = format!("{err:#}").to_ascii_lowercase();
-    text.contains("auto merge is not enabled") || text.contains("auto-merge is not enabled")
-}
 
 /// Finish stopping a merge request whose GitHub auto-merge was still armed
 /// when conflict resolution gave up: turn auto-merge off. A failure is shown
@@ -174,9 +175,10 @@ pub async fn disarm_stopped_merge(
         }
         match executor.disarm(&candidate.pr_url).await {
             Ok(()) => {
-                if db
-                    .get_active_github_merge_intent(&candidate.work_item_id, &candidate.pr_url)?
-                    .is_some()
+                // The newer request this disarm raced with, captured before
+                // the re-arm so a failure retires exactly that request.
+                if let Some(rearmed) =
+                    db.get_active_github_merge_intent(&candidate.work_item_id, &candidate.pr_url)?
                 {
                     match executor.execute(&candidate.pr_url).await {
                         Ok(_) => {
@@ -195,6 +197,7 @@ pub async fn disarm_stopped_merge(
                                 .record_merge_rearm_failure(
                                     &candidate.work_item_id,
                                     &candidate.pr_url,
+                                    &rearmed.id,
                                     &format!("{err:#}"),
                                 )?
                                 .then_some("merge_rearm_failed"))
@@ -206,9 +209,20 @@ pub async fn disarm_stopped_merge(
                         .then_some("merge_disarm_completed"))
                 }
             }
-            Err(err) if auto_merge_already_off(&err) => Ok(db
-                .complete_merge_disarm(&candidate.work_item_id, &candidate.pr_url)?
-                .then_some("merge_disarm_completed")),
+            // A failed `--disable-auto` can only mean there was nothing to turn
+            // off (auto-merge was switched off elsewhere): ask GitHub rather
+            // than guess from the error wording, which is not a stable contract.
+            Err(err) if matches!(executor.auto_merge_enabled(&candidate.pr_url).await, Ok(false)) => {
+                tracing::info!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "auto-merge is already off on GitHub; disarm obligation met"
+                );
+                Ok(db
+                    .complete_merge_disarm(&candidate.work_item_id, &candidate.pr_url)?
+                    .then_some("merge_disarm_completed"))
+            }
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
@@ -345,6 +359,38 @@ impl DirectMergeExecutor for CommandDirectMergeExecutor {
 
     async fn disarm(&self, pr_url: &str) -> Result<()> {
         gh_disarm_auto_merge(pr_url).await
+    }
+
+    async fn auto_merge_enabled(&self, pr_url: &str) -> Result<bool> {
+        gh_auto_merge_enabled(pr_url).await
+    }
+}
+
+/// Whether GitHub has auto-merge armed for `pr_url` (`autoMergeRequest` is
+/// non-null in `gh pr view --json autoMergeRequest`).
+pub async fn gh_auto_merge_enabled(pr_url: &str) -> Result<bool> {
+    let output = gh_scope(
+        callers::MERGE_WHEN_READY,
+        gh_output(&[
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "autoMergeRequest",
+            "--jq",
+            ".autoMergeRequest != null",
+        ]),
+    )
+    .await
+    .map_err(|err| anyhow!("failed to spawn `gh pr view` for auto-merge state: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("failed to read auto-merge state: {}", stderr.trim()));
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(anyhow!("unexpected auto-merge state `{other}`")),
     }
 }
 
@@ -566,18 +612,23 @@ mod tests {
                 rusqlite::params![revision.id, task.id],
             )
             .unwrap();
-        db.remember_confirmed_merge_revisions(
-            &task.id,
-            &candidate.pr_url,
-            &[boss_protocol::OpenMergeRevision {
-                id: revision.id.clone(),
-                label: "r1".into(),
-                status: "active".into(),
-            }],
-        )
-        .unwrap();
+        let request = db
+            .remember_confirmed_merge_revisions(
+                &task.id,
+                &candidate.pr_url,
+                &[boss_protocol::OpenMergeRevision {
+                    id: revision.id.clone(),
+                    label: "r1".into(),
+                    status: "active".into(),
+                }],
+            )
+            .unwrap();
         db.start_merge_conflict_resolution(&task.id, &candidate.pr_url, "main")
             .unwrap();
+        assert!(
+            db.attach_confirmed_merge_revisions(&task.id, &candidate.pr_url, &request)
+                .unwrap()
+        );
         db.mark_chore_blocked_merge_conflict(&task.id, &candidate.pr_url)
             .unwrap();
         let attempt = db
@@ -839,7 +890,10 @@ mod tests {
                 anyhow::bail!("unused")
             }
             async fn disarm(&self, _: &str) -> Result<()> {
-                anyhow::bail!("gh pr merge --disable-auto failed: Pull request Auto merge is not enabled")
+                anyhow::bail!("gh pr merge --disable-auto failed: any wording at all")
+            }
+            async fn auto_merge_enabled(&self, _: &str) -> Result<bool> {
+                Ok(false)
             }
         }
         let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
@@ -873,6 +927,98 @@ mod tests {
         };
         disarm_stopped_merge(&db, &NoopExecutionPublisher, &candidate, &AlreadyOff).await;
         assert!(db.list_pending_merge_disarms().unwrap().is_empty());
+    }
+
+    /// While the older request's re-arm runs, that request is retired and a
+    /// newer one becomes active; the older call then fails.
+    struct RearmFailsAfterReplacement<'a> {
+        db: &'a WorkDb,
+        id: &'a str,
+        pr_url: &'a str,
+    }
+
+    #[async_trait]
+    impl DirectMergeExecutor for RearmFailsAfterReplacement<'_> {
+        async fn execute(&self, _: &str) -> Result<DirectMergeSuccess> {
+            self.db
+                .retire_github_merge_intent(self.id, self.pr_url, "head_advanced")?;
+            self.db.record_github_merge_intent(
+                boss_work_db::GithubMergeIntentInsertInput::builder()
+                    .work_item_id(self.id)
+                    .pr_url(self.pr_url)
+                    .head_sha("newest-head")
+                    .build(),
+                "{}",
+            )?;
+            anyhow::bail!("gh pr merge failed: late error")
+        }
+
+        async fn disarm(&self, _: &str) -> Result<()> {
+            self.db.record_github_merge_intent(
+                boss_work_db::GithubMergeIntentInsertInput::builder()
+                    .work_item_id(self.id)
+                    .pr_url(self.pr_url)
+                    .head_sha("fresh-head")
+                    .build(),
+                "{}",
+            )?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_rearm_failure_does_not_retire_a_newer_successful_request() {
+        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+        let product = boss_work_db::test_support::create_test_product_named(&db, "Late rearm");
+        let task = boss_work_db::test_support::create_test_chore_manual(&db, product.id.clone(), "Merge");
+        let pr_url = "https://github.com/example/repo/pull/42".to_owned();
+        db.update_work_item(
+            &task.id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(pr_url.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.record_github_merge_intent(
+            boss_work_db::GithubMergeIntentInsertInput::builder()
+                .work_item_id(&task.id)
+                .pr_url(&pr_url)
+                .head_sha("head")
+                .build(),
+            "{}",
+        )
+        .unwrap();
+        db.mark_chore_blocked_merge_conflict(&task.id, &pr_url).unwrap();
+        db.stop_merge_conflict_resolution(&task.id, "manual_abandon").unwrap();
+        let candidate = PendingMergeCheck {
+            work_item_id: task.id.clone(),
+            product_id: product.id.clone(),
+            pr_url: pr_url.clone(),
+        };
+        let executor = RearmFailsAfterReplacement {
+            db: &db,
+            id: &task.id,
+            pr_url: &pr_url,
+        };
+        disarm_stopped_merge(&db, &NoopExecutionPublisher, &candidate, &executor).await;
+        assert_eq!(
+            db.get_active_github_merge_intent(&task.id, &pr_url)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            "newest-head",
+            "the newer request keeps its active intent"
+        );
+        let card = db
+            .get_work_tree(&product.id)
+            .unwrap()
+            .chores
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert_eq!(card.merge_queue_state.as_deref(), Some("queued"));
     }
 
     // --- MergeAction::as_str ---

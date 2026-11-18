@@ -532,4 +532,16 @@ async fn sweep_retires_a_pending_disarm_for_a_merged_pr_without_calling_github()
     assert_eq!(executor.disarms.load(Ordering::SeqCst), 0);
     assert!(!db.merge_disarm_pending(&id, &candidate.pr_url).unwrap());
     assert!(db.list_pending_merge_disarms().unwrap().is_empty());
+    // GitHub merged it first: the card must not keep saying the merge is
+    // paused for sign-off; it is handed to the terminal-merge path.
+    assert_eq!(db.task_blocked_reason(&id).unwrap(), None);
+    let merged_card = db
+        .get_work_tree(&candidate.product_id)
+        .unwrap()
+        .chores
+        .into_iter()
+        .find(|task| task.id == id)
+        .unwrap();
+    assert_eq!(merged_card.status.to_string(), "done");
+    assert_eq!(merged_card.merge_queue_state, None);
 }
