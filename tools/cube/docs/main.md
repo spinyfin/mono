@@ -582,10 +582,18 @@ and age on stderr and in a `workspace.processes_reaped` audit event. The
 workspace's Bazel server is spared on purpose (it exits on its own idle
 timeout) and recognised by the `bazel(<workspace>)` name the client gives it;
 all other occupants, including tty-attached tools and server action children,
-are subject to cleanup. A release proceeds regardless, naming any survivor. A removal also refuses an unreadable process table; it does
-not: unlinking a directory with live occupants is how the leak above hid, so it
-fails with the survivors' pids and leaves the directory for a later pass. The
-scan itself lives in `lib/rust/workspace_procs`, shared with the engine; see
+are subject to cleanup. Release proceeds even if processes survive or inspection
+fails, and names the survivors and inspection errors. Removal refuses to unlink
+the directory if any owned process survives or if the process table, an individual
+process, or its working directory cannot be inspected.
+
+Lease expiry does not prove that a holder has finished. Expiry and claim-time
+checks scan without sending signals. Occupied or uninspectable workspaces are
+durably quarantined with a process audit; ordinary lease selection continues to
+another workspace or provisions a new one, without resetting the prior holder’s
+working copy. Setup-failure release sweeps use the `setup_failed` phase. A warm
+Bazel server alone is audited on removal, but does not create release audit noise.
+The scan itself lives in `lib/rust/workspace_procs`, shared with the engine; see
 `tools/boss/docs/run-process-teardown.md`.
 
 ## Disk Reclamation

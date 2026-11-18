@@ -105,7 +105,7 @@ pub fn spawn_group_leader_sleeper() -> std::process::Child {
     use std::process::Command;
 
     // A private working directory per sleeper: the run-process reap treats
-    // anything whose cwd is inside the pane shell's cwd as the run's, so
+    // anything whose cwd is inside the recorded workspace as the run's, so
     // sleepers sharing the test process's cwd would be killed by whichever
     // sibling test reaps first.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

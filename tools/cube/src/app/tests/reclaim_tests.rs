@@ -1082,3 +1082,80 @@ fn a_mint_is_refused_on_a_volume_below_its_floor() {
     );
     assert_eq!(shortfall, "13.1 GiB");
 }
+
+#[test]
+fn expired_live_holder_is_quarantined_without_signals_or_reset() {
+    use super::support::{force_lease_expiry, lease_runner_for};
+    use crate::app::dispatch::run_with_dependencies;
+    use crate::cli::Cli;
+    use crate::metadata::WorkspaceHealth;
+    use crate::store::WorkspaceListFilter;
+    use clap::Parser;
+
+    struct Holder(std::process::Child);
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let (tempdir, database_path) = with_database_path();
+    let (_, root) = seed_pool(&tempdir, &database_path, 1, None);
+    let old = root.join("mono-agent-001");
+    let first_runner = lease_runner_for(&old, "abc1234");
+    let first = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "holder-regression"]),
+        Some(&database_path),
+        &first_runner,
+    )
+    .unwrap();
+    first_runner.assert_exhausted();
+    let mut holder = Holder(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .current_dir(&old)
+            .spawn()
+            .unwrap(),
+    );
+    std::fs::write(old.join("holder-work"), "preserve this").unwrap();
+    force_lease_expiry(
+        &database_path,
+        first.payload["workspace"]["lease_id"].as_str().unwrap(),
+        1,
+    );
+    let other = root.join("mono-agent-002");
+    std::fs::create_dir_all(other.join(".jj")).unwrap();
+    let runner = lease_runner_for(&other, "def5678");
+    let next = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "holder-regression"]),
+        Some(&database_path),
+        &runner,
+    )
+    .unwrap();
+    runner.assert_exhausted();
+    assert_eq!(next.payload["workspace"]["workspace_id"], "mono-agent-002");
+    assert!(
+        holder.0.try_wait().unwrap().is_none(),
+        "expired holder must not be signalled"
+    );
+    assert_eq!(
+        std::fs::read_to_string(old.join("holder-work")).unwrap(),
+        "preserve this"
+    );
+    let store = Store::open_at(&database_path).unwrap();
+    let old_record = store
+        .list_workspaces_filtered(&WorkspaceListFilter {
+            repo: Some("mono"),
+            workspace_id: Some("mono-agent-001"),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(old_record[0].health_status, Some(WorkspaceHealth::Quarantined));
+    let events = audit_events(&tempdir);
+    let quarantine = events
+        .iter()
+        .find(|e| e["event"] == "workspace.processes_quarantined")
+        .unwrap();
+    assert_eq!(quarantine["processes"]["survivors"][0]["pid"], holder.0.id());
+    assert!(quarantine["processes"]["killed"].as_array().unwrap().is_empty());
+}

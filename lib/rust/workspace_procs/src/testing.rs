@@ -113,11 +113,9 @@ pub fn fake_process(pid: i32, ppid: i32, command: &str, cwd: Option<&str>) -> Li
     LiveProcess {
         pid,
         ppid,
-        pgid: pid,
         start_micros: 999_000_000_000_000,
         command: command.to_owned(),
         argv: vec![command.to_owned()],
         cwd: cwd.map(PathBuf::from),
-        has_controlling_terminal: false,
     }
 }
