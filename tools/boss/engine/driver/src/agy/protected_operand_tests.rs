@@ -1,4 +1,5 @@
 use super::*;
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -279,4 +280,91 @@ fn operands_after_end_of_options_are_checked_verbatim() {
     }
     deny_at(&fx, "grep -e . -- -falias", &fx.workspace());
     deny_at(&fx, "cat -- name=alias", &fx.workspace());
+}
+
+#[test]
+fn exported_path_variables_cannot_be_rebound_then_expanded() {
+    let fx = Fixture::new("run-exported-rebind");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/boss-agy-auth-policy.json");
+    let protected = protected.to_str().unwrap();
+    let split = protected.len() / 2;
+    let prefix = &protected[..split];
+    let suffix = &protected[split..];
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let hooks = hooks.to_str().unwrap();
+    let hooks_split = hooks.len() / 2;
+    let hooks_prefix = &hooks[..hooks_split];
+    let hooks_suffix = &hooks[hooks_split..];
+    let data = fx.tmp.path().join("boss-data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("secret"), "x").unwrap();
+    let data_str = data.to_str().unwrap();
+    let data_split = data_str.len() / 2;
+    let data_prefix = &data_str[..data_split];
+    let data_suffix = &data_str[data_split..];
+    let env = [
+        ("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json"),
+        ("BOSS_BIN_DIR", "/opt/boss-tools"),
+    ];
+    for command in [
+        format!("BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!("BOSS_STRUCTURED_OUTPUT={hooks_prefix}; printf '{{}}' > \"${{BOSS_STRUCTURED_OUTPUT}}{hooks_suffix}\""),
+        "read BOSS_STRUCTURED_OUTPUT < f".into(),
+        "export BOSS_STRUCTURED_OUTPUT=/tmp/agy-ho".into(),
+        "printf -v BOSS_STRUCTURED_OUTPUT %s /tmp/agy-ho".into(),
+        format!("BOSS_BIN_DIR={data_prefix}; cat \"$BOSS_BIN_DIR{data_suffix}/secret\""),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn unquoted_grep_pattern_globs_and_expansions_are_denied() {
+    let fx = Fixture::new("run-grep-pattern-slots");
+    fx.install(WorkerKind::Standard);
+    let config = fx.process_home.join(".gemini/config");
+    let config = config.display();
+    for command in ["grep $X f".into(), "grep -e $X f".into(), format!("grep -v {config}/*")] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+    for command in ["grep \"$X\" f", "grep -n 'x$' f"] {
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn redirect_targets_matching_argv_words_keep_redirect_role() {
+    let fx = Fixture::new("run-redirect-same-word");
+    fx.install(WorkerKind::Standard);
+    for command in [
+        r#"echo "$P" > "$P""#,
+        r#"printf %s "$P" > "$P""#,
+        r#"echo -- "$P" > "$P""#,
+    ] {
+        deny_at(&fx, command, &fx.workspace());
+    }
+}
+
+#[test]
+fn ansi_c_quoting_cannot_hide_a_later_live_line() {
+    let fx = Fixture::new("run-ansi-c-heredoc");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    let command = format!("echo $'\\' <<X #'\ncat {}\nX", protected.display());
+    deny_at(&fx, &command, &fx.workspace());
+}
+
+#[test]
+fn symlink_parent_glob_is_denied_after_physical_dotdot() {
+    let fx = Fixture::new("run-symlink-dotdot-glob");
+    fx.install(WorkerKind::Standard);
+    let sibling = fx.tmp.path().join("other");
+    fs::create_dir_all(&sibling).unwrap();
+    std::os::unix::fs::symlink(&sibling, fx.workspace().join("link")).unwrap();
+    let leaf = format!("{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let body = deny_at(&fx, &format!("cat link/../hom?s/{leaf}"), &fx.workspace());
+    assert!(body["reason"].as_str().unwrap().contains("protected"), "{body}");
 }
