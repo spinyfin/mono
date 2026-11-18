@@ -16,8 +16,9 @@
 #   A lease has a hard time budget (the Boss engine bounds `cube workspace
 #   lease` at ~90s), so cube's setup step cannot afford `bazel build` on a cold
 #   workspace. Instead `.cube/setup.yaml` runs install-workspace-shims.sh,
-#   which symlinks every eligible REPOBIN.toml tool name in bin/ to THIS script.
-#   The engine-owned boss/cube control names are intentionally excluded. The
+#   which reads this checkout's workspace-shim-policy and symlinks every
+#   eligible REPOBIN.toml tool name in bin/ to THIS script. The engine-owned
+#   boss/boss-event/bossctl/cube names are skipped by that policy. The
 #   shim defers the build to first use and then does exactly what CI's
 #   symlink does:
 #

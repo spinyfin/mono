@@ -10,18 +10,17 @@
 # through it (see the shim's header for why the build is deferred rather than
 # done at lease time).
 #
-# Two things are repo-specific and are read from the environment rather than
-# hardcoded, so this script has no opinion about who owns which tool names:
+# Skip/require lists are repo-specific. This checkout's defaults live in
+# `workspace-shim-policy` next to this script (the lease, AGENTS.md and the
+# push-guard repair all invoke this script and pick those defaults up). A
+# checkout that copies the installer without a policy file, or that unsets
+# the lists, shims every declared tool and requires nothing. Environment
+# variables override the policy file when set:
 #   * REPOBIN_SHIM_SKIP — space-separated tool names to never shim (e.g. a
 #     repo whose engine owns its own launchers for some names declared in
-#     REPOBIN.toml). Defaults to empty: nothing is skipped.
+#     REPOBIN.toml).
 #   * REPOBIN_SHIM_REQUIRE — space-separated tool names that must end up
-#     executable in bin/ after install, or the script fails loudly. Defaults
-#     to empty: nothing is required. mono runs this (`.cube/setup.yaml`, step
-#     `repobin-tool-shims`) with REPOBIN_SHIM_SKIP='boss boss-event bossctl
-#     cube' (those four are engine-owned launchers) and
-#     REPOBIN_SHIM_REQUIRE=checkleft (a workspace without a usable checkleft
-#     gate must fail its lease rather than let a worker discover it later).
+#     executable in bin/ after install, or the script fails loudly.
 #
 # Behaviour:
 #   * Cheap and idempotent: only symlinks are written, so `run_when: always`
@@ -30,8 +29,11 @@
 #     file): that is strictly better than the shim, so bin/ is left alone.
 #   * Never overwrites a regular file or directory at a tool's name; warns
 #     and leaves it.
-#   * Exits non-zero if, after installing, any REPOBIN_SHIM_REQUIRE name is
-#     not executable in bin/.
+#   * Removes an existing symlink for a skipped name when it resolves to
+#     this installer's repobin-shim.sh, so a later lease converges after an
+#     unscoped install wrote engine-owned names.
+#   * Exits non-zero if, after installing, any required name is not
+#     executable in bin/.
 #
 # Tested by //tools/repobin/shim:repobin_shim_test.
 set -euo pipefail
@@ -42,13 +44,37 @@ config="$root/REPOBIN.toml"
 bin="$root/bin"
 shim="$here/repobin-shim.sh"
 shim_rel="../tools/repobin/shim/repobin-shim.sh"
-skip_names="${REPOBIN_SHIM_SKIP:-}"
-require_names="${REPOBIN_SHIM_REQUIRE:-}"
 
 die() {
   printf 'install-workspace-shims: %s\n' "$@" >&2
   exit 1
 }
+
+# Policy file next to this script supplies this checkout's defaults. Env
+# vars win when set (including to empty), so tests can still force the
+# generic "nothing skipped, nothing required" behaviour.
+policy_skip=""
+policy_require=""
+policy="$here/workspace-shim-policy"
+if [[ -f "$policy" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      '#'* | '') continue ;;
+      SKIP=*) policy_skip="${line#SKIP=}" ;;
+      REQUIRE=*) policy_require="${line#REQUIRE=}" ;;
+    esac
+  done < "$policy"
+fi
+if [[ -n "${REPOBIN_SHIM_SKIP+x}" ]]; then
+  skip_names="$REPOBIN_SHIM_SKIP"
+else
+  skip_names="$policy_skip"
+fi
+if [[ -n "${REPOBIN_SHIM_REQUIRE+x}" ]]; then
+  require_names="$REPOBIN_SHIM_REQUIRE"
+else
+  require_names="$policy_require"
+fi
 
 [[ -f "$config" ]] || die "no REPOBIN.toml at $root"
 [[ -x "$shim" ]] || die "$shim is missing or not executable"
@@ -95,9 +121,19 @@ for name in repobin $names; do
   installed=$((installed + 1))
 done
 
-# The property REPOBIN_SHIM_REQUIRE exists for (mono requires `checkleft`):
-# fail the lease rather than hand out a workspace missing a tool the caller
-# declared load-bearing.
+# Drop leftover shims for skipped names (declared or not) so a workspace
+# that once ran this installer without the skip list converges on the next
+# lease. Regular files and unrelated symlinks are left alone.
+for name in $skip_names; do
+  entry="$bin/$name"
+  if [[ -L "$entry" && "$entry" -ef "$shim" ]]; then
+    rm -f "$entry"
+  fi
+done
+
+# The property REPOBIN_SHIM_REQUIRE exists for (this checkout requires
+# `checkleft`): fail the lease rather than hand out a workspace missing a
+# tool the caller declared load-bearing.
 for name in $require_names; do
   [[ -x "$bin/$name" ]] || die "$bin/$name is not executable after install; REPOBIN_SHIM_REQUIRE named it as required"
 done
