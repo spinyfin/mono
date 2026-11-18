@@ -24,6 +24,27 @@ final class IdleGridCellsTests: XCTestCase {
         try XCTUnwrap(grid.layout.pages.first)
     }
 
+    /// 3×3 grid (min pane 10×10 in a 30×30 area) so occupancy can leave two
+    /// empties (7) or fill the page (9).
+    private func densePage(occupied: Int) throws -> PaneLayoutPage {
+        let names = TrekPortraitGrid.workerNames
+        let grid = AgentsGridModel(
+            policy: PaneCapacityPolicy(
+                minColumns: 1, minRows: 1, headerHeight: 0, maxPanesPerPage: 9, gap: 0, deadBand: 0
+            ),
+            isVisible: true
+        )
+        grid.noteCellSize(width: 10, height: 10)
+        grid.noteArea(width: 30, height: 30, inLiveResize: false)
+        grid.flushGeometryForTesting()
+        grid.apply(
+            states: (0..<occupied).map { makeState(runId: "r\($0)", slotId: $0 + 1, name: names[$0 % names.count]) },
+            viewers: [:], interactivePoolSize: 16, automationPoolSize: 8,
+            reviewPoolSize: 16, feedUnavailable: false
+        )
+        return try firstPage(grid)
+    }
+
     func testPartiallyFilledPageYieldsIdleCellsForTheRemainder() throws {
         let grid = applied(["a", "b", "c"])
         let page = try firstPage(grid)
@@ -97,7 +118,29 @@ final class IdleGridCellsTests: XCTestCase {
         XCTAssertTrue(cells.isEmpty)
     }
 
+    /// 3×3 page, seven occupied: two empties and a one-name crew fills the
+    /// first and leaves the other blank (the planner `break`).
+    func testPlannerLeavesRemainingEmptiesBlankWhenCrewRunsOut() throws {
+        let page = try densePage(occupied: 7)
+        let emptyIndices = page.cells.filter { $0.content == .empty }.map(\.localIndex)
+        XCTAssertEqual(emptyIndices.count, 2)
+        let cells = IdleGridCellPlanner.cells(
+            for: page, busyPersonas: [], seedRunIds: ["r0"], crew: ["Kirk"]
+        )
+        XCTAssertEqual(cells.map(\.persona), ["Kirk"])
+        XCTAssertEqual(cells.count, 1)
+        XCTAssertTrue(emptyIndices.contains(cells[0].localIndex))
+        XCTAssertEqual(Set(emptyIndices).subtracting([cells[0].localIndex]).count, 1)
+    }
+
     func testFullPageYieldsNoIdleCells() throws {
+        let page = try densePage(occupied: 9)
+        XCTAssertFalse(page.cells.contains { $0.content == .empty })
+        XCTAssertTrue(
+            IdleGridCellPlanner.cells(
+                for: page, busyPersonas: [], seedRunIds: ["r0"], crew: ["Kirk", "Spock"]
+            ).isEmpty
+        )
         let names = TrekPortraitGrid.workerNames
         let grid = AgentsGridModel(isVisible: true)
         grid.noteCellSize(width: 8, height: 16)
@@ -108,9 +151,9 @@ final class IdleGridCellsTests: XCTestCase {
             viewers: [:], interactivePoolSize: 16, automationPoolSize: 8,
             reviewPoolSize: 16, feedUnavailable: false
         )
-        let page = try firstPage(grid)
-        XCTAssertFalse(page.cells.contains { $0.content == .empty })
-        XCTAssertTrue(grid.idleCells(for: page).isEmpty)
+        let packed = try firstPage(grid)
+        XCTAssertFalse(packed.cells.contains { $0.content == .empty })
+        XCTAssertTrue(grid.idleCells(for: packed).isEmpty)
     }
 
     func testChoiceMayChangeWhenAgentSetChanges() throws {
