@@ -6,6 +6,8 @@ workspace = "../../../.."
 
 [features]
 test-support = ["dep:tempfile", "dep:tracing-subscriber", "rusqlite/backup"]
+# Enables production-scale measurement tests (the Bazel `work_tree_scale_test` target).
+scale_measurements = []
 
 [dependencies]
 boss-write-batch = { path = "../write-batch" }

@@ -337,7 +337,9 @@ async fn merge_conflict_revision_with_proven_absent_still_finalizes_despite_dirt
     })));
 
     let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
+    let handler = handler
+        .with_branch_verifier(conflict_delivery::published_verifier(verifier, Ok(head)))
+        .with_merge_probe(conflict_delivery::published_probe(probe, head));
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(

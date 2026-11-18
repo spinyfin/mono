@@ -40,7 +40,7 @@ impl std::fmt::Debug for CommandCubeClient {
 /// precedes it, and treats everything before that (whitespace-trimmed) as
 /// the path. Lines that don't match the pattern (already-bare paths, or a
 /// future jj format change) are returned unchanged.
-fn strip_jj_conflict_descriptor(line: &str) -> &str {
+pub(crate) fn strip_jj_conflict_descriptor(line: &str) -> &str {
     const MARKER: &str = "-sided conflict";
     let trimmed = line.trim();
     let Some(marker_idx) = trimmed.rfind(MARKER) else {
@@ -99,13 +99,19 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(RebaseOutcome {
-        clean,
-        pushed,
-        conflicted_files,
-        linearized_commits,
-        linearize_decline,
-    })
+    let main_ref = payload
+        .get("main_ref")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    Ok(RebaseOutcome::builder()
+        .clean(clean)
+        .pushed(pushed)
+        .conflicted_files(conflicted_files)
+        .linearized_commits(linearized_commits)
+        .maybe_linearize_decline(linearize_decline)
+        .maybe_main_ref(main_ref)
+        .build())
 }
 
 impl CommandCubeClient {

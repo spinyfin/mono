@@ -64,7 +64,7 @@ crate::stub_cube_client! { SharedStoreCube {
         self.record("rebase_workspace");
         self.rebases.fetch_add(1, Ordering::SeqCst);
         JjRepo::run(&self.store, &["rebase", "-b", PR_BRANCH, "-d", "upstream"]);
-        Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: vec![], linearized_commits: 0, linearize_decline: None })
+        Ok(RebaseOutcome::builder().clean(true).pushed(true).conflicted_files(Vec::new()).build())
     }
     async fn verify_deletion_tripwire(&self, _repo: &str, _head: &str, _base: &str, _pr: u64) -> Vec<String> {
         vec![]

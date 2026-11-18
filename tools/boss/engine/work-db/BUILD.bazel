@@ -115,11 +115,73 @@ rust_library(
 rust_test(
     name = "work_db_test",
     size = "small",
-    # 2000+ tests plus a production-cardinality work-tree measurement exceed
-    # the 300s moderate budget on loaded CI agents.
+    # 2000+ tests exceed the 300s moderate budget on loaded CI agents. The
+    # production-cardinality measurements run in `work_tree_scale_test`.
     timeout = "long",
     srcs = glob(["src/**/*.rs"]),
     compile_data = ["//tools/boss/app-macos:work_board_banners_swift"],
+    crate_root = "src/lib.rs",
+    data = [
+        "//tools/boss/app-macos:work_board_banners_swift",
+        "@jj_test_tools//:jj",
+    ] + glob(["src/**/*.rs"]),
+    edition = "2024",
+    env = {
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "HOME": "/tmp",
+    },
+    proc_macro_deps = ["//tools/boss/engine/work-db-boundary:work_db_boundary"] + all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    rustc_env = {"BOSS_WORK_BOARD_BANNERS_SWIFT": "$(execpath //tools/boss/app-macos:work_board_banners_swift)"},
+    deps = [
+        "//lib/rust/git_utils",
+        "//tools/boss/comment_anchor",
+        "//tools/boss/engine/attachments",
+        "//tools/boss/engine/automation-dedup",
+        "//tools/boss/engine/board-gesture",
+        "//tools/boss/engine/board-projection",
+        "//tools/boss/engine/conflict-diagnosis",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/effort",
+        "//tools/boss/engine/event-bus",
+        "//tools/boss/engine/host-execution",
+        "//tools/boss/engine/metrics:metrics_test_support",
+        "//tools/boss/engine/pr-review",
+        "//tools/boss/engine/pr-review-sources",
+        "//tools/boss/engine/proposal-validation",
+        "//tools/boss/engine/prose-vocabulary",
+        "//tools/boss/engine/recovery",
+        "//tools/boss/engine/review-guide",
+        "//tools/boss/engine/storage-values",
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/utils",
+        "//tools/boss/engine/work-navigator",
+        "//tools/boss/engine/write-batch",
+        "//tools/boss/gh_telemetry",
+        "//tools/boss/github",
+        "//tools/boss/protocol",
+        "//tools/boss/protocol-spoke",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# Production-cardinality measurements run separately from unit shards.
+rust_test(
+    name = "work_tree_scale_test",
+    size = "large",
+    # Observed locally at roughly 270 seconds; long gives this target 900 seconds.
+    timeout = "long",
+    srcs = glob(["src/**/*.rs"]),
+    args = [
+        "_measurement",
+        "--nocapture",
+    ],
+    compile_data = ["//tools/boss/app-macos:work_board_banners_swift"],
+    crate_features = ["scale_measurements"],
     crate_root = "src/lib.rs",
     data = [
         "//tools/boss/app-macos:work_board_banners_swift",

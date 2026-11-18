@@ -1,5 +1,7 @@
-//! Shared "discard the conflicted lockfile, regenerate it from the merged
-//! manifest" strategy used by every built-in lockfile resolver.
+//! Shared "restore the lockfile from the base revision (when one is given),
+//! regenerate it from the merged manifest" strategy used by every built-in
+//! lockfile resolver. Without a base revision the conflicted file is
+//! discarded and regenerated from scratch.
 
 use std::path::Path;
 

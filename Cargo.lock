@@ -767,6 +767,7 @@ dependencies = [
  "async-trait",
  "bon",
  "boss-backoff",
+ "boss-command-runner",
  "boss-dispatch-events",
  "boss-engine-driver",
  "boss-engine-effort",
@@ -1296,6 +1297,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bon",
  "boss-dispatch-events",
  "boss-engine-effort",
  "boss-engine-metrics-registry",

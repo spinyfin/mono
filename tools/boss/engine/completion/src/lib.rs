@@ -620,6 +620,11 @@ impl PrDetector for CommandPrDetector {
 /// concerns independently.
 #[async_trait]
 pub trait BranchVerifier: Send + Sync {
+    /// Read the published branch directly from git, independently of the PR record.
+    async fn fetch_remote_head(&self, _remote: &str, _branch: &str) -> Result<String> {
+        anyhow::bail!("remote branch verification is unavailable")
+    }
+
     /// Returns the `headRefName` for PR `pr_number` in `repo_slug`, or
     /// an error on network / API failure.
     async fn fetch_pr_head_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
@@ -733,6 +738,48 @@ impl CommandBranchVerifier {
 
 #[async_trait]
 impl BranchVerifier for CommandBranchVerifier {
+    async fn fetch_remote_head(&self, remote: &str, branch: &str) -> Result<String> {
+        let reference = format!("refs/heads/{branch}");
+        let remote = remote.to_owned();
+        let args_reference = reference.clone();
+        // Run in its own process group with prompts disabled: a credential or
+        // host-key prompt must fail fast, and a timeout must also reap the
+        // ssh / git-remote-https grandchildren, not just `git`.
+        let output = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new("git");
+            command
+                .args(["ls-remote", "--exit-code", "--refs", "--", &remote, &args_reference])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+                .stdin(std::process::Stdio::null());
+            boss_command_runner::output_blocking_timeout_in_group(
+                &mut command,
+                run_done_declaration::DECLARED_DELIVERY_NETWORK_BUDGET,
+                |_| {},
+            )
+        })
+        .await??;
+        anyhow::ensure!(
+            output.status.success(),
+            "remote head lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        let mut lines = stdout.lines();
+        let (head, found) = lines
+            .next()
+            .and_then(|line| line.split_once('\t'))
+            .ok_or_else(|| anyhow::anyhow!("remote head lookup returned no ref"))?;
+        anyhow::ensure!(
+            found == reference
+                && lines.next().is_none()
+                && head.len() == 40
+                && head.bytes().all(|c| c.is_ascii_hexdigit()),
+            "remote head lookup returned an invalid ref"
+        );
+        Ok(head.to_owned())
+    }
+
     async fn fetch_pr_head_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
         git_utils::gh_cli::fetch_pr_head_ref(repo_slug, pr_number).await
     }

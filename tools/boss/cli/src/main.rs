@@ -160,6 +160,7 @@ macro_rules! rpc_call {
 mod automation_cmds;
 mod commands;
 mod comment_commands;
+mod conflict_commands;
 mod cost_cmds;
 mod data;
 mod decision_commands;
@@ -181,6 +182,7 @@ mod work_update_args;
 pub(crate) use automation_cmds::*;
 pub(crate) use commands::*;
 pub(crate) use comment_commands::*;
+pub(crate) use conflict_commands::*;
 pub(crate) use data::*;
 pub(crate) use decision_commands::*;
 pub(crate) use dependency_filter_args::*;
