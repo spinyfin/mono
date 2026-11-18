@@ -487,6 +487,7 @@ const OVERWRITE_REPLY: &str =
 const GOLDEN_SETTINGS_STANDARD: &str = r#"{
   "agentMode": "",
   "toolPermission": "request-review",
+  "queuedMessages": "queue",
   "trustedWorkspaces": [
     "/boss-test-absent/workspaces/ws-1"
   ],

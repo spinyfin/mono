@@ -60,6 +60,10 @@ pub const AGENT_MODE: &str = "";
 /// `toolPermission` rendered for every kind.
 pub const TOOL_PERMISSION: &str = "request-review";
 
+/// Pin the pane study's buffered input mode. Accepted by agy 1.5.9's
+/// strict --settings parser; "send-immediately" changes mid-turn semantics.
+pub const QUEUED_MESSAGES: &str = "queue";
+
 /// The one per-run CLI flag the posture needs.
 const SETTINGS_FLAG: &str = "--settings";
 
@@ -137,6 +141,7 @@ fn claude_allowlist(worker_kind: WorkerKind) -> Vec<String> {
 pub struct SessionSettings {
     agent_mode: String,
     tool_permission: String,
+    queued_messages: String,
     trusted_workspaces: Vec<String>,
     permissions: Permissions,
 }
@@ -160,6 +165,9 @@ impl SessionSettings {
 
     /// Exactly the posture this module renders — nothing looser.
     fn validate(&self) -> anyhow::Result<()> {
+        if self.queued_messages != QUEUED_MESSAGES {
+            bail!("agy queuedMessages must be {QUEUED_MESSAGES:?}");
+        }
         if self.agent_mode != AGENT_MODE {
             bail!(
                 "agy agentMode must be pinned to {AGENT_MODE:?}, got {:?}",
@@ -234,6 +242,7 @@ pub fn render_settings(plan: &SettingsPlan<'_>) -> anyhow::Result<SessionSetting
     let settings = SessionSettings {
         agent_mode: AGENT_MODE.to_owned(),
         tool_permission: TOOL_PERMISSION.to_owned(),
+        queued_messages: QUEUED_MESSAGES.to_owned(),
         trusted_workspaces: vec![plan.workspace.display().to_string()],
         permissions: Permissions { allow, deny },
     };

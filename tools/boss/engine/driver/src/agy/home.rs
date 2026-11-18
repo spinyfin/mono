@@ -379,13 +379,16 @@ pub fn render_onboarding_json() -> &'static str {
 
 pub fn render_trusted_workspaces_json(workspace: &Path) -> String {
     let paths = trust_path_variants(workspace);
-    serde_json::to_string_pretty(&serde_json::json!({ "trustedWorkspaces": paths }))
-        .expect("trustedWorkspaces JSON is serializable")
+    serde_json::to_string_pretty(&serde_json::json!({
+        "trustedWorkspaces": paths,
+        "queuedMessages": super::permissions::QUEUED_MESSAGES,
+    }))
+    .expect("trustedWorkspaces JSON is serializable")
         + "\n"
 }
 
 pub fn render_session_settings_json(workspace: &Path) -> String {
-    // Trust only. Permission settings are supplied by the permission renderer.
+    // Trust and queued input. Permission settings come from the permission renderer.
     // Skipping onboarding does not answer data-collection consent;
     // enableTelemetry is omitted.
     render_trusted_workspaces_json(workspace)
@@ -533,6 +536,10 @@ pub fn assert_agy_posture(process_home: &Path, workspace: &Path) -> anyhow::Resu
         serde_json::from_str(&settings).context("parsing private CLI settings.json")?;
     if settings_json.get("enableTelemetry").is_some() {
         bail!("private CLI settings must not answer data-collection consent (enableTelemetry)");
+    }
+    if settings_json.get("queuedMessages").and_then(|value| value.as_str()) != Some(super::permissions::QUEUED_MESSAGES)
+    {
+        bail!("private CLI settings must pin queuedMessages to queue");
     }
     let trusted = settings_json
         .get("trustedWorkspaces")

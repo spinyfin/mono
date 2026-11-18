@@ -838,8 +838,8 @@ fn classify_error_for_execution(work_db: &WorkDb, execution_id: &str, text: &str
 
 fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {
     match class {
-        WorkerErrorClass::Transient => ErrorClass::Transient,
-        WorkerErrorClass::Permanent => ErrorClass::Permanent,
+        WorkerErrorClass::Transient | WorkerErrorClass::EligibilityServiceFailure => ErrorClass::Transient,
+        WorkerErrorClass::Permanent | WorkerErrorClass::QuotaExhausted => ErrorClass::Permanent,
         WorkerErrorClass::Indeterminate => ErrorClass::Indeterminate,
     }
 }
@@ -1101,6 +1101,10 @@ fn clip(s: &str, max_bytes: usize) -> String {
     let one_line = s.trim().replace('\n', " ");
     boss_engine_utils::string_clip::clip_to_bytes(&one_line, max_bytes)
 }
+
+#[cfg(test)]
+#[path = "transient_recovery_agy_tests.rs"]
+mod agy_tests;
 
 #[cfg(test)]
 mod tests {
