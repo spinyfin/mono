@@ -508,6 +508,36 @@ fn resolved_workspace(workspace: &Path) -> anyhow::Result<PathBuf> {
     })
 }
 
+/// Render the per-kind session document for `input` without writing it.
+/// Startup verification compares the installed file to this result.
+pub fn render_settings_for_input(input: &PermissionInput) -> anyhow::Result<SessionSettings> {
+    let control_dir = control_dir_for_run(&input.run_id)
+        .with_context(|| format!("resolving agy control dir for run_id {:?}", input.run_id))?;
+    let workspace = resolved_workspace(&input.workspace_path)?;
+    let boss_data_dir = if input.is_remote {
+        None
+    } else {
+        input
+            .events_socket_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    };
+    let hooks_dir = hooks_dir_for_run(&input.run_id)?;
+    let rules_path = super::home::agent_rules_path_for_run(&input.run_id)?;
+    let rules_root = rules_path.ancestors().nth(3).context("rules root")?;
+    render_settings(
+        &SettingsPlan::builder()
+            .worker_kind(input.worker_kind)
+            .workspace(&workspace)
+            .maybe_boss_data_dir(boss_data_dir.as_deref())
+            .hooks_dir(&hooks_dir)
+            .control_dir(&control_dir)
+            .rules_root(rules_root)
+            .build(),
+    )
+}
+
 /// Render the run's session settings, write them into the run's control
 /// directory, and return the artifacts the spawn flow applies.
 ///
@@ -529,29 +559,7 @@ pub fn write_session_settings(input: &PermissionInput) -> anyhow::Result<Permiss
         bail!("agy session settings path {} is not absolute", settings_path.display());
     }
 
-    let workspace = resolved_workspace(&input.workspace_path)?;
-    let boss_data_dir = if input.is_remote {
-        None
-    } else {
-        input
-            .events_socket_path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-    };
-    let hooks_dir = hooks_dir_for_run(&input.run_id)?;
-    let rules_path = super::home::agent_rules_path_for_run(&input.run_id)?;
-    let rules_root = rules_path.ancestors().nth(3).context("rules root")?;
-    let settings = render_settings(
-        &SettingsPlan::builder()
-            .worker_kind(input.worker_kind)
-            .workspace(&workspace)
-            .maybe_boss_data_dir(boss_data_dir.as_deref())
-            .hooks_dir(&hooks_dir)
-            .control_dir(&control_dir)
-            .rules_root(rules_root)
-            .build(),
-    )?;
+    let settings = render_settings_for_input(input)?;
     let body = settings.to_json()?;
 
     // Refuse a symlink or shared hard link planted where the file goes.
