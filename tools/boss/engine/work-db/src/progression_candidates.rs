@@ -14,23 +14,16 @@
 //!   reads this view.
 //! - `progression_candidates` keeps the rows where every clause holds. The sweep
 //!   reads this view.
-//! - `progression_candidate_base` is every clause but 4 plus
-//!   `candidate_ex_dependency`. Clause 4 does not treat that flag as a
-//!   prerequisite's candidacy: a prerequisite held only by its own clause 4 is
-//!   not a candidate and does not hold its dependent.
-//! - `progression_prereq_task_edges` expands each `blocks` edge to task
-//!   prerequisites (a project becomes its open members, excluding the
-//!   dependent). `progression_real_candidates` walks that DAG bottom-up so
-//!   each item's clause 4 sees its prerequisites' real candidacy. The result
-//!   is a non-correlated set tested with `IN`.
+//! - `progression_candidate_base` evaluates every clause except dependency
+//!   health. `progression_prereq_task_edges` expands open task and project
+//!   prerequisites; `progression_dependency_waiting` walks those edges
+//!   transitively to detect cycles and identifies ordinary unfinished waits.
+//!   Neither depends on a prerequisite's progression candidacy or age.
 //! - `progression_chain_roots`, `progression_family_keys`,
-//!   `progression_live_families`, `progression_live_execution_tasks`,
-//!   `progression_live_tasks` and `progression_ladder_families` are the
-//!   helpers that give clause 2 its "item, its revisions and its PR chain"
-//!   reach. They are non-correlated sets tested with `IN`, so the recursive
-//!   chain walk runs once per statement, not once per candidate row (the sweep
-//!   evaluates the view inside an `IMMEDIATE` transaction that holds the
-//!   writer lock). The same is true of the clause-4 candidacy walk.
+//!   `progression_live_families` and `progression_ladder_families` give
+//!   clause 2 its "item, its revisions and its PR chain" reach. They are
+//!   non-correlated sets tested with `IN`, so the recursive walks run once
+//!   per statement, not once per candidate row under the sweep's writer lock.
 //! - `progression_run_state` is the cheap per-item subset the stuck report
 //!   reads: the item's own progression runs, nothing about the rest of the graph.
 //!
@@ -56,19 +49,17 @@
 //! 3. **Not waiting on capacity.** No queued execution of the item carries a
 //!    slot, cap, workspace or pause wait reason. Waiting for bandwidth is not
 //!    stuck.
-//! 4. **Dependency clear.** A `blocked: dependency` item is progressed through
-//!    its prerequisite, not itself, when that prerequisite is live, parked, or
-//!    itself a progression candidate (every clause, including the prerequisite's
-//!    own clause 4). A project prerequisite counts when it is parked or any
-//!    open member task other than the dependent is live, parked, or such a
-//!    candidate. The dependent is excluded from every prerequisite-side test, so
-//!    its own candidacy, its own live executions (including a progression run
-//!    the sweep just minted) and a `blocks` edge onto its own project cannot
-//!    hold it. A stuck prerequisite that grace, cooldown, the create budget or
-//!    the failure cap keeps from being nominated is not a candidate and does
-//!    not hold the dependent; nor does an idle, unparked one, a human-held one,
-//!    a dangling edge, or a middle item held only by *its* prerequisite. The
-//!    stuck report reads the same value as `dependency_held`.
+//! 4. **Dependency clear.** An item waiting on unfinished prerequisites is
+//!    progressed through those prerequisites, however long the chain or wait.
+//!    A stuck root is considered through its own stuck state, even when its
+//!    grace, cooldown, budget or a human hold currently prevents nomination.
+//!    Dependency progression repairs missing, deleted or archived prerequisites,
+//!    cycles (including a dependency on the item's own project), and stale
+//!    blocks after all prerequisites finish or disappear. These are diagnosed
+//!    at the broken edge's dependent or the cycle's members; downstream items
+//!    wait for that repair. An open project holds dependents while parked or
+//!    while it has open members. The stuck report reads the same value as
+//!    `dependency_held`.
 //! 5. **Stuck long enough.** In one of the stuck states the enumeration marks as
 //!    progression-eligible ([`stuck_kind_sql`]) continuously for at least
 //!    `progression.stuck_after`, measured from the task status ledger exactly as
@@ -156,6 +147,7 @@ pub(super) fn migrate_views(conn: &Connection) -> Result<()> {
 const DROP_VIEWS: &str = "DROP VIEW IF EXISTS progression_candidates;
          DROP VIEW IF EXISTS progression_candidate_clauses;
          DROP VIEW IF EXISTS progression_real_candidates;
+         DROP VIEW IF EXISTS progression_dependency_waiting;
          DROP VIEW IF EXISTS progression_candidate_base;
          DROP VIEW IF EXISTS progression_run_state;
          DROP VIEW IF EXISTS progression_live_tasks;
@@ -365,155 +357,94 @@ fn ladder_families_select() -> String {
     )
 }
 
-/// True when `task` holds dependents of `excluded`: it is parked, something in
-/// its PR family other than `excluded` is live or pending, or it is a real
-/// progression candidate (clause 4 resolved through the DAG).
-fn task_holds_dependent_sql(task: &str, excluded: &str) -> String {
-    let parked = parked_task_sql(task);
-    format!(
-        "({parked}
-          OR EXISTS (
-              SELECT 1 FROM progression_family_keys pk
-              JOIN progression_family_keys other ON other.family_key = pk.family_key
-              WHERE pk.task_id = {task}.id
-                AND other.task_id <> {excluded}.id
-                AND other.task_id IN (SELECT work_item_id FROM progression_live_execution_tasks))
-          OR {task}.id IN (SELECT work_item_id FROM progression_real_candidates))"
-    )
-}
-
-/// Clause 4, the raw test: some open prerequisite of the item is live, parked,
-/// or itself a progression candidate, so progress goes through it rather than
-/// through the item (design 2.1). It does not look at the item's own
-/// `blocked_reason`; [`dependency_clear_sql`] applies that guard, and the stuck
-/// report reads this value as `dependency_held`.
-///
-/// - A **task** prerequisite holds when it is parked, when anything in its PR
-///   family *other than the dependent* is live or pending, or when it is a
-///   real candidate (`progression_real_candidates`, which includes the
-///   prerequisite's own clause 4). A stuck prerequisite that grace, cooldown,
-///   the create budget or the infrastructure-failure cap keeps from being
-///   nominated is *not* a candidate, so it does not hold the dependent. A
-///   middle item held only by *its* prerequisite is not a candidate either.
-/// - A **project** prerequisite holds when it is parked, or when any open
-///   member task *other than the dependent* is live (independently of the
-///   dependent), parked, or such a candidate. An open project whose members
-///   are all idle and not stuck holds nothing: the dependent is then the
-///   candidate and can drop the edge or ask.
-///
-/// The dependent is excluded from every prerequisite-side test: its own
-/// candidacy, its own live executions, and a `blocks` edge onto its own
-/// project cannot hold it. A human-held prerequisite, an idle one and a
-/// dangling edge hold nothing.
+/// Clause 4 uses graph health rather than progression candidacy. A failed or
+/// throttled prerequisite still owns its recovery; its dependents keep waiting.
 fn dependency_held_sql(a: &str) -> String {
-    let member_holds = task_holds_dependent_sql("m", a);
-    let prereq_holds = task_holds_dependent_sql("p", a);
-    format!(
-        "EXISTS (
-            SELECT 1 FROM work_item_dependencies d
-            WHERE d.dependent_id = {a}.id AND d.relation = 'blocks' AND (
-                EXISTS (SELECT 1 FROM projects pj
-                        WHERE pj.id = d.prerequisite_id AND pj.status NOT IN ('done', 'archived')
-                          AND (pj.parked_at IS NOT NULL
-                               OR EXISTS (SELECT 1 FROM tasks m
-                                          WHERE m.project_id = pj.id AND m.deleted_at IS NULL
-                                            AND m.status NOT IN ('done', 'archived')
-                                            AND m.id <> {a}.id
-                                            AND {member_holds})))
-                OR EXISTS (SELECT 1 FROM tasks p
-                           WHERE p.id = d.prerequisite_id AND p.deleted_at IS NULL
-                             AND p.status NOT IN ('done', 'archived')
-                             AND p.id <> {a}.id
-                             AND {prereq_holds})))"
-    )
+    format!("{a}.id IN (SELECT work_item_id FROM progression_dependency_waiting)")
 }
 
-/// `blocks` edges expanded to task prerequisites. A project prerequisite
-/// becomes each of its open members except the dependent, so a task that
-/// depends on its own project is not held by itself. Parked projects are
-/// omitted here: they hold dependents directly, not through members.
-fn prereq_task_edges_sql() -> &'static str {
-    "SELECT d.dependent_id AS dependent_id, d.prerequisite_id AS prerequisite_task_id
+/// Open `blocks` edges expanded to task prerequisites. Include the dependent
+/// among project members: depending on one's own project is a cycle. Parked
+/// projects hold dependents directly, without walking their members.
+fn prereq_task_edges_sql() -> String {
+    let live = crate::live_chain_writer_sql("p");
+    let writer = crate::revision_sequencing::has_writer_sql("p.id");
+    let conflict_in_flight = crate::revision_sequencing::conflict_fix_in_flight_sql("p.id");
+    let conflict_prefix = boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX;
+    let recovery_prefix = boss_protocol::CREATED_VIA_CONFLICT_RECOVERY_PREFIX;
+    let recovery_start = recovery_prefix.len() + 1;
+    format!(
+        "SELECT d.dependent_id AS dependent_id, d.prerequisite_id AS prerequisite_task_id
              FROM work_item_dependencies d
              JOIN tasks p ON p.id = d.prerequisite_id
-             WHERE d.relation = 'blocks'
-               AND p.deleted_at IS NULL AND p.status NOT IN ('done', 'archived')
+             LEFT JOIN tasks t ON t.id = d.dependent_id
+             LEFT JOIN progression_chain_roots tc ON tc.task_id = t.id
+             LEFT JOIN progression_chain_roots pc ON pc.task_id = p.id
+             -- A recovery inherits the conflict revision's ordering identity.
+             LEFT JOIN tasks source ON source.id = CASE
+                 WHEN t.created_via LIKE '{recovery_prefix}%'
+                 THEN substr(t.created_via, {recovery_start}) ELSE t.id END
+             LEFT JOIN progression_chain_roots sc ON sc.task_id = source.id
+             WHERE d.relation = 'blocks' AND p.deleted_at IS NULL
+               AND CASE
+                 -- Conflict writer exclusion precedes status satisfaction,
+                 -- matching gating_prereqs_for.
+                 WHEN t.kind = 'revision' AND source.kind = 'revision'
+                      AND source.created_via LIKE '{conflict_prefix}%'
+                      AND sc.root_id = pc.root_id
+                 THEN CASE WHEN p.id > source.id THEN {conflict_in_flight} ELSE {writer} END
+                 WHEN p.status IN ('done', 'archived') THEN 0
+                 WHEN t.kind = 'revision' AND tc.root_id = pc.root_id
+                 THEN NOT (p.status = 'in_review' OR (p.kind = 'revision' AND NOT {live}))
+                 ELSE 1
+               END
              UNION
              SELECT d.dependent_id, m.id
              FROM work_item_dependencies d
              JOIN projects pj ON pj.id = d.prerequisite_id
                AND pj.status NOT IN ('done', 'archived') AND pj.parked_at IS NULL
              JOIN tasks m ON m.project_id = pj.id AND m.deleted_at IS NULL
-               AND m.status NOT IN ('done', 'archived') AND m.id <> d.dependent_id
+               AND m.status NOT IN ('done', 'archived')
              WHERE d.relation = 'blocks'"
+    )
 }
 
-/// Real progression candidates: `candidate_ex_dependency` and clause 4, with
-/// each prerequisite's own clause 4 resolved bottom-up over the acyclic
-/// `blocks` DAG. Live and parked items are holding too, so a live or parked
-/// prerequisite keeps its dependent out of this set. The walk is one
-/// statement: a topological pass that accumulates holding ids, then an `IN`
-/// set for clause 4.
-fn real_candidates_view_sql() -> String {
-    let parked = parked_task_sql("t");
-    format!(
-        "CREATE VIEW progression_real_candidates AS
-         WITH RECURSIVE
-         paths(id, d) AS (
-             SELECT t.id, 0
-             FROM tasks t
-             WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
-               AND NOT EXISTS (
-                   SELECT 1 FROM progression_prereq_task_edges e WHERE e.dependent_id = t.id)
-             UNION
-             SELECT e.dependent_id, paths.d + 1
-             FROM paths
-             JOIN progression_prereq_task_edges e ON e.prerequisite_task_id = paths.id
-             WHERE paths.d < (SELECT COUNT(*) FROM tasks)
-         ),
-         topo AS (
-             SELECT t.id AS id,
-                    ROW_NUMBER() OVER (
-                        ORDER BY COALESCE(p.max_d, 1000000), t.id
-                    ) - 1 AS ord
-             FROM tasks t
-             LEFT JOIN (SELECT id, MAX(d) AS max_d FROM paths GROUP BY id) p ON p.id = t.id
-             WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
-         ),
-         walk(ord, holding) AS (
-             SELECT -1, ''
-             UNION ALL
-             SELECT tord.ord,
-                    CASE
-                      WHEN t.id IN (SELECT task_id FROM progression_live_tasks)
-                           OR {parked}
-                           OR (COALESCE(b.candidate_ex_dependency, 0)
-                               AND (t.blocked_reason IS NOT 'dependency'
-                                    OR (NOT EXISTS (
-                                            SELECT 1 FROM work_item_dependencies d
-                                            JOIN projects pj ON pj.id = d.prerequisite_id
-                                            WHERE d.dependent_id = t.id AND d.relation = 'blocks'
-                                              AND pj.parked_at IS NOT NULL
-                                              AND pj.status NOT IN ('done', 'archived'))
-                                        AND NOT EXISTS (
-                                            SELECT 1 FROM progression_prereq_task_edges e
-                                            WHERE e.dependent_id = t.id
-                                              AND INSTR(',' || walk.holding || ',',
-                                                        ',' || e.prerequisite_task_id || ',') > 0))))
-                      THEN walk.holding || ',' || t.id
-                      ELSE walk.holding
-                    END
-             FROM walk
-             JOIN topo tord ON tord.ord = walk.ord + 1
-             JOIN tasks t ON t.id = tord.id
-             LEFT JOIN progression_candidate_base b ON b.work_item_id = t.id
-         )
-         SELECT b.work_item_id AS work_item_id
-         FROM progression_candidate_base b
-         JOIN walk w ON w.ord = (SELECT MAX(ord) FROM topo)
-         WHERE b.candidate_ex_dependency
-           AND INSTR(',' || w.holding || ',', ',' || b.work_item_id || ',') > 0"
-    )
+/// Tasks waiting on unfinished work, independent of how that work is dispatched.
+/// The transitive closure uses UNION (not UNION ALL), so even corrupt cycles
+/// terminate. Only cycle members are nominated; other dependents wait for the
+/// repair upstream. Missing/archived/deleted edges belong to their direct
+/// dependent. A done edge is satisfied, so it is only a stale block once no
+/// unfinished prerequisite remains.
+fn dependency_waiting_view_sql() -> &'static str {
+    "CREATE VIEW progression_dependency_waiting AS
+     WITH RECURSIVE reach(dependent_id, prerequisite_id) AS (
+         SELECT dependent_id, prerequisite_task_id FROM progression_prereq_task_edges
+         UNION
+         SELECT r.dependent_id, e.prerequisite_task_id
+         FROM reach r
+         JOIN progression_prereq_task_edges e ON e.dependent_id = r.prerequisite_id
+     ),
+     waiting(work_item_id) AS (
+         SELECT dependent_id FROM progression_prereq_task_edges
+         UNION
+         SELECT d.dependent_id FROM work_item_dependencies d
+         JOIN projects p ON p.id = d.prerequisite_id
+         WHERE d.relation = 'blocks' AND p.parked_at IS NOT NULL
+           AND p.status NOT IN ('done', 'archived')
+     ),
+     broken(work_item_id) AS (
+         SELECT d.dependent_id FROM work_item_dependencies d
+         LEFT JOIN tasks t ON t.id = d.prerequisite_id
+         LEFT JOIN projects p ON p.id = d.prerequisite_id
+         WHERE d.relation = 'blocks'
+           AND ((t.id IS NULL AND p.id IS NULL)
+                OR t.deleted_at IS NOT NULL OR t.status = 'archived' OR p.status = 'archived')
+         UNION
+         SELECT dependent_id FROM reach WHERE dependent_id = prerequisite_id
+     )
+     SELECT work_item_id FROM waiting
+     EXCEPT
+     SELECT work_item_id FROM broken"
 }
 
 /// Clause 6, create-budget half: revisions and precursors a progression run
@@ -652,12 +583,11 @@ fn views_sql() -> String {
     let create_budget_exhausted = create_budget_exhausted_sql("t", &max_creates, &create_window);
     let run_state = run_state_select(&cooldown);
     let prereq_edges = prereq_task_edges_sql();
-    let real_candidates = real_candidates_view_sql();
+    let dependency_waiting = dependency_waiting_view_sql();
     format!(
         "{DROP_VIEWS}
 
-         -- `blocks` edges expanded to task ids (project members except the
-         -- dependent). The real-candidate walk is over this DAG.
+         -- Open `blocks` edges, including project members for cycle detection.
          CREATE VIEW progression_prereq_task_edges AS
          {prereq_edges};
 
@@ -696,28 +626,13 @@ fn views_sql() -> String {
          CREATE VIEW progression_ladder_families AS
          {ladder_families};
 
-         -- Tasks that themselves carry a live or pending execution. Clause 4
-         -- uses this (not the family expansion) so a dependent's own run cannot
-         -- make a same-family prerequisite look live.
-         CREATE VIEW progression_live_execution_tasks AS
-         SELECT DISTINCT work_item_id AS work_item_id
-         FROM work_executions
-         WHERE status IN {LIVE_OR_PENDING};
-
-         -- Every task that belongs to a family with live or pending work.
-         CREATE VIEW progression_live_tasks AS
-         SELECT k.task_id AS task_id
-         FROM progression_family_keys k
-         WHERE k.family_key IN (SELECT family_key FROM progression_live_families);
-
          CREATE VIEW progression_run_state AS
          SELECT t.id AS work_item_id, {run_state}
          FROM tasks t
          WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived');
 
-         -- Every clause except clause 4, and whether the item would be a candidate
-         -- without it. The real-candidate walk uses this as the per-item input;
-         -- clause 4 then applies each prerequisite's own clause 4.
+         -- Every clause except clause 4. Dependency health is independent of
+         -- the prerequisite's eligibility, grace, cooldown and budgets.
          CREATE VIEW progression_candidate_base AS
          SELECT s.work_item_id AS work_item_id,
                 s.stuck_kind AS stuck_kind,
@@ -731,9 +646,7 @@ fn views_sql() -> String {
                 {c6} AS c6_cooldown_and_budget_clear,
                 s.progression_live AS progression_live,
                 s.in_cooldown AS in_cooldown,
-                s.infrastructure_failing AS infrastructure_failing,
-                (s.c1_eligible AND s.c2_no_live_work AND s.c2_no_inflight_ladder AND s.c3_not_capacity_wait
-                 AND {c5} AND {c6}) AS candidate_ex_dependency
+                s.infrastructure_failing AS infrastructure_failing
          FROM (
              SELECT t.id AS work_item_id,
                     {stuck_kind} AS stuck_kind,
@@ -751,7 +664,7 @@ fn views_sql() -> String {
              WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
          ) s;
 
-         {real_candidates};
+         {dependency_waiting};
 
          CREATE VIEW progression_candidate_clauses AS
          SELECT b.work_item_id AS work_item_id,
@@ -820,7 +733,7 @@ pub struct ProgressionClauses {
     pub no_inflight_ladder: bool,
     /// Clause 3: not waiting on capacity.
     pub not_capacity_wait: bool,
-    /// Clause 4: no prerequisite is live, parked, or a progression candidate.
+    /// Clause 4: not an ordinary wait on unfinished prerequisite work.
     pub dependency_clear: bool,
     /// Clause 5: in a stuck state for long enough, or the grace was waived.
     pub stuck_long_enough: bool,
@@ -866,7 +779,7 @@ impl ProgressionClauses {
             (
                 4,
                 self.dependency_clear,
-                "waiting on a prerequisite that is live, parked, or itself a progression candidate",
+                "waiting on unfinished prerequisite work; progress or repair the prerequisite first",
             ),
             (
                 5,

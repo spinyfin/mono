@@ -455,7 +455,7 @@ fn orphan_with_durable_live_pid_is_distinguished_from_missing_pid() {
 }
 
 #[test]
-fn human_only_gates_do_not_count_as_progressing_prerequisites() {
+fn unfinished_prerequisites_keep_dependents_waiting_even_at_human_gates() {
     let db = WorkDb::open(temp_db_path("stuck-human-gates")).unwrap();
     let product = create_test_product_named(&db, "Human gates");
     for (status, reason, human_driven, actor, expected) in [
@@ -499,10 +499,9 @@ fn human_only_gates_do_not_count_as_progressing_prerequisites() {
                 .build(),
         )
         .unwrap();
-        // None of these prerequisites is live, parked or a progression
-        // candidate, so progress cannot go through them: the dependent is the
-        // item to progress.
-        assert_eq!(row(&db, &dependent.id).bucket, StuckBucket::EngineStuck);
+        // Recovery or the owner's decision belongs to the prerequisite;
+        // its dependent remains an ordinary unfinished dependency wait.
+        assert_eq!(row(&db, &dependent.id).bucket, StuckBucket::WaitingOnDependency);
     }
 }
 
