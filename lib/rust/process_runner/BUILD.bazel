@@ -1,5 +1,5 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
@@ -9,7 +9,16 @@ rust_library(
     edition = "2024",
     visibility = [
         "//tools/boss/command-runner:__pkg__",
+        "//tools/boss/spoke-package:__pkg__",
         "//tools/cube:__pkg__",
     ],
     deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "process_runner_test",
+    size = "small",
+    srcs = ["tests/retry.rs"],
+    edition = "2024",
+    deps = [":process_runner"] + all_crate_deps(normal = True),
 )

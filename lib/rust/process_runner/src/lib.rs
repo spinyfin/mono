@@ -3,6 +3,24 @@ use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// Retry an operation up to 50 times, 20 ms apart, if it fails with `ETXTBSY`.
+/// Other errors and successful results are returned immediately.
+pub fn retry_text_file_busy<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    // A freshly written executable can be briefly "text file busy" when another
+    // thread forked while its write descriptor was still open; that clears as
+    // soon as the forked child execs, so retry for a short bounded time.
+    let mut attempts = 0;
+    loop {
+        match operation() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Run a prepared command, capturing its output, and kill it if it does not
 /// exit before `timeout`.
 ///
@@ -63,7 +81,7 @@ pub fn output_bounded(
         command.process_group(0);
     }
     let program = command.get_program().to_string_lossy().into_owned();
-    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = retry_text_file_busy(|| command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn())?;
     on_spawn(child.id());
     let kill = |child: &mut std::process::Child| {
         #[cfg(unix)]

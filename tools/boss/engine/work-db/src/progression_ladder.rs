@@ -50,11 +50,11 @@
 //! questions that blame the items. The item is retried when its cooldown ends,
 //! and the wait is reported by `WorkDb::progression_launch_backoff`.
 //!
-//! A question this rung filed while failed launches were still counted has no
-//! premise once they are not. Each pass withdraws such a question
-//! ([`retract_unwarranted_questions`]) and puts the item back as "keep trying"
-//! would, without the owner having to answer it. A question whose two runs did
-//! start and then died is untouched.
+//! An open question from this rung whose item no longer meets the rule (its
+//! counted runs are failed launches, which say nothing about the item) has no
+//! premise. Each pass withdraws it ([`retract_unwarranted_questions`]) and puts
+//! the item back as "keep trying" would; a question whose two runs started and
+//! then died is untouched.
 //!
 //! ## What is stored
 //!
@@ -541,10 +541,9 @@ pub(crate) struct LadderRetraction {
 /// does (its pre-question state, the stuck-after grace waived once), in the
 /// pass's transaction.
 ///
-/// The one way an asked item stops being infrastructure-failing without an
-/// answer is that the runs the question counted are not counted any more:
-/// they were failed launches, which say nothing about the item (see the module
-/// documentation). The question's premise ("crashed or timed out twice in a row
+/// An asked item stops being infrastructure-failing without an answer when the
+/// runs the question counted are classified as failed launches, which say
+/// nothing about the item (see the module documentation). The question's premise ("crashed or timed out twice in a row
 /// while looking at this item") was never true of them, so the engine takes
 /// its own question back instead of leaving the item parked on it. The ladder's
 /// reset point is not moved: there is nothing to forgive.

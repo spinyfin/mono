@@ -53,9 +53,14 @@
 //! pass, so an engine restart does not lose it, and it clears on the first pass
 //! after an agent starts or the last such cooldown ends.
 //!
-//! A pass also withdraws any infrastructure-failure question that was filed
-//! for failed launches before they stopped being counted, so those items are
-//! nominated again without the owner answering each one.
+//! A pass also withdraws any open infrastructure-failure question whose item no
+//! longer meets the rule (its counted runs were failed launches), so those
+//! items are nominated again without the owner answering each one.
+//!
+//! A pass that could not read the backoff (the mint failed, the read failed, or
+//! the pass task panicked) reports it as unknown and the loop leaves the
+//! published value alone: an unreadable database is not evidence that nothing
+//! is waiting.
 //!
 //! ## Gating
 //!
@@ -155,9 +160,9 @@ pub struct ProgressionSweepOutcome {
     /// Items whose infrastructure-failure question the engine withdrew because
     /// the runs it counted never launched.
     pub retracted: usize,
-    /// Progression's launch backoff after this pass, if any item is waiting on
-    /// one.
-    pub launch_backoff: Option<ProgressionLaunchBackoff>,
+    /// Progression's launch backoff after this pass: `None` when the pass could
+    /// not read it, `Some(None)` when no item is waiting on one.
+    pub launch_backoff: Option<Option<ProgressionLaunchBackoff>>,
 }
 
 impl crate::sweep_loop::SweepOutcome for ProgressionSweepOutcome {
@@ -232,19 +237,18 @@ pub fn spawn_loop(
                     if initialized.load(Ordering::Relaxed) && feature_flags.is_enabled(PROGRESSION_AGENTS_FLAG) {
                         run_one_pass(work_db.clone()).await
                     } else {
-                        ProgressionSweepOutcome::default()
+                        // Nothing is being retried while the flag is off, so
+                        // nothing is backing off.
+                        ProgressionSweepOutcome {
+                            launch_backoff: Some(None),
+                            ..Default::default()
+                        }
                     };
                 if outcome.minted > 0 {
                     kick_fn();
                 }
-                let changed = launch_backoff.send_if_modified(|published| {
-                    let changed = *published != outcome.launch_backoff;
-                    if changed {
-                        published.clone_from(&outcome.launch_backoff);
-                    }
-                    changed
-                });
-                if let Some(backoff) = &outcome.launch_backoff {
+                let changed = publish_launch_backoff(&launch_backoff, &outcome);
+                if let Some(Some(backoff)) = &outcome.launch_backoff {
                     if changed {
                         tracing::warn!(
                             waiting_items = backoff.waiting_items,
@@ -284,6 +288,21 @@ pub fn spawn_loop(
             }
         },
     )
+}
+
+/// Publish the backoff a pass read; true when the published value changed. A
+/// pass that could not read it leaves the published value as it was.
+fn publish_launch_backoff(signal: &LaunchBackoffSignal, outcome: &ProgressionSweepOutcome) -> bool {
+    let Some(read) = &outcome.launch_backoff else {
+        return false;
+    };
+    signal.send_if_modified(|published| {
+        let changed = published != read;
+        if changed {
+            published.clone_from(read);
+        }
+        changed
+    })
 }
 
 /// Run one pass: mint a `progression` execution for each current candidate,
@@ -356,10 +375,13 @@ fn run_one_pass_blocking(work_db: &WorkDb) -> ProgressionSweepOutcome {
         );
     }
     // Read after the mint: an item just given a run is no longer waiting.
-    outcome.launch_backoff = work_db.progression_launch_backoff().unwrap_or_else(|error| {
-        tracing::warn!(?error, "progression sweep: failed to read the launch backoff");
-        None
-    });
+    outcome.launch_backoff = match work_db.progression_launch_backoff() {
+        Ok(backoff) => Some(backoff),
+        Err(error) => {
+            tracing::warn!(?error, "progression sweep: failed to read the launch backoff");
+            None
+        }
+    };
     outcome
 }
 
@@ -423,6 +445,7 @@ mod tests {
             outcome,
             ProgressionSweepOutcome {
                 minted: 2,
+                launch_backoff: Some(None),
                 ..Default::default()
             }
         );
@@ -445,7 +468,13 @@ mod tests {
         assert_eq!(ready, vec![oldest.clone(), newest.clone()]);
 
         // Nothing is minted while a run is queued, running, or inside its cooldown.
-        assert_eq!(run_one_pass(db.clone()).await, ProgressionSweepOutcome::default());
+        assert_eq!(
+            run_one_pass(db.clone()).await,
+            ProgressionSweepOutcome {
+                launch_backoff: Some(None),
+                ..Default::default()
+            }
+        );
         let run = progression_runs(&db, &oldest).remove(0);
         for status in ["running", "completed"] {
             db.connect()
@@ -483,7 +512,7 @@ mod tests {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET pre_start_failure_count = 1, last_error = ?3,
+                "UPDATE work_executions SET launch_failed = 1, pre_start_failure_count = 1, last_error = ?3,
                     created_at = ?2, started_at = ?2, finished_at = ?2 WHERE id = ?1",
                 rusqlite::params![run.id, now - 3600, ERROR],
             )
@@ -497,7 +526,11 @@ mod tests {
             (0, 0),
             "inside the cooldown: {outcome:?}"
         );
-        let backoff = outcome.launch_backoff.clone().expect("the pass reports the backoff");
+        let backoff = outcome
+            .launch_backoff
+            .clone()
+            .flatten()
+            .expect("the pass reports the backoff");
         assert_eq!(
             (backoff.waiting_items, backoff.latest_execution_id.as_str()),
             (1, run.id.as_str())
@@ -538,6 +571,30 @@ mod tests {
             handle.abort();
             assert_eq!(*signal.borrow(), published, "flag on: {enabled}");
         }
+    }
+
+    #[test]
+    fn an_unreadable_backoff_leaves_the_published_warning_in_place() {
+        let backoff = ProgressionLaunchBackoff {
+            waiting_items: 1,
+            next_attempt_epoch_s: 1_000,
+            latest_execution_id: "exec_waiting".to_owned(),
+            latest_failure_epoch_s: 0,
+            latest_error: "slot occupied".to_owned(),
+        };
+        let signal = launch_backoff_signal();
+        signal.send_replace(Some(backoff.clone()));
+
+        let unknown = ProgressionSweepOutcome::default();
+        assert!(!publish_launch_backoff(&signal, &unknown));
+        assert_eq!(*signal.borrow(), Some(backoff.clone()));
+
+        let nothing_waiting = ProgressionSweepOutcome {
+            launch_backoff: Some(None),
+            ..Default::default()
+        };
+        assert!(publish_launch_backoff(&signal, &nothing_waiting));
+        assert_eq!(*signal.borrow(), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -627,6 +684,7 @@ mod tests {
             ProgressionSweepOutcome {
                 minted: 1,
                 asked: 1,
+                launch_backoff: Some(None),
                 ..Default::default()
             }
         );

@@ -186,15 +186,17 @@ const LIVE_OR_PENDING: &str = "('queued','ready','waiting_dependency','claimed',
 /// Execution statuses of a progression run that died rather than reported.
 const INFRASTRUCTURE_FAILED: &str = "('failed','orphaned','abandoned')";
 
-/// Whether progression execution `x` failed before its driver started. The
-/// durable marker includes slot collisions without counting them in the
-/// driver's pre-start streak. Session identities are transient teardown state.
-/// Keep the start-time and pre-start-count fallbacks for older executions.
+/// Whether progression execution `x` failed before its agent started: the
+/// durable `launch_failed` marker (which includes slot collisions, without
+/// counting them in the driver's pre-start streak), or a run that never reached
+/// run start (`started_at IS NULL`, which is how an exhausted pre-run retry
+/// ends). `pre_start_failure_count` is not evidence either way: a pre-run
+/// failure that was retried resets the run, and a run that started on the retry
+/// and then died has a non-zero count. A run's driver session identity is not
+/// used as evidence that it started either: teardown clears it, so it cannot
+/// tell a failed launch from a run that started and died.
 pub(crate) fn launch_failed_sql(x: &str) -> String {
-    format!(
-        "({x}.status = 'failed' AND ({x}.launch_failed = 1
-          OR {x}.pre_start_failure_count > 0 OR {x}.started_at IS NULL))"
-    )
+    format!("({x}.status = 'failed' AND ({x}.launch_failed = 1 OR {x}.started_at IS NULL))")
 }
 
 /// The progression runs of item `a` that count as attempts, as a `WHERE`
