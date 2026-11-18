@@ -24,7 +24,8 @@ pub struct CanonicalRolloutToolCall {
     pub tool_input: Value,
     /// Whether this call itself starts a shell command, as opposed to being
     /// a pure continuation of one already running (a `tools.write_stdin`
-    /// cell, or any non-`exec`/`exec_command` tool).
+    /// cell or a `write_stdin` function call). Non-exec tools other than
+    /// `write_stdin` still default to `true`.
     ///
     /// Computed from the **raw** dialect input, not from `tool_input`: for
     /// the cell-harness (JavaScript) dialect, `tool_input.command` is
@@ -78,7 +79,7 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
         return None;
     }
     let call_id = payload.get("call_id").and_then(Value::as_str).map(str::to_owned);
-    let provider_name = payload.get("name")?.as_str()?;
+    let provider_name = cell::dialect_tool_name(payload.get("name")?.as_str()?);
     let raw_input = payload
         .get("input")
         .or_else(|| payload.get("arguments"))
@@ -91,10 +92,14 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
 
     let issues_command = match provider_name {
         "exec" | "exec_command" => exec_input_issues_command(&parsed_input),
+        "write_stdin" => false,
         _ => true,
     };
     let (tool_name, tool_input) = match provider_name {
-        "exec" | "exec_command" => ("Bash".to_owned(), json!({"command": exec_command(&parsed_input)})),
+        "exec" | "exec_command" => match exec_command(&parsed_input) {
+            Some(command) => ("Bash".to_owned(), json!({"command": command})),
+            None => ("Bash".to_owned(), continuation_cell_input(&parsed_input)),
+        },
         other => (other.to_owned(), parsed_input),
     };
     Some(CanonicalRolloutToolCall {
@@ -108,17 +113,15 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
 /// Whether an `exec` / `exec_command` call's raw (pre-reshape) input starts a
 /// command, as opposed to being a pure continuation.
 ///
-/// The plain shell-tool dialect (`cmd`/`command`) always issues a command by
-/// definition. The cell-harness dialect only does when its script contains a
-/// command-bearing `tools.*` call ([`cell::commands_from_cell_script`]); a
-/// pure `tools.write_stdin` continuation script does not. Any other shape —
-/// an argv array, or an object using some other key — is unrecognised, and
-/// defaults to `true` (issues a command) rather than `false`: treating an
-/// unknown shape as a pure continuation would route its output through
-/// `sessions` in `observe_output` and let it be silently subsumed into
-/// someone else's origin, which is exactly the failure mode this field
-/// exists to prevent. Only a positively-identified continuation script (a
-/// string with no command-bearing cell call) returns `false`.
+/// The plain shell-tool dialect (`cmd`/`command`, or a bare argv/string)
+/// always issues a command by definition. The cell-harness dialect only
+/// skips that when the script is a positively-identified continuation (a
+/// `tools.write_stdin` poll with no command-bearing call). Any other
+/// shape — an argv array, an object using some other key, or a string that
+/// is not a continuation cell — defaults to `true`: treating an unknown
+/// shape as a pure continuation would route its output through `sessions`
+/// in `observe_output` and let it be silently subsumed into someone else's
+/// origin, which is exactly the failure mode this field exists to prevent.
 fn exec_input_issues_command(parsed_input: &Value) -> bool {
     if parsed_input
         .get("cmd")
@@ -127,9 +130,14 @@ fn exec_input_issues_command(parsed_input: &Value) -> bool {
     {
         return true;
     }
-    !parsed_input
-        .as_str()
-        .is_some_and(|source| cell::commands_from_cell_script(source).is_empty())
+    match parsed_input.as_str() {
+        Some(source) => !cell::script_is_continuation_only(source),
+        // An unrecognised non-string shape (an argv array with no
+        // `cmd`/`command` key, say) defaults to `true`: treating it as a
+        // pure continuation would let `observe_output` silently subsume
+        // its output into someone else's session.
+        None => true,
+    }
 }
 
 /// The command an `exec` / `exec_command` tool call runs.
@@ -139,22 +147,44 @@ fn exec_input_issues_command(parsed_input: &Value) -> bool {
 /// - a JSON object carrying `cmd` / `command` — the plain shell-tool form.
 /// - **JavaScript source** — the cell harness form (`gpt-5.6-terra`), where
 ///   the command is an argument to a `tools.exec_command({…})` call inside
-///   the script. Parsing the input as JSON fails outright here, so without
-///   [`cell::cell_script_command`] the whole script becomes "the command"
-///   and renders into live status, operator notifications, and the
-///   editorial audit as such.
+///   the script, in JSON or JavaScript-object-shorthand form. Parsing the
+///   input as JSON fails outright here, so without
+///   [`cell::cell_script_command`] a command-bearing script whose argument
+///   we cannot recover becomes "the command" and renders into live status,
+///   operator notifications, and the editorial audit as such.
 ///
 /// A script with no command-bearing call (a pure `tools.write_stdin`
-/// continuation) still falls back to its source: it genuinely has no
-/// command of its own, and showing the script is more honest than
-/// attributing someone else's command to it.
-fn exec_command(parsed_input: &Value) -> String {
-    parsed_input
-        .get("cmd")
-        .or_else(|| parsed_input.get("command"))
-        .map(coerce_command_to_string)
-        .or_else(|| parsed_input.as_str().and_then(cell::cell_script_command))
-        .unwrap_or_else(|| coerce_command_to_string(parsed_input))
+/// continuation) returns `None`: putting the script in `tool_input.command`
+/// would make abandoned-command detection treat the poll as a brand-new
+/// shell command. The session id, when the script names one, is carried on
+/// [`continuation_cell_input`] instead. A plain argv/string `exec` input
+/// (`echo hi`) is not a continuation: it is the command itself.
+fn exec_command(parsed_input: &Value) -> Option<String> {
+    if let Some(command) = parsed_input.get("cmd").or_else(|| parsed_input.get("command")) {
+        return Some(coerce_command_to_string(command));
+    }
+    let source = parsed_input.as_str()?;
+    if let Some(command) = cell::cell_script_command(source) {
+        return Some(command);
+    }
+    if cell::script_is_continuation_only(source) {
+        return None;
+    }
+    Some(source.to_owned())
+}
+
+/// Canonical input for a cell that did not start a command: never a
+/// `command` field (so drain will not flag it as an abandoned shell
+/// command), plus `session_id` when a `write_stdin` poll named one.
+fn continuation_cell_input(parsed_input: &Value) -> Value {
+    let mut input = Map::new();
+    if let Some(source) = parsed_input.as_str() {
+        input.insert("script".to_owned(), Value::String(source.to_owned()));
+        if let Some(session_id) = cell::write_stdin_session_id_from_script(source) {
+            input.insert("session_id".to_owned(), Value::String(session_id));
+        }
+    }
+    Value::Object(input)
 }
 
 /// Coerce a Bash `command` value to a single string for rendering / capture.
@@ -361,14 +391,53 @@ mod tests {
     }
 
     #[test]
-    fn continuation_only_cell_script_still_falls_back_to_its_source() {
-        let source = "const r = load(\"run\");\nconst p = await tools.write_stdin({\"session_id\":r.session_id});";
+    fn continuation_only_cell_script_does_not_claim_a_command() {
+        let source =
+            "const r = load(\"run\");\nconst p = await tools.write_stdin({\"session_id\":8467,\"chars\":\"\"});";
         let payload = json!({"name": "exec", "call_id": "c9", "input": source})
             .as_object()
             .unwrap()
             .clone();
         let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
-        assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some(source));
+        assert!(!call.issues_command);
+        assert_eq!(call.tool_input.get("command"), None);
+        assert_eq!(call.tool_input.get("session_id").and_then(Value::as_str), Some("8467"));
+    }
+
+    #[test]
+    fn functions_exec_alias_reshapes_like_exec() {
+        let payload = json!({
+            "name": "functions.exec",
+            "call_id": "c-fn",
+            "input": r#"text(await tools.exec_command({cmd:"echo hello-boss-qual"}));"#
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+        assert!(call.issues_command);
+        assert_eq!(call.tool_name, "Bash");
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("echo hello-boss-qual")
+        );
+    }
+
+    #[test]
+    fn write_stdin_function_call_is_a_continuation() {
+        let payload = json!({
+            "name": "functions.write_stdin",
+            "call_id": "c-stdin",
+            "arguments": r#"{"session_id":8467,"chars":""}"#
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let call = canonical_rollout_tool_call("function_call", &payload).expect("call");
+        assert!(!call.issues_command);
+        assert_eq!(call.tool_name, "write_stdin");
+        assert_eq!(cell::write_stdin_session_id(&call.tool_input).as_deref(), Some("8467"));
+        assert_eq!(call.tool_input.get("command"), None);
     }
 
     #[test]
@@ -377,14 +446,41 @@ mod tests {
         assert!(exec_input_issues_command(&json!(
             "const r = await tools.exec_command({\"cmd\":\"echo hi\"});"
         )));
+        assert!(exec_input_issues_command(&json!(
+            r#"text(await tools.exec_command({cmd:"echo hi"}));"#
+        )));
         assert!(!exec_input_issues_command(&json!(
             "const r = load(\"run\");\nconst p = await tools.write_stdin({\"session_id\":r.session_id});"
         )));
+        // A plain argv/string `exec` (legacy/non-cell) still issues a
+        // command. Treating `echo rollout` as a continuation would drop it
+        // from abandoned-command drain and from transcript reshape.
+        assert!(exec_input_issues_command(&json!("echo rollout")));
+        assert!(exec_input_issues_command(&json!("sleep 999")));
         // An unrecognised shape (here, an argv array with no `cmd`/`command`
         // key) must default to `true`: treating it as a pure continuation
         // would let `observe_output` silently subsume its output into
         // someone else's session.
         assert!(exec_input_issues_command(&json!({"argv": ["echo", "hi"]})));
+    }
+
+    #[test]
+    fn plain_exec_string_input_is_the_shell_command() {
+        let payload = json!({
+            "name": "exec",
+            "call_id": "c-plain",
+            "input": "echo rollout"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+        assert!(call.issues_command);
+        assert_eq!(call.tool_name, "Bash");
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("echo rollout")
+        );
     }
 
     #[test]

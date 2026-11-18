@@ -79,6 +79,8 @@ fn shorthand_cell_command_heads() -> Vec<String> {
 /// A code-mode cell written in JavaScript object shorthand. Static argument
 /// objects expose their actual shell commands, including unquoted keys; ten
 /// reads in one cell become one joined command list for the summarizer.
+/// The script itself is past the redactor's per-value ceiling; the recovered
+/// `cmd` strings are what must still reach the prompt.
 fn big_shorthand_cell(call_id: &str) -> Vec<Value> {
     let mut script = String::new();
     for i in 0..10 {
