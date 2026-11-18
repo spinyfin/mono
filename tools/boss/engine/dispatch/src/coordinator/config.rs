@@ -1205,11 +1205,12 @@ impl ExecutionCoordinator {
         &self.pre_start_streaks
     }
 
-    /// After startup reconcile: a failed startup worker scan holds every work
-    /// item, which reconcile skips silently, so report the active work it is
-    /// keeping from dispatching as a global dispatch outage. No-op without a
-    /// scan error.
-    pub fn note_startup_scan_hold(&self) {
+    /// A failed startup worker scan holds every work item, and most launch
+    /// paths are refused by it silently, so report the active work it is
+    /// keeping from dispatching as a global dispatch outage. Run after startup
+    /// reconcile and then periodically by [`Self::spawn_scan_error_hold_watch`].
+    /// No-op without a scan error, and counts each held item once.
+    pub fn sweep_scan_error_hold(&self) {
         self.note_scan_error_hold_blocking_active_work();
     }
 

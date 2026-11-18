@@ -640,6 +640,15 @@ async fn serve_scoped(
     //    selection then reports `DriverProbeNotRun` loudly instead of
     //    silently matching.
     server_state.execution_coordinator.set_startup_recovery_pending(true);
+    // Restore a global dispatch outage that was in progress when the engine
+    // stopped. The record is in memory only, so an engine restarted mid-outage
+    // (an auto-update relaunch, say) rebuilds it from the dispatch event
+    // stream: the original start time and counters then survive until a new
+    // dispatch actually claims a host. It runs before any sweep, scheduler or
+    // callback that could refuse or claim a launch is spawned, so a refusal
+    // can never fill the tracker first and discard the restored record; the
+    // tracker also drops a restore that a claim has overtaken.
+    server_state.restore_dispatch_outage().await;
     let local_quarantine =
         boss_engine_runtime::local_worker_quarantine::quarantine_historical_local_workers(&server_state.work_db)
             .context("establishing historical local worker quarantine before startup recovery")?;
@@ -2557,17 +2566,14 @@ async fn serve_scoped(
         automation_scheduler_timer_wheel,
     );
 
-    // Restore a global dispatch outage that was in progress when the engine
-    // stopped. The record is in memory only, so an engine restarted mid-outage
-    // (an auto-update relaunch, say) rebuilds it from the dispatch event
-    // stream: the original start time and counters then survive until a new
-    // dispatch actually claims a host. This runs before anything below can
-    // claim a host, and the tracker also drops a restore that a claim has
-    // overtaken, so a stale outage cannot outlive a launch that ended it.
-    server_state.restore_dispatch_outage().await;
     // A failed startup worker scan holds every work item, which the reconcile
-    // above skipped without a word; report the active work it is holding back.
-    server_state.execution_coordinator.note_startup_scan_hold();
+    // above skipped without a word; report the active work it is holding back,
+    // and keep checking: a board drop, automation autostart or an engine sweep
+    // is refused by the hold without ever reaching the coordinator.
+    server_state.execution_coordinator.sweep_scan_error_hold();
+    let _scan_error_hold_watch_handle = server_state
+        .execution_coordinator
+        .spawn_scan_error_hold_watch(Duration::from_secs(15));
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
     // by a dropped wakeup (the `status_transition` → `request_recorded`

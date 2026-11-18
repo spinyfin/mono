@@ -5,6 +5,13 @@
 use super::execution::HostSelectionFailure;
 use super::*;
 
+/// "13 minutes ago"-style phrase for an outage instant, from the shared
+/// relative-time helper; `"just now"` when the instant is not in the past.
+/// The banner title and `bossctl` both render the outage start with it.
+pub fn outage_elapsed_phrase(epoch_secs: i64, now_epoch_secs: i64) -> String {
+    boss_engine_utils::iso8601::format_elapsed_ago(epoch_secs, now_epoch_secs).unwrap_or_else(|| "just now".to_owned())
+}
+
 impl ExecutionCoordinator {
     /// Per-host exclusions when a refused selection found every registered
     /// host excluded for an item-independent reason (see
@@ -153,16 +160,38 @@ impl ExecutionCoordinator {
     }
 
     /// The sweep form of [`Self::note_scan_error_hold_refusals`]: the active
-    /// work the hold is keeping from dispatching (reconcile and rescan skip
-    /// it silently).
+    /// work the hold is keeping from dispatching. Reconcile, rescan and every
+    /// launch path that asks the work db directly (a board drop to Doing,
+    /// automation autostart, the engine sweeps) are refused by the hold
+    /// without reaching the coordinator, so this runs at startup and on a
+    /// timer ([`Self::spawn_scan_error_hold_watch`]). Only items the active
+    /// outage has not counted are folded, so re-checking the same held items
+    /// every pass does not inflate the attempt count.
     pub(super) fn note_scan_error_hold_blocking_active_work(&self) {
         if self.scan_error_hold_exclusions().is_none() {
             return;
         }
         match self.work_db.list_active_chores_without_live_run() {
-            Ok(ids) => self.note_scan_error_hold_refusals(&ids),
+            Ok(ids) => {
+                let unseen = self.dispatch_outage.unrefused_work_items(&ids);
+                self.note_scan_error_hold_refusals(&unseen);
+            }
             Err(err) => tracing::warn!(error = %format!("{err:#}"), "dispatch outage: could not list held active work"),
         }
+    }
+
+    /// Re-check, every `interval`, for active work a failed startup worker
+    /// scan is holding back. The hold is global and every refusal of it is
+    /// silent on the paths named at [`Self::note_scan_error_hold_blocking_active_work`],
+    /// so this is the one seam all of them share.
+    pub fn spawn_scan_error_hold_watch(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let coordinator = self.clone();
+        boss_task_scope::spawn(async move {
+            loop {
+                coordinator.sweep_scan_error_hold();
+                tokio::time::sleep(interval).await;
+            }
+        })
     }
 
     /// A dispatch just claimed a host. If a global outage was active, that

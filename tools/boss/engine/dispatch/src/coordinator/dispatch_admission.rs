@@ -590,9 +590,12 @@ impl ExecutionCoordinator {
                 live
             })
             .inspect_err(|_| {
-                // A failed startup worker scan holds every item, so this
-                // refusal is a global outage, not one item's problem.
-                self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+                // A failed startup worker scan holds every item, so a refusal
+                // by the hold is a global outage, not one item's problem. Any
+                // other error (an unresolvable repo, say) is not the hold.
+                if self.work_db.ensure_work_item_not_quarantined(&work_item_id).is_err() {
+                    self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+                }
             })?;
         if let Some(stale) = judged_stale {
             self.release_abandoned_run(&stale);

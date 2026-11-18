@@ -142,9 +142,10 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     // and not an attention item — it stays until a new launch claims a host.
     let dispatch_outage = server_state.execution_coordinator.dispatch_outage().active();
     if let Some(outage) = dispatch_outage.as_ref() {
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
         issues.push(boss_execution_contracts::dispatch_outage_health_issue(
             outage,
-            boss_engine_utils::epoch_time::now_epoch_secs(),
+            &boss_engine_dispatch::coordinator::outage_elapsed_phrase(outage.started_epoch_s, now),
         ));
     }
 

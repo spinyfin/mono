@@ -417,26 +417,25 @@ impl ServerState {
     /// Rebuild the in-memory dispatch outage record from the dispatch event
     /// stream, so an outage in progress when the engine stopped keeps its
     /// start time and counters until a new dispatch claims a host. Called once
-    /// at startup, before anything that can claim a host; the tracker drops
-    /// the restore if a claim got there first.
+    /// at startup, before anything that can refuse or claim a launch; the
+    /// tracker merges the restore into a refusal that got there first and
+    /// drops it if a claim did.
     pub(crate) async fn restore_dispatch_outage(&self) {
         let root = self.dispatch_event_root.clone();
-        let replay = tokio::task::spawn_blocking(move || {
-            boss_dispatch_reader::read_current(&root)
-                .map(|read| boss_execution_contracts::replay_outage_events(&read.events))
-        })
-        .await;
-        match replay {
-            Ok(Ok(replay)) => {
-                if let Some(active) = replay.active {
+        let events =
+            tokio::task::spawn_blocking(move || boss_dispatch_reader::read_current(&root).map(|read| read.events))
+                .await;
+        match events {
+            Ok(Ok(events)) => {
+                if let Some(started_epoch_s) = self
+                    .execution_coordinator
+                    .dispatch_outage()
+                    .restore_from_events(&events)
+                {
                     tracing::warn!(
-                        started_epoch_s = active.started_epoch_s,
-                        refused_attempts = active.refused_attempts,
-                        "dispatch outage was in progress when the engine stopped; restoring it",
+                        started_epoch_s,
+                        "dispatch outage was in progress when the engine stopped; restored it",
                     );
-                    self.execution_coordinator
-                        .dispatch_outage()
-                        .restore(active, replay.refused_work_items);
                 }
             }
             Ok(Err(err)) => {

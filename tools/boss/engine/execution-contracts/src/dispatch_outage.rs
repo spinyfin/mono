@@ -287,24 +287,62 @@ impl DispatchOutageTracker {
         }
     }
 
+    /// The subset of `work_item_ids` the active outage has not counted yet
+    /// (all of them when none is active). A periodic check folds only these,
+    /// so re-checking the same held items does not inflate the attempt count.
+    pub fn unrefused_work_items(&self, work_item_ids: &[String]) -> Vec<String> {
+        let slot = self.active.lock().expect("dispatch outage lock poisoned");
+        work_item_ids
+            .iter()
+            .filter(|id| {
+                slot.as_ref()
+                    .is_none_or(|active| !active.refused_work_items.contains(id.as_str()))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Reinstate an outage rebuilt from the dispatch event stream after an
     /// engine restart, so its original start time and counters survive until
     /// a new dispatch actually claims a host. A record already active (a
-    /// refusal that raced the restore) is kept, and so is the absence of one
-    /// after a claim: a claim this process already recorded ended the outage
-    /// being restored, so the restore is dropped.
+    /// refusal that raced the restore) is merged into rather than replaced:
+    /// it keeps its own latest refusal and exclusions, takes the earlier
+    /// start, and adds the restored attempts and items. After a claim the
+    /// restore is dropped: a claim this process already recorded ended the
+    /// outage being restored.
     pub fn restore(&self, outage: DispatchOutage, refused_work_items: BTreeSet<String>) {
         {
             let mut slot = self.active.lock().expect("dispatch outage lock poisoned");
-            if slot.is_some() || self.claimed_since_start.load(Ordering::SeqCst) {
+            if self.claimed_since_start.load(Ordering::SeqCst) {
                 return;
             }
-            *slot = Some(Active {
-                outage,
-                refused_work_items,
-            });
+            match slot.as_mut() {
+                None => {
+                    *slot = Some(Active {
+                        outage,
+                        refused_work_items,
+                    });
+                }
+                Some(live) => {
+                    live.outage.started_epoch_s = live.outage.started_epoch_s.min(outage.started_epoch_s);
+                    live.outage.refused_attempts = live.outage.refused_attempts.saturating_add(outage.refused_attempts);
+                    live.refused_work_items.extend(refused_work_items);
+                }
+            }
         }
         self.notify_changed();
+    }
+
+    /// [`Self::restore`] from the dispatch event stream: replays `events` and
+    /// reinstates the outage they leave in progress, if any. Returns the
+    /// restored start time. The engine's startup restore and its tests both
+    /// go through here.
+    pub fn restore_from_events(&self, events: &[DispatchEvent]) -> Option<i64> {
+        let replay = replay_outage_events(events);
+        let active = replay.active?;
+        let started = active.started_epoch_s;
+        self.restore(active, replay.refused_work_items);
+        Some(started)
     }
 
     /// A new dispatch claimed a host: the outage, if one was active, is over.
@@ -343,23 +381,18 @@ impl DispatchOutageTracker {
     }
 }
 
-/// "13 minutes ago"-style phrase for an outage instant, from the shared
-/// relative-time helper; `"just now"` when the instant is not in the past.
-pub fn outage_elapsed_phrase(epoch_secs: i64, now_epoch_secs: i64) -> String {
-    boss_dispatch_events::format_elapsed_ago(epoch_secs, now_epoch_secs).unwrap_or_else(|| "just now".to_owned())
-}
-
 /// Render the active outage as the engine-health issue the app banner and
 /// `bossctl` show. The engine owns the wording; the app shows it verbatim.
 ///
-/// The title carries the duration; the body names each host's cause and the
+/// The title carries the duration, passed in as `started_phrase` (a
+/// relative phrase such as "13 minutes ago", rendered by the caller with the
+/// shared relative-time helper); the body names each host's cause and the
 /// recovery action for it, and says what ends the outage.
-pub fn health_issue_for(outage: &DispatchOutage, now_epoch_secs: i64) -> EngineHealthIssue {
-    let started = boss_dispatch_events::format_paused_since_phrase(outage.started_epoch_s, now_epoch_secs);
-    let started = if started.is_empty() {
-        "just now".to_owned()
+pub fn health_issue_for(outage: &DispatchOutage, started_phrase: &str) -> EngineHealthIssue {
+    let started = if started_phrase.is_empty() {
+        "just now"
     } else {
-        started
+        started_phrase
     };
     let causes = outage
         .host_exclusions
@@ -438,6 +471,10 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
     let mut ordered: Vec<&DispatchEvent> = events.iter().collect();
     ordered.sort_by_key(|event| event.ts_epoch_ms);
     let mut out = OutageReplay::default();
+    // Start times of outages a claim already ended. A refusal or start event
+    // can be stamped after the claim that closed its outage (the tracker
+    // updates before the event timestamp is taken), so it must not reopen it.
+    let mut closed: BTreeSet<i64> = BTreeSet::new();
     for event in ordered {
         match event.stage.as_str() {
             STAGE_STARTED => {
@@ -446,6 +483,9 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
                     .get("started_epoch_s")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or_else(|| event_epoch_s(event));
+                if closed.contains(&started) {
+                    continue;
+                }
                 let exclusions = event_exclusions(&event.details);
                 match out.active.as_mut() {
                     Some(active) if active.started_epoch_s == started => {
@@ -460,6 +500,8 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
                 }
             }
             STAGE_RECOVERED => {
+                closed.extend(out.active.as_ref().map(|active| active.started_epoch_s));
+                closed.extend(event.details.get("started_epoch_s").and_then(serde_json::Value::as_i64));
                 out.active = None;
                 out.refused_work_items.clear();
                 out.last_recovery = Some(event.details.clone());
@@ -473,6 +515,9 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
                     let started = details
                         .get("outage_started_epoch_s")
                         .and_then(serde_json::Value::as_i64);
+                    if started.is_some_and(|started| closed.contains(&started)) {
+                        continue;
+                    }
                     let exclusions = event_exclusions(details);
                     // A refusal that names no outage joins the active one.
                     let joins_active = out
@@ -508,6 +553,7 @@ pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
                     && let Some(active) = out.active.as_ref()
                 {
                     let recovered = event_epoch_s(event);
+                    closed.insert(active.started_epoch_s);
                     out.last_recovery = Some(serde_json::json!({
                         "started_epoch_s": active.started_epoch_s,
                         "recovered_epoch_s": recovered,
@@ -629,7 +675,7 @@ mod tests {
         let recovery = exclusions()[0].recovery_action.clone().unwrap();
         assert!(recovery.contains("does not lift this hold"), "{recovery}");
         assert!(!recovery.contains("roll back or drain"), "{recovery}");
-        let issue = health_issue_for(&tracker_with_one_refusal().active().unwrap(), 1_100);
+        let issue = health_issue_for(&tracker_with_one_refusal().active().unwrap(), "just now");
         assert!(!issue.body.contains("roll back or drain"), "{}", issue.body);
     }
 
@@ -702,7 +748,7 @@ mod tests {
 
     #[test]
     fn banner_text_names_cause_duration_and_recovery() {
-        let issue = health_issue_for(&tracker_with_one_refusal().active().unwrap(), 1_000 + 13 * 60);
+        let issue = health_issue_for(&tracker_with_one_refusal().active().unwrap(), "13 minutes ago");
         assert_eq!(issue.kind, DISPATCH_OUTAGE_ISSUE_KIND);
         assert_eq!(issue.severity, "error");
         assert!(issue.title.contains("13 minutes ago"), "{}", issue.title);
@@ -923,5 +969,105 @@ mod tests {
         let ended = replay_outage_events(&[started_event(1_000_000), claim(false, 1_100_000)]);
         assert!(ended.active.is_none());
         assert_eq!(ended.last_recovery.unwrap()["duration_secs"], 100);
+    }
+    fn fresh_claim(ts: u128) -> DispatchEvent {
+        stream_event(
+            "host_selected",
+            "ok",
+            "exec_9",
+            "task_9",
+            ts,
+            serde_json::json!({ "host_id": "anaplian", "existing_assignment": false }),
+        )
+    }
+
+    #[test]
+    fn replay_does_not_reopen_an_outage_for_a_refusal_stamped_after_its_claim() {
+        // The tracker is updated before the event's timestamp is taken, so a
+        // refusal that joined outage 1_000 can sort after the claim that ended it.
+        let replay = replay_outage_events(&[
+            refusal_event("task_1", 1_000_000, true, exclusions()),
+            started_event(1_000_000),
+            fresh_claim(1_100_000),
+            refusal_event("task_2", 1_100_001, true, exclusions()),
+        ]);
+        assert!(replay.active.is_none(), "{:?}", replay.active);
+        assert_eq!(replay.last_recovery.unwrap()["refused_attempts"], 1);
+    }
+
+    #[test]
+    fn replay_does_not_reopen_an_outage_for_a_start_event_stamped_after_its_claim() {
+        let mut late_start = started_event(1_100_001);
+        late_start.details["started_epoch_s"] = serde_json::json!(1_000);
+        let replay = replay_outage_events(&[
+            refusal_event("task_1", 1_000_000, true, exclusions()),
+            fresh_claim(1_100_000),
+            late_start,
+        ]);
+        assert!(replay.active.is_none(), "{:?}", replay.active);
+    }
+
+    #[test]
+    fn replay_does_not_reopen_an_outage_a_recovered_event_ended() {
+        let recovered = stream_event(
+            "dispatch_outage_recovered",
+            "ok",
+            "engine",
+            "task_9",
+            1_100_000,
+            serde_json::json!({ "started_epoch_s": 1_000 }),
+        );
+        let replay = replay_outage_events(&[
+            refusal_event("task_1", 1_000_000, true, exclusions()),
+            recovered,
+            refusal_event("task_2", 1_100_001, true, exclusions()),
+        ]);
+        assert!(replay.active.is_none(), "{:?}", replay.active);
+        // A genuinely new outage after the claim is still reported.
+        let mut later = refusal_event("task_3", 1_200_000, true, exclusions());
+        later.details["outage_started_epoch_s"] = serde_json::json!(1_200);
+        let replay = replay_outage_events(&[
+            refusal_event("task_1", 1_000_000, true, exclusions()),
+            fresh_claim(1_100_000),
+            later,
+        ]);
+        assert_eq!(replay.active.unwrap().started_epoch_s, 1_200);
+    }
+
+    #[test]
+    fn unrefused_work_items_skips_what_the_active_outage_already_counted() {
+        let tracker = DispatchOutageTracker::new();
+        let items = vec!["task_1".to_owned(), "task_2".to_owned()];
+        assert_eq!(tracker.unrefused_work_items(&items), items, "no outage: all are new");
+        tracker.record_refusal(exclusions(), "task_1", "", 1_000);
+        assert_eq!(tracker.unrefused_work_items(&items), vec!["task_2".to_owned()]);
+    }
+
+    #[test]
+    fn a_restore_landing_after_a_live_refusal_merges_instead_of_being_dropped() {
+        let tracker = DispatchOutageTracker::new();
+        tracker.record_refusal(exclusions(), "task_new", "exec_new", 2_000);
+        let restored = DispatchOutage::builder()
+            .started_epoch_s(1_000)
+            .host_exclusions(Vec::new())
+            .refused_attempts(5)
+            .refused_work_items(2)
+            .latest_refusal_epoch_s(1_500)
+            .latest_work_item_id("task_old")
+            .latest_execution_id("exec_old")
+            .build();
+        let items: BTreeSet<String> = ["task_old", "task_new"].map(str::to_owned).into();
+        tracker.restore(restored, items);
+        let merged = tracker.active().unwrap();
+        assert_eq!(merged.started_epoch_s, 1_000, "the earlier start wins");
+        assert_eq!(merged.refused_attempts, 6);
+        assert_eq!(merged.refused_work_items, 2, "an item in both is one item");
+        assert_eq!(merged.latest_work_item_id, "task_new", "the live refusal stays latest");
+        assert_eq!(merged.host_exclusions, exclusions());
+        // A claim already recorded still wins over a late restore.
+        let claimed = DispatchOutageTracker::new();
+        claimed.record_claim(10);
+        claimed.restore(merged, BTreeSet::new());
+        assert_eq!(claimed.active(), None);
     }
 }

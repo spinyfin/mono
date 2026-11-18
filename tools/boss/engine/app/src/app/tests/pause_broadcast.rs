@@ -509,12 +509,13 @@ async fn seed_outage_in_event_stream(state: &Arc<ServerState>, started: i64) {
     sink.emit(start).await;
 }
 
-/// The production startup restore, end to end: an outage written to the
-/// event stream by a previous engine comes back with its original start and
-/// counters, shows in the health report, deduplicates retries of items it
-/// already counted, and ends on the first new claim.
+/// The production startup restore: an outage written to the event stream by a
+/// previous engine comes back with its original start and counters, shows in
+/// the health report, and deduplicates retries of items it already counted.
+/// Ending it on the first real claim is covered where a production dispatch
+/// can run (`core` `coordinator_tests::dispatch_outage`).
 #[tokio::test]
-async fn a_restarted_engine_restores_the_outage_and_ends_it_on_the_first_claim() {
+async fn a_restarted_engine_restores_the_outage_with_its_original_start_and_counters() {
     let (state, _dir) = test_server_state();
     let started = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
     seed_outage_in_event_stream(&state, started).await;
@@ -542,11 +543,25 @@ async fn a_restarted_engine_restores_the_outage_and_ends_it_on_the_first_claim()
     assert_eq!((outage.refused_attempts, outage.refused_work_items), (3, 2));
     tracker.record_refusal(dispatch_outage_exclusions(), "task_3", "exec_task_3", started + 710);
     assert_eq!(tracker.active().unwrap().refused_work_items, 3);
+}
 
-    let resolved = tracker.record_claim(started + 800).expect("the first claim ends it");
-    assert_eq!(resolved.duration_secs, 800);
-    assert_eq!(resolved.outage.refused_attempts, 4);
-    assert_eq!(build_engine_health_report(&state).dispatch_outage, None);
+/// A refusal that lands before the restore (nothing else is spawned ahead of
+/// it at startup, but the tracker must not lose the old outage if one does)
+/// is merged with the restored record rather than replacing it.
+#[tokio::test]
+async fn a_refusal_that_beats_the_restore_is_merged_with_the_restored_outage() {
+    let (state, _dir) = test_server_state();
+    let started = boss_engine_utils::epoch_time::now_epoch_secs() - 600;
+    seed_outage_in_event_stream(&state, started).await;
+
+    let tracker = state.execution_coordinator.dispatch_outage();
+    tracker.record_refusal(dispatch_outage_exclusions(), "task_3", "exec_task_3", started + 590);
+    state.restore_dispatch_outage().await;
+
+    let outage = tracker.active().expect("outage stays active");
+    assert_eq!(outage.started_epoch_s, started, "the pre-restart start is kept");
+    assert_eq!(outage.refused_attempts, 3, "two restored plus the live refusal");
+    assert_eq!(outage.refused_work_items, 3);
 }
 
 /// A claim that lands while the restore is still reading the stream already
