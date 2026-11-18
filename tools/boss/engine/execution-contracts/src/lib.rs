@@ -18,8 +18,9 @@ mod worker_kind;
 pub use worker_kind::{WorkerKind, worker_kind_for_execution};
 mod dispatch_outage;
 pub use dispatch_outage::{
-    DISPATCH_OUTAGE_ISSUE_KIND, DispatchOutageTracker, LocalHold, RefusalEffect, ResolvedOutage,
-    classify_host_exclusions, format_outage_duration, health_issue_for as dispatch_outage_health_issue,
+    DISPATCH_OUTAGE_ISSUE_KIND, DispatchOutageTracker, LocalHold, OutageReplay, RefusalEffect, ResolvedOutage,
+    classify_host_exclusions, health_issue_for as dispatch_outage_health_issue, outage_elapsed_phrase,
+    replay_outage_events, scan_error_exclusions,
 };
 mod pre_start_streak;
 pub use pre_start_streak::{

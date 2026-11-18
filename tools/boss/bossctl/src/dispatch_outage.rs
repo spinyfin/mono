@@ -4,96 +4,15 @@
 //! the engine is wedged). Both print the same fields.
 
 use boss_engine::dispatch_events::DispatchEvent;
-use boss_execution_contracts::format_outage_duration;
-use boss_protocol::{DispatchOutage, DispatchOutageHostExclusion};
+use boss_execution_contracts::{OutageReplay, outage_elapsed_phrase, replay_outage_events};
+use boss_protocol::DispatchOutage;
 use serde_json::Value;
 
-const STARTED: &str = "dispatch_outage_started";
-const RECOVERED: &str = "dispatch_outage_recovered";
-
 /// What the dispatch event stream says about outages: the one still in
-/// progress (a start with no recovery after it) and the most recent recovery.
-#[derive(Debug, Default)]
-pub(super) struct OutageFromEvents {
-    pub(super) active: Option<DispatchOutage>,
-    pub(super) last_recovery: Option<Value>,
-}
-
-/// Rebuild outage state from `events` (any order). An outage runs from its
-/// `dispatch_outage_started` event to the next `dispatch_outage_recovered`;
-/// the refused-attempt counters are re-derived from the per-item
-/// `host_selected` refusals in between, which the engine does not repeat as
-/// outage events.
-pub(super) fn from_events(events: &[DispatchEvent]) -> OutageFromEvents {
-    let mut ordered: Vec<&DispatchEvent> = events.iter().collect();
-    ordered.sort_by_key(|event| event.ts_epoch_ms);
-    let mut out = OutageFromEvents::default();
-    let mut work_items = std::collections::BTreeSet::new();
-    for event in ordered {
-        match event.stage.as_str() {
-            STARTED => {
-                work_items.clear();
-                work_items.extend(event.work_item_id.clone());
-                out.active = Some(started_record(event));
-            }
-            RECOVERED => {
-                out.active = None;
-                out.last_recovery = Some(event.details.clone());
-            }
-            "host_selected"
-                if event.outcome == "error"
-                    && event.details.get("reason").and_then(Value::as_str) == Some("no_eligible_host") =>
-            {
-                if let Some(active) = out.active.as_mut() {
-                    active.refused_attempts += 1;
-                    if let Some(item) = event.work_item_id.as_deref() {
-                        work_items.insert(item.to_owned());
-                        active.latest_work_item_id = item.to_owned();
-                    }
-                    active.refused_work_items = work_items.len() as u64;
-                    active.latest_refusal_epoch_s = epoch_s(event);
-                    active.latest_execution_id = event.execution_id.clone();
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn epoch_s(event: &DispatchEvent) -> i64 {
-    i64::try_from(event.ts_epoch_ms / 1000).unwrap_or(i64::MAX)
-}
-
-fn started_record(event: &DispatchEvent) -> DispatchOutage {
-    let exclusions = event
-        .details
-        .get("host_exclusions")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<Vec<DispatchOutageHostExclusion>>(value).ok())
-        .unwrap_or_default();
-    let started = event
-        .details
-        .get("started_epoch_s")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| epoch_s(event));
-    let triggering = event
-        .details
-        .get("triggering_execution_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    DispatchOutage::builder()
-        .started_epoch_s(started)
-        .host_exclusions(exclusions)
-        // The refusal that raised the outage is the first attempt (its own
-        // `host_selected` event precedes this one); the refusals the scan
-        // sees after this event are the rest.
-        .refused_attempts(1)
-        .refused_work_items(u64::from(event.work_item_id.is_some()))
-        .latest_refusal_epoch_s(epoch_s(event))
-        .latest_work_item_id(event.work_item_id.clone().unwrap_or_default())
-        .latest_execution_id(triggering)
-        .build()
+/// progress and the most recent recovery. The rules are the engine's own
+/// (`replay_outage_events`), so this and `dispatch state` agree.
+pub(super) fn from_events(events: &[DispatchEvent]) -> OutageReplay {
+    replay_outage_events(events)
 }
 
 /// The text block both verbs print for an active outage.
@@ -101,9 +20,9 @@ pub(super) fn lines(outage: &DispatchOutage, now_epoch_s: i64) -> Vec<String> {
     let mut lines = vec![
         "DISPATCH OUTAGE: no host can accept a new worker".to_owned(),
         format!(
-            "  started: epoch {} ({} ago)",
+            "  started: epoch {} ({})",
             outage.started_epoch_s,
-            format_outage_duration(now_epoch_s.saturating_sub(outage.started_epoch_s))
+            outage_elapsed_phrase(outage.started_epoch_s, now_epoch_s)
         ),
         format!(
             "  refused: {} attempts across {} work items (latest: {} / {}, epoch {})",
@@ -136,8 +55,8 @@ fn display_or_dash(value: &str) -> &str {
 /// One line for the most recent recovery recorded in the stream.
 pub(super) fn recovery_line(details: &Value) -> String {
     format!(
-        "last dispatch outage: lasted {} (epoch {} to {}); recovered by {} on host {}; {} attempts refused",
-        format_outage_duration(details.get("duration_secs").and_then(Value::as_i64).unwrap_or(0)),
+        "last dispatch outage: lasted {}s (epoch {} to {}); recovered by {} on host {}; {} attempts refused",
+        details.get("duration_secs").and_then(Value::as_i64).unwrap_or(0),
         details.get("started_epoch_s").and_then(Value::as_i64).unwrap_or(0),
         details.get("recovered_epoch_s").and_then(Value::as_i64).unwrap_or(0),
         details
@@ -182,7 +101,12 @@ mod tests {
 
     fn refusal(execution: &str, item: &str, ts_ms: u128) -> DispatchEvent {
         event(Stage::HostSelected, Outcome::Error, execution, item, ts_ms)
-            .with_details(serde_json::json!({ "reason": "no_eligible_host" }))
+            .with_details(serde_json::json!({ "reason": "no_eligible_host", "global_outage": true }))
+    }
+
+    fn claim(execution: &str, ts_ms: u128) -> DispatchEvent {
+        event(Stage::HostSelected, Outcome::Ok, execution, "task_9", ts_ms)
+            .with_details(serde_json::json!({ "host_id": "anaplian", "existing_assignment": false }))
     }
 
     #[test]
@@ -203,7 +127,7 @@ mod tests {
         assert_eq!(active.latest_execution_id, "exec_1");
         assert_eq!(active.host_exclusions[0].host_id, "local");
         let text = lines(&active, 1_780).join("\n");
-        assert!(text.contains("13 min ago"), "{text}");
+        assert!(text.contains("13 minutes ago"), "{text}");
         assert!(text.contains("engine refusal: local dispatch quarantined: x"), "{text}");
         assert!(text.contains("recovery: delete the row"), "{text}");
     }
@@ -230,7 +154,7 @@ mod tests {
         let outages = from_events(&events);
         assert!(outages.active.is_none());
         let line = recovery_line(&outages.last_recovery.expect("recovery recorded"));
-        assert!(line.contains("lasted 13 min"), "{line}");
+        assert!(line.contains("lasted 780s"), "{line}");
         assert!(line.contains("exec_3"), "{line}");
     }
 
@@ -239,5 +163,42 @@ mod tests {
         let outages = from_events(&[refusal("exec_1", "task_1", 5_000)]);
         assert!(outages.active.is_none());
         assert!(outages.last_recovery.is_none());
+    }
+
+    #[test]
+    fn a_fresh_claim_closes_an_outage_whose_recovered_event_was_never_emitted() {
+        // The engine restarted mid-outage and its first event was a launch.
+        let events = vec![
+            started(1_000_000),
+            refusal("exec_1", "task_1", 1_100_000),
+            claim("exec_9", 1_200_000),
+        ];
+        let outages = from_events(&events);
+        assert!(outages.active.is_none(), "dispatch is healthy again");
+        let line = recovery_line(&outages.last_recovery.expect("recovery derived from the claim"));
+        assert!(line.contains("exec_9"), "{line}");
+    }
+
+    #[test]
+    fn refusals_that_are_not_global_are_not_counted_and_exclusion_changes_are_followed() {
+        let not_global = event(Stage::HostSelected, Outcome::Error, "exec_5", "task_5", 1_050_000)
+            .with_details(serde_json::json!({ "reason": "no_eligible_host" }));
+        let changed =
+            event(Stage::HostSelected, Outcome::Error, "exec_2", "task_2", 1_100_000).with_details(serde_json::json!({
+                "reason": "no_eligible_host",
+                "global_outage": true,
+                "host_exclusions": [{
+                    "host_id": "anaplian",
+                    "kind": "host_disabled",
+                    "cause": "host is disabled",
+                    "reason": "disabled",
+                    "recovery_action": null,
+                }],
+            }));
+        let active = from_events(&[started(1_000_000), not_global, changed]).active.unwrap();
+        assert_eq!(active.refused_attempts, 2, "the start plus one global refusal");
+        assert_eq!(active.refused_work_items, 2);
+        assert_eq!(active.host_exclusions.len(), 1);
+        assert_eq!(active.host_exclusions[0].host_id, "anaplian");
     }
 }

@@ -29,6 +29,7 @@ rust_library(
         "//tools/boss/engine/recovery",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -60,6 +61,7 @@ rust_library(
         "//tools/boss/engine/recovery",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )

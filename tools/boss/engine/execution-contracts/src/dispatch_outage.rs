@@ -6,8 +6,12 @@
 //! - [`classify_host_exclusions`] decides whether one refused host selection
 //!   is global. It is only global when every host is excluded for a reason
 //!   that does not depend on the item (disabled, or the local host held by
-//!   the startup quarantine). An item that merely does not fit one host —
-//!   missing capability, pinned elsewhere, pool full — is not an outage.
+//!   the startup quarantine), or when a failed startup worker scan holds every
+//!   work item ([`scan_error_exclusions`]). An item that merely does not fit
+//!   one host — missing capability, pinned elsewhere, pool full — is not an
+//!   outage. This is deliberately narrower than "no queued item can be placed
+//!   anywhere": an enabled host that lacks what every queued item needs is
+//!   not reported (see `tools/boss/docs/dispatch-outage.md`).
 //! - [`DispatchOutageTracker`] is the one outage record. Refusals during an
 //!   outage fold into it; it ends only when a new dispatch actually claims a
 //!   host ([`DispatchOutageTracker::record_claim`]), never because a flag
@@ -19,6 +23,7 @@
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
+use boss_dispatch_events::DispatchEvent;
 use boss_engine_storage_values::Host;
 use boss_protocol::{DispatchOutage, DispatchOutageHostExclusion, EngineHealthIssue};
 
@@ -27,6 +32,9 @@ pub const DISPATCH_OUTAGE_ISSUE_KIND: &str = "dispatch_outage";
 
 /// `DispatchOutageHostExclusion::kind` of the local host held by the startup quarantine.
 pub const EXCLUSION_LOCAL_QUARANTINE: &str = "local_quarantine";
+/// `DispatchOutageHostExclusion::kind` of a non-local host that cannot take any
+/// work item because a failed startup worker scan holds every one.
+pub const EXCLUSION_ALL_ITEMS_HELD: &str = "all_items_held";
 /// `DispatchOutageHostExclusion::kind` of a host the registry has disabled.
 pub const EXCLUSION_HOST_DISABLED: &str = "host_disabled";
 
@@ -65,6 +73,33 @@ pub fn classify_host_exclusions(
         .collect()
 }
 
+/// Exclusions when a failed startup worker scan holds every work item. That
+/// hold refuses every item on every host, so each host is listed: the local
+/// host as a quarantine exclusion, any other as held for every work item.
+pub fn scan_error_exclusions(hosts: &[Host], hold: &LocalHold) -> Vec<DispatchOutageHostExclusion> {
+    let mut exclusions: Vec<DispatchOutageHostExclusion> = Vec::new();
+    for host in hosts {
+        if host.id == "local" {
+            exclusions.push(local_quarantine_exclusion(hold));
+        } else {
+            exclusions.push(DispatchOutageHostExclusion {
+                host_id: host.id.clone(),
+                kind: EXCLUSION_ALL_ITEMS_HELD.to_owned(),
+                cause: format!(
+                    "every work item is held because the startup worker scan failed: {}",
+                    hold.scan_error.as_deref().unwrap_or("unknown error")
+                ),
+                reason: hold.reason.clone(),
+                recovery_action: Some(LOCAL_QUARANTINE_RECOVERY.to_owned()),
+            });
+        }
+    }
+    if !hosts.iter().any(|host| host.id == "local") {
+        exclusions.insert(0, local_quarantine_exclusion(hold));
+    }
+    exclusions
+}
+
 fn local_quarantine_exclusion(hold: &LocalHold) -> DispatchOutageHostExclusion {
     let cause = match (hold.held_executions.is_empty(), hold.scan_error.as_deref()) {
         (false, _) => format!(
@@ -83,14 +118,16 @@ fn local_quarantine_exclusion(hold: &LocalHold) -> DispatchOutageHostExclusion {
     }
 }
 
-/// How an operator clears the local hold today. The hold survives an engine
-/// restart (the startup scan re-holds the same execution) and cancelling the
-/// held execution does not release it, so neither is offered here. When a
-/// supported clear command exists, this is the one place to point at it.
+/// Recovery action for the local startup-quarantine hold. The hold survives an
+/// engine restart (the startup scan re-holds the same execution) and
+/// cancelling the held execution does not release it, so neither is offered.
+/// When a supported clear command exists, point this at it.
 const LOCAL_QUARANTINE_RECOVERY: &str = "Restarting Boss does not lift this hold, and neither does cancelling the held execution. \
-First confirm the held executions have no live worker (`bossctl agents list`). Then delete the \
-`local_worker_startup_quarantine` row from the `metadata` table of the engine's `state.db`; it takes effect on the next \
-dispatch, with no restart.";
+Before removing it, check each held execution for a live worker with `bossctl agents list --all`, which includes \
+lost-track panes the default view hides; a worker missing from that list is unknown, not dead, because the hold exists \
+precisely for workers the engine cannot identify. Only when you have confirmed that no held worker is still running, \
+delete the `local_worker_startup_quarantine` row from the `metadata` table of the engine's `state.db`; it takes effect \
+on the next dispatch, with no restart.";
 
 fn disabled_exclusion(host: &Host) -> DispatchOutageHostExclusion {
     let cause = match host.last_error_text.as_deref().filter(|text| !text.is_empty()) {
@@ -212,6 +249,24 @@ impl DispatchOutageTracker {
         effect
     }
 
+    /// Reinstate an outage rebuilt from the dispatch event stream after an
+    /// engine restart, so its original start time and counters survive until
+    /// a new dispatch actually claims a host. A record already active (a
+    /// refusal that raced the restore) is kept.
+    pub fn restore(&self, outage: DispatchOutage, refused_work_items: BTreeSet<String>) {
+        {
+            let mut slot = self.active.lock().expect("dispatch outage lock poisoned");
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(Active {
+                outage,
+                refused_work_items,
+            });
+        }
+        self.notify_changed();
+    }
+
     /// A new dispatch claimed a host: the outage, if one was active, is over.
     /// This is the only way it ends.
     pub fn record_claim(&self, now_epoch_secs: i64) -> Option<ResolvedOutage> {
@@ -244,22 +299,10 @@ impl DispatchOutageTracker {
     }
 }
 
-/// How long an outage has lasted, as `"45 s"`, `"13 min"`, `"2 h 5 min"` or
-/// `"3 d 4 h"`. Whole units only, never a raw timestamp.
-pub fn format_outage_duration(secs: i64) -> String {
-    let secs = secs.max(0);
-    match secs {
-        0..=59 => format!("{secs} s"),
-        60..=3599 => format!("{} min", secs / 60),
-        3600..=86_399 => match (secs / 3600, (secs % 3600) / 60) {
-            (h, 0) => format!("{h} h"),
-            (h, m) => format!("{h} h {m} min"),
-        },
-        _ => match (secs / 86_400, (secs % 86_400) / 3600) {
-            (d, 0) => format!("{d} d"),
-            (d, h) => format!("{d} d {h} h"),
-        },
-    }
+/// "13 minutes ago"-style phrase for an outage instant, from the shared
+/// relative-time helper; `"just now"` when the instant is not in the past.
+pub fn outage_elapsed_phrase(epoch_secs: i64, now_epoch_secs: i64) -> String {
+    boss_engine_utils::iso8601::format_elapsed_ago(epoch_secs, now_epoch_secs).unwrap_or_else(|| "just now".to_owned())
 }
 
 /// Render the active outage as the engine-health issue the app banner and
@@ -268,7 +311,12 @@ pub fn format_outage_duration(secs: i64) -> String {
 /// The title carries the duration; the body names each host's cause and the
 /// recovery action for it, and says what ends the outage.
 pub fn health_issue_for(outage: &DispatchOutage, now_epoch_secs: i64) -> EngineHealthIssue {
-    let lasted = format_outage_duration(now_epoch_secs.saturating_sub(outage.started_epoch_s));
+    let started = boss_engine_utils::iso8601::format_paused_since_phrase(outage.started_epoch_s, now_epoch_secs);
+    let started = if started.is_empty() {
+        "just now".to_owned()
+    } else {
+        started
+    };
     let causes = outage
         .host_exclusions
         .iter()
@@ -294,7 +342,7 @@ pub fn health_issue_for(outage: &DispatchOutage, now_epoch_secs: i64) -> EngineH
     EngineHealthIssue {
         kind: DISPATCH_OUTAGE_ISSUE_KIND.to_owned(),
         severity: "error".to_owned(),
-        title: format!("Dispatch is down: no host can start new workers (for {lasted})"),
+        title: format!("Dispatch is down: no host can start new workers (started {started})"),
         body: format!(
             "Every host is excluded, so every new launch is refused. {attempts} refused attempts across {items} work \
              items so far; each item keeps retrying on its own and nothing is reset when this ends. Workers that are \
@@ -304,6 +352,126 @@ pub fn health_issue_for(outage: &DispatchOutage, now_epoch_secs: i64) -> EngineH
             items = outage.refused_work_items,
         ),
     }
+}
+
+const STAGE_STARTED: &str = "dispatch_outage_started";
+const STAGE_RECOVERED: &str = "dispatch_outage_recovered";
+
+/// What the dispatch event stream says about outages.
+#[derive(Debug, Default)]
+pub struct OutageReplay {
+    /// The outage still in progress: a start with no claim after it.
+    pub active: Option<DispatchOutage>,
+    /// The work items behind `active.refused_work_items`, so a restored
+    /// tracker keeps deduplicating retries of the same item.
+    pub refused_work_items: BTreeSet<String>,
+    /// Details of the most recent recovery.
+    pub last_recovery: Option<serde_json::Value>,
+}
+
+fn event_epoch_s(event: &DispatchEvent) -> i64 {
+    i64::try_from(event.ts_epoch_ms / 1000).unwrap_or(i64::MAX)
+}
+
+/// Rebuild outage state from dispatch `events` (any order), by the same rules
+/// the live [`DispatchOutageTracker`] applies. An outage runs from its
+/// `dispatch_outage_started` event until a new dispatch claims a host: either
+/// the `dispatch_outage_recovered` event or a `host_selected` success that was
+/// a fresh selection (an engine restarted mid-outage has no tracker to emit
+/// the former). Refusals count only when flagged `global_outage`, and carry
+/// the host exclusions as of that refusal.
+///
+/// `bossctl dispatch diagnose` reads this so it answers with the engine down;
+/// the engine replays it at startup to restore an outage that was in progress.
+pub fn replay_outage_events(events: &[DispatchEvent]) -> OutageReplay {
+    let mut ordered: Vec<&DispatchEvent> = events.iter().collect();
+    ordered.sort_by_key(|event| event.ts_epoch_ms);
+    let mut out = OutageReplay::default();
+    for event in ordered {
+        match event.stage.as_str() {
+            STAGE_STARTED => {
+                out.refused_work_items.clear();
+                out.refused_work_items.extend(event.work_item_id.clone());
+                out.active = Some(started_record(event));
+            }
+            STAGE_RECOVERED => {
+                out.active = None;
+                out.refused_work_items.clear();
+                out.last_recovery = Some(event.details.clone());
+            }
+            "host_selected" => {
+                let Some(active) = out.active.as_mut() else { continue };
+                let details = &event.details;
+                if event.outcome == "error"
+                    && details.get("global_outage").and_then(serde_json::Value::as_bool) == Some(true)
+                {
+                    active.refused_attempts += 1;
+                    if let Some(item) = event.work_item_id.as_deref() {
+                        out.refused_work_items.insert(item.to_owned());
+                        active.latest_work_item_id = item.to_owned();
+                    }
+                    active.refused_work_items = out.refused_work_items.len() as u64;
+                    active.latest_refusal_epoch_s = event_epoch_s(event);
+                    active.latest_execution_id = event.execution_id.clone();
+                    if let Some(exclusions) = details
+                        .get("host_exclusions")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value::<Vec<DispatchOutageHostExclusion>>(value).ok())
+                    {
+                        active.host_exclusions = exclusions;
+                    }
+                } else if event.outcome == "ok"
+                    && details.get("existing_assignment").and_then(serde_json::Value::as_bool) != Some(true)
+                {
+                    let recovered = event_epoch_s(event);
+                    out.last_recovery = Some(serde_json::json!({
+                        "started_epoch_s": active.started_epoch_s,
+                        "recovered_epoch_s": recovered,
+                        "duration_secs": recovered.saturating_sub(active.started_epoch_s).max(0),
+                        "refused_attempts": active.refused_attempts,
+                        "refused_work_items": active.refused_work_items,
+                        "claimed_by_execution_id": event.execution_id,
+                        "claimed_host_id": details.get("host_id"),
+                    }));
+                    out.active = None;
+                    out.refused_work_items.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn started_record(event: &DispatchEvent) -> DispatchOutage {
+    let exclusions = event
+        .details
+        .get("host_exclusions")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<DispatchOutageHostExclusion>>(value).ok())
+        .unwrap_or_default();
+    let started = event
+        .details
+        .get("started_epoch_s")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| event_epoch_s(event));
+    let triggering = event
+        .details
+        .get("triggering_execution_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    DispatchOutage::builder()
+        .started_epoch_s(started)
+        .host_exclusions(exclusions)
+        // The refusal that raised the outage is the first attempt (its own
+        // `host_selected` event precedes this one); the refusals replayed
+        // after this event are the rest.
+        .refused_attempts(1)
+        .refused_work_items(u64::from(event.work_item_id.is_some()))
+        .latest_refusal_epoch_s(event_epoch_s(event))
+        .latest_work_item_id(event.work_item_id.clone().unwrap_or_default())
+        .latest_execution_id(triggering)
+        .build()
 }
 
 #[cfg(test)]
@@ -460,7 +628,7 @@ mod tests {
         let issue = health_issue_for(&tracker_with_one_refusal().active().unwrap(), 1_000 + 13 * 60);
         assert_eq!(issue.kind, DISPATCH_OUTAGE_ISSUE_KIND);
         assert_eq!(issue.severity, "error");
-        assert!(issue.title.contains("13 min"), "{}", issue.title);
+        assert!(issue.title.contains("13 minutes ago"), "{}", issue.title);
         assert!(
             issue
                 .body
@@ -474,12 +642,136 @@ mod tests {
     }
 
     #[test]
-    fn duration_uses_whole_units() {
-        assert_eq!(format_outage_duration(-5), "0 s");
-        assert_eq!(format_outage_duration(45), "45 s");
-        assert_eq!(format_outage_duration(13 * 60 + 59), "13 min");
-        assert_eq!(format_outage_duration(3600), "1 h");
-        assert_eq!(format_outage_duration(2 * 3600 + 5 * 60), "2 h 5 min");
-        assert_eq!(format_outage_duration(3 * 86_400 + 4 * 3600), "3 d 4 h");
+    fn recovery_text_names_the_check_that_covers_lost_track_workers() {
+        let recovery = exclusions()[0].recovery_action.clone().unwrap();
+        assert!(recovery.contains("bossctl agents list --all"), "{recovery}");
+        assert!(recovery.contains("unknown, not dead"), "{recovery}");
+    }
+
+    #[test]
+    fn a_scan_error_hold_excludes_every_host_even_an_enabled_remote() {
+        let hold = LocalHold {
+            reason: "scan failed".to_owned(),
+            held_executions: Vec::new(),
+            scan_error: Some("tmux unreachable".to_owned()),
+        };
+        let exclusions = scan_error_exclusions(&[host("local", true), host("remote", true)], &hold);
+        assert_eq!(exclusions.len(), 2);
+        assert_eq!(exclusions[0].kind, EXCLUSION_LOCAL_QUARANTINE);
+        assert!(
+            exclusions[0].cause.contains("tmux unreachable"),
+            "{}",
+            exclusions[0].cause
+        );
+        assert_eq!(exclusions[1].kind, EXCLUSION_ALL_ITEMS_HELD);
+        assert!(exclusions[1].cause.contains("tmux unreachable"));
+    }
+
+    #[test]
+    fn a_restored_outage_keeps_its_start_and_ends_on_the_first_claim() {
+        let original = tracker_with_one_refusal();
+        original.record_refusal(exclusions(), "task_2", "exec_2", 1_010);
+        let tracker = DispatchOutageTracker::new();
+        tracker.restore(
+            original.active().unwrap(),
+            BTreeSet::from(["task_1".to_owned(), "task_2".to_owned()]),
+        );
+        tracker.record_refusal(exclusions(), "task_2", "exec_2", 1_020);
+        let outage = tracker.active().unwrap();
+        assert_eq!(outage.started_epoch_s, 1_000);
+        assert_eq!(outage.refused_attempts, 3);
+        assert_eq!(
+            outage.refused_work_items, 2,
+            "a retry of a known item is not a new item"
+        );
+        assert_eq!(tracker.record_claim(1_100).unwrap().duration_secs, 100);
+    }
+
+    fn stream_event(
+        stage: &str,
+        outcome: &str,
+        execution: &str,
+        item: &str,
+        ts_ms: u128,
+        details: serde_json::Value,
+    ) -> DispatchEvent {
+        let mut event = DispatchEvent::new(
+            serde_json::from_value(serde_json::json!(stage)).unwrap(),
+            serde_json::from_value(serde_json::json!(outcome)).unwrap(),
+            execution,
+        )
+        .with_work_item(item)
+        .with_details(details);
+        event.ts_epoch_ms = ts_ms;
+        event
+    }
+
+    fn started_event(ts_ms: u128) -> DispatchEvent {
+        stream_event(
+            "dispatch_outage_started",
+            "error",
+            "engine",
+            "task_1",
+            ts_ms,
+            serde_json::json!({
+                "started_epoch_s": ts_ms / 1000,
+                "triggering_execution_id": "exec_1",
+                "host_exclusions": exclusions(),
+            }),
+        )
+    }
+
+    fn refusal_event(
+        item: &str,
+        ts_ms: u128,
+        global: bool,
+        exclusions: Vec<DispatchOutageHostExclusion>,
+    ) -> DispatchEvent {
+        stream_event(
+            "host_selected",
+            "error",
+            &format!("exec_{item}"),
+            item,
+            ts_ms,
+            serde_json::json!({ "reason": "no_eligible_host", "global_outage": global, "host_exclusions": exclusions }),
+        )
+    }
+
+    #[test]
+    fn replay_counts_only_global_refusals_and_follows_exclusion_changes() {
+        let narrowed = vec![exclusions().remove(1)];
+        let replay = replay_outage_events(&[
+            started_event(1_000_000),
+            refusal_event("task_2", 1_100_000, true, exclusions()),
+            refusal_event("task_3", 1_200_000, false, Vec::new()),
+            refusal_event("task_2", 1_300_000, true, narrowed.clone()),
+        ]);
+        let active = replay.active.expect("still active");
+        assert_eq!(active.refused_attempts, 3, "the start plus two global refusals");
+        assert_eq!(active.refused_work_items, 2);
+        assert_eq!(active.host_exclusions, narrowed);
+        assert_eq!(replay.refused_work_items.len(), 2);
+    }
+
+    #[test]
+    fn replay_ends_the_outage_on_a_fresh_host_claim_without_a_recovered_event() {
+        let claim = |existing: bool, ts| {
+            stream_event(
+                "host_selected",
+                "ok",
+                "exec_9",
+                "task_9",
+                ts,
+                serde_json::json!({ "host_id": "anaplian", "existing_assignment": existing }),
+            )
+        };
+        let still_active = replay_outage_events(&[started_event(1_000_000), claim(true, 1_100_000)]);
+        assert!(
+            still_active.active.is_some(),
+            "a held-spoke reconciliation is not a claim"
+        );
+        let ended = replay_outage_events(&[started_event(1_000_000), claim(false, 1_100_000)]);
+        assert!(ended.active.is_none());
+        assert_eq!(ended.last_recovery.unwrap()["duration_secs"], 100);
     }
 }

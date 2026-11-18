@@ -2595,6 +2595,39 @@ async fn serve_scoped(
     let _spawn_streak_health_handle = server_state.spawn_spawn_streak_health_broadcaster();
     // And for the global dispatch outage: start, end and the per-minute
     // refresh of its relative times.
+    // The outage record is in memory only, so an engine restarted mid-outage
+    // (an auto-update relaunch, say) restores it from the dispatch event
+    // stream first: the original start time and counters then survive until
+    // a new dispatch actually claims a host.
+    {
+        let root = server_state.dispatch_event_root.clone();
+        let replay = tokio::task::spawn_blocking(move || {
+            boss_dispatch_reader::read_current(&root)
+                .map(|read| boss_execution_contracts::replay_outage_events(&read.events))
+        })
+        .await;
+        match replay {
+            Ok(Ok(replay)) => {
+                if let Some(active) = replay.active {
+                    tracing::warn!(
+                        started_epoch_s = active.started_epoch_s,
+                        refused_attempts = active.refused_attempts,
+                        "dispatch outage was in progress when the engine stopped; restoring it",
+                    );
+                    server_state
+                        .execution_coordinator
+                        .dispatch_outage()
+                        .restore(active, replay.refused_work_items);
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(error = %format!("{err:#}"), "could not read the dispatch event stream to restore an in-progress dispatch outage");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "dispatch outage restore task failed");
+            }
+        }
+    }
     let _dispatch_outage_health_handle = server_state.spawn_dispatch_outage_health_broadcaster();
     if _dispatch_ready_subscriber_handle.is_some() {
         // Boot-time sanity check that the bus injected via `set_event_bus`
