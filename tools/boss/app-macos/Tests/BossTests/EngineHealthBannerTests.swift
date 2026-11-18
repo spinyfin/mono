@@ -352,6 +352,31 @@ final class EngineHealthBannerTests: XCTestCase {
         XCTAssertTrue(expanded.contains("standard refusal"))
     }
 
+    /// A global dispatch outage is engine-written text like every other issue
+    /// (the app infers nothing), but the banner may never collapse it to a
+    /// headline: the body names the safe recovery action. It leaves only when
+    /// the engine stops reporting it.
+    func testDispatchOutageStaysExpandedAndClearsOnlyWhenEngineStopsReportingIt() {
+        let model = makeModel()
+        let outage = EngineHealthIssue(
+            kind: EngineHealthIssue.dispatchOutageKind,
+            severity: "error",
+            title: "Dispatch is down: no host can start new workers (for 13 min)",
+            body: "Cause:\n• local: held by the startup quarantine\n\nRecovery:\n• anaplian: Run `bossctl hosts enable anaplian`."
+        )
+        let other = EngineHealthIssue(kind: "missing_anthropic_api_key", severity: "warning", title: "key", body: "set it")
+
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [outage, other]))
+
+        XCTAssertEqual(model.bannerHealthIssues.first, outage, "the outage is the headline")
+        XCTAssertEqual(EngineHealthBanner.headline(for: model.bannerHealthIssues), "\(outage.title) (1 more)")
+        XCTAssertTrue(EngineHealthBanner.hasDispatchOutage(in: model.bannerHealthIssues))
+        XCTAssertTrue(EngineHealthBanner.accessibilityLabel(for: model.bannerHealthIssues).contains("bossctl hosts enable anaplian"))
+
+        model.applyEventForTest(.engineHealthResult(apiKeyPresent: true, issues: [other]))
+        XCTAssertFalse(EngineHealthBanner.hasDispatchOutage(in: model.bannerHealthIssues))
+    }
+
     private static func streakIssue(title: String, body: String) -> EngineHealthIssue {
         EngineHealthIssue(
             kind: "pre_start_spawn_failure_streak",

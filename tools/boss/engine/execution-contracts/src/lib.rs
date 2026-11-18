@@ -16,6 +16,11 @@ pub use spawn_confirmation::{
 };
 mod worker_kind;
 pub use worker_kind::{WorkerKind, worker_kind_for_execution};
+mod dispatch_outage;
+pub use dispatch_outage::{
+    DISPATCH_OUTAGE_ISSUE_KIND, DispatchOutageTracker, LocalHold, RefusalEffect, ResolvedOutage,
+    classify_host_exclusions, format_outage_duration, health_issue_for as dispatch_outage_health_issue,
+};
 mod pre_start_streak;
 pub use pre_start_streak::{
     FailureEffect, PRE_START_FAILURE_STREAK_THRESHOLD, PreStartStreakTracker, StreakKey, UNRESOLVED_DRIVER_LABEL,

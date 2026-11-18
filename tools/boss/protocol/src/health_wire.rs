@@ -61,6 +61,56 @@ pub struct EngineHealthReport {
     #[serde(default)]
     #[builder(default)]
     pub spawn_failure_streaks: Vec<SpawnFailureStreak>,
+    /// The active global dispatch outage, if any: every registered host is
+    /// excluded for every dispatchable item, so no new worker can start.
+    /// Also appears in `issues` as a `dispatch_outage` entry carrying the
+    /// same facts as prose; this is the structured form for CLI / `jq`
+    /// consumers. `None` while at least one host can accept a launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_outage: Option<DispatchOutage>,
+}
+
+/// A global dispatch outage: the engine refused a launch because every
+/// registered host is excluded for a reason that does not depend on the work
+/// item (a host that is disabled, or the local host under the startup
+/// quarantine). An item that merely does not fit one host (missing capability,
+/// pinned elsewhere, pool full) never raises it.
+///
+/// The record is keyed to the outage, not to the refused items: every further
+/// refusal while it lasts is folded into the counters below. It ends when a
+/// new dispatch actually claims a host — never because a flag cleared.
+#[derive(bon::Builder, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[builder(on(String, into))]
+pub struct DispatchOutage {
+    /// Unix epoch seconds of the first refusal that found every host excluded.
+    pub started_epoch_s: i64,
+    /// Why each registered host is excluded, as of the latest refusal.
+    pub host_exclusions: Vec<DispatchOutageHostExclusion>,
+    /// Launch attempts refused since `started_epoch_s`. Counts every
+    /// attempt, including repeated retries of the same item.
+    pub refused_attempts: u64,
+    /// Distinct work items among those refused attempts.
+    pub refused_work_items: u64,
+    /// Unix epoch seconds of the most recent refused attempt.
+    pub latest_refusal_epoch_s: i64,
+    /// Work item of the most recent refused attempt.
+    pub latest_work_item_id: String,
+    /// Execution of the most recent refused attempt.
+    pub latest_execution_id: String,
+}
+
+/// One host's share of a [`DispatchOutage`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchOutageHostExclusion {
+    pub host_id: String,
+    /// Stable kind: `local_quarantine` or `host_disabled`.
+    pub kind: String,
+    /// One-line cause, rendered for people (what the banner shows).
+    pub cause: String,
+    /// The engine's refusal text for this host, verbatim.
+    pub reason: String,
+    /// The supported way to bring this host back, when one exists.
+    pub recovery_action: Option<String>,
 }
 
 /// One fleet-level alert: a (driver, worker kind) combination has failed

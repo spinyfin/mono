@@ -267,6 +267,20 @@ struct EngineHealthBanner: View {
         issues.contains { $0.kind == "dispatch_paused" }
     }
 
+    /// A global dispatch outage keeps its detail (cause, duration, recovery
+    /// action) on screen: the banner is the only place that names the safe
+    /// recovery, so it cannot be collapsed into a headline while the outage
+    /// lasts. It clears only when the engine stops reporting it.
+    private var hasDispatchOutage: Bool {
+        Self.hasDispatchOutage(in: issues)
+    }
+
+    private var showsDetail: Bool { isExpanded || hasDispatchOutage }
+
+    static func hasDispatchOutage(in issues: [EngineHealthIssue]) -> Bool {
+        issues.contains { $0.kind == EngineHealthIssue.dispatchOutageKind }
+    }
+
     /// Highest severity in the issue list — drives banner color so a
     /// single `error` row escalates an otherwise-warning banner.
     private var effectiveSeverity: String {
@@ -288,7 +302,10 @@ struct EngineHealthBanner: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 8) {
-                Button(action: { withAnimation(.easeInOut(duration: 0.12)) { isExpanded.toggle() } }) {
+                Button(action: {
+                    guard !hasDispatchOutage else { return }
+                    withAnimation(.easeInOut(duration: 0.12)) { isExpanded.toggle() }
+                }) {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: iconName)
                             .foregroundStyle(.white)
@@ -303,10 +320,12 @@ struct EngineHealthBanner: View {
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 0)
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .foregroundStyle(.white)
-                            .font(.caption.weight(.semibold))
-                            .padding(.top, 4)
+                        if !hasDispatchOutage {
+                            Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                                .foregroundStyle(.white)
+                                .font(.caption.weight(.semibold))
+                                .padding(.top, 4)
+                        }
                     }
                     .contentShape(Rectangle())
                 }
@@ -329,7 +348,7 @@ struct EngineHealthBanner: View {
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if isExpanded {
+            if showsDetail {
                 VStack(alignment: .leading, spacing: 6) {
                     // Keyed by position, not `issue.id` (the kind): the engine
                     // can report several issues of one kind at once — one

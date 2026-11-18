@@ -1693,6 +1693,7 @@ fn tag_cases() -> Vec<TagCase> {
                     review_guide_reenqueue: None,
                     issues: vec![],
                     spawn_failure_streaks: vec![],
+                    dispatch_outage: None,
                 },
             },
             expected_tag: "engine_health_result",

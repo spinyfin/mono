@@ -418,3 +418,54 @@ async fn streak_alert_changes_push_engine_health_to_a_running_app() {
         "a success must clear the banner issue: {cleared:?}"
     );
 }
+
+fn dispatch_outage_exclusions() -> Vec<boss_protocol::DispatchOutageHostExclusion> {
+    vec![boss_protocol::DispatchOutageHostExclusion {
+        host_id: "anaplian".to_owned(),
+        kind: "host_disabled".to_owned(),
+        cause: "host is disabled".to_owned(),
+        reason: "disabled".to_owned(),
+        recovery_action: Some("Run `bossctl hosts enable anaplian`.".to_owned()),
+    }]
+}
+
+/// A running app is pushed the outage when it starts and a cleared report
+/// when the first launch claims a host — no poll, no RPC — and the outage is
+/// the banner's headline, ahead of every other issue.
+#[tokio::test]
+async fn dispatch_outage_start_and_recovery_push_engine_health_to_a_running_app() {
+    let (state, _dir) = test_server_state();
+    let sink = subscribed_health_session(&state).await;
+    let _broadcaster = state.spawn_dispatch_outage_health_broadcaster();
+
+    let initial = next_health_report(&sink).await;
+    assert_eq!(initial.dispatch_outage, None, "fixture precondition: healthy at start");
+
+    let tracker = state.execution_coordinator.dispatch_outage();
+    tracker.record_refusal(dispatch_outage_exclusions(), "task_1", "exec_1", 1_000);
+    let raised = next_health_report(&sink).await;
+    let outage = raised.dispatch_outage.as_ref().expect("outage in the pushed report");
+    assert_eq!(outage.refused_attempts, 1);
+    assert_eq!(
+        raised.issues[0].kind,
+        boss_execution_contracts::DISPATCH_OUTAGE_ISSUE_KIND,
+        "the outage outranks every other banner issue: {raised:?}",
+    );
+    assert_eq!(raised.issues[0].severity, "error");
+    assert!(
+        raised.issues[0].body.contains("bossctl hosts enable anaplian"),
+        "{:?}",
+        raised.issues[0]
+    );
+
+    tracker.record_claim(1_780);
+    let cleared = next_health_report(&sink).await;
+    assert_eq!(cleared.dispatch_outage, None, "{cleared:?}");
+    assert!(
+        !cleared
+            .issues
+            .iter()
+            .any(|issue| issue.kind == boss_execution_contracts::DISPATCH_OUTAGE_ISSUE_KIND),
+        "a launch must clear the banner issue: {cleared:?}"
+    );
+}
