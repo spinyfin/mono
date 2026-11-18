@@ -1,62 +1,11 @@
 //! Recovery failures recorded on the work item, never classified as empty.
 use crate::work::{CreateAttentionItemInput, WorkDb, WorkExecution};
-use anyhow::Result;
 
 #[cfg(test)]
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_CREATE_FAILED_ATTENTION_KIND as CREATE_FAILED;
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED;
 #[cfg(test)]
 pub(crate) use boss_engine_storage_values::attention_kinds::EXECUTION_BOOKMARK_RECOVERY_RETIRED_ATTENTION_KIND as RECOVERY_RETIRED;
-pub(crate) use boss_engine_storage_values::attention_kinds::REVISION_CHAIN_RECOVERY_BLOCKED_ATTENTION_KIND as CHAIN_BLOCKED;
-
-/// Only authoritative integrity failures park work; transport failures keep
-/// the coordinator's pre-start backoff and rerun repair on the next attempt.
-pub(crate) fn block_unrecoverable(db: &WorkDb, execution: &WorkExecution, err: &anyhow::Error) -> Result<bool> {
-    use crate::work::ExecutionKind;
-    let damaged = boss_engine_recovery::execution_bookmark::is_pointer_integrity_error(err);
-    if damaged
-        && matches!(
-            execution.kind,
-            ExecutionKind::ChoreImplementation
-                | ExecutionKind::TaskImplementation
-                | ExecutionKind::RevisionImplementation
-        )
-    {
-        db.update_work_item_with_basis(
-            &execution.work_item_id,
-            boss_protocol::WorkItemPatch::builder()
-                .status("blocked")
-                .blocked_reason("execution_recovery_failed")
-                .blocked_detail(format!("{err:#}"))
-                .autostart(false)
-                .build(),
-            "engine",
-            "execution_bookmark_recovery:block_unrecoverable",
-        )?;
-        report_chain_block(db, execution, &format!("{err:#}"))?;
-    }
-    Ok(damaged)
-}
-
-pub(crate) fn report_chain_block(db: &WorkDb, execution: &WorkExecution, reason: &str) -> Result<()> {
-    if execution.kind != crate::work::ExecutionKind::RevisionImplementation {
-        return Ok(());
-    }
-    let Some(root) = db.get_revision_chain_root_task_id(&execution.work_item_id) else {
-        return Ok(());
-    };
-    db.upsert_refreshing_work_item_attention(
-        &root,
-        CHAIN_BLOCKED,
-        "PR revision chain blocked on recovery",
-        &format!(
-            "Revision `{}` cannot recover its preserved work: {reason}\n\nLater revisions on this PR remain sequenced behind it. Repair the reported state and explicitly restart the blocked revision; do not discard its work or bypass sequencing. Execution: `{}`.",
-            execution.work_item_id, execution.id
-        ),
-    )?;
-    Ok(())
-}
-
 pub(crate) fn report_failure(db: &WorkDb, execution: &WorkExecution, reason: &str) {
     tracing::error!(execution_id = %execution.id, reason, "execution bookmark recovery failed");
     match db.reraise_open_execution_attention(&execution.id, RECOVERY_FAILED) {
@@ -77,35 +26,5 @@ pub(crate) fn report_failure(db: &WorkDb, execution: &WorkExecution, reason: &st
         resolved_at: None,
     }) {
         tracing::error!(execution_id = %execution.id, error = %err, "could not record recovery failure on work item");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::*;
-    use crate::work::WorkDb;
-
-    #[test]
-    fn blocking_an_unrecoverable_pointer_records_the_autostart_clear_with_its_code_path() {
-        let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
-        let product = create_test_product(&db);
-        let chore = create_test_chore(&db, product.id, "Damaged pointer");
-        let execution = create_ready_chore_execution(&db, chore.id.clone());
-        let err = boss_engine_recovery::execution_bookmark::pointer_integrity_error("ambiguous bookmark");
-
-        assert!(block_unrecoverable(&db, &execution, &err).unwrap());
-
-        let history = db.list_task_field_audit(&chore.id).unwrap();
-        let cleared = history
-            .iter()
-            .rfind(|row| row.property == "autostart")
-            .expect("autostart history");
-        assert_eq!(
-            (cleared.old_value.as_deref(), cleared.new_value.as_deref()),
-            (Some("1"), Some("0"))
-        );
-        assert_eq!(cleared.actor, "engine");
-        assert_eq!(cleared.basis, "execution_bookmark_recovery:block_unrecoverable");
     }
 }

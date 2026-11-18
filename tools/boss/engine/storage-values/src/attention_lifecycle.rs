@@ -149,6 +149,26 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
+        RUN_UNDECLARED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "The run ended without declaring an outcome. A later run cannot establish what that earlier run delivered.",
+    ),
+    entry(
+        RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Records a completion claim contradicted by the delivery audit; a later successful run does not undo that claim.",
+    ),
+    entry(
+        REMOTE_COLLECTION_FAILED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Remote completion artifacts could not be collected. A later run cannot prove those earlier artifacts were recovered.",
+    ),
+    entry(
+        ATTENTION_KIND_PR_BINDING_REPAIR,
+        ClearedBy::ProducerReconciles,
+        "The PR binding repair sweep resolves this attention after it repairs or confirms the owning task's PR binding.",
+    ),
+    entry(
         WORKSPACE_POSITIONING_REFUSED,
         ClearedBy::ProducerReconciles,
         "The positioning-refusal recheck sweep probes the live PR state each pass and clears the hold with its attention once cube would accept it; an explicit launch also clears both.",

@@ -1628,9 +1628,6 @@ mod conflict_diagnosis_for_attempt_tests {
         }
         async fn teardown_driver_workspace(&self, _: &str, _: Option<&Path>, _: TeardownReason) {}
         fn report_bookmark_failure(&self, _: &WorkExecution, _: &str) {}
-        fn block_unrecoverable_bookmark(&self, _: &WorkExecution, _: &anyhow::Error) -> anyhow::Result<bool> {
-            Ok(false)
-        }
         async fn reconcile_if_execution_dead(&self, _: &WorkExecution, _: &dyn DispatchEventSink) -> bool {
             false
         }

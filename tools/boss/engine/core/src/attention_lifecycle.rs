@@ -1,5 +1,5 @@
 //! Re-exports the storage-values attention lifecycle registry and kinds.
-//! Hosts the cross-module test that checks producer registration.
+//! Producer registration is checked in storage-values/src/attention_kinds.rs.
 
 pub use boss_engine_storage_values::attention_kinds::{
     COMPLETION_WITH_BOUND_PR_ATTENTION_KIND, EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND,

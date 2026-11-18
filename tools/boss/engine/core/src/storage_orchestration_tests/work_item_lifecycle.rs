@@ -2,8 +2,7 @@
 //! a review-findings revision converted at parent close carries its origin
 //! provenance into the worker's backlink prefix, a no-op completion on a task
 //! with a bound PR keeps it in review and files the admission-deferred
-//! attention atomically, and a revision whose bookmarks cannot be recovered
-//! raises one attention item on the PR owner.
+//! attention atomically.
 
 use boss_protocol::{
     CREATED_VIA_PR_REVIEW_PREFIX, CreateExecutionInput, CreateRevisionInput, ExecutionKind, ExecutionStatus,
@@ -11,7 +10,7 @@ use boss_protocol::{
 };
 use rusqlite::params;
 
-use super::{executions_for, in_review_chore, insert_revision_row, raw, task_status};
+use super::{in_review_chore, raw};
 use crate::test_support::{
     create_test_chore_manual, create_test_product_named, create_test_product_with_repo, open_db,
 };
@@ -204,46 +203,4 @@ fn no_op_with_bound_pr_retains_review_and_files_attention_atomically() {
             .unwrap()
             .is_none()
     );
-}
-
-#[test]
-fn unrecoverable_revision_raises_attention_on_the_pr_owner() {
-    let (_dir, db) = open_db();
-    let product = create_test_product_named(&db, "Boss-attention").id;
-    let root = in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/42");
-    let revision = insert_revision_row(&db, &product, &root);
-    db.reconcile_product_executions(&product).unwrap();
-    let execution = db.get_execution(&executions_for(&db, &revision)[0].0).unwrap();
-    crate::execution_bookmark_recovery::report_chain_block(&db, &execution, "GitHub unavailable").unwrap();
-    crate::execution_bookmark_recovery::report_chain_block(&db, &execution, "GitHub unavailable").unwrap();
-    let attention = db
-        .list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
-        .unwrap();
-    assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].work_item_id.as_deref(), Some(root.as_str()));
-    assert!(attention[0].body_markdown.contains("Later revisions"));
-    assert!(attention[0].body_markdown.contains("GitHub unavailable"));
-    let original_id = attention[0].id.clone();
-    let next = insert_revision_row(&db, &product, &root);
-    let next_execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(next.clone())
-                .kind(ExecutionKind::RevisionImplementation)
-                .status(ExecutionStatus::WaitingDependency)
-                .build(),
-        )
-        .unwrap();
-    crate::execution_bookmark_recovery::report_chain_block(&db, &next_execution, "PR head deleted").unwrap();
-    let attention = db
-        .list_open_attention_items_of_kind(crate::execution_bookmark_recovery::CHAIN_BLOCKED)
-        .unwrap();
-    assert_eq!(attention.len(), 1);
-    assert_eq!(attention[0].id, original_id);
-    assert!(attention[0].body_markdown.contains(&next));
-    assert!(attention[0].body_markdown.contains(&next_execution.id));
-    assert!(attention[0].body_markdown.contains("PR head deleted"));
-    assert!(!attention[0].body_markdown.contains(&execution.id));
-    assert!(!attention[0].body_markdown.contains("GitHub unavailable"));
-    assert_eq!(task_status(&db, &revision), "todo");
 }

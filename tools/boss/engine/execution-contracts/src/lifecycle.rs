@@ -274,8 +274,6 @@ pub trait LifecycleServices: Send + Sync {
 
     fn report_bookmark_failure(&self, execution: &WorkExecution, reason: &str);
 
-    fn block_unrecoverable_bookmark(&self, execution: &WorkExecution, err: &anyhow::Error) -> anyhow::Result<bool>;
-
     async fn reconcile_if_execution_dead(
         &self,
         execution: &WorkExecution,
