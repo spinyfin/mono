@@ -27,6 +27,9 @@ import UpdateCore
 ///   fails if the target does not belong to a collapsible section.
 /// - `--capture-dump-scroll` prints every scroll view's visible rect and
 ///   document size every half second and at capture time.
+///
+/// --capture-reveal-state=markdown-list-rhythm captures the markdown document
+/// viewer with a wrapped-bullet list (`BossMarkdownListCapture`).
 @MainActor
 enum BossRevealCapture {
     private static var window: NSWindow?
@@ -120,6 +123,10 @@ enum BossRevealCapture {
         }
         if state.hasPrefix("navigator-review-") {
             BossNavigatorReviewCapture.start(path: path, state: state, updateModel: updateModel)
+            return
+        }
+        if state == "markdown-list-rhythm" {
+            BossMarkdownListCapture.start(path: path)
             return
         }
         let model = ChatViewModel(paths: BossEnginePaths.production())
