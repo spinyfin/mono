@@ -306,12 +306,16 @@ async fn revision_no_op_records_only_confirmed_merges_for_already_done_root() {
         let probe: Arc<dyn MergeProbe> = match state {
             "merged" => Arc::new(MergedProbe),
             "closed" => Arc::new(ClosedUnmergedProbe),
-            _ => Arc::new(FixedMergeabilityProbe {
-                mergeability: OpenPrMergeability::Clean,
-            }),
+            _ => published_probe(
+                Arc::new(FixedMergeabilityProbe {
+                    mergeability: OpenPrMergeability::Clean,
+                }),
+                "head",
+            ),
         };
         let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
             .handler
+            .with_branch_verifier(published_verifier(StubBranchVerifier::ok("my-feature"), Ok("head")))
             .with_merge_probe(probe);
         let execution = db.get_execution(&execution_id).unwrap();
         let outcome = handler

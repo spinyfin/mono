@@ -218,7 +218,9 @@ impl WorkerCompletionHandler {
 
         if !merged && let Ok(execution) = execution_result.as_ref() {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
-                ConflictDeliveryDecision::Failed(outcome) | ConflictDeliveryDecision::Unsettled(outcome) => return outcome,
+                ConflictDeliveryDecision::Failed(outcome) | ConflictDeliveryDecision::Unsettled(outcome) => {
+                    return outcome;
+                }
                 ConflictDeliveryDecision::Merged => {
                     target = WorkerPrCompletionTarget::Done;
                     merged = true;

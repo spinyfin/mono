@@ -372,7 +372,8 @@ pub use boss_engine_storage_values::pool_policy::{
 /// and sourced from `jj resolve --list`; the cube adapter's parser strips
 /// jj's trailing conflict-type descriptor from each entry, so callers always
 /// see bare paths here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct RebaseOutcome {
     /// `true` for `REBASED_CLEAN`, `false` for `REBASED_WITH_CONFLICTS`.
     pub clean: bool,
@@ -395,6 +396,7 @@ pub struct RebaseOutcome {
     /// them *and* proved the pushed tree byte-identical to the rebased head;
     /// it is carried purely so the ladder can say so in its trace rather
     /// than reporting an indistinguishable "clean rebase".
+    #[builder(default)]
     pub linearized_commits: usize,
     /// Which guard refused the replay-only collapse, as cube's stable slug
     /// (`conflicted_head`, `bookmarked_ancestor`, `multiple_children`,
@@ -409,6 +411,11 @@ pub struct RebaseOutcome {
     /// silence undiagnosable. Stamped on the ladder's rung-1 fall-through
     /// trace so guard hits can be counted without a code change.
     pub linearize_decline: Option<String>,
+    /// The remote-tracking ref cube rebased onto (e.g. `main@github`), named
+    /// after whichever remote cube resolved as the GitHub upstream. `None` on
+    /// a clean rebase and on a cube that predates the field; rung 0 then
+    /// falls back to `<base>@origin`.
+    pub main_ref: Option<String>,
 }
 
 #[async_trait]

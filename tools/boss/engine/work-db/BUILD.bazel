@@ -175,11 +175,11 @@ rust_test(
     size = "large",
     # Observed locally at roughly 270 seconds; long gives this target 900 seconds.
     timeout = "long",
+    srcs = glob(["src/**/*.rs"]),
     args = [
         "_measurement",
         "--nocapture",
     ],
-    srcs = glob(["src/**/*.rs"]),
     compile_data = ["//tools/boss/app-macos:work_board_banners_swift"],
     crate_features = ["scale_measurements"],
     crate_root = "src/lib.rs",

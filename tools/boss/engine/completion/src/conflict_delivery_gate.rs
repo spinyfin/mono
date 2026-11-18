@@ -61,7 +61,7 @@ impl WorkerCompletionHandler {
             {
                 return ConflictDeliveryDecision::Failed(StopOutcome::DbError);
             }
-            return ConflictDeliveryDecision::Failed(StopOutcome::ConflictDeliveryUnverified { detail });
+            return ConflictDeliveryDecision::Failed(self.delivery_unverified(execution, detail));
         };
         // A conflict revision's verdict must describe the head the worker
         // published: pin the probe to the attempt's remote branch head, read
@@ -159,6 +159,17 @@ impl WorkerCompletionHandler {
             return ConflictDeliveryDecision::Failed(StopOutcome::DbError);
         }
         self.nudge_breaker.forget(&retry_key);
-        ConflictDeliveryDecision::Failed(StopOutcome::ConflictDeliveryUnverified { detail })
+        ConflictDeliveryDecision::Failed(self.delivery_unverified(execution, detail))
+    }
+
+    /// A conflict revision's refusal is reachable from every completion path
+    /// the gate guards; an ordinary revision's stays the declared-run-done
+    /// refusal.
+    fn delivery_unverified(&self, execution: &crate::work::WorkExecution, detail: String) -> StopOutcome {
+        if self.is_merge_conflict_revision(execution) {
+            StopOutcome::ConflictDeliveryUnverified { detail }
+        } else {
+            StopOutcome::RunDoneDeclaredWithoutDelivery { detail }
+        }
     }
 }

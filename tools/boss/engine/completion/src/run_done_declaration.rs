@@ -438,7 +438,9 @@ impl WorkerCompletionHandler {
 
         if !merged && !closed_unmerged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
-                ConflictDeliveryDecision::Failed(outcome) | ConflictDeliveryDecision::Unsettled(outcome) => return outcome,
+                ConflictDeliveryDecision::Failed(outcome) | ConflictDeliveryDecision::Unsettled(outcome) => {
+                    return outcome;
+                }
                 ConflictDeliveryDecision::Merged => merged = true,
                 ConflictDeliveryDecision::ClosedUnmerged => closed_unmerged = true,
                 ConflictDeliveryDecision::Proceed => {}

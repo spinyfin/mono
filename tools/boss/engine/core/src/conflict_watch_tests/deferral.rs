@@ -263,7 +263,7 @@ crate::stub_cube_client! { CountingRebaseCube {
     }
     async fn rebase_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<RebaseOutcome> {
         self.rebases.fetch_add(1, Ordering::SeqCst);
-        Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new(), linearized_commits: 0, linearize_decline: None })
+        Ok(RebaseOutcome::builder().clean(true).pushed(true).conflicted_files(Vec::new()).build())
     }
     async fn release_workspace(&self, _lease_id: &str) -> anyhow::Result<()> {
         Ok(())
