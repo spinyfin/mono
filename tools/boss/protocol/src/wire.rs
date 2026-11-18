@@ -901,21 +901,8 @@ pub enum FrontendRequest {
         id: String,
     },
 
-    /// Read-only: the engine-defined metric series catalog — series ids,
-    /// titles, value kinds, supported dimensions, default group-by,
-    /// named presets, observed dimension values, and per-series coverage.
-    /// Backs `boss metrics catalog` and the app Performance tab's chips.
-    /// Denied to workers. Replies with [`FrontendEvent::MetricCatalogResult`].
+    /// Read-only. Denied to workers.
     GetMetricCatalog,
-
-    /// Read-only: one catalog series bucketed over
-    /// `[since_epoch_s, until_epoch_s)`. `bucket` is `"hour"` / `"day"` /
-    /// `"week"` / `"month"`; omitted, the engine picks from the range.
-    /// `group_by` is a catalog dimension id, or omitted for a single
-    /// group. Filters AND across dimensions and OR within a dimension's
-    /// values. A reply is capped at 5,000 cells; the engine coarsens the
-    /// bucket rather than truncating. Backs `boss metrics series`. Denied
-    /// to workers. Replies with [`FrontendEvent::MetricSeriesResult`].
     GetMetricSeries {
         series: String,
         since_epoch_s: i64,
