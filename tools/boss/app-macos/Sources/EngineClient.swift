@@ -292,11 +292,12 @@ final class EngineClient: @unchecked Sendable {
     // Not `private`: called from the `EngineClient+PaneResponses.swift`
     // extension, which needs file-scoped-`private` loosened to `internal`
     // to reach it.
-    /// Returns the envelope id for a socket write or queued read. Only
+    /// Returns the envelope id for a socket write or queued read.
+    /// With `returnRetainedRequestId`, retained mutations also return their id. Only
     /// self-retrying background polls may opt out of disconnected reports;
     /// user actions must either queue or report a visible failure.
     @discardableResult
-    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString) -> String? {
+    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString, returnRetainedRequestId: Bool = false) -> String? {
         outboundRecorder?(payload)
         if payload["type"] as? String == "merge_when_ready" {
             Self.log.info("merge RPC scheduled: request=\(envelopeRequestId, privacy: .public)")
@@ -318,9 +319,11 @@ final class EngineClient: @unchecked Sendable {
 
         if simulateConnectedForTesting { return envelopeRequestId }
         guard reachableState.withLock({ $0 }) else {
-            return handleDisconnectedSend(
+            let result = handleDisconnectedSend(
                 payload, envelopeRequestId: envelopeRequestId,
                 queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+            if !returnRetainedRequestId && isAwaitingRetry(envelopeRequestId) { return nil }
+            return result
         }
         guard let encoded = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
             emit(.error(message: "failed to encode outbound request"))
@@ -387,12 +390,17 @@ final class EngineClient: @unchecked Sendable {
             Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
             return nil
         }
-        if retainUnsent(payload, envelopeRequestId: envelopeRequestId) == .full {
+        let retention = retainUnsent(payload, envelopeRequestId: envelopeRequestId)
+        if retention == .full {
             emit(.actionNotSaved(requestKind: kind))
             return nil
         }
         emit(.notConnected(requestKind: kind))
-        return nil
+        return retention == .retained ? envelopeRequestId : nil
+    }
+
+    func isAwaitingRetry(_ requestId: String) -> Bool {
+        ledger.withLock { $0.unsent.contains { $0.id == requestId } }
     }
 
     private enum RetentionOutcome { case retained, ineligible, full }
@@ -1753,7 +1761,7 @@ final class EngineClient: @unchecked Sendable {
                 emit(.error(message: "received invalid comment_result payload"))
                 break
             }
-            emit(.commentResult(comment: comment))
+            emit(.commentResult(comment: comment, requestId: envelopeRequestId))
         case "comments_list":
             let artifactKind = payload["artifact_kind"] as? String ?? ""
             let artifactId = payload["artifact_id"] as? String ?? ""

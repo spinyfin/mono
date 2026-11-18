@@ -1276,11 +1276,9 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
 ///
 /// A refusal is never a silent no-op: the reply is a `WorkError` carrying
 /// the reason, correlated to the request so the picker that sent it can
-/// revert and show the reason inline. `in_revision` in particular used to be
-/// accepted as a label-only write (see [`WorkDb::override_comment_intent`]
-/// for why the claim itself must not move); that read as "nothing happened"
-/// because nothing routed, so it is now refused with the claiming task
-/// named instead.
+/// revert and show the reason inline. `in_revision` is refused rather than
+/// relabelled: the claim must not move (see [`WorkDb::override_comment_intent`]),
+/// so the reply names the claiming task.
 ///
 /// The `answering`-run stand-down runs *before* the `override_comment_intent`
 /// write (see `stand_down_answer_agent`'s doc for why); everything else is
@@ -1371,7 +1369,7 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
 ///
 /// Decided before any write, so a refused gesture leaves the row exactly as
 /// it was — label included — and the reply can say why instead of echoing an
-/// unchanged comment. The reasons are operator-facing: the picker shows them
+/// unchanged comment. The picker shows the reasons
 /// inline next to the kind it reverted to.
 ///
 /// - `in_revision`: the kind of a claimed comment is owned by the revision
@@ -1379,8 +1377,7 @@ pub(super) async fn handle_comments_set_intent(ctx: Dispatch, req: FrontendReque
 ///   immutable, so neither track can take the comment over until that task
 ///   finishes (the comment resolves) or is abandoned (reconciliation reopens
 ///   it `active`, at which point the picker works again).
-/// - `resolved` / `dismissed`: terminal threads route nowhere; the operator
-///   reopens first.
+/// - `resolved` / `dismissed`: terminal threads must be reopened before reclassification.
 /// - `orphaned`: a question needs an anchor to be answered against and a
 ///   revision needs one to be addressed; neither can start until the
 ///   comment re-anchors.
@@ -1432,7 +1429,7 @@ async fn rehome_reclassified_comment(
     }
 }
 
-/// Stand down the answer-agent run the operator just retracted by
+/// Stand down the answer-agent run retracted by
 /// reclassifying its comment away from `question`.
 ///
 /// Two steps, in this order:
@@ -2346,6 +2343,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thinking_intent_switch_timing() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, _) = seed_answering_comment(&work_db);
+        let started = std::time::Instant::now();
+        set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_REVISION).await;
+        let elapsed = started.elapsed();
+        let comment = work_db.get_comment(&comment_id).unwrap().unwrap();
+        assert_eq!(comment.status, COMMENT_STATUS_ACTIVE);
+        assert_eq!(comment.intent.as_deref(), Some(INTENT_REVISION));
+        assert_eq!(
+            work_db
+                .latest_answer_agent_run_for_comment(&comment_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            ANSWER_AGENT_RUN_STATUS_SUPERSEDED,
+        );
+        eprintln!("thinking manual switch: {elapsed:?}; active before any answer completion");
+
+        // A label-only reclassification retains the historical delayed landing:
+        // the answer's terminal transition, rather than a timer, makes it active.
+        let (delayed_id, _) = seed_answering_comment(&work_db);
+        let started = std::time::Instant::now();
+        work_db
+            .reclassify_comment_intent(&delayed_id, INTENT_REVISION, 0.9)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            work_db.get_comment(&delayed_id).unwrap().unwrap().status,
+            COMMENT_STATUS_ANSWERING
+        );
+        work_db.transition_comment_to_answered(&delayed_id).unwrap();
+        assert_eq!(
+            work_db.get_comment(&delayed_id).unwrap().unwrap().status,
+            COMMENT_STATUS_ACTIVE
+        );
+        eprintln!(
+            "label-only control: {:?}; active only after answer completion (100ms controlled hold)",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn set_intent_from_a_live_answering_run_rehomes_and_stands_down() {
         let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
@@ -2707,7 +2749,7 @@ mod tests {
     }
 
     /// A terminal thread routes nowhere, so the engine says so rather than
-    /// relabelling a comment the operator can no longer act on.
+    /// relabelling a terminal comment.
     #[tokio::test]
     async fn reclassifying_a_resolved_comment_is_refused_with_a_reason() {
         let (server_state, _dir) = test_server_state();

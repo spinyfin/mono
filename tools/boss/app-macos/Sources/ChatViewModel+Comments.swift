@@ -92,6 +92,7 @@ final class CommentEngineBridge: CommentBackend {
     /// cannot tell a refused reclassification from a failed board move.
     /// Settled by the `comment_result` echo or the correlated error.
     private(set) var pendingIntentRequests: [String: String] = [:]
+    private var latestIntentRequest: [String: String] = [:]
 
     init(engine: EngineClient, author: String = CommentAuthor.current, draftStore: GuideCommentDrafts = GuideCommentDrafts()) {
         self.draftStore = draftStore
@@ -179,14 +180,18 @@ final class CommentEngineBridge: CommentBackend {
 
     func setIntent(commentId: String, intent: String) {
         guard let requestId = engine.sendCommentsSetIntent(commentId: commentId, intent: intent) else {
-            // Nothing left the app (disconnected and not retained): the
-            // picker must not sit pending for a reply that will never come.
+            // Rejected sends have no reply to settle the picker.
+            latestIntentRequest[commentId] = nil
             forEachLayer(containing: commentId) {
-                $0.applyIntentRefusal(commentId: commentId, reason: "Not connected to the engine. Try again.")
+                $0.applyIntentRefusal(commentId: commentId, reason: "Kind change was not sent. Connect to the engine or clear the Retry queue, then try again.")
             }
             return
         }
         pendingIntentRequests[requestId] = commentId
+        latestIntentRequest[commentId] = requestId
+        if engine.isAwaitingRetry(requestId) {
+            forEachLayer(containing: commentId) { $0.showIntentRetryNotice(commentId: commentId) }
+        }
     }
 
     /// A `work_error` reply that answers an in-flight `comments_set_intent`:
@@ -195,7 +200,10 @@ final class CommentEngineBridge: CommentBackend {
     /// generic handling still applies to every other error.
     func settleIntentRefusal(message: String, requestId: String?) -> Bool {
         guard let requestId, let commentId = pendingIntentRequests.removeValue(forKey: requestId) else { return false }
-        forEachLayer(containing: commentId) { $0.applyIntentRefusal(commentId: commentId, reason: message) }
+        if latestIntentRequest[commentId] == requestId {
+            latestIntentRequest[commentId] = nil
+            forEachLayer(containing: commentId) { $0.applyIntentRefusal(commentId: commentId, reason: message) }
+        }
         return true
     }
 
@@ -235,11 +243,13 @@ final class CommentEngineBridge: CommentBackend {
     /// A single-comment mutation echo. The origin session may not receive its
     /// own topic invalidation, so reload the owning artifact's layer(s) here to
     /// stay fresh after a self-initiated create/dismiss.
-    func handleCommentResult(_ comment: WorkComment) {
+    func handleCommentResult(_ comment: WorkComment, requestId: String? = nil) {
         draftStore.acknowledge(comment)
-        pendingIntentRequests = pendingIntentRequests.filter { $0.value != comment.id }
+        let matchesIntent = requestId.flatMap { pendingIntentRequests.removeValue(forKey: $0) } == comment.id
+        let settlesSelection = matchesIntent && latestIntentRequest[comment.id] == requestId
+        if settlesSelection { latestIntentRequest[comment.id] = nil }
         forEachLayer(kind: comment.artifactKind, id: comment.artifactId) {
-            $0.applyCommentResult(comment)
+            $0.applyCommentResult(comment, settlesIntent: settlesSelection)
             $0.reload()
         }
     }
@@ -276,7 +286,15 @@ final class CommentEngineBridge: CommentBackend {
     func handleReconnected() {
         // Replies to requests sent before the drop are gone with the old
         // session; the reload below re-reads the engine's state instead.
-        pendingIntentRequests.removeAll()
+        for (requestId, commentId) in pendingIntentRequests where !engine.isAwaitingRetry(requestId) {
+            if latestIntentRequest[commentId] == requestId {
+                forEachLayer(containing: commentId) {
+                    $0.applyIntentRefusal(commentId: commentId, reason: "Request interrupted by reconnect. Pick a kind to try again.")
+                }
+                latestIntentRequest[commentId] = nil
+            }
+        }
+        pendingIntentRequests = pendingIntentRequests.filter { engine.isAwaitingRetry($0.key) }
         var resubscribed = Set<String>()
         for reg in registrations.values {
             guard let layer = reg.layer else { continue }

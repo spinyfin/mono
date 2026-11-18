@@ -419,7 +419,7 @@ private struct IntentBadge: View {
 /// The engine's reason for refusing the last kind change on a comment,
 /// shown under the row's badge strip while `CommentLayer.intentRefusal(for:)`
 /// holds one. Inline by design: the picker above it has already reverted,
-/// and the operator needs the reason next to the control they just used.
+/// and the reason belongs next to the control that sent the request.
 private struct IntentRefusalNotice: View {
     let reason: String
 
