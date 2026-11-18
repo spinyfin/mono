@@ -5,7 +5,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use boss_dispatch_events::DispatchEventSink;
 use boss_execution_contracts::{
@@ -399,10 +398,6 @@ impl LifecycleServices for CoreLifecycleServices {
         crate::execution_bookmark_recovery::report_failure(&self.work_db, execution, reason);
     }
 
-    fn block_unrecoverable_bookmark(&self, execution: &WorkExecution, err: &anyhow::Error) -> Result<bool> {
-        crate::execution_bookmark_recovery::block_unrecoverable(&self.work_db, execution, err)
-    }
-
     async fn reconcile_if_execution_dead(
         &self,
         execution: &WorkExecution,
@@ -503,6 +498,7 @@ mod tests {
     use super::*;
     use crate::host_adapter::LocalHostAdapterProvider;
     use crate::test_support::{NoopCube, NoopRunner, open_db_arc};
+    use anyhow::Result;
 
     struct RecordingRelease(std::sync::Mutex<Vec<bool>>);
     crate::stub_host_adapter! { RecordingRelease {

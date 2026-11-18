@@ -87,7 +87,7 @@ It is read from the database on every pass (`WorkDb::progression_launch_backoff`
 
 ## Adding a new attention kind
 
-Add an entry to `ATTENTION_LIFECYCLES` at the same time you add the kind. `ClearedBy::HumanDecision` is a perfectly good answer — an _undeclared_ kind is not. Filing an unregistered kind emits a `tracing::warn!` from `warn_if_lifecycle_undeclared`, and `every_attention_kind_constant_in_the_crate_is_registered` fails if a constant exists with no entry.
+Add an entry to `ATTENTION_LIFECYCLES` at the same time you add the kind. `ClearedBy::HumanDecision` is a perfectly good answer — an _undeclared_ kind is not. Filing an unregistered kind emits a `tracing::warn!` from `warn_if_lifecycle_undeclared`, and `every_attention_kind_constant_in_the_crate_is_registered` checks the hand-maintained list of constants in storage-values against the registry; it does not discover constants in other crates or constants omitted from that list. The filing-time warning covers those omissions too.
 
 This is the actual defect being guarded against. Raising a signal always went through shared, well-tested plumbing; lowering one was left to each producer to remember. So kinds added later simply never got a resolution path, and could be raised but never lowered — which is how a work item ends up in the Merging lane with a bound PR, four completed revisions, and seven still-`open` attentions describing failures a later successful pass had already superseded.
 

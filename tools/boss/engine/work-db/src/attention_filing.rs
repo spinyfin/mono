@@ -36,7 +36,7 @@ use super::*;
 /// since callers file attentions on best-effort paths that must not abort.
 ///
 /// This is also the only check that catches a *wholly new* kind constant:
-/// `every_attention_kind_constant_in_the_crate_is_registered` compares a
+/// the storage-values attention-kinds test compares a
 /// hand-maintained list against the registry, so a constant added to neither
 /// slips past it. A filing call cannot be forgotten the same way.
 pub fn warn_if_lifecycle_undeclared(kind: &str) {

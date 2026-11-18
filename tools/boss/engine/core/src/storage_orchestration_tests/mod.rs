@@ -95,21 +95,6 @@ fn insert_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str) -> S
     id
 }
 
-/// `(id, status)` of every execution bound to `work_item_id`, oldest first.
-fn executions_for(db: &WorkDb, work_item_id: &str) -> Vec<(String, String)> {
-    let mut executions = db.list_executions(Some(work_item_id)).unwrap();
-    executions.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
-    executions.into_iter().map(|e| (e.id, e.status.to_string())).collect()
-}
-
-/// The stored status of `task_id`.
-fn task_status(db: &WorkDb, task_id: &str) -> String {
-    match db.get_work_item(task_id).unwrap() {
-        boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => task.status.to_string(),
-        item => panic!("expected a task, got {item:?}"),
-    }
-}
-
 /// Put an open-PR review cycle root in `in_review` on [`PR_URL`].
 fn bind_open_pr(db: &WorkDb, task_id: &str) {
     raw(db)

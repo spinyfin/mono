@@ -14,10 +14,7 @@
 
 use super::*;
 
-/// `work_attention_items.kind` filed when a primary execution's completion
-/// is refused because the PR it resolved to is already bound to another
-/// work item.
-pub const FOREIGN_PR_REFUSED_ATTENTION_KIND: &str = "foreign_pr_binding_refused";
+pub use boss_engine_storage_values::attention_kinds::FOREIGN_PR_REFUSED_ATTENTION_KIND;
 
 /// A PR this execution verified as its own that the engine nonetheless has
 /// bound to a different work item.

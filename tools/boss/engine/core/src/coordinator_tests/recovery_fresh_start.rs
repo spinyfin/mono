@@ -314,18 +314,30 @@ impl crate::host_adapter::HostAdapterProvider for ScratchHostProvider {
 
 #[tokio::test]
 async fn legacy_source_transport_is_not_queried() {
-    source_host_dispatch(false).await;
+    source_host_dispatch(false, false).await;
 }
 
 #[tokio::test]
 async fn full_remote_source_does_not_pin_dispatch_to_its_occupied_slot() {
-    source_host_dispatch(true).await;
+    source_host_dispatch(true, false).await;
 }
 
-async fn source_host_dispatch(full: bool) {
+#[tokio::test]
+async fn removed_legacy_source_host_does_not_park_dispatch() {
+    source_host_dispatch(false, true).await;
+}
+
+async fn source_host_dispatch(full: bool, missing: bool) {
     let dir = tempdir().unwrap();
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     seed_local_claude_driver(&db);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET autostart = 1, status = 'todo' WHERE id = ?1",
+            [&next.work_item_id],
+        )
+        .unwrap();
     db.add_host("destination", "user@destination", 2, &[]).unwrap();
     db.add_host("source", "user@source", 1, &[]).unwrap();
     for host in ["destination", "source"] {
@@ -353,7 +365,8 @@ async fn source_host_dispatch(full: bool) {
     let next = db.get_execution(&next.id).unwrap();
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let record = legacy_record(&repo.worker, &prior.id, "source").await.unwrap();
+    let source_host = if missing { "removed-source" } else { "source" };
+    let record = legacy_record(&repo.worker, &prior.id, source_host).await.unwrap();
     db.record_execution_bookmark(&record).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "intact source work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
@@ -384,8 +397,33 @@ async fn source_host_dispatch(full: bool) {
     assert_eq!(cube.lease_calls.lock().await.len(), 1);
     let next = db.get_execution(&next.id).unwrap();
     assert!(next.started_at.is_some());
+    assert_eq!(next.status, ExecutionStatus::Running);
     assert_eq!(next.pre_start_failure_count, 0);
+    // The source stays unavailable. A started execution must remain Running
+    // and active across later scheduler passes, and must not be failed.
+    for _ in 0..4 {
+        sleep(Duration::from_millis(10)).await;
+        coordinator.drain_ready_queue_for_test().await;
+        assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Running);
+        let conn = db.connect().unwrap();
+        let (status, failure): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, dispatch_failed_reason FROM tasks WHERE id = ?1",
+                [&next.work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(status, "active");
+        assert!(failure.is_none(), "{failure:?}");
+        // Autostart is single-shot: only a successful run may consume it.
+        let audit = db.list_task_field_audit(&next.work_item_id).unwrap();
+        let cleared = audit.iter().rfind(|row| row.property == "autostart").unwrap();
+        assert_eq!(cleared.basis, "start_execution_run_on_host_with_tmux_hosting");
+    }
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    // Preserved-tip recovery deliberately ignores legacy-only records, even
+    // when their host is unavailable; it neither consumes nor retires them.
     assert!(db.execution_bookmark_retired_reason(&prior.id).unwrap().is_none());
     for name in [legacy_head(&record), legacy_publication(&record)] {
         assert_eq!(commit(&repo.repo, &name), old);
@@ -660,11 +698,23 @@ async fn task_ignores_legacy_pointers_and_starts_from_main() {
 
 #[tokio::test]
 async fn stale_current_names_do_not_change_initialization_or_predecessor() {
+    initialize_with_stale_names(false).await;
+}
+
+#[tokio::test]
+async fn missing_baseline_falls_back_to_trunk_and_leaves_stale_names() {
+    initialize_with_stale_names(true).await;
+}
+
+async fn initialize_with_stale_names(missing_baseline: bool) {
     let dir = tempdir().unwrap();
     let (db, prior, next) = super::blocked_workspace::blocked_pair(&dir.path().join("boss.db"));
     let repo = JjRepo::new(dir.path());
     super::recovery::configure_recovery_origin(&repo.repo);
-    let source = legacy_record(&repo.worker, &prior.id, "local").await.unwrap();
+    let mut source = legacy_record(&repo.worker, &prior.id, "local").await.unwrap();
+    if missing_baseline {
+        source.base_commit = None;
+    }
     db.record_execution_bookmark(&source).unwrap();
     std::fs::write(repo.worker.join("work.txt"), "recovered work").unwrap();
     JjRepo::run(&repo.worker, &["status"]);
@@ -704,7 +754,8 @@ async fn stale_current_names_do_not_change_initialization_or_predecessor() {
             .is_empty()
     );
     assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-    assert_eq!(record.base_commit, source.base_commit);
+    let expected_floor = source.base_commit.unwrap_or_else(|| commit(&repo.repo, "main"));
+    assert_eq!(record.base_commit.as_deref(), Some(expected_floor.as_str()));
     assert!(repo.replacement.join("work.txt").exists());
 }
 

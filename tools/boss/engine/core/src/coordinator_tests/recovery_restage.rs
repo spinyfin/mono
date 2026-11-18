@@ -283,7 +283,11 @@ async fn read_only_review_ignores_a_damaged_predecessor_record() {
             unreadable.repo_path,
             "the retry record is untouched"
         );
-        db.delete_execution_bookmark_and_restore_report(&next.id).unwrap();
+        db.connect()
+            .unwrap()
+            .execute("DELETE FROM execution_bookmarks WHERE execution_id = ?1", [&next.id])
+            .unwrap();
+        db.delete_execution_restore_report(&next.id).unwrap();
     }
 }
 
