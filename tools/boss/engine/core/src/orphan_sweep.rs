@@ -467,19 +467,29 @@ async fn run_one_pass_filtered(
         // churning would surface neither condition. `Err` still fails
         // closed — an unreadable park state is not a licence to put a
         // second worker on the row.
-        let is_deliberately_parked = match work_db.dispatch_admission_facts(&work_item_id) {
-            Ok(facts) => facts.deliberate_parked,
+        // One evaluation serves both this gate and the pause gate below
+        // (the park arrives as an informational blocker on the shared
+        // evaluator), so the facts are read once per candidate per pass.
+        let admission = match coordinator.evaluate_dispatch_admission(&work_item_id).await {
+            Ok(admission) => admission,
             Err(err) => {
+                // Fail loud and hold. An admission evaluation that cannot
+                // be computed is not a licence to redispatch — an unreadable
+                // park or pause state is how the row would get revived.
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     ?err,
-                    "orphan sweep: skipping redispatch — could not read the row's park state; \
+                    "orphan sweep: skipping redispatch — could not evaluate dispatch admission; \
                      refusing to redispatch on an unknown admission state",
                 );
                 outcome.admission_unknown_skipped += 1;
                 continue;
             }
         };
+        let is_deliberately_parked = admission
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == boss_protocol::ADMISSION_BLOCKER_DELIBERATE_PARKED);
 
         if is_deliberately_parked {
             tracing::info!(
@@ -882,22 +892,6 @@ async fn run_one_pass_filtered(
         // logging; it just does not mint an execution while dispatch is
         // paused. Orphan recovery resumes on the first pass after the
         // pause lifts.
-        let admission = match coordinator.evaluate_dispatch_admission(&work_item_id).await {
-            Ok(admission) => admission,
-            Err(err) => {
-                // Fail loud and hold. An admission evaluation that cannot
-                // be computed is not a licence to redispatch — that is
-                // exactly how the row would get revived through a pause.
-                tracing::warn!(
-                    work_item_id = %work_item_id,
-                    ?err,
-                    "orphan sweep: skipping redispatch — could not evaluate dispatch admission; \
-                     refusing to redispatch on an unknown pause state",
-                );
-                outcome.admission_unknown_skipped += 1;
-                continue;
-            }
-        };
         if admission.pause.active {
             tracing::info!(
                 work_item_id = %work_item_id,

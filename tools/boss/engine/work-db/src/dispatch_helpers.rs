@@ -1781,7 +1781,12 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // there is nothing here to bypass. If the fresh attempt fails again,
         // the next sweep pass re-files the attention.
         resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
-        super::dispatch_admission::resolve_deliberate_park_attention(conn, &work_item_id)?;
+        // Only an explicit start (`bossctl work start`, kanban drag-to-Doing)
+        // acknowledges a deliberate park. The recovery sweeps also reach this
+        // function and must never clear a park they did not evaluate.
+        if explicit_start {
+            super::dispatch_admission::resolve_deliberate_park_attention(conn, &work_item_id)?;
+        }
 
         // An explicit retry acknowledges the failed attempt. Its run history
         // retains the explanation, while the new attempt starts without a stale

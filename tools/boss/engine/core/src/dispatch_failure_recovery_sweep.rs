@@ -267,6 +267,19 @@ pub async fn run_one_pass(
             continue;
         }
 
+        match work_db.is_deliberately_parked(&work_item_id) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    ?err,
+                    "dispatch-failure recovery sweep: cannot read park state; skipping item",
+                );
+                continue;
+            }
+        }
+
         let is_live = |exec_id: &str| claimed.contains(exec_id);
         let new_execution = match work_db.reenable_and_request_execution_with_live_check(
             &work_item_id,
@@ -604,6 +617,66 @@ mod tests {
             task.dispatch_failed_reason.as_deref(),
             Some(crate::work::DELIBERATE_PARK_DISPATCH_FAILED_REASON),
         );
+    }
+
+    /// A blocked declaration parks the row even when no dispatch-failure stamp
+    /// names it: neither the sweep nor the transactional re-enable may mint
+    /// over it, and neither may resolve the park attention.
+    #[tokio::test]
+    async fn blocked_declaration_survives_recovery_sweep() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_bounced_chore(&db, &product_id);
+        make_failure_old(&db, &work_item_id, DISPATCH_FAILURE_RECOVERY_MIN_AGE_SECS + 60);
+        let execution = db
+            .create_execution(
+                crate::work::CreateExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Abandoned)
+                    .build(),
+            )
+            .unwrap();
+        let attention = db
+            .create_attention_item(boss_protocol::CreateAttentionItemInput {
+                execution_id: Some(execution.id.clone()),
+                work_item_id: None,
+                kind: crate::completion::NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
+                status: None,
+                title: "Parked".to_owned(),
+                body_markdown: "Needs a decision".to_owned(),
+                resolved_at: None,
+            })
+            .unwrap();
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(db.as_ref(), coordinator, sink.as_ref()).await;
+        assert_eq!(outcome.redispatched, 0);
+        assert!(sink.events().await.is_empty());
+        assert!(
+            db.reenable_and_request_execution_with_live_check(
+                &work_item_id,
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+                |_| false,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(db.is_deliberately_parked(&work_item_id).unwrap());
+        assert_eq!(db.list_executions(Some(&work_item_id)).unwrap().len(), 1);
+        let still_open: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM work_attention_items WHERE id = ?1 AND status = 'open'",
+                [&attention.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_open, 1, "an automatic sweep must not resolve the park attention");
     }
 
     /// If `request_execution` fails *after* autostart has been

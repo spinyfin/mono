@@ -705,6 +705,44 @@ fn rescan_does_not_remint_a_blocked_declaration() {
     assert_eq!(executions[0].id, exec_id);
 }
 
+/// An automatically minted review run becomes the work item's newest
+/// execution but cannot carry a run-done declaration; it must not clear the
+/// park the implementation run declared.
+#[test]
+fn rescan_preserves_park_after_automatic_review() {
+    let db = WorkDb::open(temp_db_path("park-after-review")).unwrap();
+    let (chore_id, blocked_id) = parked_active_chore(&db, "after-review");
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Completed)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = '0' WHERE id = ?1",
+            [&blocked_id],
+        )
+        .unwrap();
+    let newest: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM work_executions WHERE work_item_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            [&chore_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(newest, review.id);
+    assert!(db.dispatch_admission_facts(&chore_id).unwrap().deliberate_parked);
+    assert!(!db.rescan_active_dispatch().unwrap().contains(&chore_id));
+    assert_eq!(db.list_executions(Some(&chore_id)).unwrap().len(), 2);
+}
+
 /// Startup `reconcile_active_dispatch` ignores `autostart` so it can
 /// rehydrate rows whose worker died across a restart. It must still
 /// refuse a deliberate park — only the park signal, not the single-shot
@@ -969,8 +1007,13 @@ fn explicit_start_resolves_execution_scoped_park_attention_synchronously() {
         .unwrap();
     }
     assert!(db.dispatch_admission_facts(&chore_id).unwrap().deliberate_parked);
-    db.request_execution(RequestExecutionInput::builder().work_item_id(chore_id).build())
-        .unwrap();
+    db.request_execution(
+        RequestExecutionInput::builder()
+            .work_item_id(chore_id)
+            .explicit_start(true)
+            .build(),
+    )
+    .unwrap();
     let unresolved: i64 = db.connect().unwrap().query_row(
         "SELECT COUNT(*) FROM work_attention_items WHERE execution_id = ?1 AND (status != 'resolved' OR resolved_at IS NULL)",
         [&execution_id], |row| row.get(0),
