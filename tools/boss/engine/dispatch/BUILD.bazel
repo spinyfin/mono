@@ -14,6 +14,7 @@ DISPATCH_DEPS = [
     "//tools/boss/engine/host-execution",
     "//tools/boss/engine/metrics",
     "//tools/boss/engine/recovery",
+    "//tools/boss/engine/startup-policy",
     "//tools/boss/engine/storage-values",
     "//tools/boss/engine/task-scope",
     "//tools/boss/engine/utils",

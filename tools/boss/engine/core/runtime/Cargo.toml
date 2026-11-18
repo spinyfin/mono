@@ -78,6 +78,7 @@ boss-engine-recovery = { path = "../../recovery" }
 boss-protocol = { path = "../../../protocol" }
 boss-protocol-spoke = { path = "../../../protocol-spoke" }
 boss-ssh-transport = { path = "../../ssh-transport" }
+boss-startup-policy = { path = "../../startup-policy" }
 boss-timer-wheel = { path = "../../timer-wheel" }
 boss-engine-day-rotated-log = { path = "../../day-rotated-log" }
 boss-event-bus = { path = "../../event-bus" }

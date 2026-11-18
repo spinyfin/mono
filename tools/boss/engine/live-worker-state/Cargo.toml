@@ -14,6 +14,7 @@ boss-engine-driver = { path = "../driver" }
 boss-engine-storage-values = { path = "../storage-values" }
 boss-engine-utils = { path = "../utils" }
 boss-execution-contracts = { path = "../execution-contracts" }
+boss-startup-policy = { path = "../startup-policy" }
 boss-protocol = { path = "../../protocol" }
 boss-work-db = { path = "../work-db" }
 tracing = { workspace = true }

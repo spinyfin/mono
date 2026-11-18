@@ -155,6 +155,7 @@ fn every_waiting_state_yields_a_named_reason() {
         DISPATCH_WAIT_REASON_CHAIN_SERIALIZED,
         DISPATCH_WAIT_REASON_CHAIN_SERIALIZED_REVIEW_HELD,
         DISPATCH_WAIT_REASON_INTERACTIVE_CAP,
+        DISPATCH_WAIT_REASON_RESUME_STARTUP_PENDING,
     ] {
         db.set_dispatch_wait_reason(&execution.id, hold).unwrap();
         covered.insert(assert_named(hold, &wait_of(&db, pid, &chore.id), hold));

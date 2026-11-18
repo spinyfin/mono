@@ -179,6 +179,7 @@ def runtime_libraries():
             "//tools/boss/engine/review-guide",
             "//tools/boss/engine/spoke-hub",
             "//tools/boss/engine/ssh-transport",
+            "//tools/boss/engine/startup-policy",
             "//tools/boss/engine/stdout-progress",
             "//tools/boss/engine/storage-values",
             "//tools/boss/engine/structured-output",

@@ -2086,6 +2086,26 @@ final class WorkCardSnapshotTests: XCTestCase {
         )
     }
 
+    func testLiveStatusResumeStartupPendingWaitReason() {
+        let task = Self.makeTask(status: "todo", autostart: true)
+        let runtime = WorkTaskRuntime(
+            workItemID: task.id,
+            executionStatus: "ready",
+            runStatus: nil,
+            executionID: "exec-1",
+            dispatchRetryAt: nil,
+            dispatchWaitReason: "resume_startup_pending",
+            dispatchWaitSince: nil,
+            dispatchWaitLabel: "pacing startup after resume"
+        )
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: task, column: .doing, runtime: runtime, liveState: nil
+            ),
+            "Queued — pacing startup after resume"
+        )
+    }
+
     func testLiveStatusPrefersRecoveryOverLiveStatus() {
         let task = Self.makeTask(status: "active")
         let live = Self.makeLiveState(

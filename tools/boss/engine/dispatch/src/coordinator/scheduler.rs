@@ -1090,6 +1090,12 @@ impl ExecutionCoordinator {
                 return DrainOutcome::QueueEmpty;
             }
         };
+        if !paused {
+            self.resume_admission
+                .lock()
+                .unwrap()
+                .observe_ready(executions.iter().map(|execution| execution.id.clone()));
+        }
         // Rows whose work item is at the human-only `critical` priority.
         // `list_ready_executions` already sorted them first; this set is
         // what exempts them from the operator-pause gate and the
@@ -1316,6 +1322,9 @@ impl ExecutionCoordinator {
         };
 
         for execution in executions {
+            if !paused && self.resume_startup_held(&execution).await {
+                continue;
+            }
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
             // Classify the target pool. Review is checked first (and excludes
             // the others) so a reviewer of an automation-produced task is
@@ -2083,6 +2092,9 @@ impl ExecutionCoordinator {
         // themselves is unchanged — they are simply all ranked below all
         // mainline work.
         for execution in spill_candidates {
+            if !paused && self.resume_startup_held(&execution).await {
+                continue;
+            }
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
             let Some(lease_attempt) = self
                 .begin_repo_lease_or_wait(&execution, &mut changed_waits, None)
@@ -2736,6 +2748,10 @@ impl ExecutionCoordinator {
         };
         let coordinator = Arc::clone(self);
         let dispatch_slots = Arc::clone(&self.dispatch_slots);
+        self.resume_admission
+            .lock()
+            .unwrap()
+            .admitted(&execution.id, std::time::Instant::now());
         let execution = execution.clone();
         let worker_id = worker_id.to_string();
         boss_task_scope::spawn(async move {

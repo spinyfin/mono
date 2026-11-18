@@ -213,6 +213,12 @@ pub trait LiveWorkerLiveness: Send + Sync {
     fn release_persona_for_run(&self, run_id: &str);
     fn last_event_at_for_run(&self, run_id: &str) -> Option<String>;
     fn current_tool_for_run(&self, run_id: &str) -> Option<String>;
+    /// True while any claimed run still lacks driver-start proof, including
+    /// the window after a pool claim and before live-slot registration.
+    fn startup_pending(&self, claimed_runs: &std::collections::HashSet<String>) -> bool {
+        let _ = claimed_runs;
+        false
+    }
 }
 
 /// Engine lifecycle operations consumed by the dispatch coordinator (lease

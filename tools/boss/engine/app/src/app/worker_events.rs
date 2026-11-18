@@ -1,7 +1,4 @@
-//! Worker hook-event dispatch functions.
-//!
-//! Split out of `app.rs`; all `dispatch_*` functions that react to worker
-//! hook events live here. Pure structural move — no behavioural change.
+//! Worker hook-event dispatch functions split out of `app.rs`.
 
 use super::transcript_persist::persist_transcript_and_capture_cost;
 pub(super) use super::transcript_persist::transcript_offset_for_run;
@@ -10,20 +7,22 @@ use boss_engine_driver::{AgentDriver, Capability, ClaudeDriver};
 use boss_engine_live_worker_state::{ApplyEventOutcome, DriverSignalKind, HookOrigin};
 
 impl ServerState {
-    /// Stamp a driver-originated signal and, if this run is the in-flight
-    /// spawn-capability recovery canary, auto-resume a Breaker-origin pause.
+    /// First live-slot driver signal resets the breaker; later hooks do not.
     pub(super) async fn record_driver_signal(&self, run_id: &str, kind: DriverSignalKind) -> Option<u8> {
+        let already = self.live_worker_states.has_driver_signal_for_run(run_id);
         let slot = self.live_worker_states.record_driver_signal(run_id, kind);
-        if slot.is_some() {
-            boss_engine_runtime::spawn_health::maybe_resume_after_canary_driver_signal(
-                &self.spawn_health,
-                &self.work_db,
-                &self.execution_coordinator,
-                self.dispatch_events.as_ref(),
-                run_id,
-            )
-            .await;
+        if already || slot.is_none() {
+            return slot;
         }
+        self.spawn_health.record_success();
+        boss_engine_runtime::spawn_health::maybe_resume_after_canary_driver_signal(
+            &self.spawn_health,
+            &self.work_db,
+            &self.execution_coordinator,
+            self.dispatch_events.as_ref(),
+            run_id,
+        )
+        .await;
         slot
     }
 
