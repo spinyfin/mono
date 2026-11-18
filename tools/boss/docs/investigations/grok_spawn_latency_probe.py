@@ -19,8 +19,23 @@ timestamp. It stops the pane as soon as `UserPromptSubmit` fires, so the brief
 is accepted and no turn runs to completion. Seconds are measured from creating
 the tmux session.
 
-Nothing here talks to a Boss engine. It uses the operator's Grok login the way
-a worker does: through GROK_AUTH_PATH, never by copying the credential.
+`setup` times the local steps around those subprocesses: writing a Grok home
+(config, trust file, hook file, delegated paths), creating a detached tmux
+session, and the `python3` check the launcher needs. Prompt composition and the
+pane title are engine code with no standalone entry point and are not timed.
+
+The CONFIG_TOML, CANARY_HOOKS, HOOK_EVENTS, LAUNCHER_CONFIG and trust_variants
+definitions are a snapshot copied by hand from `engine/driver/src/grok/home.rs`,
+`hooks.rs` and `grok.rs` as of Grok CLI 1.0.70 (2026-11-18). Nothing ties them
+to the source: re-sync them before reusing this probe on a later revision.
+
+`preflight` runs each command directly and sums `subprocess.run` durations. It
+does not run the engine's own preflight, so it excludes the wait for a live
+OAuth refresh lock (`engine/driver/src/grok/environment.rs`) and the reprobe
+after a credential refresh.
+
+Nothing here talks to a Boss engine. It uses the host's shared Grok login
+through GROK_AUTH_PATH, without copying the credential.
 """
 
 import argparse
@@ -261,6 +276,29 @@ def tui_once(index, workspace, scratch, brief_bytes, holds, max_wait):
     return [record]
 
 
+def setup_once(index, workspace, scratch):
+    container = scratch / f"setup-{index:03d}-{uuid.uuid4().hex[:6]}"
+    began = time.monotonic()
+    provision(container, workspace)
+    home_seconds = time.monotonic() - began
+    name = f"probe-{uuid.uuid4().hex[:8]}"
+    began = time.monotonic()
+    subprocess.run(["tmux", "-L", name, "new-session", "-d", "-s", name, "-c", str(workspace), "sleep 30"],
+                   check=True, capture_output=True)
+    pane_seconds = time.monotonic() - began
+    subprocess.run(["tmux", "-L", name, "kill-server"], capture_output=True)
+    Path(os.environ.get("TMUX_TMPDIR", "/tmp"), f"tmux-{os.getuid()}", name).unlink(missing_ok=True)
+    began = time.monotonic()
+    subprocess.run(["python3", "-c", "import json, sys"], check=True, capture_output=True)
+    python_seconds = time.monotonic() - began
+    shutil.rmtree(container, ignore_errors=True)
+    return [
+        {"run": index, "step": "grok home files and delegates", "seconds": round(home_seconds, 4)},
+        {"run": index, "step": "tmux new-session -d", "seconds": round(pane_seconds, 4)},
+        {"run": index, "step": "python3 import check", "seconds": round(python_seconds, 4)},
+    ]
+
+
 def summarise(title, series):
     print(f"\n{title}")
     print(f"{'':34} {'n':>3} {'min':>7} {'median':>7} {'p90':>7} {'max':>7}")
@@ -275,7 +313,7 @@ def summarise(title, series):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", choices=["preflight", "tui"])
+    parser.add_argument("mode", choices=["preflight", "tui", "setup"])
     parser.add_argument("workspace", type=Path)
     parser.add_argument("scratch", type=Path)
     parser.add_argument("runs", type=int)
@@ -291,6 +329,8 @@ def main():
     def once(index):
         if args.mode == "preflight":
             return preflight_once(index, workspace, scratch)
+        if args.mode == "setup":
+            return setup_once(index, workspace, scratch)
         return tui_once(index, workspace, scratch, args.brief_bytes, holds, args.max_wait)
 
     records = []
@@ -309,6 +349,10 @@ def main():
         summarise(f"Grok spawn-preparation subprocesses, seconds ({args.parallel} at a time)",
                   {step: [r["seconds"] for r in records if r["step"] == step] for step in steps})
         print(f"\nchecks that did not pass: {sum(1 for r in records if not r['ok'])}")
+    elif args.mode == "setup":
+        steps = dict.fromkeys(record["step"] for record in records)
+        summarise("Local setup steps, seconds",
+                  {step: [r["seconds"] for r in records if r["step"] == step] for step in steps})
     else:
         accepted = [r for r in records if r["outcome"] == "prompt_accepted"]
         summarise(f"Grok pane start to first accepted prompt, seconds ({args.parallel} at a time)", {

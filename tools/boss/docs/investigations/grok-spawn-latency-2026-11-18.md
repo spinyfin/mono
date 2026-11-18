@@ -1,6 +1,8 @@
 # Grok spawn latency: where the time before `pane_spawned` goes
 
-A September sample showed Grok workers taking about 17 s longer than Claude or Codex between `run_started` and `pane_spawned`. On current `main` that offset does not reproduce. The work only Grok does before its pane exists took under 5 s in every one of 138 local runs, and its CLI accepted a brief under 5 s after starting in every one of 84. The one step able to cost ten seconds or more in September was removed by mono#3428.
+A September sample showed Grok workers taking about 17 s longer than Claude or Codex between `run_started` and `pane_spawned`. On current `main` that offset does not reproduce. The seven commands Grok runs before its pane, timed directly, took under 5 s in all 138 local runs, and its CLI accepted a brief under 5 s after starting in all 84. The only candidate found for a ten-second cost on every spawn in September was the bare-name `cube` probe that mono#3428 removed, inferred from code history and not measured.
+
+The direct timings exclude the engine's refresh-lock wait and credential reprobe, which were not measured.
 
 Source paths below are relative to `tools/boss/`. Everything under "Measured" was timed for this write-up on one macOS host on 2026-11-18. The section on the September cost is reasoning from code history and says so.
 
@@ -36,7 +38,7 @@ The comparable costs for the other drivers are a `python3` import check that is 
 
 ## Measured
 
-Host: 12-core macOS laptop running other workers' builds, whose load swung widely during the day. Each batch below gives the 1-minute load average read just before and after it. Grok CLI 1.0.70, Claude Code 2.1.327, Codex CLI 0.169.0. Each run used a fresh `GROK_HOME` and process `HOME` with the engine's environment and delegates, the shared `GROK_AUTH_PATH`, and a leased checkout of this repository as the working directory. `grok_spawn_latency_probe.py` beside this file is the harness. The first batch of each kind was run before it was consolidated into that one script, and the rest with it as committed.
+Host: 12-core macOS laptop running other workers' builds, whose load swung widely during the day. Each batch below gives the 1-minute load average read just before and after it. Grok CLI 1.0.70, Claude Code 2.1.327, Codex CLI 0.169.0. The `preflight` figures are direct `subprocess.run` durations of the seven commands in the engine's order and environment. They do not exercise the engine's own preflight, so they exclude its wait for a live refresh lock and its reprobe after a credential refresh (see "What can still stretch a Grok spawn"). Each run used a fresh `GROK_HOME` and process `HOME` with the engine's environment and delegates, the shared `GROK_AUTH_PATH`, and a leased checkout of this repository as the working directory. `grok_spawn_latency_probe.py` beside this file is the harness. The first batch of each kind was run before it was consolidated into that one script, and the rest with it as committed.
 
 ### Grok's seven subprocesses
 
@@ -101,7 +103,19 @@ A `SessionStart` hook held open for 3 s did not delay the composer or the first 
 
 These were not re-measured as a population. The launcher log of the Claude worker that produced this write-up shows the composer ready 0.59 s after the launcher started and Return written 0.11 s later (one run). `docs/worker-prompt-delivery.md` records 0.5 to 1.9 s to composer ready and 0.6 to 4.9 s to Return over 71 Claude runs at normal load. The `python3` check took a median 0.050 s and `codex debug models --bundled` a median 0.028 s (20 runs each).
 
-A Codex pane was not started. Its per-run home holds a snapshot of the operator's login, and a token refreshed inside a discarded probe home would not be adopted back.
+A Codex pane was not started. Its per-run home holds a snapshot of the machine's Codex login, and a token refreshed inside a discarded probe home would not be adopted back.
+
+### Local steps around the subprocesses
+
+`grok_spawn_latency_probe.py setup`, 30 runs one at a time, load average 41 to 56 (seconds):
+
+| Step                                                                              | min   | median | p90   | max   |
+| --------------------------------------------------------------------------------- | ----- | ------ | ----- | ----- |
+| Grok-only: write the Grok home (config, trust file, hook file) and delegate paths | 0.002 | 0.003  | 0.007 | 0.012 |
+| Common: `tmux new-session -d`                                                     | 0.022 | 0.033  | 0.059 | 0.099 |
+| Common: `python3` import check (first run in an engine process only)              | 0.025 | 0.037  | 0.058 | 0.102 |
+
+The Grok-only file writes are about 3 ms, so they do not change the comparison. The probe's copy of the Grok home writer stands in for the engine's `write_permission_config` and hook wiring; the engine functions themselves were not run. Prompt composition, pane title and the Claude and Codex permission and hook writes have no standalone entry point and were not timed. The statement below that these are the same for every driver is an assumption from the code, not a measurement, until `compose_ms`, `permission_config_ms` and `title_ms` are read from `pane spawned for execution` lines in production.
 
 ### Older Grok CLIs
 
@@ -109,7 +123,7 @@ Two earlier builds are still on the host. `grok inspect --json` plus `grok model
 
 ## Is the effect real today
 
-Not at the size reported. At the host's calmer moments Grok pays 1.4 to 1.8 s before its pane that the other drivers do not, and reaches an accepted prompt about half a second later than Claude does once the pane is up. That is roughly 2 s more than Claude per spawn, in one group.
+Not at the size reported. At the host's calmer moments Grok pays 1.4 to 1.8 s before its pane that the other drivers do not, and reaches an accepted prompt about half a second later than Claude does once the pane is up. That is roughly 2 s more than Claude per spawn, in one group, assuming the engine's own steps (composition, permission config, title, pane creation) cost the same for both drivers; that equality is assumed, not timed.
 
 Host load does not turn that into 17 s either. With the 1-minute load average between 165 and 235 on 12 cores, the pre-pane total had a median of 3.0 s and the pane reached an accepted prompt in a median 2.5 s. The worst figures seen in any condition were 4.8 s before the pane and 4.7 s after it.
 
@@ -143,8 +157,8 @@ The reason the question was raised has also changed. Grok was the third member o
 
 ## What can still stretch a Grok spawn
 
-- **Token refresh.** When the shared OAuth token has expired, `grok models` refreshes it and is run a second time (`engine/driver/src/grok/preflight.rs:320`). Not observed during these runs.
-- **A refresh lock held by a live process.** The Grok CLI leaves `auth.json.lock` in place after a refresh: on this host it was still there, naming an exited process, more than an hour after the refresh that wrote it. If the process that refreshed is still running, such as a long-lived worker pane, a preflight starting within 30 s waits until the lock is 30 s old (`engine/driver/src/grok/environment.rs:243`). Not observed during these runs. It is now logged when it lasts 250 ms or more.
+- **Token refresh.** When the shared OAuth token has expired, `grok models` refreshes it and is run a second time (`engine/driver/src/grok/preflight.rs:320`). Not exercised by the probe, which calls `grok models` directly and does not reprobe.
+- **A refresh lock held by a live process.** The Grok CLI leaves `auth.json.lock` in place after a refresh: on this host it was still there, naming an exited process, more than an hour after the refresh that wrote it. If the process that refreshed is still running, such as a long-lived worker pane, a preflight starting within 30 s waits until the lock is 30 s old (`engine/driver/src/grok/environment.rs:243`). Not measured: the probe does not read, wait on or reproduce the lock, so these runs say nothing about the fresh-live, stale or absent cases. It is now logged when it lasts 250 ms or more.
 - **The bounds.** 30 s for `grok models` and 60 s for each other command (`engine/driver/src/grok/preflight.rs:23`). A hung tool fails the spawn at its bound.
 - **Host load.** Heavy load roughly doubled every figure here. Seven process starts in sequence are more exposed to it than the file writes the other drivers do.
 
@@ -157,7 +171,7 @@ The reason the question was raised has also changed. Grok was the third member o
 | End the refresh-lock wait once `auth.json` is newer than the lock          | up to 30 s, only on spawns that hit a live fresh lock | Depends on the CLI writing the lock before the credential, which would need characterising first                                           |
 | Leave it as it is                                                          | nothing                                               | Grok spawns stay about 2 s slower than Claude spawns                                                                                       |
 
-None of these was made. The measured cost does not justify weakening a fail-fast check, and the lock wait has not been seen to fire.
+None of these was made. The measured cost does not justify weakening a fail-fast check, and the lock wait was not measured by the probe.
 
 ## Reading a spawn's timing from the engine log
 
@@ -179,7 +193,8 @@ The engine log now carries enough to attribute a slow spawn without an export. F
 
 - The production window was not re-measured. To confirm these figures in production, compare `provision_ms` and `pre_pane_ms` by `driver` across `pane spawned for execution` lines, and the Grok step lines, for spawns made after this logging is deployed.
 - The September window can only be re-read as `run_started` to `pane_spawned` totals. Those can confirm the size of the offset over more spawns, but no retained record splits it by step, so they cannot confirm its cause.
-- The engine's own steps (prompt composition, pane title, pane creation, hook ingest) were not timed here. They are common to all drivers and are now reported per spawn.
+- The engine's prompt composition, pane title and hook ingest were not timed here, and the Claude and Codex permission-config writes were not either. Equality across drivers is assumed from the code and unconfirmed until the new per-spawn fields are read in production. Only Grok's home writes, `tmux new-session` and the `python3` check were timed (above).
+- The seven-command totals exclude the engine's refresh-lock wait and credential reprobe. "Only candidate that would cost ten seconds on every spawn" refers to a cost present on every spawn; the lock wait and a token refresh can also cost that long on the spawns they hit.
 - The repobin shim itself was not run, because the worker launch guard refuses it. The 11.3 s figure is the Bazel build that shim performs, run directly.
 - All timings are from one host and one day.
 
@@ -189,6 +204,7 @@ The engine log now carries enough to attribute a slow spawn without an export. F
 python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py preflight <workspace> <scratch-dir> 30
 python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py preflight <workspace> <scratch-dir> 30 --parallel 3
 python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py tui <workspace> <scratch-dir> 15
+python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py setup <workspace> <scratch-dir> 30
 python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py tui <workspace> <scratch-dir> 4 --hold SessionStart:3
 ```
 
