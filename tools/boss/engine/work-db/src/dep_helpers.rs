@@ -482,10 +482,14 @@ pub(crate) fn maybe_engine_block_dependent_as_actor(
         return Ok(None);
     };
     // A fresh gate invalidates any answered-waiting marker naming earlier ones.
-    if dependent_id.starts_with("task_") {
-        super::prerequisite_question::clear_answered_waiting(conn, dependent_id)?;
-    }
+    // An answered question stays answered: restamp the marker once the row is
+    // blocked so it names the current gates.
+    let was_answered_waiting =
+        dependent_id.starts_with("task_") && super::prerequisite_question::clear_answered_waiting(conn, dependent_id)?;
     if matches!(current.as_str(), "blocked" | "done" | "archived") {
+        if was_answered_waiting {
+            super::prerequisite_question::stamp_answered_waiting(conn, dependent_id)?;
+        }
         return Ok(None);
     }
     if dependent_id.starts_with("proj_") {
@@ -513,6 +517,9 @@ pub(crate) fn maybe_engine_block_dependent_as_actor(
              WHERE id = ?1 AND status = 'blocked' AND deleted_at IS NULL",
             [dependent_id],
         )?;
+        if was_answered_waiting {
+            super::prerequisite_question::stamp_answered_waiting(conn, dependent_id)?;
+        }
         stage_task_board_change(pending, conn, dependent_id)?;
         // Invariant: a `blocked` work item must never have a live
         // execution. If a worker is actively running this dependent —

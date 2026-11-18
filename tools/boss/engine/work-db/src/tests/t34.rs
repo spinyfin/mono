@@ -698,7 +698,13 @@ fn answering_a_gated_revision_records_the_answer_and_waits_for_its_gate() {
                 let conn = db.connect().unwrap();
                 maybe_engine_block_dependent(&mut pending, &conn, &asking, &now_string()).unwrap();
             }
-            assert_eq!(blocked_fields(&db, &asking).1, None, "stale marker must be gone");
+            let other_name = match db.get_work_item(&other).unwrap() {
+                WorkItem::Task(t) | WorkItem::Chore(t) => t.name,
+                other => panic!("expected a task, got {other:?}"),
+            };
+            let detail = blocked_fields(&db, &asking).1.expect("answered stays answered");
+            assert!(!detail.contains("Old gate"), "stale gate name must be gone: {detail}");
+            assert_eq!(detail, format!("Answered · waits for {other_name}"));
         }
     }
 }

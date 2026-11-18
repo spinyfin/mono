@@ -407,7 +407,7 @@ const ANSWERED_WAITING_DETAIL_PREFIX: &str = "Answered · waits for ";
 /// it is answered and waiting, naming the prerequisites. No-op unless the task
 /// is parked `blocked` / `dependency`. The marker is cleared when the dependency
 /// block lifts or the task is re-blocked (see [`clear_answered_waiting`]).
-pub(super) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result<()> {
+pub(crate) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result<()> {
     let names = deps::gating_prereqs_for(conn, task_id)?
         .iter()
         .map(|id| Ok(query_task(conn, id)?.map_or_else(|| id.clone(), |prerequisite| prerequisite.name)))
@@ -434,66 +434,74 @@ pub(super) fn continue_after_answer(
     attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<bool> {
     let actor = attribution.actor;
-    // Recording the answer must not depend on starting the task. Leave a
-    // schedulable continuation first (the asking run has ended, and nothing
-    // else mints a replacement after a terminal run); the scheduler admits it
-    // under the normal pause and capacity rules.
+    // Recording the answer must not depend on starting the task, so the
+    // explicit start is a best-effort step under a savepoint: a refusal
+    // (quarantine, parked row) rolls back only the start. It runs first: for a
+    // revision whose spawning attempt has retired, the start reopens that
+    // attempt, whereas reconciling first would settle the row blocked and
+    // release its same-chain dependents before the reopen.
     let task = query_task(tx, &task.id).require("task", &task.id)?;
+    if !suppress_start {
+        let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
+        tx.execute_batch("SAVEPOINT answer_explicit_start")?;
+        let started = request_execution_in_tx_with_live_check(
+            pending,
+            tx,
+            RequestExecutionInput::builder()
+                .work_item_id(&task.id)
+                .maybe_preferred_workspace_id(asking.preferred_workspace_id)
+                .entry_point(boss_protocol::DispatchAdmissionEntryPoint::OperatorAnswer)
+                .explicit_start(true)
+                .audit_actor(actor)
+                .maybe_audit_basis(attribution.provenance.map(str::to_owned))
+                .build(),
+            // Match request_execution's conservative behavior when
+            // no live-worker oracle is supplied.
+            |_| true,
+        );
+        match started {
+            Ok(_) => {
+                tx.execute_batch("RELEASE answer_explicit_start")?;
+                return Ok(true);
+            }
+            Err(error) => {
+                tx.execute_batch("ROLLBACK TO answer_explicit_start; RELEASE answer_explicit_start")?;
+                tracing::warn!(
+                    work_item_id = %task.id,
+                    %error,
+                    "answer recorded; explicit start refused, a queued continuation stays for the scheduler",
+                );
+            }
+        }
+    }
+    // No start happened (suppressed or refused): leave a schedulable
+    // continuation, since the asking run has ended and nothing else mints a
+    // replacement after a terminal run. The scheduler admits it under the
+    // normal pause and capacity rules.
     if task.kind == TaskKind::Revision {
-        reconcile_revision_execution(pending, tx, &mut ExecutionReconcileResult::default(), &task)?;
+        // A revision whose spawning attempt retired unsuccessfully is settled by
+        // the reconciler's retired-attempt gate (blocked, cascading to its
+        // dependents). Leave it `todo`: only an explicit start reopens the
+        // attempt, and settling it here would release dependents the gate
+        // should still hold.
+        if retired_spawning_attempt(tx, &task)?.is_none() {
+            reconcile_revision_execution(pending, tx, &mut ExecutionReconcileResult::default(), &task)?;
+        }
     } else {
         super::prerequisite_question::queue_ready_execution(tx, &task, question)?;
     }
-    if suppress_start {
-        // The caller asked for no explicit start.
-        return Ok(false);
-    }
-    // The explicit start is a best-effort step on top of the continuation: a
-    // refusal (quarantine, parked row) must not roll back the recorded answer,
-    // so it runs under a savepoint and the continuation stays queued.
-    let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
-    tx.execute_batch("SAVEPOINT answer_explicit_start")?;
-    let started = request_execution_in_tx_with_live_check(
-        pending,
-        tx,
-        RequestExecutionInput::builder()
-            .work_item_id(&task.id)
-            .maybe_preferred_workspace_id(asking.preferred_workspace_id)
-            .entry_point(boss_protocol::DispatchAdmissionEntryPoint::OperatorAnswer)
-            .explicit_start(true)
-            .audit_actor(actor)
-            .maybe_audit_basis(attribution.provenance.map(str::to_owned))
-            .build(),
-        // Match request_execution's conservative behavior when
-        // no live-worker oracle is supplied.
-        |_| true,
-    );
-    match started {
-        Ok(_) => {
-            tx.execute_batch("RELEASE answer_explicit_start")?;
-        }
-        Err(error) => {
-            tx.execute_batch("ROLLBACK TO answer_explicit_start; RELEASE answer_explicit_start")?;
-            tracing::warn!(
-                work_item_id = %task.id,
-                %error,
-                "answer recorded; explicit start refused, the queued continuation stays for the scheduler",
-            );
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(false)
 }
 
 /// Drop the answered-waiting marker from `task_id`'s `blocked_detail`, leaving
 /// any other detail alone. Called whenever the dependency block lifts or is
 /// re-applied so a later block never shows a stale prerequisite name.
-pub(crate) fn clear_answered_waiting(conn: &Connection, task_id: &str) -> Result<()> {
-    conn.execute(
+pub(crate) fn clear_answered_waiting(conn: &Connection, task_id: &str) -> Result<bool> {
+    let cleared = conn.execute(
         "UPDATE tasks SET blocked_detail = NULL WHERE id = ?1 AND blocked_detail LIKE ?2",
         params![task_id, format!("{ANSWERED_WAITING_DETAIL_PREFIX}%")],
     )?;
-    Ok(())
+    Ok(cleared > 0)
 }
 
 /// Leave a `waiting_dependency` execution behind for the parked task.
@@ -537,9 +545,12 @@ fn queue_continuation_execution(
         return Ok(());
     }
     let Some(repo_remote_url) = resolve_repo_for_work_item(conn, &task.id)? else {
-        // Same condition under which the reconciler refuses to mint; the
-        // sticky `repo_unresolved` attention it files surfaces the missing
-        // repository.
+        // No execution can be minted without a repository. File the sticky
+        // `repo_unresolved` attention directly (the reconciler would not: the
+        // asking run is terminal). Once the repository resolves, the
+        // reconciler sees the open attention and mints the continuation.
+        let label = repo_unresolved_kind_label(conn, &task.id)?;
+        record_repo_unresolved_attention(conn, &task.id, label)?;
         return Ok(());
     };
     if query_latest_execution_for_work_item(conn, &task.id)?.is_some_and(|execution| !execution.status.is_terminal()) {
