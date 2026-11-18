@@ -89,7 +89,7 @@ async fn stream_file_bytes(
     writer: tokio::io::DuplexStream,
     halt: watch::Receiver<StreamHalt>,
 ) -> Result<(), String> {
-    super::stream_file_bytes(
+    super::stream_file_bytes_with_test_hooks(
         prepared,
         candidate,
         0,
@@ -97,6 +97,9 @@ async fn stream_file_bytes(
         writer,
         halt,
         StreamTelemetry::default(),
+        Duration::from_millis(1),
+        |_| Ok(()),
+        |_| Ok(()),
     )
     .await
 }
@@ -121,6 +124,7 @@ where
         writer,
         halt,
         StreamTelemetry::default(),
+        Duration::from_millis(1),
         before_descriptor_read,
         after_rotation_validation,
     )
@@ -1338,6 +1342,7 @@ async fn idle_polls_publish_telemetry_without_revalidating_the_root() {
     crate::sweep_metrics::register_metrics(&registry);
     let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
     let (cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
+    let (completed_tx, mut completed_rx) = watch::channel(0);
     let tail = tokio::spawn(super::stream_file_bytes_with_test_hooks(
         fixture.prepared,
         fixture.candidate,
@@ -1345,21 +1350,34 @@ async fn idle_polls_publish_telemetry_without_revalidating_the_root() {
         Arc::new(Mutex::new(StreamFileMap::default())),
         writer,
         cancel_rx,
-        StreamTelemetry::new(registry.clone()),
+        StreamTelemetry {
+            registry: Some(registry.clone()),
+            completed_polls: Some(completed_tx),
+        },
+        Duration::from_millis(1),
         |_| Ok(()),
         |_| Ok(()),
     ));
     let mut observed = Vec::new();
     read_until_contains(&mut reader, &mut observed, b"initial-stream").await;
-    // Let the publishing iteration(s) drain, then measure a quiet window.
-    tokio::time::sleep(FILE_POLL * 4).await;
+    // Wait for publication and the first idle pass to finish recording metrics.
+    tokio::time::timeout(Duration::from_secs(10), completed_rx.wait_for(|count| *count >= 2))
+        .await
+        .unwrap()
+        .unwrap();
     let passes_before = registry.counter_value("agent_jsonl_stream.passes").unwrap();
     let revalidations_before = registry.counter_value("agent_jsonl_stream.root_revalidations").unwrap();
     assert!(
         revalidations_before > 0,
         "publishing iterations must revalidate the root before bytes go out"
     );
-    tokio::time::sleep(FILE_POLL * 8).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        completed_rx.wait_for(|count| *count >= passes_before + 3),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let passes_after = registry.counter_value("agent_jsonl_stream.passes").unwrap();
     let revalidations_after = registry.counter_value("agent_jsonl_stream.root_revalidations").unwrap();
     assert!(passes_after >= passes_before + 3, "{passes_before} -> {passes_after}");

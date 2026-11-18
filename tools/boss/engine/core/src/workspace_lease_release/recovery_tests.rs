@@ -278,7 +278,6 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
         )
         .unwrap();
         db.record_workspace_lease_generation(&execution.id, "lease", 1).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         JjRepo::run(&repo.worker, &["new", "root()", "-m", "Intervening holder"]);
         std::fs::write(repo.worker.join("theirs"), "released holder").unwrap();
         let intervening = JjRepo::run(&repo.worker, &["log", "--no-graph", "-r", "@", "-T", "commit_id"]);

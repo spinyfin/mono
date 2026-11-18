@@ -64,6 +64,34 @@ impl JjRepo {
         Self::from_template(Template::Colocated, root)
     }
 
+    /// Install colocated repository metadata while preserving existing fixture files.
+    pub fn colocated_into(workspace: &Path) {
+        assert!(!workspace.join(".jj").exists());
+        assert!(!workspace.join(".git").exists());
+        let source = Template::Colocated
+            .cell()
+            .get_or_init(|| Self::build_template(Template::Colocated));
+        for name in [".jj", ".git"] {
+            copy_dir(&source.join("shared").join(name), &workspace.join(name));
+        }
+        Self::rewrite_git_target(workspace);
+    }
+
+    fn rewrite_git_target(repo: &Path) {
+        let pointer = repo.join(".jj/repo/store/git_target");
+        let target = std::fs::read_to_string(&pointer).unwrap();
+        if Path::new(target.trim()).is_absolute() {
+            std::fs::write(
+                pointer,
+                std::fs::canonicalize(repo.join(".git"))
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
     /// [`JjRepo::new`] plus an `origin` remote that is the store's own git
     /// repository, with `main` exported to it. Fetching from it afterwards
     /// tracks `main@origin`.
@@ -85,18 +113,7 @@ impl JjRepo {
         }
         let layout = Self::layout(root);
         if matches!(template, Template::Colocated) {
-            let pointer = layout.repo.join(".jj/repo/store/git_target");
-            let target = std::fs::read_to_string(&pointer).unwrap();
-            if Path::new(target.trim()).is_absolute() {
-                std::fs::write(
-                    &pointer,
-                    std::fs::canonicalize(layout.repo.join(".git"))
-                        .unwrap()
-                        .as_os_str()
-                        .as_encoded_bytes(),
-                )
-                .unwrap();
-            }
+            Self::rewrite_git_target(&layout.repo);
         }
         let store = std::fs::canonicalize(layout.repo.join(".jj/repo")).expect("copied store exists");
         for workspace in [&layout.worker, &layout.replacement] {
@@ -248,6 +265,30 @@ mod tests {
         JjRepo::snapshot(&a.worker);
         assert!(JjRepo::run(&a.repo, &["file", "list", "-r", "worker@"]).contains("only-a.txt"));
         assert!(!JjRepo::run(&b.repo, &["file", "list", "-r", "worker@"]).contains("only-a.txt"));
+    }
+
+    #[test]
+    fn colocated_copy_preserves_existing_files_and_uses_its_own_git_store() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("existing.txt"), "fixture contents").unwrap();
+        JjRepo::colocated_into(first.path());
+        JjRepo::colocated_into(second.path());
+        assert_eq!(
+            std::fs::read_to_string(first.path().join("existing.txt")).unwrap(),
+            "fixture contents"
+        );
+        for workspace in [first.path(), second.path()] {
+            let pointer = std::fs::read_to_string(workspace.join(".jj/repo/store/git_target")).unwrap();
+            let target = workspace.join(".jj/repo/store").join(pointer.trim());
+            assert_eq!(
+                target.canonicalize().unwrap(),
+                workspace.join(".git").canonicalize().unwrap()
+            );
+        }
+        JjRepo::snapshot(first.path());
+        assert!(JjRepo::run(first.path(), &["file", "list"]).contains("existing.txt"));
+        assert!(!JjRepo::run(second.path(), &["file", "list"]).contains("existing.txt"));
     }
 
     #[test]
