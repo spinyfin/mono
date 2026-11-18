@@ -619,6 +619,48 @@ fn reviewer_denies_alias_mapfile_and_compgen_callbacks() {
 }
 
 #[test]
+fn dynamic_execution_is_denied_without_enumerating_spellings() {
+    for kind in [WorkerKind::Standard, WorkerKind::Reviewer] {
+        let fx = Fixture::new("run-dynamic-fail-closed");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+        });
+        // Harmless startup-file fixture: it is never executed because the guard denies first.
+        let startup = fx.workspace().join("startup.sh");
+        fs::write(&startup, "true\n").unwrap();
+        let startup = startup.display();
+        for command in [
+            "hash -p /usr/bin/true j; j describe -m x".to_string(),
+            "hash -p /usr/bin/true bossctl; bossctl status".to_string(),
+            "declare -n r=BASH_CMDS; r[c]=/usr/bin/true; c".to_string(),
+            "declare -n r=x; r=1".to_string(),
+            "x=BASH_ALI; printf -v \"${x}ASES[c]\" '%s' y; c".to_string(),
+            "x=BASH_CMDS; read \"$x\" <<< y".to_string(),
+            "x=BASH_C; export \"${x}MDS=/usr/bin/true\"".to_string(),
+            format!("export BASH_ENV; printf -v BASH_ENV '%s' {startup}; bash -c true"),
+            format!("BASH_E\"\"NV={startup} bash -c true"),
+            format!("printf -v BASH_E\"\"NV '%s' {startup}"),
+            "echo $'BASH_\\x45NV'".to_string(),
+            "set -x; true".to_string(),
+            "set -o xtrace; true".to_string(),
+            "PS4='$(cat README.md)' true".to_string(),
+            "export PS4; printf -v PS4 x".to_string(),
+            "PROMPT_COMMAND=true true".to_string(),
+            "SHELLOPTS=xtrace true".to_string(),
+            "x='a[$(cat README.md)]'; (( x ))".to_string(),
+            "x='a[$(cat README.md)]'; [[ $x -eq 0 ]]".to_string(),
+            "x='a[$(cat README.md)]'; let x".to_string(),
+            "x='a[$(cat README.md)]'; y=abc; echo ${y:x}".to_string(),
+            "x='a[`cat README.md`]'; echo $[x]".to_string(),
+            "declare -i n; n='a[$(cat README.md)]'".to_string(),
+        ] {
+            deny_at(&fx, &command, &fx.workspace());
+        }
+    }
+}
+
+#[test]
 fn braced_names_cannot_cross_quote_segments() {
     for kind in [WorkerKind::Standard, WorkerKind::Reviewer] {
         let fx = Fixture::new("run-braced-boundary");

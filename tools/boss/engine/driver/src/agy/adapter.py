@@ -309,10 +309,128 @@ def authorized(policy, overwrite=None):
 # COMMAND_TOKENIZER_FRAGMENT
 
 
-def nested_shell_bodies(group):
+# Variables whose value bash later executes or evaluates (command hash tables,
+# startup files, xtrace prompts, callbacks, option strings). They are denied by
+# name wherever they could be written, not by enumerating spellings.
+DYNAMIC_NAMES = "BASH_ALIASES|BASH_CMDS|BASH_ENV|PS4|PS0|PROMPT_COMMAND|SHELLOPTS|BASHOPTS"
+DYNAMIC_NAME_RE = re.compile(r"(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_])" % DYNAMIC_NAMES)
+DYNAMIC_ASSIGN_RE = re.compile(r"^(?:%s)(?:\[|\+?=)" % DYNAMIC_NAMES)
+LITERAL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+NAME_BINDERS = {"export", "declare", "typeset", "local", "readonly", "unset", "read", "getopts", "mapfile", "readarray"}
+# Contexts that evaluate their text arithmetically, including a `$(...)`
+# subscript: `(( ))`, `$[ ]`, `[[ ]]`, `let`, `${v:expr}` / `${a[expr]}`,
+# `name[expr]` subscripts and integer-attribute declarations.
+ARITHMETIC_EVAL_RE = re.compile(
+    r"\(\(|\$\[|\[\[|(?<![A-Za-z0-9_])let(?![A-Za-z0-9_])|\$\{[^}]*[:\[]"
+    r"|\b(?:declare|typeset|local)\b[^;|&\n]*\s-[A-Za-z]*i|[A-Za-z_][A-Za-z0-9_]*\["
+)
+
+
+def text_outside_single_quotes(command):
+    # Single-quoted content is data; blank it. ANSI-C content is kept both raw
+    # and escape-decoded because bash decodes it before use.
+    out, quote, escaped, skip, ansi = [], None, False, False, []
+    for index, char in enumerate(command):
+        if skip:
+            skip = False
+            continue
+        if quote == ANSI:
+            if escaped:
+                escaped = False
+                ansi.append(char)
+            elif char == chr(92):
+                escaped = True
+                ansi.append(char)
+            elif char == chr(39):
+                quote = None
+                raw = "".join(ansi)
+                ansi = []
+                try:
+                    decoded = raw.encode("latin-1", "backslashreplace").decode("unicode_escape")
+                except (UnicodeError, ValueError):
+                    fail_closed("ANSI-C quoted text cannot be decoded for inspection")
+                out.append(raw + " " + decoded)
+            else:
+                ansi.append(char)
+            continue
+        if quote == chr(39):
+            if char == chr(39):
+                quote = None
+                out.append(char)
+            else:
+                out.append(" ")
+            continue
+        if escaped:
+            escaped = False
+            out.append(char)
+            continue
+        if char == chr(92):
+            escaped = True
+            out.append(char)
+            continue
+        if quote is None and is_ansi_open(command, index, quote):
+            quote, skip = ANSI, True
+            continue
+        if char in (chr(34), chr(39)):
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+        out.append(char)
+    if quote == ANSI:
+        fail_closed("unterminated ANSI-C quote cannot be inspected")
+    return "".join(out)
+
+
+def reject_dynamic_text(command):
+    text = text_outside_single_quotes(command)
+    if DYNAMIC_NAME_RE.search(text):
+        fail_closed("variables that bash later executes or evaluates cannot be named")
+    # Single-quoted or heredoc text containing a substitution is data until an
+    # arithmetic context, integer attribute or subscript evaluates it.
+    if ("$(" in command or chr(96) in command) and ARITHMETIC_EVAL_RE.search(text):
+        fail_closed("arithmetic evaluation of text containing a substitution cannot be inspected")
+
+
+def reject_dynamic_bindings(group):
     for token in without_redirections(group):
-        if re.match(r"^(?:BASH_ALIASES|BASH_CMDS|BASH_ENV)(?:\[|\+?=)", token):
+        if DYNAMIC_ASSIGN_RE.match(token):
             fail_closed("dynamic shell command assignment is denied")
+    rest = strip_prefixes(group)
+    if not rest:
+        return
+    program = os.path.basename(rest[0])
+    args = rest[1:]
+    if program == "hash" and any(a.startswith("-") and not a.startswith("--") and "p" in a for a in args):
+        fail_closed("hash -p binds a command name to a path and cannot be inspected")
+    if program in ("declare", "typeset", "local") and any(
+            a.startswith("-") and not a.startswith("--") and "n" in a for a in args):
+        fail_closed("namerefs cannot be inspected")
+    if program == "set" and any(
+            "xtrace" in a or (a.startswith("-") and not a.startswith("--") and "x" in a) for a in args):
+        fail_closed("xtrace evaluates PS4 and is denied")
+    targets = None
+    if program in NAME_BINDERS:
+        targets = [a for a in args if not a.startswith("-")]
+    elif program == "printf":
+        targets = []
+        for index, a in enumerate(args):
+            if a == "-v" and index + 1 < len(args):
+                targets.append(args[index + 1])
+            elif a.startswith("-v") and len(a) > 2:
+                targets.append(a[2:])
+    if targets is None:
+        return
+    for target in targets:
+        name = target.split("=", 1)[0]
+        if DYNAMIC_NAME_RE.search(target):
+            fail_closed("binding a variable that bash later executes is denied")
+        if not LITERAL_NAME_RE.fullmatch(name):
+            fail_closed("binding a variable through a non-literal name is denied")
+
+
+def nested_shell_bodies(group):
+    reject_dynamic_bindings(group)
     normalized = without_redirections(group)
     for index, token in enumerate(normalized):
         if os.path.basename(token) == "env" and any(
@@ -391,6 +509,7 @@ def inspected_commands(command, depth=0):
         fail_closed("incomplete shell syntax cannot be inspected")
     if has_substitution(command):
         fail_closed("command substitution is structurally denied")
+    reject_dynamic_text(command)
     yield command
     for group in command_groups(command):
         for body in nested_shell_bodies(group):
