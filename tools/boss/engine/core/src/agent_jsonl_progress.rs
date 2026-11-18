@@ -868,9 +868,11 @@ async fn run_prepared<S>(
                 prepared: &prepared,
                 sink: &sink,
                 store: &store,
-                overdue_after,
-                budget: discovery_budget.as_ref(),
-                scale_overdue_with_load,
+                overdue: DiscoveryOverdue {
+                    after: overdue_after,
+                    budget: discovery_budget.as_ref(),
+                    scale_with_load: scale_overdue_with_load,
+                },
             };
             let (candidate, discovery_secs) = match discovery.run(&mut halt).await {
                 Ok(Some(found)) => found,
@@ -1045,6 +1047,14 @@ fn checkpoint_rejection(reason: &crate::agent_jsonl_discovery::CandidateRejectio
     }
 }
 
+/// Overdue reporting for one discovery: a test override, or the live
+/// contention budget that later startups may extend.
+struct DiscoveryOverdue<'a> {
+    after: Duration,
+    budget: Option<&'a boss_startup_policy::DiscoveryBudget>,
+    scale_with_load: bool,
+}
+
 /// One run's discovery: the poll loop that waits for exactly one new,
 /// workspace-correlated rollout to appear under the prepared root.
 struct Discovery<'a, S> {
@@ -1052,9 +1062,7 @@ struct Discovery<'a, S> {
     prepared: &'a PreparedSource,
     sink: &'a S,
     store: &'a Arc<dyn IngressCheckpointStore>,
-    overdue_after: Duration,
-    budget: Option<&'a boss_startup_policy::DiscoveryBudget>,
-    scale_overdue_with_load: bool,
+    overdue: DiscoveryOverdue<'a>,
 }
 
 impl<S> Discovery<'_, S>
@@ -1080,7 +1088,7 @@ where
         let result = crate::agent_jsonl_discovery::discover_candidate_observed(
             self.prepared,
             halt,
-            self.overdue_after,
+            self.overdue.after,
             |rejected, reason, waited_secs, overdue, file_progress| {
                 if file_progress && !recorded_live {
                     self.sink.record_driver_attach(self.run_id);
@@ -1108,8 +1116,9 @@ where
                         reason: checkpoint_rejection(&reason),
                     })
                     .collect();
-                let overdue_now = if self.scale_overdue_with_load {
-                    self.budget
+                let overdue_now = if self.overdue.scale_with_load {
+                    self.overdue
+                        .budget
                         .is_some_and(|budget| started.elapsed() >= budget.timeout())
                 } else {
                     overdue
@@ -1601,8 +1610,181 @@ async fn wait_for_cancel(halt: &mut watch::Receiver<StreamHalt>) {
 mod discovery_tests;
 
 #[cfg(test)]
-#[path = "agent_jsonl_progress_deadline_tests.rs"]
-mod deadline_tests;
+mod deadline_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use crate::driver::AgentJsonlFileIngress;
+    use crate::events_socket::IncomingHookEvent;
+    use crate::stdout_progress::WorkerEventSink;
+
+    #[derive(Clone, Default)]
+    struct ObservingSink {
+        observations: Arc<Mutex<Vec<IngressObservation>>>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerEventSink for ObservingSink {
+        fn record_driver_attach(&self, _run_id: &str) {}
+
+        async fn dispatch_worker_event(&self, _incoming: IncomingHookEvent) {}
+
+        async fn record_ingress_observation(&self, _run_id: &str, observation: IngressObservation) {
+            self.observations.lock().unwrap().push(observation);
+            self.notify.notify_waiters();
+        }
+    }
+
+    impl ObservingSink {
+        fn observations(&self) -> Vec<IngressObservation> {
+            self.observations.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MemoryStore {
+        stored: Arc<Mutex<HashMap<String, IngressCheckpoint>>>,
+    }
+
+    impl IngressCheckpointStore for MemoryStore {
+        fn store_ingress_checkpoint(&self, run_id: &str, checkpoint: &IngressCheckpoint) -> Result<(), String> {
+            self.stored
+                .lock()
+                .unwrap()
+                .insert(run_id.to_owned(), checkpoint.clone());
+            Ok(())
+        }
+
+        fn load_ingress_checkpoint(&self, run_id: &str) -> Result<Option<IngressCheckpoint>, String> {
+            Ok(self.stored.lock().unwrap().get(run_id).cloned())
+        }
+    }
+
+    fn arm_run(
+        temp: &tempfile::TempDir,
+        manager: &AgentJsonlProgressManager,
+        run_id: &str,
+        sink: ObservingSink,
+        store: MemoryStore,
+    ) {
+        let directory = temp.path().join("sessions");
+        let workspace_path = temp.path().join("workspace");
+        fs::create_dir_all(&directory).unwrap();
+        fs::create_dir_all(&workspace_path).unwrap();
+        manager
+            .prepare_run(
+                run_id,
+                Arc::new(crate::driver::CodexDriver::default()),
+                AgentJsonlFileIngress {
+                    directory,
+                    filename_prefix: "rollout-".into(),
+                    filename_suffix: ".jsonl".into(),
+                    workspace_path,
+                },
+                sink,
+                Arc::new(store),
+            )
+            .unwrap();
+        manager.activate_run(run_id);
+    }
+
+    fn rollout(workspace: &std::path::Path, thread_id: &str) -> String {
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "id": thread_id, "cwd": workspace }
+        });
+        format!("{}\n", serde_json::to_string(&meta).unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_discovery_observes_later_peers_and_attaches_past_old_deadline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = AgentJsonlProgressManager::new();
+        let sink = ObservingSink::default();
+        let store = MemoryStore::default();
+        arm_run(&temp, &manager, "late", sink.clone(), store.clone());
+        tokio::task::yield_now().await;
+        let peers: Vec<_> = (0..5).map(|_| manager.discovery_load().begin()).collect();
+        tokio::time::advance(Duration::from_secs(122)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !sink
+                .observations()
+                .iter()
+                .any(|o| matches!(o, IngressObservation::DiscoveryOverdue { .. })),
+            "burst discovery must survive 120s without reporting overdue"
+        );
+        drop(peers);
+        let path = temp.path().join("sessions").join("rollout-late.jsonl");
+        fs::write(path, rollout(&temp.path().join("workspace"), "late")).unwrap();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sink
+                    .observations()
+                    .iter()
+                    .any(|o| matches!(o, IngressObservation::Attached { .. }))
+                {
+                    return;
+                }
+                let _ = tokio::time::timeout(Duration::from_millis(50), sink.notify.notified()).await;
+            }
+        })
+        .await
+        .expect("late rollout should attach after the old 120s deadline");
+        manager.stop_run("late");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_discovery_reports_overdue_at_the_bounded_deadline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = AgentJsonlProgressManager::new();
+        let sink = ObservingSink::default();
+        let store = MemoryStore::default();
+        arm_run(&temp, &manager, "dead", sink.clone(), store.clone());
+        tokio::task::yield_now().await;
+        let _peers: Vec<_> = (0..100).map(|_| manager.discovery_load().begin()).collect();
+        tokio::time::advance(Duration::from_secs(239)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !sink
+                .observations()
+                .iter()
+                .any(|o| matches!(o, IngressObservation::DiscoveryOverdue { .. }))
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sink
+                    .observations()
+                    .iter()
+                    .any(|o| matches!(o, IngressObservation::DiscoveryOverdue { .. }))
+                {
+                    return;
+                }
+                let _ = tokio::time::timeout(Duration::from_millis(50), sink.notify.notified()).await;
+            }
+        })
+        .await
+        .expect("capped contention must report overdue at 240s");
+        assert!(
+            !sink
+                .observations()
+                .iter()
+                .any(|o| matches!(o, IngressObservation::DiscoveryFailed { .. })),
+            "discovery keeps polling after the overdue report"
+        );
+        manager.stop_run("dead");
+    }
+}
 
 #[cfg(test)]
 #[path = "agent_jsonl_progress_tests/stream.rs"]

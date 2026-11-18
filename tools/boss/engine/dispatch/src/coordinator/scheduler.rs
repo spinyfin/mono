@@ -1048,37 +1048,6 @@ impl ExecutionCoordinator {
     /// mainline arrivals cannot cascade into wiping out every spilled
     /// automation run at once. See [`crate::dispatch_spillover`] for the
     /// policy and its rationale.
-    async fn resume_startup_held(&self, execution: &WorkExecution) -> bool {
-        let now = std::time::Instant::now();
-        if !self
-            .resume_admission
-            .lock()
-            .unwrap()
-            .holds(&execution.id, true, now)
-        {
-            return false;
-        }
-        // Headless coordinators without a live registry have no driver
-        // readiness lifecycle, so they do not pace resumed admission.
-        let Some(live) = &self.live_worker_states else {
-            return false;
-        };
-        // Pool claims survive the handoff from schedule to the runner,
-        // including the window before live-slot registration.
-        let startup_pending = live.startup_pending(&self.all_claimed_execution_times().await);
-        let held = self
-            .resume_admission
-            .lock()
-            .unwrap()
-            .holds(&execution.id, startup_pending, now);
-        if held {
-            self.record_dispatch_wait_reason(execution, DISPATCH_WAIT_REASON_RESUME_STARTUP_PENDING, None);
-        }
-        // The existing scheduler heartbeat revisits ready rows every 15s,
-        // including failed/cancelled starts; no sleeps occupy the drain.
-        held
-    }
-
     pub(crate) async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
             // A probe still in flight is the expected first seconds of every

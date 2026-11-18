@@ -1117,8 +1117,7 @@ pub(crate) async fn finish_reap(
         crate::spawn_health::SpawnFailureClass::ShellWithoutDriverSignal => ctx
             .spawn_health
             .record_driver_start_failure(work_item_id, now_epoch_secs),
-        crate::spawn_health::SpawnFailureClass::NoShell
-        | crate::spawn_health::SpawnFailureClass::PromptNotAccepted => {
+        crate::spawn_health::SpawnFailureClass::NoShell | crate::spawn_health::SpawnFailureClass::PromptNotAccepted => {
             ctx.spawn_health.record_failure(work_item_id, now_epoch_secs)
         }
     };

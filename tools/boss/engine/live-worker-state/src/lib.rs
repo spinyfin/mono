@@ -13,7 +13,7 @@
 //! quickly after spawn (they model the spawn act, not the worker's
 //! life). Two consecutive runs in the same slot reuse the slot key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use boss_protocol::{
@@ -189,10 +189,6 @@ pub struct LiveWorkerStateRegistry {
     /// per-field lifecycle, and there is no failure mode where one table
     /// keeps a stale entry a sibling table already dropped.
     inner: Mutex<HashMap<u8, SlotEntry>>,
-    /// Shared with JSONL discovery so a Claude or grok startup raises the
-    /// Codex discovery deadline. `None` in headless tests that never arm
-    /// file ingress.
-    discovery_load: Mutex<Option<Arc<boss_startup_policy::DiscoveryLoad>>>,
     /// Serialization locks that are independent of dispatch registry reads.
     serial: SerialLocks,
     /// Driver-hook evidence for runs whose pane is launching but whose slot
@@ -216,6 +212,14 @@ struct SerialLocks {
     /// `inner` across a database call: `inner` is taken only briefly to
     /// capture, and the lock order is `persist` -> database connection.
     persist: Mutex<()>,
+    /// Shared with JSONL discovery so a Claude or grok startup raises the
+    /// Codex discovery deadline. `None` in headless tests that never arm
+    /// file ingress.
+    discovery_load: Mutex<Option<Arc<boss_startup_policy::DiscoveryLoad>>>,
+    /// First observation of a pool claim that has no live slot yet.
+    /// Starts that claim's driver-start grace for startup pressure.
+    /// Always locked *after* `inner` when both are held.
+    unregistered_claim_seen: Mutex<HashMap<String, i64>>,
 }
 
 /// Test-only synchronization points for lifecycle/persona race tests.
@@ -588,7 +592,7 @@ impl LiveWorkerStateRegistry {
     /// Share the JSONL discovery high-water mark so every in-flight startup
     /// (not just Codex file discovery) extends pending discovery deadlines.
     pub fn set_discovery_load(&self, load: Arc<boss_startup_policy::DiscoveryLoad>) {
-        *self.discovery_load.lock().expect("registry mutex poisoned") = Some(load);
+        *self.serial.discovery_load.lock().expect("registry mutex poisoned") = Some(load);
         self.publish_startup_contention();
     }
 
@@ -608,7 +612,7 @@ impl LiveWorkerStateRegistry {
 
     pub fn publish_startup_contention(&self) {
         let load = {
-            let guard = self.discovery_load.lock().expect("registry mutex poisoned");
+            let guard = self.serial.discovery_load.lock().expect("registry mutex poisoned");
             guard.clone()
         };
         let Some(load) = load else {
@@ -806,6 +810,11 @@ impl LiveWorkerStateRegistry {
         // timestamp for a run id, so each must be stamped at the point its
         // own mutation actually lands, not before.
         let run_id = state.run_id.clone();
+        self.serial
+            .unregistered_claim_seen
+            .lock()
+            .expect("registry mutex poisoned")
+            .remove(&run_id);
         let model = state.model.clone();
         let pool = state.pool.clone();
         let kind = state.kind.clone();
@@ -1461,23 +1470,41 @@ impl LiveWorkerStateRegistry {
     /// count even while the execution remains productive. Unproven live
     /// slots older than `window_secs` do not count: they are past the
     /// driver-start grace, so they must not pin resumed admission to the
-    /// no-signal fallback. Claims without live slots use their pool claim
-    /// timestamp and expire from startup pressure at the same grace bound.
-    pub fn startup_pending(
-        &self,
-        claimed_runs: &std::collections::HashMap<String, i64>,
-        now_epoch_secs: i64,
-        window_secs: i64,
-    ) -> bool {
+    /// no-signal fallback. Claims without live slots start that same
+    /// grace on first observation and expire from startup pressure at
+    /// the same bound.
+    pub fn startup_pending(&self, claimed_runs: &HashSet<String>, now_epoch_secs: i64, window_secs: i64) -> bool {
         let cutoff = now_epoch_secs.saturating_sub(window_secs);
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.values().any(|entry| Self::slot_in_startup_window(entry, cutoff))
-            || claimed_runs.iter().any(|(run_id, claimed_at)| {
-                match guard.values().find(|entry| entry.state.run_id == *run_id) {
-                    Some(entry) => Self::slot_in_startup_window(entry, cutoff),
-                    None => *claimed_at > cutoff,
-                }
-            })
+        if guard.values().any(|entry| Self::slot_in_startup_window(entry, cutoff)) {
+            return true;
+        }
+        let live: HashSet<&str> = guard.values().map(|entry| entry.state.run_id.as_str()).collect();
+        let mut seen = self
+            .serial
+            .unregistered_claim_seen
+            .lock()
+            .expect("registry mutex poisoned");
+        seen.retain(|id, _| claimed_runs.contains(id) && !live.contains(id.as_str()));
+        for id in claimed_runs {
+            if live.contains(id.as_str()) {
+                continue;
+            }
+            let first_seen = *seen.entry(id.clone()).or_insert(now_epoch_secs);
+            if first_seen > cutoff {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_unregistered_claim_seen_for_test(&self, run_id: impl Into<String>, epoch_secs: i64) {
+        self.serial
+            .unregistered_claim_seen
+            .lock()
+            .expect("registry mutex poisoned")
+            .insert(run_id.into(), epoch_secs);
     }
 
     /// Whether any live slot for `run_id` has recorded a driver-originated
@@ -2558,7 +2585,7 @@ impl boss_execution_contracts::LiveWorkerLiveness for LiveWorkerStateRegistry {
         LiveWorkerStateRegistry::current_tool_for_run(self, run_id)
     }
 
-    fn startup_pending(&self, claimed_runs: &std::collections::HashMap<String, i64>) -> bool {
+    fn startup_pending(&self, claimed_runs: &HashSet<String>) -> bool {
         LiveWorkerStateRegistry::startup_pending(
             self,
             claimed_runs,

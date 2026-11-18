@@ -1925,9 +1925,8 @@ impl ServerState {
             let execution_coordinator = Arc::new(execution_coordinator_inner);
             completion_handler.set_host_adapter_provider(execution_coordinator.host_adapter_provider());
 
-            let agent_jsonl_progress_manager = Arc::new(
-                AgentJsonlProgressManager::new().with_metrics(metrics_registry.clone()),
-            );
+            let agent_jsonl_progress_manager =
+                Arc::new(AgentJsonlProgressManager::new().with_metrics(metrics_registry.clone()));
             live_worker_states.set_discovery_load(agent_jsonl_progress_manager.discovery_load());
 
             ServerState::builder()

@@ -88,9 +88,9 @@ fn startup_pressure_releases_on_proof_failure_and_cancellation() {
     let live = LiveWorkerStateRegistry::new();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let window = crate::live_worker_state::DRIVER_START_GRACE_SECS;
-    let reserved = std::collections::HashMap::from([("reserved".to_owned(), now)]);
+    let reserved = std::collections::HashSet::from(["reserved".to_owned()]);
     assert!(live.startup_pending(&reserved, now, window));
-    assert!(!live.startup_pending(&std::collections::HashMap::new(), now, window));
+    assert!(!live.startup_pending(&std::collections::HashSet::new(), now, window));
     live.register_spawn(1, "reserved", "codex", 123, None);
     assert!(live.startup_pending(&reserved, now, window));
     live.record_driver_signal("reserved", DriverSignalKind::HookEvent);
@@ -108,12 +108,12 @@ fn startup_pressure_ignores_unproven_slots_past_the_grace_window() {
     let window = crate::live_worker_state::DRIVER_START_GRACE_SECS;
     live.register_spawn(1, "stuck", "codex", 123, None);
     live.set_spawn_time_for_test(1, now - window - 1);
-    let claimed = std::collections::HashMap::from([("stuck".to_owned(), now - window - 1)]);
+    let claimed = std::collections::HashSet::from(["stuck".to_owned()]);
     assert!(
         !live.startup_pending(&claimed, now, window),
         "a slot already past driver-start grace must not pin resumed admission"
     );
-    assert!(!live.startup_pending(&std::collections::HashMap::new(), now, window));
+    assert!(!live.startup_pending(&std::collections::HashSet::new(), now, window));
     live.register_spawn(2, "fresh", "claude", 124, None);
     assert!(live.startup_pending(&claimed, now, window));
 }
@@ -196,10 +196,11 @@ fn startup_pressure_ignores_aged_claims_without_live_entries() {
     let live = LiveWorkerStateRegistry::new();
     let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let window = crate::live_worker_state::DRIVER_START_GRACE_SECS;
-    let claims = std::collections::HashMap::from([("unregistered".to_owned(), now - window - 1)]);
+    let claims = std::collections::HashSet::from(["unregistered".to_owned()]);
+    live.set_unregistered_claim_seen_for_test("unregistered", now - window - 1);
     assert!(!live.startup_pending(&claims, now, window));
-    let fresh = std::collections::HashMap::from([("unregistered".to_owned(), now)]);
-    assert!(live.startup_pending(&fresh, now, window));
+    live.set_unregistered_claim_seen_for_test("unregistered", now);
+    assert!(live.startup_pending(&claims, now, window));
 }
 
 #[test]

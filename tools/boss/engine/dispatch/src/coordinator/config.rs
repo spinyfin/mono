@@ -468,15 +468,6 @@ impl ExecutionCoordinator {
         claimed
     }
 
-    /// Claim times across all pools, for bounded pre-registration startup pressure.
-    pub async fn all_claimed_execution_times(&self) -> std::collections::HashMap<String, i64> {
-        let mut claimed = self.worker_pool.claimed_execution_times().await;
-        claimed.extend(self.automation_pool.claimed_execution_times().await);
-        claimed.extend(self.review_pool.claimed_execution_times().await);
-        claimed.extend(self.progression_pool.claimed_execution_times().await);
-        claimed
-    }
-
     /// Re-claim `worker_id` for `execution_id` in whichever pool owns that
     /// slot — the union-of-pools counterpart to
     /// [`Self::all_claimed_execution_ids`], used by the re-adoption path.
@@ -771,14 +762,34 @@ impl ExecutionCoordinator {
     ///
     /// The caller is responsible for persisting the new state to
     /// `state.db` — see `handle_set_dispatch_paused` in `app/engine_meta.rs`.
+    /// True when this ready row is in the resumed cohort and another
+    /// startup is still unproven. The 15s heartbeat revisits it; this
+    /// method does not sleep.
+    pub(crate) async fn resume_startup_held(&self, execution: &WorkExecution) -> bool {
+        let now = std::time::Instant::now();
+        if !self.resume_admission.lock().unwrap().holds(&execution.id, true, now) {
+            return false;
+        }
+        let Some(live) = &self.live_worker_states else {
+            return false;
+        };
+        let startup_pending = live.startup_pending(&self.all_claimed_execution_ids().await);
+        let held = self
+            .resume_admission
+            .lock()
+            .unwrap()
+            .holds(&execution.id, startup_pending, now);
+        if held {
+            self.record_dispatch_wait_reason(execution, DISPATCH_WAIT_REASON_RESUME_STARTUP_PENDING, None);
+        }
+        held
+    }
+
     pub fn resume_dispatch(&self) {
         let mut pause = self.dispatch_pause.lock().unwrap();
         if pause.is_some() {
             // Arm before exposing the unpaused state to a concurrent drain.
-            self.resume_admission
-                .lock()
-                .unwrap()
-                .resume(std::time::Instant::now());
+            self.resume_admission.lock().unwrap().resume(std::time::Instant::now());
             *pause = None;
             drop(pause);
             self.notify_pause_state_changed();
