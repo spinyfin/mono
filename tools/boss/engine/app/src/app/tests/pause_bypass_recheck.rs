@@ -1,12 +1,12 @@
 //! Unit tests for the pause-bypass dispatch re-check refusal arm in
-//! `apply_work_item_patch`: when the authoritative re-check refuses after the
+//! `apply_work_item_patch_from`: when the authoritative re-check refuses after the
 //! status patch has already landed (the narrow window between the board-
 //! handler pre-check and `dispatch_with_pause_bypass`), the row must be
 //! reverted, no execution left behind, and the client answered with a
-//! `work_error` rather than a success `WorkItemUpdated`.
+//! `WorkItemRefused` rather than a success `WorkItemUpdated`.
 
 use super::*;
-use crate::app::work_items::{BoardDragPauseBypass, apply_work_item_patch};
+use crate::app::work_items::{BoardDragPauseBypass, apply_work_item_patch_from};
 use boss_engine_dispatch::coordinator::DispatchPauseOrigin;
 use boss_engine_runtime::test_support::{create_test_chore_manual, create_test_product_with_repo};
 use boss_protocol::{PauseReason, TaskStatus, WorkItem, WorkItemPatch};
@@ -37,9 +37,9 @@ async fn sole_response(sink: &SessionSink) -> FrontendEvent {
 /// to `active` first, then `dispatch_with_pause_bypass` refuses because the
 /// observed pause generation is stale. Asserts the three contracts the
 /// revert arm exists for: status is back at its previous value, no
-/// execution row was created, and the client receives a `work_error`.
+/// execution row was created, and the client receives a `WorkItemRefused`.
 #[tokio::test]
-async fn pause_bypass_recheck_refusal_reverts_status_and_answers_work_error() {
+async fn pause_bypass_recheck_refusal_reverts_status_and_answers_work_item_refused() {
     let (server_state, _dir) = test_server_state();
     let product = create_test_product_with_repo(
         &server_state.work_db,
@@ -58,26 +58,30 @@ async fn pause_bypass_recheck_refusal_reverts_status_and_answers_work_error() {
     );
 
     // Observed generation is older than the live one — the re-check inside
-    // `dispatch_with_pause_bypass` must refuse. Calling `apply_work_item_patch`
+    // `dispatch_with_pause_bypass` must refuse. Calling `apply_work_item_patch_from`
     // directly (rather than `handle_move_work_item_on_board`) skips the
     // board-handler pre-check that would otherwise refuse before the status
     // patch, so this exercises the in-request TOCTOU revert arm itself.
     let sink = make_session_sink();
     let ctx = dispatch(&server_state, &sink);
     let patch = WorkItemPatch::builder().status("active").build();
-    apply_work_item_patch(
+    apply_work_item_patch_from(
         ctx,
         chore.id.clone(),
         patch,
         Some(BoardDragPauseBypass {
             observed_pause_since_epoch_s: Some(1_600_000_000),
         }),
+        true,
+        "board_drop:set_status",
     )
     .await;
 
     let response = sole_response(&sink).await;
     match response {
-        FrontendEvent::WorkError { message } => {
+        FrontendEvent::WorkItemRefused { id, code, message, .. } => {
+            assert_eq!(id, chore.id);
+            assert_eq!(code, boss_protocol::BoardRefusalCode::PauseOverrideRefused);
             assert!(
                 message.to_lowercase().contains("changed")
                     || message.to_lowercase().contains("pause")
@@ -85,7 +89,7 @@ async fn pause_bypass_recheck_refusal_reverts_status_and_answers_work_error() {
                 "refusal must name the pause/generation problem, got: {message}"
             );
         }
-        other => panic!("expected WorkError after re-check refusal, got: {other:?}"),
+        other => panic!("expected WorkItemRefused after re-check refusal, got: {other:?}"),
     }
 
     let item = server_state

@@ -5,11 +5,11 @@
 //! behavioural change. See [`super::Dispatch`] for the per-request
 //! context every handler receives.
 
-use anyhow::anyhow;
+use crate::app::handler_helpers::{BoardRefusal, send_refusal};
 use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
 
 use super::*;
-use boss_protocol::WorkItemPatch;
+use boss_protocol::{BoardRefusalCode, WorkItemPatch};
 
 /// Resolve the caller tier for a work-item write that may carry a
 /// priority. Two gates compose here, both engine-side:
@@ -692,6 +692,7 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
         target,
         bypass_dispatch_pause,
         observed_pause_since_epoch_s,
+        explicit_status,
     } = req
     else {
         unreachable!()
@@ -699,19 +700,27 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
     let id = match ctx.server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {
-            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+            send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
             return;
         }
     };
     let row = match board_row_for_id(&ctx.work_db, &id) {
         Ok(row) => row,
         Err(err) => {
-            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+            send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
             return;
         }
     };
     let current = row.position();
-    let resolution = resolve_drop(&row, target);
+    // An explicit status choice skips drop resolution: it names the status
+    // directly, so a blocked card can be unblocked from its own column
+    // (which `resolve_drop` would read as a reorder).
+    let resolution = match explicit_status {
+        Some(status) => DropResolution::SetStatus(status),
+        None => resolve_drop(&row, target),
+    };
     tracing::debug!(
         work_item_id = %id,
         from = %current.label(),
@@ -739,7 +748,10 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                     ctx.server_state.current_work_revision(),
                     FrontendEvent::WorkItemUpdated { item },
                 ),
-                Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+                Err(err) => {
+                    let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+                    send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
+                }
             }
         }
         DropResolution::SetStatus(status) => {
@@ -761,12 +773,14 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
                 {
                     Ok(admission) => admission,
                     Err(err) => {
-                        send_work_error(&ctx.sink, &ctx.request_id, err);
+                        let refusal = BoardRefusal::pause_override(&ctx.work_db, &id, format!("{err:#}"));
+                        send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
                         return;
                     }
                 };
                 if let Err(reason) = pause_bypass_decision(&admission, observed_pause_since_epoch_s) {
-                    send_work_error(&ctx.sink, &ctx.request_id, format!("cannot start {id}: {reason}"));
+                    let refusal = BoardRefusal::pause_override(&ctx.work_db, &id, reason);
+                    send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
                     return;
                 }
             }
@@ -774,15 +788,15 @@ pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendR
             let pause_bypass = bypass_dispatch_pause.then_some(BoardDragPauseBypass {
                 observed_pause_since_epoch_s,
             });
-            apply_work_item_patch_from(ctx, id, patch, pause_bypass, "board_drop:set_status").await;
+            apply_work_item_patch_from(ctx, id, patch, pause_bypass, true, "board_drop:set_status").await;
         }
         DropResolution::ClearAutostart => {
             let patch = WorkItemPatch::builder().autostart(false).build();
-            apply_work_item_patch_from(ctx, id, patch, None, "board_drop:clear_autostart").await;
+            apply_work_item_patch_from(ctx, id, patch, None, true, "board_drop:clear_autostart").await;
         }
         DropResolution::Refused { message } => {
-            let err = anyhow!(message);
-            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::DropRefused, message);
+            send_refusal(&ctx.sink, &ctx.request_id, true, &id, refusal);
         }
     }
 }
@@ -823,7 +837,7 @@ pub(super) async fn apply_work_item_patch(
     patch: WorkItemPatch,
     pause_bypass: Option<BoardDragPauseBypass>,
 ) {
-    apply_work_item_patch_from(ctx, id, patch, pause_bypass, "rpc:update_work_item").await;
+    apply_work_item_patch_from(ctx, id, patch, pause_bypass, false, "rpc:update_work_item").await;
 }
 
 /// [`apply_work_item_patch`] naming the handler that built the patch. `source`
@@ -835,6 +849,7 @@ pub(super) async fn apply_work_item_patch_from(
     id: String,
     patch: WorkItemPatch,
     pause_bypass: Option<BoardDragPauseBypass>,
+    board_gesture: bool,
     source: &str,
 ) {
     let Dispatch {
@@ -855,7 +870,8 @@ pub(super) async fn apply_work_item_patch_from(
     let id = match server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {
-            send_work_error(&sink, &request_id, &err);
+            let refusal = BoardRefusal::new(BoardRefusalCode::NotACard, format!("{err:#}"));
+            send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
     };
@@ -890,8 +906,9 @@ pub(super) async fn apply_work_item_patch_from(
         // `UpdateWorkItem` outright instead of letting the
         // status flip land and then swallowing the dispatch
         // error in a `WARN`. The card stays in its previous
-        // column and the user sees a `WorkError` toast naming
-        // the missing repo. Skips when an existing non-terminal
+        // column and the user sees a refusal naming the missing
+        // repo (a `WorkItemRefused` for a board gesture, a
+        // `WorkError` for every other caller). Skips when an existing non-terminal
         // execution would already own the dispatch slot —
         // there's no point validating a code path we won't run.
         let intends_active_transition = patch.status.as_deref() == Some("active")
@@ -942,7 +959,15 @@ pub(super) async fn apply_work_item_patch_from(
                     .with_details(details),
                 )
                 .await;
-            send_work_error(&sink, &request_id, &err);
+            let refusal = BoardRefusal::from_dispatch_error(
+                &work_db,
+                &id,
+                &err,
+                BoardRefusalCode::MissingRepo,
+                None,
+                server_state.pr_state_checker.as_ref(),
+            );
+            send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
         // Only a patch that carries a priority needs the row's current
@@ -984,7 +1009,7 @@ pub(super) async fn apply_work_item_patch_from(
         match applied {
             Ok((mut item, unpark_report)) => {
                 // Dispatch refusals roll back the move and return the engine reason.
-                let mut dispatch_failure_response: Option<String> = None;
+                let mut dispatch_failure_response: Option<BoardRefusal> = None;
                 // Set only inside the pause-bypass arm's genuine claim branch
                 // (`dispatch_with_pause_bypass` actually claimed a `ready` row
                 // past an active pause). Distinct from `consented_override`
@@ -1166,8 +1191,16 @@ pub(super) async fn apply_work_item_patch_from(
                                 (Some(outcome.execution.id), false, Some(reason))
                             }
                             Err(err) => {
+                                let refusal = BoardRefusal::from_dispatch_error(
+                                    &work_db,
+                                    &work_item_id_for_event,
+                                    &err,
+                                    BoardRefusalCode::PauseOverrideRefused,
+                                    previous_task_status.clone(),
+                                    server_state.pr_state_checker.as_ref(),
+                                );
                                 let reason = format!("{err:#}");
-                                dispatch_failure_response = Some(reason.clone());
+                                dispatch_failure_response = Some(refusal);
                                 (None, false, Some(reason))
                             }
                         }
@@ -1187,8 +1220,16 @@ pub(super) async fn apply_work_item_patch_from(
                                 (Some(execution.id), true, None)
                             }
                             Err(err) => {
+                                let refusal = BoardRefusal::from_dispatch_error(
+                                    &work_db,
+                                    &work_item_id_for_event,
+                                    &err,
+                                    BoardRefusalCode::DispatchRefused,
+                                    previous_task_status.clone(),
+                                    server_state.pr_state_checker.as_ref(),
+                                );
                                 let reason = format!("{err:#}");
-                                dispatch_failure_response = Some(reason.clone());
+                                dispatch_failure_response = Some(refusal);
                                 (None, false, Some(reason))
                             }
                         }
@@ -1212,8 +1253,8 @@ pub(super) async fn apply_work_item_patch_from(
                             ),
                         )
                     };
-                    if let Some(reason) = &dispatch_failure_response {
-                        tracing::warn!(work_item_id = %work_item_id_for_event, %reason,
+                    if let Some(refusal) = &dispatch_failure_response {
+                        tracing::warn!(work_item_id = %work_item_id_for_event, reason = %refusal.message, code = ?refusal.code,
                             "UpdateWorkItem → active: dispatch refused; reverting status");
                         if let Some(prev_status) = &previous_task_status {
                             let (blocked_reason, blocked_detail) = previous_block.clone().unwrap_or_default();
@@ -1400,19 +1441,20 @@ pub(super) async fn apply_work_item_patch_from(
                 if unparking && let Some(report) = unpark_report {
                     server_state.begin_unpark_reconcile(actor, &id, report).await;
                 }
-                if let Some(reason) = dispatch_failure_response {
+                if let Some(refusal) = dispatch_failure_response {
                     // The status patch was reverted above; answer this
                     // request with a refusal (not the reverted item as a
-                    // success) so the client's `.workError` handler
+                    // success) so the client's refusal handler
                     // bounces the optimistic card back instead of the
                     // "dragged it and nothing happened" shape.
-                    send_work_error(&sink, &request_id, reason);
+                    send_refusal(&sink, &request_id, board_gesture, &id, refusal);
                 } else {
                     send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
                 }
             }
             Err(err) => {
-                send_work_error(&sink, &request_id, &err);
+                let refusal = BoardRefusal::from_update_error(&work_db, &id, &err);
+                send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             }
         }
     }

@@ -287,65 +287,61 @@ extension ChatViewModel {
         guard tasks.indices.contains(destination) else { return }
 
         tasks.swapAt(currentIndex, destination)
-        engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id))
+        if let requestID = engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id), movedTaskId: task.id) {
+            reorderRequestTaskIDs[requestID] = task.id
+        }
+    }
+
+    /// A `work_error` carrying a pending reorder's own request id belongs to
+    /// the card that was moved: show it there. Returns whether the request
+    /// id matched a reorder.
+    func settleReorderWorkError(message: String, requestId: String?) -> Bool {
+        guard let requestId, let taskID = reorderRequestTaskIDs.removeValue(forKey: requestId) else { return false }
+        dragRefusalNotice = DragRefusalNotice(taskID: taskID, message: message)
+        scheduleDragRefusalDismiss(for: taskID)
+        return true
+    }
+
+    /// The engine accepted the reorder carrying `requestId`: that request can
+    /// never see an error reply. Other reorders still in flight keep their
+    /// card mapping so their own replies still land on the right card.
+    func settleReorderSuccess(requestId: String?) {
+        guard let requestId else { return }
+        reorderRequestTaskIDs.removeValue(forKey: requestId)
+    }
+
+    /// A refused "Add revision…" (attributed by the engine client to its
+    /// parent card, whichever request id the request finally went out under)
+    /// shows on that card.
+    func settleRevisionRefused(message: String, parentTaskID: String) {
+        dragRefusalNotice = DragRefusalNotice(taskID: parentTaskID, message: message, code: "create_revision_failed")
+        scheduleDragRefusalDismiss(for: parentTaskID)
     }
 
     /// Apply an explicit column choice from the work-card popover's "Move"
-    /// buttons. The drag path does not come through here — it reports its
-    /// drop target and the engine resolves it
-    /// (`sendMoveWorkItemOnBoard`). Two extra concerns vs. a pure status
-    /// edit, both per `tools/boss/docs/designs/work-kanban.md`:
-    ///
-    /// - Choosing Doing (target status `active`) also fires
-    ///   `RequestExecution` so the engine schedules a worker. The
-    ///   engine is idempotent — a non-terminal execution already
-    ///   running for this work item won't get a duplicate.
-    /// - Move OUT of Doing while a live worker is attached is
-    ///   blocked — except for two intentional gestures:
-    ///   (a) Choosing Backlog (`todo`): engine stops the worker,
-    ///       releases the lease, and parks the card — no autostart.
-    ///   (b) Terminal transitions (`done`, `archived`): these mirror the
-    ///       engine's own lifecycle resolutions and are always allowed.
+    /// buttons. Same gesture as a drop on that column (see `attemptDrop`):
+    /// the engine resolves it, including dispatching a worker on a move into
+    /// Doing, and a move out of Doing with a live worker attached is refused
+    /// except to Backlog (stop + park) or Done.
     func moveTask(_ taskID: String, to column: WorkBoardColumnKey) {
-        guard let task = task(withID: taskID) else { return }
-        let targetStatus = column.targetStatus
-        guard task.status != targetStatus else { return }
-
-        if task.status == "active"
-            && !Self.terminalKanbanStatuses.contains(targetStatus)
-            && column != .backlog  // backlog drag = stop+park: engine handles teardown
-            && hasLiveWorker(forTaskID: taskID)
+        // An explicit Move is the same gesture as dropping the card on that
+        // column: route it through the drop path so the engine resolves it,
+        // refusals come back as `work_item_refused`, and the live-worker
+        // guard shows its message on the card.
+        //
+        // A blocked card is the exception: its popover button stays enabled
+        // in the column it already sits in, where a drop would be a no-op
+        // reorder. That button means "put it in this status" (unblock), so
+        // send the explicit status and let the engine apply and vet it.
+        if let task = task(withID: taskID),
+           task.status == "blocked",
+           effectiveBoardColumn(for: task) == column
         {
-            appendSystemMessage(
-                "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing.",
-                alwaysShow: true
-            )
+            engine.sendMoveWorkItemOnBoard(id: taskID, column: column, group: nil, explicitStatus: column.targetStatus)
             return
         }
-
-        // Optimistic update: move the card to the destination column immediately
-        // before the RPC completes. The engine remains the authority — on failure
-        // we bounce back via bounceBackOptimisticMoves.
-        let originColumn = effectiveBoardColumn(for: task)
-        pendingMoveOriginByTaskID[taskID] = originColumn
-        optimisticColumnByTaskID[taskID] = column
-        invalidateWorkCache()
-
-        engine.sendUpdateWorkItem(id: task.id, patch: ["status": targetStatus])
-
-        if targetStatus == "active" {
-            engine.sendRequestExecution(workItemId: task.id)
-        }
+        _ = attemptDrop(taskID, onColumn: column, group: nil)
     }
-
-    /// Statuses that the engine itself can drive a chore into at run
-    /// completion. The kanban must allow the human to mirror those
-    /// transitions even from `active` so a successful PR-merge flow
-    /// can move a card to Done without first stopping the worker.
-    private static let terminalKanbanStatuses: Set<String> = [
-        "done",
-        "archived",
-    ]
 
     /// True iff the work item has a non-terminal worker currently
     /// attached (running, paused on input, or idle between turns). Shared

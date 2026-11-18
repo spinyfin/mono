@@ -107,6 +107,7 @@ async fn dropping_a_queued_card_into_backlog_records_the_board_gesture() {
             target: BoardDropTarget::new(BoardColumn::Backlog, None),
             bypass_dispatch_pause: false,
             observed_pause_since_epoch_s: None,
+            explicit_status: None,
         },
     )
     .await;
@@ -358,6 +359,7 @@ async fn request_execution_and_drag_to_doing_record_the_human_who_cleared_deferr
             target: BoardDropTarget::new(BoardColumn::Doing, None),
             bypass_dispatch_pause: false,
             observed_pause_since_epoch_s: None,
+            explicit_status: None,
         },
     )
     .await;

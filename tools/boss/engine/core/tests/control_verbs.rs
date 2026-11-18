@@ -1476,6 +1476,7 @@ fn move_on_board_request(id: &str, column: BoardColumn, group: Option<BoardGroup
         target: BoardDropTarget::new(column, group),
         bypass_dispatch_pause: false,
         observed_pause_since_epoch_s: None,
+        explicit_status: None,
     }
 }
 
@@ -1920,13 +1921,13 @@ async fn board_drop_into_merging_group_is_refused() -> Result<()> {
         ))
         .await?
     {
-        FrontendEvent::WorkError { message } => {
+        FrontendEvent::WorkItemRefused { message, .. } => {
             assert!(
                 message.contains("Merging"),
                 "refusal must name the group it is about, got: {message}"
             );
         }
-        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+        other => return Err(anyhow!("expected WorkItemRefused, got: {other:?}")),
     }
     assert_eq!(
         fetch_task_status(&mut client, &chore.id).await?,

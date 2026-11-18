@@ -1,6 +1,6 @@
 //! Board drops use the same dependency admission as explicit starts.
 //! A CI-fix revision behind an `in_review` sibling can dispatch; a gated
-//! row receives a `work_error` naming the prerequisite.
+//! row is refused with a `WorkItemRefused` naming the prerequisite.
 
 use super::*;
 use crate::app::work_items::handle_move_work_item_on_board;
@@ -43,6 +43,7 @@ fn drop_on_doing(id: &str) -> FrontendRequest {
         target: BoardDropTarget::new(BoardColumn::Doing, None),
         bypass_dispatch_pause: false,
         observed_pause_since_epoch_s: None,
+        explicit_status: None,
     }
 }
 
@@ -209,7 +210,7 @@ async fn blocked_worker_failed_revision_dropped_on_doing_dispatches() {
 
 /// The refusal half of the contract: a revision whose prerequisite is
 /// genuinely unsatisfied (here, a sibling still `todo` — a live writer)
-/// must be refused by the engine with a `work_error` that names the gate
+/// must be refused by the engine with a `WorkItemRefused` that names the gate
 /// — so the app can surface the refusal reason — and must not move or
 /// dispatch. Same handler, same rule, same message family as an explicit
 /// start. A `worker_failed` sibling is not a live writer and is covered
@@ -255,17 +256,22 @@ async fn gated_revision_dropped_on_doing_is_refused_with_the_gate_named() {
     handle_move_work_item_on_board(ctx, drop_on_doing(&second.id)).await;
 
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => {
+        FrontendEvent::WorkItemRefused { code, message, .. } => {
+            assert_eq!(code, boss_protocol::BoardRefusalCode::UpdateRejected);
             assert!(
-                message.contains("gated by"),
+                message.contains("waiting on"),
                 "the refusal must say the row is gated, got: {message}"
             );
             assert!(
-                message.contains(&first.id),
+                message.contains(&first.name),
                 "the refusal must name the prerequisite holding the row, got: {message}"
             );
+            assert!(
+                !message.contains(&first.id),
+                "the refusal must not leak the internal id, got: {message}"
+            );
         }
-        other => panic!("expected a WorkError naming the gate, got: {other:?}"),
+        other => panic!("expected a WorkItemRefused naming the gate, got: {other:?}"),
     }
 
     let after = task_row(&server_state, &second.id);
@@ -324,11 +330,12 @@ async fn chore_gated_on_in_review_prerequisite_dropped_on_doing_is_refused() {
     handle_move_work_item_on_board(ctx, drop_on_doing(&dependent.id)).await;
 
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => {
-            assert!(message.contains("gated by"), "got: {message}");
-            assert!(message.contains(&prerequisite.id), "got: {message}");
+        FrontendEvent::WorkItemRefused { code, message, .. } => {
+            assert_eq!(code, boss_protocol::BoardRefusalCode::UpdateRejected);
+            assert!(message.contains("waiting on"), "got: {message}");
+            assert!(message.contains(&prerequisite.name), "got: {message}");
         }
-        other => panic!("expected a WorkError naming the gate, got: {other:?}"),
+        other => panic!("expected a WorkItemRefused naming the gate, got: {other:?}"),
     }
     assert_eq!(task_row(&server_state, &dependent.id).status, TaskStatus::Blocked);
 }
@@ -370,7 +377,13 @@ async fn quarantined_drop_restores_block_and_surfaces_explicit_start_error() {
     let sink = make_session_sink();
     handle_move_work_item_on_board(dispatch(&state, &sink, "quarantined-drop"), drop_on_doing(&task.id)).await;
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => assert_eq!(message, format!("{expected:#}")),
+        FrontendEvent::WorkItemRefused { code, message, .. } => {
+            assert_eq!(code, boss_protocol::BoardRefusalCode::DispatchRefused);
+            assert!(
+                message.contains(&format!("{expected:#}")),
+                "the refusal must carry the engine's reason, got: {message}"
+            );
+        }
         other => panic!("expected quarantine refusal, got {other:?}"),
     }
     let after = task_row(&state, &task.id);
@@ -454,7 +467,17 @@ async fn folded_revision_drop_is_refused_and_preserves_status() {
     let sink = make_session_sink();
     handle_move_work_item_on_board(dispatch(&state, &sink, "folded-drop"), drop_on_doing(&revision.id)).await;
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => assert!(message.contains("no board position"), "{message}"),
+        FrontendEvent::WorkItemRefused {
+            id,
+            code,
+            message,
+            suggested_action,
+        } => {
+            assert_eq!(id, revision.id);
+            assert_eq!(code, boss_protocol::BoardRefusalCode::NotACard);
+            assert_eq!(suggested_action, None);
+            assert!(message.contains("no board position"), "{message}");
+        }
         other => panic!("expected folded-card refusal, got {other:?}"),
     }
     assert_eq!(task_row(&state, &revision.id).status, TaskStatus::InReview);
@@ -520,7 +543,17 @@ async fn folded_ci_failure_revision_drop_is_refused_and_preserves_block() {
     )
     .await;
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => assert!(message.contains("no board position"), "{message}"),
+        FrontendEvent::WorkItemRefused {
+            id,
+            code,
+            message,
+            suggested_action,
+        } => {
+            assert_eq!(id, revision.id);
+            assert_eq!(code, boss_protocol::BoardRefusalCode::NotACard);
+            assert_eq!(suggested_action, None);
+            assert!(message.contains("no board position"), "{message}");
+        }
         other => panic!("expected folded-card refusal, got {other:?}"),
     }
     let after = task_row(&state, &revision.id);
