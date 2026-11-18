@@ -674,9 +674,10 @@ pub(crate) struct WaitArgs {
     #[arg(long)]
     reason: String,
 
-    /// How long to hold the produce-a-PR nudge. A compact duration such as
-    /// `30s`, `5m`, `2h`, or `1h30m`, or a bare integer number of seconds.
-    /// The engine rejects a value above 2 hours.
+    /// How long to hold auto-nudge asks, including the produce-a-PR nudge
+    /// and run-done declaration questions and their strikes. A compact
+    /// duration such as `30s`, `5m`, `2h`, or `1h30m`, or a bare integer
+    /// number of seconds. The engine rejects a value above 2 hours.
     #[arg(long)]
     duration: String,
 

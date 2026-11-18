@@ -1,14 +1,14 @@
-//! Worker-declared, time-bounded wait that holds the produce-a-PR nudge ladder.
+//! Worker-declared, time-bounded wait that holds auto-nudge asks.
 //!
 //! Companion to [`crate::hold_registry`]: that flag is an operator exemption
 //! from idle-park *and* stale-worker reap. This registry is the worker's own
 //! "I am deliberately waiting" signal, submitted through `boss propose wait`.
-//! It suppresses only the produce-a-PR nudge and the nudge circuit breaker.
+//! It suppresses the produce-a-PR nudge, run-done declaration asks and their
+//! strikes, and the nudge circuit breaker.
 //! An accepted declaration survives resumed turns until its bounded deadline.
 //! Status replies and job checks do not prove the background job finished.
 //! The 2-hour stale-worker reap, pane-death / dead-pid reconcile, hook-trust,
-//! and every other safety check
-//! keep firing.
+//! and every other safety check keep firing.
 //!
 //! Each declaration is capped at [`boss_protocol::WAIT_MAX_DURATION_SECS`];
 //! the sum of granted durations per execution is capped at

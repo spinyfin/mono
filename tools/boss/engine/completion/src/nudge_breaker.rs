@@ -265,6 +265,23 @@ impl NudgeBreaker {
         }
     }
 
+    /// Zero the consecutive count for `fingerprint` without touching
+    /// `total_count` or other fingerprints. A declared wait and a cleared
+    /// undeclared-run park both need the declaration-ask debt gone while the
+    /// absolute cap stays in place. A no-op when nothing is tracked or the
+    /// current fingerprint does not match.
+    pub fn reset_fingerprint_count(&self, execution_id: &str, fingerprint: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("NudgeBreaker mutex poisoned")
+            .get_mut(execution_id)
+            && entry.fingerprint == fingerprint
+        {
+            entry.count = 0;
+        }
+    }
+
     /// Hand back the nudge `nudge_id`, which was charged by [`Self::record`]
     /// and never reached the worker. Returns the number of consecutive
     /// delivery failures now on record.
@@ -488,6 +505,28 @@ mod tests {
             NudgeDecision::Proceed { count: 1 },
             "forget must reset the cycle",
         );
+    }
+
+    #[test]
+    fn reset_fingerprint_count_clears_consecutive_debt_and_keeps_the_absolute_cap() {
+        let breaker = NudgeBreaker::new();
+        let fp = "run_done_undeclared:exec_wait";
+        breaker.record("exec_wait", fp, 3, tick(0));
+        breaker.record("exec_wait", fp, 3, tick(1));
+        assert_eq!(breaker.counts("exec_wait"), Some((2, 2)));
+        breaker.reset_fingerprint_count("exec_wait", fp);
+        assert_eq!(
+            breaker.counts("exec_wait"),
+            Some((0, 2)),
+            "a wait or cleared park must not reset ABSOLUTE_MAX_NUDGES"
+        );
+        assert_eq!(
+            breaker.record("exec_wait", fp, 3, tick(2)),
+            NudgeDecision::Proceed { count: 1 }
+        );
+        assert_eq!(breaker.counts("exec_wait"), Some((1, 3)));
+        breaker.reset_fingerprint_count("exec_wait", "some other fingerprint");
+        assert_eq!(breaker.counts("exec_wait"), Some((1, 3)));
     }
 
     #[test]

@@ -69,8 +69,8 @@ async fn armed_pr_with_continuous_tools_never_asks_or_spends_strikes() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _, _, execution_id) = fixture(workspace.path());
     let (harness, states) = armed_harness(db.clone(), &execution_id);
-    // Each pass starts with the old, already-expired clock from the incident.
-    // Real PostToolUse ingress must protect the worker without any Stop.
+    // Each pass starts with a silence clock already past the horizon;
+    // PostToolUse ingress alone must hold the question without any Stop.
     for _ in 0..8 {
         expire_silence(&harness.handler, &states, &execution_id);
         states.apply_event(1, &post_tool());
@@ -153,7 +153,7 @@ async fn declared_wait_answers_the_question_and_clears_strikes() {
             harness.handler.on_stop(&execution_id).await,
             StopOutcome::WorkerWaitPending { .. }
         ));
-        assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), None);
+        assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((0, 1)));
         assert!(matches!(
             harness.handler.recheck_background_nudge(&execution_id).await,
             Some(StopOutcome::WorkerWaitPending { .. })
@@ -170,7 +170,7 @@ async fn declared_wait_answers_the_question_and_clears_strikes() {
     expire_silence(&harness.handler, &states, &execution_id);
     harness.handler.recheck_for_pr(&execution_id).await;
     assert_eq!(harness.probes.snapshot().len(), 2);
-    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((1, 1)));
+    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((1, 2)));
 }
 
 #[tokio::test]
@@ -214,4 +214,133 @@ async fn unanswered_asks_park_with_attention_without_failure_or_teardown() {
     );
     harness.handler.recheck_for_pr(&execution_id).await;
     assert_eq!(harness.probes.snapshot().len(), 3);
+}
+
+#[tokio::test]
+async fn failed_declaration_delivery_is_retried_then_unanswered_asks_park() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = fixture(workspace.path());
+    let (harness, states) = armed_harness(db.clone(), &execution_id);
+    harness.probes.hold_pending_turn_boundary(true);
+    states.apply_event(1, &stop());
+    expire_silence(&harness.handler, &states, &execution_id);
+    assert!(matches!(
+        harness.handler.on_stop(&execution_id).await,
+        StopOutcome::AwaitingRunDoneDeclaration { .. }
+    ));
+    assert_eq!(harness.probes.snapshot().len(), 1);
+    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((1, 1)));
+    assert!(harness.probes.deliver_snapshot().is_empty());
+
+    expire_silence(&harness.handler, &states, &execution_id);
+    let retried = harness.handler.recheck_for_pr(&execution_id).await;
+    assert!(
+        matches!(retried, StopOutcome::AwaitingRunDoneDeclaration { ref reason } if reason.contains("awaiting delivery")),
+        "a pending ask must be retried without a new strike: {retried:?}"
+    );
+    assert_eq!(harness.probes.snapshot().len(), 1);
+    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((1, 1)));
+    assert_eq!(harness.probes.deliver_snapshot(), vec![execution_id.clone()]);
+
+    harness.probes.mark_turn_boundary_probe_delivered();
+    harness.probes.hold_pending_turn_boundary(false);
+    expire_silence(&harness.handler, &states, &execution_id);
+    for _ in 0..2 {
+        assert!(matches!(
+            harness.handler.on_stop(&execution_id).await,
+            StopOutcome::AwaitingRunDoneDeclaration { .. }
+        ));
+    }
+    assert!(matches!(
+        harness.handler.recheck_for_pr(&execution_id).await,
+        StopOutcome::RunUndeclaredParked { .. }
+    ));
+    assert_eq!(harness.probes.snapshot().len(), 3);
+    assert!(db.execution_run_undeclared(&execution_id).unwrap());
+}
+
+#[tokio::test]
+async fn parked_run_that_later_declares_done_clears_the_stamp_and_attention() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = fixture(workspace.path());
+    let (harness, states) = armed_harness(db.clone(), &execution_id);
+    states.apply_event(1, &stop());
+    expire_silence(&harness.handler, &states, &execution_id);
+    for _ in 0..3 {
+        harness.handler.on_stop(&execution_id).await;
+    }
+    assert!(matches!(
+        harness.handler.recheck_for_pr(&execution_id).await,
+        StopOutcome::RunUndeclaredParked { .. }
+    ));
+    assert!(db.execution_run_undeclared(&execution_id).unwrap());
+    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((3, 3)));
+
+    crate::test_support::declare_delivered(&db, &execution_id);
+    assert!(!db.execution_run_undeclared(&execution_id).unwrap());
+    let open = db
+        .list_attention_items(&execution_id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == RUN_UNDECLARED_ATTENTION_KIND && item.status != "resolved")
+        .count();
+    assert_eq!(open, 0);
+}
+
+#[tokio::test]
+async fn resolving_undeclared_attention_asks_again_instead_of_reparking() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = fixture(workspace.path());
+    let (harness, states) = armed_harness(db.clone(), &execution_id);
+    states.apply_event(1, &stop());
+    expire_silence(&harness.handler, &states, &execution_id);
+    for _ in 0..3 {
+        harness.handler.on_stop(&execution_id).await;
+    }
+    assert!(matches!(
+        harness.handler.recheck_for_pr(&execution_id).await,
+        StopOutcome::RunUndeclaredParked { .. }
+    ));
+    assert_eq!(harness.probes.snapshot().len(), 3);
+    db.resolve_attention_kind_for_execution(&execution_id, RUN_UNDECLARED_ATTENTION_KIND)
+        .unwrap();
+    expire_silence(&harness.handler, &states, &execution_id);
+    assert!(matches!(
+        harness.handler.recheck_for_pr(&execution_id).await,
+        StopOutcome::AwaitingRunDoneDeclaration { .. }
+    ));
+    assert_eq!(harness.probes.snapshot().len(), 4);
+    assert!(!db.execution_run_undeclared(&execution_id).unwrap());
+    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((1, 4)));
+}
+
+#[tokio::test]
+async fn resumed_activity_drops_an_undelivered_declaration_ask_and_its_strike() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = fixture(workspace.path());
+    let (harness, states) = armed_harness(db, &execution_id);
+    harness.probes.hold_pending_turn_boundary(true);
+    states.apply_event(1, &stop());
+    expire_silence(&harness.handler, &states, &execution_id);
+    harness.handler.on_stop(&execution_id).await;
+    assert_eq!(harness.probes.snapshot().len(), 1);
+    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((1, 1)));
+    states.apply_event(
+        1,
+        &WorkerEvent::PreToolUse {
+            session_id: "session".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+        },
+    );
+    expire_silence(&harness.handler, &states, &execution_id);
+    assert!(matches!(
+        harness.handler.recheck_for_pr(&execution_id).await,
+        StopOutcome::AwaitingRunDoneDeclaration { .. }
+    ));
+    assert!(
+        harness.probes.clear_snapshot().contains(&execution_id),
+        "the undelivered completion question must be dropped once activity resumes"
+    );
+    assert_eq!(harness.handler.nudge_breaker.counts(&execution_id), Some((0, 0)));
 }

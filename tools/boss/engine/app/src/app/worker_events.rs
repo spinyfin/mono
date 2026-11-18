@@ -2144,7 +2144,7 @@ pub(super) async fn dispatch_probe_on_post_tool_use(
         return ProbeDispatchOutcome::NoRunId;
     };
 
-    if server_state.next_probe_requires_turn_boundary(run_id) {
+    if server_state.next_probe_requires_turn_boundary(run_id) && !server_state.has_non_boundary_pending_probe(run_id) {
         return ProbeDispatchOutcome::NotADeliveryBoundary;
     }
 
@@ -2468,6 +2468,7 @@ pub(super) async fn dispatch_probe_now(server_state: &Arc<ServerState>, run_id: 
             .live_worker_states
             .declaration_activity_for_run(run_id)
             .is_some_and(|activity| activity.at_turn_boundary)
+        && !server_state.has_non_boundary_pending_probe(run_id)
     {
         return ProbeDispatchOutcome::NotADeliveryBoundary;
     }

@@ -97,10 +97,6 @@ mod tests {
                 session_id: "s".into(),
                 awaiting_model: true,
             },
-            WorkerEvent::Notification {
-                session_id: "s".into(),
-                message: "permission".into(),
-            },
         ] {
             states.set_declaration_activity_at_for_test(1, old.into());
             states.apply_event(1, &event);
@@ -108,6 +104,23 @@ mod tests {
             assert_ne!(activity.last_activity_at.as_deref(), Some(old));
             assert!(!activity.at_turn_boundary);
         }
+        states.set_declaration_activity_at_for_test(1, old.into());
+        states.apply_event(
+            1,
+            &WorkerEvent::Notification {
+                session_id: "s".into(),
+                message: "permission".into(),
+            },
+        );
+        assert_eq!(
+            states
+                .declaration_activity_for_run("run")
+                .unwrap()
+                .last_activity_at
+                .as_deref(),
+            Some(old),
+            "a Notification is a permission prompt or idle notice, not work"
+        );
         states.set_declaration_activity_at_for_test(1, old.into());
         states.set_live_status(1, Some("engine display update".into()));
         states.apply_event(
