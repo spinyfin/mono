@@ -24,6 +24,8 @@ extension ChatViewModel {
         attentionMembers: [Attention],
         plannerRuns: [PlannerRunSummary] = []
     ) {
+        boardDiagnostics.record("tree-apply", ["product": boardDiagnostics.token(product.id),
+            "tasks": String(tasks.count), "chores": String(chores.count)])
         // Fan-out regression counter (design entry 2): full work-tree applies.
         UIUpdateCounters.shared.recordApplyWorkTree()
         // Population timing: measure this @MainActor apply burst
@@ -280,6 +282,7 @@ extension ChatViewModel {
     /// on a revision row). Project-membership, kind, or unknown-previous
     /// updates still full-invalidate.
     func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
+        boardDiagnostics.recordAppliedRow(updatedTask)
         // Fan-out regression counter (design entry 2): single-task board update.
         UIUpdateCounters.shared.recordIncrementalTaskUpdate()
         let previous = task(withID: updatedTask.id)
