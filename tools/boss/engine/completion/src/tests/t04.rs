@@ -1791,11 +1791,14 @@ async fn pure_rebase_skip_gate_skips_conflict_resolution_with_identical_diff() {
 
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
-        .with_branch_verifier(verifier.clone())
+        .with_branch_verifier(conflict_delivery::published_verifier(verifier.clone(), Ok(head_after)))
         .with_pr_state_checker(open_pr_checker())
-        .with_merge_probe(Arc::new(FixedMergeabilityProbe {
-            mergeability: boss_observation_contracts::OpenPrMergeability::Clean,
-        }))
+        .with_merge_probe(conflict_delivery::published_probe(
+            Arc::new(FixedMergeabilityProbe {
+                mergeability: boss_observation_contracts::OpenPrMergeability::Clean,
+            }),
+            head_after,
+        ))
         .with_enable_revision_triggered_reviews(true);
 
     let outcome = handler.on_stop(&execution_id).await;
@@ -1864,11 +1867,14 @@ async fn pure_rebase_skip_gate_does_not_skip_when_content_differs() {
 
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
-        .with_branch_verifier(verifier)
+        .with_branch_verifier(conflict_delivery::published_verifier(verifier, Ok(head_after)))
         .with_pr_state_checker(open_pr_checker())
-        .with_merge_probe(Arc::new(FixedMergeabilityProbe {
-            mergeability: boss_observation_contracts::OpenPrMergeability::Clean,
-        }))
+        .with_merge_probe(conflict_delivery::published_probe(
+            Arc::new(FixedMergeabilityProbe {
+                mergeability: boss_observation_contracts::OpenPrMergeability::Clean,
+            }),
+            head_after,
+        ))
         .with_enable_revision_triggered_reviews(true);
 
     let outcome = handler.on_stop(&execution_id).await;
@@ -2166,11 +2172,14 @@ async fn pure_rebase_skip_gate_ignores_attempt_row_not_owned_by_this_revision() 
 
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
-        .with_branch_verifier(verifier.clone())
+        .with_branch_verifier(conflict_delivery::published_verifier(verifier.clone(), Ok(head_after)))
         .with_pr_state_checker(open_pr_checker())
-        .with_merge_probe(Arc::new(FixedMergeabilityProbe {
-            mergeability: boss_observation_contracts::OpenPrMergeability::Clean,
-        }))
+        .with_merge_probe(conflict_delivery::published_probe(
+            Arc::new(FixedMergeabilityProbe {
+                mergeability: boss_observation_contracts::OpenPrMergeability::Clean,
+            }),
+            head_after,
+        ))
         .with_enable_revision_triggered_reviews(true);
 
     let outcome = handler.on_stop(&execution_id).await;
