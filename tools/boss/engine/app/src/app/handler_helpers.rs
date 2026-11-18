@@ -150,10 +150,10 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
 
     // Pre-start spawn-failure streaks: a (driver, worker kind) combination
     // whose spawns keep failing before a pane exists, with no success in
-    // between. Listed straight after the dispatch outage above, which outranks
-    // it (keep that order: the banner's headline is the first issue), and "a whole class of worker cannot start" is the one entry
-    // here that is actively losing work while it sits unread. The engine
-    // renders the text; the app shows it verbatim. See
+    // between. They follow the dispatch outage above, which must stay first:
+    // the banner headline is the first issue. "A whole class of worker cannot
+    // start" is the one entry here that is actively losing work while it sits
+    // unread. The engine renders the text; the app shows it verbatim. See
     // [`boss_engine_runtime::pre_start_streak`].
     let spawn_failure_streaks = server_state.execution_coordinator.pre_start_streaks().active_alerts();
     let streak_now = boss_engine_utils::epoch_time::now_epoch_secs();

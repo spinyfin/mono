@@ -51,44 +51,118 @@ impl ExecutionCoordinator {
     }
 
     /// Fold a refused host selection into the global dispatch outage record
-    /// when it was a global refusal. The per-item failure handling that
-    /// follows is unchanged: each item keeps its own retry, and this only
-    /// adds the aggregate that makes the outage visible.
-    pub(super) async fn record_dispatch_refusal(&self, execution: &WorkExecution, err: &anyhow::Error) {
-        let Some(exclusions) = err
+    /// when it was a global refusal, before the refusal's own event is written
+    /// so that event can name the outage it joined. The per-item failure
+    /// handling that follows is unchanged: each item keeps its own retry, and
+    /// this only adds the aggregate that makes the outage visible.
+    pub(super) fn fold_dispatch_refusal(
+        &self,
+        execution: &WorkExecution,
+        err: &anyhow::Error,
+    ) -> Option<GlobalRefusal> {
+        let exclusions = err
             .downcast_ref::<HostSelectionFailure>()
-            .and_then(|failure| failure.global_exclusions.clone())
-        else {
-            return;
-        };
+            .and_then(|failure| failure.global_exclusions.clone())?;
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        let effect =
+        let recorded =
             self.dispatch_outage
-                .record_refusal(exclusions.clone(), &execution.work_item_id, &execution.id, now);
-        if effect != RefusalEffect::Started {
+                .fold_refusal(exclusions.clone(), &execution.work_item_id, &execution.id, now);
+        Some(GlobalRefusal {
+            exclusions,
+            recorded,
+            work_item_id: execution.work_item_id.clone(),
+            execution_id: execution.id.clone(),
+        })
+    }
+
+    /// After the refusal's `host_selected` event is written: announce the
+    /// outage if this refusal started it.
+    pub(super) async fn announce_dispatch_outage(&self, refusal: &GlobalRefusal) {
+        if refusal.recorded.effect != RefusalEffect::Started {
             return;
         }
         tracing::error!(
-            execution_id = %execution.id,
-            work_item_id = %execution.work_item_id,
-            hosts = %exclusions
+            execution_id = %refusal.execution_id,
+            work_item_id = %refusal.work_item_id,
+            hosts = %refusal
+                .exclusions
                 .iter()
                 .map(|exclusion| format!("{}: {}", exclusion.host_id, exclusion.reason))
                 .collect::<Vec<_>>()
                 .join("; "),
             "dispatch outage started: every host is excluded, so no new worker can start",
         );
-        self.dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::DispatchOutageStarted, DispatchOutcome::Error, "engine")
-                    .with_work_item(&execution.work_item_id)
-                    .with_details(serde_json::json!({
-                        "started_epoch_s": now,
-                        "triggering_execution_id": execution.id,
-                        "host_exclusions": exclusions,
-                    })),
-            )
-            .await;
+        self.dispatch_events.emit(outage_started_event(refusal)).await;
+    }
+
+    /// Global-health check for the startup-scan hold: a failed startup worker
+    /// scan holds every work item, so a launch refused at admission or skipped
+    /// by a reconcile/rescan pass never reaches host selection. Each such item
+    /// is folded into the outage here, with the verbatim scan error, so the
+    /// banner and `bossctl dispatch state` report it. A no-op without a scan
+    /// error. Sync (events go out on a spawned task) so it can sit in the
+    /// synchronous admission path.
+    pub(super) fn note_scan_error_hold_refusals(&self, work_item_ids: &[String]) {
+        if work_item_ids.is_empty() {
+            return;
+        }
+        let Some(exclusions) = self.scan_error_hold_exclusions() else {
+            return;
+        };
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let message = exclusions
+            .first()
+            .map(|exclusion| exclusion.reason.clone())
+            .unwrap_or_default();
+        let mut events = Vec::new();
+        for work_item_id in work_item_ids {
+            let refusal = GlobalRefusal {
+                recorded: self
+                    .dispatch_outage
+                    .fold_refusal(exclusions.clone(), work_item_id, "", now),
+                exclusions: exclusions.clone(),
+                work_item_id: work_item_id.clone(),
+                execution_id: String::new(),
+            };
+            // No execution exists yet: the refusal is filed under the engine.
+            events.push(
+                DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, "engine")
+                    .with_work_item(work_item_id)
+                    .with_error(&anyhow!("{message}"))
+                    .with_details(refusal.refusal_details()),
+            );
+            if refusal.recorded.effect == RefusalEffect::Started {
+                tracing::error!(
+                    work_item_id = %work_item_id,
+                    "dispatch outage started: a failed startup worker scan holds every work item",
+                );
+                events.push(outage_started_event(&refusal));
+            }
+        }
+        let sink = Arc::clone(&self.dispatch_events);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    for event in events {
+                        sink.emit(event).await;
+                    }
+                });
+            }
+            Err(_) => tracing::warn!("dispatch outage recorded without a runtime to write its events"),
+        }
+    }
+
+    /// The sweep form of [`Self::note_scan_error_hold_refusals`]: the active
+    /// work the hold is keeping from dispatching (reconcile and rescan skip
+    /// it silently).
+    pub(super) fn note_scan_error_hold_blocking_active_work(&self) {
+        if self.scan_error_hold_exclusions().is_none() {
+            return;
+        }
+        match self.work_db.list_active_chores_without_live_run() {
+            Ok(ids) => self.note_scan_error_hold_refusals(&ids),
+            Err(err) => tracing::warn!(error = %format!("{err:#}"), "dispatch outage: could not list held active work"),
+        }
     }
 
     /// A dispatch just claimed a host. If a global outage was active, that
@@ -124,4 +198,36 @@ impl ExecutionCoordinator {
             )
             .await;
     }
+}
+
+/// A refusal folded into the outage record, kept to build its events.
+pub(super) struct GlobalRefusal {
+    exclusions: Vec<DispatchOutageHostExclusion>,
+    recorded: RecordedRefusal,
+    work_item_id: String,
+    execution_id: String,
+}
+
+impl GlobalRefusal {
+    /// `details` of the refusal's `host_selected` error event. It names the
+    /// outage it joined by start time, so a replay does not depend on the
+    /// order concurrent dispatchers wrote their events in.
+    pub(super) fn refusal_details(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reason": "no_eligible_host",
+            "global_outage": true,
+            "outage_started_epoch_s": self.recorded.outage_started_epoch_s,
+            "host_exclusions": self.exclusions,
+        })
+    }
+}
+
+fn outage_started_event(refusal: &GlobalRefusal) -> DispatchEvent {
+    DispatchEvent::new(Stage::DispatchOutageStarted, DispatchOutcome::Error, "engine")
+        .with_work_item(&refusal.work_item_id)
+        .with_details(serde_json::json!({
+            "started_epoch_s": refusal.recorded.outage_started_epoch_s,
+            "triggering_execution_id": refusal.execution_id,
+            "host_exclusions": refusal.exclusions,
+        }))
 }
