@@ -93,20 +93,57 @@ pub(super) fn fixture(
 /// All protocol kinds/statuses, all answer types and both deletion states:
 /// live parents expose a card that can be answered and submitted; deleted
 /// parents retain history without creating an actionable attention.
-#[tokio::test]
-async fn blocked_question_always_has_an_answerable_surface() {
-    for kind in TaskKind::ALL {
-        for status in TaskStatus::ALL {
-            for (payload, answer) in [
-                (operator_question_payload(), "yes"),
-                (operator_question_payload(), "no"),
-                (multiple_choice::multiple_choice_payload(), "Gradual"),
-                (prerequisite_question_payload(), "yes"),
-                (prerequisite_question_payload(), "no"),
-            ] {
-                for deleted in [false, true] {
-                    exercise(kind, status, payload.clone(), answer, deleted).await;
+///
+/// Every case needs its own server and database, so the matrix is one test
+/// per kind rather than one test for all of it: run as a single test, its 480
+/// cases executed back to back on one thread and that test alone set the wall
+/// time of whichever shard it landed in. Separate tests let libtest run the
+/// kinds side by side and let the shard partition spread them out.
+/// `matrix_covers_every_kind` keeps the list below exhaustive.
+macro_rules! answerable_surface_per_kind {
+    ($($name:ident => $kind:ident),+ $(,)?) => {
+        mod blocked_question_always_has_an_answerable_surface {
+            use super::*;
+
+            const KINDS: &[TaskKind] = &[$(TaskKind::$kind),+];
+
+            #[test]
+            fn matrix_covers_every_kind() {
+                assert_eq!(KINDS, TaskKind::ALL);
+            }
+
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    exercise_kind(&TaskKind::$kind).await;
                 }
+            )+
+        }
+    };
+}
+
+answerable_surface_per_kind! {
+    chore => Chore,
+    design => Design,
+    followup => Followup,
+    investigation => Investigation,
+    design_postmortem => DesignPostmortem,
+    project_task => ProjectTask,
+    revision => Revision,
+    task => Task,
+}
+
+async fn exercise_kind(kind: &TaskKind) {
+    for status in TaskStatus::ALL {
+        for (payload, answer) in [
+            (operator_question_payload(), "yes"),
+            (operator_question_payload(), "no"),
+            (multiple_choice::multiple_choice_payload(), "Gradual"),
+            (prerequisite_question_payload(), "yes"),
+            (prerequisite_question_payload(), "no"),
+        ] {
+            for deleted in [false, true] {
+                exercise(kind, status, payload.clone(), answer, deleted).await;
             }
         }
     }
