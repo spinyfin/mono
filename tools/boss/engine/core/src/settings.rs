@@ -28,6 +28,18 @@ pub struct SettingSpec {
     pub default_enabled: bool,
 }
 
+/// One registered integer-valued setting. Bounded so a typo in
+/// `settings.toml` (a zero interval, a negative retention) can never wedge
+/// the consumer: out-of-range values are clamped on load.
+#[derive(Debug, Clone)]
+pub struct IntSettingSpec {
+    pub key: &'static str,
+    pub description: &'static str,
+    pub default: i64,
+    pub min: i64,
+    pub max: i64,
+}
+
 /// Presence in `settings.toml` is a hard error so a stale empty list cannot
 /// silently select a hosting mode that no longer exists.
 const TMUX_HOSTING_SETTING: &str = "workers.tmux_hosting";
@@ -105,6 +117,29 @@ pub const REGISTRY: &[SettingSpec] = &[
     },
 ];
 
+/// Integer settings. Read with [`SettingsStore::get_int`]; applied at
+/// engine start (a restart picks up an edited file).
+///
+/// In `settings.toml` write the key quoted, as the store itself does
+/// (`"host_load.retention_days" = 14`); the nested-table form
+/// (`[host_load]` / `retention_days = 14`) is accepted too.
+pub const INT_REGISTRY: &[IntSettingSpec] = &[
+    IntSettingSpec {
+        key: "host_load.sample_interval_seconds",
+        description: "Seconds between host-load samples (load average, CPU, memory, swap) recorded into the retained host_load_samples series.",
+        default: boss_engine_host_load::DEFAULT_INTERVAL_SECONDS as i64,
+        min: boss_engine_host_load::MIN_INTERVAL_SECONDS as i64,
+        max: 3600,
+    },
+    IntSettingSpec {
+        key: "host_load.retention_days",
+        description: "Days of host-load samples kept in state.db before pruning.",
+        default: boss_engine_host_load::DEFAULT_RETENTION_DAYS as i64,
+        min: boss_engine_host_load::MIN_RETENTION_DAYS as i64,
+        max: 365,
+    },
+];
+
 /// Wire/display snapshot of one setting's current state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingSnapshot {
@@ -128,6 +163,22 @@ struct SettingsState {
     /// the file by `database_backup::OffsiteRuntime`), but carried through
     /// so that toggling a boolean setting never erases it from disk.
     backup: Option<toml::Value>,
+    integers: HashMap<String, i64>,
+}
+
+/// Find `key` at the top level of the file, or as a path through nested
+/// tables (`host_load.retention_days` written as `[host_load]` plus
+/// `retention_days`).
+fn lookup_nested<'a>(settings: &'a HashMap<String, toml::Value>, key: &str) -> Option<&'a toml::Value> {
+    if let Some(value) = settings.get(key) {
+        return Some(value);
+    }
+    let (head, rest) = key.split_once('.')?;
+    let mut current = settings.get(head)?;
+    for part in rest.split('.') {
+        current = current.as_table()?.get(part)?;
+    }
+    Some(current)
 }
 
 /// Thread-safe store. In-memory overrides keyed by setting key;
@@ -175,6 +226,26 @@ impl SettingsStore {
             backup: parsed.settings.get(BACKUP_TABLE_KEY).cloned(),
             ..SettingsState::default()
         };
+        for spec in INT_REGISTRY {
+            let Some(value) = lookup_nested(&parsed.settings, spec.key) else {
+                continue;
+            };
+            let raw = value
+                .as_integer()
+                .ok_or_else(|| anyhow::anyhow!("setting {:?} must be an integer, got {value}", spec.key))?;
+            let clamped = raw.clamp(spec.min, spec.max);
+            if clamped != raw {
+                tracing::warn!(
+                    key = spec.key,
+                    value = raw,
+                    used = clamped,
+                    "settings: value out of range ({}..={}); clamping",
+                    spec.min,
+                    spec.max,
+                );
+            }
+            next.integers.insert(spec.key.to_owned(), clamped);
+        }
         for (key, value) in parsed.settings {
             // `workers.always_use_opus` was replaced by
             // `workers.non_opus_permission_mode`. If the old key is still in the
@@ -205,6 +276,14 @@ impl SettingsStore {
         let spec = REGISTRY.iter().find(|spec| spec.key == key)?;
         let guard = self.state.lock().expect("settings lock poisoned");
         Some(guard.booleans.get(key).copied().unwrap_or(spec.default_enabled))
+    }
+
+    /// Current value of an integer setting: the override if present,
+    /// else the registry default. `None` when the key is unknown.
+    pub fn get_int(&self, key: &str) -> Option<i64> {
+        let spec = INT_REGISTRY.iter().find(|spec| spec.key == key)?;
+        let guard = self.state.lock().expect("settings lock poisoned");
+        Some(guard.integers.get(key).copied().unwrap_or(spec.default))
     }
 
     /// Convenience for the one-line consumer check.
@@ -307,12 +386,17 @@ impl SettingsStore {
     fn write_to_disk(&self) -> Result<()> {
         let serialized = {
             let guard = self.state.lock().expect("settings lock poisoned");
-            let settings = guard
+            let mut settings = guard
                 .booleans
                 .iter()
                 .map(|(key, value)| (key.clone(), toml::Value::Boolean(*value)))
+                .chain(
+                    guard
+                        .integers
+                        .iter()
+                        .map(|(key, value)| (key.clone(), toml::Value::Integer(*value))),
+                )
                 .collect::<HashMap<_, _>>();
-            let mut settings = settings;
             if let Some(backup) = &guard.backup {
                 settings.insert(BACKUP_TABLE_KEY.to_owned(), backup.clone());
             }
@@ -473,6 +557,56 @@ mod tests {
         store.load().unwrap();
         assert!(store.is_enabled("default_pr_draft_mode"));
         assert!(store.get("stale_setting").is_none());
+    }
+
+    #[test]
+    fn int_settings_default_then_load_from_flat_and_nested_keys() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert_eq!(store.get_int("host_load.sample_interval_seconds"), Some(60));
+        assert_eq!(store.get_int("host_load.retention_days"), Some(7));
+        assert_eq!(store.get_int("not_a_real_setting"), None);
+
+        std::fs::write(
+            store.path(),
+            "\"host_load.sample_interval_seconds\" = 30\n[host_load]\nretention_days = 14\n",
+        )
+        .unwrap();
+        store.load().unwrap();
+        assert_eq!(store.get_int("host_load.sample_interval_seconds"), Some(30));
+        assert_eq!(store.get_int("host_load.retention_days"), Some(14));
+    }
+
+    #[test]
+    fn int_settings_are_clamped_and_must_be_integers() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        std::fs::write(
+            store.path(),
+            "\"host_load.sample_interval_seconds\" = 0\n\"host_load.retention_days\" = 100000\n",
+        )
+        .unwrap();
+        store.load().unwrap();
+        assert_eq!(store.get_int("host_load.sample_interval_seconds"), Some(5));
+        assert_eq!(store.get_int("host_load.retention_days"), Some(365));
+
+        std::fs::write(store.path(), "\"host_load.retention_days\" = \"week\"\n").unwrap();
+        let err = store.load().unwrap_err();
+        assert!(err.to_string().contains("host_load.retention_days"), "{err}");
+    }
+
+    #[test]
+    fn setting_a_boolean_preserves_integer_overrides_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        std::fs::write(store.path(), "\"host_load.retention_days\" = 3\n").unwrap();
+        store.load().unwrap();
+        store.set("default_pr_draft_mode", true).unwrap();
+        let reloaded = make_store(&tmp);
+        reloaded.load().unwrap();
+        assert!(reloaded.is_enabled("default_pr_draft_mode"));
+        assert_eq!(reloaded.get_int("host_load.retention_days"), Some(3));
     }
 
     #[test]
