@@ -68,14 +68,33 @@ fn copy_stream_to_offsite(
     host_dir: &Path,
     staging_dir: &Path,
 ) -> Result<CopyOutcome> {
+    let same_volume = on_same_volume(staging_dir, host_dir);
+    copy_via_route(source, name, host_dir, staging_dir, same_volume, &relay_candidates())
+}
+
+/// Directories outside the synced tree that may sit on the destination's
+/// volume, tried in order when the local staging directory is not.
+fn relay_candidates() -> Vec<PathBuf> {
+    vec![std::env::temp_dir().join("boss-offsite-relay")]
+}
+
+/// The copy itself, with the volume decision made by the caller.
+///
+/// The backup is always written and fsynced to `staging_dir` first. The
+/// publish step then either renames it into place (same volume) or relays it
+/// across volumes; see [`publish_across_volumes`].
+fn copy_via_route(
+    source: &mut impl Read,
+    name: &str,
+    host_dir: &Path,
+    staging_dir: &Path,
+    same_volume: bool,
+    relays: &[PathBuf],
+) -> Result<CopyOutcome> {
     let final_path = host_dir.join(name);
     std::fs::create_dir_all(staging_dir).with_context(|| format!("create staging dir {}", staging_dir.display()))?;
-    let bytes = if on_same_volume(staging_dir, host_dir) {
-        publish_from_local_staging(source, &staging_dir.join(name), &final_path)
-    } else {
-        write_stream_atomic(&final_path, source).map_err(Into::into)
-    }
-    .with_context(|| format!("copy {name} to {}", final_path.display()))?;
+    let bytes = publish_from_local_staging(source, &staging_dir.join(name), &final_path, same_volume, relays)
+        .with_context(|| format!("copy {name} to {}", final_path.display()))?;
     verify_published(&final_path, bytes)?;
     Ok(CopyOutcome {
         copied_path: final_path,
@@ -83,20 +102,77 @@ fn copy_stream_to_offsite(
     })
 }
 
-/// Write the whole copy to `staged`, then move it to `final_path` in one
-/// rename. A failed attempt removes its staged file.
-fn publish_from_local_staging(source: &mut impl Read, staged: &Path, final_path: &Path) -> Result<u64> {
-    struct Staged<'a>(&'a Path);
-    impl Drop for Staged<'_> {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(self.0);
+/// Removes its file when dropped, so a failed attempt leaves nothing behind.
+struct Cleanup<'a>(&'a Path);
+impl Drop for Cleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// Write the whole copy to `staged`, then publish it at `final_path`.
+fn publish_from_local_staging(
+    source: &mut impl Read,
+    staged: &Path,
+    final_path: &Path,
+    same_volume: bool,
+    relays: &[PathBuf],
+) -> Result<u64> {
+    let _cleanup = Cleanup(staged);
+    let bytes = write_stream_atomic(staged, source).with_context(|| format!("stage {}", staged.display()))?;
+    if same_volume {
+        match std::fs::rename(staged, final_path) {
+            Ok(()) => return Ok(bytes),
+            Err(err) if is_cross_device(&err) => {
+                tracing::warn!(
+                    staged = %staged.display(),
+                    destination = %final_path.display(),
+                    "offsite backup: rename crossed devices despite matching volume ids; relaying instead"
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("move {} into the destination", staged.display()));
+            }
         }
     }
-    let staged = Staged(staged);
-    let bytes = write_stream_atomic(staged.0, source).with_context(|| format!("stage {}", staged.0.display()))?;
-    std::fs::rename(staged.0, final_path)
-        .with_context(|| format!("move {} into the destination", staged.0.display()))?;
+    publish_across_volumes(staged, final_path, relays)?;
     Ok(bytes)
+}
+
+fn is_cross_device(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::CrossesDevices || err.raw_os_error() == Some(18)
+}
+
+/// Publish the already-staged `staged` into a different volume.
+///
+/// Preferred: copy it to a relay directory outside the synced tree that sits
+/// on the destination's volume, then rename it in, so the sync agent sees one
+/// complete new file. Last resort, when no relay directory shares the
+/// destination's volume: stream a `.tmp` sibling inside the destination and
+/// rename it, which the sync agent can observe. That path logs a warning.
+fn publish_across_volumes(staged: &Path, final_path: &Path, relays: &[PathBuf]) -> Result<()> {
+    let host_dir = final_path.parent().context("destination has no parent directory")?;
+    let name = final_path.file_name().context("destination has no file name")?;
+    for relay in relays {
+        if std::fs::create_dir_all(relay).is_err() || !on_same_volume(relay, host_dir) {
+            continue;
+        }
+        let relayed = relay.join(name);
+        let _cleanup = Cleanup(&relayed);
+        let mut staged_file = File::open(staged).with_context(|| format!("open {}", staged.display()))?;
+        write_stream_atomic(&relayed, &mut staged_file).with_context(|| format!("relay {}", relayed.display()))?;
+        std::fs::rename(&relayed, final_path)
+            .with_context(|| format!("move {} into the destination", relayed.display()))?;
+        return Ok(());
+    }
+    tracing::warn!(
+        staging_dirs = ?relays,
+        destination = %host_dir.display(),
+        "offsite backup: no staging directory shares the destination's volume; staging a .tmp file inside the destination, which a sync agent can observe"
+    );
+    let mut staged_file = File::open(staged).with_context(|| format!("open {}", staged.display()))?;
+    write_stream_atomic(final_path, &mut staged_file)?;
+    Ok(())
 }
 
 /// Whether a rename from `staging_dir` into `host_dir` stays on one volume.
@@ -277,6 +353,74 @@ mod tests {
         let staging = tmp.path().join("staging");
         assert!(copy_to_offsite(&src, &blocked, &staging).is_err());
         assert!(names(&staging).is_empty());
+    }
+
+    const NAME: &str = "state.db.bak-20260101-120000";
+
+    fn route(tmp: &TempDir, relays: &[PathBuf], reader: &mut impl Read) -> (PathBuf, PathBuf, Result<CopyOutcome>) {
+        let (host, staging) = dirs(tmp);
+        let out = copy_via_route(reader, NAME, &host, &staging, false, relays);
+        (host, staging, out)
+    }
+
+    #[test]
+    fn cross_volume_route_relays_outside_the_destination() {
+        let tmp = TempDir::new().unwrap();
+        let relay = tmp.path().join("relay");
+        let (host, staging) = dirs(&tmp);
+        let mut reader = ObservingReader {
+            chunks: vec![b"first-", b"second"],
+            host: &host,
+            staging: &staging,
+            seen_in_host: Vec::new(),
+            seen_in_staging: Vec::new(),
+        };
+        let out = copy_via_route(&mut reader, NAME, &host, &staging, false, std::slice::from_ref(&relay)).unwrap();
+        assert!(reader.seen_in_host.is_empty(), "{:?}", reader.seen_in_host);
+        assert_eq!(std::fs::read(&out.copied_path).unwrap(), b"first-second");
+        assert_eq!(names(&host), [NAME]);
+        assert!(names(&staging).is_empty());
+        assert!(names(&relay).is_empty());
+    }
+
+    #[test]
+    fn cross_volume_without_relay_falls_back_in_destination_and_cleans_up() {
+        let tmp = TempDir::new().unwrap();
+        let (host, staging, out) = route(&tmp, &[], &mut &b"payload"[..]);
+        assert_eq!(std::fs::read(out.unwrap().copied_path).unwrap(), b"payload");
+        assert_eq!(names(&host), [NAME]);
+        assert!(names(&staging).is_empty());
+    }
+
+    #[test]
+    fn cross_volume_failure_leaves_nothing_behind() {
+        struct Failing(bool);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::replace(&mut self.0, true) {
+                    return Err(std::io::Error::other("source interrupted"));
+                }
+                buf[..4].copy_from_slice(b"half");
+                Ok(4)
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let relay = tmp.path().join("relay");
+        std::fs::create_dir_all(&relay).unwrap();
+        let (host, staging, out) = route(&tmp, std::slice::from_ref(&relay), &mut Failing(false));
+        assert!(out.is_err());
+        assert!(names(&host).is_empty());
+        assert!(names(&staging).is_empty());
+        assert!(names(&relay).is_empty());
+    }
+
+    #[test]
+    fn cross_device_rename_errors_are_recognised() {
+        assert!(is_cross_device(&std::io::Error::from_raw_os_error(18)));
+        assert!(is_cross_device(&std::io::Error::from(
+            std::io::ErrorKind::CrossesDevices
+        )));
+        assert!(!is_cross_device(&std::io::Error::other("nope")));
     }
 
     #[test]

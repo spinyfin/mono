@@ -1033,6 +1033,7 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+ "tracing",
 ]
 
 [[package]]
