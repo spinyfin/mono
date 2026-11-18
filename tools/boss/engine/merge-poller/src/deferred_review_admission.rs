@@ -114,14 +114,29 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                     // settled by a batch admitted for another row: a sibling
                     // revision's later push, or an explicit review start,
                     // which is always admitted against the root.
-                    match work_db.advance_pending_review_task_to_in_review_with_verdict_source(
-                        &candidate.task_id,
-                        &candidate.cycle_root_id,
-                    ) {
+                    //
+                    // A revision is released by the batch's decision itself,
+                    // whichever it was. Asking for a verdict row left one held
+                    // for a failed batch here on every pass, with nothing
+                    // logged and nothing that would ever change the answer.
+                    let settled = if candidate.task_id == candidate.cycle_root_id {
+                        Ok(false)
+                    } else {
+                        work_db
+                            .settle_revision_review_hold(&candidate.task_id, &batch.target_sha)
+                            .map(|settlement| matches!(settlement, crate::work::ReviewHoldSettlement::Released { .. }))
+                    };
+                    let released = settled.and_then(|released| match released {
+                        true => Ok(true),
+                        false => work_db.release_review_hold(&candidate.task_id, Some(&candidate.cycle_root_id)),
+                    });
+                    match released {
                         Ok(true) => {
                             tracing::info!(
                                 task_id = %candidate.task_id,
                                 batch_id = %batch.id,
+                                batch_status = %batch.status,
+                                target_sha = %batch.target_sha,
                                 pr_url = %candidate.pr_url,
                                 "merge poller: deferred-admission hold matched an already-settled \
                                  batch for this head; advancing to in_review"
@@ -135,7 +150,15 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                                 .await;
                             outcome.reviewer_fallback_advanced += 1;
                         }
-                        Ok(false) => {}
+                        // Still held after a decided batch: say so, since the
+                        // candidate comes back on every pass until it moves.
+                        Ok(false) => tracing::debug!(
+                            task_id = %candidate.task_id,
+                            cycle_root_id = %candidate.cycle_root_id,
+                            batch_id = %batch.id,
+                            batch_status = %batch.status,
+                            "merge poller: a decided batch covers this head but the hold did not release"
+                        ),
                         Err(err) => tracing::warn!(
                             task_id = %candidate.task_id,
                             ?err,
@@ -161,10 +184,7 @@ pub(crate) async fn sweep_deferred_review_admission_with(
                 // root) — use the source-aware advance so the EXISTS
                 // subquery looks in the right place instead of silently
                 // matching zero rows forever.
-                match work_db.advance_pending_review_task_to_in_review_with_verdict_source(
-                    &candidate.task_id,
-                    &candidate.cycle_root_id,
-                ) {
+                match work_db.release_review_hold(&candidate.task_id, Some(&candidate.cycle_root_id)) {
                     Ok(true) => {
                         tracing::info!(
                             task_id = %candidate.task_id,

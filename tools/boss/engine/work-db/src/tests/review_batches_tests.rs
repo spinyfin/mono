@@ -22,6 +22,9 @@ mod focus_admission;
 #[path = "review_revision_focus_tests.rs"]
 mod revision_focus;
 
+#[path = "review_hold_settlement_tests.rs"]
+mod hold_settlement;
+
 fn classification() -> ReviewClassification {
     ReviewClassification::builder()
         .changed_files(vec!["tools/boss/engine/pr-review/src/parsing.rs".to_owned()])

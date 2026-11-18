@@ -166,7 +166,7 @@ impl WorkerCompletionHandler {
             match on_heap(|| self.conflict_delivery_decision(execution, pr_url.as_deref())).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
                 ConflictDeliveryDecision::Merged => confirmed_merged_pr = pr_url,
-                ConflictDeliveryDecision::ClosedUnmerged | ConflictDeliveryDecision::Proceed => {}
+                ConflictDeliveryDecision::ClosedUnmerged | ConflictDeliveryDecision::Proceed { .. } => {}
             }
         }
         // Captured before `record_worker_no_op_completion` below nulls

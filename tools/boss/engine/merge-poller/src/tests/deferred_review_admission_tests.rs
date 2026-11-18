@@ -489,6 +489,53 @@ async fn sweep_releases_a_revision_whose_head_was_reviewed_under_its_root() {
     );
 }
 
+/// The batch for the head the revision pushed failed for good: both
+/// automatic generations ended without a verdict, so no replacement will be
+/// minted and no verdict row exists. A failed batch is a terminal decision,
+/// so the revision leaves its hold on the sweep's next pass. Asking for a
+/// verdict here left it `active` with nothing live on every pass.
+#[tokio::test]
+async fn sweep_releases_a_revision_whose_heads_batch_failed_without_a_verdict() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let root_id = in_review_root(&db);
+    let revision_id = held_revision(&db, &root_id, false);
+    let (batch, _) = settled_batch(&db, &root_id, "head-a");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE pr_review_batch_members SET status = 'failed' WHERE batch_id = ?1",
+            rusqlite::params![batch.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pr_review_batches SET status = 'failed', generation = ?2 WHERE id = ?1",
+            rusqlite::params![batch.id, crate::work::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS],
+        )
+        .unwrap();
+    }
+    let publisher = RecordingPublisher::default();
+
+    let outcome = sweep(&db, &publisher, "head-a").await;
+
+    assert_eq!(outcome.reviewer_fallback_advanced, 1, "{outcome:?}");
+    assert_eq!(task_status(&db, &revision_id), boss_protocol::TaskStatus::InReview);
+    assert!(open_deferred_markers(&db).is_empty());
+    assert_eq!(
+        batches_for(&db, &root_id),
+        vec![(
+            crate::work::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS,
+            "head-a".to_owned(),
+            "failed".to_owned()
+        )],
+        "the generation cap is not exceeded to release the revision"
+    );
+
+    // Nothing is left for a later pass to find.
+    let again = sweep(&db, &publisher, "head-a").await;
+    assert_eq!(again.reviewer_fallback_advanced, 0, "{again:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn review_pool_sampling_survives_yield_before_upkeep() {
     let dir = tempdir().unwrap();
