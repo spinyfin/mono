@@ -490,7 +490,7 @@ async fn process_state(
         outcome.no_error_skipped += 1;
         return;
     };
-    let lines = read_transcript_tail(&transcript_path, TRANSCRIPT_TAIL_MAX_BYTES).await;
+    let lines = read_normalized_transcript_tail(work_db, &execution_id, &transcript_path).await;
     let prior_attempts = execution.transient_failure_count.max(0) as u32;
 
     // Two shapes of "this worker is stalled" are worth acting on:
@@ -833,6 +833,35 @@ fn classify_error_for_execution(work_db: &WorkDb, execution_id: &str, text: &str
             );
             ErrorClass::Indeterminate
         }
+    }
+}
+
+/// Read the bounded transcript tail and reshape it through the
+/// execution's driver (`transcript_session()` when the driver correlates
+/// rows across a tail, else the per-row `normalize_transcript_entry`) so
+/// the shared extractors see the canonical shape. A driver whose native
+/// rows differ from Claude's (agy's `ERROR_MESSAGE`) is otherwise
+/// invisible to [`extract_worker_error`] and
+/// [`transcript_shows_no_activity`]. An unresolvable driver leaves the
+/// rows as read.
+pub(crate) async fn read_normalized_transcript_tail(work_db: &WorkDb, execution_id: &str, path: &str) -> Vec<Value> {
+    let lines = read_transcript_tail(path, TRANSCRIPT_TAIL_MAX_BYTES).await;
+    let driver = match work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => DriverRegistry::default().get(&slug).cloned(),
+        _ => None,
+    };
+    let Some(driver) = driver else {
+        return lines;
+    };
+    match driver.transcript_session() {
+        Some(mut session) => lines
+            .into_iter()
+            .map(|raw| session.normalize_transcript_entry(raw))
+            .collect(),
+        None => lines
+            .into_iter()
+            .map(|raw| driver.normalize_transcript_entry(raw))
+            .collect(),
     }
 }
 
@@ -2605,4 +2634,7 @@ mod tests {
              instead of re-polling it — proof the arm cannot busy-spin",
         );
     }
+
+    #[path = "transient_recovery_agy_sweep_tests.rs"]
+    mod agy_sweep_tests;
 }

@@ -232,7 +232,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
         incoming.run_id.as_deref(),
         &incoming.event,
     );
-    boss_engine_runtime::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
+    server_state.publish_hook_derived_events(incoming).await;
     dispatch_live_worker_state(server_state, incoming).await;
     // Codex guard-trace observation: record whether this turn's PreToolUse
     // guards ran and what they decided — and, when tool calls ran with no

@@ -13,7 +13,8 @@ pub(super) fn classify_agy_error(text: &str) -> WorkerErrorClass {
     let has_status = |code: &str| {
         lower
             .split(|c: char| {
-                c.is_ascii_whitespace() || matches!(c, ':' | ',' | '"' | '[' | ']' | '{' | '}' | '(' | ')')
+                c.is_ascii_whitespace()
+                    || matches!(c, ':' | ',' | '.' | ';' | '=' | '"' | '[' | ']' | '{' | '}' | '(' | ')')
             })
             .any(|word| word == code)
     };
@@ -147,6 +148,21 @@ mod tests {
     }
 
     #[test]
+    fn eligibility_failure_recognises_trailing_period_and_equals_delimiters() {
+        let driver = AgyDriver::default();
+        for error in [
+            "Eligibility check failed: failed to fetch user info: 500.",
+            "Eligibility check failed status=500",
+        ] {
+            assert_eq!(
+                driver.classify_error(error),
+                WorkerErrorClass::EligibilityServiceFailure,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn transient_and_unknown_errors_keep_bounded_recovery() {
         let driver = AgyDriver::default();
         for error in [
@@ -158,6 +174,9 @@ mod tests {
             "rpc error: code = DeadlineExceeded",
             "connection reset by peer",
             "request timed out",
+            "status=500",
+            "code=429;",
+            "upstream failed with 503.",
         ] {
             assert_eq!(driver.classify_error(error), WorkerErrorClass::Transient, "{error}");
         }

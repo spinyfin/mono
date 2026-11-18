@@ -101,6 +101,7 @@ mod frontend_event_kind;
 pub(crate) mod frontend_metrics;
 mod github_auth;
 pub(crate) mod handler_helpers;
+mod hook_derived_events;
 mod hosts;
 mod ideas;
 /// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`
