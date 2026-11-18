@@ -895,6 +895,7 @@ pub struct ExecutionCoordinator {
     in_doubt_sweep_active: AtomicBool,
 }
 
+mod allocation_refusal;
 mod blocked_workspace;
 mod config;
 mod dispatch_admission;

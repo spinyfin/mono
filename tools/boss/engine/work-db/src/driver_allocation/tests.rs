@@ -726,7 +726,9 @@ fn conflict_resolution_and_ci_remediation_fail_loudly_when_claude_is_at_zero_eve
         let product = create_test_product(&db);
         for kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
             let chore = create_test_chore(&db, &product.id, format!("{kind} under {split:?}"));
-            let err = db
+            // Insert keeps the row so one unplaceable item cannot block its
+            // product; the refusal is recorded and dispatch claim refuses it.
+            let execution = db
                 .create_execution(
                     CreateExecutionInput::builder()
                         .work_item_id(chore.id.clone())
@@ -734,7 +736,12 @@ fn conflict_resolution_and_ci_remediation_fail_loudly_when_claude_is_at_zero_eve
                         .status(ExecutionStatus::Ready)
                         .build(),
                 )
-                .unwrap_err();
+                .unwrap();
+            let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+            assert_eq!(decision.reason, REASON_ALLOCATION_FAILED);
+            assert_eq!(decision.driver, None);
+            let err = db.claim_execution_for_dispatch(&execution.id).unwrap_err();
+            assert!(err.downcast_ref::<DriverAllocationRefused>().is_some(), "{err}");
             let text = err.to_string();
             assert!(
                 text.contains("cannot allocate a driver"),

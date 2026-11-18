@@ -653,3 +653,64 @@ async fn critical_force_start_creates_execution_under_pause_and_full_cap() {
     assert!(!admission.pause.overridable);
     assert!(crate::coordinator::pause_bypass_decision(&admission, None).is_err());
 }
+
+/// An auto-drained execution whose allocation no funded driver can satisfy
+/// must end in a visible failed state, not loop in `ready` on every drain.
+#[tokio::test]
+async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(100, 0, 0, 0))
+        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "Queued before share change");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    // The whole share moves to a driver that cannot launch work.
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 0, 0, 100))
+        .unwrap();
+
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            runner.clone(),
+        )
+        .with_dispatch_events(recording.clone()),
+    );
+    coordinator.drain_ready_queue_for_test().await;
+
+    let failed = db.get_execution(&execution.id).unwrap();
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert!(
+        failed.last_error.as_deref().is_some_and(|e| e.contains("0 share")),
+        "{:?}",
+        failed.last_error
+    );
+    assert_eq!(runner.calls.lock().await.len(), 0, "no worker may spawn");
+    let attention = db.list_attention_items(&execution.id).unwrap();
+    assert!(
+        attention
+            .iter()
+            .any(|item| item.kind == crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND),
+        "{attention:?}"
+    );
+    let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&chore.id).unwrap() else {
+        panic!("expected a chore");
+    };
+    assert_eq!(
+        task.dispatch_failed_reason.as_deref(),
+        Some(crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND)
+    );
+    let events = recording.events_for(&execution.id).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.stage == crate::dispatch_events::Stage::PreStartFailure.as_str()
+                && e.outcome == crate::dispatch_events::Outcome::Error.as_str()),
+        "{events:?}"
+    );
+}

@@ -349,6 +349,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          resolution is the operator's re-enable gesture, not an observation.",
     ),
     entry(
+        DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND,
+        ClearedBy::WorkResumed,
+        "Asserts no eligible driver held a share when the execution was dispatched. A later run start \
+         for the same item proves a driver was found for it.",
+    ),
+    entry(
         PANE_SPAWN_FAILED_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Asserts the worker pane for a run never came up. A later completed spawn run for the same \

@@ -16,9 +16,7 @@ use boss_gh_telemetry::{callers, scope as gh_scope};
 
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
-use crate::work::{
-    REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, driver_clears_dispatch_gate,
-};
+use crate::work::{REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, pin_is_honourable};
 use boss_execution_contracts::{REVIEW_GUIDE_DRIVER, pool_dispatch_policy_for_worker_id};
 use boss_protocol::{
     EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
@@ -282,12 +280,13 @@ fn yield_pins_that_fail_capability_gate<'a>(
     task_kind: Option<&TaskKind>,
     task_driver: Option<&'a str>,
     product_default_driver: Option<&'a str>,
+    design_or_investigation_tier: bool,
 ) -> (Option<&'a str>, Option<&'a str>) {
     let Some(task_kind) = task_kind else {
         return (task_driver, product_default_driver);
     };
     let task_driver = match task_driver.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(pin) if !driver_clears_dispatch_gate(pin, task_kind, execution_kind) => {
+        Some(pin) if !pin_is_honourable(pin, Some(task_kind), execution_kind, design_or_investigation_tier, true) => {
             tracing::info!(
                 execution_id = %execution_id,
                 execution_kind = %execution_kind,
@@ -305,14 +304,23 @@ fn yield_pins_that_fail_capability_gate<'a>(
         product_default_driver
     } else {
         match product_default_driver.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(pin) if !driver_clears_dispatch_gate(pin, task_kind, execution_kind) => {
+            Some(pin)
+                if !pin_is_honourable(
+                    pin,
+                    Some(task_kind),
+                    execution_kind,
+                    design_or_investigation_tier,
+                    false,
+                ) =>
+            {
                 tracing::info!(
                     execution_id = %execution_id,
                     execution_kind = %execution_kind,
                     pinned_driver = %pin,
                     pin_source = "products.default_driver",
-                    "dropping product default driver that fails the capability gate for this \
-                     execution kind; falling through to allocation/engine default",
+                    "dropping product default driver that fails the capability gate or lacks the \
+                     design/investigation tier model for this execution; falling through to the \
+                     recorded allocation",
                 );
                 None
             }
@@ -1228,6 +1236,7 @@ pub async fn compose_worker_spawn(
             work_item_kind,
             row_driver.as_deref(),
             product_default_driver.as_deref(),
+            boss_engine_effort::is_design_or_investigation_tier(work_item_kind, row_reasoning),
         )
     };
     let spawn_config = if execution.kind == ExecutionKind::PrReviewGuide {

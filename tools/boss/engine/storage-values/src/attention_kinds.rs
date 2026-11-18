@@ -175,6 +175,14 @@ pub const DISPATCH_WAIT_UNCLASSIFIED_ATTENTION_KIND: &str = "dispatch_wait_uncla
 /// is direct evidence the pane-spawn problem is no longer blocking it.
 pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
 
+/// Filed against an execution whose driver allocation was refused at dispatch:
+/// no eligible driver holds a share of the traffic split (or the split is
+/// unreadable). The execution is failed and the item bounced to Backlog.
+/// See `attention_lifecycle::ATTENTION_LIFECYCLES` for its clearing rule:
+/// `ClearedBy::WorkResumed`, since a later run starting for the item proves it
+/// found a driver.
+pub const DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND: &str = "driver_allocation_refused";
+
 /// Work-item-scoped attention kind, filed against the question comment
 /// (a `work_comments` id, not the execution), for an answer agent waiting
 /// beyond `ANSWER_AGENT_READY_AGE_ALARM_THRESHOLD`. Filed against the

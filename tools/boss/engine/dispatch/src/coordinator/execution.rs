@@ -569,7 +569,13 @@ impl ExecutionCoordinator {
                     execution.id
                 ));
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // A refused allocation fails this execution visibly instead of
+                // leaving it `ready` for the next drain to refuse again; the
+                // forcing caller still gets the error.
+                self.fail_execution_if_allocation_refused(execution, &err).await;
+                return Err(err);
+            }
         }
         // Double-spawn guard (Bug A): if another execution for this
         // work_item is already live (running or waiting_human), this

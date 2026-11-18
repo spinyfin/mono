@@ -1775,6 +1775,7 @@ mod compose_worker_spawn_tests {
             Some(&TaskKind::Chore),
             Some("codex"),
             Some("codex"),
+            false,
         );
         assert_eq!(task, None);
         assert_eq!(product, None);
@@ -1785,6 +1786,7 @@ mod compose_worker_spawn_tests {
             Some(&TaskKind::Chore),
             Some("codex"),
             Some("grok"),
+            false,
         );
         assert_eq!(task, Some("codex"));
         // Task pin is present, so product pin is left as-is for the resolver

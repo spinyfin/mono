@@ -174,19 +174,15 @@ impl WorkDb {
                 let product_pin = product_default_driver.as_deref().filter(|s| !s.trim().is_empty());
                 let pinned = task_pin.or(product_pin);
                 if let Some(pinned) = pinned {
-                    let gate_ok = match &task_kind {
-                        Some(tk) => driver_clears_dispatch_gate(pinned, tk, &exec_kind),
-                        // Unparseable task kind: keep pre-existing pin behaviour.
-                        None => true,
-                    };
-                    // A `products.default_driver` pin on a tier row also
-                    // needs a dedicated tier model, exactly like
-                    // `decide_execution_driver`'s pinned branch; a
-                    // `tasks.driver` pin stays loud regardless.
-                    let tier_ok = task_pin.is_some()
-                        || !design_or_investigation_tier
-                        || driver_has_design_investigation_model(pinned);
-                    if gate_ok && tier_ok {
+                    let from_task_pin = task_pin.is_some();
+                    let honourable = pin_is_honourable(
+                        pinned,
+                        task_kind.as_ref(),
+                        &exec_kind,
+                        design_or_investigation_tier,
+                        from_task_pin,
+                    );
+                    if honourable {
                         return Ok(Some(pinned.to_owned()));
                     }
                 }

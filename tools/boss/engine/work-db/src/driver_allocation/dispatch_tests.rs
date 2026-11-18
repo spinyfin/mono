@@ -129,3 +129,45 @@ fn revalidation_covers_legacy_and_missing_decisions_without_reassigning_live_rea
         assert_eq!(refreshed.driver.as_deref(), Some("claude"));
     }
 }
+
+#[test]
+fn an_unallocatable_task_does_not_stop_its_products_other_executions() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
+    // A model pin is an eligibility constraint, not a driver pin: "opus"
+    // belongs to claude, which holds no share, so this row cannot be placed.
+    let pinned = crate::test_support::create_test_chore(&db, &product.id, "pinned to an unfunded driver's model");
+    db.update_work_item(
+        &pinned.id,
+        boss_protocol::WorkItemPatch {
+            model_override: Some("opus".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let other = crate::test_support::create_test_chore(&db, &product.id, "unpinned");
+
+    let result = db.reconcile_product_executions(&product.id).unwrap();
+    assert!(result.created.iter().any(|e| e.work_item_id == other.id));
+    let refused = result
+        .created
+        .iter()
+        .find(|e| e.work_item_id == pinned.id)
+        .expect("the offending row still gets an execution");
+    let decision = db.get_execution_driver_decision(&refused.id).unwrap().unwrap();
+    assert_eq!(decision.reason, REASON_ALLOCATION_FAILED);
+    assert_eq!(decision.driver, None);
+    let other_decision = db
+        .get_execution_driver_decision(&result.created.iter().find(|e| e.work_item_id == other.id).unwrap().id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(other_decision.driver.as_deref(), Some("codex"));
+
+    // Claim revalidation refuses only the offending execution, with a typed error.
+    let err = db.claim_execution_for_dispatch(&refused.id).unwrap_err();
+    let refusal = err.downcast_ref::<DriverAllocationRefused>().expect("typed refusal");
+    db.fail_execution_for_allocation_refusal(&refused.id, refusal).unwrap();
+    assert_eq!(db.get_execution(&refused.id).unwrap().status, ExecutionStatus::Failed);
+}
