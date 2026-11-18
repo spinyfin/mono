@@ -537,6 +537,12 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         bound_pr_url: &str,
     ) -> StopOutcome {
+        // A verified staged or bound PR is the progress the produce-a-PR
+        // fingerprint exists to detect. Retire that cycle here — the
+        // shared point Stop's staged arm and recheck's staged deferral
+        // both reach — so a later quiet sweep cannot replay a stale
+        // `no_pr` intent while we hold for a run_done declaration.
+        self.retire_produce_pr_nudge(&execution.id);
         let descendant_count = self
             .background_activity_probe
             .live_delegated_descendant_count(&execution.id)

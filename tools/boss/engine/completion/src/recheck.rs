@@ -86,6 +86,11 @@ impl WorkerCompletionHandler {
                 .verified_staged_pr_url(execution_id, &execution, "pr-recheck")
                 .await
         {
+            // A verified staged PR is the progress the produce-a-PR
+            // fingerprint exists to detect. Retire that cycle before any
+            // deferral or finalization so a later `recheck_background_nudge`
+            // cannot replay a stale `no_pr` intent.
+            self.retire_produce_pr_nudge(execution_id);
             if execution.kind == ExecutionKind::RevisionImplementation
                 && self.should_defer_staged_pr_recheck(execution_id)
             {

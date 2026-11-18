@@ -2040,6 +2040,12 @@ safety checks."
 /// `boss propose wait` rather than answering in prose.
 pub const WORKER_WAIT_NUDGE_DIRECTIVE: &str = worker_wait_nudge_directive!();
 
+/// Fingerprint the produce-a-PR nudge records on the circuit breaker.
+/// A staged or bound PR is the progress this fingerprint exists to
+/// detect; paths that observe one must retire any retained intent and
+/// reset this breaker entry rather than replaying it.
+pub const NO_PR_FINGERPRINT: &str = "no_pr";
+
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
 /// will simply push and open one, but a worker that's blocked has an

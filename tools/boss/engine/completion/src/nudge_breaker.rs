@@ -250,6 +250,21 @@ impl NudgeBreaker {
             .remove(execution_id);
     }
 
+    /// Drop tracked state for `execution_id` only when the current
+    /// fingerprint is `fingerprint`. Used to retire a produce-a-PR
+    /// (`no_pr`) cycle once a PR is staged without wiping a later,
+    /// unrelated cycle (for example the run-done declaration backstop).
+    /// Idempotent, including when nothing is tracked.
+    pub fn forget_if_fingerprint(&self, execution_id: &str, fingerprint: &str) {
+        let mut guard = self.inner.lock().expect("NudgeBreaker mutex poisoned");
+        if guard
+            .get(execution_id)
+            .is_some_and(|record| record.fingerprint == fingerprint)
+        {
+            guard.remove(execution_id);
+        }
+    }
+
     /// Hand back the nudge `nudge_id`, which was charged by [`Self::record`]
     /// and never reached the worker. Returns the number of consecutive
     /// delivery failures now on record.
@@ -468,6 +483,21 @@ mod tests {
             breaker.record("never-tracked", "no_pr", 3, tick(0)),
             NudgeDecision::Proceed { count: 1 },
         );
+    }
+
+    #[test]
+    fn forget_if_fingerprint_clears_only_a_matching_cycle() {
+        let breaker = NudgeBreaker::new();
+        breaker.record("exec_a", "no_pr", 3, tick(0));
+        breaker.record("exec_a", "no_pr", 3, tick(1));
+        breaker.forget_if_fingerprint("exec_a", "stale:other");
+        assert_eq!(breaker.counts("exec_a"), Some((2, 2)));
+        breaker.forget_if_fingerprint("exec_a", "no_pr");
+        assert_eq!(breaker.counts("exec_a"), None);
+        breaker.forget_if_fingerprint("never-tracked", "no_pr");
+        breaker.record("exec_b", "run_done_undeclared:exec_b", 3, tick(0));
+        breaker.forget_if_fingerprint("exec_b", "no_pr");
+        assert_eq!(breaker.counts("exec_b"), Some((1, 1)));
     }
 
     // ── Debounce (MIN_RENUDGE_INTERVAL) ──────────────────────────────

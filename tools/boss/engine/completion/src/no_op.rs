@@ -149,7 +149,13 @@ impl WorkerCompletionHandler {
             };
             if !empty {
                 return on_heap(|| {
-                    self.nudge_or_park(execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
+                    self.nudge_or_park(
+                        execution,
+                        PROBE_NO_PR,
+                        NO_PR_FINGERPRINT,
+                        None,
+                        StopOutcome::AwaitingInput,
+                    )
                 })
                 .await;
             }
