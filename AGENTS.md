@@ -56,6 +56,10 @@ root-cause rule as the section below.
   [`tools/boss/docs/attention-lifecycle.md`](tools/boss/docs/attention-lifecycle.md)
 - Post-crash orphan recovery:
   [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
+- Revision review hold (why a finished revision stays `active`, the head its
+  hold is released by, what a completion records, and what to compare when
+  one stays held with nothing running):
+  [`tools/boss/docs/revision-review-hold.md`](tools/boss/docs/revision-review-hold.md)
 - Execution recovery pointers (the three bookmarks per execution, how they
   get damaged, and how dispatch reconciles or retires them):
   [`tools/boss/docs/execution-recovery-pointers.md`](tools/boss/docs/execution-recovery-pointers.md)

@@ -150,7 +150,13 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         .subscribe(session, &[boss_protocol::work_product_topic(&product_id)])
         .await;
     let calls = Arc::new(AtomicUsize::new(0));
+    // A revision's declared delivery records the head it finished at, and
+    // the guide's source capture pins that head. It is the head the source
+    // packet below describes.
+    let verifier = boss_engine_completion::tests::StubBranchVerifier::ok("boss/test");
+    verifier.set_fresh_head_oid(Ok("revised-head".to_owned())).await;
     let handler = boss_engine_completion::integration_handler(db.clone(), pr_url)
+        .with_branch_verifier(verifier)
         .with_collaborators(boss_engine_runtime::completion_adapters::completion_collaborators())
         .with_feature_flags(state.feature_flags.clone())
         .with_publisher(state.publisher.clone())

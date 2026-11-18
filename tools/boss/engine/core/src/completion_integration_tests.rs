@@ -55,4 +55,5 @@ mod poller;
 mod review_guide;
 mod review_guide_links;
 mod review_verdict_apply;
+mod revision_review_hold;
 mod teardown_sweep_race;
