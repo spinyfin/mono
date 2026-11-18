@@ -1628,8 +1628,23 @@ impl ServerState {
                 state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
             ))
         });
+        // Boothby's event-trigger queue (`boothby.md` §"Activation model"):
+        // armed either by a dispatch-stage sink (below, fanned out alongside
+        // the production JSONL sink) or by the attention-creation hook
+        // registered on `work_db` just below. `boothby_kick` doubles as the
+        // scheduler's wake signal for reasons unrelated to an event trigger
+        // (manual run, mode change) — see `app::server::serve`.
+        let boothby_kick = Arc::new(Notify::new());
+        let boothby_events = boss_engine_runtime::boothby_events::BoothbyEventQueue::new(boothby_kick.clone());
+        work_db.set_boothby_event_queue(boothby_events.clone());
+        let boothby_events_for_state = boothby_events.clone();
+        let boothby_kick_for_state = boothby_kick.clone();
+
         let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
-            Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
+            Arc::new(boss_engine_runtime::boothby_dispatch_sinks::FanOutDispatchEventSink::new(vec![
+                Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
+                Arc::new(boss_engine_runtime::boothby_dispatch_sinks::BoothbyEventSink::new(boothby_events.clone())),
+            ]));
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();
@@ -1805,27 +1820,6 @@ impl ServerState {
         // `state.db`, so an install's data is one directory.
         let attachment_state_root: PathBuf = state_root.clone();
 
-        // Dispatch-event JSONL stream lands next to state.db /
-        // events.sock under the same `state_root` resolved above.
-        let dispatch_event_root: PathBuf = state_root.clone();
-
-        // Boothby's event-trigger queue (`boothby.md` §"Activation model"):
-        // armed either by a dispatch-stage sink (below, fanned out alongside
-        // the production JSONL sink) or by the attention-creation hook
-        // registered on `work_db` just below. `boothby_kick` doubles as the
-        // scheduler's wake signal for reasons unrelated to an event trigger
-        // (manual run, mode change) — see `app::server::serve`.
-        let boothby_kick = Arc::new(Notify::new());
-        let boothby_events = boss_engine_runtime::boothby_events::BoothbyEventQueue::new(boothby_kick.clone());
-        work_db.set_boothby_event_queue(boothby_events.clone());
-        let boothby_events_for_state = boothby_events.clone();
-        let boothby_kick_for_state = boothby_kick.clone();
-
-        let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
-            Arc::new(boss_engine_runtime::boothby_dispatch_sinks::FanOutDispatchEventSink::new(vec![
-                Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
-                Arc::new(boss_engine_runtime::boothby_dispatch_sinks::BoothbyEventSink::new(boothby_events.clone())),
-            ]));
         let dispatch_events_for_state = dispatch_events.clone();
         let dispatch_event_root_for_state = dispatch_event_root.clone();
         let ipc_logger = IpcLogger::new(&dispatch_event_root);
