@@ -699,7 +699,12 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         driver_error: Option<&str>,
     ) -> StopOutcome {
-        self.finalize_progression_run(execution, driver_error, false).await
+        self.finalize_progression_run(
+            execution,
+            driver_error.map(|detail| format!("progression: driver error: {detail}")),
+            false,
+        )
+        .await
     }
 
     /// [`Self::finalize_progression`], also reached at declaration time
@@ -707,18 +712,21 @@ impl WorkerCompletionHandler {
     /// [`StopOutcome::DbError`] before tearing anything down, so the pending
     /// finalize retries with the declaration still stamped; the Stop path keeps
     /// finalizing the pane whatever the write did.
+    ///
+    /// `failure` is the `error_text` of a run the engine is failing whatever
+    /// it declared: a fatal driver error, or a pane left on an approval
+    /// dialog ([`Self::fail_blocking_dialog`]).
     pub(super) async fn finalize_progression_run(
         &self,
         execution: &crate::work::WorkExecution,
-        driver_error: Option<&str>,
+        failure: Option<String>,
         declared: bool,
     ) -> StopOutcome {
         let workspace_path = execution.workspace_path.clone();
         let teardown = self.begin_teardown(&execution.id);
-        let (finished, failed) = match driver_error {
-            Some(detail) => (
-                self.work_db
-                    .fail_progression_execution(&execution.id, &format!("progression: driver error: {detail}")),
+        let (finished, failed) = match failure {
+            Some(error_text) => (
+                self.work_db.fail_progression_execution(&execution.id, &error_text),
                 true,
             ),
             None => match self.work_db.progression_disposition(&execution.id) {

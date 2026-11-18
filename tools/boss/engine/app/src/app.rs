@@ -72,6 +72,7 @@ const PANE_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
 mod agent_launch_guard;
 mod app_session;
+mod approval_prompt;
 pub(crate) mod attachments;
 mod attentions;
 mod automations;

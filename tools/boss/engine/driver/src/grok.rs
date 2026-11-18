@@ -189,7 +189,7 @@ pub struct GrokDriver {
 ///
 /// Execution shape (design §Execution shape + T-03 pane mode):
 /// ```text
-/// python3 -I .grok/initial-prompt.py grok --model … --reasoning-effort … --no-alt-screen --always-approve
+/// python3 -I .grok/initial-prompt.py grok --model … --reasoning-effort … --no-alt-screen [--always-approve]
 ///      --trust --session-id <uuid> --cwd <ws> --no-subagents --no-memory
 /// ```
 ///
@@ -197,13 +197,20 @@ pub struct GrokDriver {
 /// directives on the [`SpawnPlan`], not flags. Never emits `-w` /
 /// `--worktree` / `--worktree-ref`. Never *sets* `GROK_FOLDER_TRUST=0`
 /// (spawn unsets the var so a host export cannot ungate project hooks/MCP).
+///
+/// `--always-approve` is omitted when the engine forces a restricted
+/// permission mode (`permission_mode_override`, the capability-restricted
+/// kinds). Always-approve is Grok's allow-everything mode: it takes precedence
+/// over the deny-by-default posture those kinds are launched with, so a
+/// restricted session that also carried it would run any command no `--deny`
+/// rule names. See [`permissions::render_restricted_claude_settings`].
 pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, session_id: &str) -> String {
     let SpawnRequest {
         model,
         effort,
         settings_path: _,
         non_opus_auto_mode: _,
-        permission_mode_override: _,
+        permission_mode_override,
         run_id: _,
     } = request;
 
@@ -221,7 +228,9 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     // T-03: `--no-alt-screen` is the recommended pane mode (stable
     // Esc:cancel markers; chrome retained after /quit).
     cmd.push_str(" --no-alt-screen");
-    cmd.push_str(" --always-approve");
+    if permission_mode_override.is_none() {
+        cmd.push_str(" --always-approve");
+    }
     // Hidden from --help (D-3) but required; trusted_folders.toml is the belt.
     cmd.push_str(" --trust");
     cmd.push_str(" --session-id ");
@@ -311,24 +320,31 @@ impl AgentDriver for GrokDriver {
             // omission is the measured result rather than caution:
             // `grok-notification-vocabulary-and-leader-process-2026-07-29.md`.
             //
-            // A genuine awaiting-input signal exists —
-            // `notificationType: "permission_prompt"` (level `info`,
-            // "Tool permission requested") — but it is raised only by an
-            // interactive permission prompt, and Boss spawns with
-            // `--always-approve`, which suppresses that prompt. Under Boss's
-            // own flags the only `Notification` observed on the wire was
-            // `task_complete` ("Background task completed: <id>"), which
-            // means the opposite of blocked. Neither a `PreToolUse` hook
-            // deny nor a `--deny` rule raises one, and `--always-approve`
-            // also suppresses the folder-trust dialog outright.
+            // An approval signal exists — `notificationType:
+            // "permission_prompt"` (level `info`, "Tool permission
+            // requested") — but it does not mean "waiting on a person" for
+            // the sessions Boss runs:
             //
-            // So there is nothing honest to bind to: mapping this capability
-            // onto `task_complete` would be exactly the fabricated
-            // WaitingForInput the contract prohibits. A Grok worker shows
-            // Working/Idle and never a fabricated WaitingForInput
-            // (design G-13 / T-24). This becomes earnable only if Boss ever
-            // spawns Grok workers *without* `--always-approve`, at which
-            // point `permission_prompt` is the already-measured mapping.
+            // - Ordinary kinds spawn with `--always-approve`. There the
+            //   notification still fires for a command Grok cannot check
+            //   against the `--deny` rules (a variable in program position,
+            //   a `$(...)` substitution), and always-approve answers it
+            //   about 20ms later; the tool then runs for as long as it runs.
+            // - The capability-restricted kinds spawn deny-by-default
+            //   without `--always-approve`. A call outside their allowlist
+            //   is refused with no notification at all.
+            // - `task_complete` ("Background task completed: <id>") means
+            //   the opposite of blocked.
+            //
+            // So there is nothing honest to bind `WaitingForInput` to, and a
+            // Grok worker shows Working/Idle (design G-13 / T-24). The one
+            // case where the notification does mean a pane is stuck on a
+            // keypress, a restricted kind that was left asking, is a launch
+            // defect rather than a wait; it is reported through
+            // [`AgentDriver::approval_prompt_reported`] and the engine fails
+            // the run. Measurements:
+            // `grok-notification-vocabulary-and-leader-process-2026-07-29.md`
+            // and `grok-restricted-permission-mode-in-the-tui-2026-11-18.md`.
             //
             // CommandOutcomeObservation — omitted → default Degrade (never
             // Synthesize). Grok's stdout stream has not been characterised
@@ -355,8 +371,11 @@ impl AgentDriver for GrokDriver {
         // owns its surface strings.
         Some(PaneMonitorSpec {
             blocking_dialog_markers: vec![],
-            // OR-semantics. "always-approve" assumes Boss spawn keeps
-            // --always-approve. "Grok 4" matches footer "Grok 4.6 …"
+            // OR-semantics. "always-approve" is on the footer only for the
+            // kinds spawned with --always-approve; a restricted kind's
+            // footer reads "Shift+Tab:mode │ Ctrl+x:shortcuts" and is
+            // matched by the other two (measured on grok 1.0.70).
+            // "Grok 4" matches footer "Grok 4.6 …"
             // without pinning the patch model id — the prefix is
             // deliberately generation-agnostic, so it keeps matching
             // across future SKU bumps too.
@@ -507,9 +526,22 @@ impl AgentDriver for GrokDriver {
         // workers get no local sandbox/guard scripts (never shipped there).
         let interception = ToolUseInterceptionConfig::from_permission_input(input);
 
-        let mut config_files = hooks::write_hooks(&grok_home, &obs_config, &interception)
+        let deny_by_default = permissions::permission_mode_for_worker_kind(input.worker_kind).is_some();
+        let mut config_files = hooks::write_hooks(&grok_home, &obs_config, &interception, deny_by_default)
             .with_context(|| format!("writing Grok hook wiring under {}", grok_home.display()))?;
         config_files.push(grok_home.join("config.toml"));
+
+        // The deny-by-default lever for the restricted kinds. Written (or
+        // removed) on every run so the file always matches this run's kind.
+        let process_home = process_home_for_run(&input.run_id).with_context(|| {
+            format!(
+                "GrokDriver::write_permission_config: resolving the process HOME for run_id {:?}",
+                input.run_id
+            )
+        })?;
+        if let Some(settings_path) = permissions::write_restricted_claude_settings(&process_home, input.worker_kind)? {
+            config_files.push(settings_path);
+        }
 
         // Boss data dir for the CLI Read/Edit belt — `None` on remote (see
         // `interception.data_dir` above).
@@ -611,6 +643,10 @@ impl AgentDriver for GrokDriver {
             output_text: grok_bash_output_text(tool_response),
             command,
         })
+    }
+
+    fn approval_prompt_reported(&self, event: &WorkerEvent) -> bool {
+        progress::is_approval_prompt(event)
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
@@ -2114,6 +2150,97 @@ mod tests {
         // Standard worker: no forced --permission-mode (T-31 answer-agent
         // allowlist is a Grok follow-on, not yet built).
         assert!(!artifacts.extra_args.contains(&"--permission-mode".to_owned()));
+    }
+
+    /// A restricted kind is launched deny-by-default: no `--always-approve`
+    /// on the pane command, the Claude-compatible setting under the scoped
+    /// process `HOME`, the forced mode flag kept as the belt, and the guard
+    /// that redirects the `"$BOSS_BIN"` spelling Grok cannot allowlist.
+    #[tokio::test]
+    async fn restricted_kind_is_launched_deny_by_default_without_always_approve() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("scratch");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-progression";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+
+        let input = PermissionInput {
+            frontend_socket_path: None,
+            worker_kind: crate::WorkerKind::Progression,
+            workspace_path: workspace.clone(),
+            events_socket_path: tmp.path().join("boss-data").join("events.sock"),
+            boss_event_path: tmp.path().join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: String::new(),
+            execution_kind: "progression".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+            git_store_guard_script: None,
+            codex_sandbox_enforced: false,
+        };
+        let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
+
+        let settings_path = process_home_for_run(run_id)
+            .unwrap()
+            .join(".claude")
+            .join("settings.json");
+        let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings, json!({"permissions": {"defaultMode": "dontAsk"}}));
+        assert!(
+            artifacts.config_files.contains(&settings_path),
+            "config_files must list the settings file: {:?}",
+            artifacts.config_files
+        );
+
+        let mut request = spawn_request("grok-4.6", run_id);
+        request.permission_mode_override = Some("dontAsk");
+        let spawn = driver.spawn_invocation(request);
+        assert!(
+            !spawn.command.contains("--always-approve"),
+            "always-approve overrides deny-by-default and must not be passed: {}",
+            spawn.command
+        );
+        let command = crate::apply_permission_extra_args(&spawn.command, &artifacts.extra_args);
+        assert!(!command.contains("--always-approve"), "{command}");
+        assert!(command.contains("'--permission-mode' 'dontAsk'"), "{command}");
+        assert!(command.contains("'--allow' 'Bash(boss propose:*)'"), "{command}");
+
+        let hooks_doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(home::hooks_file_path(&grok_home_for_run(run_id).unwrap())).unwrap(),
+        )
+        .unwrap();
+        let guards = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            guards.iter().any(|entry| {
+                entry["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("in place of"))
+            }),
+            "the variable-program guard must be armed: {guards:#?}"
+        );
+
+        // An always-approve kind in the same home keeps neither the setting
+        // nor the guard.
+        let standard = PermissionInput {
+            worker_kind: crate::WorkerKind::Standard,
+            execution_kind: "task_implementation".into(),
+            ..input
+        };
+        driver.write_permission_config(&standard, tmp.path()).await.unwrap();
+        assert!(
+            !settings_path.exists(),
+            "a stale deny-by-default setting must not survive"
+        );
+        let spawn = driver.spawn_invocation(spawn_request("grok-4.6", run_id));
+        assert!(spawn.command.contains("--always-approve"), "{}", spawn.command);
     }
 
     /// Reviewer worker kind must select a read-only workspace posture in the
