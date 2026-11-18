@@ -5,6 +5,27 @@ use std::process::{Command, Stdio};
 
 pub(crate) fn denied() -> Vec<String> {
     let mut commands = [
+        "bash -c -- 'pkill -f foo'",
+        "sh -c -e 'killall foo'",
+        "bash -c -o pipefail 'kill $(pgrep x)'",
+        "zsh -c +o errexit -- 'pkill foo'",
+        "su -c -- 'pkill foo'",
+        "flock /tmp/l -c -- 'pkill foo'",
+        "script -c -- 'killall foo'",
+        "C='pkill -f foo'; bash -c \"$C\"",
+        "C='pkill -f foo'; eval \"$C\"",
+        "C='killall foo'; bash -c 'eval \"$C\"'",
+        "$SHELL -c 'true; pkill -f foo'",
+        "$BASH -c 'true; killall foo'",
+        "$SHELL -c -- 'true; pkill foo'",
+        "echo 'pkill -f foo' | (sh)",
+        "echo 'killall foo' | { sh; }",
+        "echo 'pkill -f foo' | bash /dev/stdin",
+        "echo 'pkill -f foo' | bash /dev/fd/0",
+        "echo 'pkill -f foo' | bash -",
+        "bash <(echo 'pkill -f foo')",
+        "source <(echo 'pkill foo')",
+        ". <(echo 'pkill foo')",
         "echo \"$(bash <<'EOF'\npkill foo\nEOF\n)\"",
         "echo \"$(cat <<EOF\n$(pkill foo)\nEOF\n)\"",
         "# don't\npkill -f foo\n# it's",
@@ -149,6 +170,18 @@ pub(crate) fn denied() -> Vec<String> {
 }
 
 pub(crate) const ALLOWED: &[&str] = &[
+    "\"$CUBE_BIN\" pr update --title 'pkill is now blocked for workers'",
+    "\"$BOSS_BIN\" propose done --summary 'killall is now blocked for workers'",
+    "C='echo hi'; bash -c -- \"$C\"",
+    "C='echo hi'; eval \"$C\"",
+    "$SHELL -c 'echo hi'",
+    "bash -c -- 'kill 12345'",
+    "sh -c -e 'echo hi'",
+    "echo hi | (sh)",
+    "echo hi | bash /dev/stdin",
+    "bash <(echo 'echo hi')",
+    "source <(echo 'echo hi')",
+    ". <(echo 'echo hi')",
     "jj commit -m \"$(cat <<'EOF'\nDon't block workers\n\n1) first\nEOF\n)\"",
     "echo $((1<<3))",
     "echo $((1<<3))\nls",
@@ -254,6 +287,9 @@ print(json.dumps(results))
 
 fn claude_guard_decisions(script: &std::path::Path, commands: &[String]) -> Vec<serde_json::Value> {
     let mut child = Command::new("python3")
+        // Hook decisions only: these named tools are never executed.
+        .env("BOSS_BIN", "/worker/bin/boss")
+        .env("CUBE_BIN", "/worker/bin/cube")
         .arg("-c")
         .arg(BATCH_RUNNER)
         .arg(script)

@@ -105,7 +105,7 @@ def signal_scan(source, start=0, stop=None, kind='command'):
     # probe (quotes only) or literal (substitutions only, for heredoc bodies).
     quotes, subs_on, command = kind != 'literal', kind != 'probe', kind == 'command'
     n = len(source)
-    out, subs, holders, heredocs, ariths = [], [], [], [], []
+    out, subs, holders, heredocs, ariths, scripts = [], [], [], [], [], set()
     pending, quote, depth, found = [], None, 0, False
     word_start, mark, arith_until, i = True, 0, 0, start
     while i < n:
@@ -151,7 +151,8 @@ def signal_scan(source, start=0, stop=None, kind='command'):
             i = end + 1
             word_start = False
             continue
-        if subs_on and quote != SIG_SQ and (c == SIG_BT or source.startswith(SIG_DOLLAR + '(', i)):
+        if subs_on and quote != SIG_SQ and (c == SIG_BT or source.startswith(SIG_DOLLAR + '(', i)
+                or (quote is None and source.startswith('<(', i))):
             if c == SIG_BT:
                 j = signal_scan(source, i + 1, SIG_BT)['end']
                 text = source[i+1:j]
@@ -169,6 +170,8 @@ def signal_scan(source, start=0, stop=None, kind='command'):
                     j = signal_scan(source, s, ')')['end']
                     text = source[s:j]
                     subs.append(text)
+            if source.startswith('<(', i):
+                scripts.add(len(holders))
             holders.append(text)
             out.append('__indirect_pid_' + str(len(holders) - 1) + '__')
             i = j + 1
@@ -233,7 +236,22 @@ def signal_scan(source, start=0, stop=None, kind='command'):
     if pending:
         raise ValueError('unterminated heredoc')
     return {'out': ''.join(out), 'subs': subs, 'holders': holders, 'heredocs': heredocs,
-            'ariths': ariths, 'end': i}
+            'ariths': ariths, 'scripts': scripts, 'end': i}
+
+def signal_operand(words):
+    # Shell options may follow -c before its command operand.
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word == '--':
+            return words[i+1:i+2]
+        if word in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
+            i += 2
+        elif word[:1] in ('-', '+'):
+            i += 1
+        else:
+            return words[i:i+1]
+    return []
 
 def signal_cstrings(words):
     # Shell command strings handed to a launcher with -c or --command.
@@ -243,7 +261,7 @@ def signal_cstrings(words):
             found.append(word.split('=', 1)[1])
         elif i + 1 < len(words) and (word == '--command' or (
                 word.startswith('-') and not word.startswith('--') and 'c' in word)):
-            found.append(words[i+1])
+            found.extend(signal_operand(words[i+1:]))
     return found
 
 def signal_argv(group):
@@ -376,14 +394,15 @@ def signal_stdin(args):
         elif rest[i][:1] in ('-', '+'):
             i += 1
         else:
-            return any(a.startswith('-') and not a.startswith('--') and 's' in a for a in rest)
+            return rest[i] in ('/dev/stdin', '/dev/fd/0', '-') or any(
+                a.startswith('-') and not a.startswith('--') and 's' in a for a in rest)
     return True
 
-def signal_text(text, depth):
+def signal_text(text, depth, values=None):
     # Inspect text that a shell will later read. Text that cannot be parsed is
     # still refused when it names the forbidden programs.
     try:
-        signal_check(text, depth)
+        signal_check(text, depth, values)
     except ValueError:
         if SIG_NAME.search(text):
             _block(SIGNAL_REASON)
@@ -405,7 +424,7 @@ def signal_groups(source):
                 current, piped = [], False
             if token in ('|', '|&'):
                 piped = True
-            elif token.strip(SIG_NL):
+            elif token not in ('(', '{') and token.strip(SIG_NL):
                 piped = False
         else:
             current.append(token)
@@ -439,30 +458,19 @@ def signal_writes(group, args):
             names.update(SIG_IDENT.findall(' '.join(rest)))
     return names
 
-def signal_mentions(groups):
-    return any(w.split() and os.path.basename(w.split()[0]) in ('pkill', 'killall')
-               for g, _, _ in groups for w in g)
-
-def signal_check(source, depth=0):
+def signal_check(source, depth=0, inherited=None):
     if depth > 40:
         _block(SIGNAL_REASON + ' Shell nesting is too deep to inspect safely.')
     source = source.replace(SIG_BS + SIG_NL, '')
     scan = signal_scan(source)
     holders = scan['holders']
-    for substitution in scan['subs']:
-        signal_check(substitution, depth+1)
-    for header, body, quoted in scan['heredocs']:
-        if any(signal_shell(signal_argv(g)[0]) for g, _, _ in signal_groups(header)):
-            signal_check(body, depth+1)
-        elif not quoted:
-            for substitution in signal_scan(body, 0, None, 'literal')['subs']:
-                signal_check(substitution, depth+1)
     groups = signal_groups(scan['out'])
     parsed = [signal_argv(g) for g, _, _ in groups]
 
     # Provenance is decided over the whole command: a name holds a captured PID
     # only if every write to it is a pure assignment of the background PID.
-    values, writes, first, rebound = {}, {}, {}, set()
+    values = {name: set(items) for name, items in (inherited or {}).items()}
+    writes, first, rebound = {}, {}, set()
     for index, (group, _, _) in enumerate(groups):
         args, _, _, assigns = parsed[index]
         for name, plus, value in assigns:
@@ -486,6 +494,35 @@ def signal_check(source, depth=0):
         rebound |= signal_arith_names(text)
     qualified = {name for name in first if name not in rebound and all(writes[name])}
 
+    for substitution in scan['subs']:
+        signal_check(substitution, depth+1, values)
+    for header, body, quoted in scan['heredocs']:
+        if any(signal_shell(signal_argv(g)[0]) for g, _, _ in signal_groups(header)):
+            signal_check(body, depth+1, values)
+        elif not quoted:
+            for substitution in signal_scan(body, 0, None, 'literal')['subs']:
+                signal_check(substitution, depth+1, values)
+
+    def inspect(text, hops=0):
+        # Expand recorded command-string variables without executing the shell.
+        if hops >= 8:
+            _block(SIGNAL_REASON + ' Variable indirection is too deep to inspect safely.')
+        variable = re.search(re.escape(SIG_DOLLAR) + '([{]?[A-Za-z_][A-Za-z0-9_]*[}]?)', text)
+        if variable:
+            name = variable.group(1).strip('{}')
+            if name in values:
+                for value in sorted(values[name]):
+                    inspect(text[:variable.start()] + value + text[variable.end():], hops + 1)
+                return
+            if SIG_NAME.search(text):
+                _block(SIGNAL_REASON)
+        signal_text(text, depth+1, values)
+
+    def input_words(text):
+        for words, _, _ in signal_groups(text):
+            for word in words:
+                inspect(word)
+
     def dispatch(group, args, indirect, chain, hops, captures):
         if not args:
             return
@@ -498,11 +535,11 @@ def signal_check(source, depth=0):
                 for value in sorted(values[name]):
                     inner, inner_indirect, inner_strings, _ = signal_argv(value.split() + args[1:])
                     for string in inner_strings:
-                        signal_check(string, depth+1)
+                        inspect(string)
                     dispatch(group, inner, indirect or inner_indirect, chain, hops + 1, captures)
                 return
-            if signal_mentions(groups):
-                _block(SIGNAL_REASON)
+            for string in signal_cstrings(args[1:]):
+                inspect(string)
         base = os.path.basename(program)
         for match in SIG_HOLDER.finditer(program):
             if SIG_NAME.search(holders[int(match.group(1))]):
@@ -524,28 +561,31 @@ def signal_check(source, depth=0):
                         command.append(item)
                     inner, inner_indirect, inner_strings, _ = signal_argv(command)
                     for string in inner_strings:
-                        signal_check(string, depth+1)
+                        inspect(string)
                     dispatch(group, inner, inner_indirect, chain, hops, captures)
         if base == 'eval':
-            signal_check(' '.join(args[1:]), depth+1)
+            inspect(' '.join(args[1:]))
+        if signal_shell(args) or base in ('source', '.'):
+            for word in args[1:]:
+                for match in SIG_HOLDER.finditer(word):
+                    index = int(match.group(1))
+                    if index in scan['scripts']:
+                        input_words(holders[index])
         if signal_shell(args):
             if signal_stdin(args):
                 for k, word in enumerate(group):
                     if word == '<<<' and k + 1 < len(group):
-                        signal_text(group[k+1], depth+1)
+                        inspect(group[k+1])
                 for upstream in chain:
                     for word in upstream:
-                        signal_text(word, depth+1)
-            for k, arg in enumerate(args[1:], 1):
-                if arg.startswith('-') and not arg.startswith('--') and 'c' in arg:
-                    if k+1 < len(args):
-                        signal_check(args[k+1], depth+1)
-                    break
+                        inspect(word)
+            for string in signal_cstrings(args[1:]):
+                inspect(string)
 
     for index, (group, _, chain) in enumerate(groups):
         args, indirect, strings, _ = parsed[index]
         for string in strings:
-            signal_check(string, depth+1)
+            inspect(string)
         captures = {name for name in qualified if first[name] < index}
         dispatch(group, args, indirect, chain, 0, captures)
 
