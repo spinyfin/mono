@@ -248,6 +248,11 @@ impl WorkerCompletionHandler {
             && self.enable_revision_triggered_reviews
             && let Ok(execution) = execution_result.as_ref()
             && execution.kind == ExecutionKind::RevisionImplementation
+            && !super::run_done_declaration::review_skipped_before_hold(
+                &self.work_db,
+                &execution.work_item_id,
+                self.max_review_cycles,
+            )
             && !matches!(
                 self.work_db.get_revision_stop_contributed_head(execution_id),
                 Ok(Some(ref stamped)) if !stamped.is_empty()

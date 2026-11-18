@@ -6,14 +6,10 @@
 //! finished run. So a completion that takes the hold has to know that head,
 //! and has to leave the hold owned by something that will decide it.
 //!
-//! Before this module the Stop boundary read the head and a declared delivery
-//! did not: it finished the run with no head recorded and left the revision
-//! held for a head that only a later admission call could supply. When that
-//! call did not return a batch, the review that eventually ran released
-//! nothing (spinyfin/mono#3502, 2026-11-09). Admission now records the head
-//! at every attempt (mono#3539). This module removes the dependence on a
-//! later call: every completion records the head itself, and settles the
-//! hold against the batch for it.
+//! Every completion that takes a revision's review hold records the head the
+//! run finished at before taking it, and settles the hold against the
+//! pre-merge batch for that head, so the hold never depends on a later
+//! admission call to name its head.
 //!
 //! - [`WorkerCompletionHandler::delivered_revision_head`] reads the head a
 //!   declared delivery finished at. The Stop boundary has its own reads.

@@ -583,13 +583,14 @@ impl WorkerCompletionHandler {
         } else {
             WorkerPrCompletionTarget::InReview
         };
-        // The head this revision's delivery finished at. A Stop-boundary
-        // completion reads it; this path used to finish the run without one,
-        // leaving `pr_head_after` empty and the review hold below keyed on a
-        // head only a later admission call could supply. See
-        // `super::revision_review_hold`.
+
+        // The head this revision's delivery finished at. The review hold
+        // below is keyed on it, so it is recorded with the completion. See
+        // `super::revision_review_hold`. A parked revision or one at the
+        // review-cycle bound goes straight to `in_review` and takes no hold.
         let holds_revision_for_review = execution.kind == ExecutionKind::RevisionImplementation
-            && matches!(target, WorkerPrCompletionTarget::PendingReview);
+            && matches!(target, WorkerPrCompletionTarget::PendingReview)
+            && !review_skipped_before_hold(&self.work_db, &execution.work_item_id, self.max_review_cycles);
         let delivered_head = if execution.kind == ExecutionKind::RevisionImplementation && !merged && !closed_unmerged {
             self.delivered_revision_head(execution, &pr_url, verified_head).await
         } else {
@@ -1164,12 +1165,10 @@ async fn run_declared_delivery_post_effects(
 fn release_pending_review_hold_with_verdict(work_db: &crate::work::WorkDb, work_item_id: &str, cycle_root_id: &str) {
     match work_db.release_review_hold(work_item_id, Some(cycle_root_id)) {
         Ok(true) => {}
-        // A revision's hold is its own, not the cycle root's: the decision
-        // not to review what it pushed is made, and the Stop boundary sends
-        // the same skip straight to `in_review` without asking for a verdict.
-        // Requiring one here stranded the revision whenever the root's newest
-        // reviewer run had none: a pure rebase before the first review, or a
-        // newer batch that was reaped.
+        // A revision's hold is its own, not the cycle root's, so no verdict
+        // under the root is required to release it: the decision not to
+        // review what it pushed is already made, and the Stop boundary sends
+        // the same skip straight to `in_review`.
         Ok(false) if work_item_id != cycle_root_id => {
             tracing::info!(
                 work_item_id,
@@ -1193,6 +1192,17 @@ fn release_pending_review_hold_with_verdict(work_db: &crate::work::WorkDb, work_
             "run_done post-effects: failed to release PendingReview hold",
         ),
     }
+}
+
+/// `true` when a revision's push will not be reviewed because its row is
+/// parked or its review cycle is at `max_review_cycles`; such a revision goes
+/// straight to `in_review` and takes no hold, so it needs no recorded head.
+pub(super) fn review_skipped_before_hold(work_db: &crate::work::WorkDb, work_item_id: &str, max_cycles: usize) -> bool {
+    if reviewer_suppressed_by_park(work_db, work_item_id) {
+        return true;
+    }
+    let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
+    matches!(work_db.get_task_review_cycle_state(&cycle_root_id), Ok((cycle, _)) if (cycle as usize) >= max_cycles)
 }
 
 /// `true` when `work_item_id` is parked, so no automated reviewer may be

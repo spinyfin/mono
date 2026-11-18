@@ -219,6 +219,7 @@ fn settling_against_a_running_batch_holds_until_its_decision() {
     held.fail_through_quorum(&batch.id);
 
     assert_eq!(held.status(), TaskStatus::InReview);
+    held.assert_later_revision_is_dispatchable();
 }
 
 /// With no batch for the head there is nothing to settle against. The head is
