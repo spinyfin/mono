@@ -247,6 +247,13 @@ impl AgentDriver for AgyDriver {
         ]
     }
 
+    fn post_submit_failure_markers(&self) -> Vec<String> {
+        // Measured: the vendor eligibility service answering 500 discards the
+        // submitted prompt on screen; the composer returns to idle and no
+        // `SessionStart` or `Stop` hook fires.
+        vec!["Eligibility check failed".into()]
+    }
+
     fn settings_log_check(&self) -> Option<SettingsLogCheckSpec> {
         Some(SettingsLogCheckSpec {
             verify: permissions::verify_runtime_state,
@@ -1531,6 +1538,10 @@ mod tests {
                 .any(|m| m == "Settings Error")
         );
         assert_eq!(config["paste_landed_markers"], serde_json::json!([]));
+        assert_eq!(
+            config["post_submit_failure_markers"],
+            serde_json::json!(["Eligibility check failed"])
+        );
         assert_eq!(config["check_settings_log"], true);
     }
 

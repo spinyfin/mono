@@ -94,6 +94,44 @@ fn normalize_dialog_line(line: &str) -> &str {
 /// Modal choices are adjacent to the question and cancellation footer.
 /// Ordinary transcript prose and quoted questions do not establish a dialog.
 fn dialog_contains(visible: &str, marker: &str) -> bool {
+    footer_dialog_contains(visible, marker) || selection_menu_contains(visible, marker)
+}
+
+/// The selected row of Antigravity's startup menus. Its trust dialog and its
+/// `Settings Error` screen carry no `esc to cancel` footer and no numbered
+/// choices; the answer is the `>`-marked row among unnumbered ones.
+const SELECTION_MENU_CHOICES: [&str; 2] = ["Yes, I trust this folder", "Exit and fix manually"];
+
+fn selection_menu_contains(visible: &str, marker: &str) -> bool {
+    let mut lines: Vec<_> = visible.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    // The live menu owns the bottom of the screen: its selected row is the
+    // last `>` row, with no composer (`>` or `❯`) after it. A transcript copy
+    // is followed by the real composer.
+    let Some(selected) = lines.iter().rposition(|line| {
+        let row = line.trim().trim_start_matches(BOX_GLYPHS).trim();
+        row.starts_with('>') || row.contains('❯')
+    }) else {
+        return false;
+    };
+    if !lines[selected]
+        .trim()
+        .trim_start_matches(BOX_GLYPHS)
+        .trim()
+        .starts_with('>')
+        || !SELECTION_MENU_CHOICES.contains(&normalize_dialog_line(lines[selected]))
+    {
+        return false;
+    }
+    lines[..selected].iter().enumerate().any(|(index, line)| {
+        let question = normalize_dialog_line(line).trim_start_matches('⚠').trim();
+        !marker.is_empty() && lines.len() - index <= 12 && question.starts_with(marker)
+    })
+}
+
+fn footer_dialog_contains(visible: &str, marker: &str) -> bool {
     let lines: Vec<_> = visible.lines().collect();
     // An active modal owns the footer. Status chrome below that footer
     // (mode line, bypass banner) must not hide it. A transcript example

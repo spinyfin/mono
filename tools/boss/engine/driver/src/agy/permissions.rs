@@ -525,7 +525,7 @@ pub fn render_settings_for_input(input: &PermissionInput) -> anyhow::Result<Sess
     };
     let hooks_dir = hooks_dir_for_run(&input.run_id)?;
     let rules_path = super::home::agent_rules_path_for_run(&input.run_id)?;
-    let rules_root = rules_path.ancestors().nth(3).context("rules root")?;
+    let rules_root = rules_path.parent().context("rules root")?;
     render_settings(
         &SettingsPlan::builder()
             .worker_kind(input.worker_kind)

@@ -592,6 +592,22 @@ fn the_rendered_fences_name_the_engine_data_dir_and_resolved_paths() {
     ] {
         assert!(deny.contains(&expected.as_str()), "missing {expected} in {deny:?}");
     }
+    // The rules fence is this run's `rules-root`, not the shared homes tree
+    // above it, and the production renderer agrees with the live probe.
+    let rules_root = super::super::home::agent_rules_path_for_run("run-fences")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert!(rules_root.ends_with("run-fences/rules-root"), "{rules_root:?}");
+    assert!(
+        deny.contains(&format!("write_file({})", rules_root.display()).as_str()),
+        "missing rules-root fence in {deny:?}"
+    );
+    assert!(
+        !deny.contains(&format!("write_file({})", super::super::home::agy_homes_root().display()).as_str()),
+        "the shared homes dir must not be fenced: {deny:?}"
+    );
 
     // Remote: the forwarded socket's directory is not a Boss data dir.
     let remote = permission_input(WorkerKind::Standard, &workspace, &data_dir, "run-fences", true);

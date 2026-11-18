@@ -246,6 +246,18 @@ class BlockingDialogOnScreen(RuntimeError):
         super().__init__(f"BlockingDialogOnScreen: pane input refused because a blocking dialog was on screen; matched marker {self.marker!r}")
 
 
+class BriefDropped(RuntimeError):
+    """The CLI reported, on screen, that it discarded the submitted brief."""
+
+    def __init__(self, marker):
+        self.marker = marker.decode("utf-8", "replace")
+        super().__init__(f"submitted brief was dropped by the driver: screen shows {self.marker!r}")
+
+
+# How long after the submit the screen is watched for a drop notice. A drop is
+# reported within seconds; later output is the turn itself.
+POST_SUBMIT_WATCH = 30
+
 PROMPT_MARK = "❯".encode()
 _BOX_PREFIXES = (b"|", "│".encode(), "┃".encode(), "║".encode())
 
@@ -274,11 +286,40 @@ def _is_later_composer(line):
     return bool(row) and (PROMPT_MARK in row or row.startswith(b">"))
 
 
+SELECTION_MENU_CHOICES = (b"Yes, I trust this folder", b"Exit and fix manually")
+
+
+def _selection_menu_marker(lines, markers):
+    # Antigravity's trust dialog and `Settings Error` screen have no
+    # `esc to cancel` footer and no numbered choices: the answer is the
+    # `>`-marked row among unnumbered ones, last on screen. A transcript copy
+    # is followed by the real composer, so the last marker row is not a choice.
+    lines = list(lines)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    selected = next((index for index in range(len(lines) - 1, -1, -1)
+                     if _strip_box_glyphs(lines[index].strip()).startswith(b">")
+                     or PROMPT_MARK in _strip_box_glyphs(lines[index].strip())), None)
+    if selected is None or not _strip_box_glyphs(lines[selected].strip()).startswith(b">"):
+        return None
+    if _dialog_line(lines[selected]) not in SELECTION_MENU_CHOICES:
+        return None
+    for marker in markers:
+        for index in range(selected):
+            if (len(lines) - index <= 12 and marker
+                    and _dialog_line(lines[index]).lstrip("⚠".encode()).strip().startswith(marker)):
+                return marker
+    return None
+
+
 def check_blocking_dialog(view, markers, payload=b""):
     visible = view.text()
     if len(payload) <= len(visible) and b"\n" in payload:
         visible = visible.replace("❯ ".encode() + payload, b"", 1)
     lines = visible.splitlines()
+    menu = _selection_menu_marker(lines, markers)
+    if menu is not None:
+        raise BlockingDialogOnScreen(menu)
     footer = next((index for index in range(len(lines) - 1, -1, -1)
                    if b"esc to cancel" in _dialog_line(lines[index]).lower()), None)
     if footer is None:
@@ -421,7 +462,7 @@ class SettingsLogWatcher:
 
 def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_markers=(),
         landing_timeout=LANDING_TIMEOUT, log=lambda step, **fields: None, blocking_dialog_markers=(),
-        settings_check=None):
+        settings_check=None, post_submit_failure_markers=()):
     if b"\x1b[201~" in prompt or b"\0" in prompt:
         raise ValueError("initial brief contains a terminal paste terminator or NUL")
     outer_tty = os.isatty(0)
@@ -475,6 +516,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
     stdin_open = outer_tty
     exit_status = None
     drain_until = None
+    watch_until = 0
     try:
         if outer_tty:
             tty.setraw(0, termios.TCSANOW)
@@ -532,6 +574,15 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                 if not delivered:
                     view.feed(output)
                     check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
+                elif post_submit_failure_markers and now < watch_until:
+                    # An accepted paste does not prove a turn started: the CLI
+                    # can discard the brief with a vendor error and fire no hook.
+                    view.feed(output)
+                    visible = view.text()
+                    dropped = next((m for m in post_submit_failure_markers if m in visible), None)
+                    if dropped is not None:
+                        log("post_submit_failure", marker=dropped.decode("utf-8", "replace"))
+                        raise BriefDropped(dropped)
                 if stage == "landing":
                     echo = (echo + output)[-65536:]
                 if not paste_started:
@@ -586,6 +637,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     # Durable proof the moment the submit bytes are fully
                     # written, not when the (long-lived) driver exits.
                     write_marker(DELIVERED_MARKER)
+                    watch_until = time.monotonic() + POST_SUBMIT_WATCH
                     log("submit_sent")
                 elif not pending and stage == "paste":
                     # Return follows only once the composer shows the brief.
@@ -681,6 +733,7 @@ def main():
     write_marker(DELIVERY_LOG)
     return run(argv, prompt, markers, starting_markers, landed_markers=landed_markers, log=log_delivery,
                blocking_dialog_markers=[s.encode() for s in config.get("blocking_dialog_markers", [])],
+               post_submit_failure_markers=[s.encode() for s in config.get("post_submit_failure_markers", [])],
                settings_check=Path(__file__).with_name("settings-log-check.json")
                if config.get("check_settings_log") else None)
 

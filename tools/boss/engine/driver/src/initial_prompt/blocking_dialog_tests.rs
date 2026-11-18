@@ -156,3 +156,53 @@ while True:
             .any(|marker| marker == "Run this command?")
     );
 }
+
+#[test]
+fn launcher_fails_the_spawn_when_the_cli_reports_a_dropped_brief() {
+    use crate::AgentDriver;
+    // The vendor error discards the brief without any hook, so the launcher is
+    // the only place that can see it.
+    let markers = crate::AgyDriver::default().post_submit_failure_markers();
+    assert_eq!(markers, ["Eligibility check failed"]);
+    let temp = tempfile::tempdir().unwrap();
+    provision(temp.path(), temp.path(), "private sentinel", &crate::ClaudeDriver).unwrap();
+    let config_path = temp.path().join("initial-prompt.json");
+    let mut config: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["post_submit_failure_markers"] = serde_json::json!(markers);
+    fs::write(&config_path, config.to_string()).unwrap();
+    let stub = temp.path().join("driver.py");
+    fs::write(
+        &stub,
+        r#"
+import os, tty
+tty.setraw(0)
+os.write(1, b'\x1b[?2004hClaude Code')
+data = b''
+while not data.endswith(b'\x1b[201~'):
+    data += os.read(0, 4096)
+os.write(1, b'\r\n[Pasted text #1 +1 lines]')
+while not data.endswith(b'\r'):
+    data += os.read(0, 4096)
+os.write(1, b'\r\nEligibility check failed: failed to fetch user info: 500 Internal Server Error\r\n')
+import time
+time.sleep(30)
+"#,
+    )
+    .unwrap();
+    let output = boss_command_runner::output_blocking_timeout(
+        std::process::Command::new("python3")
+            .arg(temp.path().join("initial-prompt.py"))
+            .arg("python3")
+            .arg(stub)
+            .stdin(std::process::Stdio::null()),
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    // Delivered (the brief was submitted), then failed: not the undelivered code.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(delivered_marker_present(temp.path()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("submitted brief was dropped"), "{stderr}");
+    let log = fs::read_to_string(temp.path().join("initial-prompt.delivery.jsonl")).unwrap();
+    assert!(log.contains("post_submit_failure"), "{log}");
+}
