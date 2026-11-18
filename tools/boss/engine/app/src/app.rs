@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -52,9 +54,9 @@ use boss_protocol::{
     DispatchAdmissionEntryPoint, EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput,
     FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
     HostedPaneState, HostedPaneStatus, InvalidationClass, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
-    RequestExecutionInput, RevealWorkItemInput, TOPIC_BOOTHBY_ACTIVITY, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
-    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic, execution_topic, probe_topic,
-    work_product_topic,
+    RequestExecutionInput, RevealWorkItemInput, TOPIC_BOOTHBY_ACTIVITY, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH,
+    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
+    execution_topic, probe_topic, work_product_topic,
 };
 use boss_work_db::{
     ANSWER_AGENT_RUN_STATUS_FAILED, ActionedAttentionGroup, DuplicateTaskError, ExecutionKind, ExecutionStatus,
@@ -74,9 +76,9 @@ mod approval_prompt;
 pub(crate) mod attachments;
 mod attentions;
 mod automations;
-mod boothby;
 mod blocking_dialog;
 mod board_progress;
+mod boothby;
 mod broadcasts;
 mod ci_remediation;
 mod comments;
@@ -1210,17 +1212,11 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
-    /// Boothby's event-trigger queue (`boothby.md` §"Activation model").
-    /// Armed by [`boss_engine_runtime::boothby_dispatch_sinks::BoothbyEventSink`]
-    /// (dispatch-stage triggers) and by `WorkDb::create_attention_item`
-    /// (attention-kind triggers); consulted by
-    /// [`boss_engine_runtime::boothby_scheduler::spawn_loop`].
+    /// Boothby's event-trigger queue (`boothby.md` §"Activation model"),
+    /// armed by dispatch-stage and attention-kind triggers.
     boothby_events: Arc<boss_engine_runtime::boothby_events::BoothbyEventQueue>,
-    /// Wakes the Boothby scheduler loop for reasons unrelated to an event
-    /// trigger — a manual `RunBoothbyPass`, or `SetBoothbyMode` flipping the
-    /// mode off `off`. The same `Notify` `boothby_events` arms internally
-    /// (`BoothbyEventQueue::kick_handle`), so either path wakes the same
-    /// sleeping loop.
+    /// Wakes the Boothby scheduler loop outside an event trigger (manual run,
+    /// mode change); the same `Notify` `boothby_events` arms internally.
     boothby_kick: Arc<Notify>,
     /// The merge poller's host: conflict remediation (behind its bounded
     /// background queue and per-PR cooldown), design-doc pointer upkeep and
@@ -1257,19 +1253,6 @@ struct ServerState {
     /// wheel's background task.
     #[builder(default)]
     timer_wheel: std::sync::OnceLock<Arc<TimerWheel>>,
-}
-
-/// Lets [`boss_engine_runtime::boothby_scheduler::spawn_loop`] push pass-lifecycle changes
-/// onto the `boothby.activity` topic without depending on `ServerState`
-/// directly (the scheduler module only knows `WorkDb` and trait objects — see
-/// its module doc). `Arc<ServerState>` coerces to
-/// `Arc<dyn BoothbyActivitySink>` at the `spawn_loop` call site in
-/// `app::server::serve`.
-#[async_trait]
-impl boss_engine_runtime::boothby_scheduler::BoothbyActivitySink for ServerState {
-    async fn pass_changed(&self, pass: &boss_protocol::BoothbyPass) {
-        self.broadcast_boothby_activity(pass.clone()).await;
-    }
 }
 
 impl ServerState {
@@ -1628,23 +1611,10 @@ impl ServerState {
                 state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
             ))
         });
-        // Boothby's event-trigger queue (`boothby.md` §"Activation model"):
-        // armed either by a dispatch-stage sink (below, fanned out alongside
-        // the production JSONL sink) or by the attention-creation hook
-        // registered on `work_db` just below. `boothby_kick` doubles as the
-        // scheduler's wake signal for reasons unrelated to an event trigger
-        // (manual run, mode change) — see `app::server::serve`.
-        let boothby_kick = Arc::new(Notify::new());
-        let boothby_events = boss_engine_runtime::boothby_events::BoothbyEventQueue::new(boothby_kick.clone());
-        work_db.set_boothby_event_queue(boothby_events.clone());
+        let (boothby_events, boothby_kick, dispatch_events) =
+            boothby::event_triggers(&work_db, dispatch_event_root.clone());
         let boothby_events_for_state = boothby_events.clone();
         let boothby_kick_for_state = boothby_kick.clone();
-
-        let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
-            Arc::new(boss_engine_runtime::boothby_dispatch_sinks::FanOutDispatchEventSink::new(vec![
-                Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone())),
-                Arc::new(boss_engine_runtime::boothby_dispatch_sinks::BoothbyEventSink::new(boothby_events.clone())),
-            ]));
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();

@@ -58,7 +58,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
     let dispatch_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match request {
         r @ FrontendRequest::GetBoothbyState => Box::pin(boothby::handle_get_boothby_state(ctx, r)),
         r @ FrontendRequest::ListBoothbyPasses { .. } => Box::pin(boothby::handle_list_boothby_passes(ctx, r)),
-        r @ FrontendRequest::RunBoothbyPass { .. } => Box::pin(boothby::handle_run_boothby_pass(ctx, r)),
+        r @ FrontendRequest::RunBoothbyPass => Box::pin(boothby::handle_run_boothby_pass(ctx, r)),
         r @ FrontendRequest::SetBoothbyMode { .. } => Box::pin(boothby::handle_set_boothby_mode(ctx, r)),
         r @ FrontendRequest::AbandonCiRemediation { .. } => {
             Box::pin(ci_remediation::handle_abandon_ci_remediation(ctx, r))

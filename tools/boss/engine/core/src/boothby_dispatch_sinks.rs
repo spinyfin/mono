@@ -70,9 +70,7 @@ impl BoothbyEventSink {
 #[async_trait]
 impl DispatchEventSink for BoothbyEventSink {
     async fn emit(&self, event: DispatchEvent) {
-        let is_trigger_stage = BOOTHBY_TRIGGER_STAGES
-            .iter()
-            .any(|stage| stage.as_str() == event.stage);
+        let is_trigger_stage = BOOTHBY_TRIGGER_STAGES.iter().any(|stage| stage.as_str() == event.stage);
         if is_trigger_stage {
             let now = boss_engine_utils::epoch_time::now_epoch_secs();
             self.queue.arm(

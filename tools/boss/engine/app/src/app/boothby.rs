@@ -4,6 +4,32 @@
 
 use super::*;
 
+/// Boothby's event-trigger queue and its wake signal, plus the dispatch-event
+/// sink that fans out to the production JSONL stream and arms the queue on a
+/// trigger stage. The queue is also registered on `work_db` so attention-kind
+/// triggers arm it.
+pub(super) fn event_triggers(
+    work_db: &WorkDb,
+    dispatch_event_root: PathBuf,
+) -> (
+    Arc<boss_engine_runtime::boothby_events::BoothbyEventQueue>,
+    Arc<Notify>,
+    Arc<dyn boss_dispatch_events::DispatchEventSink>,
+) {
+    let kick = Arc::new(Notify::new());
+    let events = boss_engine_runtime::boothby_events::BoothbyEventQueue::new(kick.clone());
+    work_db.set_boothby_event_queue(events.clone());
+    let sink: Arc<dyn boss_dispatch_events::DispatchEventSink> = Arc::new(
+        boss_engine_runtime::boothby_dispatch_sinks::FanOutDispatchEventSink::new(vec![
+            Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root)),
+            Arc::new(boss_engine_runtime::boothby_dispatch_sinks::BoothbyEventSink::new(
+                events.clone(),
+            )),
+        ]),
+    );
+    (events, kick, sink)
+}
+
 pub(super) fn spawn_scheduler(server_state: &Arc<ServerState>) -> tokio::task::JoinHandle<()> {
     // Boothby scheduler (boothby.md §"Activation model"): adaptive-sleep loop
     // over the cron `boothby.schedule` setting plus the event-trigger queue
@@ -193,5 +219,18 @@ pub(super) async fn handle_set_boothby_mode(ctx: Dispatch, req: FrontendRequest)
     match boothby_state_event(&server_state, &work_db) {
         Ok(event) => send_response(&sink, &request_id, event),
         Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
+/// Lets [`boss_engine_runtime::boothby_scheduler::spawn_loop`] push pass-lifecycle changes
+/// onto the `boothby.activity` topic without depending on `ServerState`
+/// directly (the scheduler module only knows `WorkDb` and trait objects — see
+/// its module doc). `Arc<ServerState>` coerces to
+/// `Arc<dyn BoothbyActivitySink>` at the `spawn_loop` call site in
+/// `app::server::serve`.
+#[async_trait]
+impl boss_engine_runtime::boothby_scheduler::BoothbyActivitySink for ServerState {
+    async fn pass_changed(&self, pass: &boss_protocol::BoothbyPass) {
+        self.broadcast_boothby_activity(pass.clone()).await;
     }
 }

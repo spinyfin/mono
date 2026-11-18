@@ -1839,9 +1839,7 @@ pub enum FrontendEvent {
     // --- Boothby replies (boothby.md) ---
     #[worker(passthrough)]
     /// Response to [`FrontendRequest::ListBoothbyPasses`].
-    BoothbyPassesList {
-        passes: Vec<BoothbyPass>,
-    },
+    BoothbyPassesList { passes: Vec<BoothbyPass> },
     #[worker(passthrough)]
     /// Response to [`FrontendRequest::GetBoothbyState`] and
     /// [`FrontendRequest::SetBoothbyMode`].
@@ -1854,15 +1852,11 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::RunBoothbyPass`]: the pass row that was
     /// opened. A pass that finds no candidates finishes essentially
     /// instantly, but this reply does not wait for that — it confirms the pass opened, not that it finished.
-    BoothbyPassStarted {
-        pass: BoothbyPass,
-    },
+    BoothbyPassStarted { pass: BoothbyPass },
     #[worker(passthrough)]
     /// Pushed on [`TOPIC_BOOTHBY_ACTIVITY`] whenever a `boothby_passes` row
     /// opens or closes.
-    BoothbyActivity {
-        pass: BoothbyPass,
-    },
+    BoothbyActivity { pass: BoothbyPass },
 }
 
 impl FrontendEvent {
