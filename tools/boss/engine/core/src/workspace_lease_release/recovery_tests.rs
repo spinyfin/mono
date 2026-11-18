@@ -239,6 +239,13 @@ crate::stub_cube_client! { HandoffRegistry {
     async fn list_workspaces(&self) -> Result<Vec<boss_execution_contracts::CubeWorkspaceStatus>> { Ok(self.0.clone()) }
 } }
 
+fn past_lease_boundary_millis() -> i64 {
+    // One millisecond behind "now" so a later jj operation is strictly after
+    // the boundary without a real-time wait. Original worker commands in this
+    // test have already run, so their operations stay at or before the stamp.
+    (boss_engine_utils::epoch_time::now_epoch_ms() as i64).saturating_sub(1)
+}
+
 #[tokio::test]
 async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
     use boss_engine_test_git::jj::JjRepo;
@@ -942,14 +949,9 @@ async fn leftover_sweep_never_adopts_an_allow_dirty_successors_edits() {
                 "commit_id",
             ],
         );
-        db.confirm_workspace_lease(
-            &execution.id,
-            "lease",
-            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
-        )
-        .unwrap();
+        db.confirm_workspace_lease(&execution.id, "lease", past_lease_boundary_millis())
+            .unwrap();
         db.record_workspace_lease_generation(&execution.id, "lease", 1).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         std::fs::write(repo.worker.join("theirs"), "allow-dirty successor").unwrap();
         if successor_ran_jj {
             JjRepo::run(&repo.worker, &["status"]);
@@ -1013,13 +1015,8 @@ async fn leftover_sweep_snapshots_boundary_edits_for_inspection_and_reports_late
                 "commit_id",
             ],
         );
-        db.confirm_workspace_lease(
-            &execution.id,
-            "lease",
-            boss_engine_utils::epoch_time::now_epoch_ms() as i64,
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        db.confirm_workspace_lease(&execution.id, "lease", past_lease_boundary_millis())
+            .unwrap();
         if action == "new" {
             JjRepo::run(&repo.worker, &["new", "-m", "Next change"]);
             std::fs::write(repo.worker.join("next"), "unsnapshotted").unwrap();

@@ -302,7 +302,7 @@ async fn bound_pr_snapshot_dispatch(revision: bool, fail_first: bool) {
             .unwrap()
             .dispatch_not_before
             .as_deref()
-            .expect("timeout stamps dispatch_not_before")
+            .expect("pre-start retry stamps dispatch_not_before")
             .parse::<i64>()
             .unwrap();
         let _clock = boss_engine_utils::epoch_time::NowGuard::set(retry_at + 1);
