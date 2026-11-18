@@ -30,8 +30,13 @@ mod declared_wait;
 mod never_started_reap;
 mod prompt_acceptance;
 pub mod semantic_progress;
-pub use declared_wait::{DeclaredWait, DeclaredWaitSource};
-use declared_wait::{SharedWaitSource, effective_wait, is_idle_prompt_message, reconcile_parked, settle_parked};
+mod wait_park;
+pub use declared_wait::{DeclaredWait, DeclaredWaitIdentity, DeclaredWaitSource};
+use declared_wait::{SharedWaitSource, effective_wait, is_idle_prompt_message, reconcile_parked};
+use wait_park::{
+    WaitSnapshot, lapsed_wait_consumed, note_overtaken_wait_park, note_wait_park, note_wait_resume,
+    observe_wait_declaration, settle_slot, wait_snapshot,
+};
 
 /// Literal written when `activity` is `WaitingForInput` and no narrative exists.
 pub const AWAITING_INPUT_LITERAL: &str = "awaiting input";
@@ -486,6 +491,10 @@ struct SlotMeta {
     /// the park it applied to; after a resume it reads as no wait.
     #[builder(default = false)]
     resumed_after_wait_park: bool,
+    /// The wait [`Self::parked_on_declared_wait`] / [`Self::resumed_after_wait_park`]
+    /// refer to. A later declaration resets those flags so they cannot
+    /// suppress a new wait's overdue state.
+    parked_wait: Option<declared_wait::DeclaredWaitIdentity>,
     /// Ordered clearing events retained for this slot lifetime so a late
     /// notification is attributed to its first consumer, not the newest one.
     #[builder(default)]
@@ -1905,14 +1914,19 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let mut changed = Vec::new();
         for (slot_id, entry) in guard.iter_mut() {
+            let snapshot = WaitSnapshot {
+                wait: source.declared_wait(&entry.state.run_id, now_epoch_secs),
+                identity: source.wait_identity(&entry.state.run_id),
+            };
+            observe_wait_declaration(&mut entry.meta, snapshot);
             let wait = effective_wait(
-                source.declared_wait(&entry.state.run_id, now_epoch_secs),
-                entry.meta.resumed_after_wait_park,
+                snapshot.wait,
+                lapsed_wait_consumed(&entry.meta, snapshot.identity.as_ref()),
             );
             if let Some(next) = reconcile_parked(entry.state.activity, entry.meta.blocking_prompt_pending, wait) {
                 changed.push((*slot_id, entry.state.activity, next));
                 entry.state.activity = next;
-                note_wait_park(&mut entry.meta, next);
+                note_wait_park(&mut entry.meta, next, snapshot.identity);
             }
         }
         changed
@@ -1932,7 +1946,9 @@ impl LiveWorkerStateRegistry {
     /// - a `Stop` overtaken by the resumed turn's tool hook still opened a
     ///   turn boundary, which is reported through
     ///   [`HookApplied::resumed_after`] without consuming the wait declared before
-    ///   that boundary.
+    ///   that boundary. Park/resume bookkeeping for a lapsed wait still
+    ///   updates in ingress order, including this stale path, so a later
+    ///   Stop cannot hide a human ask as `WaitOverdue`.
     ///
     /// Every other late event describes a state the worker has already left
     /// and is refused.
@@ -1981,9 +1997,11 @@ impl LiveWorkerStateRegistry {
                     "live-state registry: a hook event arrived behind a newer one; \
                      the slot already reflects what the worker did after it",
                 );
-                let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin);
+                let snapshot = wait_snapshot(&wait_source, &state.run_id, now_secs);
+                observe_wait_declaration(meta, snapshot);
+                let (resumed_after, repaired) = reconcile_late_event(state, meta, ingress_seq, event, origin, snapshot);
                 if repaired && matches!(state.activity, WorkerActivity::Idle | WorkerActivity::WaitingForInput) {
-                    settle_slot(state, meta, state.activity, wait_state(&wait_source, &state.run_id));
+                    settle_slot(state, meta, state.activity, snapshot);
                 }
 
                 return HookApplied {
@@ -1994,7 +2012,9 @@ impl LiveWorkerStateRegistry {
             }
             meta.last_applied_ingress_seq = Some(ingress_seq);
         }
-        let resumed_after = record_turn_progress(meta, ingress_seq, event, origin);
+        let snapshot = wait_snapshot(&wait_source, &state.run_id, now_secs);
+        observe_wait_declaration(meta, snapshot);
+        let resumed_after = record_turn_progress(meta, ingress_seq, event, origin, snapshot.identity.as_ref());
         let before = state.clone();
 
         // A replayed hook carries the time the host saw it. Both the display
@@ -2114,12 +2134,7 @@ impl LiveWorkerStateRegistry {
                     meta.blocking_prompt_pending |= blocking;
                     // A parked worker's own declared wait decides whether an
                     // idle prompt is a human's problem.
-                    settle_slot(
-                        state,
-                        meta,
-                        WorkerActivity::WaitingForInput,
-                        wait_state(&wait_source, &state.run_id),
-                    );
+                    settle_slot(state, meta, WorkerActivity::WaitingForInput, snapshot);
                 }
             }
             WorkerEvent::Stop { .. } => {
@@ -2136,7 +2151,7 @@ impl LiveWorkerStateRegistry {
                     WorkerActivity::Idle
                 };
                 if meta.awaiting_input_capable {
-                    settle_slot(state, meta, raw, wait_state(&wait_source, &state.run_id));
+                    settle_slot(state, meta, raw, snapshot);
                 } else {
                     state.activity = raw;
                 }
@@ -2723,6 +2738,7 @@ fn record_turn_progress(
     seq: Option<u64>,
     event: &WorkerEvent,
     origin: HookOrigin,
+    identity: Option<&DeclaredWaitIdentity>,
 ) -> Option<TurnBoundary> {
     let keep_newest = |slot: &mut Option<u64>| {
         if seq.is_some() {
@@ -2741,9 +2757,7 @@ fn record_turn_progress(
                 return None;
             }
             keep_newest(&mut meta.last_main_activity_seq);
-            if meta.parked_on_declared_wait {
-                meta.resumed_after_wait_park = true;
-            }
+            note_wait_resume(meta, seq, identity);
             meta.open_turn_boundary.take()
         }
         WorkerEvent::SessionStart { .. } | WorkerEvent::Notification { .. } => None,
@@ -2758,12 +2772,14 @@ fn reconcile_late_event(
     seq: u64,
     event: &WorkerEvent,
     origin: HookOrigin,
+    snapshot: WaitSnapshot,
 ) -> (Option<TurnBoundary>, bool) {
     match event {
         WorkerEvent::Stop { .. } => {
             let repaired = consume_late_notification(state, meta, seq);
             let boundary = TurnBoundary { seq: Some(seq) };
             if meta.last_main_activity_seq.is_some_and(|main| main > seq) {
+                note_overtaken_wait_park(meta, seq, snapshot);
                 return (Some(boundary), repaired);
             }
             // Only subagent hooks have been applied since: the main session
@@ -2824,14 +2840,32 @@ fn reconcile_late_event(
         WorkerEvent::UserPromptSubmit { .. } | WorkerEvent::PreToolUse { .. } | WorkerEvent::PostToolUse { .. }
             if !origin.from_subagent =>
         {
-            let repaired =
+            let mut repaired =
                 matches!(event, WorkerEvent::PreToolUse { .. }) && consume_late_notification(state, meta, seq);
             meta.last_main_activity_seq = Some(meta.last_main_activity_seq.map_or(seq, |last| last.max(seq)));
+            note_wait_resume(meta, Some(seq), snapshot.identity.as_ref());
             let resumed = meta
                 .open_turn_boundary
                 .filter(|boundary| boundary.seq.is_none_or(|stop| seq > stop));
             if resumed.is_some() {
                 meta.open_turn_boundary = None;
+            }
+            if matches!(
+                state.activity,
+                WorkerActivity::Idle
+                    | WorkerActivity::WaitingForInput
+                    | WorkerActivity::WaitingOnWork
+                    | WorkerActivity::WaitOverdue
+            ) && meta.last_stop_seq.is_some_and(|stop| stop > seq)
+            {
+                let raw = if state.activity == WorkerActivity::WaitingForInput || meta.blocking_prompt_pending {
+                    WorkerActivity::WaitingForInput
+                } else {
+                    WorkerActivity::Idle
+                };
+                let before = state.activity;
+                settle_slot(state, meta, raw, snapshot);
+                repaired |= before != state.activity;
             }
             (resumed, repaired)
         }
@@ -2884,28 +2918,6 @@ fn worker_event_name(event: &WorkerEvent) -> &'static str {
         WorkerEvent::ToolPoll { .. } => "ToolPoll",
         WorkerEvent::ModelProgress { .. } => "ModelProgress",
         WorkerEvent::SessionEnd { .. } => "SessionEnd",
-    }
-}
-
-fn wait_state(source: &Option<SharedWaitSource>, run_id: &str) -> DeclaredWait {
-    match source {
-        Some(source) => source.declared_wait(run_id, boss_engine_utils::epoch_time::now_epoch_secs()),
-        None => DeclaredWait::None,
-    }
-}
-
-/// Fold a declared wait into a parked slot, scoping a lapsed wait to the
-/// park it applied to so a later resume cannot stay overdue forever.
-fn settle_slot(state: &mut LiveWorkerState, meta: &mut SlotMeta, raw: WorkerActivity, wait: DeclaredWait) {
-    let wait = effective_wait(wait, meta.resumed_after_wait_park);
-    state.activity = settle_parked(raw, meta.blocking_prompt_pending, wait);
-    note_wait_park(meta, state.activity);
-}
-
-fn note_wait_park(meta: &mut SlotMeta, activity: WorkerActivity) {
-    if matches!(activity, WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue) {
-        meta.parked_on_declared_wait = true;
-        meta.resumed_after_wait_park = false;
     }
 }
 

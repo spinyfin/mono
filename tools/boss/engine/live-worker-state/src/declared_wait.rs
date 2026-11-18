@@ -28,14 +28,27 @@ use std::sync::Arc;
 use boss_protocol::WorkerActivity;
 
 /// What the wait registry says about one run at a point in time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeclaredWait {
     /// No wait was ever declared, or it was cleared.
+    #[default]
     None,
     /// A declared wait whose `wait_expires_at` is still in the future.
     Live,
     /// A declared wait whose deadline has passed.
     Lapsed,
+}
+
+/// Identity of one wait declaration, so park/resume bookkeeping can follow
+/// that record rather than the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredWaitIdentity {
+    /// Monotonic per-run generation; a later `declare` is a different wait.
+    pub generation: u64,
+    pub declared_at_epoch: i64,
+    pub expires_at_epoch: i64,
+    /// Newest accepted hook sequence when this wait was declared.
+    pub declared_after_seq: Option<u64>,
 }
 
 /// Declared wait lifecycle, keyed by run id (the execution id).
@@ -44,6 +57,12 @@ pub enum DeclaredWait {
 /// below completion: the wait registry implements the trait there.
 pub trait DeclaredWaitSource: Send + Sync {
     fn declared_wait(&self, run_id: &str, now_epoch_secs: i64) -> DeclaredWait;
+
+    /// The current record's identity, including a lapsed one still held so
+    /// overdue UI can name it. `None` when this run has no record.
+    fn wait_identity(&self, _run_id: &str) -> Option<DeclaredWaitIdentity> {
+        None
+    }
 }
 
 pub(super) type SharedWaitSource = Arc<dyn DeclaredWaitSource>;
@@ -57,10 +76,10 @@ pub(super) fn is_idle_prompt_message(message: &str) -> bool {
 }
 
 /// A lapsed wait is overdue only for the park it applied to. Once the
-/// main session has resumed a turn after that park, the expired record is
-/// no longer a live wait and classifies as [`DeclaredWait::None`].
-pub(super) fn effective_wait(wait: DeclaredWait, resumed_after_wait_park: bool) -> DeclaredWait {
-    if wait == DeclaredWait::Lapsed && resumed_after_wait_park {
+/// main session has resumed after that park, or kept working past this
+/// declaration, the expired record classifies as [`DeclaredWait::None`].
+pub(super) fn effective_wait(wait: DeclaredWait, lapsed_consumed: bool) -> DeclaredWait {
+    if wait == DeclaredWait::Lapsed && lapsed_consumed {
         DeclaredWait::None
     } else {
         wait
