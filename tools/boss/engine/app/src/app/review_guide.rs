@@ -175,7 +175,12 @@ pub(super) async fn handle_get_review_guide_summary(ctx: Dispatch, req: Frontend
         .and_then(|summary| {
             summary
                 .map(|summary| {
-                    let findings = work_db.review_guide_findings(&summary.root_task_id, &summary.canonical_pr_url)?;
+                    let findings = work_db
+                        .review_guide_findings(&summary.root_task_id, &summary.canonical_pr_url)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(root_task_id = %summary.root_task_id, %error, "review guide findings unavailable");
+                            None
+                        });
                     let mut wire = boss_work_db::to_wire_review_guide_summary(summary);
                     wire.findings = findings;
                     Ok(wire)

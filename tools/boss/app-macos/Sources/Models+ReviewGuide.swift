@@ -273,8 +273,21 @@ struct OpenMergeRevision: Codable, Equatable {
     let id: String
     let label: String
     let status: String
+    let statusLabel: String
 
-    var wirePayload: [String: String] { ["id": id, "label": label, "status": status] }
+    enum CodingKeys: String, CodingKey {
+        case id, label, status
+        case statusLabel = "status_label"
+    }
+
+    init(id: String, label: String, status: String, statusLabel: String = "") {
+        self.id = id
+        self.label = label
+        self.status = status
+        self.statusLabel = statusLabel
+    }
+
+    var wirePayload: [String: String] { ["id": id, "label": label, "status": status, "status_label": statusLabel] }
 
     /// Dialog line: short id and a verb. The engine still sends the
     /// canonical status string; this is display-only.

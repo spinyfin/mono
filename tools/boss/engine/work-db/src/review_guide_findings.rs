@@ -27,6 +27,7 @@ impl WorkDb {
                     label: boss_protocol::short_id_label(task.short_id).unwrap_or_else(|| id.clone()),
                     id,
                     status: task.status.to_string(),
+                    status_label: task.status.display_label().to_owned(),
                 });
             }
         }
@@ -44,7 +45,7 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
     reviewed_ids.push(root_id.to_owned());
     let placeholders = vec!["?"; reviewed_ids.len()].join(", ");
     let mut stmt = conn.prepare(&format!(
-        "SELECT p.payload_json, t.id, t.short_id, t.status, t.deleted_at, t.description
+        "SELECT p.payload_json, t.id, t.short_id, t.status, t.deleted_at, t.description, t.kind
          FROM pr_review_verdicts v
          LEFT JOIN worker_proposals p ON p.id = v.proposal_id
          LEFT JOIN pr_review_batches b ON b.id = v.batch_id
@@ -62,14 +63,22 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
     let mut text = FindingsText::default();
     for row in rows {
-        let (payload, id, short_id, status, deleted_at, description) = row?;
+        let (payload, id, short_id, status, deleted_at, description, kind) = row?;
         let findings = if let Some(payload) = payload {
-            let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(&payload)?;
-            let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
+            let verdict = serde_json::from_str::<boss_protocol::ReviewVerdictProposalPayload>(&payload)
+                .and_then(|payload| serde_json::from_value::<boss_pr_review::SupervisorVerdict>(payload.verdict));
+            let verdict = match verdict {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    tracing::warn!(tracker_id = ?id, %error, "skipping unparseable review findings payload");
+                    continue;
+                }
+            };
             verdict
                 .findings
                 .into_iter()
@@ -92,7 +101,14 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             }
             _ => false,
         };
-        let status = if deleted_at.is_some() { None } else { status.as_deref() };
+        let status = if deleted_at.is_some() {
+            None
+        } else if status.as_deref() == Some("in_review") && kind.as_deref() != Some("revision") {
+            // Follow-ups have their own PR and still need to finish before the finding is fixed.
+            Some("active")
+        } else {
+            status.as_deref()
+        };
         for (severity, title) in findings {
             text.push(&severity, &title, label.as_deref(), status, resolved);
         }
