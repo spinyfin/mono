@@ -445,7 +445,7 @@ fn every_waiting_state_yields_a_named_reason() {
         ExecutionKind::ChoreImplementation,
         ExecutionStatus::Ready,
     );
-    set_execution_status(&db, &run.id, "completed");
+    set_execution_status(&db, &run.id, "failed");
     covered.insert(assert_named(
         "active, worker ended, waiting for the orphan sweep",
         &wait_of(&db, pid, &finished.id),
@@ -798,11 +798,12 @@ fn a_running_or_finished_item_does_not_carry_a_stale_dispatch_hold() {
             continue;
         }
         if status == "completed" {
-            // An active item whose run ended waits for the orphan sweep.
+            // Successful completion must never promise automatic redispatch.
             assert_eq!(
                 runtime.dispatch_wait_reason.as_deref(),
-                Some(DISPATCH_WAIT_REASON_AWAITING_REDISPATCH)
+                Some(DISPATCH_WAIT_REASON_RUN_ENDED)
             );
+            assert!(!db.list_orphan_active_candidates(0).unwrap().contains(&chore.id));
             continue;
         }
         assert!(

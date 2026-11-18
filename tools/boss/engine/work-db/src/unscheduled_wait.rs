@@ -177,11 +177,16 @@ pub(super) fn classify(
             None => {}
         }
     }
+    let completed: HashSet<&str> = candidates
+        .iter()
+        .filter(|candidate| candidate.latest == Some(&ExecutionStatus::Completed))
+        .map(|candidate| candidate.task.id.as_str())
+        .collect();
     holds.cards = held_cards;
     let cost = ClassifyCost {
         queued: measured(counter, queued.len(), || classify_queued(conn, &queued, &mut waits))?,
         idle_active: measured(counter, idle_active.len(), || {
-            classify_idle_active(conn, &idle_active, &mut waits)
+            classify_idle_active(conn, &idle_active, &completed, &mut waits)
         })?,
         review: measured(counter, review.len(), || classify_review(conn, &review, &mut waits))?,
         holds,
@@ -600,7 +605,12 @@ fn classify_queued(
 /// starts a replacement run, so the sweep's own candidate predicate names the
 /// ordinary state; the holds it leaves alone are named in turn. Anything
 /// else is the anomaly [`DISPATCH_WAIT_REASON_UNCLASSIFIED`].
-fn classify_idle_active(conn: &Connection, tasks: &[&Task], waits: &mut HashMap<String, DispatchWait>) -> Result<()> {
+fn classify_idle_active(
+    conn: &Connection,
+    tasks: &[&Task],
+    completed: &HashSet<&str>,
+    waits: &mut HashMap<String, DispatchWait>,
+) -> Result<()> {
     let holds = RowHolds::load(conn, &ids_of(tasks))?;
     let mut rest = Vec::new();
     for task in tasks {
@@ -677,6 +687,10 @@ fn classify_idle_active(conn: &Connection, tasks: &[&Task], waits: &mut HashMap<
             }
         } else if review_owned.contains(&task.id) || review_recovery.contains(&task.id) {
             DISPATCH_WAIT_REASON_AWAITING_REVIEW
+        } else if completed.contains(task.id.as_str())
+            && task.updated_at.parse::<i64>().is_ok_and(|updated| updated < i64::MAX)
+        {
+            DISPATCH_WAIT_REASON_RUN_ENDED
         } else {
             DISPATCH_WAIT_REASON_UNCLASSIFIED
         };

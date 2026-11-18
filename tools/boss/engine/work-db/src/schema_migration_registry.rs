@@ -478,6 +478,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: project_postmortem::migrate_task_changed_trigger_project_index,
         },
         Migration {
+            id: "20261028_1900_pr_head_after_capture".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "pr_head_after_capture")? {
+                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261109_1930_preserved_archive_cleanup".into(),
             legacy_version: None,
             apply: preserved_cleanup::migrate_archive_cleanup,
@@ -640,16 +650,6 @@ pub(super) fn all() -> Vec<Migration> {
             id: recurring_read_indexes::PERIODIC_SWEEP_MIGRATION_ID.into(),
             legacy_version: None,
             apply: recurring_read_indexes::migrate_periodic_sweep,
-        },
-        Migration {
-            id: "20261028_1900_pr_head_after_capture".into(),
-            legacy_version: None,
-            apply: |conn| {
-                if !table_has_column(conn, "work_executions", "pr_head_after_capture")? {
-                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")?;
-                }
-                Ok(())
-            },
         },
         Migration {
             id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),

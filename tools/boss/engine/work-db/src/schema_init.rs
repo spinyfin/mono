@@ -794,7 +794,10 @@ mod floor_tests {
         let mut steps: Vec<ExpectedStep> = vec![
             (
                 "20261028_1900_pr_head_after_capture",
-                Box::new(|c| c.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT").unwrap()),
+                Box::new(|c| {
+                    c.execute_batch("ALTER TABLE work_executions ADD COLUMN pr_head_after_capture TEXT")
+                        .unwrap()
+                }),
             ),
             (
                 "00000000_0000_v033_postmortem_signals",
