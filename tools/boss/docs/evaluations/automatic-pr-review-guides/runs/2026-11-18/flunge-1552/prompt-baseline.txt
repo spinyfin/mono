@@ -1,0 +1,63 @@
+I want you to provide me a guided summary of the changes in https://github.com/brianduff/flunge/pull/1552. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: brianduff/flunge
+- PR title: frontend: profile and speed up the jest suite, shard it under bazel (2.2x)
+- Merge-base revision: 54e4e293dfe4e142bf8a63761f4f0348af205a0e
+- Head revision: 7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base ("before") content with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/brianduff-flunge/.git show 54e4e293dfe4e142bf8a63761f4f0348af205a0e:<path>`, and its diff with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/brianduff-flunge/.git diff --no-ext-diff --no-textconv 54e4e293dfe4e142bf8a63761f4f0348af205a0e 7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1 -- <path>`. Always pass `--git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/brianduff-flunge/.git` explicitly: that is the pinned object store for this checkout, it is not exported as `GIT_DIR`, and a bare `git` has no repository to read. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
+
+## Source context
+
+Comparison: `https://github.com/brianduff/flunge/pull/1552` base `54e4e293dfe4e142bf8a63761f4f0348af205a0e` (merge base `54e4e293dfe4e142bf8a63761f4f0348af205a0e`) to head `7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1`.
+
+### PR description
+
+## Summary
+
+This PR speeds up the Bazel Jest target by using a transpile-only `ts-jest` transform and partitioning it into four Bazel-owned shards. The original profiling identified repeated per-file TypeScript program construction as the dominant cost; the transform avoids that duplicate work while CI's Frontend Build and Test step still type-checks all of `src`, including test files.
+
+The branch is rebased onto current `main`. It preserves main's `jest.setup.cjs` TextEncoder/TextDecoder polyfill in both Jest configuration and Bazel runfiles, so React Router remains loadable in jsdom.
+
+- Adds a conditional shard sequencer for Bazel's runtime shard environment and retains Jest's default sequencer for bare local runs.
+- Keeps Jest in-band within each Bazel shard; Bazel owns the four-way parallelism.
+- Stores Bazel-run Jest cache data under `TEST_TMPDIR`, avoiding host temporary-directory accumulation while retaining Jest's default cache location for bare runs.
+- Covers failed-test selection so an already-sharded list is ordered but never partitioned a second time.
+
+## Measurements
+
+The rebased target now runs 58 suites and 449 tests. The current four shards contain 15/15/14/14 suites and 107/160/93/89 tests, respectively, for an exact 449-test partition.
+
+Worker configuration was measured by alternating the shipped in-band configuration with `--maxWorkers=4` after removing `--runInBand`. On this machine, in-band Bazel shards completed in 39.6–43.3s; allowing four Jest workers inside every shard took 97.9–102.4s. The latter oversubscribes the four concurrently scheduled Bazel shards, so this PR deliberately keeps `--runInBand`.
+
+## Scope
+
+Jest-level sharding for local `npm test` runs remains explicitly out of scope; Jest already supports `--shard=N/M` for that separate workflow.
+
+## Verification
+
+- `bazel build //frontend:jest_test`
+- `bazel test //frontend:jest_test --test_output=errors`
+- `checkleft run`
+
+
+### Changed files
+
+- `frontend/BUILD` (Modified, +6/-0)
+- `frontend/jest.config.cjs` (Modified, +28/-1)
+- `frontend/jest.shard-sequencer.cjs` (Added, +63/-0)
+- `frontend/src/jest.shard-sequencer.test.js` (Added, +40/-0)
+
+
+### Registered screenshots
+
+No screenshots are registered for this task or its revisions.

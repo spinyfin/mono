@@ -1,0 +1,17 @@
+{
+  "case_id": "flunge-1545",
+  "variant": "production",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "wall_seconds": 104,
+  "started_at_epoch": 1789608415,
+  "ended_at_epoch": 1789608519,
+  "usage": {
+    "input_tokens": 416602,
+    "cached_input_tokens": 370560,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 4608,
+    "reasoning_output_tokens": 158
+  },
+  "turn_failed": false
+}

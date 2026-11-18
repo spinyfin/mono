@@ -1,0 +1,99 @@
+I want you to provide me a guided summary of the changes in https://github.com/spinyfin/mono/pull/2860. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: spinyfin/mono
+- PR title: boss: coordinator session handoff across restarts
+- Merge-base revision: 91567c86a7195ee78f3e340fbcf6c5bccc5ebedc
+- Head revision: 725bd759480d416ffffcd39c32ab5fa99d3acc97
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base ("before") content with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/spinyfin-mono/.git show 91567c86a7195ee78f3e340fbcf6c5bccc5ebedc:<path>`, and its diff with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/spinyfin-mono/.git diff --no-ext-diff --no-textconv 91567c86a7195ee78f3e340fbcf6c5bccc5ebedc 725bd759480d416ffffcd39c32ab5fa99d3acc97 -- <path>`. Always pass `--git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/spinyfin-mono/.git` explicitly: that is the pinned object store for this checkout, it is not exported as `GIT_DIR`, and a bare `git` has no repository to read. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
+
+## Source context
+
+Comparison: `https://github.com/spinyfin/mono/pull/2860` base `97db22f5bb3fcb02dc105cf6973cc57de3810104` (merge base `91567c86a7195ee78f3e340fbcf6c5bccc5ebedc`) to head `725bd759480d416ffffcd39c32ab5fa99d3acc97`.
+
+### PR description
+
+## Summary
+
+When the coordinator session restarts (Claude Code update, app/engine restart, crash, or the restart ceiling firing), the incoming session starts with zero knowledge of what was said to the outgoing one in chat. This adds a **coordinator session handoff**: the outgoing session keeps a short rolling brief current via `boss handoff write`, and the engine hands it to every fresh coordinator session as that session's first prompt. The motivating incident (a chore filed against a CI host that had already been reported as shut down in chat, then an agent briefed on tmux state that had already been reversed) is the failure this closes.
+
+It extends the existing restart-time coordinator lifecycle in `coordinator_tmux.rs` rather than adding a parallel injection mechanism. The existing prompt-change nudge only fires on the *adoption* path (engine restarted, coordinator survived). The handoff case is the other path — `start_new`, a fresh `claude` process with no context — and that is where the brief lands. The two are complementary: an adopted session keeps its context and gets no brief; a fresh one gets the brief and no nudge.
+
+## Design decisions
+
+**1. What triggers the write: a rolling handoff, never shutdown-only.** Every event on the list kills the session with no chance to run anything, so a shutdown hook would silently produce nothing in exactly the case that matters. Instead the coordinator prompt (`bossSystemPrompt` in `BossPaneModel.swift`, new "Session handoff" section) binds the session to rewrite the whole handoff in the same turn whenever a fact that changes the world, a decision, or a prohibition is stated in chat; when an open thread starts or resolves; and before acknowledging any restart/update/reset request. An abrupt kill therefore cannot yield an *empty* handoff with no indication: the engine stamps every write with the writer session's spawn token and records each session's start time, so the brief can say "the session that just ended never wrote one; the newest handoff is from an earlier session, 3 days ago" (**STALE**) as opposed to "written by the session that just ended, 4 minutes ago" (**PRESENT**). A handoff written while no coordinator session was on record (empty writer token) is reported as "writer unknown" rather than folded into either of those, since the engine genuinely cannot say who wrote it.
+
+**2. Where it lives:** one JSON value in the engine's `metadata` table (`coordinator.handoff`: body, `written_at`, `writer_spawn_token`). Coordinator-private, engine-owned, never in a repo, reachable only through `boss handoff …`. The coordinator record additionally stamps `coordinator.tmux_spawned_at`.
+
+**3. How the incoming session consumes it: injected at start.** `start_new` composes a session-start brief, writes it to `.claude/handoff-brief.txt` in the coordinator session directory, and launches `claude … --permission-mode auto "$(cat '<brief>')"` — the same positional-initial-prompt shape worker panes already use. The session reads it on its first turn before anyone types anything; no pane injection to time, no reliance on the model choosing to open a file. The brief carries absolute UTC timestamps and elapsed ages for both the handoff and the previous session's start, plus why the previous session ended (`CoordinatorStartReason`: first creation, tmux session missing, `claude` exited, reset, model change). Missing and unreadable are distinct states (`HandoffState`); neither is ever passed off as "nothing to hand off" — a first-ever session gets a non-alarming "none is expected", every other missing case gets "NO HANDOFF AVAILABLE … this is NOT the same as nothing to hand off", and a corrupt stored value gets "HANDOFF UNREADABLE" with the decode error. If the brief file itself cannot be written, the launch falls back to a short inline notice naming the error and pointing at `boss handoff show`, never a bare session. Every launch is audited (`coordinator_handoff_brief`), as is every write (`coordinator_handoff_written`). `boss handoff show` re-reads the stored handoff at any time (after compaction, say) and returns an error, not an empty result, for the unreadable case, rendering age via the engine's shared `format_elapsed_ago` and the written-at timestamp via the CLI's local-time convention. Consumption is not optional-by-default: it is the first prompt of the session.
+
+**4. What goes in it:** facts stated in chat with the time they were stated, decisions, open threads with ids, and explicit prohibitions. Not a transcript, not engine-readable status, not memory-store content. The engine enforces a 16 KiB cap and rejects blank bodies. The prompt gives a heredoc template so the coordinator needs no scratch file or Write tool.
+
+**Transcript fallback.** When `~/.claude/projects/<encoded session dir>/` exists, the brief names it as a slow last resort only. It is not the mechanism.
+
+## Changes
+
+- **protocol:** `CoordinatorHandoffView`; requests `GetCoordinatorHandoff` / `SetCoordinatorHandoff`; events `CoordinatorHandoffResult` / `CoordinatorHandoffSet`; wire tag tests; worker-policy marks both verbs `CoordinatorOnly`; sanitize pass-through.
+- **engine:** new `coordinator_handoff` module (storage, three-state read, validation, pure brief composer); `start_new` threads a start reason from every caller and launches with the brief; `CoordinatorTmuxRecord` gains `spawned_at` (and the `bon::Builder` derive the giant-structs check requires at six fields); RPC handlers in `app/coordinator_handoff.rs`. The coordinator spawn/reconcile lifecycle (`ensure_for_attach`, `restart_if_dead`, `reconcile_existing`, `recreate_after_confirmation(_inner)`, `start_new`) takes a single `CoordinatorSpawn<'_>` context struct (also `bon::Builder`-derived) instead of positional arguments, so none of them need a `#[allow(clippy::too_many_arguments)]`.
+- **cli:** `boss handoff write <FILE|->` and `boss handoff show` (`--json` supported). The subcommand types live in `handoff.rs` next to the handler, following the `attach::AttachArgs` precedent, because `commands.rs` was already at 2977 lines and would otherwise trip the 3000-line file-size check. Relative-age rendering reuses `boss_engine_utils::iso8601::format_elapsed_ago` (the same helper the engine-side brief uses) rather than a second hand-rolled formatter.
+- **app:** "Session handoff" prompt section; `boss handoff write|show` added to the auto-mode pre-clear list so the write never stalls on a classifier prompt nobody is watching.
+- **docs:** `tools/boss/docs/coordinator-session-handoff.md`, linked from the root `CLAUDE.md` operational-docs list.
+
+No cross-cutting infrastructure was duplicated: the RPC surface reuses the `Dispatch`/`send_response` handler shape, the CLI reuses `rpc_call!`/`print_entity`, storage reuses the metadata table, and delivery reuses the worker initial-prompt shape.
+
+## Validation
+
+- `bazel test //tools/boss/... -//tools/boss/app-macos/... -//tools/boss/installer/...` — 94 tests pass (engine core suite: 5014 passed, including 24 new tests covering validation, the three states, stale-vs-present attribution, each start reason, the launch command shape, and the RPC round trip).
+- `bazel test //tools/boss/app-macos/...` — 8 pass (Swift prompt literal and allowlist change compile and pass).
+- `checkleft run` — no findings.
+- Not exercised: a live coordinator restart against a real `claude` binary (a worker may not launch a production engine). The launch command is pinned by test to the exact worker-proven shape.
+
+## Changes in this revision
+
+Addressed 4 automated-review findings: deleted the CLI's duplicate age formatter in favor of the shared `format_elapsed_ago`; replaced the coordinator spawn lifecycle's growing positional argument lists with a `CoordinatorSpawn` context struct, removing both `#[allow(clippy::too_many_arguments)]`; fixed an edge case where a handoff with no recorded writer was misreported as STALE; and corrected a doc comment that claimed `boss handoff show` is runnable by anyone when it is coordinator-only.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_01H5pmnUqStP2HNXdSeVisJ2
+
+
+### Changed files
+
+- `AGENTS.md` (Modified, +4/-0)
+- `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift` (Modified, +36/-0)
+- `tools/boss/cli/src/commands.rs` (Modified, +12/-0)
+- `tools/boss/cli/src/handoff.rs` (Added, +117/-0)
+- `tools/boss/cli/src/main.rs` (Modified, +5/-0)
+- `tools/boss/docs/coordinator-session-handoff.md` (Added, +101/-0)
+- `tools/boss/engine/core/src/app.rs` (Modified, +7/-0)
+- `tools/boss/engine/core/src/app/coordinator_handoff.rs` (Added, +130/-0)
+- `tools/boss/engine/core/src/app/server.rs` (Modified, +8/-8)
+- `tools/boss/engine/core/src/app/sessions.rs` (Modified, +17/-14)
+- `tools/boss/engine/core/src/app/tests.rs` (Modified, +1/-0)
+- `tools/boss/engine/core/src/app/tests/coordinator_handoff.rs` (Added, +147/-0)
+- `tools/boss/engine/core/src/coordinator_handoff.rs` (Added, +594/-0)
+- `tools/boss/engine/core/src/coordinator_tmux.rs` (Modified, +458/-170)
+- `tools/boss/engine/core/src/lib.rs` (Modified, +1/-0)
+- `tools/boss/engine/core/src/work/coordinator_tmux.rs` (Modified, +26/-5)
+- `tools/boss/engine/worker-policy/src/policy.rs` (Modified, +7/-0)
+- `tools/boss/engine/worker-policy/src/sanitize.rs` (Modified, +2/-0)
+- `tools/boss/engine/worker-policy/src/tests.rs` (Modified, +4/-0)
+- `tools/boss/protocol/src/types.rs` (Modified, +2/-0)
+- `tools/boss/protocol/src/types/coordinator_handoff.rs` (Added, +33/-0)
+- `tools/boss/protocol/src/wire.rs` (Modified, +34/-13)
+- `tools/boss/protocol/src/wire/events.rs` (Modified, +11/-0)
+- `tools/boss/protocol/src/wire/frontend_event_wire_tests.rs` (Modified, +27/-0)
+
+
+### Registered screenshots
+
+No screenshots are registered for this task or its revisions.

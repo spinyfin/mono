@@ -1,0 +1,1418 @@
+I want you to provide me a guided summary of the changes in https://github.com/brianduff/flunge/pull/1545. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: brianduff/flunge
+- PR title: Distinguish transient vs permanent share-link load failures
+- Base revision: b4e72c775d4e60b5fe0565599f666fdcd2a598cd
+- Head revision: ba2e4fce1b1de11fe605390ed84dfe9f0f415e99
+- The accompanying source context and available read tools provide the PR description, diff, before/after files, related source and tests, and validated GitHub link targets.
+
+Ground the guide in those revisions. Inspect relevant callers, helpers, types, and tests when they determine what the change actually does. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
+
+Organize the walkthrough in a useful reading order through the core implementation. Explain why the important pieces fit together, not just which files changed. Prioritize details that help a reviewer understand or verify the fix. Use short faithful excerpts; clearly label condensed pseudocode. Avoid repetitive summaries and incidental cleanup unless it matters to the solution.
+
+Link the core fix, worked example, and important test changes to the supplied GitHub diff locations. Use revision-pinned source links for relevant unchanged context or lines outside the displayed diff. Reuse supplied URLs or validated reference mappings and check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision. Where an exact diff link is unavailable, use the corresponding pinned source link.
+
+In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when verified and useful. Distinguish author-reported validation from checks you actually performed and from conclusions drawn by reading the tests. Do not claim to have run tests when you have not. State important coverage limits without producing an exhaustive speculative bug hunt.
+
+Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
+
+Return only the finished Markdown guide, with a descriptive title and the four requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not include a chat preamble, model details, internal tool logs, a merge recommendation, or an unsupported declaration that the PR is safe to merge. If essential context cannot be obtained, state the specific limitation rather than inventing behavior.
+
+## Source context
+
+The paths, diff hunks, and pinned before/after content below are the complete set of files available for this task — every citable path and line range. Do not reference a path, line range, or repository location that is not reproduced below, even one you believe you know from general familiarity with this kind of codebase. If a claim would need support from a file that is not listed below, state the claim without a source link, or say the supporting source was not available, rather than link to it.
+
+Comparison: `https://github.com/brianduff/flunge/pull/1545` base `b4e72c775d4e60b5fe0565599f666fdcd2a598cd` (merge base `b4e72c775d4e60b5fe0565599f666fdcd2a598cd`) to head `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`.
+
+### PR description
+
+## Summary
+
+Share recipient pages used one error card for every failed view fetch: "This link isn't available." That copy is correct when the backend has answered that the token is missing, unknown, revoked, expired, or malformed. It is wrong when the backend never answered — the mid-deploy restart window that produces connection refused, timeouts, or 502/503/504 — because it tells the recipient the link is bad when it is fine and will work in a minute.
+
+This PR classifies the failed request from status / error class and renders different copy:
+
+- **Permanent** (404, 410, other 4xx except 408/429): "This link isn't available." / "Check the link with whoever shared it." No retry action.
+- **Transient** (5xx, 408, 429, network errors, anything without a status): "Couldn't load this right now." / "Try again in a moment." plus a **Try again** button that `refetch()`es the view query. No background polling.
+
+Ambiguous failures (no response, unknown error) are treated as transient. A missing token in the URL is permanent.
+
+The results share page (`/r/:token`) is wired to the new card. The owner-side share dialogs are untouched.
+
+### Shared presentation
+
+Classification and copy live in `shareLoadFailure.ts`. The card is `ShareLoadFailureState` (same `LinkOff` icon, `StateCard` layout, and placement as before; only copy and the transient action changed).
+
+The **plan share page is not on `main` yet** — it is landing in https://github.com/brianduff/flunge/pull/1542 with its own copy of the old generic `UnavailableState`. This PR does not duplicate that page. `#1542` (or a follow-up after it merges) should import `ShareLoadFailureState` instead of keeping a second card. The upcoming chore that consolidates shared presentation between the two recipient pages should treat this component as the error surface, not invent another copy.
+
+### Copy (results share page, live)
+
+Permanent (404 from a fake local API):
+
+> This link isn't available.
+> Check the link with whoever shared it.
+> (no Try again)
+
+Transient (503 from a fake local API):
+
+> Couldn't load this right now.
+> Try again in a moment.
+> [Try again]
+
+## Validation
+
+- `bazel test --build_tests_only //frontend/...` (`//frontend:jest_test` PASSED)
+- `cd frontend && npm run build` (tsc + vite build)
+- `./tools/checks run` — no findings
+- Jest: classifier table (400/403/404/410 permanent; 408/429/5xx and network/unknown transient); `ShareLoadFailureState` copy + Try again; `ShareResultsPage` 404/410/503/Failed to fetch, Try again re-issues `getShareResultsView` twice and then renders the view, event-level 404 still permanent with no retry
+- Live on Vite against a local fake API: `/r/:token` with 404 shows permanent copy and no button; 503 shows transient copy and Try again. Plan share page could not be exercised on this branch because `SharePlanPage` is not present.
+
+## Open Questions
+
+None.
+
+
+### `frontend/src/ShareResultsPage.test.tsx` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -1,4 +1,4 @@
+-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+ import { QueryClient, QueryClientProvider } from "react-query";
+ import { MemoryRouter, Route, Routes } from "react-router-dom";
+ 
+@@ -117,18 +117,78 @@ describe("ShareResultsPage", () => {
+     document.head.querySelectorAll("meta[data-flunge-share-policy]").forEach((el) => el.remove());
+   });
+ 
+-  it("shows a generic unavailable state when the view API fails", async () => {
+-    getShareResultsViewMock.mockRejectedValue(new Error("Failed to GET"));
++  it("shows a permanent unavailable state when the view API returns 404", async () => {
++    getShareResultsViewMock.mockRejectedValue(new HttpError("Failed to GET", 404));
+ 
+     renderShare("/r/unknownToken");
+ 
+     expect(await screen.findByText("This link isn't available.")).toBeTruthy();
++    expect(screen.getByText("Check the link with whoever shared it.")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+     expect(screen.queryByText(/sign up/i)).toBeNull();
+     expect(screen.queryByText(/create an account/i)).toBeNull();
+     expect(screen.queryByText(/revoked/i)).toBeNull();
+     expect(screen.queryByText(/expired/i)).toBeNull();
+   });
+ 
++  it("shows a permanent unavailable state when the view API returns 410", async () => {
++    getShareResultsViewMock.mockRejectedValue(new HttpError("Failed to GET", 410));
++
++    renderShare("/r/revokedToken");
++
++    expect(await screen.findByText("This link isn't available.")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
++  });
++
++  it("shows a transient state with Try again when the backend is unreachable", async () => {
++    getShareResultsViewMock.mockRejectedValue(new TypeError("Failed to fetch"));
++
++    renderShare("/r/aK9mQx2LpN4rT8wB");
++
++    expect(await screen.findByText("Couldn't load this right now.")).toBeTruthy();
++    expect(screen.getByText("Try again in a moment.")).toBeTruthy();
++    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
++    expect(screen.queryByText("This link isn't available.")).toBeNull();
++  });
++
++  it("shows a transient state on 503", async () => {
++    getShareResultsViewMock.mockRejectedValue(new HttpError("Failed to GET", 503));
++
++    renderShare("/r/aK9mQx2LpN4rT8wB");
++
++    expect(await screen.findByText("Couldn't load this right now.")).toBeTruthy();
++    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
++  });
++
++  it("re-issues the view request from Try again without a full reload", async () => {
++    let resolveRetry: (view: typeof VIEW) => void;
++    getShareResultsViewMock
++      .mockRejectedValueOnce(new HttpError("Failed to GET", 503))
++      .mockImplementationOnce(
++        () =>
++          new Promise((resolve) => {
++            resolveRetry = resolve;
++          }),
++      );
++    getShareResultsEventMock.mockResolvedValue(EVENT);
++
++    renderShare("/r/aK9mQx2LpN4rT8wB");
++
++    fireEvent.click(await screen.findByRole("button", { name: "Try again" }));
++
++    expect(await screen.findByText("Loading results...")).toBeTruthy();
++    expect(screen.queryByText("Couldn't load this right now.")).toBeNull();
++
++    await act(async () => {
++      resolveRetry(VIEW);
++    });
++
++    expect(await screen.findByText("DOE Jane")).toBeTruthy();
++    expect(getShareResultsViewMock).toHaveBeenCalledTimes(2);
++    expect(getShareResultsViewMock).toHaveBeenNthCalledWith(1, "aK9mQx2LpN4rT8wB");
++    expect(getShareResultsViewMock).toHaveBeenNthCalledWith(2, "aK9mQx2LpN4rT8wB");
++  });
++
+   it("renders the fencer name, opponent as text, and noreferrer video anchors", async () => {
+     getShareResultsViewMock.mockResolvedValue(VIEW);
+     getShareResultsEventMock.mockResolvedValue(EVENT);
+@@ -212,6 +272,7 @@ describe("ShareResultsPage", () => {
+     fireEvent.click(screen.getByText("Example Open"));
+ 
+     expect(await screen.findByText("This link isn't available.")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+     expect(screen.queryByText("DOE Jane")).toBeNull();
+   });
+ });
+```
+
+**Before (merge base)** (`frontend/src/ShareResultsPage.test.tsx` @ `b4e72c775d4e60b5fe0565599f666fdcd2a598cd`):
+
+```
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "react-query";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+
+import { ShareResultsPage } from "./ShareResultsPage";
+import { getShareResultsEvent, getShareResultsView } from "./api/v3/share";
+import { getFencersByIdsInBatches } from "./api/v3/view/fencer";
+import { getFencerStandings } from "./api/v3/view/standings";
+import { HttpError } from "./api/http";
+
+jest.mock("./api/v3/share", () => ({
+  getShareResultsView: jest.fn(),
+  getShareResultsEvent: jest.fn(),
+}));
+
+jest.mock("./api/v3/view/standings", () => ({
+  getFencerStandings: jest.fn(),
+}));
+
+jest.mock("./api/v3/view/fencer", () => ({
+  getFencersByIdsInBatches: jest.fn(),
+}));
+
+const getShareResultsViewMock = getShareResultsView as jest.MockedFunction<
+  typeof getShareResultsView
+>;
+const getShareResultsEventMock = getShareResultsEvent as jest.MockedFunction<
+  typeof getShareResultsEvent
+>;
+const getFencersByIdsInBatchesMock = getFencersByIdsInBatches as jest.MockedFunction<
+  typeof getFencersByIdsInBatches
+>;
+const getFencerStandingsMock = getFencerStandings as jest.MockedFunction<typeof getFencerStandings>;
+
+const VIEW = {
+  fencerId: "f.u.123",
+  fencerName: "DOE Jane",
+  createdAt: "2026-01-01T00:00:00Z",
+  expiresAt: "2026-04-01T00:00:00Z",
+  tournaments: [
+    {
+      id: "t.1",
+      name: "Example Open",
+      when: "2026-03-01",
+      location: "Austin",
+      eventIds: ["e.1"],
+    },
+  ],
+};
+
+const EVENT = {
+  name: "Y14 Women's Foil",
+  results: [
+    {
+      id: "m.1",
+      opponent: { id: "f.u.999", name: "SMITH Alex" },
+      stage: { pool: { sequence: 1 } },
+      myTouches: 5,
+      opponentTouches: 2,
+      resultClass: "majorWin" as const,
+      videos: [
+        {
+          id: "v.1",
+          url: "https://youtu.be/abc",
+          visibility: "familyGroup" as const,
+        },
+      ],
+    },
+  ],
+};
+
+function renderShare(path: string) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/r/:token" element={<ShareResultsPage />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+describe("ShareResultsPage", () => {
+  beforeEach(() => {
+    getShareResultsViewMock.mockReset();
+    getShareResultsEventMock.mockReset();
+    getFencersByIdsInBatchesMock.mockReset();
+    getFencerStandingsMock.mockReset();
+    getFencersByIdsInBatchesMock.mockImplementation(async (_ids, { onBatch } = {}) => {
+      const hydratedOpponent = {
+        id: "f.u.999",
+        name: "SMITH Alex",
+        rating: null,
+        club: null,
+        firstCompetitionYear: 2020,
+        birthYear: 2010,
+        country: null,
+        gender: null,
+        strength: null,
+      };
+      onBatch?.([hydratedOpponent]);
+      return [hydratedOpponent];
+    });
+    getFencerStandingsMock.mockResolvedValue({
+      fencerId: "f.u.123",
+      identityResolved: true,
+      standings: [],
+    });
+    document.head.querySelectorAll("meta[data-flunge-share-policy]").forEach((el) => el.remove());
+  });
+
+  afterEach(() => {
+    document.head.querySelectorAll("meta[data-flunge-share-policy]").forEach((el) => el.remove());
+  });
+
+  it("shows a generic unavailable state when the view API fails", async () => {
+    getShareResultsViewMock.mockRejectedValue(new Error("Failed to GET"));
+
+    renderShare("/r/unknownToken");
+
+    expect(await screen.findByText("This link isn't available.")).toBeTruthy();
+    expect(screen.queryByText(/sign up/i)).toBeNull();
+    expect(screen.queryByText(/create an account/i)).toBeNull();
+    expect(screen.queryByText(/revoked/i)).toBeNull();
+    expect(screen.queryByText(/expired/i)).toBeNull();
+  });
+
+  it("renders the fencer name, opponent as text, and noreferrer video anchors", async () => {
+    getShareResultsViewMock.mockResolvedValue(VIEW);
+    getShareResultsEventMock.mockResolvedValue(EVENT);
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("DOE Jane")).toBeTruthy();
+    expect(screen.queryByText(/sign up/i)).toBeNull();
+    expect(screen.queryByText(/refresh results/i)).toBeNull();
+    expect(screen.queryByText(/select a connected fencer/i)).toBeNull();
+
+    expect(document.head.querySelector('meta[name="robots"]')?.getAttribute("content")).toBe(
+      "noindex, nofollow",
+    );
+    expect(document.head.querySelector('meta[name="referrer"]')?.getAttribute("content")).toBe(
+      "no-referrer",
+    );
+
+    fireEvent.click(screen.getByText("Example Open"));
+
+    expect(await screen.findByText("SMITH Alex")).toBeTruthy();
+    expect(screen.getByText("SMITH Alex").closest("a")).toBeNull();
+    expect(await screen.findByText("2010")).toBeTruthy();
+    expect(screen.getByRole("img", { name: /competing/ })).toBeTruthy();
+    expect(screen.getByText("Y14 Women's Foil")).toBeTruthy();
+
+    const video = screen.getByRole("link", { name: "Watch bout video" });
+    expect(video.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(video.getAttribute("target")).toBe("_blank");
+    expect(video.getAttribute("href")).toBe("https://youtu.be/abc");
+    expect(video.getAttribute("referrerPolicy") ?? video.getAttribute("referrerpolicy")).toBe(
+      "no-referrer",
+    );
+
+    expect(getShareResultsViewMock).toHaveBeenCalledWith("aK9mQx2LpN4rT8wB");
+    expect(getShareResultsEventMock).toHaveBeenCalledWith("aK9mQx2LpN4rT8wB", "t.1", "e.1");
+    expect(getFencerStandingsMock).toHaveBeenCalledWith("f.u.123");
+  });
+
+  it("does not send the share token on the public standings callout", async () => {
+    getShareResultsViewMock.mockResolvedValue({ ...VIEW, tournaments: [] });
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    await waitFor(() => {
+      expect(getFencerStandingsMock).toHaveBeenCalledWith("f.u.123");
+    });
+    expect(getFencerStandingsMock.mock.calls[0]?.length).toBe(1);
+  });
+
+  it("shows an empty-results state when the view has no tournaments", async () => {
+    getShareResultsViewMock.mockResolvedValue({ ...VIEW, tournaments: [] });
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("No results to show.")).toBeTruthy();
+  });
+
+  it("keeps the page live when an event request fails", async () => {
+    getShareResultsViewMock.mockResolvedValue(VIEW);
+    getShareResultsEventMock.mockRejectedValue(new Error("Failed to GET"));
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("DOE Jane")).toBeTruthy();
+    fireEvent.click(screen.getByText("Example Open"));
+
+    expect(await screen.findByText("Unable to load this event.")).toBeTruthy();
+    expect(screen.queryByText("This link isn't available.")).toBeNull();
+  });
+
+  it("shows the unavailable state when an event request returns 404", async () => {
+    getShareResultsViewMock
+      .mockResolvedValueOnce(VIEW)
+      .mockRejectedValueOnce(new HttpError("Failed to GET", 404));
+    getShareResultsEventMock.mockRejectedValue(new HttpError("Failed to GET", 404));
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("DOE Jane")).toBeTruthy();
+    fireEvent.click(screen.getByText("Example Open"));
+
+    expect(await screen.findByText("This link isn't available.")).toBeTruthy();
+    expect(screen.queryByText("DOE Jane")).toBeNull();
+  });
+});
+```
+
+**After (head)** (`frontend/src/ShareResultsPage.test.tsx` @ `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`):
+
+```
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "react-query";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+
+import { ShareResultsPage } from "./ShareResultsPage";
+import { getShareResultsEvent, getShareResultsView } from "./api/v3/share";
+import { getFencersByIdsInBatches } from "./api/v3/view/fencer";
+import { getFencerStandings } from "./api/v3/view/standings";
+import { HttpError } from "./api/http";
+
+jest.mock("./api/v3/share", () => ({
+  getShareResultsView: jest.fn(),
+  getShareResultsEvent: jest.fn(),
+}));
+
+jest.mock("./api/v3/view/standings", () => ({
+  getFencerStandings: jest.fn(),
+}));
+
+jest.mock("./api/v3/view/fencer", () => ({
+  getFencersByIdsInBatches: jest.fn(),
+}));
+
+const getShareResultsViewMock = getShareResultsView as jest.MockedFunction<
+  typeof getShareResultsView
+>;
+const getShareResultsEventMock = getShareResultsEvent as jest.MockedFunction<
+  typeof getShareResultsEvent
+>;
+const getFencersByIdsInBatchesMock = getFencersByIdsInBatches as jest.MockedFunction<
+  typeof getFencersByIdsInBatches
+>;
+const getFencerStandingsMock = getFencerStandings as jest.MockedFunction<typeof getFencerStandings>;
+
+const VIEW = {
+  fencerId: "f.u.123",
+  fencerName: "DOE Jane",
+  createdAt: "2026-01-01T00:00:00Z",
+  expiresAt: "2026-04-01T00:00:00Z",
+  tournaments: [
+    {
+      id: "t.1",
+      name: "Example Open",
+      when: "2026-03-01",
+      location: "Austin",
+      eventIds: ["e.1"],
+    },
+  ],
+};
+
+const EVENT = {
+  name: "Y14 Women's Foil",
+  results: [
+    {
+      id: "m.1",
+      opponent: { id: "f.u.999", name: "SMITH Alex" },
+      stage: { pool: { sequence: 1 } },
+      myTouches: 5,
+      opponentTouches: 2,
+      resultClass: "majorWin" as const,
+      videos: [
+        {
+          id: "v.1",
+          url: "https://youtu.be/abc",
+          visibility: "familyGroup" as const,
+        },
+      ],
+    },
+  ],
+};
+
+function renderShare(path: string) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/r/:token" element={<ShareResultsPage />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+describe("ShareResultsPage", () => {
+  beforeEach(() => {
+    getShareResultsViewMock.mockReset();
+    getShareResultsEventMock.mockReset();
+    getFencersByIdsInBatchesMock.mockReset();
+    getFencerStandingsMock.mockReset();
+    getFencersByIdsInBatchesMock.mockImplementation(async (_ids, { onBatch } = {}) => {
+      const hydratedOpponent = {
+        id: "f.u.999",
+        name: "SMITH Alex",
+        rating: null,
+        club: null,
+        firstCompetitionYear: 2020,
+        birthYear: 2010,
+        country: null,
+        gender: null,
+        strength: null,
+      };
+      onBatch?.([hydratedOpponent]);
+      return [hydratedOpponent];
+    });
+    getFencerStandingsMock.mockResolvedValue({
+      fencerId: "f.u.123",
+      identityResolved: true,
+      standings: [],
+    });
+    document.head.querySelectorAll("meta[data-flunge-share-policy]").forEach((el) => el.remove());
+  });
+
+  afterEach(() => {
+    document.head.querySelectorAll("meta[data-flunge-share-policy]").forEach((el) => el.remove());
+  });
+
+  it("shows a permanent unavailable state when the view API returns 404", async () => {
+    getShareResultsViewMock.mockRejectedValue(new HttpError("Failed to GET", 404));
+
+    renderShare("/r/unknownToken");
+
+    expect(await screen.findByText("This link isn't available.")).toBeTruthy();
+    expect(screen.getByText("Check the link with whoever shared it.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(screen.queryByText(/sign up/i)).toBeNull();
+    expect(screen.queryByText(/create an account/i)).toBeNull();
+    expect(screen.queryByText(/revoked/i)).toBeNull();
+    expect(screen.queryByText(/expired/i)).toBeNull();
+  });
+
+  it("shows a permanent unavailable state when the view API returns 410", async () => {
+    getShareResultsViewMock.mockRejectedValue(new HttpError("Failed to GET", 410));
+
+    renderShare("/r/revokedToken");
+
+    expect(await screen.findByText("This link isn't available.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("shows a transient state with Try again when the backend is unreachable", async () => {
+    getShareResultsViewMock.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("Couldn't load this right now.")).toBeTruthy();
+    expect(screen.getByText("Try again in a moment.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(screen.queryByText("This link isn't available.")).toBeNull();
+  });
+
+  it("shows a transient state on 503", async () => {
+    getShareResultsViewMock.mockRejectedValue(new HttpError("Failed to GET", 503));
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("Couldn't load this right now.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
+  it("re-issues the view request from Try again without a full reload", async () => {
+    let resolveRetry: (view: typeof VIEW) => void;
+    getShareResultsViewMock
+      .mockRejectedValueOnce(new HttpError("Failed to GET", 503))
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRetry = resolve;
+          }),
+      );
+    getShareResultsEventMock.mockResolvedValue(EVENT);
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Try again" }));
+
+    expect(await screen.findByText("Loading results...")).toBeTruthy();
+    expect(screen.queryByText("Couldn't load this right now.")).toBeNull();
+
+    await act(async () => {
+      resolveRetry(VIEW);
+    });
+
+    expect(await screen.findByText("DOE Jane")).toBeTruthy();
+    expect(getShareResultsViewMock).toHaveBeenCalledTimes(2);
+    expect(getShareResultsViewMock).toHaveBeenNthCalledWith(1, "aK9mQx2LpN4rT8wB");
+    expect(getShareResultsViewMock).toHaveBeenNthCalledWith(2, "aK9mQx2LpN4rT8wB");
+  });
+
+  it("renders the fencer name, opponent as text, and noreferrer video anchors", async () => {
+    getShareResultsViewMock.mockResolvedValue(VIEW);
+    getShareResultsEventMock.mockResolvedValue(EVENT);
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("DOE Jane")).toBeTruthy();
+    expect(screen.queryByText(/sign up/i)).toBeNull();
+    expect(screen.queryByText(/refresh results/i)).toBeNull();
+    expect(screen.queryByText(/select a connected fencer/i)).toBeNull();
+
+    expect(document.head.querySelector('meta[name="robots"]')?.getAttribute("content")).toBe(
+      "noindex, nofollow",
+    );
+    expect(document.head.querySelector('meta[name="referrer"]')?.getAttribute("content")).toBe(
+      "no-referrer",
+    );
+
+    fireEvent.click(screen.getByText("Example Open"));
+
+    expect(await screen.findByText("SMITH Alex")).toBeTruthy();
+    expect(screen.getByText("SMITH Alex").closest("a")).toBeNull();
+    expect(await screen.findByText("2010")).toBeTruthy();
+    expect(screen.getByRole("img", { name: /competing/ })).toBeTruthy();
+    expect(screen.getByText("Y14 Women's Foil")).toBeTruthy();
+
+    const video = screen.getByRole("link", { name: "Watch bout video" });
+    expect(video.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(video.getAttribute("target")).toBe("_blank");
+    expect(video.getAttribute("href")).toBe("https://youtu.be/abc");
+    expect(video.getAttribute("referrerPolicy") ?? video.getAttribute("referrerpolicy")).toBe(
+      "no-referrer",
+    );
+
+    expect(getShareResultsViewMock).toHaveBeenCalledWith("aK9mQx2LpN4rT8wB");
+    expect(getShareResultsEventMock).toHaveBeenCalledWith("aK9mQx2LpN4rT8wB", "t.1", "e.1");
+    expect(getFencerStandingsMock).toHaveBeenCalledWith("f.u.123");
+  });
+
+  it("does not send the share token on the public standings callout", async () => {
+    getShareResultsViewMock.mockResolvedValue({ ...VIEW, tournaments: [] });
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    await waitFor(() => {
+      expect(getFencerStandingsMock).toHaveBeenCalledWith("f.u.123");
+    });
+    expect(getFencerStandingsMock.mock.calls[0]?.length).toBe(1);
+  });
+
+  it("shows an empty-results state when the view has no tournaments", async () => {
+    getShareResultsViewMock.mockResolvedValue({ ...VIEW, tournaments: [] });
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("No results to show.")).toBeTruthy();
+  });
+
+  it("keeps the page live when an event request fails", async () => {
+    getShareResultsViewMock.mockResolvedValue(VIEW);
+    getShareResultsEventMock.mockRejectedValue(new Error("Failed to GET"));
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("DOE Jane")).toBeTruthy();
+    fireEvent.click(screen.getByText("Example Open"));
+
+    expect(await screen.findByText("Unable to load this event.")).toBeTruthy();
+    expect(screen.queryByText("This link isn't available.")).toBeNull();
+  });
+
+  it("shows the unavailable state when an event request returns 404", async () => {
+    getShareResultsViewMock
+      .mockResolvedValueOnce(VIEW)
+      .mockRejectedValueOnce(new HttpError("Failed to GET", 404));
+    getShareResultsEventMock.mockRejectedValue(new HttpError("Failed to GET", 404));
+
+    renderShare("/r/aK9mQx2LpN4rT8wB");
+
+    expect(await screen.findByText("DOE Jane")).toBeTruthy();
+    fireEvent.click(screen.getByText("Example Open"));
+
+    expect(await screen.findByText("This link isn't available.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(screen.queryByText("DOE Jane")).toBeNull();
+  });
+});
+```
+
+### `frontend/src/ShareResultsPage.tsx` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -3,9 +3,10 @@ import { useParams } from "react-router-dom";
+ import { useQuery, useQueryClient } from "react-query";
+ import AccordionGroup from "@mui/joy/AccordionGroup";
+ import { Link, Stack, Typography } from "@mui/joy";
+-import { LinkOff, YouTube } from "@mui/icons-material";
++import { YouTube } from "@mui/icons-material";
+ 
+-import { LoadingState, StateCard } from "./components/PageStates";
++import { ShareLoadFailureState } from "./components/ShareLoadFailureState";
++import { LoadingState } from "./components/PageStates";
+ import { FencerStandingsCallout } from "./components/FencerStandingsCallout";
+ import {
+   ResultsEventCard,
+@@ -16,11 +17,10 @@ import { getResultVideos } from "./components/ResultVideos";
+ import { getShareResultsEvent, getShareResultsView } from "./api/v3/share";
+ import { HttpError } from "./api/http";
+ import type { V3MatchResult, V3Tournament } from "./api/v3/view/results";
++import { classifyShareLoadFailure } from "./shareLoadFailure";
+ import { applySharePageDocumentPolicy } from "./sharePageDocumentPolicy";
+ import { parseDate } from "./util";
+ 
+-const UNAVAILABLE_COPY = "This link isn't available.";
+-
+ export function ShareResultsPage() {
+   const { token } = useParams<{ token: string }>();
+ 
+@@ -42,8 +42,21 @@ export function ShareResultsPage() {
+     };
+   }, [viewQuery.data?.fencerName]);
+ 
+-  if (!token || viewQuery.isError) {
+-    return <UnavailableState />;
++  if (!token) {
++    return <ShareLoadFailureState kind="permanent" />;
++  }
++
++  if (viewQuery.isError) {
++    if (viewQuery.isFetching) {
++      return <LoadingState message="Loading results..." />;
++    }
++    const kind = classifyShareLoadFailure(viewQuery.error);
++    return (
++      <ShareLoadFailureState
++        kind={kind}
++        onRetry={kind === "transient" ? () => void viewQuery.refetch() : undefined}
++      />
++    );
+   }
+ 
+   if (viewQuery.isLoading || !viewQuery.data) {
+@@ -76,14 +89,6 @@ export function ShareResultsPage() {
+   );
+ }
+ 
+-function UnavailableState() {
+-  return (
+-    <Stack alignItems="center" justifyContent="center" sx={{ minHeight: "50vh", p: 2 }}>
+-      <StateCard icon={LinkOff} title={UNAVAILABLE_COPY} message="" />
+-    </Stack>
+-  );
+-}
+-
+ function ShareTournamentEvents({ token, tournament }: { token: string; tournament: V3Tournament }) {
+   return (
+     <Stack spacing={2}>
+```
+
+**Before (merge base)** (`frontend/src/ShareResultsPage.tsx` @ `b4e72c775d4e60b5fe0565599f666fdcd2a598cd`):
+
+```
+import * as React from "react";
+import { useParams } from "react-router-dom";
+import { useQuery, useQueryClient } from "react-query";
+import AccordionGroup from "@mui/joy/AccordionGroup";
+import { Link, Stack, Typography } from "@mui/joy";
+import { LinkOff, YouTube } from "@mui/icons-material";
+
+import { LoadingState, StateCard } from "./components/PageStates";
+import { FencerStandingsCallout } from "./components/FencerStandingsCallout";
+import {
+  ResultsEventCard,
+  ResultsMatchesTable,
+  ResultsTournamentAccordion,
+} from "./components/ResultsPresentation";
+import { getResultVideos } from "./components/ResultVideos";
+import { getShareResultsEvent, getShareResultsView } from "./api/v3/share";
+import { HttpError } from "./api/http";
+import type { V3MatchResult, V3Tournament } from "./api/v3/view/results";
+import { applySharePageDocumentPolicy } from "./sharePageDocumentPolicy";
+import { parseDate } from "./util";
+
+const UNAVAILABLE_COPY = "This link isn't available.";
+
+export function ShareResultsPage() {
+  const { token } = useParams<{ token: string }>();
+
+  React.useEffect(() => applySharePageDocumentPolicy(), []);
+
+  const viewQuery = useQuery(["shareResultsView", token], () => getShareResultsView(token!), {
+    enabled: !!token,
+    retry: false,
+  });
+
+  React.useEffect(() => {
+    if (!viewQuery.data?.fencerName) {
+      return;
+    }
+    const previous = document.title;
+    document.title = `${viewQuery.data.fencerName} — Flunge`;
+    return () => {
+      document.title = previous;
+    };
+  }, [viewQuery.data?.fencerName]);
+
+  if (!token || viewQuery.isError) {
+    return <UnavailableState />;
+  }
+
+  if (viewQuery.isLoading || !viewQuery.data) {
+    return <LoadingState message="Loading results..." />;
+  }
+
+  const { fencerName, fencerId, tournaments } = viewQuery.data;
+  const sorted = [...tournaments].sort(
+    (a, b) => parseDate(b.when).getTime() - parseDate(a.when).getTime(),
+  );
+
+  return (
+    <Stack spacing={1}>
+      <Typography level="h3">{fencerName}</Typography>
+      <FencerStandingsCallout fencerId={fencerId} />
+      {sorted.length === 0 ? (
+        <Typography level="body-sm" color="neutral">
+          No results to show.
+        </Typography>
+      ) : (
+        <AccordionGroup size="sm">
+          {sorted.map((tournament) => (
+            <ResultsTournamentAccordion key={tournament.id} tournament={tournament}>
+              <ShareTournamentEvents token={token} tournament={tournament} />
+            </ResultsTournamentAccordion>
+          ))}
+        </AccordionGroup>
+      )}
+    </Stack>
+  );
+}
+
+function UnavailableState() {
+  return (
+    <Stack alignItems="center" justifyContent="center" sx={{ minHeight: "50vh", p: 2 }}>
+      <StateCard icon={LinkOff} title={UNAVAILABLE_COPY} message="" />
+    </Stack>
+  );
+}
+
+function ShareTournamentEvents({ token, tournament }: { token: string; tournament: V3Tournament }) {
+  return (
+    <Stack spacing={2}>
+      {tournament.eventIds.map((eventId) => (
+        <ShareEventCard
+          key={eventId}
+          token={token}
+          tournamentId={tournament.id}
+          eventId={eventId}
+        />
+      ))}
+    </Stack>
+  );
+}
+
+function ShareEventCard({
+  token,
+  tournamentId,
+  eventId,
+}: {
+  token: string;
+  tournamentId: string;
+  eventId: string;
+}) {
+  const queryClient = useQueryClient();
+  const query = useQuery(
+    ["shareResultsEvent", token, tournamentId, eventId],
+    () => getShareResultsEvent(token, tournamentId, eventId),
+    {
+      retry: false,
+      onError: (error) => {
+        if (error instanceof HttpError && error.status === 404) {
+          void queryClient.invalidateQueries(["shareResultsView", token]);
+        }
+      },
+    },
+  );
+
+  const event = query.data;
+
+  return (
+    <ResultsEventCard
+      event={event}
+      errorMessage={query.isError ? "Unable to load this event." : undefined}
+    >
+      {(loadedEvent) => (
+        <ResultsMatchesTable
+          matches={loadedEvent.results}
+          renderOpponentName={(opponent) => opponent.name}
+          renderVideo={(_opponent, match) => <ShareVideoAnchors match={match} />}
+        />
+      )}
+    </ResultsEventCard>
+  );
+}
+
+function ShareVideoAnchors({ match }: { match: V3MatchResult }) {
+  const videos = getResultVideos(match).filter((video) => video.url.trim().length > 0);
+  if (videos.length === 0) {
+    return null;
+  }
+  return (
+    <Stack direction="row" spacing={1}>
+      {videos.map((video, index) => (
+        <Link
+          key={video.id || `${match.id}-video-${index}`}
+          href={video.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          referrerPolicy="no-referrer"
+          level="body-lg"
+          aria-label="Watch bout video"
+        >
+          <YouTube />
+        </Link>
+      ))}
+    </Stack>
+  );
+}
+```
+
+**After (head)** (`frontend/src/ShareResultsPage.tsx` @ `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`):
+
+```
+import * as React from "react";
+import { useParams } from "react-router-dom";
+import { useQuery, useQueryClient } from "react-query";
+import AccordionGroup from "@mui/joy/AccordionGroup";
+import { Link, Stack, Typography } from "@mui/joy";
+import { YouTube } from "@mui/icons-material";
+
+import { ShareLoadFailureState } from "./components/ShareLoadFailureState";
+import { LoadingState } from "./components/PageStates";
+import { FencerStandingsCallout } from "./components/FencerStandingsCallout";
+import {
+  ResultsEventCard,
+  ResultsMatchesTable,
+  ResultsTournamentAccordion,
+} from "./components/ResultsPresentation";
+import { getResultVideos } from "./components/ResultVideos";
+import { getShareResultsEvent, getShareResultsView } from "./api/v3/share";
+import { HttpError } from "./api/http";
+import type { V3MatchResult, V3Tournament } from "./api/v3/view/results";
+import { classifyShareLoadFailure } from "./shareLoadFailure";
+import { applySharePageDocumentPolicy } from "./sharePageDocumentPolicy";
+import { parseDate } from "./util";
+
+export function ShareResultsPage() {
+  const { token } = useParams<{ token: string }>();
+
+  React.useEffect(() => applySharePageDocumentPolicy(), []);
+
+  const viewQuery = useQuery(["shareResultsView", token], () => getShareResultsView(token!), {
+    enabled: !!token,
+    retry: false,
+  });
+
+  React.useEffect(() => {
+    if (!viewQuery.data?.fencerName) {
+      return;
+    }
+    const previous = document.title;
+    document.title = `${viewQuery.data.fencerName} — Flunge`;
+    return () => {
+      document.title = previous;
+    };
+  }, [viewQuery.data?.fencerName]);
+
+  if (!token) {
+    return <ShareLoadFailureState kind="permanent" />;
+  }
+
+  if (viewQuery.isError) {
+    if (viewQuery.isFetching) {
+      return <LoadingState message="Loading results..." />;
+    }
+    const kind = classifyShareLoadFailure(viewQuery.error);
+    return (
+      <ShareLoadFailureState
+        kind={kind}
+        onRetry={kind === "transient" ? () => void viewQuery.refetch() : undefined}
+      />
+    );
+  }
+
+  if (viewQuery.isLoading || !viewQuery.data) {
+    return <LoadingState message="Loading results..." />;
+  }
+
+  const { fencerName, fencerId, tournaments } = viewQuery.data;
+  const sorted = [...tournaments].sort(
+    (a, b) => parseDate(b.when).getTime() - parseDate(a.when).getTime(),
+  );
+
+  return (
+    <Stack spacing={1}>
+      <Typography level="h3">{fencerName}</Typography>
+      <FencerStandingsCallout fencerId={fencerId} />
+      {sorted.length === 0 ? (
+        <Typography level="body-sm" color="neutral">
+          No results to show.
+        </Typography>
+      ) : (
+        <AccordionGroup size="sm">
+          {sorted.map((tournament) => (
+            <ResultsTournamentAccordion key={tournament.id} tournament={tournament}>
+              <ShareTournamentEvents token={token} tournament={tournament} />
+            </ResultsTournamentAccordion>
+          ))}
+        </AccordionGroup>
+      )}
+    </Stack>
+  );
+}
+
+function ShareTournamentEvents({ token, tournament }: { token: string; tournament: V3Tournament }) {
+  return (
+    <Stack spacing={2}>
+      {tournament.eventIds.map((eventId) => (
+        <ShareEventCard
+          key={eventId}
+          token={token}
+          tournamentId={tournament.id}
+          eventId={eventId}
+        />
+      ))}
+    </Stack>
+  );
+}
+
+function ShareEventCard({
+  token,
+  tournamentId,
+  eventId,
+}: {
+  token: string;
+  tournamentId: string;
+  eventId: string;
+}) {
+  const queryClient = useQueryClient();
+  const query = useQuery(
+    ["shareResultsEvent", token, tournamentId, eventId],
+    () => getShareResultsEvent(token, tournamentId, eventId),
+    {
+      retry: false,
+      onError: (error) => {
+        if (error instanceof HttpError && error.status === 404) {
+          void queryClient.invalidateQueries(["shareResultsView", token]);
+        }
+      },
+    },
+  );
+
+  const event = query.data;
+
+  return (
+    <ResultsEventCard
+      event={event}
+      errorMessage={query.isError ? "Unable to load this event." : undefined}
+    >
+      {(loadedEvent) => (
+        <ResultsMatchesTable
+          matches={loadedEvent.results}
+          renderOpponentName={(opponent) => opponent.name}
+          renderVideo={(_opponent, match) => <ShareVideoAnchors match={match} />}
+        />
+      )}
+    </ResultsEventCard>
+  );
+}
+
+function ShareVideoAnchors({ match }: { match: V3MatchResult }) {
+  const videos = getResultVideos(match).filter((video) => video.url.trim().length > 0);
+  if (videos.length === 0) {
+    return null;
+  }
+  return (
+    <Stack direction="row" spacing={1}>
+      {videos.map((video, index) => (
+        <Link
+          key={video.id || `${match.id}-video-${index}`}
+          href={video.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          referrerPolicy="no-referrer"
+          level="body-lg"
+          aria-label="Watch bout video"
+        >
+          <YouTube />
+        </Link>
+      ))}
+    </Stack>
+  );
+}
+```
+
+### `frontend/src/components/ShareLoadFailureState.test.tsx` (Added)
+
+Diff hunk:
+
+```diff
+@@ -0,0 +1,23 @@
++import { fireEvent, render, screen } from "@testing-library/react";
++
++import { ShareLoadFailureState } from "./ShareLoadFailureState";
++
++describe("ShareLoadFailureState", () => {
++  it("renders permanent copy without a retry action", () => {
++    render(<ShareLoadFailureState kind="permanent" />);
++
++    expect(screen.getByText("This link isn't available.")).toBeTruthy();
++    expect(screen.getByText("Check the link with whoever shared it.")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
++  });
++
++  it("renders transient copy and calls onRetry from Try again", () => {
++    const onRetry = jest.fn();
++    render(<ShareLoadFailureState kind="transient" onRetry={onRetry} />);
++
++    expect(screen.getByText("Couldn't load this right now.")).toBeTruthy();
++    expect(screen.getByText("Try again in a moment.")).toBeTruthy();
++    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
++    expect(onRetry).toHaveBeenCalledTimes(1);
++  });
++});
+```
+
+**After (head)** (`frontend/src/components/ShareLoadFailureState.test.tsx` @ `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`):
+
+```
+import { fireEvent, render, screen } from "@testing-library/react";
+
+import { ShareLoadFailureState } from "./ShareLoadFailureState";
+
+describe("ShareLoadFailureState", () => {
+  it("renders permanent copy without a retry action", () => {
+    render(<ShareLoadFailureState kind="permanent" />);
+
+    expect(screen.getByText("This link isn't available.")).toBeTruthy();
+    expect(screen.getByText("Check the link with whoever shared it.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("renders transient copy and calls onRetry from Try again", () => {
+    const onRetry = jest.fn();
+    render(<ShareLoadFailureState kind="transient" onRetry={onRetry} />);
+
+    expect(screen.getByText("Couldn't load this right now.")).toBeTruthy();
+    expect(screen.getByText("Try again in a moment.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+### `frontend/src/components/ShareLoadFailureState.tsx` (Added)
+
+Diff hunk:
+
+```diff
+@@ -0,0 +1,36 @@
++import { LinkOff } from "@mui/icons-material";
++import { Button, Stack } from "@mui/joy";
++
++import { SHARE_LOAD_FAILURE_COPY, type ShareLoadFailureKind } from "../shareLoadFailure";
++import { StateCard } from "./PageStates";
++
++/**
++ * Recipient-facing card for a failed share-view load. Used by the results
++ * share page today; the plan share page should use the same component so
++ * the two copies cannot drift.
++ */
++export function ShareLoadFailureState({
++  kind,
++  onRetry,
++}: {
++  kind: ShareLoadFailureKind;
++  onRetry?: () => void;
++}) {
++  const copy = SHARE_LOAD_FAILURE_COPY[kind];
++  return (
++    <Stack alignItems="center" justifyContent="center" sx={{ minHeight: "50vh", p: 2 }}>
++      <StateCard
++        icon={LinkOff}
++        title={copy.title}
++        message={copy.message}
++        action={
++          onRetry ? (
++            <Button variant="soft" onClick={onRetry}>
++              Try again
++            </Button>
++          ) : undefined
++        }
++      />
++    </Stack>
++  );
++}
+```
+
+**After (head)** (`frontend/src/components/ShareLoadFailureState.tsx` @ `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`):
+
+```
+import { LinkOff } from "@mui/icons-material";
+import { Button, Stack } from "@mui/joy";
+
+import { SHARE_LOAD_FAILURE_COPY, type ShareLoadFailureKind } from "../shareLoadFailure";
+import { StateCard } from "./PageStates";
+
+/**
+ * Recipient-facing card for a failed share-view load. Used by the results
+ * share page today; the plan share page should use the same component so
+ * the two copies cannot drift.
+ */
+export function ShareLoadFailureState({
+  kind,
+  onRetry,
+}: {
+  kind: ShareLoadFailureKind;
+  onRetry?: () => void;
+}) {
+  const copy = SHARE_LOAD_FAILURE_COPY[kind];
+  return (
+    <Stack alignItems="center" justifyContent="center" sx={{ minHeight: "50vh", p: 2 }}>
+      <StateCard
+        icon={LinkOff}
+        title={copy.title}
+        message={copy.message}
+        action={
+          onRetry ? (
+            <Button variant="soft" onClick={onRetry}>
+              Try again
+            </Button>
+          ) : undefined
+        }
+      />
+    </Stack>
+  );
+}
+```
+
+### `frontend/src/shareLoadFailure.test.ts` (Added)
+
+Diff hunk:
+
+```diff
+@@ -0,0 +1,26 @@
++import { HttpError } from "./api/http";
++import { classifyShareLoadFailure } from "./shareLoadFailure";
++
++describe("classifyShareLoadFailure", () => {
++  it.each([
++    [400, "permanent"],
++    [404, "permanent"],
++    [410, "permanent"],
++    [403, "permanent"],
++    [408, "transient"],
++    [429, "transient"],
++    [500, "transient"],
++    [502, "transient"],
++    [503, "transient"],
++    [504, "transient"],
++  ] as const)("classifies HTTP %s as %s", (status, kind) => {
++    expect(classifyShareLoadFailure(new HttpError("Failed to GET", status))).toBe(kind);
++  });
++
++  it("classifies a network/unknown error as transient", () => {
++    expect(classifyShareLoadFailure(new TypeError("Failed to fetch"))).toBe("transient");
++    expect(classifyShareLoadFailure(new Error("Failed to GET"))).toBe("transient");
++    expect(classifyShareLoadFailure("nope")).toBe("transient");
++    expect(classifyShareLoadFailure(undefined)).toBe("transient");
++  });
++});
+```
+
+**After (head)** (`frontend/src/shareLoadFailure.test.ts` @ `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`):
+
+```
+import { HttpError } from "./api/http";
+import { classifyShareLoadFailure } from "./shareLoadFailure";
+
+describe("classifyShareLoadFailure", () => {
+  it.each([
+    [400, "permanent"],
+    [404, "permanent"],
+    [410, "permanent"],
+    [403, "permanent"],
+    [408, "transient"],
+    [429, "transient"],
+    [500, "transient"],
+    [502, "transient"],
+    [503, "transient"],
+    [504, "transient"],
+  ] as const)("classifies HTTP %s as %s", (status, kind) => {
+    expect(classifyShareLoadFailure(new HttpError("Failed to GET", status))).toBe(kind);
+  });
+
+  it("classifies a network/unknown error as transient", () => {
+    expect(classifyShareLoadFailure(new TypeError("Failed to fetch"))).toBe("transient");
+    expect(classifyShareLoadFailure(new Error("Failed to GET"))).toBe("transient");
+    expect(classifyShareLoadFailure("nope")).toBe("transient");
+    expect(classifyShareLoadFailure(undefined)).toBe("transient");
+  });
+});
+```
+
+### `frontend/src/shareLoadFailure.ts` (Added)
+
+Diff hunk:
+
+```diff
+@@ -0,0 +1,44 @@
++import { HttpError } from "./api/http";
++
++export type ShareLoadFailureKind = "permanent" | "transient";
++
++export const SHARE_LOAD_FAILURE_COPY: Record<
++  ShareLoadFailureKind,
++  { title: string; message: string }
++> = {
++  permanent: {
++    title: "This link isn't available.",
++    message: "Check the link with whoever shared it.",
++  },
++  transient: {
++    title: "Couldn't load this right now.",
++    message: "Try again in a moment.",
++  },
++};
++
++/** 4xx that mean the request did not complete, not that the link itself is bad. */
++const TRANSIENT_CLIENT_STATUSES = new Set([408, 429]);
++
++/**
++ * Classify a failed share-view fetch so the recipient page can tell "this
++ * link is the problem" from "the service could not answer".
++ *
++ * Permanent: the backend answered that the token is missing, unknown,
++ * revoked, expired, or malformed (404 / 410 / other 4xx except 408/429).
++ * Transient: 5xx, 408, 429, a network failure, or any error without a
++ * status — including the mid-deploy connection-refused window. Ambiguous
++ * failures are transient: better to ask a valid-link holder to retry than
++ * to tell them the link is broken.
++ */
++export function classifyShareLoadFailure(error: unknown): ShareLoadFailureKind {
++  if (error instanceof HttpError) {
++    if (TRANSIENT_CLIENT_STATUSES.has(error.status)) {
++      return "transient";
++    }
++    if (error.status >= 400 && error.status < 500) {
++      return "permanent";
++    }
++    return "transient";
++  }
++  return "transient";
++}
+```
+
+**After (head)** (`frontend/src/shareLoadFailure.ts` @ `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`):
+
+```
+import { HttpError } from "./api/http";
+
+export type ShareLoadFailureKind = "permanent" | "transient";
+
+export const SHARE_LOAD_FAILURE_COPY: Record<
+  ShareLoadFailureKind,
+  { title: string; message: string }
+> = {
+  permanent: {
+    title: "This link isn't available.",
+    message: "Check the link with whoever shared it.",
+  },
+  transient: {
+    title: "Couldn't load this right now.",
+    message: "Try again in a moment.",
+  },
+};
+
+/** 4xx that mean the request did not complete, not that the link itself is bad. */
+const TRANSIENT_CLIENT_STATUSES = new Set([408, 429]);
+
+/**
+ * Classify a failed share-view fetch so the recipient page can tell "this
+ * link is the problem" from "the service could not answer".
+ *
+ * Permanent: the backend answered that the token is missing, unknown,
+ * revoked, expired, or malformed (404 / 410 / other 4xx except 408/429).
+ * Transient: 5xx, 408, 429, a network failure, or any error without a
+ * status — including the mid-deploy connection-refused window. Ambiguous
+ * failures are transient: better to ask a valid-link holder to retry than
+ * to tell them the link is broken.
+ */
+export function classifyShareLoadFailure(error: unknown): ShareLoadFailureKind {
+  if (error instanceof HttpError) {
+    if (TRANSIENT_CLIENT_STATUSES.has(error.status)) {
+      return "transient";
+    }
+    if (error.status >= 400 && error.status < 500) {
+      return "permanent";
+    }
+    return "transient";
+  }
+  return "transient";
+}
+```
+

@@ -1,0 +1,18 @@
+{
+  "comparison": {
+    "id": "flunge-1552",
+    "pr_url": "https://github.com/brianduff/flunge/pull/1552",
+    "base_tip_sha": "54e4e293dfe4e142bf8a63761f4f0348af205a0e",
+    "merge_base_sha": "54e4e293dfe4e142bf8a63761f4f0348af205a0e",
+    "head_sha": "7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1"
+  },
+  "packet_sha256": "2a22c965eac22f6aee8b3685c5ebf0c52475c3fa1263304401dd135611e89148",
+  "codex_version": "codex-cli 0.164.0",
+  "renderer_source_sha256": "270b3cd98a1a3fb0e7cdae2ccbe61a173d4fa9a80f5a137d9fa09e8b9e22e404",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "saved_sources_matching_pinned_objects": 6,
+  "checkout": "/Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/checkouts/flunge-1552",
+  "git_dir": "/Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/brianduff-flunge/.git",
+  "submission": "local stdout capture with production validation; no live engine binding"
+}

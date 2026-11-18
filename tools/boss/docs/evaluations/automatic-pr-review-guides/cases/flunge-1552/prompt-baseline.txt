@@ -1,0 +1,537 @@
+I want you to provide me a guided summary of the changes in https://github.com/brianduff/flunge/pull/1552. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: brianduff/flunge
+- PR title: frontend: profile and speed up the jest suite, shard it under bazel (2.2x)
+- Base revision: 54e4e293dfe4e142bf8a63761f4f0348af205a0e
+- Head revision: 7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1
+- The accompanying source context and available read tools provide the PR description, diff, before/after files, related source and tests, and validated GitHub link targets.
+
+## Source context
+
+The paths, diff hunks, and pinned before/after content below are the complete set of files available for this task — every citable path and line range. Do not reference a path, line range, or repository location that is not reproduced below, even one you believe you know from general familiarity with this kind of codebase. If a claim would need support from a file that is not listed below, state the claim without a source link, or say the supporting source was not available, rather than link to it.
+
+Comparison: `https://github.com/brianduff/flunge/pull/1552` base `54e4e293dfe4e142bf8a63761f4f0348af205a0e` (merge base `54e4e293dfe4e142bf8a63761f4f0348af205a0e`) to head `7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1`.
+
+### PR description
+
+## Summary
+
+This PR speeds up the Bazel Jest target by using a transpile-only `ts-jest` transform and partitioning it into four Bazel-owned shards. The original profiling identified repeated per-file TypeScript program construction as the dominant cost; the transform avoids that duplicate work while CI's Frontend Build and Test step still type-checks all of `src`, including test files.
+
+The branch is rebased onto current `main`. It preserves main's `jest.setup.cjs` TextEncoder/TextDecoder polyfill in both Jest configuration and Bazel runfiles, so React Router remains loadable in jsdom.
+
+- Adds a conditional shard sequencer for Bazel's runtime shard environment and retains Jest's default sequencer for bare local runs.
+- Keeps Jest in-band within each Bazel shard; Bazel owns the four-way parallelism.
+- Stores Bazel-run Jest cache data under `TEST_TMPDIR`, avoiding host temporary-directory accumulation while retaining Jest's default cache location for bare runs.
+- Covers failed-test selection so an already-sharded list is ordered but never partitioned a second time.
+
+## Measurements
+
+The rebased target now runs 58 suites and 449 tests. The current four shards contain 15/15/14/14 suites and 107/160/93/89 tests, respectively, for an exact 449-test partition.
+
+Worker configuration was measured by alternating the shipped in-band configuration with `--maxWorkers=4` after removing `--runInBand`. On this machine, in-band Bazel shards completed in 39.6–43.3s; allowing four Jest workers inside every shard took 97.9–102.4s. The latter oversubscribes the four concurrently scheduled Bazel shards, so this PR deliberately keeps `--runInBand`.
+
+## Scope
+
+Jest-level sharding for local `npm test` runs remains explicitly out of scope; Jest already supports `--shard=N/M` for that separate workflow.
+
+## Verification
+
+- `bazel build //frontend:jest_test`
+- `bazel test //frontend:jest_test --test_output=errors`
+- `checkleft run`
+
+
+### `frontend/BUILD` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -47,6 +47,7 @@ bin.jest_test(
+     data = [
+         "jest.config.cjs",
+         "jest.setup.cjs",
++        "jest.shard-sequencer.cjs",
+         "package.json",
+         "tsconfig.json",
+         "tsconfig.node.json",
+@@ -55,4 +56,9 @@ bin.jest_test(
+         "public/**",
+         "src/**/*.json",
+     ]),
++    # Bazel hands each shard TEST_TOTAL_SHARDS/TEST_SHARD_INDEX, which
++    # jest.shard-sequencer.cjs turns into a partition of the test files.
++    # Each shard is a single in-band jest process, so Bazel (not jest)
++    # owns the parallelism and the shards cannot oversubscribe each other.
++    shard_count = 4,
+ )
+```
+
+**Before (merge base)** (`frontend/BUILD` @ `54e4e293dfe4e142bf8a63761f4f0348af205a0e`):
+
+```
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//frontend:jest/package_json.bzl", "bin")
+
+npm_link_all_packages(name = "node_modules")
+
+JS_TEST_FILES = glob(
+    [
+        "**/*.test.js",
+        "**/*.test.jsx",
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.spec.js",
+        "**/*.spec.jsx",
+        "**/*.spec.ts",
+        "**/*.spec.tsx",
+    ],
+    allow_empty = True,
+    exclude = [
+        "dist/**",
+        "node_modules/**",
+    ],
+)
+
+FRONTEND_JS_TS_FILES = glob(
+    [
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.ts",
+        "**/*.tsx",
+    ],
+    allow_empty = True,
+    exclude = [
+        "dist/**",
+        "node_modules/**",
+    ],
+)
+
+bin.jest_test(
+    name = "jest_test",
+    args = [
+        "--ci",
+        "--config",
+        "$(rootpath :jest.config.cjs)",
+        "--runInBand",
+        "--runTestsByPath",
+    ] + ["$(rootpath {})".format(test_file) for test_file in JS_TEST_FILES],
+    data = [
+        "jest.config.cjs",
+        "jest.setup.cjs",
+        "package.json",
+        "tsconfig.json",
+        "tsconfig.node.json",
+        ":node_modules",
+    ] + FRONTEND_JS_TS_FILES + glob([
+        "public/**",
+        "src/**/*.json",
+    ]),
+)
+```
+
+**After (head)** (`frontend/BUILD` @ `7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1`):
+
+```
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//frontend:jest/package_json.bzl", "bin")
+
+npm_link_all_packages(name = "node_modules")
+
+JS_TEST_FILES = glob(
+    [
+        "**/*.test.js",
+        "**/*.test.jsx",
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.spec.js",
+        "**/*.spec.jsx",
+        "**/*.spec.ts",
+        "**/*.spec.tsx",
+    ],
+    allow_empty = True,
+    exclude = [
+        "dist/**",
+        "node_modules/**",
+    ],
+)
+
+FRONTEND_JS_TS_FILES = glob(
+    [
+        "**/*.js",
+        "**/*.jsx",
+        "**/*.ts",
+        "**/*.tsx",
+    ],
+    allow_empty = True,
+    exclude = [
+        "dist/**",
+        "node_modules/**",
+    ],
+)
+
+bin.jest_test(
+    name = "jest_test",
+    args = [
+        "--ci",
+        "--config",
+        "$(rootpath :jest.config.cjs)",
+        "--runInBand",
+        "--runTestsByPath",
+    ] + ["$(rootpath {})".format(test_file) for test_file in JS_TEST_FILES],
+    data = [
+        "jest.config.cjs",
+        "jest.setup.cjs",
+        "jest.shard-sequencer.cjs",
+        "package.json",
+        "tsconfig.json",
+        "tsconfig.node.json",
+        ":node_modules",
+    ] + FRONTEND_JS_TS_FILES + glob([
+        "public/**",
+        "src/**/*.json",
+    ]),
+    # Bazel hands each shard TEST_TOTAL_SHARDS/TEST_SHARD_INDEX, which
+    # jest.shard-sequencer.cjs turns into a partition of the test files.
+    # Each shard is a single in-band jest process, so Bazel (not jest)
+    # owns the parallelism and the shards cannot oversubscribe each other.
+    shard_count = 4,
+)
+```
+
+### `frontend/jest.config.cjs` (Modified)
+
+Diff hunk:
+
+```diff
+@@ -1,7 +1,34 @@
+ /** @type {import('ts-jest').JestConfigWithTsJest} */
+ module.exports = {
+-  preset: "ts-jest",
+   testEnvironment: "jsdom",
++  // Only installed when Bazel asks for sharding; bare `npx jest` and
++  // unsharded runs keep jest's default sequencer. See the sequencer file.
++  ...(process.env.TEST_TOTAL_SHARDS ? { testSequencer: "<rootDir>/jest.shard-sequencer.cjs" } : {}),
+   moduleFileExtensions: ["ts", "tsx", "js", "jsx", "json", "node"],
+   setupFiles: ["<rootDir>/jest.setup.cjs"],
++  transform: {
++    // Transpile-only. Type checking is NOT done here. CI always runs `tsc`
++    // over all of `src` (test files included) in the Frontend Build and Test
++    // step, which is gated on the same frontend-changed condition as this
++    // target, so type errors in test files still fail the build. Doing it
++    // again per jest worker is duplicate work. tsconfig.json already sets
++    // `isolatedModules: true`, so the codebase is required to be safe to
++    // transpile file-by-file.
++    "^.+\\.[tj]sx?$": [
++      "ts-jest",
++      {
++        isolatedModules: true,
++        // Jest's runtime is CommonJS, but the app tsconfig targets an ESM
++        // bundler. Override just enough for the module system to line up;
++        // everything else (jsx, jsxImportSource, target, lib) is inherited
++        // from tsconfig.json.
++        tsconfig: {
++          module: "CommonJS",
++          moduleResolution: "Node",
++          esModuleInterop: true,
++        },
++      },
++    ],
++  },
++  ...(process.env.TEST_TMPDIR ? { cacheDirectory: `${process.env.TEST_TMPDIR}/jest-cache` } : {}),
+ };
+```
+
+**Before (merge base)** (`frontend/jest.config.cjs` @ `54e4e293dfe4e142bf8a63761f4f0348af205a0e`):
+
+```
+/** @type {import('ts-jest').JestConfigWithTsJest} */
+module.exports = {
+  preset: "ts-jest",
+  testEnvironment: "jsdom",
+  moduleFileExtensions: ["ts", "tsx", "js", "jsx", "json", "node"],
+  setupFiles: ["<rootDir>/jest.setup.cjs"],
+};
+```
+
+**After (head)** (`frontend/jest.config.cjs` @ `7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1`):
+
+```
+/** @type {import('ts-jest').JestConfigWithTsJest} */
+module.exports = {
+  testEnvironment: "jsdom",
+  // Only installed when Bazel asks for sharding; bare `npx jest` and
+  // unsharded runs keep jest's default sequencer. See the sequencer file.
+  ...(process.env.TEST_TOTAL_SHARDS ? { testSequencer: "<rootDir>/jest.shard-sequencer.cjs" } : {}),
+  moduleFileExtensions: ["ts", "tsx", "js", "jsx", "json", "node"],
+  setupFiles: ["<rootDir>/jest.setup.cjs"],
+  transform: {
+    // Transpile-only. Type checking is NOT done here. CI always runs `tsc`
+    // over all of `src` (test files included) in the Frontend Build and Test
+    // step, which is gated on the same frontend-changed condition as this
+    // target, so type errors in test files still fail the build. Doing it
+    // again per jest worker is duplicate work. tsconfig.json already sets
+    // `isolatedModules: true`, so the codebase is required to be safe to
+    // transpile file-by-file.
+    "^.+\\.[tj]sx?$": [
+      "ts-jest",
+      {
+        isolatedModules: true,
+        // Jest's runtime is CommonJS, but the app tsconfig targets an ESM
+        // bundler. Override just enough for the module system to line up;
+        // everything else (jsx, jsxImportSource, target, lib) is inherited
+        // from tsconfig.json.
+        tsconfig: {
+          module: "CommonJS",
+          moduleResolution: "Node",
+          esModuleInterop: true,
+        },
+      },
+    ],
+  },
+  ...(process.env.TEST_TMPDIR ? { cacheDirectory: `${process.env.TEST_TMPDIR}/jest-cache` } : {}),
+};
+```
+
+### `frontend/jest.shard-sequencer.cjs` (Added)
+
+Diff hunk:
+
+```diff
+@@ -0,0 +1,63 @@
++"use strict";
++
++const fs = require("node:fs");
++
++// Translates Bazel's test-sharding protocol into a jest test partition.
++//
++// Bazel sets TEST_TOTAL_SHARDS / TEST_SHARD_INDEX on each sharded test action
++// and expects the runner to (a) run only its own slice of the tests and
++// (b) touch TEST_SHARD_STATUS_FILE to advertise that it understood the
++// request. A runner that ignores the variables would run the whole suite
++// once per shard; one that never touches the status file fails the action
++// outright with "Sharding requested, but the test runner did not advertise
++// support for it".
++//
++// jest's own `--shard=i/n` cannot be used here because the flag has to be
++// baked into the rule's `args` at analysis time, while the shard index is
++// only known at run time. A custom sequencer is the supported hook that can
++// read the environment instead. jest.config.cjs only installs this sequencer
++// when TEST_TOTAL_SHARDS is present, so unsharded and bare `npx jest` runs
++// keep jest's default sequencer (and its timing-cache ordering) untouched.
++
++const statusFile = process.env.TEST_SHARD_STATUS_FILE;
++if (statusFile) {
++  fs.writeFileSync(statusFile, "");
++}
++
++function fileSize(test) {
++  try {
++    return fs.statSync(test.path).size;
++  } catch {
++    return 0;
++  }
++}
++
++function bySizeThenPath(a, b) {
++  return fileSize(b) - fileSize(a) || a.path.localeCompare(b.path);
++}
++
++class BazelShardSequencer {
++  // Largest-first, then round-robin across shards. Without jest's timing
++  // cache (which never survives a bazel sandbox) file size is the best
++  // available proxy for cost, and dealing the sorted list out round-robin
++  // keeps the shards balanced rather than giving one shard every slow file.
++  sort(tests) {
++    const total = Number(process.env.TEST_TOTAL_SHARDS);
++    const index = Number(process.env.TEST_SHARD_INDEX);
++    const ordered = [...tests].sort(bySizeThenPath);
++    if (!Number.isInteger(total) || total < 1 || !Number.isInteger(index)) {
++      return ordered;
++    }
++    return ordered.filter((_, i) => i % total === index);
++  }
++
++  allFailedTests(tests) {
++    return [...tests].sort(bySizeThenPath);
++  }
++
++  // jest persists per-file timings here to order later runs. Every bazel run
++  // gets a fresh sandbox path, so there is nothing to persist to.
++  cacheResults() {}
++}
++
++module.exports = BazelShardSequencer;
+```
+
+**After (head)** (`frontend/jest.shard-sequencer.cjs` @ `7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1`):
+
+```
+"use strict";
+
+const fs = require("node:fs");
+
+// Translates Bazel's test-sharding protocol into a jest test partition.
+//
+// Bazel sets TEST_TOTAL_SHARDS / TEST_SHARD_INDEX on each sharded test action
+// and expects the runner to (a) run only its own slice of the tests and
+// (b) touch TEST_SHARD_STATUS_FILE to advertise that it understood the
+// request. A runner that ignores the variables would run the whole suite
+// once per shard; one that never touches the status file fails the action
+// outright with "Sharding requested, but the test runner did not advertise
+// support for it".
+//
+// jest's own `--shard=i/n` cannot be used here because the flag has to be
+// baked into the rule's `args` at analysis time, while the shard index is
+// only known at run time. A custom sequencer is the supported hook that can
+// read the environment instead. jest.config.cjs only installs this sequencer
+// when TEST_TOTAL_SHARDS is present, so unsharded and bare `npx jest` runs
+// keep jest's default sequencer (and its timing-cache ordering) untouched.
+
+const statusFile = process.env.TEST_SHARD_STATUS_FILE;
+if (statusFile) {
+  fs.writeFileSync(statusFile, "");
+}
+
+function fileSize(test) {
+  try {
+    return fs.statSync(test.path).size;
+  } catch {
+    return 0;
+  }
+}
+
+function bySizeThenPath(a, b) {
+  return fileSize(b) - fileSize(a) || a.path.localeCompare(b.path);
+}
+
+class BazelShardSequencer {
+  // Largest-first, then round-robin across shards. Without jest's timing
+  // cache (which never survives a bazel sandbox) file size is the best
+  // available proxy for cost, and dealing the sorted list out round-robin
+  // keeps the shards balanced rather than giving one shard every slow file.
+  sort(tests) {
+    const total = Number(process.env.TEST_TOTAL_SHARDS);
+    const index = Number(process.env.TEST_SHARD_INDEX);
+    const ordered = [...tests].sort(bySizeThenPath);
+    if (!Number.isInteger(total) || total < 1 || !Number.isInteger(index)) {
+      return ordered;
+    }
+    return ordered.filter((_, i) => i % total === index);
+  }
+
+  allFailedTests(tests) {
+    return [...tests].sort(bySizeThenPath);
+  }
+
+  // jest persists per-file timings here to order later runs. Every bazel run
+  // gets a fresh sandbox path, so there is nothing to persist to.
+  cacheResults() {}
+}
+
+module.exports = BazelShardSequencer;
+```
+
+### `frontend/src/jest.shard-sequencer.test.js` (Added)
+
+Diff hunk:
+
+```diff
+@@ -0,0 +1,40 @@
++const BazelShardSequencer = require("../jest.shard-sequencer.cjs");
++
++describe("BazelShardSequencer", () => {
++  const originalTotal = process.env.TEST_TOTAL_SHARDS;
++  const originalIndex = process.env.TEST_SHARD_INDEX;
++
++  beforeEach(() => {
++    process.env.TEST_TOTAL_SHARDS = "4";
++    process.env.TEST_SHARD_INDEX = "1";
++  });
++
++  afterAll(() => {
++    if (originalTotal === undefined) {
++      delete process.env.TEST_TOTAL_SHARDS;
++    } else {
++      process.env.TEST_TOTAL_SHARDS = originalTotal;
++    }
++    if (originalIndex === undefined) {
++      delete process.env.TEST_SHARD_INDEX;
++    } else {
++      process.env.TEST_SHARD_INDEX = originalIndex;
++    }
++  });
++
++  it("does not partition Jest's already-sharded failed-test list again", () => {
++    const tests = [
++      { path: "/missing/c.test.js" },
++      { path: "/missing/a.test.js" },
++      { path: "/missing/b.test.js" },
++    ];
++    const sequencer = new BazelShardSequencer();
++
++    expect(sequencer.sort(tests).map((test) => test.path)).toEqual(["/missing/b.test.js"]);
++    expect(sequencer.allFailedTests(tests).map((test) => test.path)).toEqual([
++      "/missing/a.test.js",
++      "/missing/b.test.js",
++      "/missing/c.test.js",
++    ]);
++  });
++});
+```
+
+**After (head)** (`frontend/src/jest.shard-sequencer.test.js` @ `7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1`):
+
+```
+const BazelShardSequencer = require("../jest.shard-sequencer.cjs");
+
+describe("BazelShardSequencer", () => {
+  const originalTotal = process.env.TEST_TOTAL_SHARDS;
+  const originalIndex = process.env.TEST_SHARD_INDEX;
+
+  beforeEach(() => {
+    process.env.TEST_TOTAL_SHARDS = "4";
+    process.env.TEST_SHARD_INDEX = "1";
+  });
+
+  afterAll(() => {
+    if (originalTotal === undefined) {
+      delete process.env.TEST_TOTAL_SHARDS;
+    } else {
+      process.env.TEST_TOTAL_SHARDS = originalTotal;
+    }
+    if (originalIndex === undefined) {
+      delete process.env.TEST_SHARD_INDEX;
+    } else {
+      process.env.TEST_SHARD_INDEX = originalIndex;
+    }
+  });
+
+  it("does not partition Jest's already-sharded failed-test list again", () => {
+    const tests = [
+      { path: "/missing/c.test.js" },
+      { path: "/missing/a.test.js" },
+      { path: "/missing/b.test.js" },
+    ];
+    const sequencer = new BazelShardSequencer();
+
+    expect(sequencer.sort(tests).map((test) => test.path)).toEqual(["/missing/b.test.js"]);
+    expect(sequencer.allFailedTests(tests).map((test) => test.path)).toEqual([
+      "/missing/a.test.js",
+      "/missing/b.test.js",
+      "/missing/c.test.js",
+    ]);
+  });
+});
+```
+

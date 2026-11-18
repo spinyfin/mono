@@ -1,0 +1,6 @@
+{
+  "skipped": true,
+  "reason": "prompt exceeds boss_review_guide::MAX_PROMPT_CHARS",
+  "production": "PROMPT_TOO_LARGE chars=2288133 budget=1000000",
+  "baseline": "PROMPT_TOO_LARGE chars=2285631 budget=1000000"
+}

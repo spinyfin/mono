@@ -1,0 +1,6 @@
+INVALID — 4 issue(s):
+  - reference `https://github.com/spinyfin/mono/blob/12c538d6f328d9f4cbb62c0ef69d6fa9b301500a/tools/boss/app-macos/Sources/BossMarkdownStyle.swift#L870-L892` does not resolve to any pinned source in the packet
+  - reference `https://github.com/spinyfin/mono/blob/12c538d6f328d9f4cbb62c0ef69d6fa9b301500a/tools/boss/app-macos/Sources/Comments/CommentHighlightingParser.swift#L146-L184` does not resolve to any pinned source in the packet
+  - reference `https://github.com/spinyfin/mono/blob/12c538d6f328d9f4cbb62c0ef69d6fa9b301500a/tools/boss/app-macos/BUILD.bazel#L58-L64` does not resolve to any pinned source in the packet
+  - reference `https://github.com/spinyfin/mono/blob/12c538d6f328d9f4cbb62c0ef69d6fa9b301500a/tools/boss/app-macos/BUILD.bazel#L278-L291` does not resolve to any pinned source in the packet
+corpus-tool: validation failed for /Users/brianduff/.local/share/cube/workspaces/mono-agent-473/tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2890/guide-production-attempt3.md

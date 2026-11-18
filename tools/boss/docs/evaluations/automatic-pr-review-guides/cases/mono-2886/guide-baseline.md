@@ -1,0 +1,94 @@
+[PR #2886](https://github.com/spinyfin/mono/pull/2886) changes the evidence Boss requires before replacing or restarting an engine: an unavailable fingerprint no longer counts as a version mismatch, and a single failed liveness check no longer schedules recovery.
+
+**1. Problem being solved.** There are two paths where uncertain observations could trigger unnecessary intervention:
+
+- **During startup:** Boss discovers a reachable engine and requests its binary fingerprint. Previously, three unsuccessful requests fell through to the same shutdown-and-replacement path as a confirmed fingerprint mismatch. A busy engine could therefore be stopped even though Boss had no evidence that its build was wrong.
+- **During supervision:** the first failed liveness tick immediately consumed a restart attempt and scheduled recovery. The log described this as “engine exited,” although the observation established only unreachability.
+
+The consequences differ: the startup path explicitly stops the existing engine; supervised recovery calls `start()` again, which rediscovers any reachable engine before deciding what to do. See the [previous startup decision](https://github.com/spinyfin/mono/blob/6f8ca35153d0fcae9aea5e9852894ea549989ca0/tools/boss/app-macos/Sources/EngineProcessController.swift#L188-L203) and [previous supervisor](https://github.com/spinyfin/mono/blob/6f8ca35153d0fcae9aea5e9852894ea549989ca0/tools/boss/app-macos/Sources/EngineSupervisor.swift).
+
+**2. Core implementation.** The central fix is an early return when the running engine’s fingerprint remains unavailable. The three attempts, each with a three-second timeout argument, remain unchanged. After those attempts, startup now distinguishes three outcomes:
+
+| Fingerprint result              | Startup action                                          |
+| ------------------------------- | ------------------------------------------------------- |
+| Unavailable                     | Log an inconclusive check and keep the reachable engine |
+| Matches the bundled fingerprint | Keep the engine                                         |
+| Positively differs              | Stop the engine and launch its replacement              |
+
+The decisive code is this branch in [`EngineProcessController.start`](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/EngineProcessController.swift#L195-L205), shown with logging omitted:
+
+```swift
+guard let runningFP else {
+    // Log the inconclusive check.
+    return
+}
+if bundledFP == runningFP {
+    // Log the matching build.
+    return
+}
+try stopRunningEngine(running)
+```
+
+Those returns exit the `withStartLock` closure. Execution still reaches the supervision setup after the closure; keeping an engine does not bypass subsequent liveness supervision.
+
+**Worked example, taken from the new regression fixture.** The primary socket is reachable, forced restart is disabled, and a bundled fixture file contains `"bundled engine fixture"`. Its fingerprint can be computed, but the running engine’s fingerprint RPC returns `nil` every time. Assume `BOSS_ENGINE_CMD` is unset so version checking runs.
+
+1. Both implementations discover the reachable socket, compute the bundled fingerprint, and make three fingerprint requests.
+2. **Old behavior:** the matching-fingerprint condition fails because the result is `nil`. Boss logs an upgrade and calls `stopRunningEngine`. With this fixture’s successful shutdown/close responses, it then invokes the replacement launch handler.
+3. **New behavior:** `guard let runningFP` fails. Boss logs `[engine version-check inconclusive]` and exits the startup closure without requesting shutdown or launching a replacement.
+
+The observable result is pinned directly by the [new test](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift#L224-L238):
+
+```swift
+XCTAssertEqual(
+    fixture.socketControl.fingerprintRequests,
+    Array(repeating: fixture.paths.socketPath, count: 3)
+)
+XCTAssertTrue(fixture.socketControl.shutdownRequests.isEmpty)
+XCTAssertTrue(launchRecorder.socketPaths.isEmpty)
+```
+
+The fake returns `nil` immediately, so this tests the decision after unavailable responses, not actual timeout duration.
+
+The useful contrasting case is a **known mismatch**: the existing `"stale-engine"` legacy-socket test still expects shutdown on the legacy endpoint and replacement on the primary endpoint. Preservation applies to uncertainty; confirmed mismatches still trigger replacement. See the [existing mismatch test](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift#L208-L222).
+
+**3. Major logic and architecture changes.** The existing separation remains: `EngineSupervisor` makes pure state-machine decisions, while `EngineProcessController` performs I/O, schedules recovery, and publishes state.
+
+The supervisor gains a failure counter and an intermediate `.unreachable(consecutiveFailures:requiredFailures:)` action. The [new threshold gate](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/EngineSupervisor.swift#L47-L65) sits before restart-budget consumption:
+
+```swift
+guard consecutiveFailures >= policy.consecutiveFailureThreshold else {
+    return .unreachable(
+        consecutiveFailures: consecutiveFailures,
+        requiredFailures: policy.consecutiveFailureThreshold
+    )
+}
+consecutiveFailures = 0
+let attempt = restartAttempts + 1
+```
+
+With the default threshold of three, failed ticks produce `unreachable(1/3)`, then `unreachable(2/3)`, then restart attempt 1 with its existing one-second backoff. This counts observations, rather than measuring an elapsed outage duration.
+
+Several details matter when reviewing this state machine:
+
+- A healthy tick immediately clears the failure streak. Replenishing an already-used restart budget still requires the existing healthy interval.
+- `reset()` also clears the streak.
+- Reaching the threshold clears the streak before checking the attempt budget, so subsequent recovery decisions require another streak.
+- The default threshold is three and constructor values are clamped to at least one. The existing backoff schedule, six-attempt limit, one-second polling interval, and 60-second healthy-reset interval remain. There is no new environment-variable override for the threshold.
+
+See the [policy configuration](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/EngineProcessController.swift#L9-L51) and [complete supervisor](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/EngineSupervisor.swift).
+
+The controller handles `.unreachable` by logging and returning, without scheduling work or publishing a new supervision state. Logs identify whether the observation came from the injected client-connection probe or socket discovery. Restart logs now describe consecutive unreachable ticks instead of asserting process exit. Probe selection itself is unchanged: an installed client probe supplies the answer; a false result does not trigger a second socket check. See [controller integration](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/EngineProcessController.swift#L395-L433).
+
+One boundary to keep in mind: ticks are skipped while a restart is pending. This change delays scheduling; it does not add cancellation when connectivity recovers during the backoff.
+
+**4. Tests and supporting infrastructure.** Two tests are added:
+
+- **Controller regression:** the worked example above verifies three unavailable fingerprint responses cause neither shutdown nor replacement.
+- **Supervisor threshold:** three consecutive failed ticks produce two `.unreachable` actions followed by `.restart(attempt: 1, delay: 1)`. All calls use the same timestamp, reinforcing that the threshold counts ticks. See the [new supervisor test](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Tests/BossTests/EngineRestartPolicyTests.swift#L74-L89).
+
+Supporting changes are confined to the existing test fixtures and configuration. `FakeSocketControl.expectedFingerprint` becomes optional, and `Fixture` gains `fingerprintAvailable`, defaulting to `true`. This lets tests model a reachable socket independently from fingerprint availability while preserving existing fixture behavior. See the [updated fake and fixture](https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift#L291-L389).
+
+Three existing budget/reset tests explicitly select threshold `1`, preserving their focus on budget exhaustion and replenishment. The new tests do not directly cover a healthy tick interrupting a partial failure streak or controller-level delayed scheduling. No build or test-runner configuration changes appear in the supplied diff.
+
+The PR description lists Bazel library/test builds, `BossTestsShard3` execution, app/installer builds, and `checkleft run` as validation. I have not independently run those checks.

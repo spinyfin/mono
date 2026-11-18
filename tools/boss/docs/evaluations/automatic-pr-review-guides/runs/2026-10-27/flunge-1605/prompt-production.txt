@@ -1,0 +1,135 @@
+I want you to provide me a guided summary of the changes in https://github.com/brianduff/flunge/pull/1605. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+5. a section headed exactly `## Evidence` reporting the validation the change's authors performed, as they reported it: the commands they ran and the results they gave, or the tests they added. If the authors report no validation, say "No validation reported."
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Ground every step in source you have actually read.
+
+Review context:
+- Repository: brianduff/flunge
+- PR title: Share the British Fencing licence across everyone who tracks a fencer
+- Merge-base revision: 9806138106ee6c5da6840b58b468bbc4f3e0b8af
+- Head revision: 256630b62986cc513c42e7e9075e57011707ce9a
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base ("before") content with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/brianduff-flunge/.git show 9806138106ee6c5da6840b58b468bbc4f3e0b8af:<path>`, and its diff with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/brianduff-flunge/.git diff --no-ext-diff --no-textconv 9806138106ee6c5da6840b58b468bbc4f3e0b8af 256630b62986cc513c42e7e9075e57011707ce9a -- <path>`. Always pass `--git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/brianduff-flunge/.git` explicitly: that is the pinned object store for this checkout, it is not exported as `GIT_DIR`, and a bare `git` has no repository to read. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
+
+Ground the guide in those revisions. Explain relevant callers, helpers, types, and tests only to the extent you can verify them by reading the checkout. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
+
+Organize the walkthrough in a useful reading order through the core implementation. Explain why the important pieces fit together, not just which files changed. Prioritize details that help a reviewer understand or verify the fix. Use short faithful excerpts; clearly label condensed pseudocode. Avoid repetitive summaries and incidental cleanup unless it matters to the solution.
+
+Link the core fix, worked example, important test changes, and relevant unchanged context to revision-pinned source lines you actually read. Construct links as `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>-L<end>` using the full head or merge-base SHA and the corresponding repository, path, and line numbers. Use `#L<line>` for a single line. Check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision.
+
+In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when supported by what you read and useful. Describe what each test asserts according to the test source you read. Write about the change and its authors in the third person; do not narrate your own process, and do not describe what you did or did not run, verify, or inspect.
+
+In the Evidence section, report the validation the authors performed, from the PR description: state each as "the author ran X; result Y" or "the revision added test Z", including commands and results, repeated-run counts for flake fixes, measurements, and before/after observations where supplied. Include known failing tests or open risks the authors called out, attributed to them. If the PR description reports no validation, write "No validation reported." The guide is not a validator: do not grade, second-guess, or qualify the evidence, and do not add sections or sentences about limits, missing evidence, unverified claims, or what the guide itself did or did not check.
+
+Use the Registered screenshots manifest to report the screenshots the authors attached. If present, list them by caption, retaining attachment ids and dimensions where useful; if none, say no screenshots are registered. Mention reclaimed images as unavailable. Do not inline images or include attachment URLs or localhost links.
+
+Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
+
+Submit the finished Markdown guide using `"$BOSS_BIN" propose review-guide --body '<finished Markdown guide>'`. Read-only source exploration through Read, Grep, Glob, and the pinned git commands above is permitted; submission is the only permitted write operation. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run commands other than the permitted source reads and submission. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title and the five requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not use first-person narration or hedging about attribution, and do not include sections or phrasing about the guide's own limits, missing evidence, or what it did or did not verify. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge.
+
+## Source context
+
+Comparison: `https://github.com/brianduff/flunge/pull/1605` base `9806138106ee6c5da6840b58b468bbc4f3e0b8af` (merge base `9806138106ee6c5da6840b58b468bbc4f3e0b8af`) to head `256630b62986cc513c42e7e9075e57011707ce9a`.
+
+### PR description
+
+## Summary
+
+The British Fencing licence is now a shared property of the fencer, not a private annotation on one account. Anyone who tracks the fencer may set or correct it; last write wins, with `setBy` / `setAt` provenance. Two parents tracking the same child both see British standings after either one types the number.
+
+This reverses the original "do not promote one user's guess into a global fact" decision in `docs/design-docs/british-fencing-rankings-as-a-standings-source.md`. The scraper-ownership objection was **not** dismissed: the value lives in a new `fencer_british_licences` Cosmos collection (`fencer_licence` crate), keyed by fencer id (`bfl-{fencerViewId}`), which `SyncFencerInfo` / `merge_into` cannot address. `fencer_refresh_merge_does_not_patch_a_licence_path` pins that a fencer refresh emits no licence patch and that `FencerFields` JSON has no `britishFencingLicence` key.
+
+Writes still go through `PUT /api/v3/user/tracked-fencers/{fencerId}/british-fencing-membership` (caller must track the fencer). `GET /api/v2/user/me` hydrates `trackedFencers[].britishFencingLicence` from the sidecar in a single batched query (`cosmos::id_in` over the tracked fencer ids) so the settings editor does not need a new read; a failure to load the sidecar degrades that field to unset rather than failing the whole `/user/me` response. That field is no longer a stored per-user assertion: the write path does not patch the user document, the generic `PATCH /api/v2/user/me` json-patch endpoint unconditionally rejects any path containing `britishFencingLicence`, and a one-shot migration strips leftover keys.
+
+Standings / composition / history still require a **tracking viewing context** (signed-in caller who tracks the fencer, or a live results-share link whose owner tracks the bound fencer). A signed-out visitor with no share token still sees no British chips. Share links are not widened beyond that owner-scoped grant.
+
+Capture no longer has a multi-asserter ambiguity path. One shared record cannot produce two values, so `resolve_british_licence` / `BritishLicenceResolution::Ambiguous` / `CaptureCounts.britishLicenceAmbiguous` are gone.
+
+### Migration
+
+Via admin task `migrate_british_fencing_licences` only — it is not run automatically on backend startup, since it does a full uncached scan of the users container and every replica would otherwise pay that cost on every process start:
+
+- Exactly one distinct per-user licence for a fencer → adopt it (`setBy` = lexicographically-smallest asserting user id).
+- Two or more distinct licences → leave the shared record unset, log a warning with **fencer id and distinct-count only** (never the membership ids), and leave that fencer's per-user `britishFencingLicence` values in place on the user documents so the competing assertions stay recoverable until a human reconciles them.
+- A fencer that already has a sidecar record is not overwritten.
+- Then strip `britishFencingLicence` from user documents that still carry it, except for fencers left in conflict above.
+
+This workspace has no production user documents, so this run cannot report live bucket counts. Running the `migrate_british_fencing_licences` admin task in production/staging logs `adopted`, `conflicted`, `skipped_already_shared`, and `users_stripped`.
+
+### Assumptions
+
+- A sidecar collection is the way to keep a hand-typed value off scraper-owned `FencerFields` without requiring a fencer document to exist for every `f.u.*` tracked fencer.
+- `TrackedFencer.britishFencingLicence` stays on the GET `/user/me` response as a hydrated field so the settings UI does not need a new endpoint. It is not a second write path.
+- Share links resolve the **shared** licence after confirming the owner tracks the fencer. That is how a spouse-set licence appears on the owner's share page; the public fencer-id route still does not load the licence.
+
+## Validation
+
+- `bazel test --build_tests_only //backend/...` — pass, including new unit tests for the previously-untested blob-side migration and hydration orchestration (`collect_assertions`, `strip_licence_except`) and for the `britishFencingLicence` patch-path rejection
+- `bazel build //backend:backend` — pass
+- `./tools/checks run` — no findings
+- `npm --prefix frontend run build` (`tsc && vite build`) — pass
+
+## Open Questions
+
+None. Production migration bucket counts will appear in the `migrate_british_fencing_licences` admin task log lines (`adopted`, `conflicted`, `skipped_already_shared`, `users_stripped`) when it is run.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_01VJYNRDKa98DRSe7sKVaeSe
+
+
+### Changed files
+
+- `Cargo.lock` (Modified, +13/-0)
+- `Cargo.toml` (Modified, +2/-0)
+- `MODULE.bazel.lock` (Modified, +5/-4)
+- `backend/admintasks/src/lib.rs` (Modified, +12/-0)
+- `backend/admintasks/src/migrate_british_fencing_licences.rs` (Added, +32/-0)
+- `backend/blob/BUILD` (Modified, +1/-0)
+- `backend/blob/Cargo.toml` (Modified, +1/-0)
+- `backend/blob/src/app.rs` (Modified, +12/-2)
+- `backend/blob/src/auth.rs` (Modified, +3/-3)
+- `backend/blob/src/db/mod.rs` (Modified, +5/-0)
+- `backend/blob/src/fencer_licence.rs` (Added, +328/-0)
+- `backend/blob/src/fencingtracker/mod.rs` (Modified, +70/-1)
+- `backend/blob/src/lib.rs` (Modified, +1/-0)
+- `backend/blob/src/share/view.rs` (Modified, +4/-2)
+- `backend/blob/src/standings_history/capture.rs` (Modified, +6/-169)
+- `backend/blob/src/standings_history/state.rs` (Modified, +7/-17)
+- `backend/blob/src/v2/model.rs` (Modified, +6/-4)
+- `backend/blob/src/v2/user.rs` (Modified, +67/-65)
+- `backend/blob/src/v3/user.rs` (Modified, +7/-6)
+- `backend/blob/src/view/standings/fencer.rs` (Modified, +59/-29)
+- `backend/blob/src/view/standings/fencer_british_tests.rs` (Modified, +14/-14)
+- `backend/blob/src/view/standings/fencer_history.rs` (Modified, +6/-3)
+- `backend/fencer_licence/BUILD` (Added, +21/-0)
+- `backend/fencer_licence/Cargo.toml` (Added, +14/-0)
+- `backend/fencer_licence/src/lib.rs` (Added, +18/-0)
+- `backend/fencer_licence/src/migrate.rs` (Added, +230/-0)
+- `backend/fencer_licence/src/model.rs` (Added, +75/-0)
+- `backend/fencer_licence/src/repository.rs` (Added, +121/-0)
+- `docs/backend.md` (Modified, +1/-0)
+- `docs/backend/standings.md` (Modified, +1/-1)
+- `docs/design-docs/british-fencing-rankings-as-a-standings-source.md` (Modified, +43/-27)
+- `frontend/src/AdminPage.tsx` (Modified, +1/-1)
+- `frontend/src/api/v2.ts` (Modified, +1/-2)
+- `frontend/src/api/v3/user.ts` (Modified, +3/-2)
+
+### Capture diagnostics
+
+These are capture-time packet diagnostics, not evidence that workspace reads will fail. Notes that pinned source was collected instead of an API patch describe capture provenance only. Try the pinned checkout with Read/Grep/Glob or read-only git show/git diff first. If essential source cannot be read, report a generation failure instead of submitting a guide. Do not invent content.
+
+- `MODULE.bazel.lock` (Before): pinned source exceeds the 1048576-byte per-file capture budget
+- `MODULE.bazel.lock` (After): pinned source exceeds the 1048576-byte per-file capture budget
+- `MODULE.bazel.lock` (both): GitHub omitted the API patch; pinned source was collected instead
+
+
+### Registered screenshots
+
+No screenshots are registered for this task or its revisions.

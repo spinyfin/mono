@@ -1,0 +1,48 @@
+{
+  "$schema_note": "The six saved comparisons from the design's 'Reproducible six-PR sample' (tools/boss/docs/designs/automatic-pr-review-guides.md), read from the archive's original cases/*/source/manifest.json. All SHAs are full immutable revisions. merge_base_sha is recorded here for cross-check only: the production collector (boss_pr_review_sources::collect_pinned_source_packet, driven by tools/boss/engine/review-guide:corpus-tool) always recomputes it live from GitHub rather than accepting it as an input, and each case's collected cases/<id>/packet.json records what that live recomputation actually returned.",
+  "prompt_version": "review-guide-v1",
+  "cases": [
+    {
+      "id": "flunge-1545",
+      "pr_url": "https://github.com/brianduff/flunge/pull/1545",
+      "base_tip_sha": "b4e72c775d4e60b5fe0565599f666fdcd2a598cd",
+      "merge_base_sha": "b4e72c775d4e60b5fe0565599f666fdcd2a598cd",
+      "head_sha": "ba2e4fce1b1de11fe605390ed84dfe9f0f415e99"
+    },
+    {
+      "id": "flunge-1552",
+      "pr_url": "https://github.com/brianduff/flunge/pull/1552",
+      "base_tip_sha": "54e4e293dfe4e142bf8a63761f4f0348af205a0e",
+      "merge_base_sha": "54e4e293dfe4e142bf8a63761f4f0348af205a0e",
+      "head_sha": "7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1"
+    },
+    {
+      "id": "flunge-1605",
+      "pr_url": "https://github.com/brianduff/flunge/pull/1605",
+      "base_tip_sha": "9806138106ee6c5da6840b58b468bbc4f3e0b8af",
+      "merge_base_sha": "9806138106ee6c5da6840b58b468bbc4f3e0b8af",
+      "head_sha": "256630b62986cc513c42e7e9075e57011707ce9a"
+    },
+    {
+      "id": "mono-2860",
+      "pr_url": "https://github.com/spinyfin/mono/pull/2860",
+      "base_tip_sha": "97db22f5bb3fcb02dc105cf6973cc57de3810104",
+      "merge_base_sha": "91567c86a7195ee78f3e340fbcf6c5bccc5ebedc",
+      "head_sha": "725bd759480d416ffffcd39c32ab5fa99d3acc97"
+    },
+    {
+      "id": "mono-2886",
+      "pr_url": "https://github.com/spinyfin/mono/pull/2886",
+      "base_tip_sha": "6f8ca35153d0fcae9aea5e9852894ea549989ca0",
+      "merge_base_sha": "6f8ca35153d0fcae9aea5e9852894ea549989ca0",
+      "head_sha": "68e51b6cfd5cb8ccac6473273d04d57fe972d7a4"
+    },
+    {
+      "id": "mono-2890",
+      "pr_url": "https://github.com/spinyfin/mono/pull/2890",
+      "base_tip_sha": "6f8ca35153d0fcae9aea5e9852894ea549989ca0",
+      "merge_base_sha": "6f8ca35153d0fcae9aea5e9852894ea549989ca0",
+      "head_sha": "12c538d6f328d9f4cbb62c0ef69d6fa9b301500a"
+    }
+  ]
+}

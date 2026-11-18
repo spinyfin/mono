@@ -1,0 +1,83 @@
+I want you to provide me a guided summary of the changes in https://github.com/brianduff/flunge/pull/1545. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: brianduff/flunge
+- PR title: Distinguish transient vs permanent share-link load failures
+- Merge-base revision: b4e72c775d4e60b5fe0565599f666fdcd2a598cd
+- Head revision: ba2e4fce1b1de11fe605390ed84dfe9f0f415e99
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base ("before") content with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/brianduff-flunge/.git show b4e72c775d4e60b5fe0565599f666fdcd2a598cd:<path>`, and its diff with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/brianduff-flunge/.git diff --no-ext-diff --no-textconv b4e72c775d4e60b5fe0565599f666fdcd2a598cd ba2e4fce1b1de11fe605390ed84dfe9f0f415e99 -- <path>`. Always pass `--git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/brianduff-flunge/.git` explicitly: that is the pinned object store for this checkout, it is not exported as `GIT_DIR`, and a bare `git` has no repository to read. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
+
+## Source context
+
+Comparison: `https://github.com/brianduff/flunge/pull/1545` base `b4e72c775d4e60b5fe0565599f666fdcd2a598cd` (merge base `b4e72c775d4e60b5fe0565599f666fdcd2a598cd`) to head `ba2e4fce1b1de11fe605390ed84dfe9f0f415e99`.
+
+### PR description
+
+## Summary
+
+Share recipient pages used one error card for every failed view fetch: "This link isn't available." That copy is correct when the backend has answered that the token is missing, unknown, revoked, expired, or malformed. It is wrong when the backend never answered — the mid-deploy restart window that produces connection refused, timeouts, or 502/503/504 — because it tells the recipient the link is bad when it is fine and will work in a minute.
+
+This PR classifies the failed request from status / error class and renders different copy:
+
+- **Permanent** (404, 410, other 4xx except 408/429): "This link isn't available." / "Check the link with whoever shared it." No retry action.
+- **Transient** (5xx, 408, 429, network errors, anything without a status): "Couldn't load this right now." / "Try again in a moment." plus a **Try again** button that `refetch()`es the view query. No background polling.
+
+Ambiguous failures (no response, unknown error) are treated as transient. A missing token in the URL is permanent.
+
+The results share page (`/r/:token`) is wired to the new card. The owner-side share dialogs are untouched.
+
+### Shared presentation
+
+Classification and copy live in `shareLoadFailure.ts`. The card is `ShareLoadFailureState` (same `LinkOff` icon, `StateCard` layout, and placement as before; only copy and the transient action changed).
+
+The **plan share page is not on `main` yet** — it is landing in https://github.com/brianduff/flunge/pull/1542 with its own copy of the old generic `UnavailableState`. This PR does not duplicate that page. `#1542` (or a follow-up after it merges) should import `ShareLoadFailureState` instead of keeping a second card. The upcoming chore that consolidates shared presentation between the two recipient pages should treat this component as the error surface, not invent another copy.
+
+### Copy (results share page, live)
+
+Permanent (404 from a fake local API):
+
+> This link isn't available.
+> Check the link with whoever shared it.
+> (no Try again)
+
+Transient (503 from a fake local API):
+
+> Couldn't load this right now.
+> Try again in a moment.
+> [Try again]
+
+## Validation
+
+- `bazel test --build_tests_only //frontend/...` (`//frontend:jest_test` PASSED)
+- `cd frontend && npm run build` (tsc + vite build)
+- `./tools/checks run` — no findings
+- Jest: classifier table (400/403/404/410 permanent; 408/429/5xx and network/unknown transient); `ShareLoadFailureState` copy + Try again; `ShareResultsPage` 404/410/503/Failed to fetch, Try again re-issues `getShareResultsView` twice and then renders the view, event-level 404 still permanent with no retry
+- Live on Vite against a local fake API: `/r/:token` with 404 shows permanent copy and no button; 503 shows transient copy and Try again. Plan share page could not be exercised on this branch because `SharePlanPage` is not present.
+
+## Open Questions
+
+None.
+
+
+### Changed files
+
+- `frontend/src/ShareResultsPage.test.tsx` (Modified, +64/-3)
+- `frontend/src/ShareResultsPage.tsx` (Modified, +19/-14)
+- `frontend/src/components/ShareLoadFailureState.test.tsx` (Added, +23/-0)
+- `frontend/src/components/ShareLoadFailureState.tsx` (Added, +36/-0)
+- `frontend/src/shareLoadFailure.test.ts` (Added, +26/-0)
+- `frontend/src/shareLoadFailure.ts` (Added, +44/-0)
+
+
+### Registered screenshots
+
+No screenshots are registered for this task or its revisions.

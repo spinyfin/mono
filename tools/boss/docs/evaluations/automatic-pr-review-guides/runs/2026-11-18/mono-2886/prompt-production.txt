@@ -1,0 +1,74 @@
+I want you to provide me a guided summary of the changes in https://github.com/spinyfin/mono/pull/2886. The summary should break down as:
+
+0. a section headed exactly `## Orientation`, placed first, directly after the title, that orients a reader who knows nothing about this change or the system around it (see the orientation requirements below).
+1. a general overview of the change, framed by the type of change: for a new feature or capability, what is being built and how it behaves; for a bug fix, the broken behaviour and the corrected behaviour; for a refactor, cleanup, or infrastructure change, what is restructured and what that enables.
+2. a general overview of the core implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that implements the new behaviour or fix.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+5. a section headed exactly `## Evidence` reporting the validation the change's authors performed, as they reported it: the commands they ran and the results they gave, or the tests they added. If the authors report no validation, say "No validation reported."
+
+Determine the type of change from the task description and the diff; do not comment on how the work was filed or categorised.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Orientation requirements. Write `## Orientation` in plain language for a reader with no prerequisite knowledge, and keep it short: a few paragraphs, no code excerpts, no diff detail. It must:
+- Lead with the goal in the reader's terms: the observable symptom or user-facing outcome that motivated the work (what a person using the product saw, felt, or could not do), taken from the originating task's description in the Task context. For a revision, use the original change's description, not the revision's. State it before any internal mechanism. If the originating description is itself purely mechanical, say in plain words what effect the change has on the running system. Only then explain the mechanism, and do not use internal terms such as a queue, cache, or marker before that observable effect has been stated.
+- Say what the change does in a few sentences, framed by the type of change rather than always as a fix. For a new feature or capability, describe what is being built, what it lets someone do, and how it behaves. For a bug fix, describe the broken behaviour and how it behaves now. For a refactor, cleanup, or infrastructure change, describe what is restructured and what that enables. Do not force every change into a "what problem does this solve?" framing. Also say where it lives, naming the subsystem or component in plain words.
+- When the Task context names a containing project, explain how the change fits the bigger picture: what the project as a whole is building, which part of it this PR delivers, which earlier pieces it builds on, and which later pieces it enables. Draw these from the project summary, the design document (read it from the checkout when its path is given), and the other project work listed in the Task context; do not name pieces those sources do not support. When the Task context says there is no containing project, do not describe one.
+- Explain, in one line, each term, internal concept, or acronym that the rest of the guide relies on, in plain language where it is first used.
+- When the Task context lists revisions filed against this PR (review findings, CI fixes, merge-conflict resolutions, or human-requested changes), first summarize the PR as a whole (what the original change does and why, as above) and only then say what the revisions change relative to it and why, for example which review findings they address. A reader who has not seen the original PR or any earlier guide must be able to follow the guide from the Orientation alone. When the Task context lists no revisions, describe the change itself.
+
+Make the core change concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Ground every step in source you have actually read.
+
+Review context:
+- Repository: spinyfin/mono
+- PR title: Preserve healthy engines on inconclusive checks
+- Merge-base revision: 6f8ca35153d0fcae9aea5e9852894ea549989ca0
+- Head revision: 68e51b6cfd5cb8ccac6473273d04d57fe972d7a4
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base ("before") content with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/spinyfin-mono/.git show 6f8ca35153d0fcae9aea5e9852894ea549989ca0:<path>`, and its diff with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/spinyfin-mono/.git diff --no-ext-diff --no-textconv 6f8ca35153d0fcae9aea5e9852894ea549989ca0 68e51b6cfd5cb8ccac6473273d04d57fe972d7a4 -- <path>`. Always pass `--git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/spinyfin-mono/.git` explicitly: that is the pinned object store for this checkout, it is not exported as `GIT_DIR`, and a bare `git` has no repository to read. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
+
+Ground the guide in those revisions. Explain relevant callers, helpers, types, and tests only to the extent you can verify them by reading the checkout. Treat the PR description and code comments as statements to verify against the implementation. Distinguish enforced behavior from conventions, prompt instructions, and assumptions. Do not turn a conditional or local check into a broader guarantee.
+
+Organize the walkthrough in a useful reading order through the core implementation. Explain why the important pieces fit together, not just which files changed. Prioritize details that help a reviewer understand or verify the change. Use short faithful excerpts; clearly label condensed pseudocode. Avoid repetitive summaries and incidental cleanup unless it matters to the change.
+
+Link the core change, worked example, important test changes, and relevant unchanged context to revision-pinned source lines you actually read. Construct links as `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>-L<end>` using the full head or merge-base SHA and the corresponding repository, path, and line numbers. Use `#L<line>` for a single line. Check that each link targets the code being discussed. Do not invent diff anchors or imply that a mutable PR URL identifies an immutable revision.
+
+In the tests section, distinguish added, modified, and removed tests. Name the important scenarios and assertions; identify relevant fixture, helper, and build/configuration changes. Include counts only when supported by what you read and useful. Describe what each test asserts according to the test source you read. Write about the change and its authors in the third person; do not narrate your own process, and do not describe what you did or did not run, verify, or inspect.
+
+In the Evidence section, report the validation the authors performed, from the PR description: state each as "the author ran X; result Y" or "the revision added test Z", including commands and results, repeated-run counts for flake fixes, measurements, and before/after observations where supplied. Include known failing tests or open risks the authors called out, attributed to them. If the PR description reports no validation, write "No validation reported." The guide is not a validator: do not grade, second-guess, or qualify the evidence, and do not add sections or sentences about limits, missing evidence, unverified claims, or what the guide itself did or did not check.
+
+Use the Registered screenshots manifest to report the screenshots the authors attached. If present, list them by caption, retaining attachment ids and dimensions where useful; if none, say no screenshots are registered. Mention reclaimed images as unavailable. Do not inline images or include attachment URLs or localhost links.
+
+Use the complete revised PR comparison if this is a regenerated guide. Do not describe only the latest incremental commit. Existing comments may provide context, but the explanation must match the actual current source revisions.
+
+Submit the finished Markdown guide using `"$BOSS_BIN" propose review-guide --body '<finished Markdown guide>'`. Read-only source exploration through Read, Grep, Glob, and the pinned git commands above is permitted; submission is the only permitted write operation. Pass the entire Markdown as a literal single-quoted shell argument (escape any apostrophe with the standard shell quote sequence); do not write a file, pipe input, use command substitution, or run commands other than the permitted source reads and submission. The command is bound to your execution automatically. A final assistant message does not submit a guide. If submission fails, correct the reported error and retry the same command before ending. The guide must have a descriptive title, the Orientation section first, and then the five requested main sections. Put the worked example within the implementation walkthrough. Keep the guide as concise as the explanation permits while preserving useful reasoning and evidence. Do not use first-person narration or hedging about attribution, and do not include sections or phrasing about the guide's own limits, missing evidence, or what it did or did not verify. Do not include a chat preamble, model details, internal execution details, a merge recommendation, or an unsupported declaration that the PR is safe to merge.
+
+## Source context
+
+Comparison: `https://github.com/spinyfin/mono/pull/2886` base `6f8ca35153d0fcae9aea5e9852894ea549989ca0` (merge base `6f8ca35153d0fcae9aea5e9852894ea549989ca0`) to head `68e51b6cfd5cb8ccac6473273d04d57fe972d7a4`.
+
+### PR description
+
+## Summary
+- Keep a reachable engine attached when its fingerprint RPC is inconclusive, while still replacing positively mismatched builds.
+- Debounce unreachable supervision ticks and emit production logs that identify the liveness source and restart evidence.
+- Add regression coverage for unresponsive fingerprint RPCs and consecutive-failure restart scheduling.
+
+## Validation
+- `bazel build //tools/boss/app-macos:boss_mac_app_lib //tools/boss/app-macos:BossTestsShard3`
+- `bazel test //tools/boss/app-macos:BossTestsShard3`
+- `bazel build //tools/boss/app-macos:Boss //tools/boss/installer:release`
+- `checkleft run`
+
+
+### Changed files
+
+- `tools/boss/app-macos/Sources/EngineProcessController.swift` (Modified, +23/-12)
+- `tools/boss/app-macos/Sources/EngineSupervisor.swift` (Modified, +12/-0)
+- `tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift` (Modified, +24/-4)
+- `tools/boss/app-macos/Tests/BossTests/EngineRestartPolicyTests.swift` (Modified, +23/-3)
+
+
+### Registered screenshots
+
+No screenshots are registered for this task or its revisions.
