@@ -105,11 +105,12 @@ async fn focus_starts_off_and_set_add_remove_clear_edit_the_set() {
 }
 
 #[tokio::test]
-async fn held_count_reflects_ready_rows_outside_the_set() {
-    let (state, _dir) = test_server_state();
+async fn held_count_counts_out_of_scope_rows_once_focus_mode_is_recorded() {
+    let (state, _dir) = test_server_state_with_fakes();
     let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
     let focused = project(&state, &product.id, "Focused");
     let other = project(&state, &product.id, "Other");
+    let mut outside_exec = None;
     for (project, name) in [(&focused, "In scope"), (&other, "Outside")] {
         let task = state
             .work_db
@@ -122,7 +123,7 @@ async fn held_count_reflects_ready_rows_outside_the_set() {
                     .build(),
             )
             .unwrap();
-        state
+        let execution = state
             .work_db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
@@ -132,11 +133,29 @@ async fn held_count_reflects_ready_rows_outside_the_set() {
                     .build(),
             )
             .unwrap();
+        if name == "Outside" {
+            outside_exec = Some(execution.id);
+        }
     }
+    let outside_exec = outside_exec.expect("outside execution");
 
-    let focus = focus_of(update(&state, DispatchFocusAction::Set, &[&focused.id]).await);
+    let before_drain = focus_of(update(&state, DispatchFocusAction::Set, &[&focused.id]).await);
+    assert_eq!(
+        before_drain.held_count, 0,
+        "held_count ignores out-of-scope rows until drain records focus_mode"
+    );
 
-    assert_eq!(focus.held_count, 1);
+    state.execution_coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        state
+            .work_db
+            .get_execution(&outside_exec)
+            .unwrap()
+            .dispatch_wait_reason
+            .as_deref(),
+        Some(boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE),
+    );
+    assert_eq!(show(&state).await.held_count, 1);
 }
 
 #[tokio::test]
