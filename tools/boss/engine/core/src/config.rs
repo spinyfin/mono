@@ -510,7 +510,7 @@ impl AgentConfig {
             Ok(command) => parse_command_line("BOSS_CUBE_CMD", command)?,
             Err(_) => (
                 boss_engine_worker_bin::resolve_cube_cli_for_engine(engine_path)
-                    .context("no bundled cube found; set BOSS_CUBE_CMD or CUBE_CLI_BIN to an executable path")?
+                    .context("no bundled cube found; set CUBE_CLI_BIN to an executable path")?
                     .to_string_lossy()
                     .into_owned(),
                 Vec::new(),

@@ -12,9 +12,9 @@ package(default_visibility = ["//visibility:private"])
 # The set of binaries bundled inside Boss.app/Contents/Resources/bin/.
 # cube is bundled here so that the engine can find it even when the macOS GUI
 # launchd PATH excludes the user's shell PATH (~/bin, /opt/homebrew/bin, etc.).
-# Workers run inside Ghostty terminal panes and inherit the user's shell PATH,
-# so they continue to resolve cube (and jj, gh, claude, etc.) from PATH — only
-# the engine needs the bundled copy.
+# Boss-owned tools run from the bundle by absolute path: the engine resolves
+# them through //tools/boss/engine/worker-bin and workers use per-workspace
+# launchers. Only third-party tools (jj, gh, claude, etc.) resolve from PATH.
 filegroup(
     name = "bundled_binaries",
     srcs = [
