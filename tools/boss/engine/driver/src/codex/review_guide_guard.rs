@@ -49,8 +49,12 @@ pub fn review_guide_deny_rules() -> Vec<String> {
 
 /// Shared by Codex materialization and Claude settings hooks.
 pub fn codex_review_guide_guard_script() -> String {
-    with_review_guide_command(&with_command_tokenizer(SCRIPT_TEMPLATE))
-        .replace("# REVIEW_GUIDE_READ_FRAGMENT", reads::SCRIPT)
+    with_source_reads(&with_review_guide_command(&with_command_tokenizer(SCRIPT_TEMPLATE)))
+}
+
+/// Compose the shared source-read grammar with a driver-specific command policy.
+pub(crate) fn with_source_reads(template: &str) -> String {
+    template.replace("# REVIEW_GUIDE_READ_FRAGMENT", reads::SCRIPT)
 }
 
 /// Insert the submission recognizer into another guard without bypassing its checks.

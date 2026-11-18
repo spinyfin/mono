@@ -1,19 +1,15 @@
 //! Codex-only `PreToolUse` guard enforcing the reviewer read-only /
 //! no-publish mandate.
 //!
-//! Claude and local Grok reviewers get this fence from a declarative
-//! `permissions.deny` allowlist
-//! (`boss_engine_core::worker_setup::reviewer_deny_rules`) plus their
-//! driver's OS sandbox. Codex has no equivalent declarative deny surface,
-//! and — since the reviewer OS sandbox was removed (it desynced the
-//! session's real working directory from the one hooks were armed and
-//! trust-attested against, making every Codex reviewer appear
-//! never-started) — no OS sandbox either. Without a replacement, a Codex
-//! reviewer could edit the checkout or push/publish with nothing to stop
-//! it, unlike its Claude and Grok counterparts.
+//! Claude reviewers use declarative `permissions.deny` rules. Grok reviewers
+//! use a dedicated PreToolUse guard through the Grok adapter: it admits source
+//! inspection and the run's review-result file, and denies other writes and
+//! publishing. Local macOS Grok runs with its OS sandbox disabled.
 //!
-//! This guard is that replacement, expressed the way Codex enforces
-//! anything: a `PreToolUse` decision, not a declarative rule list.
+//! Codex has no declarative deny surface or reviewer OS sandbox. This guard
+//! blocks native patches and the publish command families below; the separate
+//! static-analysis guard also rejects build/test/interpreter execution.
+//! This guard alone is not an OS-level fence against arbitrary shell writes.
 //!
 //! - Every `apply_patch` call is blocked outright. A reviewer never
 //!   legitimately writes a file: its `ReviewResult` is extracted from
@@ -22,7 +18,7 @@
 //!   sanctioned write for this guard to carve an exception for (contrast
 //!   Claude's `reviewer_deny_rules`, which scopes its file-write deny
 //!   because the Claude reviewer *does* write one engine-owned artifact).
-//! - The same publish commands `publish_deny_rules` denies for Claude/Grok
+//! - The same publish commands `publish_deny_rules` denies for Claude
 //!   are blocked here too: `jj git push` / `git push`, `gh pr`/`gh issue`
 //!   mutations, and all `cube pr` subcommands.
 //!
@@ -55,7 +51,7 @@ use super::guard_python::with_command_tokenizer;
 const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env python3
 """Codex reviewer read-only / no-publish PreToolUse gate (Boss).
 
-Replaces, for Codex, the two controls the Claude/Grok reviewer gets from
+Replaces, for Codex, the two controls the Claude reviewer gets from
 declarative `permissions.deny` rules (`reviewer_deny_rules` in
 `boss_engine_core::worker_setup`): no file writes, and no push/publish.
 Fails closed: an unreadable payload for a tool this guard must judge is
