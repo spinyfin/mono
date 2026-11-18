@@ -15,6 +15,7 @@ async fn choose(state: &Arc<ServerState>, id: &str, value: &str) -> FrontendEven
         state,
         None,
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: id.into(),
             answer: boss_protocol::OperatorAnswer::MultipleChoice { value: value.into() },
         },

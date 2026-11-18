@@ -171,6 +171,36 @@ final class WorkBlockedBadgeTests: XCTestCase {
         XCTAssertFalse(WorkBlockedBadge.hasMoreInfo(for: task))
     }
 
+    // MARK: - Answered and waiting on a prerequisite
+
+    /// An answered row parked behind its gate reads "Answered · waits for <prerequisite>"
+    /// on the card, and still counts as a dependency-blocked badge for hover behaviour.
+    func testAnsweredRowWaitingOnPrerequisiteShowsWaitingLabel() {
+        let detail = "Answered · waits for Resolve merge conflict against main"
+        let task = makeTask(status: "blocked", blockedReason: "dependency", blockedDetail: detail)
+        XCTAssertTrue(WorkBlockedBadge.isAnsweredAndWaiting(task))
+        XCTAssertEqual(WorkBlockedBadge.badgeText(for: task), detail)
+        let snapshot = WorkCardSnapshot.build(task: task, context: WorkCardSnapshotContext(column: .backlog))
+        XCTAssertEqual(snapshot.blockedBadgeText, detail)
+        XCTAssertTrue(snapshot.isDependencyBlockedBadge)
+        XCTAssertNil(snapshot.operatorQuestion, "no buttons once the question is answered")
+    }
+
+    /// An ordinary dependency block keeps the plain label.
+    func testPlainDependencyBlockKeepsDependencyLabel() {
+        let task = makeTask(status: "blocked", blockedReason: "dependency", blockedDetail: "something else")
+        XCTAssertFalse(WorkBlockedBadge.isAnsweredAndWaiting(task))
+        XCTAssertEqual(WorkBlockedBadge.badgeText(for: task), "Dependency")
+    }
+
+    /// The marker never outlives the block.
+    func testAnsweredWaitingMarkerIgnoredOnceNotBlocked() {
+        let task = makeTask(
+            status: "todo", blockedReason: "dependency",
+            blockedDetail: "Answered · waits for Gate")
+        XCTAssertFalse(WorkBlockedBadge.isAnsweredAndWaiting(task))
+    }
+
     // MARK: - Helpers
 
     private func makeTask(

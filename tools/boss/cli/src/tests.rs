@@ -2855,3 +2855,62 @@ fn default_comment_author_is_user_prefixed() {
     );
     assert!(author.len() > "user:".len());
 }
+
+fn answer_args(yes: bool, choice: Option<&str>) -> crate::commands::TaskAnswerArgs {
+    crate::commands::TaskAnswerArgs {
+        id: "task_1".into(),
+        yes,
+        no: !yes && choice.is_none(),
+        choice: choice.map(str::to_owned),
+    }
+}
+
+#[test]
+fn task_answer_request_carries_no_autostart_as_suppress_start() {
+    for no_autostart in [false, true] {
+        let boss_protocol::FrontendRequest::AnswerOperatorQuestion {
+            id,
+            answer,
+            suppress_start,
+        } = crate::work_cmds::answer_request(answer_args(true, None), no_autostart)
+        else {
+            panic!("expected an answer request");
+        };
+        assert_eq!(id, "task_1");
+        assert_eq!(answer, boss_protocol::OperatorAnswer::YesNo { value: true });
+        assert_eq!(suppress_start, no_autostart);
+    }
+    let boss_protocol::FrontendRequest::AnswerOperatorQuestion { answer, .. } =
+        crate::work_cmds::answer_request(answer_args(false, Some("Bypass limit")), true)
+    else {
+        panic!("expected an answer request");
+    };
+    assert_eq!(
+        answer,
+        boss_protocol::OperatorAnswer::MultipleChoice {
+            value: "Bypass limit".into()
+        }
+    );
+}
+
+#[test]
+fn task_answer_outcome_succeeds_on_an_updated_item_and_fails_otherwise() {
+    let task = Task::builder()
+        .id("task_1")
+        .product_id("prod_1")
+        .kind(TaskKind::Chore)
+        .name("n")
+        .description("")
+        .status(TaskStatus::Todo)
+        .created_at("")
+        .updated_at("")
+        .build();
+    let item = boss_protocol::WorkItem::Task(task);
+    assert!(
+        crate::work_cmds::answer_outcome(boss_protocol::FrontendEvent::WorkItemUpdated { item }).is_ok(),
+        "a recorded answer maps to success (exit 0), with or without --no-autostart"
+    );
+    let failure = crate::work_cmds::answer_outcome(boss_protocol::FrontendEvent::WorkError { message: "nope".into() })
+        .unwrap_err();
+    assert_ne!(failure.exit_code(), std::process::ExitCode::SUCCESS);
+}

@@ -175,6 +175,7 @@ mod operator_question_tests {
         );
         assert!(
             !worker_verb_decision(&FrontendRequest::AnswerOperatorQuestion {
+                suppress_start: false,
                 id: "oq_example".into(),
                 answer: boss_protocol::OperatorAnswer::YesNo { value: true },
             })

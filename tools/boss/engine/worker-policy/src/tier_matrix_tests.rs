@@ -145,6 +145,7 @@ fn denied_for_both_fixtures() -> Vec<FrontendRequest> {
         req(json!({"type": "get_dispatch_state"})),
         req(json!({"type": "set_dispatch_paused", "paused": true})),
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: "oq".into(),
             answer: boss_protocol::OperatorAnswer::YesNo { value: true },
         },

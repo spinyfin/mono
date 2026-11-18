@@ -96,8 +96,16 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         FrontendRequest::DismissOperatorQuestion { question_id, note, .. } => Some((question_id.clone(), note.clone())),
         _ => None,
     };
+    let mut suppress = false;
     let (id, answer) = match req {
-        FrontendRequest::AnswerOperatorQuestion { id, answer } => (id, Some(answer)),
+        FrontendRequest::AnswerOperatorQuestion {
+            id,
+            answer,
+            suppress_start,
+        } => {
+            suppress = suppress_start;
+            (id, Some(answer))
+        }
         FrontendRequest::ListOperatorQuestions { id } | FrontendRequest::DismissOperatorQuestion { id, .. } => {
             (id, None)
         }
@@ -151,6 +159,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             server_state.pr_state_checker.as_ref(),
             actor,
             Some(&provenance),
+            suppress,
         )
     };
     match result {

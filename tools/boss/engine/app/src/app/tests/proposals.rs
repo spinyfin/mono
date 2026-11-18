@@ -26,6 +26,7 @@ use boss_protocol::{
 };
 use serde_json::{Value, json};
 
+mod gated_answer;
 mod review_guide_loop;
 
 fn operator_question_payload() -> Value {
@@ -68,6 +69,7 @@ async fn answer_question(state: &Arc<ServerState>, id: &str, value: bool) -> Fro
         state,
         None,
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: id.into(),
             answer: boss_protocol::OperatorAnswer::YesNo { value },
         },
@@ -537,33 +539,90 @@ async fn question_restart_delete_and_edits_withdraw_atomically() {
 }
 
 #[tokio::test]
-async fn question_answer_rolls_back_when_dispatch_cannot_create_an_execution() {
-    let (state, _dir, _, task_id) = parked_question_task().await;
-    let before = question_task(&state, &task_id);
-    // Repository resolution is part of the dispatch transaction. A failure
-    // must leave both the unanswered question and original brief intact.
-    state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute(
-            "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
-            [&before.product_id],
+async fn question_answer_is_recorded_when_dispatch_cannot_create_an_execution() {
+    for suppress_start in [false, true] {
+        let (state, _dir, _, task_id) =
+            parked_task_with_question_route(operator_question_payload(), false, Some(false)).await;
+        let before = question_task(&state, &task_id);
+        let repo: Option<String> = state
+            .work_db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT repo_remote_url FROM products WHERE id = ?1",
+                [&before.product_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Repository resolution is part of starting the work. Its failure must not
+        // undo the answer: the answer and its brief are recorded regardless.
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE products SET repo_remote_url = NULL WHERE id = ?1",
+                [&before.product_id],
+            )
+            .unwrap();
+        let response = call_with_peer(
+            &state,
+            None,
+            FrontendRequest::AnswerOperatorQuestion {
+                suppress_start,
+                id: task_id.clone(),
+                answer: boss_protocol::OperatorAnswer::YesNo { value: true },
+            },
         )
-        .unwrap();
-    assert!(matches!(
-        answer_question(&state, &task_id, true).await,
-        FrontendEvent::WorkError { .. }
-    ));
-    let after = question_task(&state, &task_id);
-    assert_eq!(after.description, before.description);
-    assert_eq!(after.status, before.status);
-    assert_eq!(after.blocked_reason, before.blocked_reason);
-    assert_eq!(after.operator_question, before.operator_question);
-    let records = state.work_db.list_operator_questions(&task_id).unwrap();
-    assert_eq!(records[0].status, boss_protocol::OperatorQuestionStatus::Open);
-    assert!(records[0].answer.is_none());
-    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+        .await;
+        assert!(
+            matches!(response, FrontendEvent::WorkItemUpdated { .. }),
+            "suppress_start={suppress_start}: {response:?}"
+        );
+        let after = question_task(&state, &task_id);
+        assert_ne!(after.description, before.description);
+        let records = state.work_db.list_operator_questions(&task_id).unwrap();
+        assert_eq!(records[0].status, boss_protocol::OperatorQuestionStatus::Answered);
+        assert!(records[0].answer.is_some());
+
+        // The row is not stranded silently: the sticky attention names the problem.
+        let open_attention = |state: &ServerState| -> i64 {
+            state
+                .work_db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM work_attention_items
+                     WHERE work_item_id = ?1 AND kind = 'repo_unresolved' AND status = 'open'",
+                    [&task_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(open_attention(&state), 1, "suppress_start={suppress_start}");
+
+        // Restoring the repository recovers the row without a second answer.
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE products SET repo_remote_url = ?2 WHERE id = ?1",
+                rusqlite::params![before.product_id, repo],
+            )
+            .unwrap();
+        state.work_db.reconcile_product_executions(&before.product_id).unwrap();
+        state.work_db.reconcile_product_executions(&before.product_id).unwrap();
+        let live = state
+            .work_db
+            .list_executions(Some(&task_id))
+            .unwrap()
+            .into_iter()
+            .filter(|execution| !execution.status.is_terminal())
+            .count();
+        assert_eq!(live, 1, "exactly one continuation (suppress_start={suppress_start})");
+        assert_eq!(open_attention(&state), 0, "the attention lowers once the repo resolves");
+    }
 }
 
 #[tokio::test]

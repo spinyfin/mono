@@ -789,6 +789,7 @@ async fn answer_by_name(state: &Arc<ServerState>, id: &str, option: &str) -> Fro
         state,
         None,
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: id.into(),
             answer: boss_protocol::OperatorAnswer::MultipleChoice { value: option.into() },
         },

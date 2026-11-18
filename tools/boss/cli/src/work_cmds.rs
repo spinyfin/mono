@@ -903,26 +903,11 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         }
         TaskCommand::Answer(args) => {
             let response = client
-                .send_request(&FrontendRequest::AnswerOperatorQuestion {
-                    id: args.id,
-                    answer: match args.choice {
-                        Some(value) => boss_protocol::OperatorAnswer::MultipleChoice { value },
-                        None => boss_protocol::OperatorAnswer::YesNo { value: args.yes },
-                    },
-                })
+                .send_request(&answer_request(args, ctx.no_autostart))
                 .await
                 .map_err(CliError::internal)?;
-            match response {
-                FrontendEvent::WorkItemUpdated { item } => print_entity(ctx, &item, || println!("Answer recorded.")),
-                FrontendEvent::OperatorQuestionError {
-                    error: error @ boss_protocol::OperatorQuestionError::ValidationFailed { .. },
-                } => Err(CliError::usage(error.to_string())),
-                FrontendEvent::OperatorQuestionError { error } => Err(CliError::application(error.to_string())),
-                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
-                    Err(CliError::application(message))
-                }
-                other => Err(unexpected_event("task answer", &other)),
-            }
+            let item = answer_outcome(response)?;
+            print_entity(ctx, &item, || println!("Answer recorded."))
         }
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, *args).await,
@@ -2295,6 +2280,35 @@ async fn request_critical(
             println!("Pending app confirmation: {id} (expires in five minutes)");
         },
     )
+}
+
+/// The wire request for `boss task answer`. `--no-autostart` records the answer
+/// but asks the engine not to request an explicit start for the task.
+pub(crate) fn answer_request(args: TaskAnswerArgs, no_autostart: bool) -> FrontendRequest {
+    FrontendRequest::AnswerOperatorQuestion {
+        id: args.id,
+        answer: match args.choice {
+            Some(value) => boss_protocol::OperatorAnswer::MultipleChoice { value },
+            None => boss_protocol::OperatorAnswer::YesNo { value: args.yes },
+        },
+        suppress_start: no_autostart,
+    }
+}
+
+/// Map the engine's reply to `boss task answer`: the updated item on success,
+/// a typed error (and so a non-zero exit) otherwise.
+pub(crate) fn answer_outcome(response: FrontendEvent) -> Result<boss_protocol::WorkItem, CliError> {
+    match response {
+        FrontendEvent::WorkItemUpdated { item } => Ok(item),
+        FrontendEvent::OperatorQuestionError {
+            error: error @ boss_protocol::OperatorQuestionError::ValidationFailed { .. },
+        } => Err(CliError::usage(error.to_string())),
+        FrontendEvent::OperatorQuestionError { error } => Err(CliError::application(error.to_string())),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("task answer", &other)),
+    }
 }
 
 #[cfg(test)]

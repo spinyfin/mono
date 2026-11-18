@@ -153,6 +153,19 @@ pub fn record_repo_unresolved_attention(conn: &Connection, work_item_id: &str, k
     Ok(())
 }
 
+/// True while an open `repo_unresolved` attention item exists for `work_item_id`.
+pub(crate) fn repo_unresolved_attention_open(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_attention_items
+                       WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open')",
+        params![
+            work_item_id,
+            boss_engine_storage_values::attention_kinds::REPO_UNRESOLVED_ATTENTION_KIND
+        ],
+        |row| row.get(0),
+    )?)
+}
+
 /// True while cube's positioning refusal holds `work_item_id`. Items in
 /// `todo`/`active` carry it on the task row (`blocked_reason`); review-phase
 /// items (`in_review`, `blocked:merge_conflict`, `blocked:ci_failure`) keep their
@@ -917,6 +930,23 @@ pub fn reconcile_work_item_execution(
                 // (or claimed) run, and minting beside that worker is the
                 // same churn loop the revision-to-chore arm already guards.
                 insert_fresh(result, Some(&execution))?;
+            } else if execution.kind == kind
+                && execution.status.is_terminal()
+                && !work_item_has_in_flight_execution(conn, work_item_id)?
+                && repo_unresolved_attention_open(conn, work_item_id)?
+                && resolve_repo_for_work_item(conn, work_item_id)?.is_some()
+            {
+                // An answered question left this row waiting for a repository
+                // to resolve (`queue_continuation_execution` filed the sticky
+                // attention instead of an execution). The repository now
+                // resolves, so the row gets its continuation and the
+                // attention lowers.
+                insert_fresh(result, Some(&execution))?;
+                resolve_attention_kind_in_tx(
+                    conn,
+                    work_item_id,
+                    boss_engine_storage_values::attention_kinds::REPO_UNRESOLVED_ATTENTION_KIND,
+                )?;
             }
         }
         None => insert_fresh(result, None)?,

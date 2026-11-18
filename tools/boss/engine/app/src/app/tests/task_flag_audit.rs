@@ -405,6 +405,7 @@ async fn answering_a_question_that_restarts_autostart_records_the_socket_caller(
     work_items::handle_operator_question(
         dispatch(&state, &sink, "req-answer"),
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: chore.id.clone(),
             answer: OperatorAnswer::YesNo { value: true },
         },
@@ -501,6 +502,7 @@ async fn answer_over_socket(state: &Arc<ServerState>, work_item_id: &str, reques
     work_items::handle_operator_question(
         dispatch(state, &sink, request_id),
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: work_item_id.to_owned(),
             answer,
         },
