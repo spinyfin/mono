@@ -941,7 +941,7 @@ mod host_reconcile_queries;
 mod host_storage;
 mod local_worker_quarantine_store;
 pub use host_storage::{HOST_HEALTH_FAILURE_THRESHOLD, Host, HostCapability, HostHealthOutcome};
-pub use local_worker_quarantine_store::LocalWorkerQuarantine;
+pub use local_worker_quarantine_store::{LocalWorkerQuarantine, UnidentifiedLocalRun};
 mod ideas;
 mod insert_helpers;
 mod list_filter;

@@ -421,7 +421,9 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         LOCAL_WORKER_STARTUP_QUARANTINE_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "Startup re-probes historical local workers after rollback/drain and resolves this attention only when their quarantine clears.",
+        "Raised for a local worker with no tmux identity whose process is not proven dead. Startup and every \
+         dispatch decision re-judge it and resolve this attention when the hold lifts: the execution is \
+         terminal, its process is proven gone, or an operator releases it.",
     ),
     entry(
         STALE_WORKER_ATTENTION_KIND,

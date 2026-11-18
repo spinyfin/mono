@@ -2,9 +2,9 @@
 
 - **Date:** 2026-10-29; all timeline times are CDT (UTC−05:00), the host's local zone.
 - **Impact:** No new local worker could launch for roughly 20–25 minutes (19:11:16 to about 19:3x). The only remote host was disabled, so nothing could dispatch anywhere. Workers already running were unaffected. One unrelated task was archived as collateral damage.
-- **Status:** Resolved by hand-deleting the quarantine metadata row. The underlying defect is still present on `main`; a fix task is filed (see §8). This document changes no code.
+- **Status:** Each occurrence was resolved by hand-deleting the quarantine metadata row. The incident recurred on 2026-11-17 (§9). The underlying defect is fixed by the change described in §9; two recommended follow-ups in §8 remain open.
 - **Provenance:** Notes and command captures taken during the incident (launch refusal text, the quarantine row's value before deletion, `bossctl agents list`, a timeline), file metadata on the installed app bundle, source inspection, and the text of the PRs cited below.
-- **Source baseline:** `main` at `c7e2223826f3` (mono#3347). All `path:line` references below refer to this revision.
+- **Source baseline:** `main` at `c7e2223826f3` (mono#3347). All `path:line` references in §1 to §8 refer to this revision. Several of the files have since moved between crates; §9 names the current locations.
 
 ## 1. Summary
 
@@ -129,3 +129,29 @@ The latent window has existed since PR #2993 shipped. Hitting it requires an eng
 - The app update / relaunch path should drain or wait for in-flight spawns before restarting the engine.
 - A launch that fails only because of a dispatcher-wide gate (quarantine, no eligible host) must not archive the task.
 - Add a supported CLI to inspect and clear the startup hold, with an explicit confirmation step, so recovery never requires editing the database by hand.
+
+## 9. Recurrence and resolution
+
+### 9.1 Recurrence, 2026-11-17
+
+The same failure happened again before the fix landed. The app auto-updated to 1.0.1033 while a local worker spawn (execution `exec_18e8fd6e24e04ca0_2e0`) was still in setup, the new engine's startup scan held it, and every local launch was refused until the repo owner deleted the `local_worker_startup_quarantine` metadata row by hand. [Incident 010](incident-010-local-dispatch-quarantine-recurrence-and-unshipped-followup.md) is the record of that occurrence, including why the fix had not shipped in the meantime.
+
+Nothing about the mechanism differs from the first occurrence: an engine restart caused by an app update, inside the spawn window, on a build that still had the defect. It confirms that the trigger is routine (every app update restarts the engine) and not an artifact of the first evening's machine load.
+
+### 9.2 What the fix changes
+
+The premise in §4.4 is corrected in code and in the design doc ([Unverified local workers](../designs/make-tmux-the-only-pane-hosting-mode.md#unverified-local-workers)). Against the root-cause sections above:
+
+- **§4.1 and §4.2, the scan could not tell a spawn window from a pre-migration row.** It can now. A local run is stamped `tmux_hosted` in the transaction that creates it, and the spawn writes the session identity before tmux receives any command. The scan (`tools/boss/engine/core/src/local_worker_quarantine.rs`, candidate query in `tools/boss/engine/work-db/src/local_worker_quarantine_store.rs`) classifies a stamped run with no identity, no pid, and no sibling run holding a spawn token as a spawn that never reached tmux. Startup fails that execution with a reason saying so and the work item is queued again. It is never held. The verdict comes from durable state, so machine load and timing cannot change it.
+- **§4.3, global.** A held execution now holds only its own work item. Other work items dispatch normally, on the local host too. Only a run inventory that cannot be read at all pauses local dispatch as a whole.
+- **§4.3, sticky.** A hold lasts only while its execution is non-terminal. The storage readers check the execution's current status, so a cancel releases the work item on the next dispatch decision. The scan no longer re-adds a previously held execution regardless of status.
+- **§4.3, startup-only.** The coordinator re-judges the hold before every host selection: it releases an execution whose process is now proven gone, and retries an unreadable inventory. No restart is needed to lift a hold.
+- **§5, the remedy text.** Refusals and the attention item name the held execution and what releases it.
+- **§5, no supported clearing path.** `bossctl dispatch quarantine status|recheck|clear` inspects and releases holds. `clear` requires `--confirm` and refuses a hold whose recorded process is alive. See the [runbook](../runbooks/unverified-local-worker-hold.md).
+
+An engine upgraded from a build with the defect may start with a hold that build recorded. The first startup scan re-judges it under the rules above, so a recorded hold naming a never-started or terminal execution is dropped without operator action.
+
+### 9.3 Still open from §8
+
+- The app update and relaunch path still restarts the engine without closing spawn admission or waiting for in-flight spawns. With the fix an interrupted spawn fails cleanly and is queued again instead of freezing dispatch, so the remaining cost is one wasted spawn per unlucky update rather than an outage. Incident 010 lists this as an action item.
+- A launch that fails only because of a dispatcher-wide gate can still archive the task. The gate that caused it here no longer applies to unrelated work, but the archiving rule itself is unchanged.

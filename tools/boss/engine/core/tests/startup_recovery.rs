@@ -7,7 +7,8 @@ use anyhow::{Result, anyhow};
 use boss_client::wait_for_socket;
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
-use boss_engine::work::{ClaimPlannerRunInput, PLANNER_RUN_ENGINE_RESTART_SUMMARY, WorkDb};
+use boss_engine::local_worker_quarantine::SPAWN_NEVER_REACHED_TMUX_REASON;
+use boss_engine::work::{ClaimPlannerRunInput, LocalWorkerQuarantine, PLANNER_RUN_ENGINE_RESTART_SUMMARY, WorkDb};
 use boss_protocol::{
     CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, ExecutionKind, ExecutionStatus,
     PLANNER_OUTCOME_PLANNER_FAILED, RequestExecutionInput,
@@ -100,6 +101,125 @@ async fn serve_quarantines_historical_local_workers_before_recovery() -> Result<
         );
     }
     assert_eq!(db.get_execution(&executions[2].id)?.status, ExecutionStatus::Orphaned);
+    // Two held workers hold their own two work items. Local dispatch as a
+    // whole is not paused, and unrelated work is admitted.
+    assert!(db.local_dispatch_quarantine_reason()?.is_none());
+    let unrelated = db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("unrelated")
+            .autostart(false)
+            .build(),
+    )?;
+    db.request_execution(RequestExecutionInput::builder().work_item_id(unrelated.id).build())?;
+    Ok(())
+}
+
+/// An engine restart (here: the one an app update causes) lands while a local
+/// spawn is still setting up: the run row exists, stamped for tmux hosting,
+/// and no tmux identity or pid was ever written. The previous build held all
+/// local dispatch for that run and could never release it. Startup must
+/// instead fail that one execution with a reason that says what happened,
+/// drop the hold the previous build recorded, and leave every other work item
+/// free to dispatch.
+#[tokio::test]
+async fn serve_fails_a_spawn_that_never_reached_tmux_and_holds_nothing() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let socket_path = temp.path().join("engine.sock");
+    let db_path = temp.path().join("state.db");
+    let db = WorkDb::open(db_path.clone())?;
+    let product = db.create_product(
+        CreateProductInput::builder()
+            .name("Restart mid-spawn")
+            .repo_remote_url("https://example.invalid/mid-spawn.git")
+            .build(),
+    )?;
+    let stranded_chore = db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("launched just before the restart")
+            .build(),
+    )?;
+    let stranded = db.request_execution(
+        RequestExecutionInput::builder()
+            .work_item_id(stranded_chore.id.clone())
+            .build(),
+    )?;
+    db.start_execution_run_on_host_with_tmux_hosting(
+        &stranded.id,
+        "worker-1",
+        "mid-spawn-repo",
+        "mid-spawn-lease",
+        "mid-spawn-workspace",
+        temp.path().to_str().unwrap(),
+        "local",
+        true,
+    )?;
+    assert_eq!(db.get_execution(&stranded.id)?.status, ExecutionStatus::Running);
+    assert!(db.tmux_identity_for_execution(&stranded.id)?.is_none());
+    let unrelated = db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("unrelated")
+            .autostart(false)
+            .build(),
+    )?;
+    // The hold and its attention item exactly as the previous build left them.
+    db.write_local_worker_quarantine(&LocalWorkerQuarantine {
+        executions: [(stranded.id.clone(), stranded_chore.id.clone())].into(),
+        scan_error: None,
+    })?;
+    db.upsert_external_tracker_attention(
+        &stranded_chore.id,
+        "local_worker_startup_quarantine",
+        "Local dispatch paused for a historical worker",
+        "recorded by the previous build",
+    )?;
+
+    let work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(db_path)
+        .build();
+    let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
+    let bound_socket = socket_path.clone();
+    let join = tokio::spawn(async move { serve(cfg, bound_socket, None, None, None, None).await });
+    let bound = wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await;
+    let failed = async {
+        if !bound {
+            return Err(anyhow!("engine never bound its isolated frontend socket"));
+        }
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        while !db.get_execution(&stranded.id)?.status.is_terminal() {
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "startup left the spawn that never reached tmux running: {:?}",
+                    db.get_execution(&stranded.id)?.status
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+    .await;
+    // Stop the isolated engine before assertions, including on failure.
+    join.abort();
+    let _ = join.await;
+    failed?;
+
+    let execution = db.get_execution(&stranded.id)?;
+    assert_eq!(execution.status, ExecutionStatus::Orphaned);
+    assert_eq!(execution.last_error.as_deref(), Some(SPAWN_NEVER_REACHED_TMUX_REASON));
+    // Nothing is held: the recorded hold is gone, local dispatch is not
+    // paused, and neither the stranded work item nor unrelated work is gated.
+    assert!(db.read_local_worker_quarantine()?.is_empty());
+    assert!(db.local_dispatch_quarantine_reason()?.is_none());
+    db.ensure_work_item_not_quarantined(&stranded_chore.id)?;
+    assert!(
+        db.list_attention_items_for_work_item(&stranded_chore.id)?
+            .iter()
+            .all(|item| item.kind != "local_worker_startup_quarantine" || item.status == "resolved")
+    );
+    db.request_execution(RequestExecutionInput::builder().work_item_id(unrelated.id).build())?;
     Ok(())
 }
 
