@@ -87,6 +87,22 @@ to explicit toolchain manifests, locale and SDK selection, and
 credential-variable inheritance. Those policies should be specified
 independently of this fix.
 
+## Bazel configuration under isolated homes
+
+Grok and Antigravity set `HOME` to a per-run `process-home`. Their shared
+`HostToolPaths::provision_into` setup links the host user's `.bazelrc` into
+that home when it exists, alongside the existing host-tool and cache delegates.
+Bazel therefore discovers the same machine configuration through its normal
+user-rc lookup in mono and other repositories. The link follows later edits or
+atomic replacements of the host file; setup never writes to that file or
+changes its permissions. Like the other host-tool delegates, this is not a
+read-only filesystem boundary. A host without `.bazelrc` needs no setup and
+keeps each repository's default execution settings.
+
+Codex isolates `CODEX_HOME` only, and Claude leaves `HOME` unchanged. Both
+already inherit the user's Bazel configuration. Existing Grok and Antigravity
+homes gain the link when provisioned again; new runs receive it at setup.
+
 ## The progression agent: no workspace
 
 A `progression` run (the agent that diagnoses one stuck work item) holds no
