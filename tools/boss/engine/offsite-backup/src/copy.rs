@@ -157,7 +157,11 @@ fn publish_across_volumes(staged: &Path, final_path: &Path, relays: &[PathBuf]) 
         if std::fs::create_dir_all(relay).is_err() || !on_same_volume(relay, host_dir) {
             continue;
         }
-        let relayed = relay.join(name);
+        // Unique per attempt: concurrent copies of the same backup name must
+        // not delete or rename each other's relayed file.
+        static RELAY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = RELAY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let relayed = relay.join(format!("{}.{}-{seq}.relay", name.to_string_lossy(), std::process::id()));
         let _cleanup = Cleanup(&relayed);
         let mut staged_file = File::open(staged).with_context(|| format!("open {}", staged.display()))?;
         write_stream_atomic(&relayed, &mut staged_file).with_context(|| format!("relay {}", relayed.display()))?;
