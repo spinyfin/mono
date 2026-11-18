@@ -428,14 +428,38 @@ BINDING_BUILTINS = {"export", "declare", "typeset", "local", "readonly", "unset"
 ANY_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
 
 
+# Contexts bash evaluates arithmetically after expansion: `(( ))`, `$[ ]`,
+# `[[ ]]`, and non-trivial `${name[subscript]}` subscripts. An assignment
+# inside one rebinds a variable without any assignment word.
+ARITHMETIC_CONTEXT_RES = (
+    re.compile(r"\(\((.*?)(?:\)\)|\Z)", re.S),
+    re.compile(r"\$\[(.*?)(?:\]|\Z)", re.S),
+    re.compile(r"\[\[(.*?)(?:\]\]|\Z)", re.S),
+    re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[0-9]+|[@*])\]\})(.*?)(?:\]\}|\Z)", re.S),
+)
+
+
+def arithmetic_context_rebinds(command):
+    masked = TRUSTED_VAR_RE.sub("", command)
+    for pattern in ARITHMETIC_CONTEXT_RES:
+        for match in pattern.finditer(masked):
+            body = match.group(1)
+            if "$" in body or TRUSTED_NAME_IN_TOKEN_RE.search(body):
+                return True
+    return False
+
+
 def reject_trusted_rebinding(command, groups):
+    # Bash joins backslash-newline before parsing, so test the joined text.
+    command = strip_line_continuations(command)
     uses_trusted = TRUSTED_VAR_RE.search(command) is not None
-    # Arithmetic, subscripts and `[[ ]]` assign without a binding word. Mask
-    # `$NAME` / `${NAME}` expansions; a remaining mention of a trusted name
-    # in a command that also expands one is a rebinding expand_exported
-    # would miss. Bare names as search text (`rg BOSS_BIN`) stay allowed.
-    if uses_trusted and TRUSTED_NAME_IN_TOKEN_RE.search(TRUSTED_VAR_RE.sub("", command)):
-        fail_closed("reassigning an engine-provided path variable is denied")
+    # In a command that expands a trusted name, an arithmetic context that
+    # names a trusted variable or contains any other expansion (which could
+    # compose the name) may assign it; expand_exported would then substitute
+    # the stale inherited value. Names outside such contexts, including
+    # quoted message text and search patterns, are plain data.
+    if uses_trusted and arithmetic_context_rebinds(command):
+        fail_closed("an arithmetic context in a command using an engine-provided path variable could reassign it")
     for group in groups:
         normalized = without_redirections(group)
         rest = list(strip_prefixes(group))
@@ -578,6 +602,14 @@ def operand_path_texts(token, role, program):
         return [token.split('=', 1)[1] if '=' in token else token]
     if role == 'redirect_attached':
         return [re.sub(r'^(?:[0-9]+|&)?[<>|]+', '', token)]
+    if role == 'dynamic_short':
+        flags = FILE_FLAGS.get(program, ()) + TEXT_FLAGS.get(program, ())
+        candidates = [token]
+        for i, char in enumerate(token[1:], 1):
+            if '-' + char in flags and token[i + 1:]:
+                candidates.append(token[i + 1:])
+                break
+        return candidates
     if role == 'attached':
         flags = FILE_FLAGS.get(program, ()) + TEXT_FLAGS.get(program, ())
         for i, char in enumerate(token[1:], 1):
@@ -743,7 +775,9 @@ def path_operand_positions(group):
                     skip_next, skip_as_path = True, False
             else:
                 if has_unquoted_glob_or_expansion(token, token_literal(group, index)):
-                    positions[index] = 'operand'
+                    # Keep the whole word, and also check any value a
+                    # recognized file or text flag carries attached.
+                    positions[index] = 'dynamic_short'
                 else:
                     consumed = False
                     for i, char in enumerate(token[1:], 1):

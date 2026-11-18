@@ -485,3 +485,59 @@ fn arithmetic_contexts_cannot_rebind_trusted_path_variables() {
         assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
     }
 }
+
+#[test]
+fn attached_file_flag_values_behind_a_trusted_expansion_are_checked() {
+    for kind in [WorkerKind::Standard, WorkerKind::Reviewer] {
+        let fx = Fixture::new("run-attached-dynamic-flag");
+        fx.install_with(kind, |c| {
+            c.is_standard_worker = kind == WorkerKind::Standard;
+            c.is_reviewer = kind == WorkerKind::Reviewer;
+        });
+        let home = fx.process_home.display().to_string();
+        let env = [("HOME", home.as_str())];
+        for command in [
+            "grep -f$HOME/.gemini/config/hooks.json f",
+            "grep -vf$HOME/.gemini/config/hooks.json f",
+            "grep -f${HOME}/.gemini/config/hooks.json f",
+        ] {
+            let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(command), &env);
+            assert_eq!(decision(&body), "deny", "{kind:?} {command}: {body} {stderr}");
+        }
+    }
+}
+
+#[test]
+fn split_or_composed_trusted_names_cannot_rebind_in_arithmetic() {
+    let fx = Fixture::new("run-composed-rebind");
+    fx.install(WorkerKind::Standard);
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let env = [("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json")];
+    let read = format!(r#"cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#);
+    for command in [
+        format!("(( BOSS_STRUC\\\nTURED_OUTPUT = 0 )); {read}"),
+        format!(r#"n=BOSS_STRUCTURED; echo "${{a[${{n}}_OUTPUT=0]}}"; {read}"#),
+        format!(r#"n=BOSS_STRUCTURED; echo $[${{n}}_OUTPUT=0]; {read}"#),
+        format!(r#"n=BOSS_STRUCTURED; printf '%s' "${{a[${{n}}_OUTPUT=0]}}"; {read}"#),
+        format!(
+            r#"n=BOSS_STRUCTURED; echo $[${{n}}_OUTPUT=0]; echo x > "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#
+        ),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}
+
+#[test]
+fn mention_of_a_trusted_name_outside_arithmetic_is_not_a_rebinding() {
+    let fx = Fixture::new("run-mention-scope");
+    fx.install(WorkerKind::Standard);
+    let env = [("BOSS_BIN", "/opt/boss/boss")];
+    for command in [
+        r#""$BOSS_BIN" propose done --summary "read HOME before exporting""#,
+        r#"cat "$BOSS_BIN" ; rg BOSS_BIN_DIR ."#,
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(command), &env);
+        assert_ne!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
+}

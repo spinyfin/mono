@@ -299,6 +299,10 @@ fn path_guard_blocks_arithmetic_rebinding_of_the_data_dir() {
         r#"echo "${a[BOSS_DATA_DIR=0]}"; cat "${BOSS_DATA_DIR}/../T/state.db""#,
         r#"[[ 1 -eq BOSS_DATA_DIR=0 ]]; cat "${BOSS_DATA_DIR}/../T/state.db""#,
         r#"(( BOSS_DATA_DIR = 0 )); echo x > "${BOSS_DATA_DIR}/../T/state.db""#,
+        "(( BOSS_DATA\\\n_DIR = 0 )); cat \"${BOSS_DATA_DIR}/../T/state.db\"",
+        r#"n=BOSS_DATA; echo "${a[${n}_DIR=0]}"; cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"n=BOSS_DATA; echo $[${n}_DIR=0]; cat "${BOSS_DATA_DIR}/../T/state.db""#,
+        r#"n=BOSS_DATA; printf '%s' $[${n}_DIR=0]; echo x > "${BOSS_DATA_DIR}/../T/state.db""#,
     ] {
         let (decision, reason) = run_path_guard(
             data.path(),

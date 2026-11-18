@@ -1137,13 +1137,24 @@ def main():
             tokens = command.split()
         candidates.extend(tokens)
         # Arithmetic, subscripts and `[[ ]]` rebind BOSS_DATA_DIR without an
-        # assignment word. Mask `$BOSS_DATA_DIR` / `${BOSS_DATA_DIR}`; a
-        # remaining mention in a command that also expands the name would
-        # make expandvars check the inherited path while bash opens another.
+        # assignment word. Bash joins backslash-newline first. In a command
+        # that expands the name, an arithmetic context that names it or holds
+        # any other expansion (which could compose the name) would make
+        # expandvars check the inherited path while bash opens another.
+        joined = raw_command.replace("\\\n", "")
         data_dir_expansion = re.compile(r"\$(?:BOSS_DATA_DIR\b|\{BOSS_DATA_DIR\})")
         data_dir_name = re.compile(r"(?<![A-Za-z0-9_])BOSS_DATA_DIR(?![A-Za-z0-9_])")
-        if data_dir_expansion.search(raw_command) and data_dir_name.search(data_dir_expansion.sub("", raw_command)):
-            emit("block", RECOVERY)
+        if data_dir_expansion.search(joined):
+            masked = data_dir_expansion.sub("", joined)
+            for context in (
+                r"\(\((.*?)(?:\)\)|\Z)",
+                r"\$\[(.*?)(?:\]|\Z)",
+                r"\[\[(.*?)(?:\]\]|\Z)",
+                r"\$\{[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[0-9]+|[@*])\]\})(.*?)(?:\]\}|\Z)",
+            ):
+                for found in re.finditer(context, masked, re.S):
+                    if "$" in found.group(1) or data_dir_name.search(found.group(1)):
+                        emit("block", RECOVERY)
     elif tool == "apply_patch":
         # Codex's freeform apply_patch: the patch body is the "command".
         patch = tool_input.get("command")
