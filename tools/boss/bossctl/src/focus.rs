@@ -108,9 +108,6 @@ pub(crate) fn focus_json(focus: &DispatchFocusState) -> serde_json::Value {
     serde_json::to_value(focus).unwrap_or(serde_json::Value::Null)
 }
 
-/// What `bossctl dispatch diagnose` reports about focus mode for the
-/// executions it is looking at. Read straight from `state.db`, so it works
-/// with the engine down, like the rest of `diagnose`.
 /// One ready execution as `diagnose` sees it against the focus set.
 pub(crate) struct ReadyRow {
     pub(crate) execution_id: String,
@@ -132,6 +129,9 @@ impl ReadyRow {
     }
 }
 
+/// What `bossctl dispatch diagnose` reports about focus mode for the
+/// executions it is looking at. Read straight from `state.db`, so it works
+/// with the engine down, like the rest of `diagnose`.
 pub(crate) struct FocusDiagnosis {
     pub(crate) focus: boss_protocol::DispatchFocus,
     pub(crate) targets: Vec<boss_protocol::DispatchFocusTarget>,

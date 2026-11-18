@@ -62,50 +62,48 @@ pub(crate) fn resolve_feedback_target_on(
 }
 
 fn resolve_guide_implementation_target(conn: &Connection, series_id: &str) -> Result<Option<FeedbackTarget>> {
-    {
-        let Some((root_task_id, canonical_pr)) = conn
-            .query_row(
-                "SELECT root_task_id, canonical_pr_url FROM pr_review_guide_source_series WHERE id = ?1",
-                [series_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        let Some(task) = query_task(conn, &root_task_id)? else {
-            return Ok(None);
-        };
-        if task.deleted_at.is_some() {
-            return Ok(None);
-        }
-        let chain_root_id = chain_root(conn, &task.id)?;
-        let root = query_task(conn, &chain_root_id)?.unwrap_or(task);
-        let pr_url = root.pr_url.clone().or_else(|| {
-            if canonical_pr.is_empty() {
-                None
-            } else {
-                Some(canonical_pr.clone())
-            }
-        });
-        let pr_lifecycle = if pr_url.is_none() {
-            DocOwnerPrLifecycle::NoPr
-        } else if root.status == TaskStatus::Done {
-            DocOwnerPrLifecycle::Merged
-        } else {
-            DocOwnerPrLifecycle::Open
-        };
-        Ok(Some(FeedbackTarget::PullRequestImplementation {
-            // Series owner (may be a revision). Distinct from `chain_root_id`,
-            // which is the PR-owning chain root the new revision parents to.
-            root_task_id,
-            series_id: series_id.to_owned(),
-            canonical_pr,
-            chain_root_id,
-            pr_lifecycle,
-            pr_url,
-        }))
+    let Some((root_task_id, canonical_pr)) = conn
+        .query_row(
+            "SELECT root_task_id, canonical_pr_url FROM pr_review_guide_source_series WHERE id = ?1",
+            [series_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let Some(task) = query_task(conn, &root_task_id)? else {
+        return Ok(None);
+    };
+    if task.deleted_at.is_some() {
+        return Ok(None);
     }
+    let chain_root_id = chain_root(conn, &task.id)?;
+    let root = query_task(conn, &chain_root_id)?.unwrap_or(task);
+    let pr_url = root.pr_url.clone().or_else(|| {
+        if canonical_pr.is_empty() {
+            None
+        } else {
+            Some(canonical_pr.clone())
+        }
+    });
+    let pr_lifecycle = if pr_url.is_none() {
+        DocOwnerPrLifecycle::NoPr
+    } else if root.status == TaskStatus::Done {
+        DocOwnerPrLifecycle::Merged
+    } else {
+        DocOwnerPrLifecycle::Open
+    };
+    Ok(Some(FeedbackTarget::PullRequestImplementation {
+        // Series owner (may be a revision). Distinct from `chain_root_id`,
+        // which is the PR-owning chain root the new revision parents to.
+        root_task_id,
+        series_id: series_id.to_owned(),
+        canonical_pr,
+        chain_root_id,
+        pr_lifecycle,
+        pr_url,
+    }))
 }
 
 #[cfg(test)]

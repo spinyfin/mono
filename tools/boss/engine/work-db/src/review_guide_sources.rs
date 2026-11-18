@@ -488,13 +488,15 @@ impl WorkDb {
     ) -> Result<Option<PrReviewGuideSourceCapture>> {
         let conn = self.connect()?;
         let artifact_root = self.artifact_root()?;
+        let Some(root) = comparison_root_and_head_on(&conn, comparison_id)? else {
+            return Ok(None);
+        };
         conn.query_row(
-            "SELECT s.id, s.root_task_id, c.observation_sequence, c.trigger, c.packet_hash,
+            "SELECT c.series_id, ?2, c.observation_sequence, c.trigger, c.packet_hash,
                     c.complete, c.captured_at, c.id, c.packet_path, c.omission_count, c.omission_summary_json, c.attempt_count
-             FROM pr_review_guide_source_series s
-             JOIN pr_review_guide_source_comparisons c ON c.series_id = s.id
+             FROM pr_review_guide_source_comparisons c
              WHERE c.id = ?1",
-            [comparison_id],
+            rusqlite::params![comparison_id, root.root_task_id],
             |row| map_capture(row, &artifact_root),
         )
         .optional()
@@ -991,6 +993,42 @@ fn unreferenced_packet_blob_paths(artifact_root: &Path, live: &std::collections:
     candidates
 }
 
+/// The series root task and head SHA of one comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ComparisonRoot {
+    pub(crate) root_task_id: String,
+    pub(crate) head_sha: String,
+    /// The root task is soft-deleted. Dispatch focus treats such a comparison
+    /// as unattributable, like a guide comment on the same root; the
+    /// coordinator still needs the capture of an execution already bound to
+    /// it, so it ignores this flag.
+    pub(crate) root_deleted: bool,
+}
+
+/// The single comparison-to-root authority, against an open connection.
+/// Shared by [`WorkDb::get_pr_review_guide_comparison_by_id`] and dispatch
+/// focus scope resolution so a comparison is attributed to the same root
+/// task everywhere.
+pub(crate) fn comparison_root_and_head_on(conn: &Connection, comparison_id: &str) -> Result<Option<ComparisonRoot>> {
+    conn.query_row(
+        "SELECT s.root_task_id, c.head_sha, COALESCE(t.deleted_at IS NOT NULL, 0)
+         FROM pr_review_guide_source_comparisons c
+         JOIN pr_review_guide_source_series s ON s.id = c.series_id
+         LEFT JOIN tasks t ON t.id = s.root_task_id
+         WHERE c.id = ?1",
+        [comparison_id],
+        |row| {
+            Ok(ComparisonRoot {
+                root_task_id: row.get(0)?,
+                head_sha: row.get(1)?,
+                root_deleted: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1000,18 +1038,3 @@ mod artifact_tests;
 #[cfg(test)]
 #[path = "review_guide_sources_tests.rs"]
 mod upstream_tests;
-
-/// `(series root task id, head sha)` of one comparison, against an open
-/// connection. Shared with dispatch focus scope resolution so a comparison is
-/// attributed to the same root task everywhere.
-pub(crate) fn comparison_root_and_head_on(conn: &Connection, comparison_id: &str) -> Result<Option<(String, String)>> {
-    conn.query_row(
-        "SELECT s.root_task_id, c.head_sha FROM pr_review_guide_source_comparisons c
-         JOIN pr_review_guide_source_series s ON s.id = c.series_id
-         WHERE c.id = ?1",
-        [comparison_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .optional()
-    .map_err(Into::into)
-}

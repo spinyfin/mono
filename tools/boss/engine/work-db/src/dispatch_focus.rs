@@ -166,10 +166,9 @@ impl<'a> ScopeResolver<'a> {
             return match comparison {
                 // The guide describes one head of the root's PR, so it
                 // follows the review of that head.
-                Some((root_id, head_sha)) => Ok(
-                    self.resolve(&root_id, depth + 1)? || self.reviewed_head_in_scope(&root_id, &head_sha, depth)?
-                ),
-                None => Ok(false),
+                Some(root) if !root.root_deleted => Ok(self.resolve(&root.root_task_id, depth + 1)?
+                    || self.reviewed_head_in_scope(&root.root_task_id, &root.head_sha, depth)?),
+                _ => Ok(false),
             };
         }
         // An automation triage run is keyed by the automation id.
