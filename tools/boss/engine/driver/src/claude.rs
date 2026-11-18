@@ -827,8 +827,10 @@ impl AgentDriver for ClaudeDriver {
         if let Some(mode) = permission_mode_override {
             // Forced mode (e.g. `dontAsk` for the capability-restricted answer
             // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
-            // branches — the latter would bypass the settings allow/deny rules
-            // entirely, defeating the allowlist. The CLI flag wins over the
+            // branches — both permit calls outside the settings allowlist
+            // unless explicitly denied, defeating deny-by-default. Explicit
+            // denies and PreToolUse blocks still apply in skip-permissions mode.
+            // The CLI flag wins over the
             // settings-file `defaultMode`, so this is the authoritative mode.
             cmd.push_str(" --permission-mode ");
             cmd.push_str(mode);
@@ -2422,8 +2424,8 @@ mod tests {
     #[test]
     fn permission_mode_override_forces_mode_and_suppresses_skip_permissions() {
         // A non-auto model + non_opus_auto_mode=false would normally spawn with
-        // `--dangerously-skip-permissions` (which bypasses the settings
-        // allow/deny rules). The override must win and suppress that entirely,
+        // `--dangerously-skip-permissions` (which permits calls outside the
+        // allowlist unless denied). The override must win and suppress that,
         // so the capability-restricted answer agent always runs deny-by-default.
         let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
             permission_mode_override: Some("dontAsk"),

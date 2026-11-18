@@ -57,8 +57,12 @@ use std::path::Path;
 /// they are safe for a read-only reviewer to run (e.g. to navigate the
 /// history for context).
 pub fn reviewer_deny_rules(workspace_path: &Path) -> Vec<String> {
+    assert!(workspace_path.is_absolute(), "reviewer workspace must be absolute");
     let fence = workspace_path.parent().unwrap_or(workspace_path).display();
-    let mut rules = vec![format!("Edit({fence}/**)")];
+    // Claude interprets /path relative to the settings/project root; //path
+    // is absolute. A single slash silently leaves the real checkout writable
+    // in both auto and bypassPermissions modes (verified with Claude 2.1.327).
+    let mut rules = vec![format!("Edit(/{}/**)", fence.to_string().trim_end_matches('/'))];
     rules.extend(publish_deny_rules());
     rules
 }

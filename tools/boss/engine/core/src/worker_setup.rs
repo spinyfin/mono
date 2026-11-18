@@ -418,8 +418,9 @@ fn pre_tool_use_array(hooks: &mut serde_json::Map<String, serde_json::Value>) ->
 ///   worker off from Boss's runtime state and (per kind) from writing/pushing.
 ///   Project-local settings override user-global per key, so this wins even
 ///   when the human's `~/.claude/settings.json` defaults to interactive. The
-///   `deny` rules are belt; the engine-side audit in
-///   `audit_worker_sandbox_attempt` is suspenders.
+///   `deny` rules are enforced in both `auto` and `bypassPermissions` modes;
+///   the latter bypasses approval prompts, not explicit denies. The data-dir
+///   boundary additionally has the `PATH_GUARD_SCRIPT` PreToolUse hook.
 ///
 /// - **AnswerAgent → allowlist.** `defaultMode: "dontAsk"` auto-denies every
 ///   tool call except those matching `permissions.allow` and built-in

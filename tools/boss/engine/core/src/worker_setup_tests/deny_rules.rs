@@ -135,7 +135,7 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         .parent()
         .unwrap_or(&rev_input.workspace_path)
         .display();
-    let critical = format!("Edit({fence}/**)");
+    let critical = format!("Edit(/{fence}/**)");
     assert!(
         rev_deny.contains(&critical.as_str()),
         "reviewer must deny workspaces-root-scoped {critical} (got {rev_deny:?})",
@@ -153,6 +153,92 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         !rev_deny.contains(&"Edit(**)"),
         "reviewer must NOT carry blanket Edit(**) (got {rev_deny:?})",
     );
+}
+
+#[test]
+fn reviewer_launches_keep_absolute_write_and_publish_denies_for_every_tier() {
+    use crate::driver::{AgentDriver, SpawnRequest};
+    use boss_protocol::ReviewModelTier;
+
+    let mut input = sample_input();
+    input.worker_kind = WorkerKind::Reviewer;
+    input.workspace_path = PathBuf::from("/worker checkouts/reviewer");
+    let settings = TempDir::new().unwrap();
+    let settings_path = settings.path().join("reviewer.json");
+    std::fs::write(&settings_path, render_settings_json(&input, &ClaudeDriver)).unwrap();
+    let policy: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let deny = policy["permissions"]["deny"].as_array().unwrap();
+
+    // These are the rule forms observed to reject Edit, Write, Bash redirects
+    // and publishing in real auto / skip-permissions Claude sessions. Pin the
+    // absolute spelling independently of the renderer: /worker checkouts/**
+    // is project-relative and allowed real writes in both launch modes.
+    assert!(deny.contains(&serde_json::json!("Edit(//worker checkouts/**)")));
+    assert!(!deny.contains(&serde_json::json!("Edit(/worker checkouts/**)")));
+    assert!(
+        !deny.contains(&serde_json::json!("Edit(**)")),
+        "artifact must remain writable"
+    );
+    for command in [
+        "git push",
+        "jj git push",
+        "gh pr create",
+        "gh pr merge",
+        "gh pr close",
+        "gh pr edit",
+        "gh pr comment",
+        "gh pr review",
+        "cube pr",
+    ] {
+        for suffix in ["", ":*"] {
+            assert!(deny.contains(&serde_json::json!(format!("Bash({command}{suffix})"))));
+        }
+    }
+
+    let menu = &ClaudeDriver.descriptor().model_menu;
+    let models = [
+        (menu.review_model_for_tier)(ReviewModelTier::Fast),
+        (menu.review_model_for_tier)(ReviewModelTier::Balanced),
+        (menu.review_model_for_tier)(ReviewModelTier::Strong),
+        "fable",
+    ];
+    for model in models {
+        for non_opus_auto_mode in [false, true] {
+            let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
+                model,
+                effort: None,
+                settings_path: Some(&settings_path),
+                non_opus_auto_mode,
+                permission_mode_override: input.worker_kind.forced_permission_mode(),
+                run_id: Some(&input.run_id),
+            });
+            assert!(
+                plan.command
+                    .contains(&format!("--settings '{}'", settings_path.display()))
+            );
+            let mode = if (menu.model_requires_auto_permissions)(model) || non_opus_auto_mode {
+                "--permission-mode auto"
+            } else {
+                "--dangerously-skip-permissions"
+            };
+            assert!(
+                plan.command.contains(mode),
+                "unverified reviewer mode: {}",
+                plan.command
+            );
+        }
+    }
+}
+
+#[test]
+fn reviewer_root_workspace_fences_the_entire_filesystem() {
+    assert!(reviewer_deny_rules(Path::new("/")).contains(&"Edit(//**)".to_owned()));
+}
+
+#[test]
+#[should_panic(expected = "reviewer workspace must be absolute")]
+fn reviewer_rejects_a_relative_workspace_instead_of_rendering_an_unenforced_fence() {
+    reviewer_deny_rules(Path::new("relative/reviewer"));
 }
 
 #[test]
