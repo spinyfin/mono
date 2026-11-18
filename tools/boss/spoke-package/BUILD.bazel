@@ -19,6 +19,7 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = [
+        "//lib/rust/process_runner",
         "//tools/boss/engine/spoke-preflight",
         "//tools/boss/http_retry",
         "//tools/boss/spoke-credentials",
