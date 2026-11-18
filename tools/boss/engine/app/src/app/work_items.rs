@@ -627,7 +627,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
     };
     tracing::Span::current().record("item_id", &id);
     tracing::debug!(target: "work_write_timing", boundary = "handler_entry");
-    apply_work_item_patch(ctx, id, *patch, None, false).await;
+    apply_work_item_patch(ctx, id, *patch, None).await;
 }
 
 /// Park or un-park a task, chore or project. A parking-only `UpdateWorkItem`
@@ -642,7 +642,7 @@ pub(super) async fn handle_park_work_item(ctx: Dispatch, req: FrontendRequest) {
         .parked(parked)
         .maybe_parked_reason(reason)
         .build();
-    apply_work_item_patch(ctx, id, patch, None, false).await;
+    apply_work_item_patch(ctx, id, patch, None).await;
 }
 
 /// Confirmed pause-only override state carried from a `MoveWorkItemOnBoard`
@@ -827,9 +827,8 @@ pub(super) async fn apply_work_item_patch(
     id: String,
     patch: WorkItemPatch,
     pause_bypass: Option<BoardDragPauseBypass>,
-    board_gesture: bool,
 ) {
-    apply_work_item_patch_from(ctx, id, patch, pause_bypass, board_gesture, "rpc:update_work_item").await;
+    apply_work_item_patch_from(ctx, id, patch, pause_bypass, false, "rpc:update_work_item").await;
 }
 
 /// [`apply_work_item_patch`] naming the handler that built the patch. `source`

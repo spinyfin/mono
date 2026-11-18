@@ -793,8 +793,8 @@ final class EngineClient: @unchecked Sendable {
             if finished { emit(.retriedActionsStatus(message: nil)) }
         }
 
-        if decodeBoardReply(type: type, payload: payload, envelope: envelope, lineRecvNanos: lineRecvNanos, lineByteCount: lineByteCount) { return }
-        if decodeReviewReply(type: type, payload: payload, requestId: envelopeRequestId) { return }
+        if decodeBoardReply(type: type, payload: payload, envelope: envelope, answeredRequest: answeredRequest, lineRecvNanos: lineRecvNanos, lineByteCount: lineByteCount) { return }
+        if decodeReviewReply(type: type, payload: payload, requestId: envelopeRequestId, answeredRequest: answeredRequest) { return }
         if decodeSettingsReply(type: type, payload: payload, requestId: envelopeRequestId) { return }
         _ = decodeActionReply(type: type, payload: payload, requestId: envelopeRequestId)
     }
@@ -804,7 +804,7 @@ final class EngineClient: @unchecked Sendable {
     @inline(never)
     private func decodeBoardReply(
         type: String, payload: [String: Any], envelope: [String: Any],
-        lineRecvNanos: UInt64, lineByteCount: Int
+        answeredRequest: [String: Any]?, lineRecvNanos: UInt64, lineByteCount: Int
     ) -> Bool {
         let envelopeRequestId = envelope["request_id"] as? String
         switch type {
@@ -1111,7 +1111,8 @@ final class EngineClient: @unchecked Sendable {
 
     @inline(never)
     private func decodeReviewReply(
-        type: String, payload: [String: Any], requestId envelopeRequestId: String?
+        type: String, payload: [String: Any], requestId envelopeRequestId: String?,
+        answeredRequest: [String: Any]?
     ) -> Bool {
         switch type {
         case "project_design_doc_resolved":

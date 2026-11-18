@@ -467,7 +467,17 @@ async fn folded_revision_drop_is_refused_and_preserves_status() {
     let sink = make_session_sink();
     handle_move_work_item_on_board(dispatch(&state, &sink, "folded-drop"), drop_on_doing(&revision.id)).await;
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => assert!(message.contains("no board position"), "{message}"),
+        FrontendEvent::WorkItemRefused {
+            id,
+            code,
+            message,
+            suggested_action,
+        } => {
+            assert_eq!(id, revision.id);
+            assert_eq!(code, boss_protocol::BoardRefusalCode::NotACard);
+            assert_eq!(suggested_action, None);
+            assert!(message.contains("no board position"), "{message}");
+        }
         other => panic!("expected folded-card refusal, got {other:?}"),
     }
     assert_eq!(task_row(&state, &revision.id).status, TaskStatus::InReview);
@@ -533,7 +543,17 @@ async fn folded_ci_failure_revision_drop_is_refused_and_preserves_block() {
     )
     .await;
     match sole_response(&sink).await {
-        FrontendEvent::WorkError { message } => assert!(message.contains("no board position"), "{message}"),
+        FrontendEvent::WorkItemRefused {
+            id,
+            code,
+            message,
+            suggested_action,
+        } => {
+            assert_eq!(id, revision.id);
+            assert_eq!(code, boss_protocol::BoardRefusalCode::NotACard);
+            assert_eq!(suggested_action, None);
+            assert!(message.contains("no board position"), "{message}");
+        }
         other => panic!("expected folded-card refusal, got {other:?}"),
     }
     let after = task_row(&state, &revision.id);

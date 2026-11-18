@@ -12,8 +12,8 @@ use crate::metrics_wire::MetricLiveEntry;
 use crate::tmux_worker_status::TmuxWorkerStatus;
 
 mod type_imports;
-use type_imports::*;
 use crate::{BoardRefusalAction, BoardRefusalCode};
+use type_imports::*;
 
 mod topics;
 pub use topics::*;

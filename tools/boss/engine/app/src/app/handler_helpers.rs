@@ -824,7 +824,7 @@ impl BoardRefusal {
         err: &anyhow::Error,
         fallback: boss_protocol::BoardRefusalCode,
         prior_status: Option<boss_protocol::TaskStatus>,
-        pr_checker: &dyn crate::work::PrStateChecker,
+        pr_checker: &dyn boss_work_db::PrStateChecker,
     ) -> Self {
         if err.downcast_ref::<boss_work_db::BoundPrRefusal>().is_some() {
             let pr_url = match work_db.get_work_item(id) {
@@ -841,7 +841,7 @@ impl BoardRefusal {
             // pre-move status is the signal); otherwise the live probe decides
             // between Open, Merged and ClosedUnmerged.
             let state = if prior_status == Some(boss_protocol::TaskStatus::Done) {
-                Some(crate::work::PrOpenState::Merged)
+                Some(boss_work_db::PrOpenState::Merged)
             } else {
                 pr_url.as_deref().and_then(|url| pr_checker.check(url).ok())
             };
@@ -854,9 +854,9 @@ impl BoardRefusal {
                 action: None,
             };
             return match state {
-                Some(crate::work::PrOpenState::Merged) => not_revisable("has been merged"),
-                Some(crate::work::PrOpenState::ClosedUnmerged) => not_revisable("was closed without merging"),
-                Some(crate::work::PrOpenState::Open) => Self {
+                Some(boss_work_db::PrOpenState::Merged) => not_revisable("has been merged"),
+                Some(boss_work_db::PrOpenState::ClosedUnmerged) => not_revisable("was closed without merging"),
+                Some(boss_work_db::PrOpenState::Open) => Self {
                     code: boss_protocol::BoardRefusalCode::BoundPr,
                     message: format!("This item already has {pr_phrase}. To change it, add a revision."),
                     raw: Some(format!("{err:#}")),

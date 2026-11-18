@@ -1,12 +1,12 @@
 //! Unit tests for the pause-bypass dispatch re-check refusal arm in
-//! `apply_work_item_patch`: when the authoritative re-check refuses after the
+//! `apply_work_item_patch_from`: when the authoritative re-check refuses after the
 //! status patch has already landed (the narrow window between the board-
 //! handler pre-check and `dispatch_with_pause_bypass`), the row must be
 //! reverted, no execution left behind, and the client answered with a
 //! `WorkItemRefused` rather than a success `WorkItemUpdated`.
 
 use super::*;
-use crate::app::work_items::{BoardDragPauseBypass, apply_work_item_patch};
+use crate::app::work_items::{BoardDragPauseBypass, apply_work_item_patch_from};
 use boss_engine_dispatch::coordinator::DispatchPauseOrigin;
 use boss_engine_runtime::test_support::{create_test_chore_manual, create_test_product_with_repo};
 use boss_protocol::{PauseReason, TaskStatus, WorkItem, WorkItemPatch};
@@ -58,14 +58,14 @@ async fn pause_bypass_recheck_refusal_reverts_status_and_answers_work_item_refus
     );
 
     // Observed generation is older than the live one — the re-check inside
-    // `dispatch_with_pause_bypass` must refuse. Calling `apply_work_item_patch`
+    // `dispatch_with_pause_bypass` must refuse. Calling `apply_work_item_patch_from`
     // directly (rather than `handle_move_work_item_on_board`) skips the
     // board-handler pre-check that would otherwise refuse before the status
     // patch, so this exercises the in-request TOCTOU revert arm itself.
     let sink = make_session_sink();
     let ctx = dispatch(&server_state, &sink);
     let patch = WorkItemPatch::builder().status("active").build();
-    apply_work_item_patch(
+    apply_work_item_patch_from(
         ctx,
         chore.id.clone(),
         patch,
@@ -73,6 +73,7 @@ async fn pause_bypass_recheck_refusal_reverts_status_and_answers_work_item_refus
             observed_pause_since_epoch_s: Some(1_600_000_000),
         }),
         true,
+        "board_drop:set_status",
     )
     .await;
 

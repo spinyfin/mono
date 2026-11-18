@@ -19,7 +19,6 @@ impl std::fmt::Display for BoundPrRefusal {
 
 impl std::error::Error for BoundPrRefusal {}
 
-
 /// Shared per-product short-id read-modify-write. Reads the current
 /// `next_value` from `table` for `product_id` (defaulting to 1 when no
 /// row exists yet), writes back `next_value + 1`, and returns the value

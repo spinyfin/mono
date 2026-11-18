@@ -225,7 +225,7 @@ final class EngineReconnectIntegrationTests: XCTestCase {
         for kind in kinds {
             var payload: [String: Any] = [
                 "type": kind, "id": "missing", "product_id": "missing", "project_id": "missing",
-                "work_item_id": "missing", "root_task_id": "missing", "attention_id": "missing",
+                "work_item_id": "missing", "parent_task_id": "missing", "root_task_id": "missing", "attention_id": "missing",
                 "name": "", "description": "", "patch": [:], "goal": "", "task_ids": [],
                 "enabled": false, "paused": false, "key": "invalid-fixture-setting", "slot_id": 0,
                 "skip": true, "dismiss": false, "skip_unanswered": true,

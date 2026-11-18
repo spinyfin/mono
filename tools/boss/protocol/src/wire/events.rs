@@ -288,13 +288,9 @@ pub enum FrontendEvent {
     /// Reply to [`FrontendRequest::RestoreWorkItem`]. Carries the
     /// now-live work item so the CLI can echo its friendly id / name.
     #[worker(passthrough)]
-    WorkItemRestored {
-        item: WorkItem,
-    },
+    WorkItemRestored { item: WorkItem },
     #[worker(passthrough)]
-    WorkError {
-        message: String,
-    },
+    WorkError { message: String },
     /// A board gesture (`MoveWorkItemOnBoard`) was refused or reverted by
     /// the engine. Sent instead of [`Self::WorkError`] so the app can show
     /// `message` on the card that was dragged (`id`) and offer

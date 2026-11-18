@@ -20,10 +20,11 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AttachmentMediaType, AutomationTrigger, BoardRefusalAction, BoardRefusalCode, COORDINATOR_GUIDANCE_PATH, CoordinatorGuidanceState,
-    CoordinatorHandoffAuthorizationDelivery, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
-    DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput,
-    ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
+    AttachmentMediaType, AutomationTrigger, BoardRefusalAction, BoardRefusalCode, COORDINATOR_GUIDANCE_PATH,
+    CoordinatorGuidanceState, CoordinatorHandoffAuthorizationDelivery, Decision, DecisionKind, DecisionStatus,
+    DesignDocEntry, DesignDocTree, DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind,
+    ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus,
+    WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
