@@ -1218,9 +1218,12 @@ pub mod input {
         workspace: &Path,
         prompt_utf8: &[u8],
         run_id: &str,
+        kind: boss_engine_driver::ExecutionWorkspaceKind,
     ) -> Result<Option<DriverRuntimeState>> {
         let prompt = std::str::from_utf8(prompt_utf8).context("initial prompt must be UTF-8")?;
-        driver.provision_workspace(workspace, prompt, run_id).await
+        driver
+            .provision_workspace_with_kind(workspace, prompt, run_id, kind)
+            .await
     }
 
     /// Reclaim only the home recorded by provisioning, after the caller has retained
@@ -2469,9 +2472,15 @@ mod tests {
     async fn input_is_validated_before_provisioning_and_only_owned_home_is_reclaimed() {
         let root = tempfile::tempdir().unwrap();
         assert!(
-            input::provision(&boss_engine_driver::ClaudeDriver, root.path(), &[255], "invalid")
-                .await
-                .is_err()
+            input::provision(
+                &boss_engine_driver::ClaudeDriver,
+                root.path(),
+                &[255],
+                "invalid",
+                boss_engine_driver::ExecutionWorkspaceKind::Cube
+            )
+            .await
+            .is_err()
         );
         assert!(!root.path().join(".claude").exists());
         let run_id: String = root
@@ -2488,6 +2497,7 @@ mod tests {
             root.path(),
             b"private input",
             &run_id,
+            boss_engine_driver::ExecutionWorkspaceKind::Cube,
         )
         .await
         .unwrap()

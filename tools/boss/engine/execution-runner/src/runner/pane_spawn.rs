@@ -1015,6 +1015,11 @@ impl ExecutionRunner for PaneSpawnRunner {
             workspace_path,
             prompt_text.as_bytes(),
             &execution.id,
+            if execution.kind.holds_cube_lease() {
+                crate::driver::ExecutionWorkspaceKind::Cube
+            } else {
+                crate::driver::ExecutionWorkspaceKind::Scratch
+            },
         )
         .await
         .with_context(|| {

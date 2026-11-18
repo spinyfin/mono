@@ -318,7 +318,15 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 return Ok(outcome(command, ResultCode::Rejected, error.to_string(), None));
             }
         };
-        let runtime = match input::provision(driver.as_ref(), &workspace, &spawn.prompt_utf8, &run.run_id).await {
+        let runtime = match input::provision(
+            driver.as_ref(),
+            &workspace,
+            &spawn.prompt_utf8,
+            &run.run_id,
+            boss_engine_driver::ExecutionWorkspaceKind::Cube,
+        )
+        .await
+        {
             Ok(runtime) => runtime,
             Err(error) => {
                 record.phase = Phase::Terminal;
