@@ -88,14 +88,10 @@ pub enum RunWaitState {
     WaitingReview,
     /// Worker is awaiting merge of an approved PR. Workspace retained.
     WaitingMerge,
-    /// The execution was cancelled (kanban drag to Backlog, force-stop)
-    /// *during* its spawn window — after the worker pane came up but
-    /// before the run could be recorded. The runner has already reaped
-    /// the just-spawned pane; the coordinator must release the cube
-    /// lease the cancel path deliberately left held and skip the normal
-    /// completion recording (the row is already terminal). See
-    /// `PaneSpawnRunner::run_execution` and the mid-spawn-cancel
-    /// collision this closes.
+    /// The execution became terminal (cancelled, orphaned, or another terminal
+    /// status) during its spawn window. The runner has already reaped the
+    /// just-spawned pane; the coordinator must release the retained workspace
+    /// and skip completion recording to preserve the existing final status.
     CancelledDuringSpawn,
     /// An agent pane was successfully spawned. The pane is alive and its
     /// agent is actively working; the engine has handed the turn loop off
@@ -123,9 +119,9 @@ impl RunWaitState {
             RunWaitState::WaitingHuman => ExecutionStatus::WaitingHuman,
             RunWaitState::WaitingReview => ExecutionStatus::WaitingReview,
             RunWaitState::WaitingMerge => ExecutionStatus::WaitingMerge,
-            // The row is already `cancelled`; the coordinator never
-            // drives a status transition for this variant. Report the
-            // terminal status for completeness.
+            // The row is already terminal; the coordinator never drives a
+            // status transition for this variant. This representative value
+            // must not overwrite the actual final status (for example orphaned).
             RunWaitState::CancelledDuringSpawn => ExecutionStatus::Cancelled,
             // Agent pane is alive and working; execution stays `running`.
             RunWaitState::WorkerPaneAlive => ExecutionStatus::Running,

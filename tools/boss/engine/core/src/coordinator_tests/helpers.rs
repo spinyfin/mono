@@ -706,6 +706,13 @@ impl ExecutionRunner for FakeExecutionRunner {
             ));
         }
         if self.viewer_abort_failed {
+            // A rejected viewer can leave behind a worker whose identity was
+            // recorded while the execution was still running.
+            let db = self.work_db.as_ref().expect("viewer abort fixture requires a database");
+            assert!(
+                db.record_tmux_spawn_intent_for_execution(&execution.id, "boss", "boss-unreaped", "tok-unreaped",)
+                    .unwrap()
+            );
             return Err(
                 anyhow::Error::new(crate::spawn_flow::StartWorkerError::ViewerAbortFailed {
                     error: EngineToAppError::SlotBusy {

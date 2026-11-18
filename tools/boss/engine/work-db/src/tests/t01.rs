@@ -2669,6 +2669,8 @@ fn list_adoptable_tmux_runs_includes_finished_run_of_live_execution() {
 #[test]
 fn tmux_spawn_intent_is_refused_once_the_execution_is_terminal() {
     for terminal in [
+        ExecutionStatus::Completed,
+        ExecutionStatus::Abandoned,
         ExecutionStatus::Orphaned,
         ExecutionStatus::Cancelled,
         ExecutionStatus::Failed,

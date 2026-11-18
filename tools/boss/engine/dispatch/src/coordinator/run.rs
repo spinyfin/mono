@@ -298,13 +298,10 @@ impl ExecutionCoordinator {
         let mut abort_unconfirmed = false;
 
         match run_outcome {
-            // Mid-spawn cancel: the worker was cancelled while it
-            // was still spawning. The runner has already reaped the
-            // just-spawned pane; our job is to release the cube lease the
-            // cancel path deliberately left held (so a still-occupied
-            // workspace was never handed back to cube) and to skip the
-            // normal completion recording — the row is already
-            // `cancelled`, so `finish_execution_run` would reject it.
+            // The execution became terminal (cancelled, orphaned, or another
+            // terminal status) while spawning. The runner has reaped the pane;
+            // release the retained cube lease and skip completion recording
+            // because the execution already has its final status.
             Ok(outcome) if outcome.wait_state == RunWaitState::CancelledDuringSpawn => {
                 self.lifecycle
                     .teardown_driver_workspace(
@@ -329,7 +326,7 @@ impl ExecutionCoordinator {
                     run_id = %run.id,
                     worker_id = %worker_id,
                     released_workspace = released,
-                    "reconciled mid-spawn cancel: worker pane reaped, deferred lease released",
+                    "reconciled terminal execution during spawn: worker pane reaped, deferred lease released",
                 );
                 self.dispatch_events
                     .emit(
@@ -340,7 +337,7 @@ impl ExecutionCoordinator {
                             .with_cube_workspace(&lease.workspace_id)
                             .with_details(serde_json::json!({
                                 "run_id": run.id,
-                                "cancelled_during_spawn": true,
+                                "terminal_during_spawn": true,
                                 "released_workspace": released,
                             })),
                     )
