@@ -10,6 +10,7 @@ use crate::test_support::*;
 use crate::work::WorkDb;
 
 mod attention;
+mod events;
 
 struct NoViewers;
 
