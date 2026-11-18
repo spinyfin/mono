@@ -1,6 +1,8 @@
 # Grok spawn latency: where the time before `pane_spawned` goes
 
-A September sample showed Grok workers taking about 17 s longer than Claude or Codex between `run_started` and `pane_spawned`. On current `main` that offset does not reproduce. The seven commands Grok runs before its pane, timed directly, took under 5 s in all 138 local runs, and its CLI accepted a brief under 5 s after starting in all 84. The only candidate found for a ten-second cost on every spawn in September was the bare-name `cube` probe that mono#3428 removed, inferred from code history and not measured.
+A September sample showed Grok workers taking about 17 s longer than Claude or Codex between `run_started` and `pane_spawned`. The roughly 17 s cost was not observed in the measured direct-subprocess and CLI-start paths on current `main`; the full engine offset and its distribution remain undetermined.
+
+The seven commands Grok runs before its pane, timed directly, took under 5 s in all 138 local runs, and its CLI accepted a brief under 5 s after starting in all 84. The only candidate found for a ten-second cost on every spawn in September was the bare-name `cube` probe that mono#3428 removed, inferred from code history and not measured.
 
 The direct timings exclude the engine's refresh-lock wait and credential reprobe, which were not measured.
 
@@ -18,7 +20,7 @@ Source paths below are relative to `tools/boss/`. Everything under "Measured" wa
 | Create the tmux pane                                                                      | yes           | yes            |
 | Wait for the CLI to show its composer, take the brief and report a turn (since mono#3034) | no            | yes            |
 
-In mid-September the runner returned as soon as the pane existed, so the 17 s had to be spent before the pane: in composition, provisioning, config or pane creation. Only provisioning differs by driver in a way that runs subprocesses. Today the interval also includes the CLI's start and the brief delivery (`engine/execution-runner/src/runner/pane_spawn.rs:1470`), for every driver.
+In mid-September the runner returned as soon as the pane existed, so the 17 s had to be spent before the pane: in composition, provisioning, config or pane creation. Grok provisioning adds the seven subprocesses listed below; permission/config work also differs by driver. Today the interval also includes the CLI's start and the brief delivery (`engine/execution-runner/src/runner/pane_spawn.rs:1470`), for every driver.
 
 ## What only Grok does before its pane
 
@@ -38,7 +40,7 @@ The comparable costs for the other drivers are a `python3` import check that is 
 
 ## Measured
 
-Host: 12-core macOS laptop running other workers' builds, whose load swung widely during the day. Each batch below gives the 1-minute load average read just before and after it. Grok CLI 1.0.70, Claude Code 2.1.327, Codex CLI 0.169.0. The `preflight` figures are direct `subprocess.run` durations of the seven commands in the engine's order and environment. They do not exercise the engine's own preflight, so they exclude its wait for a live refresh lock and its reprobe after a credential refresh (see "What can still stretch a Grok spawn"). Each run used a fresh `GROK_HOME` and process `HOME` with the engine's environment and delegates, the shared `GROK_AUTH_PATH`, and a leased checkout of this repository as the working directory. `grok_spawn_latency_probe.py` beside this file is the harness. The first batch of each kind was run before it was consolidated into that one script, and the rest with it as committed.
+Host: 12-core macOS laptop running other workers' builds, whose load swung widely during the day. Where recorded, batches below give the 1-minute load average read just before and after them; load was not recorded for the final setup fixtures. Grok CLI 1.0.70, Claude Code 2.1.327, Codex CLI 0.169.0. The `preflight` figures are direct `subprocess.run` durations of the seven commands in the engine's order and environment. They do not exercise the engine's own preflight, so they exclude its wait for a live refresh lock and its reprobe after a credential refresh (see "What can still stretch a Grok spawn"). Each run used a fresh `GROK_HOME` and process `HOME` with the engine's environment and delegates, the shared `GROK_AUTH_PATH`, and a leased checkout of this repository as the working directory. `grok_spawn_latency_probe.py` beside this file is the harness. The first batch of each kind was run before it was consolidated into that one script, and the rest with it as committed.
 
 ### Grok's seven subprocesses
 
@@ -101,21 +103,49 @@ A `SessionStart` hook held open for 3 s did not delay the composer or the first 
 
 ### Claude and Codex
 
-These were not re-measured as a population. The launcher log of the Claude worker that produced this write-up shows the composer ready 0.59 s after the launcher started and Return written 0.11 s later (one run). `docs/worker-prompt-delivery.md` records 0.5 to 1.9 s to composer ready and 0.6 to 4.9 s to Return over 71 Claude runs at normal load. The `python3` check took a median 0.050 s and `codex debug models --bundled` a median 0.028 s (20 runs each).
+These were not re-measured as a population. The launcher log of the Claude worker that produced this write-up shows the composer ready 0.59 s after the launcher started and Return written 0.11 s later (one run). `docs/worker-prompt-delivery.md` records 0.5 to 1.9 s to composer ready and 0.6 to 4.9 s to Return over 71 Claude runs at normal load. The corrected local setup batch below measures the exact `python3` import check and the Codex bundled-model probe, including their spread.
 
 A Codex pane was not started. Its per-run home holds a snapshot of the machine's Codex login, and a token refreshed inside a discarded probe home would not be adopted back.
 
 ### Local steps around the subprocesses
 
-`grok_spawn_latency_probe.py setup`, 30 runs one at a time, load average 41 to 56 (seconds):
+`grok_spawn_latency_probe.py setup`, 30 runs one at a time (seconds), rerun with the exact engine command `python3 -c 'import fcntl, pty, termios'`:
 
-| Step                                                                              | min   | median | p90   | max   |
-| --------------------------------------------------------------------------------- | ----- | ------ | ----- | ----- |
-| Grok-only: write the Grok home (config, trust file, hook file) and delegate paths | 0.002 | 0.003  | 0.007 | 0.012 |
-| Common: `tmux new-session -d`                                                     | 0.022 | 0.033  | 0.059 | 0.099 |
-| Common: `python3` import check (first run in an engine process only)              | 0.025 | 0.037  | 0.058 | 0.102 |
+| Step                                        | n   | min   | median | p90   | max   |
+| ------------------------------------------- | --- | ----- | ------ | ----- | ----- |
+| Grok home stand-in and delegate paths       | 30  | 0.002 | 0.002  | 0.003 | 0.004 |
+| Detached `tmux new-session -d`              | 30  | 0.018 | 0.020  | 0.022 | 0.025 |
+| Python import, uncached first-success check | 30  | 0.024 | 0.026  | 0.029 | 0.032 |
+| `codex debug models --bundled`              | 30  | 0.014 | 0.015  | 0.017 | 0.022 |
 
-The Grok-only file writes are about 3 ms, so they do not change the comparison. The probe's copy of the Grok home writer stands in for the engine's `write_permission_config` and hook wiring; the engine functions themselves were not run. Prompt composition, pane title and the Claude and Codex permission and hook writes have no standalone entry point and were not timed. The statement below that these are the same for every driver is an assumption from the code, not a measurement, until `compose_ms`, `permission_config_ms` and `title_ms` are read from `pane spawned for execution` lines in production.
+The Python check is not a per-spawn charge: `PREFLIGHT_OK` caches its first success in each engine process. The Codex probe applies only when selecting Sol. These local subprocess checks do not start either CLI worker.
+
+The `//tools/boss/engine/core:spawn_setup_probe` harness also calls the real Rust code paths, 30 fresh fixtures per driver, sequentially, with a roughly 40 KB chore description. Seconds (six decimal places retain the sub-millisecond steps):
+
+| Driver | Step                         | n   | min      | median   | p90      | max      |
+| ------ | ---------------------------- | --- | -------- | -------- | -------- | -------- |
+| claude | composition                  | 30  | 0.000409 | 0.000472 | 0.000597 | 0.002062 |
+| claude | workspace settings and hooks | 30  | 0.003137 | 0.003485 | 0.018792 | 0.254829 |
+| claude | permission config            | 30  | 0.000001 | 0.000002 | 0.000004 | 0.000017 |
+| claude | spawn invocation             | 30  | 0.000003 | 0.000006 | 0.000012 | 0.000014 |
+| claude | pane title (no credential)   | 30  | 0.000245 | 0.000285 | 0.000344 | 0.000540 |
+| claude | pane title (cached)          | 30  | 0.000240 | 0.000256 | 0.000325 | 0.000352 |
+| codex  | composition                  | 30  | 0.000429 | 0.000506 | 0.000534 | 0.000620 |
+| codex  | workspace settings and hooks | 30  | 0.001737 | 0.001906 | 0.002052 | 0.002240 |
+| codex  | permission config            | 30  | 0.068520 | 0.072471 | 0.095171 | 0.140546 |
+| codex  | spawn invocation             | 30  | 0.000014 | 0.000017 | 0.000018 | 0.000032 |
+| codex  | pane title (no credential)   | 30  | 0.000305 | 0.000351 | 0.000375 | 0.000525 |
+| codex  | pane title (cached)          | 30  | 0.000248 | 0.000263 | 0.000272 | 0.000387 |
+| grok   | composition                  | 30  | 0.000372 | 0.000432 | 0.000535 | 0.000564 |
+| grok   | workspace settings and hooks | 30  | 0.001724 | 0.001943 | 0.002097 | 0.002260 |
+| grok   | permission config            | 30  | 0.001561 | 0.001658 | 0.001785 | 0.001855 |
+| grok   | spawn invocation             | 30  | 0.000059 | 0.000082 | 0.000109 | 0.000148 |
+| grok   | pane title (no credential)   | 30  | 0.000235 | 0.000267 | 0.000304 | 0.000321 |
+| grok   | pane title (cached)          | 30  | 0.000234 | 0.000245 | 0.000269 | 0.000353 |
+
+This is local attribution, not a full engine dispatch. Each fixture uses a private database, workspace, process home and per-run driver homes. It calls `compose_worker_spawn`, `write_workspace_files` (including Claude's actual settings and hooks), each driver's `write_permission_config`, `spawn_invocation`, and `title_for_spawn`. Codex permission config includes the real installed CLI's hook-trust attestation; Grok includes `hooks::write_hooks` and permission artifacts, not the Python canary stand-in. Claude's driver permission method is empty; its work is in the workspace-settings row. The first Claude settings call was the 255 ms maximum, including initial guard-script materialization; subsequent fixtures reuse those content-addressed scripts, as an engine does.
+
+Provisioning is excluded from these Rust timings: fresh empty driver homes are created before measurement, without copying credentials or running preflight. The separate Grok subprocess measurements and home stand-in remain separate observations. Pane creation is the detached tmux measurement above; Grok driver start is the 84-run accepted-prompt sample. Title rows cover the real cached and missing-credential branches, without a utility-model inference request. An uncached credentialed title can make a network request with up to two 5 s attempts and a 250 ms backoff; these local title figures do not bound that branch. The fixture does not include database scheduling, refresh-lock waits, credential reprobes, a production repo-guidance fetch or hook ingest. These differences prevent treating the rows as an end-to-end distribution or assuming identical setup costs across drivers.
 
 ### Older Grok CLIs
 
@@ -123,9 +153,9 @@ Two earlier builds are still on the host. `grok inspect --json` plus `grok model
 
 ## Is the effect real today
 
-Not at the size reported. At the host's calmer moments Grok pays 1.4 to 1.8 s before its pane that the other drivers do not, and reaches an accepted prompt about half a second later than Claude does once the pane is up. That is roughly 2 s more than Claude per spawn, in one group, assuming the engine's own steps (composition, permission config, title, pane creation) cost the same for both drivers; that equality is assumed, not timed.
+The roughly 17 s cost was not observed in the measured direct-subprocess and CLI-start paths. The full engine offset and its distribution remain undetermined. At the host's calmer moments the seven Grok-only direct subprocesses totalled 1.4 to 1.8 s, and its accepted-prompt timing was about half a second later than the available Claude observation. A roughly 2 s difference is only a conditional estimate: it requires no refresh-lock wait or credential reprobe, comparable remaining setup costs, and representative post-pane samples. It is not a measured cross-driver engine interval.
 
-Host load does not turn that into 17 s either. With the 1-minute load average between 165 and 235 on 12 cores, the pre-pane total had a median of 3.0 s and the pane reached an accepted prompt in a median 2.5 s. The worst figures seen in any condition were 4.8 s before the pane and 4.7 s after it.
+With the 1-minute load average between 165 and 235 on 12 cores, the seven-command direct-subprocess total had a median of 3.0 s and the pane reached an accepted prompt in a median 2.5 s. The worst figures seen in those measured paths were 4.8 s for the direct subprocesses and 4.7 s after pane creation. Neither measurement bounds the unmeasured engine waits.
 
 This is a local reproduction. The production dispatch-event window was not re-measured.
 
@@ -133,7 +163,7 @@ This is a local reproduction. The production dispatch-event window was not re-me
 
 Inferred, not measured.
 
-Mid-September's interval ended at pane creation, so the cost was in Grok's pre-pane subprocesses. Until mono#3428 merged on 2026-11-02, the preflight ran the cube probe by bare name, `cube`, resolved through the engine's `PATH`. Of the seven commands, that is the only one whose cost is not bounded by a sub-second process start or a single network round trip:
+Mid-September's interval ended at pane creation, so the cost was somewhere in pre-pane preparation; the subprocess hypothesis below is inferred. Until mono#3428 merged on 2026-11-02, the preflight ran the cube probe by bare name, `cube`, resolved through the engine's `PATH`. Of the seven commands, that is the only one whose cost is not bounded by a sub-second process start or a single network round trip:
 
 - A host with a repobin `cube` shim on `PATH` runs that shim instead of the bundled binary. From inside a checkout, repobin builds `//tools/cube:cube` there before running it. Its cache of the built path is keyed by repository root and checked against source and binary mtimes, so a newly leased or repositioned workspace misses it.
 - `bazel build //tools/cube:cube` in the leased workspace used for this write-up took 11.3 s with every action cached, because the workspace's Bazel server had to start and analyse (one run). With the server up it took 0.8 to 1.9 s. Any action that actually has to run adds to the first figure.
@@ -151,7 +181,7 @@ Other candidates and why they do not fit a cost on every spawn:
 
 ## Repository or upstream
 
-The remaining Grok-only cost is this repository's choice to run seven checks before each pane. Nothing in the Grok CLI needs to change for the reported offset. The floor of `grok models` is a network call to xAI and is upstream.
+The measured Grok-only direct-subprocess cost comes from this repository's choice to run seven checks before each pane. These measurements do not establish whether a repository or CLI change is needed to address the full reported offset. The floor of `grok models` is a network call to xAI and is upstream.
 
 The reason the question was raised has also changed. Grok was the third member of every pre-merge review batch, so its spawn time was the batch's. mono#3073 removed the Grok leaf reviewer from those batches. Grok still pays this cost as an implementation and progression driver.
 
@@ -164,14 +194,14 @@ The reason the question was raised has also changed. Grok was the third member o
 
 ## What could be done, and what it would cost
 
-| Change                                                                     | Saves per Grok spawn                                  | Cost                                                                                                                                       |
-| -------------------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Run the independent checks concurrently                                    | about 0.5 s (to the slowest check, about 0.8 s)       | More threads per spawn, and a failure no longer stops the later checks from running                                                        |
-| Reuse a recent `grok models` or `gh auth status` result for a short window | up to about 1.2 s                                     | A credential revoked inside the window passes the check. These checks exist because a worker that starts without them parks holding a slot |
-| End the refresh-lock wait once `auth.json` is newer than the lock          | up to 30 s, only on spawns that hit a live fresh lock | Depends on the CLI writing the lock before the credential, which would need characterising first                                           |
-| Leave it as it is                                                          | nothing                                               | Grok spawns stay about 2 s slower than Claude spawns                                                                                       |
+| Change                                                                     | Saves per Grok spawn                                  | Cost                                                                                                                                                 |
+| -------------------------------------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Run the independent checks concurrently                                    | about 0.5 s (to the slowest check, about 0.8 s)       | More threads per spawn, and a failure no longer stops the later checks from running                                                                  |
+| Reuse a recent `grok models` or `gh auth status` result for a short window | up to about 1.2 s                                     | A credential revoked inside the window passes the check. These checks exist because a worker that starts without them parks holding a slot           |
+| End the refresh-lock wait once `auth.json` is newer than the lock          | up to 30 s, only on spawns that hit a live fresh lock | Depends on the CLI writing the lock before the credential, which would need characterising first                                                     |
+| Leave it as it is                                                          | nothing                                               | Full engine offset remains undetermined; about 2 s is conditional on no refresh-lock wait/reprobe and comparable remaining setup and post-pane costs |
 
-None of these was made. The measured cost does not justify weakening a fail-fast check, and the lock wait was not measured by the probe.
+None of these was made. The measured direct-subprocess cost alone does not justify weakening a fail-fast check, and the lock wait was not measured by the probe.
 
 ## Reading a spawn's timing from the engine log
 
@@ -193,7 +223,7 @@ The engine log now carries enough to attribute a slow spawn without an export. F
 
 - The production window was not re-measured. To confirm these figures in production, compare `provision_ms` and `pre_pane_ms` by `driver` across `pane spawned for execution` lines, and the Grok step lines, for spawns made after this logging is deployed.
 - The September window can only be re-read as `run_started` to `pane_spawned` totals. Those can confirm the size of the offset over more spawns, but no retained record splits it by step, so they cannot confirm its cause.
-- The engine's prompt composition, pane title and hook ingest were not timed here, and the Claude and Codex permission-config writes were not either. Equality across drivers is assumed from the code and unconfirmed until the new per-spawn fields are read in production. Only Grok's home writes, `tmux new-session` and the `python3` check were timed (above).
+- Local fixture timings cover real prompt composition, per-driver settings/hooks, permission config, spawn invocation and cached/missing-credential pane titles. They do not measure a credentialed title inference request or hook ingest, and do not establish production cross-driver equality.
 - The seven-command totals exclude the engine's refresh-lock wait and credential reprobe. "Only candidate that would cost ten seconds on every spawn" refers to a cost present on every spawn; the lock wait and a token refresh can also cost that long on the spawns they hit.
 - The repobin shim itself was not run, because the worker launch guard refuses it. The 11.3 s figure is the Bazel build that shim performs, run directly.
 - All timings are from one host and one day.
@@ -208,4 +238,6 @@ python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py setup <worksp
 python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py tui <workspace> <scratch-dir> 4 --hold SessionStart:3
 ```
 
-It needs a logged-in `grok`, `gh`, `jj`, `tmux` and the bundled `cube` (or `PROBE_CUBE` naming another build). It does not contact a Boss engine. The `tui` mode submits a brief asking for a one-word reply and stops the pane when the prompt is accepted.
+To reproduce the real-code setup attribution, build `//tools/boss/engine/core:spawn_setup_probe` with `bazel build --remote_download_outputs=toplevel`, then invoke the resulting `bazel-bin/tools/boss/engine/core/spawn_setup_probe` binary with one absolute, nonexistent scratch-directory argument. It emits tab-separated driver, run, step and seconds columns, 30 runs per driver. It is a measurement binary, not a test or an engine; it starts neither worker panes nor an engine, isolates every writable runtime home, and needs an installed `codex` for hook-trust attestation. Keep its scratch directory and output for analysis.
+
+The Python harness needs a logged-in `grok`, `gh`, `jj`, `tmux` and the bundled `cube` (or `PROBE_CUBE` naming another build). It does not contact a Boss engine. The `tui` mode submits a brief asking for a one-word reply and stops the pane when the prompt is accepted.

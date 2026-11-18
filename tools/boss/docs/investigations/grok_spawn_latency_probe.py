@@ -21,8 +21,9 @@ the tmux session.
 
 `setup` times the local steps around those subprocesses: writing a Grok home
 (config, trust file, hook file, delegated paths), creating a detached tmux
-session, and the `python3` check the launcher needs. Prompt composition and the
-pane title are engine code with no standalone entry point and are not timed.
+session, the launcher's exact first-success Python import check, and Codex's
+bundled-model probe. The real Rust setup paths, including composition and pane
+title, are measured separately by `//tools/boss/engine/core:spawn_setup_probe`.
 
 The CONFIG_TOML, CANARY_HOOKS, HOOK_EVENTS, LAUNCHER_CONFIG and trust_variants
 definitions are a snapshot copied by hand from `engine/driver/src/grok/home.rs`,
@@ -289,10 +290,14 @@ def setup_once(index, workspace, scratch):
     subprocess.run(["tmux", "-L", name, "kill-server"], capture_output=True)
     Path(os.environ.get("TMUX_TMPDIR", "/tmp"), f"tmux-{os.getuid()}", name).unlink(missing_ok=True)
     began = time.monotonic()
-    subprocess.run(["python3", "-c", "import json, sys"], check=True, capture_output=True)
+    subprocess.run(["python3", "-c", "import fcntl, pty, termios"], check=True, capture_output=True)
     python_seconds = time.monotonic() - began
+    began = time.monotonic()
+    subprocess.run(["codex", "debug", "models", "--bundled"], check=True, capture_output=True)
+    codex_seconds = time.monotonic() - began
     shutil.rmtree(container, ignore_errors=True)
     return [
+        {"run": index, "step": "codex bundled model probe", "seconds": round(codex_seconds, 4)},
         {"run": index, "step": "grok home files and delegates", "seconds": round(home_seconds, 4)},
         {"run": index, "step": "tmux new-session -d", "seconds": round(pane_seconds, 4)},
         {"run": index, "step": "python3 import check", "seconds": round(python_seconds, 4)},

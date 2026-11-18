@@ -801,3 +801,19 @@ sh_test(
         "//:.ci.bazelrc",
     ],
 )
+
+rust_binary(
+    name = "spawn_setup_probe",
+    srcs = ["bin/spawn_setup_probe.rs"],
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":engine_lib",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/execution-runner",
+        "//tools/boss/engine/pane-summary",
+        "//tools/boss/engine/utility-model",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)
