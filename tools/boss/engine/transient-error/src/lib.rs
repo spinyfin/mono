@@ -294,25 +294,30 @@ pub fn transcript_shows_no_activity(lines: &[Value]) -> bool {
 /// detect that it recovered after an error. Assistant entries that are
 /// themselves API errors are excluded by the caller (they're matched
 /// by [`entry_api_error_text`] first).
+///
+/// Canonical shapes:
+/// - Claude nested `{type:assistant|user, message:{content:[{type:tool_use|tool_result}]}}`
+/// - flattened `{type:assistant|user, content:[{type:tool_use|tool_result}]}` (agy planner)
+/// - top-level `{type:tool_result}` (agy tool step)
 fn is_progress_entry(line: &Value) -> bool {
     match line.get("type").and_then(Value::as_str) {
         Some("assistant") | Some("user") => {
-            !entry_text(line).trim().is_empty()
-                || line
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(Value::as_array)
-                    .is_some_and(|blocks| {
-                        blocks.iter().any(|b| {
-                            matches!(
-                                b.get("type").and_then(Value::as_str),
-                                Some("tool_use") | Some("tool_result")
-                            )
-                        })
-                    })
+            !entry_text(line).trim().is_empty() || content_has_tool_block(line.get("message").unwrap_or(line))
         }
+        Some("tool_result") => true,
         _ => false,
     }
+}
+
+fn content_has_tool_block(value: &Value) -> bool {
+    value.get("content").and_then(Value::as_array).is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("tool_use") | Some("tool_result")
+            )
+        })
+    })
 }
 
 /// Concatenate the text content of a transcript entry. Handles both
@@ -657,6 +662,43 @@ mod tests {
     fn transcript_with_tool_use_shows_activity() {
         let lines = vec![tool_use_entry("Bash")];
         assert!(!transcript_shows_no_activity(&lines));
+    }
+
+    fn top_level_tool_use() -> Value {
+        json!({"type": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {}}]})
+    }
+
+    fn top_level_tool_result() -> Value {
+        json!({"type": "tool_result", "content": "ok", "is_error": false, "tool_name": "Bash"})
+    }
+
+    #[test]
+    fn top_level_tool_use_is_progress() {
+        assert!(is_progress_entry(&top_level_tool_use()));
+        assert!(!transcript_shows_no_activity(&[top_level_tool_use()]));
+    }
+
+    #[test]
+    fn top_level_tool_result_is_progress() {
+        assert!(is_progress_entry(&top_level_tool_result()));
+        assert!(!transcript_shows_no_activity(&[top_level_tool_result()]));
+    }
+
+    #[test]
+    fn error_followed_by_top_level_tool_progress_yields_none() {
+        let lines = vec![
+            api_error_entry("API Error: You have exhausted your quota on this model."),
+            top_level_tool_use(),
+            top_level_tool_result(),
+        ];
+        assert_eq!(extract_worker_error(&lines), None);
+    }
+
+    #[test]
+    fn tool_only_tail_is_activity() {
+        let lines = vec![top_level_tool_use(), top_level_tool_result()];
+        assert!(!transcript_shows_no_activity(&lines));
+        assert_eq!(extract_worker_error(&lines), None);
     }
 
     #[test]

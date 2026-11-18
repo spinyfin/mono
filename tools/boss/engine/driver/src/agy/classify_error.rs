@@ -21,8 +21,10 @@ pub(super) fn classify_agy_error(text: &str) -> WorkerErrorClass {
     let has = |markers: &[&str]| markers.iter().any(|marker| lower.contains(marker));
 
     // Quota takes precedence over retryable wrappers (including 429/500).
-    // RESOURCE_EXHAUSTED can also mean a short rate limit, but absent a
-    // distinct signal it must not repeatedly dispatch into exhausted quota.
+    // RESOURCE_EXHAUSTED is also Google's per-minute rate-limit status, so
+    // it is quota only when the text also names quota or a used-up limit.
+    // A bare RESOURCE_EXHAUSTED / HTTP 429 RESOURCE_EXHAUSTED stays on the
+    // bounded-retry path instead of escalating as exhausted quota.
     if has(&[
         "quota_exhausted",
         "quota exhausted",
@@ -32,8 +34,6 @@ pub(super) fn classify_agy_error(text: &str) -> WorkerErrorClass {
         "quota has been exhausted",
         "exhausted your quota",
         "subscription limit for this account is used up",
-        "resource_exhausted",
-        "resourceexhausted",
     ]) {
         return WorkerErrorClass::QuotaExhausted;
     }
@@ -91,7 +91,6 @@ mod tests {
             "Quota exhausted",
             "The subscription limit for this account is used up; it resets in 5h",
             "QUOTA_EXHAUSTED: retry after reset",
-            "HTTP 429: RESOURCE_EXHAUSTED",
             "rpc error: code = ResourceExhausted desc = Quota exceeded",
             "Your image generation quota has been exceeded. Please try again later.",
             "Eligibility check failed: 500 Internal Server Error: QUOTA_EXHAUSTED",
@@ -102,6 +101,23 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn resource_exhausted_is_quota_only_with_quota_language() {
+        let driver = AgyDriver::default();
+        assert_eq!(
+            driver.classify_error("rpc error: code = ResourceExhausted desc = Quota exceeded"),
+            WorkerErrorClass::QuotaExhausted
+        );
+        assert_eq!(
+            driver.classify_error("HTTP 429: RESOURCE_EXHAUSTED"),
+            WorkerErrorClass::Transient
+        );
+        assert_eq!(
+            driver.classify_error("RESOURCE_EXHAUSTED"),
+            WorkerErrorClass::Indeterminate
+        );
     }
 
     #[test]
@@ -167,6 +183,7 @@ mod tests {
         let driver = AgyDriver::default();
         for error in [
             "HTTP 429 Too Many Requests",
+            "HTTP 429: RESOURCE_EXHAUSTED",
             "503 Service Unavailable",
             "500",
             r#"{"code":503,"status":"UNAVAILABLE"}"#,
@@ -183,6 +200,8 @@ mod tests {
         for error in [
             "",
             "unknown vendor error",
+            "RESOURCE_EXHAUSTED",
+            "rpc error: code = ResourceExhausted",
             "quota available",
             "5000",
             "file /tmp/500",

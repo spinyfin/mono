@@ -952,10 +952,10 @@ fn resolve_connection_driver(
 /// — the eventual subscriber's own check no-ops on a false positive.
 ///
 /// - [`Event::TransientErrorIdle`]: published on the driver's turn
-///   boundary when the transcript's last meaningful entry is a trailing
-///   API error — the same ground truth [`crate::transient_recovery`]'s
-///   sweep already trusts, just checked immediately instead of waiting
-///   for the next 60s pass.
+///   boundary when that driver's extractor reports a trailing API error
+///   on the normalised transcript — the same ground truth
+///   [`crate::transient_recovery`]'s sweep already trusts, just checked
+///   immediately instead of waiting for the next 60s pass.
 /// - [`Event::AnswerAgentDied`]: published on `SessionEnd`, the only
 ///   hook that fires when a worker's session terminates. This does not
 ///   cover a hard pane kill (no hook fires at all in that case) — that
@@ -971,9 +971,10 @@ pub async fn publish_hook_derived_events(bus: &EventBus, work_db: &WorkDb, incom
         let Some(transcript_path) = incoming.transcript_path.as_deref() else {
             return;
         };
-        let lines =
-            crate::transient_recovery::read_normalized_transcript_tail(work_db, &execution_id, transcript_path).await;
-        if crate::transient_error::extract_worker_error(&lines).is_some() {
+        let inspection =
+            crate::transient_recovery::inspect_normalized_transcript_tail(work_db, &execution_id, transcript_path)
+                .await;
+        if inspection.trailing_error.is_some() {
             bus.publish(Event::TransientErrorIdle { execution_id });
         }
         return;
