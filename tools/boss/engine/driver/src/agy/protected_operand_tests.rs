@@ -311,6 +311,10 @@ fn exported_path_variables_cannot_be_rebound_then_expanded() {
         format!("BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
         format!("BOSS_STRUCTURED_OUTPUT={hooks_prefix}; printf '{{}}' > \"${{BOSS_STRUCTURED_OUTPUT}}{hooks_suffix}\""),
         "read BOSS_STRUCTURED_OUTPUT < f".into(),
+        "builtin read BOSS_STRUCTURED_OUTPUT < f".into(),
+        format!("builtin export BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!("BOSS_STRUCTURED_OUTPUT[0]={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!("BOSS_BIN_DIR+={data_prefix}; cat \"$BOSS_BIN_DIR{data_suffix}/secret\""),
         "export BOSS_STRUCTURED_OUTPUT=/tmp/agy-ho".into(),
         "printf -v BOSS_STRUCTURED_OUTPUT %s /tmp/agy-ho".into(),
         format!("BOSS_BIN_DIR={data_prefix}; cat \"$BOSS_BIN_DIR{data_suffix}/secret\""),
@@ -355,6 +359,43 @@ fn ansi_c_quoting_cannot_hide_a_later_live_line() {
     let protected = fx.process_home.join(".gemini/config/hooks.json");
     let command = format!("echo $'\\' <<X #'\ncat {}\nX", protected.display());
     deny_at(&fx, &command, &fx.workspace());
+}
+
+#[test]
+fn ansi_c_escaped_quote_cannot_hide_a_live_command_or_substitution() {
+    let fx = Fixture::new("run-ansi-c-escaped-quote");
+    fx.install(WorkerKind::Standard);
+    let protected = fx.process_home.join(".gemini/config/hooks.json");
+    deny_at(
+        &fx,
+        &format!("echo $'\\'' ; cat {} ; echo \\'", protected.display()),
+        &fx.workspace(),
+    );
+    deny_at(&fx, "echo $'\\'' $(jj describe -m x) \\'", &fx.workspace());
+}
+
+#[test]
+fn multi_word_expansions_option_bundles_and_braces_are_denied() {
+    let fx = Fixture::new("run-multi-word-expansions");
+    fx.install(WorkerKind::Standard);
+    let config = fx.process_home.join(".gemini/config");
+    let hooks = config.join("hooks.json");
+    let hooks = hooks.display();
+    for command in [
+        "grep \"$@\" f".to_string(),
+        "grep -e \"${a[@]}\" f".to_string(),
+        "set -- x /tmp/y; grep \"$@mes/z\"".to_string(),
+        "grep -v$X f".to_string(),
+        "grep -e . -A$X f".to_string(),
+        format!("grep {{x,{hooks}}}"),
+        format!("cat {{{hooks},}}"),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+    for command in ["grep \"$X\" f", "grep -n 'x$' f"] {
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
 }
 
 #[test]

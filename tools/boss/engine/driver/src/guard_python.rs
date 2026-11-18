@@ -264,6 +264,39 @@ def open_quote(text):
     return quote
 
 
+def ansi_escapes_quote(text):
+    # True when an unquoted $'...' string holds an escaped quote. Bash pairs
+    # that quote inside the string while shlex closes the string there, so the
+    # words shlex reports are not the words bash runs.
+    quote, index = None, 0
+    while index < len(text):
+        char = text[index]
+        if quote == ANSI:
+            if char == chr(92):
+                if text[index + 1:index + 2] == chr(39):
+                    return True
+                index += 2
+                continue
+            if char == chr(39):
+                quote = None
+            index += 1
+            continue
+        if quote != chr(39) and char == chr(92):
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+        elif is_ansi_open(text, index, quote):
+            quote = ANSI
+            index += 2
+            continue
+        elif char in (chr(39), chr(34)):
+            quote = char
+        index += 1
+    return False
+
+
 def odd_trailing_backslashes(text):
     return (len(text) - len(text.rstrip(chr(92)))) % 2 == 1
 
@@ -382,6 +415,10 @@ def command_records(command, stripped=False):
                 receiver.body_span = (start, min(offset, len(command)))
             continue
         pending = shell_text(pending + line + chr(10))
+        if ansi_escapes_quote(pending):
+            groups.append(CommandGroup([], error='incomplete shell syntax'))
+            pending = ''
+            continue
         try:
             lexer = shlex.shlex(pending, posix=True, punctuation_chars=';&|()')
             lexer.whitespace_split = True
@@ -514,6 +551,24 @@ for command in ('command -v cube', 'command -V boss', 'command -v bossctl',
     assert strip_prefixes(shlex.split(command)) == [], command
 assert strip_prefixes(shlex.split('command cube')) == ['cube']
 assert strip_prefixes(shlex.split('command -- bossctl')) == ['bossctl']
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn ansi_c_escaped_quote_yields_an_error_group() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+command = "echo $'\\'' ; cat /etc/passwd ; echo \\'"
+assert any(g.error for g in command_records(command)), [list(g) for g in command_records(command)]
+assert not any(g.error for g in command_records("echo $'a\\nb' x"))
 "#,
         );
         let output = std::process::Command::new("python3")

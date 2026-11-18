@@ -344,13 +344,23 @@ def has_substitution(command):
             start, end = group.body_span
             masked[start:end] = ' ' * (end - start)
     masked = ''.join(masked)
-    quote, escaped = None, False
+    quote, escaped, skip = None, False, False
     for index, char in enumerate(masked):
+        if skip:
+            skip = False
+            continue
         if escaped:
             escaped = False
             continue
         if char == chr(92) and quote != chr(39):
             escaped = True
+            continue
+        if is_ansi_open(masked, index, quote):
+            quote, skip = ANSI, True
+            continue
+        if quote == ANSI:
+            if char == chr(39):
+                quote = None
             continue
         if char in (chr(34), chr(39)):
             if quote == char:
@@ -414,17 +424,29 @@ TRUSTED_NAME_IN_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_])"
 BINDING_BUILTINS = {"export", "declare", "typeset", "local", "readonly", "unset", "read", "getopts", "mapfile", "readarray", "let"}
 
 
+ANY_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+
+
 def reject_trusted_rebinding(command, groups):
     uses_trusted = TRUSTED_VAR_RE.search(command) is not None
     for group in groups:
         normalized = without_redirections(group)
-        rest = strip_prefixes(group)
+        rest = list(strip_prefixes(group))
         # Prefix and standalone assignment positions bind a variable; the same
         # words as ordinary arguments (`rg BOSS_BIN`) are plain data.
-        assigned = normalized[:len(normalized) - len(rest)] if rest else normalized
+        assigned = list(normalized[:len(normalized) - len(rest)] if rest else normalized)
+        # `NAME+=v` and `NAME[i]=v` are assignments too, though strip_prefixes
+        # only recognizes `NAME=`.
+        while rest and ANY_ASSIGN_RE.match(rest[0]):
+            assigned.append(rest.pop(0))
         for token in assigned:
             if TRUSTED_VAR_ASSIGN_RE.match(token):
                 fail_closed("reassigning an engine-provided path variable is denied")
+        # `builtin` dispatches to the builtin named by its argument.
+        while rest and os.path.basename(rest[0]) == "builtin":
+            rest.pop(0)
+            while rest and rest[0].startswith("-"):
+                rest.pop(0)
         if not rest:
             continue
         program = os.path.basename(rest[0])
@@ -602,11 +624,39 @@ def strip_prefix_indices(group):
     return kept[len(kept) - len(stripped):]
 
 
+MULTI_WORD_EXPANSION_RE = re.compile(r"^\$(?:@|\{(?:@[^}]*|[^}]*\[@\][^}]*|![^}]*@)\})")
+
+
+def has_brace_expansion(token, literal, start):
+    depth, comma = 0, False
+    for j in range(start, len(token)):
+        if j < len(literal) and literal[j]:
+            continue
+        char = token[j]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return comma or '..' in token[start:j]
+        elif char == ',' and depth == 1:
+            comma = True
+    return False
+
+
 def has_unquoted_glob_or_expansion(token, literal):
     for i, char in enumerate(token):
-        if i < len(literal) and literal[i]:
+        quoted = literal[i] if i < len(literal) else False
+        if quoted == 'd':
+            # "$@" and "${a[@]}" still expand to one word per element.
+            if char == '$' and MULTI_WORD_EXPANSION_RE.match(token[i:]):
+                return True
+            continue
+        if quoted:
             continue
         if char == '$' or char in '*?[':
+            return True
+        if char == '{' and has_brace_expansion(token, literal, i):
             return True
     return False
 
@@ -683,6 +733,8 @@ def path_operand_positions(group):
                         positions[index] = 'option'
                     else:
                         skip_next, skip_as_path = True, True
+                elif has_unquoted_glob_or_expansion(token, token_literal(group, index)):
+                    positions[index] = 'operand'
                 elif eq:
                     positions[index] = 'option'
                 elif name in value_flags:
@@ -709,8 +761,11 @@ def path_operand_positions(group):
                         skip_next, skip_as_path = True, False
                         consumed = True
                         break
-                if not consumed and '=' in token:
-                    positions[index] = 'option'
+                if not consumed:
+                    if has_unquoted_glob_or_expansion(token, token_literal(group, index)):
+                        positions[index] = 'operand'
+                    elif '=' in token:
+                        positions[index] = 'option'
         elif program in NON_PATH_PROGRAMS:
             pass
         elif program in GREP_FAMILY and not pattern_seen:
@@ -759,6 +814,10 @@ def command_touches_protected(command, policy, cwd):
             protected_text = ''.join({'$': chr(1), '~': chr(3)}.get(c, c) if i < len(literal) and literal[i] is True else c
                                      for i, c in enumerate(token))
             is_redirect = role.startswith('redirect')
+            if (is_redirect or program not in PATH_TEXT_PROGRAMS) and any(
+                    char == '{' and not (i < len(literal) and literal[i]) and has_brace_expansion(token, literal, i)
+                    for i, char in enumerate(token)):
+                fail_closed("unresolved shell brace expansion")
             for candidate in operand_path_texts(protected_text, role, program):
                 if candidate and not candidate.startswith('&') and operand_touches_protected(candidate, policy, current, program, is_redirect):
                     return True
