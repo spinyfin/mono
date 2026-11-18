@@ -1267,6 +1267,44 @@ impl WorkDb {
             );
         }
 
+        // A run is starting for this work item, which refutes the one thing
+        // an `execution_recovery_failed` hold asserts: that the engine could
+        // not establish recovery for the item's next attempt. Recovery is
+        // decided afresh from the store before every start, so the hold and
+        // its detail describe an earlier attempt and nothing re-reads them.
+        // Left in place, the stale hold outlives the launch: the status
+        // advance below skips `blocked` rows, so the worker runs on a card
+        // that still shows the old failure, and a question it asks is filed
+        // as withdrawn (`task_not_parkable`) because the row is blocked for
+        // another reason. Same rule as the `dispatch_failed_reason` clear
+        // below, and hooked here for the same reason: it holds for every way
+        // a run starts. Only the kinds that recover preserved work on their
+        // own row lift it; a review starting on the row proves nothing about
+        // implementation recovery.
+        if matches!(
+            execution.kind,
+            ExecutionKind::ChoreImplementation
+                | ExecutionKind::TaskImplementation
+                | ExecutionKind::RevisionImplementation
+        ) {
+            crate::task_status_audit::execute(
+                &tx,
+                "start_execution_run_clears_recovery_hold",
+                "engine",
+                "UPDATE tasks
+                 SET status = 'active',
+                     blocked_reason = NULL,
+                     blocked_detail = NULL,
+                     last_status_actor = 'engine',
+                     updated_at = ?2
+                 WHERE id = ?1
+                   AND deleted_at IS NULL
+                   AND status = 'blocked'
+                   AND blocked_reason = 'execution_recovery_failed'",
+                params![execution.work_item_id, now],
+            )?;
+        }
+
         // Auto-advance the work item's kanban status to `active` so
         // the card moves into the Doing column when work begins.
         // Only applies to tasks/chores; products and projects use a

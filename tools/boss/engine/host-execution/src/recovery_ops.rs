@@ -189,6 +189,7 @@ mod tests {
             .base_fallback("used origin/main")
             .discarded_tips("bbb")
             .unrestaged_unpublished("ccc")
+            .already_contained("ddd")
             .build();
         let restore_json = serde_json::json!({
             "pointer": "preserved/exec_1",
@@ -199,12 +200,22 @@ mod tests {
             "pr_bound": true,
             "base_fallback": "used origin/main",
             "discarded_tips": "bbb",
-            "unrestaged_unpublished": "ccc"
+            "unrestaged_unpublished": "ccc",
+            "already_contained": "ddd"
         });
         assert_eq!(serde_json::to_value(&restore).unwrap(), restore_json);
         assert_eq!(
             serde_json::from_value::<recovery::RestoreReport>(restore_json).unwrap(),
             restore
+        );
+        // A report from a host that predates `already_contained` still parses.
+        let mut older = serde_json::to_value(&restore).unwrap();
+        older.as_object_mut().unwrap().remove("already_contained");
+        assert_eq!(
+            serde_json::from_value::<recovery::RestoreReport>(older)
+                .unwrap()
+                .already_contained,
+            ""
         );
     }
 

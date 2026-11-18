@@ -1786,6 +1786,9 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // An explicit retry acknowledges the failed attempt. Its run history
         // retains the explanation, while the new attempt starts without a stale
         // failure blocker. Automatic reconciliation cannot reach this clear.
+        // `execution_recovery_failed` is such a blocker: its detail describes
+        // the store as one earlier attempt found it, and this attempt checks
+        // recovery again from the store as it is now.
         super::pr_flow::withdraw_questions(conn, &work_item_id, "restarted_without_answer")?;
         let _ = clear_positioning_hold_in_tx(conn, &work_item_id, actor)?;
         crate::task_status_audit::execute(
@@ -1794,7 +1797,7 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
             actor,
             "UPDATE tasks SET status = 'todo', blocked_reason = NULL, blocked_detail = NULL,
                  last_status_actor = ?3, updated_at = ?2
-             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer', 'question_dismissed')",
+             WHERE id = ?1 AND status = 'blocked' AND blocked_reason IN ('worker_failed', 'awaiting_operator_answer', 'question_dismissed', 'execution_recovery_failed')",
             params![work_item_id, now, actor],
         )?;
 

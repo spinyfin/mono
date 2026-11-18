@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 mod preserved;
 #[cfg(test)]
+mod preserved_contained_tests;
+#[cfg(test)]
 mod preserved_quarantine_tests;
 #[cfg(test)]
 mod preserved_retry_tests;
@@ -333,10 +335,23 @@ pub struct RestoreReport {
     #[serde(default)]
     #[builder(default)]
     pub unrestaged_unpublished: String,
+    /// Preserved changes left out of `commits` because the destination
+    /// already carries their content: restaging them changed nothing.
+    #[serde(default)]
+    #[builder(default)]
+    pub already_contained: String,
 }
 
 impl RestoreReport {
     pub fn instructions(&self) -> String {
+        let contained = if self.already_contained.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nPreserved commits whose content that base already carries (not restaged):\n```text\n{}```\n",
+                self.already_contained
+            )
+        };
         let conflict_task = if self.conflicts.is_empty() {
             "The rebase completed without conflicts.".to_owned()
         } else {
@@ -366,8 +381,14 @@ impl RestoreReport {
                 self.discarded_tips
             )
         };
+        if self.commits.trim().is_empty() {
+            return format!(
+                "## EXECUTION BOOKMARK RECOVERY\n\nThe predecessor's preserved pointer `{}` holds nothing to restage onto base SHA `{}`: its changes are published or already in that history. The engine positioned this lease normally.{contained}{discarded}\n\nThe old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+                self.pointer, self.base_sha
+            );
+        }
         format!(
-            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine restaged this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n{discarded}\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+            "## EXECUTION BOOKMARK RECOVERY\n\nRestored pointer: `{}`. After fetching the upstream, the engine restaged this history onto base SHA `{}`.\n\nOriginal commits (before rebasing):\n```text\n{}```\n{discarded}{contained}\n{conflict_task}\n\n{pr_rewrite}Stay at `@` and inspect the inherited history. The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
             self.pointer, self.base_sha, self.commits
         )
     }

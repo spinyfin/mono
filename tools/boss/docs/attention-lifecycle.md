@@ -34,7 +34,7 @@ A signal can be re-raised onto an already-open row instead of getting a fresh on
 
 ## Where it runs
 
-- **Inline, on the producing path.** The fastest clear, and the one an operator actually sees: `finalize_pr_review_pass` resolves the dead-review attention as it completes, `dispatch_claimed_execution` resolves the stall attention on slot claim, `start_execution_run_on_host` clears the dispatch-failure columns in the same transaction that flips the execution to `running`.
+- **Inline, on the producing path.** The fastest clear, and the one an operator actually sees: `finalize_pr_review_pass` resolves the dead-review attention as it completes, `dispatch_claimed_execution` resolves the stall attention on slot claim, `start_execution_run_on_host` clears the dispatch-failure columns in the same transaction that flips the execution to `running`, and for an implementation run it also lifts a `blocked: execution_recovery_failed` hold with its detail (see [execution recovery pointers](execution-recovery-pointers.md#what-happens-to-the-item)).
 - **`attention_reconcile_sweep`, every 5 minutes.** The backstop, driven by the same declarative table (`WorkDb::reconcile_stale_attention_signals`). It catches what the inline paths structurally cannot: a condition that ended while a previous engine process was running, and any future code path that starts work without knowing it should clear something.
 
 Both apply the same rule, so the sweep is never doing anything the inline path would have disagreed with.

@@ -236,54 +236,46 @@ pub async fn restore_preserved(
     )
     .await?;
     let mut selected_tip = tip.clone();
+    let mut commits = commits;
+    let mut already_contained = String::new();
     if !commits.is_empty() {
         let change = log(jj, &record.repo_path, &tip, "change_id").await?;
         // Include empty connectors in the roots; exclude published history.
         let roots = format!("roots(::{tip} ~ (::remote_bookmarks() | ::{base}))");
         jj.run(workspace, &["rebase", "-s", &roots, "-d", base]).await?;
-        let evolved = log(
+        let restaged = evolved_from(jj, &record.repo_path, &change, base, &tip)
+            .await?
+            .ok_or_else(|| pointer_integrity_error("rebased preserved change has no identifiable evolution"))?;
+        let kept = drop_contained(
             jj,
-            &record.repo_path,
-            &format!("{change} & {base}::"),
-            "commit_id ++ \"\\n\"",
+            record,
+            workspace,
+            base,
+            &restaged,
+            &mut commits,
+            &mut already_contained,
         )
         .await?;
-        let mut selected = None;
-        for candidate in evolved.lines() {
-            let history = jj
-                .run(
-                    &record.repo_path,
-                    &[
-                        "--ignore-working-copy",
-                        "evolog",
-                        "--no-graph",
-                        "-r",
-                        candidate,
-                        "-T",
-                        "commit_id ++ \"\\n\"",
-                    ],
-                )
-                .await?;
-            if history.lines().any(|version| version == tip) {
-                selected = Some(candidate);
-                break;
+        match kept {
+            Some(selected) => {
+                selected_tip = selected.clone();
+                jj.run(workspace, &["edit", &selected]).await?;
+                if discard_positioning {
+                    let remaining = log(
+                        jj,
+                        &record.repo_path,
+                        &format!("present({positioned}) & empty()"),
+                        "commit_id",
+                    )
+                    .await?;
+                    if !remaining.is_empty() {
+                        jj.run(workspace, &["abandon", positioned]).await?;
+                    }
+                }
             }
-        }
-        let selected = selected
-            .ok_or_else(|| pointer_integrity_error("rebased preserved change has no identifiable evolution"))?;
-        selected_tip = selected.to_owned();
-        jj.run(workspace, &["edit", selected]).await?;
-        if discard_positioning {
-            let remaining = log(
-                jj,
-                &record.repo_path,
-                &format!("present({positioned}) & empty()"),
-                "commit_id",
-            )
-            .await?;
-            if !remaining.is_empty() {
-                jj.run(workspace, &["abandon", positioned]).await?;
-            }
+            // Everything preserved is already in the destination: the
+            // workspace stays where cube positioned it.
+            None => selected_tip = base.to_owned(),
         }
     }
     let conflicts = jj
@@ -337,8 +329,151 @@ pub async fn restore_preserved(
             .conflicts(conflicts)
             .discarded_tips(discarded.join("\n"))
             .unrestaged_unpublished(unrestaged.join("\n"))
+            .already_contained(already_contained)
             .build(),
     ))
+}
+
+/// The visible commit at or above `base` that `version` evolved into, found
+/// through the change it belongs to.
+async fn evolved_from(jj: &dyn Jj, repo: &Path, change: &str, base: &str, version: &str) -> Result<Option<String>> {
+    let evolved = log(jj, repo, &format!("{change} & {base}::"), "commit_id ++ \"\\n\"").await?;
+    for candidate in evolved.lines() {
+        let history = jj
+            .run(
+                repo,
+                &[
+                    "--ignore-working-copy",
+                    "evolog",
+                    "--no-graph",
+                    "-r",
+                    candidate,
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+            )
+            .await?;
+        if history.lines().any(|id| id == version) {
+            return Ok(Some(candidate.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Drop restaged changes whose content the destination already carries.
+///
+/// A preserved change that held work before the rebase and is empty after it
+/// added nothing to `base`: every hunk it carried is already there. That is
+/// what remains of a predecessor's commits after its PR was rewritten under
+/// new commit identities (a rebase by another revision of the same PR, with
+/// or without hunks moved between commits). Restaging such a change would
+/// hand the worker a duplicate of published history, and a later retry would
+/// read the emptied duplicate as a foreign edit of the recorded commit.
+///
+/// Containment is decided by the rebase result alone, never by name or
+/// description: a change that still differs from `base` (or conflicts with
+/// it) stays restaged and is reported as before. Returns the restaged tip to
+/// edit, or `None` when no preserved work is left above `base`. `commits`
+/// loses the dropped changes, which `contained` then names.
+async fn drop_contained(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    base: &str,
+    restaged: &str,
+    commits: &mut String,
+    contained: &mut String,
+) -> Result<Option<String>> {
+    let repo = &record.repo_path;
+    let range = format!("{base}..{restaged}");
+    let listing = log(
+        jj,
+        repo,
+        &range,
+        "commit_id ++ \" \" ++ change_id ++ \" \" ++ if(empty && !conflict, \"contained\", if(empty, \"connector\", \"work\")) ++ \"\\n\"",
+    )
+    .await?;
+    // Only changes that held work before the rebase can have been emptied by
+    // it; a commit that was already empty is a connector and stays.
+    let held_work: std::collections::HashSet<&str> = commits
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(change, _)| change))
+        .collect();
+    let mut dropped = Vec::new();
+    let mut dropped_changes = std::collections::HashSet::new();
+    let mut work_left = false;
+    for line in listing.lines() {
+        let mut fields = line.split(' ');
+        let (Some(commit), Some(change), Some(state)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if state == "contained" && held_work.contains(change) {
+            dropped.push(commit.to_owned());
+            dropped_changes.insert(change.to_owned());
+        } else if state == "work" {
+            work_left = true;
+        }
+    }
+    if dropped.is_empty() {
+        return Ok(Some(restaged.to_owned()));
+    }
+    let (kept, named): (Vec<&str>, Vec<&str>) = commits.lines().partition(|line| {
+        !line
+            .split_once(' ')
+            .is_some_and(|(change, _)| dropped_changes.contains(change))
+    });
+    *contained = named.iter().map(|line| format!("{line}\n")).collect();
+    *commits = kept.iter().map(|line| format!("{line}\n")).collect();
+    // `--retain-bookmarks` moves every name on a dropped commit to its
+    // parent, whose tree is identical because the dropped commit is empty.
+    // `preserved/<exec>` therefore stays resolvable, so a retry of this
+    // restore finds nothing left to do instead of a missing pointer.
+    if !work_left {
+        // Nothing but connectors would remain above the destination.
+        jj.run(workspace, &["abandon", "--retain-bookmarks", &range]).await?;
+        tracing::info!(
+            execution_id = %record.execution_id,
+            base,
+            contained = %contained.trim_end(),
+            "preserved work is already in the destination; nothing restaged"
+        );
+        return Ok(None);
+    }
+    // The tip to edit: the restaged tip, or what is left beneath it when the
+    // tip itself was emptied. More than one head left means the tip joined
+    // lines of work, so it stays as their connector.
+    let mut tip = restaged.to_owned();
+    if dropped.iter().any(|commit| commit == restaged) {
+        let heads = log(
+            jj,
+            repo,
+            &format!("heads(({range}) ~ ({}))", dropped.join("|")),
+            "commit_id ++ \"\\n\"",
+        )
+        .await?;
+        match heads.lines().collect::<Vec<_>>().as_slice() {
+            [head] => tip = (*head).to_owned(),
+            _ => dropped.retain(|commit| commit != restaged),
+        }
+    }
+    if dropped.is_empty() {
+        return Ok(Some(tip));
+    }
+    let change = log(jj, repo, &tip, "change_id").await?;
+    let mut abandon = vec!["abandon", "--retain-bookmarks"];
+    abandon.extend(dropped.iter().map(String::as_str));
+    jj.run(workspace, &abandon).await?;
+    tracing::info!(
+        execution_id = %record.execution_id,
+        base,
+        contained = %contained.trim_end(),
+        "preserved changes already in the destination were not restaged"
+    );
+    // Abandoning an ancestor rewrites the tip.
+    evolved_from(jj, repo, change.trim(), base, &tip)
+        .await?
+        .ok_or_else(|| pointer_integrity_error("restaged preserved change has no identifiable evolution"))
+        .map(Some)
 }
 
 /// Keep variant-selection provenance separate from integrity archives.

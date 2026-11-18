@@ -29,6 +29,7 @@ mod preserved_work;
 mod progression_pool;
 mod progression_spawn;
 mod recovery;
+mod recovery_contained;
 mod recovery_fresh_start;
 mod recovery_restage;
 mod review_batch_dispatch;
