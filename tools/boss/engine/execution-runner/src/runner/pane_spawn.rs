@@ -1310,7 +1310,21 @@ impl ExecutionRunner for PaneSpawnRunner {
         } else {
             work_item_name(work_item).to_owned()
         };
-        let title_summary = match pane_summary::derived_title_summary(&execution.kind, review_stage, &title_subject) {
+        // Derived kinds only *read* the implementer's cached summary (never
+        // write it): a review-guide run reads its owning task's slot, every
+        // other kind the slot of its own bound work item.
+        let cache_owner_id = if execution.kind == ExecutionKind::PrReviewGuide {
+            self.work_db.owning_work_item_id(&execution.work_item_id)
+        } else {
+            work_item_id(work_item).to_owned()
+        };
+        let cached_summary = pane_summary::cached_summary(&self.work_db, &cache_owner_id);
+        let title_summary = match pane_summary::derived_title_summary(
+            &execution.kind,
+            review_stage,
+            &title_subject,
+            cached_summary.as_deref(),
+        ) {
             Some(summary) => summary,
             None => pane_summary::get_or_generate(&self.work_db, utility.as_ref(), work_item).await,
         };

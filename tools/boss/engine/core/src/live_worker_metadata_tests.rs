@@ -518,6 +518,7 @@ fn review_guide_pane_without_an_owning_task_falls_back_cleanly() {
         &execution.kind,
         None,
         metadata.owning_work_item_title.as_deref().unwrap_or_default(),
+        None,
     );
     assert_eq!(title.flatten().as_deref(), Some("generating a review guide"));
     let label = crate::execution_label::label_for_execution(&db, &execution);
