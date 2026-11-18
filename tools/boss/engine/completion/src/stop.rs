@@ -707,6 +707,25 @@ impl WorkerCompletionHandler {
             return self.finalize_pr_review_pass(&execution).await;
         }
 
+        // Concrete unfinished work must not wait through the generic silence
+        // horizon, which live descendants can extend indefinitely. A durable
+        // declaration still belongs to the submit finalizer/recovery paths.
+        if !defer_finalization
+            && self.staged_unobserved_commands.has_unobserved_proposal(execution_id)
+            && matches!(self.work_db.execution_run_done_outcome(execution_id), Ok(None))
+        {
+            self.detect_and_file_unobserved_command_signal(&execution).await;
+            return self
+                .nudge_or_park(
+                    &execution,
+                    "Your turn ended with an unobserved boss propose command. Poll its existing session or cell until it exits and inspect the printed result. If it failed or the session is gone, check the proposal status and retry the submission if needed. Do not infer acceptance from your final summary. Run boss propose commands to completion, including pr-created, wait, and done; if your work is finished, submit the appropriate done outcome as your last action.",
+                    crate::nudge::PROPOSAL_OBSERVATION_FINGERPRINT,
+                    None,
+                    StopOutcome::AwaitingInput,
+                )
+                .await;
+        }
+
         // Flaky/infra retrigger park (issue #1205): a `ci_remediation`
         // worker that diagnosed the CI failure as infra and re-ran the job
         // (`mark-retriggered`) stamped the `ci_flaky_retriggered` signal on

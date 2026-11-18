@@ -12,6 +12,8 @@ use crate::nudge_breaker::NUDGE_DELIVERY_DEADLINE;
 const OVERDUE_NUDGE_DETAIL: &str = "the nudge could not be written into the worker's pane within the delivery \
      deadline after it was issued, and was withdrawn; each refused or failed attempt is in the engine log";
 
+pub(super) const PROPOSAL_OBSERVATION_FINGERPRINT: &str = "codex-unobserved-proposal";
+
 impl WorkerCompletionHandler {
     /// Generic auto-nudge gate. Records the intent to nudge `execution`
     /// against the circuit breaker (keyed by `fingerprint`, which must
@@ -48,6 +50,22 @@ impl WorkerCompletionHandler {
         bound_pr_url: Option<&str>,
         proceed_outcome: StopOutcome,
     ) -> StopOutcome {
+        let proposal_observation = fingerprint == PROPOSAL_OBSERVATION_FINGERPRINT;
+        // Retain concrete recovery before any explicit hold can return. The
+        // recurring sweep retries it after the hold clears, even without a Stop.
+        if proposal_observation {
+            self.background_children_tracker.record_intent(
+                &execution.id,
+                BackgroundNudgeIntent {
+                    probe_text: probe_text.to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                    bound_pr_url: bound_pr_url.map(str::to_owned),
+                    proceed_outcome: proceed_outcome.clone(),
+                    activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
+                    hold: NudgeHold::Debounced,
+                },
+            );
+        }
         // Operator hold (`bossctl agents hold`): the most explicit
         // suppression signal there is — a human deliberately exempted this
         // run from the idle-park sweep. Checked before every other signal
@@ -147,7 +165,9 @@ impl WorkerCompletionHandler {
         // "waiting" forever without ever finishing still eventually
         // reaches the normal nudge/park path (requirement: genuine wedge
         // detection must keep working).
-        if let Some(text) = self.read_final_triage_message(&execution.id).await.into_message()
+        // Concrete proposal recovery takes precedence over prose about a build wait.
+        if !proposal_observation
+            && let Some(text) = self.read_final_triage_message(&execution.id).await.into_message()
             && let Some(signal) = detect_build_wait_signal(&text)
         {
             let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -233,7 +253,11 @@ impl WorkerCompletionHandler {
                                 bound_pr_url: bound_pr_url.map(str::to_owned),
                                 proceed_outcome: proceed_outcome.clone(),
                                 activity_watermark: self.background_activity_probe.activity_watermark(&execution.id),
-                                hold: NudgeHold::BackgroundChildren,
+                                hold: if proposal_observation {
+                                    NudgeHold::Debounced
+                                } else {
+                                    NudgeHold::BackgroundChildren
+                                },
                             },
                         );
                         tracing::info!(
@@ -335,6 +359,9 @@ impl WorkerCompletionHandler {
                 },
             ),
             None => self.background_children_tracker.forget_intent(&execution.id),
+        }
+        if proposal_observation && Self::nudge_queued_a_probe(&outcome) {
+            self.staged_unobserved_commands.take_unobserved_proposal(&execution.id);
         }
         outcome
     }
