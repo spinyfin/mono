@@ -2006,6 +2006,11 @@ impl std::fmt::Display for UnownedOccupants {
 
 impl std::error::Error for UnownedOccupants {}
 
+/// Occupancy report produced by an owning-host scan. Defined once in
+/// `boss_worker_processes` so local cleanup, spoke `ctl_cleanup`, and hub
+/// classification share one type.
+pub use boss_worker_processes::Occupied;
+
 /// A spawn whose outcome is unknown: the host may have started the worker.
 /// The execution keeps its assignment and workspace and a retry reuses the
 /// same command, so nothing starts twice. Coordinators treat it like an

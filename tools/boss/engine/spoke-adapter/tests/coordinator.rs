@@ -379,6 +379,11 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
                     Some(refused(command, ResultCode::OutcomeUncertain, "no session"))
                 }
                 Some(command::Body::Adopt(_)) => Some(ok(command, Some(pane(PaneLife::Alive)))),
+                // The occupancy check before release is its own stop command;
+                // once the worker is gone the host answers it at once.
+                Some(command::Body::Stop(_)) if script_gone.load(Ordering::SeqCst) => {
+                    Some(ok(command, Some(pane(PaneLife::Exited))))
+                }
                 Some(command::Body::Stop(_)) => None,
                 _ => answer(command),
             }),

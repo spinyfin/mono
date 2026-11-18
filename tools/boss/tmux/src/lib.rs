@@ -17,6 +17,7 @@ pub use probe::{PaneProbe, probe_pane};
 
 pub use boss_command_runner::{CommandOutput, CommandRunner, RealCommandRunner};
 pub use boss_shell_quote::shell_quote as quote_for_shell;
+pub use boss_worker_processes::Occupied;
 pub use types::{
     DEFAULT_SEND_CHUNK_BYTES, DEFAULT_SEND_CHUNK_DELAY, DisplayField, MINIMUM_VERSION, NewSession, SERVER_LABEL,
     Session, TMUX_SPAWN_TOKEN_ENV, TmuxVersion,
@@ -863,22 +864,12 @@ impl Tmux {
     pub async fn verify_workspace_quiescent(&self, workspace: &Path) -> Result<()> {
         if self.runner.manages_host_processes() {
             let result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", &workspace.to_string_lossy()).await?;
-            // Unowned-only occupants are worded as the hub's
-            // `UnownedOccupants` report so it can apply its bounded release
-            // across the stop result; any owned or unreadable occupant keeps
-            // the plain message and the lease.
-            anyhow::ensure!(
-                !result.stray_only(),
-                "unowned workspace occupants {:?}",
-                result.occupants
-            );
-            anyhow::ensure!(
-                result.empty(),
-                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
-                result.occupants,
-                result.owners,
-                result.unknown
-            );
+            // The report stays typed so a spoke can send the occupants and
+            // their owners to the hub as data. Its message keeps the wording
+            // older hubs recognise.
+            if let Some(occupied) = boss_worker_processes::Occupied::of(&result) {
+                return Err(occupied.into());
+            }
         }
         Ok(())
     }

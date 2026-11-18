@@ -46,30 +46,52 @@ impl WorkspaceOccupancy for HostOccupancy {
             // or it now belongs to a process without that run's identity (a
             // reused PID). Unknown identities and terminal rows whose worker
             // is still alive are never signalled.
+            let mut protected_owners = std::collections::HashSet::new();
             for owner in result.owners.keys() {
                 if owner != &execution.id
                     && let Ok(old) = db.get_execution(owner)
                     && old.status.is_terminal()
-                    && db
+                {
+                    let shell_gone = if db
                         .execution_host_id(owner)
                         .is_ok_and(|host| host.is_none_or(|host| host == "local"))
-                    && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
-                    && let Ok(pid) = u32::try_from(pid)
-                    && !boss_worker_processes::shell_alive("BOSS_RUN_ID", owner, pid).await?
-                {
-                    boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
+                        && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
+                        && let Ok(pid) = u32::try_from(pid)
+                    {
+                        !boss_worker_processes::shell_alive("BOSS_RUN_ID", owner, pid).await?
+                    } else {
+                        false
+                    };
+                    if shell_gone {
+                        boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
+                    } else {
+                        protected_owners.insert(owner.clone());
+                    }
                 }
             }
             if !result.owners.is_empty() {
                 result = boss_worker_processes::cleanup("BOSS_RUN_ID", "", workspace).await?;
             }
-            if result.stray_only() && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS) {
+            let Some(report) = boss_worker_processes::Occupied::of(&result) else {
+                return Ok(Occupancy::Empty);
+            };
+            // The remote bound has no shell probe. Locally, a live shell or
+            // incomplete shell evidence must keep its surviving occupants held.
+            if report.owners.keys().any(|owner| protected_owners.contains(owner)) {
+                return Err(report.into());
+            }
+            // A scan on another host is classified by the same function, so a
+            // run id the engine has never heard of is bounded here as it is
+            // there, while a live run's processes keep the lease.
+            if let OccupantVerdict::Unowned(unowned) = classify_occupants(db, &report)
+                && settled_for(execution, UNOWNED_OCCUPANT_BOUND_SECS)
+            {
                 // Nothing in the registry owns these and they are not safe to
                 // signal. Holding the lease forever strands a 10-20 GiB
                 // workspace, so return it loudly, naming the PIDs.
                 tracing::error!(
                     execution_id = %execution.id,
-                    occupants = ?result.occupants,
+                    occupants = ?unowned,
                     "releasing workspace lease with unowned processes still in it"
                 );
                 raise_attention(
@@ -79,19 +101,12 @@ impl WorkspaceOccupancy for HostOccupancy {
                     "Workspace lease released with unowned processes inside",
                     &format!(
                         "Processes {:?} were still running in {workspace} more than {UNOWNED_OCCUPANT_BOUND_SECS} seconds after this run ended. No live run claims them, so the engine did not signal them, and the lease was returned rather than held indefinitely. Inspect them on the engine host and stop them if they are stale.",
-                        result.occupants
+                        unowned
                     ),
                 );
                 return Ok(Occupancy::Empty);
             }
-            anyhow::ensure!(
-                result.empty(),
-                "workspace occupants {:?} (owners {:?}); unreadable processes {:?}",
-                result.occupants,
-                result.owners,
-                result.unknown
-            );
-            Ok(Occupancy::Empty)
+            Err(report.into())
         }))
     }
 

@@ -1361,6 +1361,57 @@ async fn stop_signals_a_reparented_shell_that_carries_only_the_run_id() {
     assert!(exited, "the run-id-only shell was signalled by stop");
 }
 
+/// An occupant no run owns comes back as data, never as prose, and every stop
+/// scans again: once the occupant is gone a repeat stop reports an empty
+/// workspace rather than replaying the refusal.
+#[tokio::test]
+async fn stop_reports_unowned_occupants_as_data_and_rescans_on_every_stop() {
+    use std::io::BufRead;
+    let root = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeTmux::default());
+    live(&fake);
+    fake.manage_processes.store(true, std::sync::atomic::Ordering::Relaxed);
+    let supervisor = supervisor(root.path(), fake).await;
+    seed(&supervisor.store, Phase::Alive);
+    let mut stray = std::process::Command::new("python3")
+        .args([
+            "-u",
+            "-c",
+            "import os,time; os.setsid(); print('ready'); time.sleep(600)",
+        ])
+        .current_dir(root.path().join("worker"))
+        .env_remove("BOSS_RUN_ID")
+        .env_remove("BOSS_SPAWN_TOKEN")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    std::io::BufReader::new(stray.stdout.as_mut().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+
+    let held = supervisor.execute(&stop_command(), false, 1).await;
+    let Some(command_result::Value::Occupancy(report)) = &held.value else {
+        let _ = stray.kill();
+        panic!("expected a structured occupancy report: {held:?}");
+    };
+    assert_eq!(held.code, ResultCode::Rejected as i32, "{}", held.reason);
+    assert!(report.occupants.contains(&stray.id()), "{report:?}");
+    assert!(report.owners.is_empty() && report.unreadable.is_empty(), "{report:?}");
+    assert!(
+        stray.try_wait().unwrap().is_none(),
+        "unowned processes are never signalled"
+    );
+
+    let _ = stray.kill();
+    let _ = stray.wait();
+    let mut again = stop_command();
+    again.command_id = "stop-2".into();
+    let empty = supervisor.execute(&again, false, 2).await;
+    assert_eq!(empty.code, ResultCode::Ok as i32, "{}", empty.reason);
+    assert!(empty.value.is_some() && !matches!(empty.value, Some(command_result::Value::Occupancy(_))));
+}
+
 #[tokio::test]
 async fn stop_reclaims_the_run_home() {
     let root = tempfile::tempdir().unwrap();

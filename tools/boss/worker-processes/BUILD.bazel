@@ -13,6 +13,7 @@ rust_library(
         "//tools/boss/engine/app:__pkg__",
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/core/runtime:__pkg__",
+        "//tools/boss/engine/execution-contracts:__pkg__",
         "//tools/boss/engine/worker-bin:__pkg__",
         "//tools/boss/tmux:__pkg__",
     ],

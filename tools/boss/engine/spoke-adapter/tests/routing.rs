@@ -756,6 +756,79 @@ async fn a_spoke_reporting_only_unowned_occupants_yields_the_typed_report() {
     );
 }
 
+fn occupancy_report(
+    c: &Command,
+    occupants: &[u32],
+    owners: &[(&str, &[u32])],
+) -> boss_protocol_spoke::v1::CommandResult {
+    use boss_protocol_spoke::v1::{PidList, WorkspaceOccupancy, command_result};
+    let mut result = refused(c, ResultCode::Rejected, "workspace occupants");
+    result.value = Some(command_result::Value::Occupancy(WorkspaceOccupancy {
+        occupants: occupants.to_vec(),
+        unreadable: vec![],
+        owners: owners
+            .iter()
+            .map(|(owner, pids)| ((*owner).to_owned(), PidList { pids: pids.to_vec() }))
+            .collect(),
+    }));
+    result
+}
+
+/// An occupancy check is a new command every time. A stop that succeeded once
+/// must not be replayed as proof the workspace is still empty.
+#[tokio::test]
+async fn a_second_occupancy_check_is_a_new_command_and_sees_new_occupants() {
+    let fx = Fixture::new().await;
+    fx.ready(HOST);
+    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+    let mut stops = 0;
+    let peer = fx
+        .spoke(
+            Box::new(move |c| match &c.body {
+                Some(command::Body::Stop(_)) => {
+                    stops += 1;
+                    Some(match stops {
+                        1 => ok(c, Some(pane(PaneLife::Exited))),
+                        2 => occupancy_report(c, &[4242, 4243], &[("exec_unknown", &[4243])]),
+                        _ => ok(c, Some(pane(PaneLife::Exited))),
+                    })
+                }
+                _ => standard(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    lease(&adapter).await;
+    spawn(&adapter).await.unwrap();
+    let workspace = Path::new(PATH);
+    assert_eq!(
+        adapter.cleanup_execution_processes("exec_1", workspace).await.unwrap(),
+        boss_execution_contracts::Occupancy::Empty
+    );
+    let occupied = adapter
+        .cleanup_execution_processes("exec_1", workspace)
+        .await
+        .unwrap_err();
+    let report = occupied
+        .downcast_ref::<boss_execution_contracts::Occupied>()
+        .expect("the host's report arrives as data");
+    assert_eq!(report.unowned(), vec![4242]);
+    assert_eq!(report.owners["exec_unknown"], vec![4243]);
+    assert_eq!(
+        adapter.cleanup_execution_processes("exec_1", workspace).await.unwrap(),
+        boss_execution_contracts::Occupancy::Empty,
+        "once the occupants are gone the next check is empty"
+    );
+    let ids: std::collections::BTreeSet<_> = peer
+        .commands()
+        .into_iter()
+        .filter(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        .map(|c| c.command_id)
+        .collect();
+    assert_eq!(ids.len(), 3, "each check sent its own command: {ids:?}");
+}
+
 #[tokio::test]
 async fn a_replacement_stop_is_reused_until_it_settles() {
     let fx = Fixture::with(short(400)).await;
