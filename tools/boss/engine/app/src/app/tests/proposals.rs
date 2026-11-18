@@ -26,6 +26,7 @@ use boss_protocol::{
 };
 use serde_json::{Value, json};
 
+mod gated_answer;
 mod review_guide_loop;
 
 fn operator_question_payload() -> Value {
@@ -68,6 +69,7 @@ async fn answer_question(state: &Arc<ServerState>, id: &str, value: bool) -> Fro
         state,
         None,
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: id.into(),
             answer: boss_protocol::OperatorAnswer::YesNo { value },
         },

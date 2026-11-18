@@ -381,7 +381,21 @@ enum WorkBlockedBadge {
     static func badgeText(for task: WorkTask) -> String? {
         guard task.status == "blocked" else { return nil }
         guard let reason = task.blockedReason else { return "Blocked" }
+        if isAnsweredAndWaiting(task), let detail = task.blockedDetail { return detail }
         return label(forReason: reason)
+    }
+
+    /// Prefix the engine stamps on `blockedDetail` when an operator's answer
+    /// parked the row behind its prerequisites; the rest names them.
+    static let answeredWaitingPrefix = "Answered · waits for "
+
+    /// `true` for a dependency-blocked row whose operator question was
+    /// answered and which now waits on its gating prerequisites. The engine
+    /// persists this in `blockedDetail`, so it survives a relaunch.
+    static func isAnsweredAndWaiting(_ task: WorkTask) -> Bool {
+        task.status == "blocked"
+            && task.blockedReason == "dependency"
+            && (task.blockedDetail?.hasPrefix(answeredWaitingPrefix) ?? false)
     }
 
     /// Tooltip content for the blocked pill: the verbatim, untransformed

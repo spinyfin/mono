@@ -1,3 +1,4 @@
+use super::prerequisite_question::RestartOptions;
 use super::*;
 
 #[path = "question_dismissal.rs"]
@@ -2555,7 +2556,14 @@ impl WorkDb {
         answer: OperatorAnswer,
         pr_checker: &dyn PrStateChecker,
     ) -> Result<OperatorAnswerOutcome> {
-        self.answer_operator_question_from(id, answer, pr_checker, boss_protocol::LAST_STATUS_ACTOR_HUMAN, None)
+        self.answer_operator_question_from(
+            id,
+            answer,
+            pr_checker,
+            boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+            None,
+            false,
+        )
     }
 
     /// [`Self::answer_operator_question_with`] with the resolved caller so an
@@ -2567,6 +2575,7 @@ impl WorkDb {
         pr_checker: &dyn PrStateChecker,
         actor: &str,
         provenance: Option<&str>,
+        suppress_start: bool,
     ) -> Result<OperatorAnswerOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2661,7 +2670,7 @@ impl WorkDb {
                         choice: &value,
                         pr_checker,
                         answered_at,
-                        now: &now,
+                        restart: RestartOptions::new(&now, suppress_start),
                     },
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
@@ -2708,7 +2717,7 @@ impl WorkDb {
                     &task,
                     &question.question,
                     &block,
-                    &now,
+                    RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
             }
@@ -2721,7 +2730,7 @@ impl WorkDb {
                     &task,
                     &question.question,
                     &block,
-                    &now,
+                    RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
             }
@@ -2740,7 +2749,7 @@ impl WorkDb {
                     &task,
                     &question.question,
                     &block,
-                    &now,
+                    RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
             }
@@ -2753,7 +2762,7 @@ impl WorkDb {
                     &task,
                     &question.question,
                     &block,
-                    &now,
+                    RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
             }
@@ -2794,7 +2803,7 @@ pub(super) fn restart_after_answer(
         task,
         question,
         block,
-        now,
+        RestartOptions::new(now, false),
         crate::task_status_audit::WriteAttribution {
             actor: boss_protocol::LAST_STATUS_ACTOR_HUMAN,
             provenance: None,
@@ -2821,9 +2830,10 @@ pub(super) fn restart_after_answer_from(
     task: &Task,
     question: &OperatorQuestionView,
     block: &str,
-    now: &str,
+    options: RestartOptions<'_>,
     attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<bool> {
+    let RestartOptions { now, suppress_start } = options;
     let description = format!("{}{block}", task.description);
     super::description_guard::validate_description_update(&task.description, &description, false)?;
     let actor = attribution.actor;
@@ -2864,6 +2874,12 @@ pub(super) fn restart_after_answer_from(
         } else {
             super::prerequisite_question::queue_gated_execution(tx, &task, question)?;
         }
+        super::prerequisite_question::stamp_answered_waiting(tx, &task.id)?;
+        return Ok(false);
+    }
+    if suppress_start {
+        // The answer is recorded and the brief carries it; the caller asked for
+        // no explicit start, so the normal scheduler decides when it runs.
         return Ok(false);
     }
     let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;

@@ -17,6 +17,7 @@
 //!    archives it and mints a port-sized revision on the same PR. Either way the
 //!    attempt's `architectural_mismatch` exit is closed.
 
+use super::prerequisite_question::RestartOptions;
 use super::*;
 use rusqlite::{Transaction, TransactionBehavior};
 
@@ -380,7 +381,8 @@ pub(super) struct Answer<'a> {
     pub choice: &'a str,
     pub pr_checker: &'a dyn PrStateChecker,
     pub answered_at: chrono::DateTime<chrono::Utc>,
-    pub now: &'a str,
+    /// The answer time and whether to skip the explicit start.
+    pub restart: RestartOptions<'a>,
 }
 
 /// Apply the repo owner's choice for `answer.attempt_id`, inside the answer
@@ -398,8 +400,9 @@ pub(super) fn answer_in_tx(
         choice,
         pr_checker,
         answered_at,
-        now,
+        restart,
     } = *answer;
+    let RestartOptions { now, suppress_start } = restart;
     let attempt = query_conflict_resolution(tx, attempt_id).require("conflict resolution", attempt_id)?;
     let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
     tx.execute(
@@ -410,11 +413,13 @@ pub(super) fn answer_in_tx(
         CONFLICT_MISMATCH_CHOICE_FORCE_MERGE => {
             let block = force_merge_block(question, &timestamp);
             let minted_execution =
-                super::pr_flow::restart_after_answer_from(pending, tx, asker, question, &block, now, attribution)?;
-            mark_operator_forced_admission_in_tx(tx, &asker.id)?;
+                super::pr_flow::restart_after_answer_from(pending, tx, asker, question, &block, restart, attribution)?;
+            if !suppress_start {
+                mark_operator_forced_admission_in_tx(tx, &asker.id)?;
+            }
             Ok(AnswerEffect {
                 touched: vec![asker.id.clone()],
-                dispatch: Some(asker.id.clone()),
+                dispatch: (!suppress_start).then(|| asker.id.clone()),
                 minted_execution,
             })
         }
@@ -458,10 +463,12 @@ pub(super) fn answer_in_tx(
                 "UPDATE conflict_resolutions SET revision_task_id = ?2 WHERE id = ?1",
                 params![attempt_id, port.id],
             )?;
-            mark_operator_forced_admission_in_tx(tx, &port.id)?;
+            if !suppress_start {
+                mark_operator_forced_admission_in_tx(tx, &port.id)?;
+            }
             Ok(AnswerEffect {
                 touched: vec![asker.id.clone(), port.id.clone()],
-                dispatch: Some(port.id),
+                dispatch: (!suppress_start).then_some(port.id),
                 minted_execution: false,
             })
         }

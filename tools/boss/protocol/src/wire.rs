@@ -216,6 +216,11 @@ pub enum FrontendRequest {
     AnswerOperatorQuestion {
         id: String,
         answer: crate::OperatorAnswer,
+        /// Record the answer without requesting an explicit start or launching
+        /// the answered work; the scheduler dispatches it under its normal
+        /// pause and admission rules (`boss task answer --no-autostart`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        suppress_start: bool,
     },
 
     /// Heuristic feedback-loop audit (design §Q4 follow-up, PR #370).

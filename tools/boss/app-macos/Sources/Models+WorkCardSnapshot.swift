@@ -327,6 +327,7 @@ struct WorkCardSnapshot: Equatable {
         let blockedBadgeHasMoreInfo = WorkBlockedBadge.hasMoreInfo(for: task)
         let isDependencyBlockedBadge = blockedBadgeText
             == WorkBlockedBadge.label(forReason: "dependency")
+            || WorkBlockedBadge.isAnsweredAndWaiting(task)
 
         let conflictClearedBadgeVisible = WorkBlockedBadge.conflictClearedVisible(
             forTask: task,

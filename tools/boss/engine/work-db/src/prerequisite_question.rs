@@ -296,6 +296,7 @@ fn park_behind(
     )?;
     add_dependency_edge_in_tx(pending, conn, &task.id, &prerequisite.id, RELATION_BLOCKS, now)?;
     queue_gated_execution(conn, task, question)?;
+    stamp_answered_waiting(conn, &task.id)?;
     tracing::info!(
         work_item_id = %task.id,
         prerequisite_id = %prerequisite.id,
@@ -380,6 +381,43 @@ fn order_project_prerequisites(conn: &Connection, task: &Task, prerequisite: &Ta
             )?;
         }
     }
+    Ok(())
+}
+
+/// Per-answer knobs for [`restart_after_answer_from`].
+#[derive(Clone, Copy)]
+pub(super) struct RestartOptions<'a> {
+    pub now: &'a str,
+    /// Record the answer but never request an explicit start for the task.
+    pub suppress_start: bool,
+}
+
+impl<'a> RestartOptions<'a> {
+    pub(super) fn new(now: &'a str, suppress_start: bool) -> Self {
+        Self { now, suppress_start }
+    }
+}
+
+/// Prefix of the `blocked_detail` that marks a parked task whose question is
+/// answered and which now waits on its gating prerequisites. The board card
+/// reads it to show "Answered · waits for <prerequisite>".
+const ANSWERED_WAITING_DETAIL_PREFIX: &str = "Answered · waits for ";
+
+/// After an answer parks `task_id` behind its gating prerequisites, record that
+/// it is answered and waiting, naming the prerequisites. No-op unless the task
+/// is parked `blocked` / `dependency`; the detail clears with the block.
+pub(super) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result<()> {
+    let names = deps::gating_prereqs_for(conn, task_id)?
+        .iter()
+        .map(|id| Ok(query_task(conn, id)?.map_or_else(|| id.clone(), |prerequisite| prerequisite.name)))
+        .collect::<Result<Vec<_>>>()?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE tasks SET blocked_detail = ?2 WHERE id = ?1 AND status = 'blocked' AND blocked_reason = 'dependency'",
+        params![task_id, format!("{ANSWERED_WAITING_DETAIL_PREFIX}{}", names.join(", "))],
+    )?;
     Ok(())
 }
 

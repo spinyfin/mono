@@ -307,6 +307,7 @@ async fn answer(parked: &Parked, choice: &str) -> FrontendEvent {
     handle_operator_question(
         ctx,
         FrontendRequest::AnswerOperatorQuestion {
+            suppress_start: false,
             id: parked.revision_id.clone(),
             answer: OperatorAnswer::MultipleChoice {
                 value: choice.to_owned(),

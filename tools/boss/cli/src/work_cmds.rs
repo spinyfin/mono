@@ -909,6 +909,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                         Some(value) => boss_protocol::OperatorAnswer::MultipleChoice { value },
                         None => boss_protocol::OperatorAnswer::YesNo { value: args.yes },
                     },
+                    suppress_start: ctx.no_autostart,
                 })
                 .await
                 .map_err(CliError::internal)?;
