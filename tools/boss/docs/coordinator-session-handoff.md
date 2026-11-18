@@ -35,6 +35,10 @@ Each persisted handoff has a unique `write_id`, so an earlier write cannot satis
 
 The transcript cursor is captured before sending the frame, so completion before delivery confirmation or between reads is retained. The lifecycle lock protects validation and frame send, then is released before awaiting confirmation. Recreation rechecks the spawn token under the lock. Dead or missing sessions skip delivery.
 
+Both lock acquisitions in a reset are bounded by `LOCK_WAIT_TIMEOUT` (10 s): the delivery phase (validate and send the request) and the recreation phase (replace the session). If a competing lifecycle operation, such as supervisor recovery or an app-registration attach, holds the lock longer than that, the reset fails with `coordinator lifecycle busy; try again` and records `coordinator_reset_lock_wait_timeout` with a `phase` of `delivery` or `recreation`, the spawn token and `waited_ms`. This error deliberately does not begin with `coordinator did not receive the handoff request`, so the app does not offer "Reset anyway (no fresh handoff)": a forced reset would only queue behind the same lock. The session stays running and the operator retries. The missing-handoff warning ("Restarting with potentially missing context") is sent only after the recreation lock is held, so a restart that is refused as busy is never announced first.
+
+Resolving which tmux server hosts the coordinator is bounded too. If the durable socket already has the coordinator session, the retired `-L boss` server is not probed at all. Otherwise the legacy probe is limited to `LEGACY_SESSION_PROBE_TIMEOUT` (2 s); a timeout counts as a probe error, the session is assumed absent from the legacy server, and the durable socket is used. A hung retired server therefore cannot stall lifecycle calls made while holding the lifecycle lock.
+
 The handoff is written by the coordinator session itself. The engine never synthesizes one from logs or transcripts.
 
 ### Write authorization

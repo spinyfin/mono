@@ -544,3 +544,31 @@ fn handoff_request_expires_after_delivery_deadline() {
     );
     assert!(prompt.contains("ignore it"), "{prompt}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_lifecycle_lock_held_too_long_fails_the_reset_loudly_instead_of_stalling() {
+    let (db, tmux, server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let lock = tokio::sync::Mutex::new(());
+    // A competing lifecycle operation (supervisor restart, app attach) never lets go.
+    let _competing = lock.lock().await;
+    let written = Notify::new();
+    let error = tokio::time::timeout(
+        crate::coordinator_tmux::reset_handoff::LOCK_WAIT_TIMEOUT + Duration::from_secs(1),
+        request_and_wait(&db, &tmux, &lock, &written, "token", false, Duration::from_secs(30)),
+    )
+    .await
+    .expect("the wait for the lock is bounded")
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("lifecycle busy"), "{message}");
+    assert!(
+        !message.contains(crate::coordinator_tmux::reset_handoff::DELIVERY_FAILED_PREFIX),
+        "contention must not offer a futile forced reset: {message}"
+    );
+    assert!(
+        server.calls().is_empty(),
+        "nothing touched the session: {:?}",
+        server.calls()
+    );
+}

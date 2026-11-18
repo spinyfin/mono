@@ -18,6 +18,8 @@ use boss_protocol::CoordinatorRecreateReason;
 
 const TOKEN: &str = "token";
 
+mod latency;
+
 /// Models a live coordinator tmux server: answers the read-only probes,
 /// records every call, and adopts the spawn token of a `new-session` so a
 /// replacement is observable the way a real server would show it.
@@ -38,6 +40,8 @@ struct DeliveryFaults {
     /// `deliver_accepted` accepts the frame but its confirmation never
     /// resolves, the way a held or lost frame would.
     hold_confirmation: bool,
+    /// How long any command addressed to the retired `-L boss` server hangs.
+    legacy_delay: Duration,
 }
 
 impl Default for LiveCoordinatorRunner {
@@ -58,6 +62,12 @@ impl CommandRunner for LiveCoordinatorRunner {
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         let mut success = true;
         let mut stderr = String::new();
+        if args.first().map(String::as_str) == Some("-L") {
+            let delay = self.faults.lock().unwrap().legacy_delay;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
         let stdout = match args.get(2).map(String::as_str) {
             Some("list-sessions") => "boss-coordinator\t\n".to_owned(),
             Some("show-environment") => format!("BOSS_SPAWN_TOKEN={}\n", self.token.lock().unwrap()),

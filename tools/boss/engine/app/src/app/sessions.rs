@@ -172,7 +172,8 @@ pub(super) async fn attach_coordinator_to_registered_app(server_state: Arc<Serve
             return;
         }
     };
-    let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+    let legacy_tmux =
+        boss_tmux::Tmux::for_legacy_label_server_with_runner(tmux.program().to_path_buf(), tmux.runner()).ok();
     let working_directory = match server_state.coordinator_session_directory() {
         Ok(path) => path,
         Err(error) => {
@@ -765,7 +766,8 @@ impl CoordinatorReset {
             reason,
             force_without_handoff,
         } = self;
-        let legacy_tmux = boss_tmux::Tmux::for_legacy_label_server(tmux.program().to_path_buf()).ok();
+        let legacy_tmux =
+            boss_tmux::Tmux::for_legacy_label_server_with_runner(tmux.program().to_path_buf(), tmux.runner()).ok();
         let replacement = {
             // The lifecycle lock is held only for the validate-and-send phase
             // inside `request_and_wait`, so the supervisor stays free to recover
@@ -798,6 +800,27 @@ impl CoordinatorReset {
                     return;
                 }
             };
+            // Take the recreation lock before warning the operator: a restart
+            // that is then refused as busy must never have been announced.
+            let _guard = match boss_engine_runtime::coordinator_tmux::reset_handoff::acquire_lifecycle_lock(
+                &server_state.coordinator_tmux_lock,
+                &expected_spawn_token,
+                "recreation",
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::Error {
+                            message: format!("recreate_coordinator: {error:#}"),
+                        },
+                    );
+                    return;
+                }
+            };
             if !fresh_handoff && !force_without_handoff {
                 send_response(
                     &sink,
@@ -810,7 +833,6 @@ impl CoordinatorReset {
                     },
                 );
             }
-            let _guard = server_state.coordinator_tmux_lock.lock().await;
             let active_tmux =
                 boss_engine_runtime::coordinator_tmux::resolve_active_handle(&tmux, legacy_tmux.as_ref()).await;
             boss_engine_runtime::coordinator_tmux::recreate_after_confirmation(
