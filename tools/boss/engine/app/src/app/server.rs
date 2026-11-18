@@ -1860,12 +1860,14 @@ async fn serve_scoped(
         .event_bus
         .subscribe(TopicFilter::kind(EventKind::ExecutionTerminal));
     let _terminal_work_sweep_handle = boss_engine_runtime::terminal_work_sweep::spawn_loop(
-        server_state.work_db.clone(),
-        server_state.live_worker_states.clone(),
-        Arc::clone(&server_state) as Arc<dyn boss_engine_runtime::terminal_work_sweep::WorkerReaper>,
-        server_state.cube_client.clone(),
-        server_state.dispatch_events.clone(),
-        server_state.teardown_registry.clone(),
+        boss_engine_runtime::terminal_work_sweep::SweepContext {
+            work_db: server_state.work_db.clone(),
+            live_states: server_state.live_worker_states.clone(),
+            reaper: Arc::clone(&server_state) as Arc<dyn boss_engine_runtime::terminal_work_sweep::WorkerReaper>,
+            cube_client: server_state.cube_client.clone(),
+            dispatch_events: server_state.dispatch_events.clone(),
+            teardown_registry: server_state.teardown_registry.clone(),
+        },
         boss_engine_runtime::terminal_work_sweep::DEFAULT_INTERVAL,
         terminal_work_execution_terminal_events,
     );

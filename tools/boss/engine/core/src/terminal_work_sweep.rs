@@ -155,11 +155,7 @@ use boss_execution_contracts::CubeClient;
 /// confirmation delay before a strand is reaped.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Once an `ExecutionTerminal` event triggers an out-of-cycle pass, further
-/// events are absorbed for this long before another out-of-cycle pass runs —
-/// mirrors the merge poller's kick-quiesce window so a burst of terminations
-/// can't turn into a hot loop of full passes. The periodic `interval` tick
-/// remains the backstop regardless.
+/// Minimum retry spacing for one execution while teardown owns it.
 const EVENT_QUIESCE: Duration = Duration::from_secs(5);
 
 /// Tears down a live worker pane bound to a run id. Implemented by
@@ -227,35 +223,22 @@ impl crate::sweep_loop::SweepOutcome for TerminalWorkSweepOutcome {
     }
 }
 
-/// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
-/// threading the cross-pass candidate set (each candidate's first-seen
-/// timestamp) so the elapsed-time confirmation guard survives between
-/// passes.
-///
-/// Also subscribes to `ExecutionTerminal` events via
-/// [`crate::sweep_loop::spawn_sweep_loop_with_events`]: receiving one runs an
-/// out-of-cycle pass right away (subject to [`EVENT_QUIESCE`]) instead of
-/// waiting out the rest of `interval`. This still goes through the same
-/// [`run_one_pass`] and shared `seen_terminal` map as the periodic tick, and
-/// `run_one_pass` always requires a full [`DEFAULT_INTERVAL`] of WALL-CLOCK
-/// time (via [`crate::sweep_loop::confirm_after_delay`]) before treating a
-/// candidate as confirmed — so an out-of-cycle pass can only notice a
-/// confirmed strand sooner once that time has genuinely elapsed, never
-/// shorten the delay itself. The periodic tick remains the backstop: a
-/// dropped or coalesced event never leaves a strand unreconciled for longer
-/// than `interval`.
-// Every parameter is a distinct collaborator `run_one_pass` needs threaded
-// through unchanged (mirrors the precedent in `live_worker_state.rs` /
-// `spawn_ack_sweep.rs`); bundling them into a struct would only move the
-// field count, not reduce it.
-#[allow(clippy::too_many_arguments)]
+/// Collaborators shared by targeted and full terminal-work passes.
+#[derive(Clone, bon::Builder)]
+#[builder(on(String, into))]
+pub struct SweepContext {
+    pub work_db: Arc<WorkDb>,
+    pub live_states: Arc<LiveWorkerStateRegistry>,
+    pub reaper: Arc<dyn WorkerReaper>,
+    pub cube_client: Arc<dyn CubeClient>,
+    pub dispatch_events: Arc<dyn DispatchEventSink>,
+    pub teardown_registry: Arc<TeardownRegistry>,
+}
+
+/// Run periodic full passes and targeted terminal-event reconciles using
+/// the same teardown ownership and elapsed-time confirmation guards.
 pub fn spawn_loop(
-    work_db: Arc<WorkDb>,
-    live_states: Arc<LiveWorkerStateRegistry>,
-    reaper: Arc<dyn WorkerReaper>,
-    cube_client: Arc<dyn CubeClient>,
-    dispatch_events: Arc<dyn DispatchEventSink>,
-    teardown_registry: Arc<TeardownRegistry>,
+    context: SweepContext,
     interval: Duration,
     execution_terminal_events: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
@@ -271,47 +254,71 @@ pub fn spawn_loop(
         EVENT_QUIESCE,
         execution_terminal_events,
         "terminal-work sweep",
-        move || {
-            crate::sweep_metrics::TERMINAL_WORK_SWEEP.record_tick(work_db.metrics_registry(), &mut previous_pass);
-            let work_db = Arc::clone(&work_db);
-            let live_states = Arc::clone(&live_states);
-            let reaper = Arc::clone(&reaper);
-            let cube_client = Arc::clone(&cube_client);
-            let dispatch_events = Arc::clone(&dispatch_events);
-            let teardown_registry = Arc::clone(&teardown_registry);
+        move |execution_id| {
+            crate::sweep_metrics::TERMINAL_WORK_SWEEP
+                .record_tick(context.work_db.metrics_registry(), &mut previous_pass);
+            let context = context.clone();
             let seen_terminal = Arc::clone(&seen_terminal);
             async move {
                 let mut seen_terminal = seen_terminal.lock().await;
-                // The candidate-gathering phase is synchronous SQLite work (one
-                // execution point-read per live slot plus one batched status
-                // read); keep it off the async worker threads so a slow pass
-                // cannot stall the runtime's other tasks. The reap phase that
-                // follows awaits the reaper / cube client and stays async.
-                let gather_db = Arc::clone(&work_db);
+                let gather_context = context.clone();
+                let target = execution_id.clone();
                 let gathered = crate::work::db_diagnostics::spawn_blocking(move || {
-                    gather_reap_candidates(gather_db.as_ref(), live_states.as_ref(), teardown_registry.as_ref())
+                    gather_filtered_candidates(
+                        &gather_context.work_db,
+                        &gather_context.live_states,
+                        &gather_context.teardown_registry,
+                        target.as_deref(),
+                    )
                 })
                 .await;
                 let gathered = match gathered {
                     Ok(gathered) => gathered,
                     Err(err) => {
                         tracing::error!(?err, "terminal-work sweep: candidate gathering did not complete");
-                        return TerminalWorkSweepOutcome::default();
+                        return (TerminalWorkSweepOutcome::default(), execution_id.map(|_| interval));
                     }
                 };
-                reap_confirmed_candidates(
+                // A targeted lookup must not erase another execution's clock.
+                let mut target_seen = HashMap::new();
+                let seen = if let Some(id) = &execution_id {
+                    if let Some(first) = seen_terminal.remove(id) {
+                        target_seen.insert(id.clone(), first);
+                    }
+                    &mut target_seen
+                } else {
+                    &mut *seen_terminal
+                };
+                let outcome = reap_confirmed_candidates(
                     gathered,
-                    work_db.as_ref(),
-                    reaper.as_ref(),
-                    cube_client.as_ref(),
-                    dispatch_events.as_ref(),
-                    &mut seen_terminal,
+                    &context.work_db,
+                    context.reaper.as_ref(),
+                    context.cube_client.as_ref(),
+                    context.dispatch_events.as_ref(),
+                    seen,
                     interval,
                 )
-                .await
+                .await;
+                let retry = execution_id.as_ref().and_then(|id| {
+                    if let Some(first) = target_seen.get(id) {
+                        Some(interval.saturating_sub(first.elapsed()))
+                    } else if outcome.teardown_in_flight_skipped + outcome.lookup_failed_skipped > 0 {
+                        Some(EVENT_QUIESCE)
+                    } else {
+                        None
+                    }
+                });
+                seen_terminal.extend(target_seen);
+                (outcome, retry)
             }
         },
     )
+}
+
+/// Per-pass confirmation memory and the minimum observation duration.
+pub struct Confirmation<'a> {
+    pub seen: &'a mut HashMap<String, tokio::time::Instant>,
+    pub min_delay: Duration,
 }
 
 /// Run a single terminal-work reconciliation pass over every live worker
@@ -325,9 +332,6 @@ pub fn spawn_loop(
 /// [`DEFAULT_INTERVAL`] as `min_confirm_delay` in production; tests may pass
 /// a different value together with a paused [`tokio::time`] clock. Returns a
 /// summary; callers may log it.
-// See the `#[allow]` on `spawn_loop` above: each parameter is a distinct
-// collaborator, not incidental plumbing.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -335,9 +339,12 @@ pub async fn run_one_pass(
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
     teardown_registry: &TeardownRegistry,
-    seen_terminal: &mut HashMap<String, tokio::time::Instant>,
-    min_confirm_delay: Duration,
+    confirmation: Confirmation<'_>,
 ) -> TerminalWorkSweepOutcome {
+    let Confirmation {
+        seen: seen_terminal,
+        min_delay: min_confirm_delay,
+    } = confirmation;
     let gathered = gather_reap_candidates(work_db, live_states, teardown_registry);
     reap_confirmed_candidates(
         gathered,
@@ -369,19 +376,29 @@ pub(crate) fn gather_reap_candidates(
     live_states: &LiveWorkerStateRegistry,
     teardown_registry: &TeardownRegistry,
 ) -> GatheredCandidates {
+    gather_filtered_candidates(work_db, live_states, teardown_registry, None)
+}
+
+fn gather_filtered_candidates(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    teardown_registry: &TeardownRegistry,
+    execution_id: Option<&str>,
+) -> GatheredCandidates {
     let registry = work_db.metrics_registry();
     let timer = crate::sweep_metrics::TERMINAL_WORK_SWEEP.begin();
     let mut outcome = TerminalWorkSweepOutcome::default();
-    if let Err(err) =
-        work_db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|id| {
-            crate::durable_liveness::probe_execution_worker_within(
-                work_db,
-                id,
-                crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
-                boss_engine_utils::epoch_time::now_epoch_secs(),
-            )
-            .is_alive()
-        })
+    if execution_id.is_none()
+        && let Err(err) =
+            work_db.reconcile_pr_review_guide_attempts_with_live_runs(&std::collections::HashSet::new(), &|id| {
+                crate::durable_liveness::probe_execution_worker_within(
+                    work_db,
+                    id,
+                    crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                    boss_engine_utils::epoch_time::now_epoch_secs(),
+                )
+                .is_alive()
+            })
     {
         tracing::warn!(?err, "terminal-work sweep: review-guide attempt reconcile failed",);
     }
@@ -394,7 +411,11 @@ pub(crate) fn gather_reap_candidates(
     // turns these into the confirmed/pending partitions below.
     let mut candidates: Vec<(String, ReapCandidate)> = Vec::new();
 
-    let states = live_states.snapshot();
+    let states: Vec<_> = live_states
+        .snapshot()
+        .into_iter()
+        .filter(|state| execution_id.is_none_or(|id| id == state.run_id))
+        .collect();
     let items = states.len();
     let mut slots = Vec::with_capacity(states.len());
     for state in states {
@@ -1008,6 +1029,8 @@ mod tests {
         (dir, Arc::new(db), product_id)
     }
 
+    mod events;
+
     // ─── tests ───────────────────────────────────────────────────────────────
 
     /// The O'Brien regression: a live worker whose WORK ITEM is `done` (its
@@ -1041,8 +1064,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
@@ -1061,8 +1086,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(immediate.reaped, 0, "no reap before the confirmation delay has elapsed");
@@ -1078,8 +1105,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(
@@ -1104,8 +1133,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(third.reaped, 0);
@@ -1143,8 +1174,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 &teardown,
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             assert_eq!(
@@ -1187,8 +1220,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
@@ -1203,8 +1238,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
@@ -1247,8 +1284,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 &teardown,
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             assert_eq!(outcome.reaped, 0);
@@ -1289,8 +1328,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         tokio::time::advance(DEFAULT_INTERVAL).await;
@@ -1301,8 +1342,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
 
@@ -1350,8 +1393,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 &teardown,
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             let second = run_one_pass(
@@ -1361,8 +1406,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 &teardown,
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             assert_eq!(first.active_skipped, 1, "{state} answer agent must be ignored");
@@ -1470,8 +1517,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
@@ -1490,8 +1539,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
@@ -1561,8 +1612,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 &teardown,
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             assert_eq!(outcome.reaped, 0);
@@ -1602,8 +1655,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 &teardown,
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             assert_eq!(outcome.reaped, 0, "active worker must never be reaped");
@@ -1641,8 +1696,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(first.pending_confirmation, 1);
@@ -1657,8 +1714,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(second.reaped, 0, "reverted candidate must not be reaped");
@@ -1690,8 +1749,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 &teardown,
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             assert_eq!(outcome.reaped, 0);
@@ -1728,8 +1789,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await; // record
         tokio::time::advance(DEFAULT_INTERVAL).await;
@@ -1740,8 +1803,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await; // reap
         let p3 = run_one_pass(
@@ -1751,8 +1816,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await; // retry
 
@@ -1795,8 +1862,10 @@ mod tests {
                 &cube,
                 sink.as_ref(),
                 teardown.as_ref(),
-                &mut seen,
-                DEFAULT_INTERVAL,
+                Confirmation {
+                    seen: &mut seen,
+                    min_delay: DEFAULT_INTERVAL,
+                },
             )
             .await;
             assert_eq!(
@@ -1824,8 +1893,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             teardown.as_ref(),
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(first.reaped, 0, "the confirmation clock restarts after the mark clears");
@@ -1838,8 +1909,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             teardown.as_ref(),
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(
@@ -1879,8 +1952,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             teardown.as_ref(),
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(first.teardown_in_flight_skipped, 0, "an overrun mark stops protecting");
@@ -1893,8 +1968,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             teardown.as_ref(),
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(second.reaped, 1, "a wedged teardown must still be reclaimable");
@@ -1932,8 +2009,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(
@@ -1949,8 +2028,10 @@ mod tests {
             &cube,
             sink.as_ref(),
             &teardown,
-            &mut seen,
-            DEFAULT_INTERVAL,
+            Confirmation {
+                seen: &mut seen,
+                min_delay: DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(second.reaped, 1);

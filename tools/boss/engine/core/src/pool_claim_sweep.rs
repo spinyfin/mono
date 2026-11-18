@@ -130,11 +130,7 @@ use crate::work::WorkDb;
 /// is reclaimed within a minute, slow enough to be negligible overhead.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Once an `ExecutionTerminal` event triggers an out-of-cycle pass, further
-/// events are absorbed for this long before another out-of-cycle pass runs —
-/// mirrors the merge poller's kick-quiesce window so a burst of terminations
-/// (e.g. a batch stop) can't turn into a hot loop of full passes. The
-/// periodic `interval` tick remains the backstop regardless.
+/// Minimum delay between retries for a single execution.
 const EVENT_QUIESCE: Duration = Duration::from_secs(5);
 
 /// Grace period after an execution's `finished_at` during which a still-
@@ -300,14 +296,8 @@ impl crate::sweep_loop::SweepOutcome for PoolClaimSweepOutcome {
 /// Fires immediately on spawn so a pool wedged before an engine restart
 /// self-heals at boot without waiting for the first interval.
 ///
-/// Also subscribes to [`Event::ExecutionTerminal`]: receiving one runs an
-/// out-of-cycle pass right away (subject to [`EVENT_QUIESCE`]) instead of
-/// waiting out the rest of `interval`, so a leaked claim whose execution
-/// just went terminal is reconciled as soon as its [`LEAK_GRACE_SECS`]
-/// grace period allows rather than at some arbitrary point in the next
-/// periodic cycle. The periodic tick remains the backstop: a dropped or
-/// coalesced event never leaves a leaked claim unreconciled for longer than
-/// `interval`.
+/// Terminal events reconcile only their execution and schedule a retry at
+/// its grace deadline; periodic full scans remain the missed-event backstop.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     live_states: Arc<LiveWorkerStateRegistry>,
@@ -323,7 +313,7 @@ pub fn spawn_loop(
         EVENT_QUIESCE,
         execution_terminal_events,
         "pool-claim sweep",
-        move || {
+        move |execution_id| {
             let retries = Arc::clone(&retries);
             let viewers = Arc::clone(&viewers);
             let work_db = Arc::clone(&work_db);
@@ -331,15 +321,27 @@ pub fn spawn_loop(
             let coordinator = coordinator.clone();
             let dispatch_events = Arc::clone(&dispatch_events);
             async move {
-                run_one_pass(
+                let (outcome, grace_retry) = run_filtered_pass(
                     work_db.as_ref(),
                     live_states.as_ref(),
                     coordinator,
                     dispatch_events.as_ref(),
                     viewers.as_ref(),
                     &mut *retries.lock().await,
+                    execution_id.as_deref(),
                 )
-                .await
+                .await;
+                let retry = execution_id.and_then(|_| {
+                    grace_retry.or_else(|| {
+                        (outcome.live_backed_skipped
+                            + outcome.lookup_failed_skipped
+                            + outcome.viewer_detach_pending
+                            + outcome.process_teardown_pending
+                            > 0)
+                        .then_some(interval)
+                    })
+                });
+                (outcome, retry)
             }
         },
     )
@@ -358,7 +360,30 @@ pub async fn run_one_pass(
     viewers: &dyn WorkerViewerDetach,
     retries: &mut TeardownRetries,
 ) -> PoolClaimSweepOutcome {
+    run_filtered_pass(
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        viewers,
+        retries,
+        None,
+    )
+    .await
+    .0
+}
+
+async fn run_filtered_pass(
+    work_db: &WorkDb,
+    live_states: &LiveWorkerStateRegistry,
+    coordinator: Arc<ExecutionCoordinator>,
+    dispatch_events: &dyn DispatchEventSink,
+    viewers: &dyn WorkerViewerDetach,
+    retries: &mut TeardownRetries,
+    execution_id: Option<&str>,
+) -> (PoolClaimSweepOutcome, Option<Duration>) {
     let mut outcome = PoolClaimSweepOutcome::default();
+    let mut retry_after = None;
 
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - LEAK_GRACE_SECS;
@@ -385,11 +410,26 @@ pub async fn run_one_pass(
         (coordinator.progression_worker_pool(), "progression"),
     ] {
         for claim in pool.claims().await {
+            if execution_id.is_some_and(|id| id != claim.execution_id) {
+                continue;
+            }
             // A live pane still backs this slot — the completion /
             // dead-pid / stale-worker paths own the release. Releasing
             // here would race a pane that may still be physically up.
             if live_run_ids.contains(&claim.execution_id) {
                 outcome.live_backed_skipped += 1;
+                // The pane still owns teardown, but a terminal event must
+                // retain its grace deadline even if that pane disappears
+                // before the next full scan.
+                if execution_id.is_some()
+                    && let Ok(execution) = work_db.get_execution(&claim.execution_id)
+                    && let Some(finished) = execution.finished_epoch()
+                    && finished > grace_cutoff
+                {
+                    retry_after = Some(Duration::from_secs(
+                        (finished + LEAK_GRACE_SECS - now_epoch_secs) as u64,
+                    ));
+                }
                 continue;
             }
 
@@ -429,6 +469,8 @@ pub async fn run_one_pass(
             let finished_epoch = execution.finished_epoch();
             if matches!(finished_epoch, Some(t) if t > grace_cutoff) {
                 outcome.grace_skipped += 1;
+                retry_after = finished_epoch
+                    .map(|finished| Duration::from_secs((finished + LEAK_GRACE_SECS - now_epoch_secs) as u64));
                 continue;
             }
 
@@ -515,7 +557,7 @@ pub async fn run_one_pass(
     }
 
     retries.reconcile(work_db, &coordinator).await;
-    outcome
+    (outcome, retry_after)
 }
 
 #[cfg(test)]

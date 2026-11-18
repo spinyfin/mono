@@ -240,8 +240,10 @@ async fn assert_sweep_reaps_nothing(
             &sweep_cube,
             sink.as_ref(),
             teardown_registry,
-            &mut seen,
-            terminal_work_sweep::DEFAULT_INTERVAL,
+            terminal_work_sweep::Confirmation {
+                seen: &mut seen,
+                min_delay: terminal_work_sweep::DEFAULT_INTERVAL,
+            },
         )
         .await;
         assert_eq!(
