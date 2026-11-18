@@ -53,6 +53,11 @@ impl PendingEvents {
         self.0.push(event);
     }
 
+    /// Stage every event in `other` after those already queued.
+    pub fn append(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
     /// True if nothing has been staged yet.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()

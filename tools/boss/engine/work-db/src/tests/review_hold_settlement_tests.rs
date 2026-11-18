@@ -198,6 +198,45 @@ fn a_revision_held_after_its_heads_batch_failed_is_released_when_settled() {
     held.assert_later_revision_is_dispatchable();
 }
 
+/// A quorum failure is a terminal decision: it releases the held revision,
+/// makes the revision queued behind it dispatchable, and publishes the
+/// dependent's board change so the card is no longer shown as gated.
+#[tokio::test]
+async fn quorum_failure_unblocks_the_queued_revision_and_publishes_its_board_change() {
+    use boss_event_bus::{Event, EventKind, TopicFilter};
+    let held = held("quorum-fail-board-event");
+    let batch = held.batch_for_root(HEAD);
+    assert!(matches!(held.settle(HEAD), ReviewHoldSettlement::AwaitingBatch { .. }));
+    let later = match held.db.get_work_item(&held.later_id).unwrap() {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task,
+        other => panic!("expected a task, got {other:?}"),
+    };
+    let mut sub = held
+        .db
+        .event_bus()
+        .subscribe(TopicFilter::kind(EventKind::WorkItemChanged));
+    held.fail_through_quorum(&batch.id);
+    held.assert_later_revision_is_dispatchable();
+    let mut saw_later = false;
+    for _ in 0..8 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), sub.recv())
+            .await
+            .expect("WorkItemChanged should publish when a quorum failure unblocks a dependent")
+            .unwrap();
+        if let Event::WorkItemChanged { task_id, product_id } = event
+            && task_id == held.later_id
+        {
+            assert_eq!(product_id, later.product_id);
+            saw_later = true;
+            break;
+        }
+    }
+    assert!(
+        saw_later,
+        "the queued revision's board change must publish on quorum failure"
+    );
+}
+
 /// While the batch for the head is still running, settling only records the
 /// head. The batch's own decision then releases the revision.
 #[test]

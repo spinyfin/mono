@@ -125,6 +125,7 @@ pub(super) fn accept(
         applied_ref: Some(attempt),
         post_commit_audit_line: None,
         review_batch_quorum_outcome: None,
+        pending_events: crate::event_publish::PendingEvents::new(),
     }))
 }
 
