@@ -595,9 +595,8 @@ fn two_infrastructure_failures_stop_the_nominations_and_file_the_question_with_t
 // ── failed launches ──────────────────────────────────────────────────────────
 
 /// A progression agent that fails to start says nothing about the item it was
-/// sent to. Two such failures in a row used to stop the nominations and park
-/// the item on a question about the item. A run that never launched is not an
-/// attempt on the item: it is retried after each cooldown.
+/// sent to, so such runs never stop nominations or file the question. The item
+/// is retried after each cooldown.
 #[test]
 fn failed_launches_are_retried_after_each_cooldown_and_never_file_the_question() {
     let fx = fx();
@@ -629,6 +628,88 @@ fn failed_launches_are_retried_after_each_cooldown_and_never_file_the_question()
     assert!(!fx.is_candidate(&cooling));
     let clauses = fx.db.progression_clauses(&cooling).unwrap().unwrap();
     assert!(clauses.in_cooldown && !clauses.infrastructure_failing, "{clauses:?}");
+}
+
+#[test]
+fn slot_collisions_back_off_without_filing_a_question_and_retry_after_cooldown() {
+    let fx = fx();
+    let id = fx.conflicted("Slot occupied");
+    for ago in [2 * HOUR, HOUR] {
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        fx.db
+            .start_progression_run_on_local_host(&execution.id, "progression-41", "/tmp/scratch", true)
+            .unwrap();
+        fx.finish(&execution.id, "failed", None, ago, "fp", S5);
+        assert_eq!(fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count, 0);
+    }
+    let pass = fx.pass();
+    assert!(pass.minted.is_empty() && pass.asked.is_empty(), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+    assert!(!fx.db.progression_clauses(&id).unwrap().unwrap().infrastructure_failing);
+    assert_eq!(fx.db.progression_launch_backoff().unwrap().unwrap().waiting_items, 1);
+    fx.sql(&format!(
+        "UPDATE work_executions SET finished_at = finished_at - {} WHERE work_item_id = '{id}'",
+        6 * HOUR
+    ));
+    assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+}
+
+#[test]
+fn failed_runs_with_driver_sessions_still_file_the_infrastructure_question() {
+    let fx = fx();
+    let id = fx.conflicted("Driver started and died");
+    for ago in [20 * HOUR, 10 * HOUR] {
+        let execution = fx
+            .db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&id)
+                    .kind(ExecutionKind::Progression)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        fx.db
+            .start_progression_run_on_local_host(&execution.id, "progression-41", "/tmp/scratch", true)
+            .unwrap();
+        fx.db
+            .claim_run_progress_session_identity(&execution.id, "driver-session")
+            .unwrap();
+        fx.finish(&execution.id, "failed", None, ago, "fp", S5);
+    }
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (0, 1), "{pass:?}");
+    assert_eq!(pass.asked[0].reason, LadderReason::InfrastructureFailure);
+    assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+}
+
+#[test]
+fn a_question_filed_for_unstarted_runs_without_a_driver_streak_is_withdrawn() {
+    let fx = fx();
+    let id = fx.conflicted("Launch never began");
+    for ago in [20 * HOUR, 10 * HOUR] {
+        fx.past_run(&id, "failed", None, ago, "fp", S5);
+    }
+    assert_eq!(fx.pass().asked.len(), 1);
+    fx.sql(&format!(
+        "UPDATE work_executions SET started_at = NULL WHERE work_item_id = '{id}'"
+    ));
+    let pass = fx.pass();
+    assert_eq!(pass.retracted, vec![id.clone()]);
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
 }
 
 #[test]

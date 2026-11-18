@@ -186,14 +186,18 @@ const LIVE_OR_PENDING: &str = "('queued','ready','waiting_dependency','claimed',
 /// Execution statuses of a progression run that died rather than reported.
 const INFRASTRUCTURE_FAILED: &str = "('failed','orphaned','abandoned')";
 
-/// Whether progression execution `x` failed to launch: the engine could not
-/// start its agent (the spawn or its confirmation failed), so no agent ever
-/// read the item. The dispatcher records exactly this shape for a failed
-/// progression spawn: `failed`, with the pre-start failure counted on the row.
-/// A run that started and then died (`orphaned` by the run timeout, or `failed`
-/// after its first turn) never carries a pre-start failure.
+/// Whether progression execution `x` failed before its driver started. The
+/// dispatcher opens a run before spawning, so `started_at` on its own is not
+/// driver evidence. A persisted run without a driver session also covers slot
+/// collisions, which do not increment the driver's pre-start failure count.
+/// Rows without a run retain their execution start stamp as the fallback.
 pub(crate) fn launch_failed_sql(x: &str) -> String {
-    format!("({x}.status = 'failed' AND {x}.pre_start_failure_count > 0)")
+    format!(
+        "({x}.status = 'failed' AND ({x}.pre_start_failure_count > 0 OR {x}.started_at IS NULL
+          OR (EXISTS (SELECT 1 FROM work_runs lr WHERE lr.execution_id = {x}.id)
+              AND NOT EXISTS (SELECT 1 FROM work_runs lr WHERE lr.execution_id = {x}.id
+                              AND lr.progress_session_id IS NOT NULL))))"
+    )
 }
 
 /// The progression runs of item `a` that count as attempts, as a `WHERE`

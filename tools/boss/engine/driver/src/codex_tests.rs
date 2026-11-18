@@ -49,8 +49,8 @@ fn trusted_projects(config: &str) -> Vec<String> {
 /// Codex keys project trust by the directory it resolves for itself, which is
 /// the physical path. A progression run's scratch directory lives under the
 /// system temp directory, and on macOS that path crosses a symlink
-/// (`/var/folders` -> `/private/var/folders`), so trusting only the engine's
-/// spelling left Codex asking "Trust this folder?" instead of taking its brief.
+/// (`/var/folders` -> `/private/var/folders`), so a config trusting only the
+/// engine's spelling would leave Codex asking "Trust this folder?" instead of taking its brief.
 #[test]
 fn a_workspace_reached_through_a_symlink_is_trusted_under_its_physical_path_too() {
     let temp = TempDir::new().unwrap();

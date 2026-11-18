@@ -84,6 +84,18 @@ pub fn launch_backoff_signal() -> Arc<LaunchBackoffSignal> {
     Arc::new(tokio::sync::watch::channel(None).0)
 }
 
+/// Wake health rendering on changes, and once a minute during an unchanged
+/// cooldown so relative retry and failure ages keep advancing.
+pub async fn wait_for_backoff_health_refresh(
+    changes: &mut tokio::sync::watch::Receiver<Option<ProgressionLaunchBackoff>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    let active = changes.borrow().is_some();
+    tokio::select! {
+        changed = changes.changed() => changed,
+        _ = tokio::time::sleep(Duration::from_secs(60)), if active => Ok(()),
+    }
+}
+
 /// `EngineHealthIssue::kind` of the backoff notice in the engine health report.
 pub const LAUNCH_BACKOFF_ISSUE_KIND: &str = "progression_launch_backoff";
 
@@ -150,7 +162,7 @@ pub struct ProgressionSweepOutcome {
 
 impl crate::sweep_loop::SweepOutcome for ProgressionSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.minted > 0 || self.failed > 0 || self.asked > 0 || self.retracted > 0 || self.launch_backoff.is_some()
+        self.minted > 0 || self.failed > 0 || self.asked > 0 || self.retracted > 0
     }
 
     fn log(&self) {
@@ -161,16 +173,6 @@ impl crate::sweep_loop::SweepOutcome for ProgressionSweepOutcome {
             retracted = self.retracted,
             "progression sweep: pass complete",
         );
-        if let Some(backoff) = &self.launch_backoff {
-            tracing::warn!(
-                waiting_items = backoff.waiting_items,
-                next_attempt_epoch_s = backoff.next_attempt_epoch_s,
-                latest_execution_id = %backoff.latest_execution_id,
-                latest_error = %backoff.latest_error,
-                "progression sweep: backing off after failed agent launches; each waiting item is \
-                 retried when its cooldown ends",
-            );
-        }
     }
 }
 
@@ -235,13 +237,27 @@ pub fn spawn_loop(
                 if outcome.minted > 0 {
                     kick_fn();
                 }
-                launch_backoff.send_if_modified(|published| {
+                let changed = launch_backoff.send_if_modified(|published| {
                     let changed = *published != outcome.launch_backoff;
                     if changed {
                         published.clone_from(&outcome.launch_backoff);
                     }
                     changed
                 });
+                if let Some(backoff) = &outcome.launch_backoff {
+                    if changed {
+                        tracing::warn!(
+                            waiting_items = backoff.waiting_items,
+                            next_attempt_epoch_s = backoff.next_attempt_epoch_s,
+                            latest_execution_id = %backoff.latest_execution_id,
+                            latest_error = %backoff.latest_error,
+                            "progression sweep: backing off after failed agent launches; each waiting item is \
+                             retried when its cooldown ends",
+                        );
+                    } else {
+                        tracing::debug!(?backoff, "progression sweep: launch backoff unchanged");
+                    }
+                }
                 let interval = work_db
                     .progression_limit(METADATA_KEY_SWEEP_INTERVAL_SECS, settings.sweep_interval_secs)
                     .unwrap_or_else(|error| {
@@ -486,7 +502,7 @@ mod tests {
             (backoff.waiting_items, backoff.latest_execution_id.as_str()),
             (1, run.id.as_str())
         );
-        assert!(crate::sweep_loop::SweepOutcome::has_activity(&outcome));
+        assert!(!crate::sweep_loop::SweepOutcome::has_activity(&outcome));
 
         let issue = launch_backoff_health_issue(&backoff, now);
         assert_eq!(
@@ -522,6 +538,42 @@ mod tests {
             handle.abort();
             assert_eq!(*signal.borrow(), published, "flag on: {enabled}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_backoff_refreshes_the_relative_retry_estimate() {
+        let now = 1_000_000;
+        let backoff = ProgressionLaunchBackoff {
+            waiting_items: 1,
+            next_attempt_epoch_s: now + 6 * 3600,
+            latest_execution_id: "exec_waiting".to_owned(),
+            latest_failure_epoch_s: now,
+            latest_error: "slot occupied".to_owned(),
+        };
+        let signal = launch_backoff_signal();
+        signal.send_replace(Some(backoff.clone()));
+        let mut changes = signal.subscribe();
+        let before = launch_backoff_health_issue(&backoff, now);
+        let started = tokio::time::Instant::now();
+        for _ in 0..60 {
+            wait_for_backoff_health_refresh(&mut changes).await.unwrap();
+        }
+        assert_eq!(*changes.borrow(), Some(backoff.clone()));
+        assert!(!changes.has_changed().unwrap(), "no sweep update was needed");
+        let after = launch_backoff_health_issue(&backoff, now + started.elapsed().as_secs() as i64);
+        assert!(before.title.contains("in about 6 hours"), "{before:?}");
+        assert!(after.title.contains("in about 5 hours"), "{after:?}");
+        assert!(after.body.contains("1 hour ago"), "{after:?}");
+
+        signal.send_replace(None);
+        wait_for_backoff_health_refresh(&mut changes).await.unwrap();
+        assert!(changes.borrow().is_none(), "clearing the notice wakes immediately");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(120), wait_for_backoff_health_refresh(&mut changes))
+                .await
+                .is_err(),
+            "inactive backoff does not refresh periodically"
+        );
     }
 
     #[test]
