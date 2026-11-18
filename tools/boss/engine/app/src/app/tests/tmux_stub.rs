@@ -372,10 +372,7 @@ impl RecordingPaneRunner {
                 }
                 CaptureBehavior::Empty | CaptureBehavior::Paused(_) => Self::success(""),
                 CaptureBehavior::Fixed(text) => Self::success(*text),
-                CaptureBehavior::EchoLastPaste => {
-                    let last = self.stdin.lock().unwrap().last().cloned().unwrap_or_default();
-                    Self::success(String::from_utf8_lossy(&last).into_owned())
-                }
+                CaptureBehavior::EchoLastPaste => Self::success(self.try_last_paste().unwrap_or_default()),
             };
         }
         Self::success("")
