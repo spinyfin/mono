@@ -2001,7 +2001,6 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 keep_work_item_schedulable: false,
                 actor: StatusActor::Engine,
                 peer_pid: None,
-                caller_records_timeline: false,
             },
         )
         .unwrap();
@@ -2023,7 +2022,6 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 keep_work_item_schedulable: false,
                 actor: StatusActor::Engine,
                 peer_pid: None,
-                caller_records_timeline: false,
             },
         )
         .unwrap();
@@ -2052,7 +2050,6 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
                 keep_work_item_schedulable: false,
                 actor: StatusActor::Engine,
                 peer_pid: None,
-                caller_records_timeline: false,
             },
         )
         .unwrap_err()

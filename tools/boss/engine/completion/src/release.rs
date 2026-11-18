@@ -202,25 +202,11 @@ impl WorkerCompletionHandler {
         actor: boss_protocol::StatusActor,
         reason: &str,
     ) {
-        let prior_status = self.work_db.get_execution(execution_id).ok().map(|e| e.status);
         let cancelled = match self
             .work_db
             .cancel_running_execution_with_reason(execution_id, actor, reason)
         {
-            Ok((cancelled, work_item_parked)) => {
-                if cancelled {
-                    self.record_execution_cancelled(
-                        execution_id,
-                        work_item_id,
-                        prior_status,
-                        actor,
-                        reason,
-                        work_item_parked,
-                    )
-                    .await;
-                }
-                cancelled
-            }
+            Ok((cancelled, _work_item_parked)) => cancelled,
             Err(err) => {
                 tracing::warn!(
                     work_item_id,
@@ -274,7 +260,6 @@ impl WorkerCompletionHandler {
     /// Idempotent: a second call for the same execution is a no-op
     /// at both the DB and the cube-release layers.
     pub async fn force_stop_execution_as(&self, execution_id: &str, actor: boss_protocol::StatusActor, reason: &str) {
-        let before = self.work_db.get_execution(execution_id).ok();
         let (exec_cancelled, task_demoted) =
             match self
                 .work_db
@@ -302,17 +287,6 @@ impl WorkerCompletionHandler {
                 task_demoted,
                 "force_stop: cancelled execution and demoted task",
             );
-            if exec_cancelled && let Some(before) = &before {
-                self.record_execution_cancelled(
-                    execution_id,
-                    &before.work_item_id,
-                    Some(before.status.clone()),
-                    actor,
-                    reason,
-                    task_demoted,
-                )
-                .await;
-            }
             // Publish work-item-changed so the UI refreshes. Requires
             // looking up the execution's work_item_id + product_id.
             if let Ok(execution) = self.work_db.get_execution(execution_id)
@@ -327,33 +301,6 @@ impl WorkerCompletionHandler {
         }
 
         self.force_release(execution_id).await;
-    }
-
-    /// Put a cancel this handler just performed on the execution's dispatch
-    /// timeline (`execution_cancelled`, with actor, reason, the status that
-    /// was terminalized and whether the board moved). `prior_status` is
-    /// `None` only when the pre-cancel read failed, in which case the event
-    /// still lands with the status marked unknown rather than being dropped:
-    /// the timeline must never silently stop at `pane_spawned` for a row the
-    /// durable store says is `cancelled`.
-    pub async fn record_execution_cancelled(
-        &self,
-        execution_id: &str,
-        work_item_id: &str,
-        prior_status: Option<boss_protocol::ExecutionStatus>,
-        actor: boss_protocol::StatusActor,
-        reason: &str,
-        work_item_moved: bool,
-    ) {
-        let event = crate::dispatch_events::execution_cancelled_event(
-            execution_id,
-            work_item_id,
-            prior_status.as_ref().map_or("unknown", |status| status.as_str()),
-            actor.as_str(),
-            reason,
-            work_item_moved,
-        );
-        self.dispatch_events.emit(event).await;
     }
 
     /// Publish the more specific "stopped without a PR" signal so the

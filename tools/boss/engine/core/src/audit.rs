@@ -164,7 +164,7 @@ pub fn record_start(ctx: StartContext) {
         fields.insert("exe_path".into(), Value::String(exe.display().to_string()));
     }
 
-    write_record(now, "start", fields);
+    let _ = write_record(now, "start", fields);
 }
 
 /// `app` if the macOS app set `BOSS_APP_PID` (the only process that does),
@@ -205,7 +205,7 @@ pub fn record_instance_lock_failed(lock_path: &Path, holder_pid: Option<u32>) {
     if let Ok(exe) = std::env::current_exe() {
         fields.insert("exe_path".into(), Value::String(exe.display().to_string()));
     }
-    write_record(epoch_now_s(), "instance_lock_failed", fields);
+    let _ = write_record(epoch_now_s(), "instance_lock_failed", fields);
 }
 
 /// Record a clean / signalled / panicked shutdown. `reason` is a
@@ -228,7 +228,7 @@ pub fn record_shutdown(reason: impl Into<String>) {
         let uptime = (now - started).max(0);
         fields.insert("uptime_sec".into(), json!(uptime));
     }
-    write_record(now, "shutdown", fields);
+    let _ = write_record(now, "shutdown", fields);
 }
 
 /// Outcome of a socket bind attempt. Surfaces the same window
@@ -255,7 +255,7 @@ pub fn record_socket_bind(kind: &str, path: &Path, result: SocketBindResult<'_>)
             "socket_bind_failed"
         }
     };
-    write_record(now, event, fields);
+    let _ = write_record(now, event, fields);
 }
 
 /// Record that an accept loop is now running on a socket. Emitted
@@ -270,7 +270,7 @@ pub fn record_accept_loop_started(kind: &str, path: &Path) {
     fields.insert("pid".into(), json!(std::process::id()));
     fields.insert("socket_kind".into(), Value::String(kind.to_owned()));
     fields.insert("socket_path".into(), Value::String(path.display().to_string()));
-    write_record(now, "accept_loop_started", fields);
+    let _ = write_record(now, "accept_loop_started", fields);
 }
 
 /// Record a `shutdown_rpc` attempt — the engine received a
@@ -286,7 +286,7 @@ pub fn record_shutdown_rpc(outcome: &str, peer_pid: Option<i32>) {
     if let Some(p) = peer_pid {
         fields.insert("peer_pid".into(), json!(p));
     }
-    write_record(now, "shutdown_rpc", fields);
+    let _ = write_record(now, "shutdown_rpc", fields);
 }
 
 /// Record an arbitrary auxiliary event. A single funnel into the file
@@ -295,6 +295,14 @@ pub fn record_shutdown_rpc(outcome: &str, peer_pid: Option<i32>) {
 /// and reason even though the row itself is soft-deleted (and thus
 /// mostly invisible to normal queries).
 pub fn record_event<T: Serialize>(event: &str, payload: &T) {
+    // Best-effort: `try_record_event` reports the failure to callers that
+    // need to retry; the log line is the only trace for the rest.
+    let _ = try_record_event(event, payload);
+}
+
+/// [`record_event`] for a caller that must know whether the record reached the
+/// log, so it can retry instead of treating a dropped write as delivered.
+pub fn try_record_event<T: Serialize>(event: &str, payload: &T) -> std::io::Result<()> {
     let value = match serde_json::to_value(payload) {
         Ok(Value::Object(m)) => m,
         Ok(other) => {
@@ -304,10 +312,10 @@ pub fn record_event<T: Serialize>(event: &str, payload: &T) {
         }
         Err(err) => {
             tracing::warn!(?err, event, "engine-audit: failed to serialize event payload");
-            return;
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
         }
     };
-    write_record(epoch_now_s(), event, value);
+    write_record(epoch_now_s(), event, value)
 }
 
 fn epoch_now_s() -> i64 {
@@ -321,10 +329,13 @@ fn parent_pid() -> Option<u32> {
     if raw <= 0 { None } else { Some(raw as u32) }
 }
 
-fn write_record(now_epoch_s: i64, event: &str, mut fields: Map<String, Value>) {
+fn write_record(now_epoch_s: i64, event: &str, mut fields: Map<String, Value>) -> std::io::Result<()> {
     let Some(path) = resolve_path() else {
         tracing::warn!("engine-audit: no path resolved (HOME unset?); skipping record");
-        return;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no audit log path resolved",
+        ));
     };
 
     fields.insert(
@@ -334,9 +345,11 @@ fn write_record(now_epoch_s: i64, event: &str, mut fields: Map<String, Value>) {
     fields.insert("ts_epoch_s".into(), json!(now_epoch_s));
     fields.insert("event".into(), Value::String(event.to_owned()));
 
-    if let Err(err) = append_to(&path, &Value::Object(fields)) {
+    let result = append_to(&path, &Value::Object(fields));
+    if let Err(err) = &result {
         tracing::warn!(?err, path = %path.display(), event, "engine-audit: append failed");
     }
+    result
 }
 
 fn resolve_path() -> Option<PathBuf> {

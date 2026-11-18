@@ -3,14 +3,16 @@
 //! Every cancel writes a record in its own transaction
 //! (`boss_work_db::ExecutionCancelRecord`), so a rolled-back cancel leaves
 //! nothing to publish. [`drain`] writes the `execution_cancelled` audit record
-//! for each undelivered one and, unless the caller put the cancel on the
-//! timeline itself, the `execution_cancelled` dispatch event that `bossctl
-//! dispatch diagnose` reads, then acknowledges it.
+//! and the `execution_cancelled` dispatch event that `bossctl dispatch
+//! diagnose` reads for each undelivered one, then acknowledges it. The durable
+//! record is the only path to either log, for every cancel, so no caller has
+//! to remember to write the timeline event after its transaction commits.
 //!
 //! The subscriber drains at startup, on every cancel notification, and
 //! periodically in case a notification was dropped. Delivery is at least
-//! once: a crash after the write but before the acknowledgement repeats the
-//! record, which keeps the time the cancel was originally written.
+//! once: a record stays pending until both writes succeed, so a crash or a
+//! failed write repeats the record, which keeps the time the cancel was
+//! originally written.
 
 use std::sync::Arc;
 
@@ -22,13 +24,9 @@ use crate::work::{ExecutionCancelRecord, WorkDb};
 /// How often the subscriber drains without having been notified.
 const BACKSTOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The timeline event for a committed cancel, or `None` when the caller
-/// records it. Stamped with the time the cancel was written, not the time it
-/// is published.
-pub fn timeline_event(record: &ExecutionCancelRecord) -> Option<DispatchEvent> {
-    if !record.on_timeline {
-        return None;
-    }
+/// The timeline event for a committed cancel. Stamped with the time the cancel
+/// was written, not the time it is published.
+pub fn timeline_event(record: &ExecutionCancelRecord) -> DispatchEvent {
     let mut event = crate::dispatch_events::execution_cancelled_event(
         &record.execution_id,
         &record.work_item_id,
@@ -42,11 +40,11 @@ pub fn timeline_event(record: &ExecutionCancelRecord) -> Option<DispatchEvent> {
     if let Ok(secs) = record.cancelled_at.parse::<u128>() {
         event.ts_epoch_ms = secs * 1000;
     }
-    Some(event)
+    event
 }
 
-fn record_audit(record: &ExecutionCancelRecord) {
-    crate::audit::record_event(
+fn record_audit(record: &ExecutionCancelRecord) -> std::io::Result<()> {
+    crate::audit::try_record_event(
         "execution_cancelled",
         &serde_json::json!({
             "execution_id": record.execution_id,
@@ -59,21 +57,28 @@ fn record_audit(record: &ExecutionCancelRecord) {
             "peer_pid": record.peer_pid,
             "cancelled_at": record.cancelled_at,
         }),
-    );
+    )
 }
 
 /// Publish every committed cancel that has not been published yet. Returns
-/// how many were published.
+/// how many were published. A record whose audit or timeline write failed
+/// stays pending for the next drain; the others are still published.
 pub async fn drain(db: &WorkDb, sink: &dyn DispatchEventSink) -> anyhow::Result<usize> {
     let records = db.pending_cancel_records()?;
+    let mut published = 0;
     for record in &records {
-        record_audit(record);
-        if let Some(event) = timeline_event(record) {
-            sink.emit(event).await;
+        if let Err(error) = record_audit(record) {
+            tracing::warn!(%error, execution_id = %record.execution_id, "cancel audit write failed; will retry");
+            continue;
+        }
+        if let Err(error) = sink.try_emit(timeline_event(record)).await {
+            tracing::warn!(%error, execution_id = %record.execution_id, "cancel timeline write failed; will retry");
+            continue;
         }
         db.acknowledge_cancel_record(&record.execution_id)?;
+        published += 1;
     }
-    Ok(records.len())
+    Ok(published)
 }
 
 /// Subscribe before the first drain so startup and live cancels share one path.
@@ -135,7 +140,7 @@ mod tests {
         create_ready_chore_execution(db, chore.id)
     }
 
-    fn record(on_timeline: bool) -> ExecutionCancelRecord {
+    fn record() -> ExecutionCancelRecord {
         ExecutionCancelRecord {
             execution_id: "exec_1".into(),
             work_item_id: "task_1".into(),
@@ -145,19 +150,13 @@ mod tests {
             work_item_moved: false,
             queued_only: false,
             peer_pid: None,
-            on_timeline,
             cancelled_at: "1700000000".into(),
         }
     }
 
     #[test]
-    fn a_caller_recorded_cancel_is_not_written_to_the_timeline_twice() {
-        assert!(timeline_event(&record(false)).is_none());
-    }
-
-    #[test]
     fn the_timeline_event_keeps_the_time_the_cancel_was_written() {
-        let event = timeline_event(&record(true)).unwrap();
+        let event = timeline_event(&record());
         assert_eq!(event.stage, Stage::ExecutionCancelled.as_str());
         assert_eq!(event.ts_epoch_ms, 1_700_000_000_000);
         assert_eq!(event.details["actor"], "engine");
@@ -207,11 +206,10 @@ mod tests {
         assert_eq!(events[0].details["reason"], "coordinator cancelled it");
     }
 
-    /// A caller that writes the timeline event itself (the RPC handler, the
-    /// coordinator) still gets its audit record, with `queued_only` and the
-    /// issuing pid, and no second timeline event.
+    /// A cancel issued over RPC is audited with `queued_only` and the issuing
+    /// pid, and reaches the timeline from the same record.
     #[test]
-    fn a_caller_recorded_cancel_is_audited_with_queued_only_and_peer_pid() {
+    fn an_rpc_cancel_is_audited_with_queued_only_and_peer_pid() {
         let _audit = crate::audit::lock_audit_globals_for_tests();
         let db = WorkDb::open_in_memory().unwrap();
         let execution = ready_execution(&db);
@@ -220,7 +218,6 @@ mod tests {
             CancelExecutionOpts {
                 queued_only: true,
                 peer_pid: Some(4242),
-                caller_records_timeline: true,
                 ..CancelExecutionOpts::default()
             },
         )
@@ -229,11 +226,58 @@ mod tests {
         let sink = RecordingDispatchEventSink::new();
         assert_eq!(block_on(drain(&db, &sink)).unwrap(), 1);
 
-        assert!(block_on(sink.events()).is_empty());
+        assert_eq!(block_on(sink.events()).len(), 1);
         let records = audit_records_for(&execution.id);
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(records[0]["queued_only"], true);
         assert_eq!(records[0]["peer_pid"], 4242);
+    }
+
+    /// A sink whose write fails, so the cancel it was given must stay pending.
+    struct FailingSink;
+
+    #[async_trait::async_trait]
+    impl DispatchEventSink for FailingSink {
+        async fn emit(&self, _event: DispatchEvent) {}
+
+        async fn try_emit(&self, _event: DispatchEvent) -> Result<(), String> {
+            Err("disk full".to_owned())
+        }
+    }
+
+    /// A failed timeline write must not acknowledge the cancel: the next
+    /// drain publishes it.
+    #[test]
+    fn a_failed_write_leaves_the_cancel_pending_until_a_drain_succeeds() {
+        let _audit = crate::audit::lock_audit_globals_for_tests();
+        let db = WorkDb::open_in_memory().unwrap();
+        let execution = ready_execution(&db);
+        db.cancel_execution(&execution.id).unwrap();
+
+        assert_eq!(block_on(drain(&db, &FailingSink)).unwrap(), 0);
+        assert_eq!(db.pending_cancel_records().unwrap().len(), 1);
+
+        let sink = RecordingDispatchEventSink::new();
+        assert_eq!(block_on(drain(&db, &sink)).unwrap(), 1);
+        assert!(db.pending_cancel_records().unwrap().is_empty());
+        assert_eq!(block_on(sink.events()).len(), 1);
+    }
+
+    /// The path that used to skip the timeline because its caller was to
+    /// write the event: a preemption/teardown cancel committed with no caller
+    /// emit at all still reaches the timeline.
+    #[test]
+    fn a_running_execution_teardown_reaches_the_timeline_without_a_caller_emit() {
+        let _audit = crate::audit::lock_audit_globals_for_tests();
+        let db = WorkDb::open_in_memory().unwrap();
+        let execution = ready_execution(&db);
+        assert!(db.cancel_running_execution(&execution.id).unwrap());
+
+        let sink = RecordingDispatchEventSink::new();
+        assert_eq!(block_on(drain(&db, &sink)).unwrap(), 1);
+        let events = block_on(sink.events());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].execution_id, execution.id);
     }
 
     #[tokio::test]
