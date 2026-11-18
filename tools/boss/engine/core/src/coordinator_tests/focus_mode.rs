@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 use super::helpers::*;
 
+use crate::coordinator::DISPATCH_WAIT_REASON_DISPATCH_PAUSED;
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe};
 use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
@@ -604,9 +605,9 @@ async fn held_count_excludes_rows_a_pause_is_holding() {
     );
     h.coordinator.drain_ready_queue_for_test().await;
 
-    assert_ne!(
+    assert_eq!(
         h.execution(&other_exec).dispatch_wait_reason.as_deref(),
-        Some(DISPATCH_WAIT_REASON_FOCUS_MODE),
+        Some(DISPATCH_WAIT_REASON_DISPATCH_PAUSED),
         "the pause is what holds the row"
     );
     assert_eq!(

@@ -539,3 +539,72 @@ fn answer_agent_on_a_review_guide_comment_follows_the_series_root_task() {
     assert!(in_focus(&db, &in_comment.id, &focus));
     assert!(!in_focus(&db, &out_comment.id, &focus));
 }
+
+/// Focus treats a comparison whose series root is soft-deleted as
+/// unattributable, matching a guide comment on that root. The coordinator
+/// lookup still returns the capture so an already-bound guide execution can
+/// finish.
+#[test]
+fn a_comparison_on_a_soft_deleted_root_is_unattributable_but_still_readable() {
+    use crate::test_support::{add_guide_comment, open_db, seed_review_guide_series_for_pr};
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let focused = project(&db, &product.id, "Focused", false);
+    let root = project_task(&db, &product.id, &focused.id, "Root");
+    let pr_url = "https://github.com/acme/widget/pull/42";
+    db.update_work_item(
+        &root.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr_url.to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    let (series, comparison) = seed_review_guide_series_for_pr(&db, &root.id, pr_url, "base", "head");
+    let attempt = db
+        .create_pr_review_guide_attempt(&series, &comparison, "review-guide-v1")
+        .unwrap();
+    db.publish_pr_review_guide_version(&attempt.id, "# Guide\n\nOriginal quote", "raw")
+        .unwrap();
+    let comment = add_guide_comment(&db, &series, "why?");
+    let guide_exec = db.create_pr_review_guide_execution(&comparison, "org/repo").unwrap();
+    let focus = focus_on_project(&focused.id);
+
+    assert!(in_focus(&db, &comparison, &focus));
+    assert!(in_focus(&db, &comment.id, &focus));
+    assert!(
+        !db.executions_outside_dispatch_focus(std::slice::from_ref(&guide_exec), &focus)
+            .unwrap()
+            .contains(&guide_exec.id)
+    );
+    let live = db
+        .get_pr_review_guide_comparison_by_id(&comparison)
+        .unwrap()
+        .expect("live comparison");
+    assert_eq!(live.root_task_id, root.id);
+    assert_eq!(live.packet.head_sha, "head");
+
+    db.delete_work_item(&root.id).unwrap();
+
+    let after = db
+        .get_pr_review_guide_comparison_by_id(&comparison)
+        .unwrap()
+        .expect("bound comparison survives a soft-deleted root");
+    assert_eq!(after.root_task_id, root.id);
+    assert_eq!(after.packet.head_sha, "head");
+    assert!(
+        !in_focus(&db, &comparison, &focus),
+        "deleted-root comparison is out of scope"
+    );
+    assert!(
+        db.executions_outside_dispatch_focus(std::slice::from_ref(&guide_exec), &focus)
+            .unwrap()
+            .contains(&guide_exec.id),
+        "a prgc_ execution on the deleted root is held"
+    );
+    assert!(
+        !in_focus(&db, &comment.id, &focus),
+        "a guide comment on the same deleted root is also unattributable"
+    );
+}
