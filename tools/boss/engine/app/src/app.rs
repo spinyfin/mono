@@ -171,8 +171,9 @@ use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePane
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{dispatch_codex_unobserved_command_on_notification, dispatch_probe_now};
 
-// Production ingress paths go through `dispatch_worker_event_fanout`, which
-// calls these in order. Only the test modules name them individually, to drive
+// Production ingress paths converge on `dispatch_staged_worker_event_fanout`
+// (via `dispatch_worker_event_fanout`, or via the events socket's
+// `dispatch_hook_events` after it stages markers), which calls these in order. Only the test modules name them individually, to drive
 // one handler at a time — so outside `#[cfg(test)]` this import is dead, the
 // same situation as the `pane_ops` import above.
 #[cfg(test)]

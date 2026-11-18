@@ -185,16 +185,13 @@ impl boss_engine_runtime::stdout_progress::WorkerEventSink for ServerEventSink {
 /// Fan one normalised worker event out to every engine subsystem that reacts
 /// to worker progress, in the order those subsystems require.
 ///
-/// Transport-agnostic on purpose. Both progress ingresses converge here:
-/// [`boss_engine_runtime::events_socket`] (a `ProgressIngress::HookCallback` driver's
-/// `boss-event` shim over the unix socket) and
-/// [`boss_engine_runtime::stdout_progress`] (a byte-stream driver's stdout or rollout
-/// stream). By the time an event reaches this function the driver has
-/// already normalised it, so which transport carried it is no longer
-/// observable — which is exactly the property that makes live-status, the
-/// staleness sweeps, and the kanban see the same shapes from either one.
-///
-/// Ordering here is load-bearing; see the per-call comments.
+/// Stages the event's unobserved-command marker, then runs
+/// [`dispatch_staged_worker_event_fanout`]. This is the entry point for the
+/// stdout/rollout stream ([`boss_engine_runtime::stdout_progress`]) and the
+/// spoke projection. Hook-callback drivers' events arrive through
+/// [`boss_engine_runtime::events_socket`], whose `dispatch_hook_events` stages
+/// markers while the hook decode turn is held and then calls
+/// [`dispatch_staged_worker_event_fanout`] directly.
 pub(super) async fn dispatch_worker_event_fanout(
     server_state: &Arc<ServerState>,
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
@@ -203,7 +200,22 @@ pub(super) async fn dispatch_worker_event_fanout(
     dispatch_staged_worker_event_fanout(server_state, incoming).await;
 }
 
-/// Fan out an event whose marker was staged while its hook decode turn was held.
+/// Fan one normalised worker event out to every engine subsystem that reacts
+/// to worker progress, in the order those subsystems require. This is where
+/// every progress ingress converges.
+///
+/// Transport-agnostic on purpose: by the time an event reaches this function
+/// the driver has already normalised it, so which transport carried it is no
+/// longer observable — which is exactly the property that makes live-status,
+/// the staleness sweeps, and the kanban see the same shapes from either one.
+///
+/// **Every caller must stage the event's unobserved-command marker first**,
+/// either through [`dispatch_worker_event_fanout`] or through
+/// `dispatch_hook_events` while the decode turn is held; calling this
+/// directly without staging silently skips marker staging, and a following
+/// `Stop` could then be evaluated before the marker is visible.
+///
+/// Ordering here is load-bearing; see the per-call comments.
 pub(super) async fn dispatch_staged_worker_event_fanout(
     server_state: &Arc<ServerState>,
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,

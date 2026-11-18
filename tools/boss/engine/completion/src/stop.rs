@@ -1593,9 +1593,8 @@ must not be asked to open one",
                     // clears that flag so a later clean turn gets a fair
                     // no-changes-needed evaluation — see
                     // `codex_unobserved_command::UnobservedCommandTracker`.
-                    // For Antigravity it also returns the run-long refused-tool
-                    // latch, which does not clear: a refused tool keeps
-                    // refusing every later no-changes-needed claim.
+                    // Antigravity refused tools use the same read-and-clear
+                    // policy; its permanent audit trail stays visible.
                     if self.refuse_no_op_declaration(&execution) {
                         return self.nudge_refused_no_op(&execution).await;
                     }

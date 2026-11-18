@@ -60,7 +60,7 @@ impl WorkerCompletionHandler {
     ///
     /// Refuses when (a) an unobserved tool is staged
     /// ([`crate::codex_unobserved_command::UnobservedCommandTracker::consume_unresolved`]:
-    /// Codex is read-and-clear; Antigravity latches for the rest of the run),
+    /// read-and-clear for every driver),
     /// or (b) for a revision, an observed contribution contradicts the claim
     /// (or the lookup failed, so the claim is unverifiable). Uses local DB
     /// reads and writes plus in-memory state, with no network I/O. This is
