@@ -10,16 +10,14 @@ use super::*;
 // asks for that run. The worker of the new run then owns the row: a question
 // it asks parks the row on that question and stays open.
 //
-// The shape this pins: a review revision asked the owner a question; another
-// revision of the same PR rebased the branch meanwhile, so relaunching the
-// first one was refused before start and the row was blocked for recovery;
-// the store was repaired and the row restarted; every later run asked its
-// question on a row still blocked for recovery, so the question was filed as
-// withdrawn (`task_not_parkable`) and the card kept the old failure text.
+// A revision relaunched after a sibling revision rebased its PR recovers
+// without restaging content the PR head already carries, and a question its
+// worker asks stays open. These tests seed an execution_recovery_failed row
+// carrying a stale hold so the lift is observable.
 
-/// The detail an earlier engine wrote when preserved work looked uncontained
-/// in a PR head rebased by another revision. It names bookmark targets that
-/// were true only at that attempt.
+/// A seeded execution_recovery_failed row carrying a stale hold. The detail
+/// names bookmark targets from an earlier attempt, not the store as a later
+/// start finds it.
 const STALE_DETAIL: &str = "preserved work of execution exec_prior is not contained in PR head pr/42 (28f2ec23): \
      boss-recovery/exec_prior at 7f082787 has 1 change(s) with no variant in it";
 

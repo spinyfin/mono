@@ -318,3 +318,40 @@ async fn shallow_history_below_trunk_does_not_affect_baseline_creation() {
         .unwrap();
     assert_eq!(next.base_commit.as_deref(), Some(advanced.as_str()));
 }
+
+#[test]
+fn empty_commits_prompt_keeps_pr_rewrite_guidance_when_pr_bound() {
+    let prompt = RestoreReport::builder()
+        .pointer("preserved/exec_published")
+        .commits("")
+        .base_sha("abc123")
+        .conflicts("")
+        .pr_bound(true)
+        .already_contained("xyz PR change\n")
+        .build()
+        .instructions();
+    assert!(
+        prompt.contains("nothing to restage") && prompt.contains("PR change"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("cube pr update") && prompt.contains("jj bookmark set --allow-backwards"),
+        "a PR-bound empty restage still tells the worker how to rewrite the PR: {prompt}"
+    );
+}
+
+#[test]
+fn empty_commits_prompt_omits_pr_rewrite_when_unbound() {
+    let prompt = RestoreReport::builder()
+        .pointer("preserved/exec_unbound")
+        .commits("")
+        .base_sha("abc123")
+        .conflicts("")
+        .build()
+        .instructions();
+    assert!(prompt.contains("nothing to restage"), "{prompt}");
+    assert!(
+        !prompt.contains("cube pr update"),
+        "an unbound empty restage has no PR to rewrite: {prompt}"
+    );
+}

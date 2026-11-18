@@ -1,12 +1,15 @@
-//! A revision relaunched after another revision rebased its PR.
+//! A revision relaunched after a sibling revision rebased its PR recovers
+//! without restaging content the PR head already carries, and a question its
+//! worker asks stays open.
 //!
 //! The first run stopped on a question with its commits preserved. Before it
 //! was answered, another revision of the same PR rebased the branch: the PR
 //! head now carries the same content in commits with new identities, with the
-//! lockfile hunk moved into a commit of its own. An earlier engine read the
-//! preserved commits as work missing from the PR head, refused the relaunch
-//! and blocked the row for recovery; each later run then asked its question
-//! on a row still blocked for recovery, and the question was withdrawn.
+//! lockfile hunk moved into a commit of its own. A seeded
+//! `execution_recovery_failed` row is a stale hold from an earlier attempt;
+//! starting this run lifts it so the worker's question can park the row. When
+//! the rewritten PR does not carry a preserved change, recovery refuses and
+//! no worker starts.
 use super::helpers::*;
 use boss_engine_recovery::execution_bookmark::LocalJj;
 use boss_engine_test_git::jj::JjRepo;
@@ -74,8 +77,8 @@ async fn a_question_asked_after_another_revision_rebased_the_pr_stays_open() {
     let pr_head = JjRepo::run(&repo.repo, &["log", "--no-graph", "-r", "pr/99", "-T", "commit_id"]);
     JjRepo::run(&repo.repo, &["new", "main"]);
 
-    // The row as that earlier refusal left it: blocked for recovery, with a
-    // detail naming bookmark targets that were true only at that attempt.
+    // A seeded execution_recovery_failed row carrying a stale hold: its
+    // detail names bookmark targets from an earlier attempt.
     let stale = "preserved work of execution exec_prior is not contained in PR head pr/99";
     db.update_work_item_with_basis(
         &item,
@@ -173,4 +176,110 @@ async fn a_question_asked_after_another_revision_rebased_the_pr_stays_open() {
     assert_eq!(asked.len(), 1, "{asked:?}");
     assert_eq!(asked[0].status, boss_protocol::OperatorQuestionStatus::Open);
     assert_eq!(asked[0].withdrawn_reason, None);
+}
+
+#[tokio::test]
+async fn uncontained_preserved_work_after_a_sibling_rebase_starts_no_worker() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let (db, prior, next) = super::blocked_workspace::blocked_pair(&path);
+    seed_local_claude_driver(&db);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![next.id, PR_URL],
+        )
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![next.work_item_id, PR_URL],
+        )
+        .unwrap();
+    let next = db.get_execution(&next.id).unwrap();
+    let item = next.work_item_id.clone();
+
+    let repo = JjRepo::new(dir.path());
+    super::recovery::configure_recovery_origin(&repo.repo);
+    let record = boss_engine_recovery_fixtures::create(&LocalJj, &repo.worker, &prior.id, "local")
+        .await
+        .unwrap();
+    db.record_execution_bookmark(&record).unwrap();
+    std::fs::write(repo.worker.join("feature.txt"), "feature\n").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "PR change"]);
+    JjRepo::run(&repo.worker, &["new", "-m", "Revision work"]);
+    std::fs::write(repo.worker.join("src.txt"), "revision\n").unwrap();
+    std::fs::write(repo.worker.join("deps.lock"), "one\ntwo\n").unwrap();
+    JjRepo::run(&repo.worker, &["new"]);
+    super::recovery::preserve_work(&db, &prior.id, &repo.worker).await;
+    let saved = db.preserved_tip(&prior.id).unwrap().expect("preserved tip");
+    let baseline = record.base_commit.clone().expect("dispatch recorded a floor");
+
+    // Rewritten PR on the workspace cube will position, with lockfile
+    // content the predecessor does not carry. Leave `@` on the PR head;
+    // dispatch's goto creates the empty child restore uses as destination.
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "Upstream"]);
+    std::fs::write(repo.replacement.join("upstream.txt"), "upstream\n").unwrap();
+    JjRepo::run(
+        &repo.replacement,
+        &["bookmark", "set", "main", "-r", "@", "--allow-backwards"],
+    );
+    JjRepo::run(&repo.replacement, &["new", "main", "-m", "PR change"]);
+    std::fs::write(repo.replacement.join("feature.txt"), "feature\n").unwrap();
+    JjRepo::run(&repo.replacement, &["new", "-m", "Revision work"]);
+    std::fs::write(repo.replacement.join("src.txt"), "revision\n").unwrap();
+    JjRepo::run(&repo.replacement, &["new", "-m", "Regenerate lockfile"]);
+    std::fs::write(repo.replacement.join("deps.lock"), "one\nthree\n").unwrap();
+    JjRepo::run(
+        &repo.replacement,
+        &["bookmark", "set", "pr/99", "-r", "@", "--allow-backwards"],
+    );
+    let pr_head = JjRepo::run(
+        &repo.replacement,
+        &["log", "--no-graph", "-r", "pr/99", "-T", "commit_id"],
+    );
+
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let cube = Arc::new(FakeCubeClient {
+        workspace_root: Some(dir.path().to_path_buf()),
+        next_workspace_id: Mutex::new(Some("replacement".into())),
+        real_bookmarks: true,
+        position_real_workspace: true,
+        ..FakeCubeClient::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner.clone())
+            .with_pre_start_retry_delays(Vec::new()),
+    );
+    let worker = coordinator
+        .pool_for_execution_for_test(&next)
+        .claim_worker(&next.id, None)
+        .await
+        .unwrap();
+    let started = coordinator
+        .schedule_execution_for_test(&next, &worker, DispatchAdmission::Queued)
+        .await;
+    let restore = db.execution_restore_report(&next.id).unwrap();
+    assert!(
+        started.is_err(),
+        "uncontained recovery must not start a worker: {started:?}; restore={restore:?}"
+    );
+    assert_eq!(db.get_execution(&next.id).unwrap().status, ExecutionStatus::Failed);
+    assert!(
+        runner.calls.lock().await.is_empty(),
+        "no worker starts when containment cannot be proven"
+    );
+    let (status, reason, detail) = blocked_fields(&db, &item);
+    assert_eq!(status, "blocked");
+    assert_eq!(reason.as_deref(), Some("execution_recovery_failed"));
+    let detail = detail.expect("refusal names the current store");
+    assert!(
+        detail.contains(&pr_head)
+            && detail.contains(&saved.commit_id)
+            && detail.contains(&baseline)
+            && detail.contains("current bookmarks:"),
+        "the refusal names the PR head, preserved tip, baseline and bookmark positions: {detail}"
+    );
 }

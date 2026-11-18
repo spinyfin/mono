@@ -107,6 +107,10 @@ async fn work_equal_to_the_rebased_pr_head_is_contained_not_restaged() {
         prompt.contains("nothing to restage") && prompt.contains("Revision work"),
         "the worker is told the work is already in the PR head: {prompt}"
     );
+    assert!(
+        report.pr_bound && prompt.contains("cube pr update"),
+        "a PR-bound empty restage still tells the worker how to rewrite the PR: {prompt}"
+    );
     // The first run's old workspace gets a fresh working-copy commit when
     // its own is dropped; nothing else may remain above the PR head.
     let restaged = log(
@@ -191,25 +195,141 @@ async fn only_the_work_the_pr_head_lacks_is_restaged() {
 }
 
 #[tokio::test]
-async fn work_the_pr_head_does_not_carry_is_restaged_and_named() {
+async fn work_the_pr_head_does_not_carry_is_refused_with_current_state() {
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture(dir.path());
     let record = first_run(&repo, "exec_not_contained", false, false).await;
     let saved = teardown(&repo, &record).await;
+    let original_tip = saved.commit_id.clone();
+    let baseline = record.base_commit.clone().expect("dispatch recorded a floor");
     // The regenerated lockfile differs, so the revision commit's lockfile
     // hunk is not in the PR head and containment cannot be shown.
     sibling_rebase(&repo, "one\nthree\n");
+    let positioned = log(&repo.replacement, "@", "commit_id");
+    let head = log(&repo.replacement, "@-", "commit_id");
+
+    let err = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap_err();
+    assert!(is_uncontained_preserved_work(&err), "{err:#}");
+    let detail = format!("{err:#}");
+    assert!(
+        detail.contains(&head) && detail.contains(&original_tip) && detail.contains(&baseline),
+        "the refusal names the PR head, preserved tip and baseline: {detail}"
+    );
+    assert!(
+        detail.contains(&preserved_name(&record.execution_id)) && detail.contains("current bookmarks:"),
+        "the refusal names live bookmark positions: {detail}"
+    );
+    assert_eq!(
+        log(&repo.replacement, "@", "commit_id"),
+        positioned,
+        "the workspace stays where cube positioned it"
+    );
+    assert_eq!(
+        log(&repo.replacement, &preserved_name(&record.execution_id), "commit_id"),
+        original_tip,
+        "the preserved bookmark still names the original tip"
+    );
+    let restaged = log(
+        &repo.replacement,
+        &format!("({head}:: ~ {head}) ~ working_copies()"),
+        "commit_id ++ \"\\n\"",
+    );
+    assert!(
+        restaged.trim().is_empty(),
+        "the refused restage was abandoned: {restaged}"
+    );
+}
+
+#[tokio::test]
+async fn a_contained_tip_is_replaced_by_the_remaining_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_contained_tip", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("follow-up.txt"), "not pushed\n").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "Unpublished follow-up"]);
+    JjRepo::run(&repo.worker, &["new", "-m", "Already in the PR"]);
+    std::fs::write(repo.worker.join("feature.txt"), "feature\n").unwrap();
+    std::fs::write(repo.worker.join("src.txt"), "revision\n").unwrap();
+    std::fs::write(repo.worker.join("deps.lock"), "one\ntwo\n").unwrap();
+    // Preserve on the contained commit itself so the restaged tip is that
+    // emptied change, not an empty working-copy child beneath it.
+    let saved = teardown(&repo, &record).await;
+    sibling_rebase(&repo, "one\ntwo\n");
 
     let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
         .await
         .unwrap()
         .unwrap();
 
-    assert!(report.commits.contains("Revision work"), "{report:#?}");
-    assert!(!report.commits.contains("PR change"), "{report:#?}");
-    assert!(report.already_contained.contains("PR change"), "{report:#?}");
+    assert!(report.commits.contains("Unpublished follow-up"), "{report:#?}");
+    assert!(!report.commits.contains("Already in the PR"), "{report:#?}");
+    assert!(report.already_contained.contains("Already in the PR"), "{report:#?}");
+    assert!(report.conflicts.trim().is_empty(), "{report:#?}");
+    assert_eq!(
+        log(&repo.replacement, "@", "description.first_line()"),
+        "Unpublished follow-up",
+        "the emptied tip is replaced by the remaining head"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("follow-up.txt")).unwrap(),
+        "not pushed\n"
+    );
+}
+
+#[tokio::test]
+async fn a_contained_merge_tip_stays_as_the_connector_of_two_heads() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture(dir.path());
+    let record = create(&LocalJj, &repo.worker, "exec_contained_merge", "local")
+        .await
+        .unwrap();
+    std::fs::write(repo.worker.join("a.txt"), "line a\n").unwrap();
+    JjRepo::run(&repo.worker, &["describe", "-m", "Line A"]);
+    let line_a = log(&repo.worker, "@", "commit_id");
+    JjRepo::run(&repo.worker, &["new", "main", "-m", "Line B"]);
+    std::fs::write(repo.worker.join("b.txt"), "line b\n").unwrap();
+    let line_b = log(&repo.worker, "@", "commit_id");
+    JjRepo::run(
+        &repo.worker,
+        &["new", &line_a, &line_b, "-m", "Merge already in the PR"],
+    );
+    std::fs::write(repo.worker.join("feature.txt"), "feature\n").unwrap();
+    std::fs::write(repo.worker.join("src.txt"), "revision\n").unwrap();
+    std::fs::write(repo.worker.join("deps.lock"), "one\ntwo\n").unwrap();
+    // Preserve on the merge so the restaged tip is the contained connector.
+    let saved = teardown(&repo, &record).await;
+    sibling_rebase(&repo, "one\ntwo\n");
+
+    let report = restore_preserved(&LocalJj, &record, &repo.replacement, Some(&saved))
+        .await
+        .unwrap()
+        .unwrap();
+
     assert!(
-        report.conflicts.contains("Revision work"),
-        "the differing lockfile hunk is reported for the worker: {report:#?}"
+        report.commits.contains("Line A") && report.commits.contains("Line B"),
+        "{report:#?}"
+    );
+    assert!(
+        report.already_contained.contains("Merge already in the PR"),
+        "{report:#?}"
+    );
+    assert!(!report.commits.contains("Merge already in the PR"), "{report:#?}");
+    assert!(report.conflicts.trim().is_empty(), "{report:#?}");
+    assert_eq!(
+        log(&repo.replacement, "@", "description.first_line()"),
+        "Merge already in the PR",
+        "the contained merge tip stays as the connector of the two remaining heads"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("a.txt")).unwrap(),
+        "line a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.replacement.join("b.txt")).unwrap(),
+        "line b\n"
     );
 }

@@ -2,6 +2,8 @@
 use super::preserved::{OP_VIEW_LOAD_LIMIT, RecordedPresence, log, operations, resolve_recorded_presence, unpublished};
 use super::*;
 
+const CONTAINMENT_LINE: &str = "commit_id ++ \" \" ++ change_id ++ \" \" ++ if(empty && !conflict, \"contained\", if(empty, \"connector\", \"work\")) ++ \"\\n\"";
+
 async fn recorded_candidates(jj: &dyn Jj, record: &ExecutionBookmark, recorded: &PreservedTip) -> Result<Vec<String>> {
     match resolve_recorded_presence(jj, &record.repo_path, recorded).await? {
         RecordedPresence::Visible(visible) => {
@@ -241,11 +243,37 @@ pub async fn restore_preserved(
     if !commits.is_empty() {
         let change = log(jj, &record.repo_path, &tip, "change_id").await?;
         // Include empty connectors in the roots; exclude published history.
-        let roots = format!("roots(::{tip} ~ (::remote_bookmarks() | ::{base}))");
+        // `all:` is required when two unpublished lines share the preserved tip
+        // (a merge): `roots(...)` then names more than one revision.
+        let roots = format!("all:roots(::{tip} ~ (::remote_bookmarks() | ::{base}))");
         jj.run(workspace, &["rebase", "-s", &roots, "-d", base]).await?;
         let restaged = evolved_from(jj, &record.repo_path, &change, base, &tip)
             .await?
             .ok_or_else(|| pointer_integrity_error("rebased preserved change has no identifiable evolution"))?;
+        let range = format!("{base}..{restaged}");
+        let listing = log(jj, &record.repo_path, &range, CONTAINMENT_LINE).await?;
+        let restaged_conflicts = log(
+            jj,
+            &record.repo_path,
+            &format!("({range}) & conflicts()"),
+            "change_id ++ \" \" ++ description.first_line() ++ \"\\n\"",
+        )
+        .await?;
+        if restage_is_uncontained(&commits, &listing, &restaged_conflicts) {
+            return refuse_uncontained(
+                jj,
+                record,
+                workspace,
+                UncontainedRestage {
+                    base,
+                    original_tip: &tip,
+                    restaged: &restaged,
+                    positioned,
+                    conflicts: &restaged_conflicts,
+                },
+            )
+            .await;
+        }
         let kept = drop_contained(
             jj,
             record,
@@ -320,6 +348,15 @@ pub async fn restore_preserved(
             unrestaged.push(format!("{commit} ({name})"));
         }
     }
+    let pr_bound = !log(
+        jj,
+        &record.repo_path,
+        &format!("{base} & remote_bookmarks()"),
+        "commit_id",
+    )
+    .await?
+    .trim()
+    .is_empty();
     Ok(Some(
         RestoreReport::builder()
             .pointer(preserved_name(&record.execution_id))
@@ -327,6 +364,7 @@ pub async fn restore_preserved(
             .base_sha(base)
             .inherited_base(base)
             .conflicts(conflicts)
+            .pr_bound(pr_bound)
             .discarded_tips(discarded.join("\n"))
             .unrestaged_unpublished(unrestaged.join("\n"))
             .already_contained(already_contained)
@@ -360,6 +398,92 @@ async fn evolved_from(jj: &dyn Jj, repo: &Path, change: &str, base: &str, versio
     Ok(None)
 }
 
+/// True when a sibling rebase emptied some preserved changes (they are in
+/// the destination) but the rest still conflict: containment is unproven
+/// and the remainder is not a clean restage.
+fn restage_is_uncontained(commits: &str, listing: &str, conflicts: &str) -> bool {
+    if conflicts.trim().is_empty() {
+        return false;
+    }
+    let held_work: std::collections::HashSet<&str> = commits
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(change, _)| change))
+        .collect();
+    listing.lines().any(|line| {
+        let mut fields = line.split(' ');
+        matches!(
+            (fields.next(), fields.next(), fields.next()),
+            (Some(_), Some(change), Some("contained")) if held_work.contains(change)
+        )
+    })
+}
+
+/// Undo the restage, restore `preserved/<exec>` onto the original tip, and
+/// fail with a detail that names the live PR head, preserved tip, baseline
+/// and bookmark positions.
+struct UncontainedRestage<'a> {
+    base: &'a str,
+    original_tip: &'a str,
+    restaged: &'a str,
+    positioned: &'a str,
+    conflicts: &'a str,
+}
+
+async fn refuse_uncontained(
+    jj: &dyn Jj,
+    record: &ExecutionBookmark,
+    workspace: &Path,
+    restage: UncontainedRestage<'_>,
+) -> Result<Option<RestoreReport>> {
+    let UncontainedRestage {
+        base,
+        original_tip,
+        restaged,
+        positioned,
+        conflicts,
+    } = restage;
+    let name = preserved_name(&record.execution_id);
+    jj.run(
+        &record.repo_path,
+        &[
+            "--ignore-working-copy",
+            "bookmark",
+            "set",
+            &name,
+            "-r",
+            original_tip,
+            "--allow-backwards",
+        ],
+    )
+    .await?;
+    // Leave the restaged tip before abandoning it: after the rebase `@` is
+    // typically on that tip, and abandoning the working-copy commit fails.
+    let still_positioned = log(jj, &record.repo_path, &format!("present({positioned})"), "commit_id").await?;
+    if !still_positioned.trim().is_empty() {
+        jj.run(workspace, &["edit", positioned]).await?;
+    } else {
+        jj.run(workspace, &["new", base]).await?;
+    }
+    let restaged_range = format!("{base}..{restaged}");
+    let remaining = log(jj, &record.repo_path, &restaged_range, "commit_id").await?;
+    if !remaining.trim().is_empty() {
+        jj.run(workspace, &["abandon", &restaged_range]).await?;
+    }
+    let current = log(jj, &record.repo_path, &revision(&name), "commit_id").await?;
+    let dest_names = log(jj, &record.repo_path, base, "bookmarks.join(\", \")").await?;
+    let baseline = record.base_commit.as_deref().unwrap_or("(none)");
+    let dest_note = match dest_names.trim() {
+        "" => String::new(),
+        names => format!(" ({names})"),
+    };
+    Err(uncontained_preserved_work(format!(
+        "preserved work of execution {} is not contained in PR head {base}{dest_note}: {name} at {original_tip}; baseline {baseline}; current bookmarks: {name}={} destination={base}; remaining restaged work conflicts:\n{}",
+        record.execution_id,
+        current.trim(),
+        conflicts.trim_end(),
+    )))
+}
+
 /// Drop restaged changes whose content the destination already carries.
 ///
 /// A preserved change that held work before the rebase and is empty after it
@@ -371,10 +495,12 @@ async fn evolved_from(jj: &dyn Jj, repo: &Path, change: &str, base: &str, versio
 /// read the emptied duplicate as a foreign edit of the recorded commit.
 ///
 /// Containment is decided by the rebase result alone, never by name or
-/// description: a change that still differs from `base` (or conflicts with
-/// it) stays restaged and is reported as before. Returns the restaged tip to
-/// edit, or `None` when no preserved work is left above `base`. `commits`
-/// loses the dropped changes, which `contained` then names.
+/// description. A change that still differs from `base` and restages cleanly
+/// stays restaged. When some changes empty and the remainder conflicts,
+/// [`restore_preserved`] refuses rather than handing the worker an unproven
+/// restage. Returns the restaged tip to edit, or `None` when no preserved
+/// work is left above `base`. `commits` loses the dropped changes, which
+/// `contained` then names.
 async fn drop_contained(
     jj: &dyn Jj,
     record: &ExecutionBookmark,
@@ -386,13 +512,7 @@ async fn drop_contained(
 ) -> Result<Option<String>> {
     let repo = &record.repo_path;
     let range = format!("{base}..{restaged}");
-    let listing = log(
-        jj,
-        repo,
-        &range,
-        "commit_id ++ \" \" ++ change_id ++ \" \" ++ if(empty && !conflict, \"contained\", if(empty, \"connector\", \"work\")) ++ \"\\n\"",
-    )
-    .await?;
+    let listing = log(jj, repo, &range, CONTAINMENT_LINE).await?;
     // Only changes that held work before the rebase can have been emptied by
     // it; a commit that was already empty is a connector and stays.
     let held_work: std::collections::HashSet<&str> = commits

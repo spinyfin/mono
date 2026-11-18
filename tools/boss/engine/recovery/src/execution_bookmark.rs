@@ -173,6 +173,29 @@ pub fn is_base_unresolvable_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<BaseUnresolvableError>())
 }
 
+/// Restaging a PR-bound predecessor onto a rewritten PR head left work that
+/// is neither contained in that head nor clean to restage. Dispatch parks
+/// the row rather than starting a worker or archiving and starting fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncontainedPreservedWork(pub String);
+
+impl std::fmt::Display for UncontainedPreservedWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UncontainedPreservedWork {}
+
+pub fn uncontained_preserved_work(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(UncontainedPreservedWork(message.into()))
+}
+
+/// True when `error` (or any cause in its chain) is an uncontained preserved-work refusal.
+pub fn is_uncontained_preserved_work(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<UncontainedPreservedWork>())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ExecutionBookmark {
@@ -383,7 +406,7 @@ impl RestoreReport {
         };
         if self.commits.trim().is_empty() {
             return format!(
-                "## EXECUTION BOOKMARK RECOVERY\n\nThe predecessor's preserved pointer `{}` holds nothing to restage onto base SHA `{}`: its changes are published or already in that history. The engine positioned this lease normally.{contained}{discarded}\n\nThe old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
+                "## EXECUTION BOOKMARK RECOVERY\n\nThe predecessor's preserved pointer `{}` holds nothing to restage onto base SHA `{}`: its changes are published or already in that history. The engine positioned this lease normally.{contained}{discarded}\n\n{pr_rewrite}The old workspace was not used: re-run the required build and tests in your own leased workspace before publishing; earlier validation does not satisfy this run's gate.\n\n",
                 self.pointer, self.base_sha
             );
         }
