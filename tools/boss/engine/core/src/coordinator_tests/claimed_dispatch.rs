@@ -13,10 +13,20 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
     let chore = create_test_chore(&db, product.id.clone(), "Waiting for capacity");
     db.reconcile_product_executions(&product.id).unwrap();
     let publisher = Arc::new(crate::test_support::RecordingPublisher::default());
+    let lease_db = db.clone();
+    let lease_task = chore.id.clone();
+    let cube = FakeCubeClient {
+        on_lease: Some(Arc::new(move || {
+            let runtime = lease_db.get_task_runtime(&lease_task).unwrap();
+            assert_eq!(runtime.execution_status, Some(ExecutionStatus::Claimed));
+            assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some("leasing_workspace"));
+        })),
+        ..Default::default()
+    };
     let coordinator = Arc::new(ExecutionCoordinator::with_publisher(
         db.clone(),
         WorkerPool::new(1),
-        Arc::new(FakeCubeClient::default()),
+        Arc::new(cube),
         Arc::new(FakeExecutionRunner {
             pending: true,
             ..Default::default()
@@ -59,9 +69,17 @@ async fn queue_wait_changes_and_claims_refresh_the_board_without_repeated_hold_n
             .runtime_reasons()
             .await
             .contains(&"dispatch_claimed".to_owned()),
-        "claiming a slot clears the card's wait: a runtime-class change"
+        "claiming a slot replaces the capacity hold with startup progress"
     );
+    let runtime = db.get_task_runtime(&chore.id).unwrap();
+    assert_eq!(runtime.execution_status, Some(ExecutionStatus::Claimed));
+    assert_eq!(runtime.dispatch_wait_reason.as_deref(), Some("dispatching"));
+    wait_for_execution_status(&db, runtime.execution_id.as_deref().unwrap(), ExecutionStatus::Running).await;
     assert!(db.get_task_runtime(&chore.id).unwrap().dispatch_wait_reason.is_none());
+    let reasons = publisher.runtime_reasons().await;
+    for phase in ["workspace_leasing", "workspace_preparing"] {
+        assert!(reasons.iter().any(|reason| reason == phase), "{reasons:?}");
+    }
 }
 
 /// Drain-loop chain hold must revert the pickup claim so a serialized row

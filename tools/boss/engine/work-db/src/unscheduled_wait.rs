@@ -40,6 +40,9 @@ use boss_engine_storage_values::dispatch_wait::{
 pub(super) struct Candidate<'a> {
     pub task: &'a Task,
     pub latest: Option<&'a ExecutionStatus>,
+    /// The execution `latest` describes, as the caller's projection selected
+    /// it. `None` means the caller selected none; diagnostics never pick one.
+    pub execution_id: Option<&'a str>,
 }
 
 /// What classifying the items of one branch cost.
@@ -184,6 +187,16 @@ pub(super) fn classify(
         holds,
     };
     name_deferred_conflicts(conn, &mut waits)?;
+    let unexplained: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| waits.get(&candidate.task.id).is_some_and(DispatchWait::is_unclassified))
+        .map(|candidate| super::wait_diagnostics::Unclassified {
+            work_item_id: &candidate.task.id,
+            execution_id: candidate.execution_id,
+            execution_status: candidate.latest.map(ExecutionStatus::as_str),
+        })
+        .collect();
+    super::wait_diagnostics::log_unclassified(conn, &unexplained);
     Ok((waits, cost))
 }
 

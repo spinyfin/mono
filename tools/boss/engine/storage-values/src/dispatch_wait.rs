@@ -90,6 +90,13 @@ pub const DISPATCH_WAIT_REASON_HOST_LEASE_PARK: &str = "host_lease_park";
 /// reclassified as [`DISPATCH_WAIT_REASON_UNCLASSIFIED`].
 pub const DISPATCH_WAIT_REASON_AWAITING_DISPATCH: &str = "awaiting_dispatch";
 
+/// The dispatcher has claimed the execution and is preparing its launch.
+pub const DISPATCH_WAIT_REASON_DISPATCHING: &str = "dispatching";
+/// Cube is acquiring a workspace for the claimed execution.
+pub const DISPATCH_WAIT_REASON_LEASING_WORKSPACE: &str = "leasing_workspace";
+/// The workspace has been acquired and is being positioned for the worker.
+pub const DISPATCH_WAIT_REASON_PREPARING_WORKSPACE: &str = "preparing_workspace";
+
 /// Startup preflight (boot recovery, the local capability probe, or a failed
 /// runtime check) is holding every local dispatch.
 pub const DISPATCH_WAIT_REASON_PREFLIGHT_HOLD: &str = "dispatch_preflight";
@@ -172,6 +179,18 @@ pub use boss_protocol::DISPATCH_WAIT_REASON_UNCLASSIFIED;
 /// reported as [`DISPATCH_WAIT_REASON_UNCLASSIFIED`], so a new hold cannot
 /// reach a card as a bare identifier.
 pub const DISPATCH_WAIT_REASON_CODES: &[(&str, &str)] = &[
+    (
+        DISPATCH_WAIT_REASON_DISPATCHING,
+        "dispatching: preparing the worker launch",
+    ),
+    (
+        DISPATCH_WAIT_REASON_LEASING_WORKSPACE,
+        "dispatching: leasing a workspace",
+    ),
+    (
+        DISPATCH_WAIT_REASON_PREPARING_WORKSPACE,
+        "dispatching: preparing the worker workspace",
+    ),
     (
         DISPATCH_WAIT_REASON_REVIEW_COMPLETE,
         "review complete; waiting for checks and merge handling",

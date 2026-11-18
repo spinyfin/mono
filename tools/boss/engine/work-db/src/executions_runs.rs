@@ -909,7 +909,12 @@ impl WorkDb {
     pub fn release_dispatch_claim(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let updated = conn.execute(
-            "UPDATE work_executions SET status = 'ready' WHERE id = ?1 AND status = 'claimed'",
+            "UPDATE work_executions SET status = 'ready',
+                 dispatch_wait_reason = CASE WHEN dispatch_wait_reason IN
+                     ('dispatching', 'leasing_workspace', 'preparing_workspace') THEN NULL ELSE dispatch_wait_reason END,
+                 dispatch_wait_since = CASE WHEN dispatch_wait_reason IN
+                     ('dispatching', 'leasing_workspace', 'preparing_workspace') THEN NULL ELSE dispatch_wait_since END
+             WHERE id = ?1 AND status = 'claimed'",
             [execution_id],
         )?;
         Ok(updated > 0)
@@ -929,7 +934,12 @@ impl WorkDb {
         let mut released = Vec::new();
         for id in ids {
             let updated = conn.execute(
-                "UPDATE work_executions SET status = 'ready' WHERE id = ?1 AND status = 'claimed'",
+                "UPDATE work_executions SET status = 'ready',
+                 dispatch_wait_reason = CASE WHEN dispatch_wait_reason IN
+                     ('dispatching', 'leasing_workspace', 'preparing_workspace') THEN NULL ELSE dispatch_wait_reason END,
+                 dispatch_wait_since = CASE WHEN dispatch_wait_reason IN
+                     ('dispatching', 'leasing_workspace', 'preparing_workspace') THEN NULL ELSE dispatch_wait_since END
+             WHERE id = ?1 AND status = 'claimed'",
                 [&id],
             )?;
             if updated > 0 {
@@ -1250,6 +1260,9 @@ impl WorkDb {
                  workspace_path = ?5,
                  host_id = ?7,
                  started_at = COALESCE(started_at, ?6),
+                 dispatch_wait_reason = NULL,
+                 dispatch_wait_since = NULL,
+                 dispatch_wait_blocker_id = NULL,
                  finished_at = NULL,
                  last_error = NULL
              WHERE id = ?1

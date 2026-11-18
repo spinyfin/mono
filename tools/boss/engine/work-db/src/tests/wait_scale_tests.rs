@@ -50,6 +50,7 @@ fn classify_all(conn: &Connection) -> BTreeMap<String, String> {
         .map(|task| Candidate {
             task,
             latest: latest.get(&task.id),
+            execution_id: None,
         })
         .collect();
     let (classified, _) = unscheduled_wait::classify(conn, &candidates, None).unwrap();
@@ -283,6 +284,7 @@ fn classify_cost(conn: &Connection, tasks: &[&Task]) -> unscheduled_wait::Classi
         .map(|task| Candidate {
             task,
             latest: latest.get(&task.id),
+            execution_id: None,
         })
         .collect();
     let counter = StatementCounter::install(conn);
@@ -394,6 +396,7 @@ fn pause_exemptions_are_read_for_the_whole_set() {
             .map(|task| Candidate {
                 task,
                 latest: latest.get(&task.id),
+                execution_id: None,
             })
             .collect();
         let (classified, _) = unscheduled_wait::classify(&conn, &candidates, None).unwrap();

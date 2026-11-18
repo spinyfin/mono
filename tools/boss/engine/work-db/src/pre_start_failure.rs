@@ -85,6 +85,9 @@ impl WorkDb {
         let rows = conn.execute(
             "UPDATE work_executions
              SET status = 'ready',
+                 dispatch_wait_reason = NULL,
+                 dispatch_wait_since = NULL,
+                 dispatch_wait_blocker_id = NULL,
                  started_at = NULL,
                  finished_at = NULL,
                  dispatch_not_before = ?2, dispatch_not_before_source = 'host_lease_park',
@@ -233,6 +236,9 @@ impl WorkDb {
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'ready',
+                     dispatch_wait_reason = NULL,
+                     dispatch_wait_since = NULL,
+                     dispatch_wait_blocker_id = NULL,
                      pre_start_failure_count = ?2,
                      cube_repo_id = COALESCE(?3, cube_repo_id),
                      started_at = NULL,

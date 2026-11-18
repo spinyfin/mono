@@ -916,6 +916,7 @@ pub mod remote_input_cleanup;
 mod revision_ai_review;
 pub mod sweep_handles;
 mod unscheduled_wait;
+mod wait_diagnostics;
 pub mod work_dependencies;
 pub use feedback_target::FeedbackTarget;
 mod connection_wait;

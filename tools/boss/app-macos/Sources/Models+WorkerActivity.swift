@@ -386,12 +386,10 @@ enum AgentActivityState: Equatable {
             // Gating on it here would paint every such worker as "Run
             // completed".
             self = .active
-        case "ready", "waiting_dependency":
+        case "ready", "waiting_dependency", "claimed":
             // Not started yet. Why is the engine's to say: the same line the
             // card shows, never a reason inferred from the execution status.
             self = .waiting(reason: WorkCardLiveStatus.queuedLabel(runtime: runtime, now: Date()))
-        case "claimed":
-            self = .waiting(reason: "Starting worker")
         case "waiting_human":
             self = .waiting(reason: "Waiting on human input")
         case "waiting_review":
