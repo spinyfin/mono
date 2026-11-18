@@ -205,8 +205,7 @@ pub(crate) const ALLOWED: &[&str] = &[
     "\"$TOOL\" pr create --title 'Block pkill and killall'",
 ];
 
-#[test]
-fn claude_signal_guard_decisions() {
+fn claude_launch_guard_script() -> tempfile::NamedTempFile {
     let config = ToolUseInterceptionConfig {
         data_dir: None,
         path_guard_script: None,
@@ -221,33 +220,88 @@ fn claude_signal_guard_decisions() {
     };
     let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
     let guard = wiring.pre_tool_use_hooks[0]["hooks"][0]["command"].as_str().unwrap();
-    for (command, expected) in denied()
-        .iter()
-        .map(|c| (c.as_str(), "block"))
-        .chain(ALLOWED.iter().map(|c| (*c, "approve")))
-    {
-        let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
-        let mut child = Command::new("sh")
-            .args(["-c", guard])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(payload.to_string().as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "{command}: {:?}", output);
-        let decision: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(decision["decision"], expected, "{command}: {decision}");
-        if expected == "block" {
-            let reason = decision["reason"].as_str().unwrap();
-            assert!(reason.contains("other workers") && reason.contains("explicit positive numeric PIDs"));
-        }
+    let body = guard
+        .strip_prefix("python3 -c \"")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("launch guard is python3 -c");
+    let mut script = tempfile::NamedTempFile::new().unwrap();
+    script.write_all(body.as_bytes()).unwrap();
+    script.flush().unwrap();
+    script
+}
+
+/// One interpreter for the whole matrix. Spawning python3 per command blew
+/// the small-test 60s shard budget once the deny list grew past ~180 cases.
+const BATCH_RUNNER: &str = r#"
+import json, sys, io, contextlib
+script = open(sys.argv[1]).read()
+results = []
+for cmd in json.load(sys.stdin):
+    buf = io.StringIO()
+    fake_in = io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}}))
+    with contextlib.redirect_stdout(buf):
+        old = sys.stdin
+        sys.stdin = fake_in
+        try:
+            exec(compile(script, "guard.py", "exec"), {"__name__": "__main__"})
+        except SystemExit:
+            pass
+        finally:
+            sys.stdin = old
+    results.append(json.loads(buf.getvalue()))
+print(json.dumps(results))
+"#;
+
+fn claude_guard_decisions(script: &std::path::Path, commands: &[String]) -> Vec<serde_json::Value> {
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(BATCH_RUNNER)
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(commands).unwrap().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "batch runner failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn claude_signal_guard_denies_forbidden_commands() {
+    let script = claude_launch_guard_script();
+    let commands = denied();
+    let decisions = claude_guard_decisions(script.path(), &commands);
+    assert_eq!(decisions.len(), commands.len());
+    for (command, decision) in commands.iter().zip(decisions) {
+        assert_eq!(decision["decision"], "block", "{command}: {decision}");
+        let reason = decision["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("other workers") && reason.contains("explicit positive numeric PIDs"),
+            "{command}: {reason}"
+        );
+    }
+}
+
+#[test]
+fn claude_signal_guard_allows_safe_commands() {
+    let script = claude_launch_guard_script();
+    let commands: Vec<String> = ALLOWED.iter().map(|s| (*s).to_string()).collect();
+    let decisions = claude_guard_decisions(script.path(), &commands);
+    assert_eq!(decisions.len(), commands.len());
+    for (command, decision) in commands.iter().zip(decisions) {
+        assert_eq!(decision["decision"], "approve", "{command}: {decision}");
     }
 }
 

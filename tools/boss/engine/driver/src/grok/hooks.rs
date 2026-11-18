@@ -974,21 +974,25 @@ mod tests {
     }
 
     #[test]
-    fn grok_signal_guard_decisions() {
+    fn grok_adapter_translates_signal_guard_block_and_allow() {
         let tmp = tempfile::TempDir::new().unwrap();
         let adapter_path = write_adapter_script(tmp.path());
         let guards = guard_commands(&interception_config(|c| c.is_standard_worker = false));
-        for (command, expected) in crate::signal_guard_tests::denied()
-            .iter()
-            .map(|c| (c.as_str(), "deny"))
-            .chain(crate::signal_guard_tests::ALLOWED.iter().map(|c| (*c, "allow")))
-        {
+        let body = guards[0]
+            .command
+            .strip_prefix("python3 -c \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("launch guard is python3 -c");
+        let script = tmp.path().join("signal_guard.py");
+        std::fs::write(&script, body).unwrap();
+        let guard = format!("python3 {}", script.display());
+        for (command, expected) in [("pkill foo", "deny"), ("pgrep -f foo", "allow")] {
             let payload = json!({
                 "hookEventName": "pre_tool_use",
                 "toolName": "run_terminal_command",
                 "toolInput": {"command": command},
             });
-            let (code, stdout, stderr) = run_adapter(&adapter_path, &guards[0].command, &payload, true);
+            let (code, stdout, stderr) = run_adapter(&adapter_path, &guard, &payload, true);
             assert_eq!(code, 0, "{command}: {stderr}");
             let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
             assert_eq!(decision["decision"], expected, "{command}: {stdout}");

@@ -938,18 +938,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_signal_guard_decisions() {
+    fn codex_shim_translates_signal_guard_block_and_allow() {
         let body = crate::codex::python_c_to_script(crate::claude::BOSS_LAUNCH_GUARD_COMMAND).unwrap();
-        for command in crate::signal_guard_tests::denied() {
-            let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}).to_string();
-            let (verdict, _) = run_shim("signal-deny", &body, &payload);
-            assert!(matches!(verdict, Verdict::Block(_)), "{command}: {verdict:?}");
-        }
-        for command in crate::signal_guard_tests::ALLOWED {
-            let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}).to_string();
-            let (verdict, _) = run_shim("signal-allow", &body, &payload);
-            assert_eq!(verdict, Verdict::Allow, "{command}");
-        }
+        let (verdict, _) = run_shim(
+            "signal-deny",
+            &body,
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "pkill foo"}}).to_string(),
+        );
+        assert!(matches!(verdict, Verdict::Block(_)), "{verdict:?}");
+        let (verdict, _) = run_shim(
+            "signal-allow",
+            &body,
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "pgrep -f foo"}}).to_string(),
+        );
+        assert_eq!(verdict, Verdict::Allow);
     }
 
     #[test]
