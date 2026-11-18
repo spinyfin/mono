@@ -384,3 +384,58 @@ async fn answer_transaction_identifies_force_launched_resume() {
         "resume: {resume:?}"
     );
 }
+
+#[tokio::test]
+async fn declining_a_force_launched_runs_question_resumes_it_past_the_pause() {
+    let (state, _dir, asking, task_id, runner) = force_launched_question().await;
+
+    assert!(matches!(
+        answer_question(&state, &task_id, false).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+
+    let resume_id = resume_execution(&state, &task_id, &asking).id;
+    wait_for_starts(&state, &runner, 2).await;
+    assert_eq!(
+        state.work_db.get_execution(&resume_id).unwrap().status,
+        ExecutionStatus::Running,
+        "a No answer must start the resume without a second force launch"
+    );
+    assert!(state.work_db.execution_force_launched(&resume_id).unwrap());
+    assert!(state.execution_coordinator.is_dispatch_paused());
+}
+
+#[tokio::test]
+async fn declining_answer_transaction_identifies_force_launched_resume() {
+    let (state, _dir, asking, task_id, _runner) = force_launched_question().await;
+    let outcome = state
+        .work_db
+        .answer_operator_question(&task_id, boss_protocol::OperatorAnswer::YesNo { value: false })
+        .unwrap();
+    let resume = resume_execution(&state, &task_id, &asking);
+    assert_eq!(outcome.force_resume_execution_id, Some(resume.id));
+}
+
+#[tokio::test]
+async fn declining_a_normally_dispatched_runs_question_still_waits_behind_the_pause() {
+    let (state, _dir, asking, task_id) = parked_question_task().await;
+    pause_dispatch(&state);
+
+    assert!(matches!(
+        answer_question(&state, &task_id, false).await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+
+    let resume_id = resume_execution(&state, &task_id, &asking).id;
+    let mut held = false;
+    for _ in 0..200 {
+        let execution = state.work_db.get_execution(&resume_id).unwrap();
+        if execution.dispatch_wait_reason.as_deref() == Some("dispatch_paused") {
+            held = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(held, "the pause must hold the resume after a No answer");
+    assert!(!state.work_db.execution_force_launched(&resume_id).unwrap());
+}

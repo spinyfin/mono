@@ -2759,7 +2759,7 @@ impl WorkDb {
             ) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = file_count_bypass_authorization_block(&question.question, *spec, &timestamp);
-                minted_execution = restart_after_answer_from(
+                let restart = restart_after_answer_from(
                     &mut pending,
                     &tx,
                     &task,
@@ -2767,13 +2767,14 @@ impl WorkDb {
                     &block,
                     RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
-                )?
-                .minted;
+                )?;
+                minted_execution = restart.minted;
+                force_resume_execution_id = restart.force_resume_execution_id;
             }
             (OperatorAnswer::YesNo { value: false }, _) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = declined_block(&question.question, &timestamp);
-                minted_execution = restart_after_answer_from(
+                let restart = restart_after_answer_from(
                     &mut pending,
                     &tx,
                     &task,
@@ -2781,8 +2782,9 @@ impl WorkDb {
                     &block,
                     RestartOptions::new(&now, suppress_start),
                     crate::task_status_audit::WriteAttribution { actor, provenance },
-                )?
-                .minted;
+                )?;
+                minted_execution = restart.minted;
+                force_resume_execution_id = restart.force_resume_execution_id;
             }
             // `check_answer` above refuses every other pairing.
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
