@@ -695,7 +695,10 @@ fn restore_prior(
             // Restore autostart first, while the row is still waiting on the
             // question, so this write keeps its own basis and actor. Status
             // and reason restoration below keeps the earlier failure's
-            // provenance so progression classification is unchanged.
+            // provenance so progression classification is unchanged. One
+            // operation so the status restore is listed with the autostart
+            // flag write.
+            let operation = crate::task_status_audit::begin_operation_on(conn)?;
             crate::task_status_audit::execute(
                 conn,
                 &attribution.basis("progression_ladder_restore_autostart"),
@@ -730,6 +733,7 @@ fn restore_prior(
                     grace,
                 ],
             )?;
+            operation.end()?;
         }
         // `file_question` records the state in the same transaction that
         // blocks the item, so a missing record means the row is not one this

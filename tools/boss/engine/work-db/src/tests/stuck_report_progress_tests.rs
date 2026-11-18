@@ -361,7 +361,8 @@ fn execution_wait_migration_preserves_ages_and_removes_ledger_coupling() {
         )
         .unwrap();
     assert_eq!(count, 0);
-    // Execution transitions must work without the task-property audit tables.
+    // Abandonment recording depends on the ledger; wait-history writes must
+    // still work when the audit tables are absent.
     conn.execute_batch("DROP TRIGGER task_status_audit_abandon_execution; DROP TABLE task_status_audit;")
         .unwrap();
     drop(conn);

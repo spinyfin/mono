@@ -160,53 +160,6 @@ row is present on a given installation cannot be told from source: it
 depends on the sweep having run, on how many newer never-started rows the
 item has, and on the clock at that moment.
 
-## 3. Automatic stop history — `task_status_audit`
-
-Every engine write that moves an execution to `abandoned`, and every write
-to a task's `autostart`, `deferred` or `status`, appends a row to the
-`task_status_audit` ledger **in the same transaction as the change**
-(a rolled-back change leaves no row). Rows are read with
-`boss task show <id> --json` (`field_audit`) and
-`boss task executions <id>` (text, and `field_audit` in `--json`), over the
-existing `ListTaskFieldAudit` request.
-
-What a row carries:
-
-| Field                                  | Meaning                                                                                                                 |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `property`                             | `execution_abandoned`, `autostart`, `deferred`, or a `status` move made in the same operation as one of those           |
-| `old_value` / `new_value`              | Before and after; for an abandonment, the execution's previous status and `abandoned`                                   |
-| `reason_code`                          | Stable machine-readable cause (never reworded once shipped); `unattributed_write` for a write that bypassed the helpers |
-| `detail`                               | Diagnostic text for the cause; may be reworded                                                                          |
-| `actor`, `basis`                       | Who the engine attributes the write to, and the writer (plus the socket caller's identity when one exists)              |
-| `operation_id`                         | Shared by every row one atomic operation wrote (abandon + autostart off + status demotion)                              |
-| `execution_id`                         | The abandoned execution; the execution row itself may since have been pruned                                            |
-| `failure_stamp` / `failure_error`      | The task's dispatch-failure time, and the execution's last error (else the task's dispatch-failure reason)              |
-| `execution_ever_ran` / `item_ever_ran` | Whether the execution, and any execution of the item, had started or produced a run at that moment                      |
-
-Rows written before this ledger captured causes keep `NULL` in every added
-field: nothing is inferred for them, and attribution that was never recorded
-(which caller, which transaction) cannot be recovered retrospectively.
-`autostart` and `status` rows take their `reason_code` from the writer's
-helper name (the first word of `basis`); abandonment rows carry an explicit
-code per writer (`abandon_cause` in `work-db/src/task_status_audit.rs`).
-Conflict-resolution and CI-remediation attempts that are marked `abandoned`
-are separate tables, not executions: they appear here only through the
-execution changes they cause.
-
-### Retention of the other surfaces, from source
-
-- `engine-audit.log`: capped at 2 MiB (`MAX_LOG_BYTES` in
-  `engine/core/src/audit.rs`); past the cap the oldest half is dropped on the
-  next append. There is no guaranteed day window; coverage depends on write
-  rate.
-- Dispatch events (`current.jsonl`, `engine/dispatch-events`): rotated at
-  100 MiB, five rotated segments kept (six counting the active file). Also
-  volume-bounded, not time-bounded.
-- The ledger above is the only one of these that is both durable and tied to
-  the state change; prefer it for "why did this stop?" over the volume-bounded
-  logs.
-
 ### Counting traps
 
 - **Rounds = distinct `.message.id`**, not assistant-record count.
@@ -244,6 +197,53 @@ tasks → work_executions → work_runs → transcript_path
 Gap: review-findings follow-up work parented elsewhere links back via
 `tasks.origin_task_short_id` / `origin_pr_number`, populated on only
 27 / 4,132 rows in the measurement corpus.
+
+## 3. Automatic stop history — `task_status_audit`
+
+Every engine write that moves an execution to `abandoned`, and every write
+to a task's `autostart`, `deferred` or `status`, appends a row to the
+`task_status_audit` ledger **in the same transaction as the change**
+(a rolled-back change leaves no row). Rows are read with
+`boss task show <id> --json` (`field_audit`) and
+`boss task executions <id>` (text, and `field_audit` in `--json`), over the
+existing `ListTaskFieldAudit` request.
+
+What a row carries:
+
+| Field                                  | Meaning                                                                                                                 |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `property`                             | `execution_abandoned`, `autostart`, `deferred`, or a `status` move made in the same operation as one of those           |
+| `old_value` / `new_value`              | Before and after; for an abandonment, the execution's previous status and `abandoned`                                   |
+| `reason_code`                          | Stable machine-readable cause (never reworded once shipped); `unattributed_write` for a write that bypassed the helpers |
+| `detail`                               | Diagnostic text for the cause; may be reworded                                                                          |
+| `actor`, `basis`                       | Who the engine attributes the write to, and the writer (plus the socket caller's identity when one exists)              |
+| `operation_id`                         | Shared by every row one atomic operation wrote (abandon + autostart off + status demotion)                              |
+| `execution_id`                         | The abandoned execution; the execution row itself may since have been pruned                                            |
+| `failure_stamp` / `failure_error`      | The task's dispatch-failure time, and the execution's last error (else the task's dispatch-failure diagnostic text)     |
+| `execution_ever_ran` / `item_ever_ran` | Whether the execution, and any execution of the item, had started or produced a run at that moment                      |
+
+Rows written before this ledger captured causes keep `NULL` in every added
+field: nothing is inferred for them, and attribution that was never recorded
+(which caller, which transaction) cannot be recovered retrospectively.
+`autostart` and `status` rows take their `reason_code` from the writer's
+helper name (the first word of `basis`); abandonment rows carry an explicit
+code per writer (`abandon_cause` in `work-db/src/task_status_audit.rs`).
+Conflict-resolution and CI-remediation attempts that are marked `abandoned`
+are separate tables, not executions: they appear here only through the
+execution changes they cause.
+
+### Retention of the other surfaces, from source
+
+- `engine-audit.log`: capped at 2 MiB (`MAX_LOG_BYTES` in
+  `engine/core/src/audit.rs`); past the cap the oldest half is dropped on the
+  next append. There is no guaranteed day window; coverage depends on write
+  rate.
+- Dispatch events (`current.jsonl`, `engine/dispatch-events`): rotated at
+  100 MiB, five rotated segments kept (six counting the active file). Also
+  volume-bounded, not time-bounded.
+- The ledger above is the only one of these that is both durable and tied to
+  the state change; prefer it for "why did this stop?" over the volume-bounded
+  logs.
 
 ## Related
 

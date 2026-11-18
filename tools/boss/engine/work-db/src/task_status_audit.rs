@@ -37,7 +37,7 @@ impl<'a> AbandonCause<'a> {
         }
     }
 
-    /// The same cause attributed to another actor (an operator deferral).
+    /// The same cause attributed to the caller's actor, such as an explicit deferral.
     pub(crate) const fn by(self, actor: &'a str) -> Self {
         Self { actor, ..self }
     }
@@ -150,8 +150,8 @@ pub fn execute<P: rusqlite::Params>(
     params: P,
 ) -> rusqlite::Result<usize> {
     conn.execute_batch("SAVEPOINT task_status_write")?;
+    let operation = begin_operation_if_absent(conn)?;
     let result = (|| {
-        let operation = begin_operation_if_absent(conn)?;
         conn.execute(
             "INSERT INTO task_status_audit_context (basis, actor) VALUES (?1, ?2)",
             params![basis, actor],
@@ -175,11 +175,15 @@ pub fn execute<P: rusqlite::Params>(
         if parking_ctx {
             conn.execute("DELETE FROM parking_audit_context", [])?;
         }
-        operation.end(conn)?;
         Ok(count)
     })();
     if result.is_err() {
+        operation.forget();
         conn.execute_batch("ROLLBACK TO task_status_write")?;
+    } else if let Err(err) = operation.end() {
+        conn.execute_batch("ROLLBACK TO task_status_write")?;
+        conn.execute_batch("RELEASE task_status_write")?;
+        return Err(err);
     }
     conn.execute_batch("RELEASE task_status_write")?;
     result
@@ -195,36 +199,82 @@ pub fn execute<P: rusqlite::Params>(
 /// begun and ended inside one transaction: the operation row is
 /// transaction-local state, and an error return drops the transaction, which
 /// rolls the row back with the rest of the writes.
+///
+/// Drop ends an operation that the caller did not end, so a forgotten `end`
+/// cannot leave the singleton in place for later, unrelated writes to join.
+/// Call [`Operation::end`] before committing so a delete error is not lost
+/// on the drop path.
 #[must_use = "end the operation before committing"]
-pub(crate) struct Operation {
+pub(crate) struct Operation<'a> {
+    conn: &'a Connection,
     created: bool,
+    ended: std::cell::Cell<bool>,
 }
 
-impl Operation {
-    pub(crate) fn end(self, conn: &Connection) -> rusqlite::Result<()> {
-        if self.created {
-            conn.execute("DELETE FROM task_status_audit_operation", [])?;
+impl Operation<'_> {
+    pub(crate) fn end(self) -> rusqlite::Result<()> {
+        self.end_inner()
+    }
+
+    /// The surrounding savepoint is about to roll this row back; Drop must
+    /// not DELETE it first, or the rollback would restore the singleton.
+    fn forget(&self) {
+        self.ended.set(true);
+    }
+
+    fn end_inner(&self) -> rusqlite::Result<()> {
+        if self.created && !self.ended.get() {
+            self.conn.execute("DELETE FROM task_status_audit_operation", [])?;
+            self.ended.set(true);
         }
         Ok(())
     }
 }
 
-/// Start an [`Operation`] that spans the writes made before it ends. Joins an
-/// operation that is already active.
-pub(crate) fn begin_operation(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<Operation> {
-    begin_operation_if_absent(tx)
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        if self.created
+            && !self.ended.get()
+            && let Err(err) = self.end_inner()
+        {
+            tracing::error!(
+                error = %err,
+                "task_status_audit operation dropped without end(); later ledger writes may join this operation_id"
+            );
+        }
+    }
 }
 
-fn begin_operation_if_absent(conn: &Connection) -> rusqlite::Result<Operation> {
+/// Start an [`Operation`] that spans the writes made before it ends. Joins an
+/// operation that is already active.
+pub(crate) fn begin_operation<'a>(tx: &'a rusqlite::Transaction<'_>) -> rusqlite::Result<Operation<'a>> {
+    begin_operation_on(tx)
+}
+
+/// Start an [`Operation`] on a connection that is already inside a
+/// transaction. The operation row is transaction-local state; this must not
+/// be called outside a transaction, because a committed singleton would
+/// correlate every later write until something else ended it.
+pub(crate) fn begin_operation_on(conn: &Connection) -> rusqlite::Result<Operation<'_>> {
+    begin_operation_if_absent(conn)
+}
+
+fn begin_operation_if_absent(conn: &Connection) -> rusqlite::Result<Operation<'_>> {
     match conn.execute(
         "INSERT OR IGNORE INTO task_status_audit_operation (singleton, operation_id) VALUES (1, ?1)",
         params![super::audit_misc::next_id("auditop")],
     ) {
-        Ok(created) => Ok(Operation { created: created > 0 }),
+        Ok(created) => Ok(Operation {
+            conn,
+            created: created > 0,
+            ended: std::cell::Cell::new(false),
+        }),
         // A schema older than the operation migration records no correlation.
-        Err(err) if super::parking::sqlite_missing_table(&err, "task_status_audit_operation") => {
-            Ok(Operation { created: false })
-        }
+        Err(err) if super::parking::sqlite_missing_table(&err, "task_status_audit_operation") => Ok(Operation {
+            conn,
+            created: false,
+            ended: std::cell::Cell::new(true),
+        }),
         Err(err) => Err(err),
     }
 }
@@ -241,19 +291,23 @@ pub(crate) fn abandon<P: rusqlite::Params>(
     params: P,
 ) -> rusqlite::Result<usize> {
     conn.execute_batch("SAVEPOINT task_status_abandon")?;
+    let operation = begin_operation_if_absent(conn)?;
     let result = (|| {
-        let operation = begin_operation_if_absent(conn)?;
         conn.execute(
             "INSERT INTO task_status_audit_context (basis, actor, reason_code, detail) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![cause.path, cause.actor, cause.code, cause.detail],
         )?;
         let count = conn.execute(sql, params)?;
         conn.execute("DELETE FROM task_status_audit_context", [])?;
-        operation.end(conn)?;
         Ok(count)
     })();
     if result.is_err() {
+        operation.forget();
         conn.execute_batch("ROLLBACK TO task_status_abandon")?;
+    } else if let Err(err) = operation.end() {
+        conn.execute_batch("ROLLBACK TO task_status_abandon")?;
+        conn.execute_batch("RELEASE task_status_abandon")?;
+        return Err(err);
     }
     conn.execute_batch("RELEASE task_status_abandon")?;
     result
@@ -382,14 +436,32 @@ fn install_abandon_trigger(conn: &Connection) -> Result<()> {
                 (SELECT detail FROM task_status_audit_context),
                 NEW.id,
                 (SELECT dispatch_failed_at FROM tasks WHERE id = NEW.work_item_id),
-                COALESCE(NEW.last_error, (SELECT dispatch_failed_reason FROM tasks WHERE id = NEW.work_item_id)),
-                NEW.started_at IS NOT NULL OR EXISTS (SELECT 1 FROM work_runs WHERE execution_id = NEW.id),
-                EXISTS (SELECT 1 FROM work_runs wr JOIN work_executions we ON wr.execution_id = we.id
-                        WHERE we.work_item_id = NEW.work_item_id));
+                COALESCE(NEW.last_error, (SELECT dispatch_failed_error FROM tasks WHERE id = NEW.work_item_id)),
+                {EXECUTION_EVER_RAN_SQL},
+                {ITEM_EVER_RAN_SQL});
          END;"
     ))?;
     Ok(())
 }
+
+/// SQL boolean: this execution had started or produced a run.
+const EXECUTION_EVER_RAN_SQL: &str =
+    "NEW.started_at IS NOT NULL OR EXISTS (SELECT 1 FROM work_runs WHERE execution_id = NEW.id)";
+
+/// SQL boolean: any execution of the item had started or produced a run.
+/// Uses the same "started or produced a run" definition as [`EXECUTION_EVER_RAN_SQL`].
+const ITEM_EVER_RAN_SQL: &str = "EXISTS (
+    SELECT 1 FROM work_executions we
+    WHERE we.work_item_id = NEW.work_item_id
+      AND (we.started_at IS NOT NULL
+           OR EXISTS (SELECT 1 FROM work_runs wr WHERE wr.execution_id = we.id)))";
+
+/// [`ITEM_EVER_RAN_SQL`] against a `tasks` trigger's `NEW.id`.
+const ITEM_EVER_RAN_ON_TASK_SQL: &str = "EXISTS (
+    SELECT 1 FROM work_executions we
+    WHERE we.work_item_id = NEW.id
+      AND (we.started_at IS NOT NULL
+           OR EXISTS (SELECT 1 FROM work_runs wr WHERE wr.execution_id = we.id)))";
 
 impl WorkDb {
     /// The recorded history of one task, oldest first: its `deferred` /
@@ -469,13 +541,12 @@ pub(super) fn install_property_triggers(conn: &Connection, property: &str) -> Re
     // basis (the rest is the socket caller's identity).
     let (columns, values) = if enriched {
         let ran = if matches!(property, "status" | "autostart" | "deferred") {
-            "EXISTS (SELECT 1 FROM work_runs wr JOIN work_executions we ON wr.execution_id = we.id
-                     WHERE we.work_item_id = NEW.id)"
+            ITEM_EVER_RAN_ON_TASK_SQL
         } else {
             "NULL"
         };
         let failure = if matches!(property, "status" | "autostart" | "deferred") {
-            "NEW.dispatch_failed_at, NEW.dispatch_failed_reason"
+            "NEW.dispatch_failed_at, NEW.dispatch_failed_error"
         } else {
             "NULL, NULL"
         };

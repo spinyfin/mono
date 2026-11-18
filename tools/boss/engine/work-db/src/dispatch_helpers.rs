@@ -1292,6 +1292,8 @@ pub fn reconcile_revision_execution(
 
         let now = now_string();
         // Drop any not-yet-live execution row before archiving the task.
+        // One operation so the archive/status row is listed with the abandonment.
+        let operation = crate::task_status_audit::begin_operation_on(conn)?;
         abandon_pending_executions(
             pending,
             conn,
@@ -1308,6 +1310,7 @@ pub fn reconcile_revision_execution(
             "reconcile_revision",
             ARCHIVE_MECHANISM_PARENT_CLOSE_DISPATCH_RECONCILIATION,
         )?;
+        operation.end()?;
         return Ok(());
     }
 
@@ -1345,6 +1348,7 @@ pub fn reconcile_revision_execution(
     // `blocked_detail` written below names that path.
     if let Some(attempt) = retired_spawning_attempt(conn, task)? {
         let now = now_string();
+        let operation = crate::task_status_audit::begin_operation_on(conn)?;
         abandon_pending_item_work_executions(
             pending,
             conn,
@@ -1410,6 +1414,7 @@ pub fn reconcile_revision_execution(
                 }
             }
         }
+        operation.end()?;
         return Ok(());
     }
 
@@ -1694,6 +1699,10 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
         // created or refreshed it; it must never become a work-item field.
         requested_host_id: _,
     } = input;
+
+    // One operation for this request: stale-governing abandonment, status
+    // clears, and flag writes share an `operation_id`.
+    let _operation = crate::task_status_audit::begin_operation_on(conn)?;
 
     let preferred_workspace_id = normalize_optional_text(preferred_workspace_id);
     // An explicit start does not override a park: the row stays skipped by every
@@ -2190,7 +2199,7 @@ pub(crate) fn request_execution_in_tx_as_actor<F: FnOnce(&str) -> bool>(
                 let now = now_string();
                 crate::task_status_audit::abandon(
                     conn,
-                    crate::task_status_audit::abandon_cause::STALE_GOVERNING_REDISPATCH,
+                    crate::task_status_audit::abandon_cause::STALE_GOVERNING_REDISPATCH.by(actor),
                     "UPDATE work_executions
                      SET status = 'abandoned',
                          finished_at = COALESCE(finished_at, ?2)

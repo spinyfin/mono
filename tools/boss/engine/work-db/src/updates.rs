@@ -785,7 +785,7 @@ impl WorkDb {
                 crate::task_status_audit::abandon_cause::DEFERRED.by(actor),
             )?;
         }
-        operation.end(&tx)?;
+        operation.end()?;
 
         if status_changed && previous_status != task.status {
             cascade_dependents_after_prereq_status_change(

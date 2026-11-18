@@ -709,6 +709,7 @@ fn parent_close_reconcile_records_its_own_abandonment_cause() {
             "waiting_dependency".to_owned()
         )]
     );
+    assert_status_shares_abandonment_and_unrelated_stays_distinct(&db, &revision_id, "archived");
 }
 
 /// The sweep that blocks pending revisions when the parent closes records a
@@ -753,6 +754,7 @@ fn parent_close_sweep_records_its_own_abandonment_cause() {
         abandonment_codes(&db, &revision_id),
         [(execution.id, "parent_close_sweep".to_owned(), "ready".to_owned())]
     );
+    assert_status_shares_abandonment_and_unrelated_stays_distinct(&db, &revision_id, "archived");
 }
 
 /// A revision whose spawning attempt was retired withdraws its pending
@@ -820,6 +822,45 @@ fn retired_spawning_attempt_gate_records_its_own_abandonment_cause() {
             "waiting_dependency".to_owned()
         )]
     );
+    assert_status_shares_abandonment_and_unrelated_stays_distinct(&db, &revision_id, "blocked");
+}
+
+/// The combined write listed a status demotion that shares the abandonment's
+/// `operation_id`, and a later unrelated flag write does not join it.
+fn assert_status_shares_abandonment_and_unrelated_stays_distinct(
+    db: &WorkDb,
+    work_item_id: &str,
+    expected_status: &str,
+) {
+    let rows = db.list_task_field_audit(work_item_id).unwrap();
+    let abandon = rows
+        .iter()
+        .rfind(|row| row.property == "execution_abandoned")
+        .expect("abandonment row");
+    let status = rows
+        .iter()
+        .rfind(|row| row.property == "status" && row.new_value.as_deref() == Some(expected_status))
+        .expect("status demotion should be listed with the abandonment");
+    assert_eq!(status.operation_id, abandon.operation_id);
+    assert!(abandon.operation_id.is_some());
+
+    crate::task_status_audit::execute(
+        &db.connect().unwrap(),
+        "unrelated_write",
+        "human",
+        "UPDATE tasks SET autostart = 0 WHERE id = ?1 AND autostart = 1",
+        [work_item_id],
+    )
+    .unwrap();
+    let after = db.list_task_field_audit(work_item_id).unwrap();
+    let later = after
+        .iter()
+        .rfind(|row| {
+            row.property == "autostart" && row.new_value.as_deref() == Some("0") && row.basis == "unrelated_write"
+        })
+        .expect("unrelated autostart write");
+    assert_ne!(later.operation_id, abandon.operation_id);
+    assert!(later.operation_id.is_some());
 }
 
 /// `(execution id, reason code, previous status)` of each abandonment the

@@ -706,6 +706,8 @@ pub fn block_pending_revisions_on_parent_close(
         }
 
         // Drop any not-yet-live execution row before archiving the task.
+        // One operation so the archive/status row is listed with the abandonment.
+        let operation = crate::task_status_audit::begin_operation_on(conn)?;
         abandon_pending_executions(
             pending,
             conn,
@@ -723,6 +725,7 @@ pub fn block_pending_revisions_on_parent_close(
             "block_pending_revisions",
             ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP,
         )?;
+        operation.end()?;
     }
     Ok(())
 }

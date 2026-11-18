@@ -263,7 +263,7 @@ impl WorkDb {
                    AND deleted_at IS NULL",
                 params![work_item_id, now],
             )?;
-            operation.end(&tx)?;
+            operation.end()?;
             if updated > 0 {
                 healed.push(HealedGhostActive {
                     work_item_id,
@@ -1882,7 +1882,7 @@ impl WorkDb {
                 AND status IN ('todo', 'active')",
             params![task_id, now],
         )?;
-        operation.end(&tx)?;
+        operation.end()?;
         if task_rows > 0 {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, task_id, "in_review", &now)?;
         }

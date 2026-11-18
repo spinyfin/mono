@@ -1403,14 +1403,14 @@ pub struct TaskFieldAuditRow {
     /// The task's recorded dispatch-failure time at the moment of the change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_stamp: Option<String>,
-    /// The execution's last error, else the task's dispatch-failure reason, at
-    /// the moment of the change.
+    /// The execution's last error, else the task's dispatch-failure diagnostic
+    /// text (`dispatch_failed_error`), at the moment of the change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_error: Option<String>,
     /// Whether the abandoned execution had ever started or produced a run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_ever_ran: Option<bool>,
-    /// Whether any execution of the item had ever produced a run.
+    /// Whether any execution of the item had ever started or produced a run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_ever_ran: Option<bool>,
 }
