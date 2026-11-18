@@ -148,8 +148,8 @@ rust_test(
     name = "work_db_test",
     size = "small",
     # 2,500+ tests in one unsharded process, so it has no shards to spread a
-    # loaded host over: `long` rather than `moderate`. The seeded-board scale
-    # tests and measurements it used to carry run in `work_db_scale_test`.
+    # loaded host over: `long` rather than `moderate`. Seeded-board scale
+    # tests and measurements run in `work_db_scale_test`.
     timeout = "long",
     srcs = glob(["src/**/*.rs"]),
     compile_data = ["//tools/boss/app-macos:work_board_banners_swift"],
@@ -183,11 +183,13 @@ rust_test(
 # `bazel test //...`, CI included.
 #
 # The binary is the whole test crate, so the target selects its tests by name:
-# every test whose path contains `scale`. The selection is passed the way
-# `bazel test --test_filter` passes one, as TESTBRIDGE_TEST_ONLY, because the
-# rust_test wrapper then refuses to report success when it matches nothing. A
-# plain `args` filter that stopped matching would pass with zero tests run.
-# An explicit `--test_filter` replaces it, for running one measurement.
+# every test whose path contains `scale`. `tests::scale_selection_guard` fails
+# if a cfg-gated module would be skipped or an ungated test would match.
+# The selection is passed the way `bazel test --test_filter` passes one, as
+# TESTBRIDGE_TEST_ONLY, because the rust_test wrapper then refuses to report
+# success when it matches nothing. A plain `args` filter that stopped matching
+# would pass with zero tests run. An explicit `--test_filter` replaces it, for
+# running one measurement.
 #
 # size/timeout: the tests run side by side for about half a minute on a
 # remote-execution worker, and together peak near 1.25 GB of live heap, 1.6

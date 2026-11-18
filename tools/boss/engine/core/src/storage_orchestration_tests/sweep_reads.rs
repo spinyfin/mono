@@ -336,4 +336,5 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
         single_elapsed,
         single_elapsed / ROOTS as u32,
     );
+    crate::test_support::install_peak_memory_report();
 }

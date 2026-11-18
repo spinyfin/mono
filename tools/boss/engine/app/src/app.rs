@@ -2069,9 +2069,7 @@ impl ServerState {
         // called — hence the late bind.
         //
         // Weak, because the coordinator owns this publisher: a strong handle
-        // here is a reference cycle, and nothing the server state built
-        // (the coordinator, its services, the work database's connection and
-        // page cache) is freed when the server state is dropped.
+        // here is a reference cycle.
         let coord_for_kick = Arc::downgrade(&server_state.execution_coordinator);
         publisher_impl.set_kick(move || {
             if let Some(coordinator) = coord_for_kick.upgrade() {

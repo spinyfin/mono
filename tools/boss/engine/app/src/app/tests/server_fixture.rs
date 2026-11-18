@@ -23,8 +23,8 @@ fn prepared_databases_keep_server_state_isolated_and_persistent() {
 
 /// Nothing a server state builds may keep its coordinator, or its database
 /// connection and page cache, alive after it is dropped. Every test here
-/// builds at least one server state, and a reference cycle between the
-/// coordinator and the publisher it owns once left about 1 MB behind for each.
+/// builds at least one server state; a strong scheduler-kick handle would
+/// cycle the coordinator and the publisher it owns.
 #[test]
 fn a_dropped_server_state_frees_its_coordinator_and_database() {
     for (state, _dir) in [test_server_state(), test_server_state_with_fakes()] {

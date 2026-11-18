@@ -120,6 +120,9 @@ rust_binary(
 #
 # Run an individual test through the hermetic wrapper with bazel test
 # --test_filter=path::to::test_name.
+#
+# The 1,500-root sweep cost baseline is compiled only into
+# `:engine_lib_scale_test` (`--cfg=boss_scale_tests`).
 
 # The same suite against the oldest and the newest supported jj (see
 # //tools/cube/docs/jj-compatibility.md): one compile, two test targets.
@@ -181,6 +184,60 @@ twin_test(
     data = ["@jj_upgrade_test_tools//:jj"],
     env = {"BOSS_JJ_BIN": "$(rootpath @jj_upgrade_test_tools//:jj)"},
     shard_count = 7,
+)
+
+# Runtime cost baseline for the sweeps' narrow reads against the full
+# per-id projection (1,500 in-review roots). `--cfg=boss_scale_tests`
+# compiles that module only here, so `engine_lib_test` does not build or
+# run the fixture. The target still runs on every `bazel test //...`, CI
+# included.
+#
+# The binary is the whole test crate, so the target selects the baseline
+# by path (`storage_orchestration_tests::sweep_reads`) via
+# TESTBRIDGE_TEST_ONLY. The rust_test wrapper then refuses to report
+# success when the selection matches nothing. An explicit `--test_filter`
+# replaces it. RUST_TEST_NOCAPTURE puts the measured figures in the log.
+rust_test(
+    name = "engine_lib_scale_test",
+    size = "small",
+    timeout = "moderate",
+    aliases = TEST_ALIASES,
+    crate = ":runtime",
+    data = [
+        "//tools/boss/engine/driver:codex_test_binary",
+        "//tools/boss/event-shim:boss-event",
+        "//tools/cube",
+        "//tools/repobin",
+        "@jj_test_tools//:jj",
+    ],
+    edition = "2024",
+    env = {
+        "BOSS_TEST_EVENT_SHIM": "$(rootpath //tools/boss/event-shim:boss-event)",
+        "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
+        "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
+        "HOME": "/tmp",
+        "RUST_TEST_NOCAPTURE": "1",
+        "TESTBRIDGE_TEST_ONLY": "storage_orchestration_tests::sweep_reads",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    rustc_flags = ["--cfg=boss_scale_tests"],
+    deps = TEST_DEPS + [
+        "//tools/boss/engine/pane-summary",
+        "//tools/boss/engine/prose-vocabulary",
+        "//tools/boss/engine/recovery-fixtures",
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/test-git",
+    ] + all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 network_enabled_rust_test(

@@ -44,7 +44,8 @@ const FILE_POLL: Duration = Duration::from_millis(50);
 /// get a shorter clock of its own. It now runs until the run is torn down
 /// ([`AgentJsonlProgressManager::stop_run`]) and merely *records* — durably,
 /// on the checkpoint, and as a dispatch event — that it is overdue.
-/// The threshold also slows scans from 100ms to one second.
+/// Past the threshold, scans slow from [`crate::agent_jsonl_discovery::DISCOVERY_POLL`]
+/// to [`crate::agent_jsonl_discovery::DISCOVERY_POST_OVERDUE_POLL`].
 pub const DISCOVERY_OVERDUE_AFTER: Duration = crate::agent_jsonl_discovery::DISCOVERY_TIMEOUT;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLEX_BYTES: usize = 64 * 1024;
@@ -522,6 +523,11 @@ pub struct AgentJsonlProgressManager {
     /// See [`DISCOVERY_OVERDUE_AFTER`]. A field so a test can drive the
     /// overdue path in milliseconds rather than minutes.
     discovery_overdue_after: Duration,
+    /// Gap between scans after [`Self::discovery_overdue_after`]. Production
+    /// uses [`crate::agent_jsonl_discovery::DISCOVERY_POST_OVERDUE_POLL`];
+    /// tests inject a short interval so post-overdue transitions do not wait
+    /// on wall-clock seconds.
+    discovery_post_overdue_poll: Duration,
     /// Per-poll telemetry sink for every tail this manager spawns; a
     /// no-op unless [`Self::with_metrics`] was called.
     telemetry: StreamTelemetry,
@@ -532,6 +538,7 @@ impl Default for AgentJsonlProgressManager {
         Self {
             runs: Mutex::new(HashMap::new()),
             discovery_overdue_after: DISCOVERY_OVERDUE_AFTER,
+            discovery_post_overdue_poll: crate::agent_jsonl_discovery::DISCOVERY_POST_OVERDUE_POLL,
             telemetry: StreamTelemetry::default(),
         }
     }
@@ -556,6 +563,14 @@ impl AgentJsonlProgressManager {
     #[cfg(test)]
     fn with_discovery_overdue_after(mut self, after: Duration) -> Self {
         self.discovery_overdue_after = after;
+        self
+    }
+
+    /// Scan this often after overdue instead of
+    /// [`crate::agent_jsonl_discovery::DISCOVERY_POST_OVERDUE_POLL`].
+    #[cfg(test)]
+    fn with_discovery_post_overdue_poll(mut self, poll: Duration) -> Self {
+        self.discovery_post_overdue_poll = poll;
         self
     }
 
@@ -732,6 +747,7 @@ impl AgentJsonlProgressManager {
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
         let overdue_after = self.discovery_overdue_after;
+        let post_overdue_poll = self.discovery_post_overdue_poll;
         let telemetry = self.telemetry.clone();
         boss_task_scope::spawn(async move {
             run_prepared(
@@ -742,6 +758,7 @@ impl AgentJsonlProgressManager {
                     .sink(sink)
                     .store(store)
                     .overdue_after(overdue_after)
+                    .post_overdue_poll(post_overdue_poll)
                     .telemetry(telemetry)
                     .build(),
                 start,
@@ -798,6 +815,7 @@ struct RunPreparedConfig<S> {
     sink: S,
     store: Arc<dyn IngressCheckpointStore>,
     overdue_after: Duration,
+    post_overdue_poll: Duration,
     telemetry: StreamTelemetry,
 }
 
@@ -816,6 +834,7 @@ async fn run_prepared<S>(
         sink,
         store,
         overdue_after,
+        post_overdue_poll,
         telemetry,
     } = config;
     tokio::select! {
@@ -832,13 +851,14 @@ async fn run_prepared<S>(
 
     let (candidate, start_offset, session_state, discovery_secs) = match start {
         IngressStart::Discover => {
-            let discovery = Discovery {
-                run_id: &run_id,
-                prepared: &prepared,
-                sink: &sink,
-                store: &store,
-                overdue_after,
-            };
+            let discovery = Discovery::builder()
+                .run_id(&run_id)
+                .prepared(&prepared)
+                .sink(&sink)
+                .store(&store)
+                .overdue_after(overdue_after)
+                .post_overdue_poll(post_overdue_poll)
+                .build();
             let (candidate, discovery_secs) = match discovery.run(&mut halt).await {
                 Ok(Some(found)) => found,
 
@@ -1014,12 +1034,14 @@ fn checkpoint_rejection(reason: &crate::agent_jsonl_discovery::CandidateRejectio
 
 /// One run's discovery: the poll loop that waits for exactly one new,
 /// workspace-correlated rollout to appear under the prepared root.
+#[derive(bon::Builder)]
 struct Discovery<'a, S> {
     run_id: &'a str,
     prepared: &'a PreparedSource,
     sink: &'a S,
     store: &'a Arc<dyn IngressCheckpointStore>,
     overdue_after: Duration,
+    post_overdue_poll: Duration,
 }
 
 impl<S> Discovery<'_, S>
@@ -1046,6 +1068,7 @@ where
             self.prepared,
             halt,
             self.overdue_after,
+            self.post_overdue_poll,
             |rejected, reason, waited_secs, overdue, file_progress| {
                 if file_progress && !recorded_live {
                     self.sink.record_driver_attach(self.run_id);

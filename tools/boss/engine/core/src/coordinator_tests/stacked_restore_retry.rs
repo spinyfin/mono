@@ -296,8 +296,8 @@ async fn every_integrity_verdict_retains_saved_work_and_allows_fresh_dispatch() 
 }
 
 /// One test per execution kind: each case builds its own repositories through
-/// `jj`, and as a single looped test the twelve of them were the longest test
-/// in the binary. Separate tests run side by side and spread across shards.
+/// `jj`. Separate tests run side by side and spread across shards so no single
+/// case serializes the others.
 macro_rules! legacy_conflicts_remain_untouched_and_never_prevent_start {
     ($($test:ident => $kind:ident),+ $(,)?) => {
         $(

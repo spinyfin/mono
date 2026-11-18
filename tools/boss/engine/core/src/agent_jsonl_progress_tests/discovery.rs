@@ -47,9 +47,9 @@ async fn rejected_candidate_after_overdue_refreshes_diagnostics_and_can_recover(
         })
         .await;
     let oversized = discovery_record(fx.store.get("run-diagnostic")).unwrap();
+    assert_eq!(oversized.verdict, DiscoveryVerdict::Overdue);
     assert_eq!(oversized.rejected_candidates, 1);
     assert_eq!(oversized.rejections[0].file_name, "rollout-diagnostic-thread.jsonl");
-    assert!(oversized.waited_secs >= 1);
     fs::write(&path, b"{").unwrap();
     fx.sink
         .wait_for(|_| {
@@ -171,12 +171,15 @@ impl Fixture {
 
 /// A prepared and activated run whose overdue threshold is milliseconds.
 fn armed_run(run_id: &str, overdue_after: Duration) -> Fixture {
+    crate::test_support::install_peak_memory_report();
     let temp = TempDir::new().unwrap();
     let sessions = temp.path().join("sessions");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&sessions).unwrap();
     fs::create_dir_all(&workspace).unwrap();
-    let manager = AgentJsonlProgressManager::new().with_discovery_overdue_after(overdue_after);
+    let manager = AgentJsonlProgressManager::new()
+        .with_discovery_overdue_after(overdue_after)
+        .with_discovery_post_overdue_poll(Duration::from_millis(5));
     let sink = ObservingSink::default();
     let store = MemoryStore::default();
     manager
