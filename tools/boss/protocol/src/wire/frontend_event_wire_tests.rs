@@ -2548,7 +2548,11 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::OperatorDecisionSnapshot { .. }
         | FrontendEvent::OperatorQuestionsList { .. }
         | FrontendEvent::TaskFieldAuditList { .. }
-        | FrontendEvent::OperatorQuestionError { .. } => {}
+        | FrontendEvent::OperatorQuestionError { .. }
+        | FrontendEvent::BoothbyPassesList { .. }
+        | FrontendEvent::BoothbyState { .. }
+        | FrontendEvent::BoothbyPassStarted { .. }
+        | FrontendEvent::BoothbyActivity { .. } => {}
     }
 }
 

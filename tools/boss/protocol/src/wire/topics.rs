@@ -19,6 +19,14 @@ pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
 /// Configured driver traffic split published after a successful `SetDriverTrafficSplit`.
 pub const TOPIC_DRIVER_TRAFFIC_SPLIT: &str = "driver.traffic_split";
 
+/// Global topic carrying Boothby pass lifecycle pushes
+/// ([`FrontendEvent::BoothbyActivity`]). The engine publishes whenever a
+/// `boothby_passes` row opens or closes so the Boothby tab's pass history and
+/// audit feed update without polling. See
+/// `tools/boss/docs/designs/boothby.md` §"Interaction with the existing
+/// engine".
+pub const TOPIC_BOOTHBY_ACTIVITY: &str = "boothby.activity";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }

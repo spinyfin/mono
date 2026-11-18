@@ -397,11 +397,19 @@ pub use boss_protocol::Automation;
 pub use boss_protocol::AutomationPatch;
 pub use boss_protocol::AutomationRun;
 pub use boss_protocol::AutomationTrigger;
+pub use boss_protocol::BOOTHBY_OUTCOME_CAPPED;
+pub use boss_protocol::BOOTHBY_OUTCOME_COMPLETED;
+pub use boss_protocol::BOOTHBY_OUTCOME_FAILED;
+pub use boss_protocol::BOOTHBY_OUTCOME_NOTHING_TO_DO;
+pub use boss_protocol::BOOTHBY_OUTCOME_TIMED_OUT;
 pub use boss_protocol::BOOTHBY_REVERSIBILITY_IRREVERSIBLE;
 pub use boss_protocol::BOOTHBY_TARGET_ATTENTION;
 pub use boss_protocol::BOOTHBY_TARGET_ATTENTION_ITEM;
 pub use boss_protocol::BOOTHBY_TARGET_PROJECT;
 pub use boss_protocol::BOOTHBY_TARGET_TASK;
+pub use boss_protocol::BOOTHBY_TRIGGER_EVENT_PREFIX;
+pub use boss_protocol::BOOTHBY_TRIGGER_MANUAL;
+pub use boss_protocol::BOOTHBY_TRIGGER_SCHEDULE;
 pub use boss_protocol::BlockedSignal;
 pub use boss_protocol::BoothbyAction;
 pub use boss_protocol::BoothbyCursor;
@@ -785,6 +793,14 @@ pub struct WorkDb {
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
     persona_metrics: Arc<boss_metrics::Registry>,
+    /// Registered once at boot via [`WorkDb::set_boothby_event_queue`]. Armed
+    /// by [`WorkDb::create_attention_item`] when a new legacy attention item
+    /// is created with a kind in
+    /// [`crate::boothby_events::BOOTHBY_TRIGGER_ATTENTION_KINDS`]. `None` in
+    /// every test `WorkDb` and any boot path that never registers one — a
+    /// missing queue means "no one is listening," not an error.
+    #[builder(default)]
+    boothby_event_queue: Arc<Mutex<Option<Arc<crate::boothby_events::BoothbyEventQueue>>>>,
     /// Produces coordinator handoff write ids and tmux spawn authorizations.
     /// Defaults to the shared utility generator; callers can inject a fixture
     /// or an alternate generator at the open boundary.
@@ -804,6 +820,7 @@ impl Clone for WorkDb {
             engine_rebase_holds: Arc::clone(&self.engine_rebase_holds),
             event_bus: Arc::clone(&self.event_bus),
             persona_metrics: Arc::clone(&self.persona_metrics),
+            boothby_event_queue: Arc::clone(&self.boothby_event_queue),
             token_generator: Arc::clone(&self.token_generator),
         }
     }
@@ -855,6 +872,8 @@ pub mod board_projection_schema;
 pub mod board_review_cache;
 pub mod board_runtime_cache;
 mod boothby;
+pub mod boothby_events;
+mod boothby_passes;
 mod cached_task_runtimes;
 mod chain_helpers;
 mod ci_failure_identity;

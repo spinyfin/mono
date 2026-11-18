@@ -24,6 +24,9 @@ pub mod automation_triage;
 pub mod awaiting_input_status;
 pub mod background_children;
 pub mod background_work;
+pub mod boothby_dispatch_sinks;
+pub use boss_work_db::boothby_events;
+pub mod boothby_scheduler;
 pub mod board_invalidation_metrics;
 #[cfg(test)]
 mod board_invalidation_replay;

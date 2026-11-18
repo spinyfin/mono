@@ -421,6 +421,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         R::GetAutomation { .. }
         | R::GetAutomationOpenTaskCount { .. }
         | R::GetAutomationState
+        | R::GetBoothbyState
         | R::GetCiBudget { .. }
         | R::GetCiRemediation { .. }
         | R::GetConflictHotspots { .. }
@@ -440,6 +441,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::ListAutomationRuns { .. }
         | R::ListAutomationTasks { .. }
         | R::ListAutomations { .. }
+        | R::ListBoothbyPasses { .. }
         | R::ListCiRemediations { .. }
         | R::ListConflictResolutions { .. }
         // BOSS_COORDINATOR.md is coordinator-facing by construction, keeping
@@ -503,6 +505,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::ReleaseHoldRun { .. }
         | R::RevokeDecision { .. }
         | R::SetAutomationPaused { .. }
+        | R::SetBoothbyMode { .. }
         | R::SetCiBudget { .. }
         | R::SetCoordinatorHandoff { .. } => ordered_replayable(WorkerAccess::Coordinator, ProgressionAccess::Deny),
 
@@ -603,6 +606,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::RetryCiRemediation { .. }
         | R::RetryConflictResolution { .. }
         | R::RunAutomation { .. }
+        | R::RunBoothbyPass
         | R::Shutdown { .. }
         | R::SpawnCapabilityRestored
         | R::StartProjectPostmortem { .. }
