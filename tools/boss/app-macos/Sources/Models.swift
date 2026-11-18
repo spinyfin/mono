@@ -385,8 +385,8 @@ enum WorkBlockedBadge {
         return label(forReason: reason)
     }
 
-    /// Prefix the engine stamps on `blockedDetail` when an operator's answer
-    /// parked the row behind its prerequisites; the rest names them.
+    /// Prefix stored in `blockedDetail` after a question is answered while
+    /// prerequisites still gate the row; the suffix names those prerequisites.
     static let answeredWaitingPrefix = "Answered · waits for "
 
     /// `true` for a dependency-blocked row whose operator question was

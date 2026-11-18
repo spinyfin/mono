@@ -539,11 +539,11 @@ async fn question_restart_delete_and_edits_withdraw_atomically() {
 }
 
 #[tokio::test]
-async fn question_answer_rolls_back_when_dispatch_cannot_create_an_execution() {
+async fn question_answer_is_recorded_when_dispatch_cannot_create_an_execution() {
     let (state, _dir, _, task_id) = parked_question_task().await;
     let before = question_task(&state, &task_id);
-    // Repository resolution is part of the dispatch transaction. A failure
-    // must leave both the unanswered question and original brief intact.
+    // Repository resolution is part of starting the work. Its failure must not
+    // undo the answer: the answer and its brief are recorded regardless.
     state
         .work_db
         .connect()
@@ -555,17 +555,13 @@ async fn question_answer_rolls_back_when_dispatch_cannot_create_an_execution() {
         .unwrap();
     assert!(matches!(
         answer_question(&state, &task_id, true).await,
-        FrontendEvent::WorkError { .. }
+        FrontendEvent::WorkItemUpdated { .. }
     ));
     let after = question_task(&state, &task_id);
-    assert_eq!(after.description, before.description);
-    assert_eq!(after.status, before.status);
-    assert_eq!(after.blocked_reason, before.blocked_reason);
-    assert_eq!(after.operator_question, before.operator_question);
+    assert_ne!(after.description, before.description);
     let records = state.work_db.list_operator_questions(&task_id).unwrap();
-    assert_eq!(records[0].status, boss_protocol::OperatorQuestionStatus::Open);
-    assert!(records[0].answer.is_none());
-    assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+    assert_eq!(records[0].status, boss_protocol::OperatorQuestionStatus::Answered);
+    assert!(records[0].answer.is_some());
 }
 
 #[tokio::test]

@@ -481,6 +481,10 @@ pub(crate) fn maybe_engine_block_dependent_as_actor(
     let Some(current) = current_status else {
         return Ok(None);
     };
+    // A fresh gate invalidates any answered-waiting marker naming earlier ones.
+    if dependent_id.starts_with("task_") {
+        super::prerequisite_question::clear_answered_waiting(conn, dependent_id)?;
+    }
     if matches!(current.as_str(), "blocked" | "done" | "archived") {
         return Ok(None);
     }
@@ -760,6 +764,7 @@ pub(crate) fn maybe_engine_unblock_dependent_as_actor(
              WHERE id = ?1 AND deleted_at IS NULL",
             [dependent_id],
         )?;
+        super::prerequisite_question::clear_answered_waiting(conn, dependent_id)?;
         stage_task_board_change(pending, conn, dependent_id)?;
     }
     tracing::info!(

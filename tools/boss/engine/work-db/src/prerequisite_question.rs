@@ -405,7 +405,8 @@ const ANSWERED_WAITING_DETAIL_PREFIX: &str = "Answered · waits for ";
 
 /// After an answer parks `task_id` behind its gating prerequisites, record that
 /// it is answered and waiting, naming the prerequisites. No-op unless the task
-/// is parked `blocked` / `dependency`; the detail clears with the block.
+/// is parked `blocked` / `dependency`. The marker is cleared when the dependency
+/// block lifts or the task is re-blocked (see [`clear_answered_waiting`]).
 pub(super) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result<()> {
     let names = deps::gating_prereqs_for(conn, task_id)?
         .iter()
@@ -421,6 +422,80 @@ pub(super) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result
     Ok(())
 }
 
+/// After an answer on an ungated, eligible task: leave a schedulable
+/// continuation, then (unless `suppress_start`) try an explicit start.
+/// Returns whether an explicit start minted the execution.
+pub(super) fn continue_after_answer(
+    pending: &mut PendingEvents,
+    tx: &rusqlite::Transaction<'_>,
+    task: &Task,
+    question: &OperatorQuestionView,
+    suppress_start: bool,
+    attribution: crate::task_status_audit::WriteAttribution<'_>,
+) -> Result<bool> {
+    let actor = attribution.actor;
+    // Recording the answer must not depend on starting the task. Leave a
+    // schedulable continuation first (the asking run has ended, and nothing
+    // else mints a replacement after a terminal run); the scheduler admits it
+    // under the normal pause and capacity rules.
+    let task = query_task(tx, &task.id).require("task", &task.id)?;
+    if task.kind == TaskKind::Revision {
+        reconcile_revision_execution(pending, tx, &mut ExecutionReconcileResult::default(), &task)?;
+    } else {
+        super::prerequisite_question::queue_ready_execution(tx, &task, question)?;
+    }
+    if suppress_start {
+        // The caller asked for no explicit start.
+        return Ok(false);
+    }
+    // The explicit start is a best-effort step on top of the continuation: a
+    // refusal (quarantine, parked row) must not roll back the recorded answer,
+    // so it runs under a savepoint and the continuation stays queued.
+    let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
+    tx.execute_batch("SAVEPOINT answer_explicit_start")?;
+    let started = request_execution_in_tx_with_live_check(
+        pending,
+        tx,
+        RequestExecutionInput::builder()
+            .work_item_id(&task.id)
+            .maybe_preferred_workspace_id(asking.preferred_workspace_id)
+            .entry_point(boss_protocol::DispatchAdmissionEntryPoint::OperatorAnswer)
+            .explicit_start(true)
+            .audit_actor(actor)
+            .maybe_audit_basis(attribution.provenance.map(str::to_owned))
+            .build(),
+        // Match request_execution's conservative behavior when
+        // no live-worker oracle is supplied.
+        |_| true,
+    );
+    match started {
+        Ok(_) => {
+            tx.execute_batch("RELEASE answer_explicit_start")?;
+        }
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO answer_explicit_start; RELEASE answer_explicit_start")?;
+            tracing::warn!(
+                work_item_id = %task.id,
+                %error,
+                "answer recorded; explicit start refused, the queued continuation stays for the scheduler",
+            );
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Drop the answered-waiting marker from `task_id`'s `blocked_detail`, leaving
+/// any other detail alone. Called whenever the dependency block lifts or is
+/// re-applied so a later block never shows a stale prerequisite name.
+pub(crate) fn clear_answered_waiting(conn: &Connection, task_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET blocked_detail = NULL WHERE id = ?1 AND blocked_detail LIKE ?2",
+        params![task_id, format!("{ANSWERED_WAITING_DETAIL_PREFIX}%")],
+    )?;
+    Ok(())
+}
+
 /// Leave a `waiting_dependency` execution behind for the parked task.
 ///
 /// The cascade that fires when the prerequisite is satisfied only promotes an
@@ -431,14 +506,34 @@ pub(super) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result
 /// so the resumed run lands where the branch state is. Revisions are left
 /// alone: their own reconciler mints the replacement when the gate clears.
 pub(super) fn queue_gated_execution(conn: &Connection, task: &Task, question: &OperatorQuestionView) -> Result<()> {
+    if deps::gating_prereqs_for(conn, &task.id)?.is_empty() {
+        return Ok(());
+    }
+    queue_continuation_execution(conn, task, question, ExecutionStatus::WaitingDependency)
+}
+
+/// Leave a `ready` execution behind for an answered task that nothing gates.
+///
+/// Recording an answer must not depend on starting the task: the asking run
+/// has already ended, and nothing else mints a replacement after a terminal
+/// run. This row is the schedulable continuation, so the scheduler admits it
+/// under the ordinary pause and capacity rules whether or not the caller also
+/// asked for an explicit start. Revisions are left to their own reconciler.
+pub(super) fn queue_ready_execution(conn: &Connection, task: &Task, question: &OperatorQuestionView) -> Result<()> {
+    queue_continuation_execution(conn, task, question, ExecutionStatus::Ready)
+}
+
+fn queue_continuation_execution(
+    conn: &Connection,
+    task: &Task,
+    question: &OperatorQuestionView,
+    status: ExecutionStatus,
+) -> Result<()> {
     if !parking::upkeep_eligible(conn, &task.id)? {
         return Ok(());
     }
     let kind = execution_kind_for_work_item(conn, &task.id)?;
-    if kind == ExecutionKind::RevisionImplementation
-        || deps::gating_prereqs_for(conn, &task.id)?.is_empty()
-        || primary_pr_awaits_review(conn, &task.id)?
-    {
+    if kind == ExecutionKind::RevisionImplementation || primary_pr_awaits_review(conn, &task.id)? {
         return Ok(());
     }
     let Some(repo_remote_url) = resolve_repo_for_work_item(conn, &task.id)? else {
@@ -458,7 +553,7 @@ pub(super) fn queue_gated_execution(conn: &Connection, task: &Task, question: &O
         CreateExecutionInput::builder()
             .work_item_id(&task.id)
             .kind(kind)
-            .status(ExecutionStatus::WaitingDependency)
+            .status(status)
             .repo_remote_url(repo_remote_url)
             .allow_dirty(preferred.is_some())
             .prefer_is_soft(preferred.is_some())

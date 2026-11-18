@@ -4,8 +4,8 @@ use super::*;
 #[path = "question_dismissal.rs"]
 pub(super) mod question_dismissal;
 use boss_protocol::{
-    DispatchAdmissionEntryPoint, OperatorAnswer, OperatorAnswerType, OperatorQuestion, OperatorQuestionError,
-    OperatorQuestionRecord, OperatorQuestionStatus, OperatorQuestionView,
+    OperatorAnswer, OperatorAnswerType, OperatorQuestion, OperatorQuestionError, OperatorQuestionRecord,
+    OperatorQuestionStatus, OperatorQuestionView,
 };
 
 /// The `blocked_reason` value the incident-002 postmortem tripwire stamps on
@@ -2877,28 +2877,7 @@ pub(super) fn restart_after_answer_from(
         super::prerequisite_question::stamp_answered_waiting(tx, &task.id)?;
         return Ok(false);
     }
-    if suppress_start {
-        // The answer is recorded and the brief carries it; the caller asked for
-        // no explicit start, so the normal scheduler decides when it runs.
-        return Ok(false);
-    }
-    let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
-    request_execution_in_tx_with_live_check(
-        pending,
-        tx,
-        RequestExecutionInput::builder()
-            .work_item_id(&task.id)
-            .maybe_preferred_workspace_id(asking.preferred_workspace_id)
-            .entry_point(DispatchAdmissionEntryPoint::OperatorAnswer)
-            .explicit_start(true)
-            .audit_actor(actor)
-            .maybe_audit_basis(attribution.provenance.map(str::to_owned))
-            .build(),
-        // Match request_execution's conservative behavior when
-        // no live-worker oracle is supplied.
-        |_| true,
-    )?;
-    Ok(true)
+    super::prerequisite_question::continue_after_answer(pending, tx, task, question, suppress_start, attribution)
 }
 
 /// No on a plain yes-no or ordinary prerequisite question: record the

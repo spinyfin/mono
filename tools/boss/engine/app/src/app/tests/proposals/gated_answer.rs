@@ -123,15 +123,15 @@ async fn suppressed_start_records_the_answer_without_requesting_a_start() {
         );
         assert!(task.description.contains("Repo owner approval"));
         let after = statuses(&state, &task_id);
-        assert!(!after.contains(&ExecutionStatus::Ready), "{after:?}");
         if gated {
+            assert!(!after.contains(&ExecutionStatus::Ready), "{after:?}");
             assert_eq!(task.status, TaskStatus::Blocked);
         } else {
             assert_eq!(task.status, TaskStatus::Todo);
-            assert_eq!(
-                after, before,
-                "no execution is requested for an ungated suppressed answer"
-            );
+            // The answer leaves a schedulable continuation instead of stranding
+            // the row: a never-dispatched ready execution, with no start requested.
+            assert_eq!(after.len(), before.len() + 1, "{after:?}");
+            assert_eq!(after.last(), Some(&ExecutionStatus::Ready), "{after:?}");
         }
     }
 }

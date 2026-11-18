@@ -638,9 +638,41 @@ fn answering_a_gated_revision_records_the_answer_and_waits_for_its_gate() {
         let conn = db.connect().unwrap();
         let gating = deps::gating_prereqs_for(&conn, &asking).unwrap();
         assert!(gating.contains(&gate), "the gate keeps holding the row: {gating:?}");
-        // Approving a split adds its own prerequisite; the row then also waits for it.
-        let only_gate = gating.len() == 1;
+        // The db hands out one connection at a time: release it before using `db`.
         drop(conn);
+        // Approving a split (Yes) adds its own prerequisite, so the row then
+        // waits for the created task as well; every other answer leaves only
+        // the original gate.
+        let creates_prerequisite = split_question && answer;
+        let only_gate = !creates_prerequisite;
+        assert_eq!(gating.len(), if creates_prerequisite { 2 } else { 1 }, "{gating:?}");
+        if creates_prerequisite {
+            let created = gating.iter().find(|id| **id != gate).expect("created prerequisite");
+            let created_name = match db.get_work_item(created).unwrap() {
+                WorkItem::Task(t) | WorkItem::Chore(t) => t.name,
+                other => panic!("expected a task, got {other:?}"),
+            };
+            assert_eq!(created_name, "Land the first part");
+        }
+        let questions = db.list_operator_questions(&asking).unwrap();
+        assert_eq!(
+            questions[0].answer,
+            Some(boss_protocol::OperatorAnswer::YesNo { value: answer })
+        );
+        let description = match db.get_work_item(&asking).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.description,
+            other => panic!("expected a task, got {other:?}"),
+        };
+        assert_eq!(
+            description.contains("Prerequisite approved by the repo owner"),
+            creates_prerequisite,
+            "{description}"
+        );
+        assert_eq!(
+            description.contains("change/file-count"),
+            split_question && !answer,
+            "only the bypass answer authorizes the file-count exception: {description}"
+        );
 
         db.connect()
             .unwrap()
@@ -648,5 +680,25 @@ fn answering_a_gated_revision_records_the_answer_and_waits_for_its_gate() {
             .unwrap();
         assert_eq!(db.try_unblock_dependency_if_resolved(&asking).unwrap(), only_gate);
         assert_eq!(task_status(&db, &asking), if only_gate { "todo" } else { "blocked" });
+        // The answered-waiting marker lifts with the block and never resurfaces
+        // naming a finished prerequisite when the row is gated again.
+        if only_gate {
+            assert_eq!(blocked_fields(&db, &asking).1, None);
+            let other = insert_revision_row(&db, &product_id, &chore_id);
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET blocked_detail = 'Answered · waits for Old gate' WHERE id = ?1",
+                [&asking],
+            )
+            .unwrap();
+            deps::insert_edge(&conn, &asking, &other, RELATION_BLOCKS, &now_string()).unwrap();
+            drop(conn);
+            let mut pending = PendingEvents::default();
+            {
+                let conn = db.connect().unwrap();
+                maybe_engine_block_dependent(&mut pending, &conn, &asking, &now_string()).unwrap();
+            }
+            assert_eq!(blocked_fields(&db, &asking).1, None, "stale marker must be gone");
+        }
     }
 }
