@@ -53,14 +53,6 @@ pub struct CancelExecutionOpts {
     /// Pid of the process that issued the cancel, when it arrived over RPC.
     /// Carried onto the audit record so a cancel traces to its issuer.
     pub peer_pid: Option<i32>,
-    /// True when the caller puts this cancel on the execution's dispatch
-    /// timeline itself (it holds the async sink and richer context). The
-    /// default (`false`) makes the committed cancel publish an
-    /// [`Event::ExecutionCancelled`] that the engine's subscriber writes to
-    /// the timeline, so a cancel from a path with no sink of its own still
-    /// shows up in `bossctl dispatch diagnose`.
-    #[builder(default)]
-    pub caller_records_timeline: bool,
 }
 
 impl Default for CancelExecutionOpts {
@@ -72,7 +64,6 @@ impl Default for CancelExecutionOpts {
             keep_work_item_schedulable: false,
             actor: StatusActor::Engine,
             peer_pid: None,
-            caller_records_timeline: false,
         }
     }
 }
@@ -2435,7 +2426,6 @@ pub(super) fn cancel_execution_in_tx_with_outcome(
             work_item_moved: work_item_parked,
             queued_only: opts.queued_only,
             peer_pid: opts.peer_pid,
-            caller_records_timeline: opts.caller_records_timeline,
         },
     )?;
     stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;

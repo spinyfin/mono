@@ -155,7 +155,9 @@ use std::collections::HashSet;
 use super::*;
 use crate::executions_runs::CancelExecutionOpts;
 use crate::parking_reconcile::{self, UnparkReport};
-use boss_protocol::{LAST_STATUS_ACTOR_BOSS, LAST_STATUS_ACTOR_HUMAN, PARKED_VIA_DIRECT, parked_via_project};
+use boss_protocol::{
+    LAST_STATUS_ACTOR_BOSS, LAST_STATUS_ACTOR_HUMAN, PARKED_VIA_DIRECT, StatusActor, parked_via_project,
+};
 
 pub(super) const MIGRATION_ID: &str = "20261104_0145_task_parking";
 
@@ -792,11 +794,11 @@ pub(crate) fn set_task_parked(
                     params![id, PARKED_VIA_DIRECT, actor, reason, now],
                 )?;
             }
-            inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, now, BASIS_PARKED)?;
+            inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, reason, now, BASIS_PARKED)?;
             return Ok(UnparkReport::default());
         }
         stamp_task(tx, id, actor, reason, PARKED_VIA_DIRECT, now, BASIS_PARKED)?;
-        inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, now, BASIS_PARKED)?;
+        inherit_park_stamp_onto_open_revisions(tx, pending, id, actor, reason, now, BASIS_PARKED)?;
         return Ok(UnparkReport::default());
     }
     if task.parked_at.is_none() {
@@ -868,6 +870,7 @@ fn inherit_park_stamp_onto_open_revisions(
     pending: &mut PendingEvents,
     parent_id: &str,
     actor: &str,
+    reason: Option<&str>,
     now: &str,
     basis: &str,
 ) -> Result<()> {
@@ -892,9 +895,9 @@ fn inherit_park_stamp_onto_open_revisions(
            )",
         params![parent_id, now],
     )?;
-    cancel_pending_executions(tx, pending, parent_id)?;
+    cancel_pending_executions(tx, pending, parent_id, actor, reason)?;
     for revision_id in open_revision_ids(tx, parent_id)? {
-        cancel_pending_executions(tx, pending, &revision_id)?;
+        cancel_pending_executions(tx, pending, &revision_id, actor, reason)?;
     }
     Ok(())
 }
@@ -966,7 +969,7 @@ fn set_project_parked(
             params![id, now, actor, reason, via],
         )?;
         for child in &children {
-            cancel_pending_executions(tx, pending, child)?;
+            cancel_pending_executions(tx, pending, child, actor, reason)?;
         }
         return Ok(UnparkReport::default());
     }
@@ -1002,11 +1005,22 @@ fn set_project_parked(
 /// Cancel `work_item_id`'s never-started executions. A `claimed` row is
 /// mid-spawn and a `running` / `waiting_human` one is a live worker: both are
 /// left to finish.
+///
+/// `actor` is whoever parked the item (a `tasks.last_status_actor` value; an
+/// unrecognised one is recorded as the engine) and `park_reason` their stated
+/// reason, so the cancel record says who stopped the execution and why.
 pub(crate) fn cancel_pending_executions(
     tx: &Connection,
     pending: &mut PendingEvents,
     work_item_id: &str,
+    actor: &str,
+    park_reason: Option<&str>,
 ) -> Result<usize> {
+    let actor = actor.parse::<StatusActor>().unwrap_or(StatusActor::Engine);
+    let cancel_reason = match park_reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+        Some(reason) => format!("{CANCEL_REASON_PARKED}: {reason}"),
+        None => CANCEL_REASON_PARKED.to_owned(),
+    };
     let ids: Vec<String> = tx
         .prepare(
             "SELECT id FROM work_executions
@@ -1025,7 +1039,8 @@ pub(crate) fn cancel_pending_executions(
             pending,
             execution_id,
             CancelExecutionOpts {
-                reason: Some(CANCEL_REASON_PARKED.to_owned()),
+                reason: Some(cancel_reason.clone()),
+                actor,
                 queued_only: true,
                 // The park owns this row's state, and un-parking mints the
                 // execution afresh (`cancelled_by_park`): stopping the row in
@@ -1046,6 +1061,8 @@ pub(crate) fn cancel_pending_for_parked_chain(
     pending: &mut PendingEvents,
     root_id: &str,
 ) -> Result<()> {
+    // The membership trigger stamped the park; read it back so the cancel
+    // names the actor and reason the stamp carries.
     let mut ids = vec![root_id.to_owned()];
     ids.extend(crate::chain_helpers::collect_chain_revision_ids_including_deleted(
         tx, root_id,
@@ -1057,7 +1074,18 @@ pub(crate) fn cancel_pending_for_parked_chain(
             })
             .unwrap_or(false);
         if parked {
-            cancel_pending_executions(tx, pending, &id)?;
+            let (parked_by, parked_reason): (Option<String>, Option<String>) = tx
+                .query_row("SELECT parked_by, parked_reason FROM tasks WHERE id = ?1", [&id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap_or((None, None));
+            cancel_pending_executions(
+                tx,
+                pending,
+                &id,
+                parked_by.as_deref().unwrap_or(StatusActor::Engine.as_str()),
+                parked_reason.as_deref(),
+            )?;
         }
     }
     Ok(())

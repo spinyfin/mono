@@ -189,9 +189,6 @@ impl WorkDb {
                     work_item_moved: task_demoted || work_item_parked,
                     queued_only: false,
                     peer_pid: None,
-                    // Every caller (`cancel_and_release`, `force_stop_execution_as`,
-                    // the preemption requeue) writes the timeline event itself.
-                    caller_records_timeline: true,
                 },
             )?;
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;

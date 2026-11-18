@@ -465,11 +465,9 @@ impl ExecutionCoordinator {
             .unwrap_or_else(|| "blocked after the pause was set aside (reason not recorded)".to_string());
         if was_new {
             let cancel_reason = format!("pause-only forced dispatch refused: {reason}");
-            if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
+            if let Err(error) = self.work_db.cancel_execution_with_outcome(
                 &refreshed.id,
                 CancelExecutionOpts {
-                    // Records its own timeline event with richer context.
-                    caller_records_timeline: true,
                     peer_pid: None,
                     reason: Some(cancel_reason.clone()),
                     queued_only: true,
@@ -483,8 +481,7 @@ impl ExecutionCoordinator {
                     actor: StatusActor::Engine,
                 },
             ) {
-                self.record_engine_cancel(&cancelled, refreshed.status.clone(), &cancel_reason)
-                    .await;
+                tracing::warn!(%error, "pause-only forced dispatch refusal: could not cancel the execution it created");
             }
             // This row can carry a `--host` routing constraint set by
             // `request_execution_via_db` just above; it will never drain
@@ -626,11 +623,9 @@ impl ExecutionCoordinator {
                 // committed a created/refreshed row for this status, so
                 // clean it up rather than leaving residue behind an error.
                 let cancel_reason = "--host only applies to a queued execution";
-                if let Ok(cancelled) = self.work_db.cancel_execution_with_outcome(
+                if let Err(error) = self.work_db.cancel_execution_with_outcome(
                     &execution.id,
                     CancelExecutionOpts {
-                        // Records its own timeline event with richer context.
-                        caller_records_timeline: true,
                         peer_pid: None,
                         reason: Some(cancel_reason.to_string()),
                         queued_only: true,
@@ -640,7 +635,7 @@ impl ExecutionCoordinator {
                         actor: StatusActor::Engine,
                     },
                 ) {
-                    self.record_engine_cancel_detached(&cancelled, execution.status.clone(), cancel_reason);
+                    tracing::warn!(%error, "--host refusal: could not cancel the execution it left queued");
                 }
                 bail!(
                     "{} resolved to execution {} in status `{}`; --host only applies to a queued execution",

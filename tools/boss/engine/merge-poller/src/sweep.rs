@@ -292,12 +292,9 @@ pub async fn stop_active_revision_executions(
         // Now mark the obsolete revision execution terminal. The task has
         // already reached its parent-close state in the DB transaction, so
         // cancel's active-to-todo demotion does not overwrite that decision.
-        let prior_status = execution.status.clone();
         let cancel_result = work_db.cancel_execution_with(
             &execution.id,
             crate::work::CancelExecutionOpts {
-                // Records its own timeline event with richer context.
-                caller_records_timeline: true,
                 peer_pid: None,
                 reason: Some("parent PR merged".to_owned()),
                 queued_only: false,
@@ -311,11 +308,8 @@ pub async fn stop_active_revision_executions(
             },
         );
         match &cancel_result {
-            Ok(cancelled) => {
+            Ok(_) => {
                 outcome.revision_invalidated += 1;
-                handler
-                    .record_parent_pr_merge_cancellation(cancelled, prior_status, chain_root_id)
-                    .await;
             }
             Err(err) => {
                 // The execution may have already moved to a terminal state

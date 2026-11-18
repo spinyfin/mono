@@ -319,6 +319,9 @@ fn a_park_cancel_does_not_stop_the_row_and_unpark_requeues_it() {
     let parked = task(&db, &chore_id);
     assert!(parked.autostart, "the park's own cancel leaves automatic start on");
     assert_eq!(parked.dispatch_failed_reason, None);
+    let record = cancel_record(&db, &execution.id);
+    assert_eq!(record.actor, "human", "the park's own actor, not the engine");
+    assert_eq!(record.reason, "parked: not now");
 
     db.park_work_item_as_actor(&chore_id, false, None, boss_protocol::LAST_STATUS_ACTOR_HUMAN)
         .unwrap();
@@ -430,16 +433,15 @@ fn a_cancel_records_the_named_actor_reason_and_board_effect() {
     assert!(record.work_item_moved);
     assert!(record.queued_only);
     assert_eq!(record.peer_pid, Some(4242));
-    assert!(record.on_timeline, "no caller put this cancel on the timeline");
 
     db.acknowledge_cancel_record(&execution.id).unwrap();
     assert!(db.pending_cancel_records().unwrap().is_empty());
 }
 
-/// A caller that writes the timeline event itself says so on the record, so
-/// the publisher audits the cancel without writing a second timeline event.
+/// A running-execution teardown stages the same durable record as every other
+/// cancel, with the actor and reason its caller named.
 #[test]
-fn a_caller_recorded_cancel_is_marked_off_the_timeline() {
+fn a_running_execution_teardown_stages_a_cancel_record() {
     let (db, _product_id, chore_id) = setup_product_and_chore();
     let execution = create_ready_chore_execution(&db, chore_id);
     db.start_execution_run(&execution.id, "worker-1", "cube-repo", "lease", "ws", "/tmp/ws")
@@ -449,7 +451,6 @@ fn a_caller_recorded_cancel_is_marked_off_the_timeline() {
         .unwrap();
 
     let record = cancel_record(&db, &execution.id);
-    assert!(!record.on_timeline);
     assert_eq!(record.actor, "human");
     assert_eq!(record.reason, "explicit stop");
     assert_eq!(record.from_status, "running");
@@ -477,7 +478,6 @@ fn a_dependency_block_records_the_engine_cancel() {
     assert_eq!(record.actor, "engine");
     assert_eq!(record.reason, "dependent transitioned to blocked");
     assert_eq!(record.from_status, "running");
-    assert!(record.on_timeline);
 }
 
 #[test]
@@ -491,7 +491,6 @@ fn a_remediation_tombstone_records_the_engine_cancel() {
     assert_eq!(record.actor, "engine");
     assert_eq!(record.reason, "orphaned review remediation tombstoned");
     assert_eq!(record.from_status, "ready");
-    assert!(record.on_timeline);
 }
 
 /// The record commits with the cancel, and announces itself only then.
@@ -537,4 +536,19 @@ fn a_rolled_back_cancel_leaves_no_record() {
     }
     assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Ready);
     assert!(db.pending_cancel_records().unwrap().is_empty());
+}
+
+/// A park the coordinator issues is recorded as the coordinator's cancel, not
+/// the human's or the engine's.
+#[test]
+fn a_park_cancel_by_the_coordinator_is_recorded_as_boss() {
+    let (db, _product_id, chore_id) = setup_product_and_chore();
+    let execution = create_ready_chore_execution(&db, chore_id.clone());
+
+    db.park_work_item_as_actor(&chore_id, true, None, boss_protocol::LAST_STATUS_ACTOR_BOSS)
+        .unwrap();
+
+    let record = cancel_record(&db, &execution.id);
+    assert_eq!(record.actor, "boss");
+    assert_eq!(record.reason, "parked");
 }

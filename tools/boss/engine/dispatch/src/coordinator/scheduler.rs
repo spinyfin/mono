@@ -2449,11 +2449,7 @@ impl ExecutionCoordinator {
         };
 
         match self.work_db.cancel_running_execution_for_requeue(&victim.execution_id) {
-            Ok(true) => {
-                self.record_engine_cancel_of(&victim_execution, "preempted; requeued as a fresh execution")
-                    .await;
-            }
-            Ok(false) => {}
+            Ok(_) => {}
             Err(err) => {
                 tracing::warn!(
                     victim_execution_id = %victim.execution_id,

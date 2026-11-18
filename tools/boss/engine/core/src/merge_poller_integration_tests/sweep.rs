@@ -106,6 +106,8 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
     );
     assert_eq!(followup.product_id, product_id);
 
+    // The cancel's durable record is the only source of the timeline event.
+    crate::cancel_timeline::drain(&db, events.as_ref()).await.unwrap();
     let cancellation = events
         .events_for(&original.id)
         .await
@@ -113,9 +115,8 @@ async fn merged_pr_redispatches_live_review_revision_as_followup_and_records_can
         .find(|event| event.stage == "execution_cancelled")
         .expect("merge cancellation must be recorded in the dispatch timeline");
     assert_eq!(cancellation.outcome, "ok");
-    assert_eq!(cancellation.details["reason"], "parent_pr_merged");
+    assert_eq!(cancellation.details["reason"], "parent PR merged");
     assert_eq!(cancellation.details["prior_status"], "running");
-    assert_eq!(cancellation.details["chain_root_id"], parent_id);
     assert!(
         crate::dispatch_reader::is_terminal_event(&cancellation),
         "merge cancellation must close the original dispatch timeline",

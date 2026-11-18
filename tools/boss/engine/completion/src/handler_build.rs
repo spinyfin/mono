@@ -99,27 +99,6 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Record the merge poller's intentional cancellation of a revision
-    /// execution after its parent PR merged. This is emitted only after the
-    /// durable cancellation succeeds.
-    pub(crate) async fn record_parent_pr_merge_cancellation(
-        &self,
-        execution: &crate::work::WorkExecution,
-        prior_status: ExecutionStatus,
-        chain_root_id: &str,
-    ) {
-        let mut event = crate::dispatch_events::execution_cancelled_event(
-            &execution.id,
-            &execution.work_item_id,
-            prior_status.as_str(),
-            boss_protocol::StatusActor::Engine.as_str(),
-            "parent_pr_merged",
-            false,
-        );
-        event.details["chain_root_id"] = serde_json::Value::String(chain_root_id.to_owned());
-        self.dispatch_events.emit(event).await;
-    }
-
     /// Point structured-output reads at `dir` instead of the process-wide
     /// [`crate::structured_output::default_dir`]. Tests use this to seed the
     /// per-execution artifact in a tempdir; production leaves the default.
@@ -597,16 +576,6 @@ impl CompletionRequests for WorkerCompletionHandler {
 
     async fn force_release(&self, execution_id: &str) {
         let _ = WorkerCompletionHandler::force_release(self, execution_id).await;
-    }
-
-    async fn record_parent_pr_merge_cancellation(
-        &self,
-        execution: &boss_protocol::WorkExecution,
-        prior_status: ExecutionStatus,
-        chain_root_id: &str,
-    ) {
-        WorkerCompletionHandler::record_parent_pr_merge_cancellation(self, execution, prior_status, chain_root_id)
-            .await;
     }
 
     async fn force_stop_execution_as(&self, execution_id: &str, actor: boss_protocol::StatusActor, reason: &str) {

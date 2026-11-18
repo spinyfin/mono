@@ -886,13 +886,14 @@ fn parent_no_longer_revisable(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Soft-delete a revision/follow-up this call materialised whose owning
-/// proposal turned out not to be the decision that stands (see the
-/// `current_state != Applied` guard in `commit_applied_review_verdict`).
 /// Reason recorded for executions retired with a tombstoned orphaned
 /// remediation.
 const TOMBSTONE_CANCEL_REASON: &str = "orphaned review remediation tombstoned";
 
+/// Soft-delete a revision/follow-up this call materialised whose owning
+/// proposal turned out not to be the decision that stands (see the
+/// `current_state != Applied` guard in `commit_applied_review_verdict`).
+///
 /// Soft-delete drops the task from every `tasks.deleted_at IS NULL` list
 /// query (including the `autostart` scheduler query). That is not enough
 /// for dispatch: `list_ready_executions` selects `work_executions` by
@@ -946,7 +947,6 @@ fn tombstone_orphaned_remediation_in_tx(
                 work_item_moved: false,
                 queued_only: false,
                 peer_pid: None,
-                caller_records_timeline: false,
             },
         )?;
         stage_execution_terminal(pending, tx, &execution.id, task_id)?;

@@ -1022,10 +1022,6 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
             );
             return;
         }
-        // Snapshot from_status before the write so the dispatch-timeline
-        // event can record what was cancelled
-        // (the returned row is already `cancelled`).
-        let prior_status = server_state.work_db.get_execution(&execution_id).ok().map(|e| e.status);
         let actor = resolve_cancel_actor(&server_state, peer_pid);
         let reason_text = reason.clone().unwrap_or_else(|| "explicit cancel".to_owned());
         let opts = boss_work_db::CancelExecutionOpts {
@@ -1035,8 +1031,6 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
             keep_work_item_schedulable: false,
             actor,
             peer_pid,
-            // The handler puts this cancel on the timeline below.
-            caller_records_timeline: true,
         };
         match server_state.work_db.cancel_execution_with_outcome(&execution_id, opts) {
             Ok(boss_work_db::CancelledExecution {
@@ -1052,21 +1046,8 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
                     peer_pid = ?peer_pid,
                     "cancel_execution: marked cancelled",
                 );
-                // Per-execution dispatch timeline, where `bossctl dispatch
-                // diagnose` reads it. The `engine-audit.log` record (actor,
-                // reason, from_status, queued_only, peer pid) is written from
-                // the cancel's durable record once it has committed.
-                server_state
-                    .completion_handler
-                    .record_execution_cancelled(
-                        &execution.id,
-                        &execution.work_item_id,
-                        prior_status,
-                        actor,
-                        &reason_text,
-                        work_item_parked,
-                    )
-                    .await;
+                // The dispatch timeline and `engine-audit.log` records are
+                // written from the cancel's durable record once it commits.
                 // Pane releases are keyed by run_id (the slot
                 // registry's key), not by execution_id — so
                 // walk the execution's still-active runs and

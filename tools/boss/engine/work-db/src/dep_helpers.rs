@@ -600,7 +600,6 @@ fn cancel_live_execution_for_block_in_tx(
             work_item_moved: false,
             queued_only: false,
             peer_pid: None,
-            caller_records_timeline: false,
         },
     )?;
     // Canonical terminalization trace — see `WorkDb::mark_execution_orphaned`

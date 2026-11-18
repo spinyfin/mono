@@ -52,8 +52,6 @@ pub struct ExecutionCancelRecord {
     pub queued_only: bool,
     /// Pid of the process that issued the cancel, when it arrived over RPC.
     pub peer_pid: Option<i32>,
-    /// False when the caller writes the dispatch-timeline event itself.
-    pub on_timeline: bool,
     /// Epoch seconds at which the cancel was written.
     pub cancelled_at: String,
 }
@@ -71,8 +69,6 @@ pub(crate) struct CancelProvenance<'a> {
     pub work_item_moved: bool,
     pub queued_only: bool,
     pub peer_pid: Option<i32>,
-    /// The caller writes the dispatch-timeline event itself.
-    pub caller_records_timeline: bool,
 }
 
 /// Record one cancel in the cancelling transaction `tx`, and stage the
@@ -95,7 +91,6 @@ pub(crate) fn stage_cancel_provenance(
         work_item_moved: cancel.work_item_moved,
         queued_only: cancel.queued_only,
         peer_pid: cancel.peer_pid,
-        on_timeline: !cancel.caller_records_timeline,
         cancelled_at: now_string(),
     };
     // An execution is cancelled once; REPLACE only matters for a row that was

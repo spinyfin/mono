@@ -1311,6 +1311,14 @@ pub fn execution_cancelled_event(
 #[async_trait]
 pub trait DispatchEventSink: Send + Sync {
     async fn emit(&self, event: DispatchEvent);
+
+    /// [`Self::emit`] for a publisher that must retry a dropped write. The
+    /// default cannot observe a failure and reports success; a sink that
+    /// persists events overrides it to say whether the event was stored.
+    async fn try_emit(&self, event: DispatchEvent) -> Result<(), String> {
+        self.emit(event).await;
+        Ok(())
+    }
 }
 
 /// Default sink for tests and any caller that doesn't want the
@@ -1524,6 +1532,11 @@ async fn recreate_live_file(path: &Path) -> std::io::Result<()> {
 #[async_trait]
 impl DispatchEventSink for JsonlFileSink {
     async fn emit(&self, event: DispatchEvent) {
+        // Best-effort: the failure is already logged by `try_emit`.
+        let _ = self.try_emit(event).await;
+    }
+
+    async fn try_emit(&self, event: DispatchEvent) -> Result<(), String> {
         let current_path = self.current_path();
         let execution_path = self.execution_path(&event.execution_id);
 
@@ -1535,6 +1548,7 @@ impl DispatchEventSink for JsonlFileSink {
         let current_result = results.next().expect("append_to_all returns one result per input path");
         let execution_result = results.next().expect("append_to_all returns one result per input path");
 
+        let mut failure = None;
         if let Err(err) = current_result {
             tracing::warn!(
                 ?err,
@@ -1543,6 +1557,7 @@ impl DispatchEventSink for JsonlFileSink {
                 execution_id = %event.execution_id,
                 "failed to append dispatch event to current.jsonl; dropping"
             );
+            failure = Some(format!("current.jsonl: {err}"));
         } else {
             self.maybe_rotate_current(&current_path).await;
         }
@@ -1555,7 +1570,9 @@ impl DispatchEventSink for JsonlFileSink {
                 execution_id = %event.execution_id,
                 "failed to append dispatch event to per-execution mirror; dropping"
             );
+            failure.get_or_insert_with(|| format!("per-execution mirror: {err}"));
         }
+        failure.map_or(Ok(()), Err)
     }
 }
 
