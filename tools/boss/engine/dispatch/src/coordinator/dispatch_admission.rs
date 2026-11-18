@@ -488,6 +488,11 @@ impl ExecutionCoordinator {
         mut input: RequestExecutionInput,
         live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
+        // Re-judge before admission, including ordinary requests that never
+        // reach host selection. A stored unreadable-inventory pause and a
+        // hold whose pid has since died both lift here; the storage
+        // transaction below then sees the current record.
+        self.lifecycle.reevaluate_local_worker_holds();
         if let Some(host_id) = input.requested_host_id.clone() {
             // `request_execution_with_live_check` (called below) resolves
             // friendly short ids (a `T`-prefixed short id, `#42`, ...) to a

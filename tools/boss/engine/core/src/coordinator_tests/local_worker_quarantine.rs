@@ -3,8 +3,10 @@
 //! holds nothing at all, and a hold lifts without an engine restart.
 
 use super::helpers::*;
+use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::local_worker_quarantine::{SPAWN_NEVER_REACHED_TMUX_REASON, quarantine_historical_local_workers};
 use crate::run_reconcile::RunReconcileVerdict;
+use crate::work::LocalWorkerQuarantine;
 
 fn coordinator_for(db: &Arc<WorkDb>, runner: Arc<FakeExecutionRunner>) -> Arc<ExecutionCoordinator> {
     Arc::new(ExecutionCoordinator::new(
@@ -255,4 +257,79 @@ async fn a_hold_naming_a_cancelled_execution_gates_nothing_before_any_scan_runs(
     dispatches_locally(&db, &coordinator, &unrelated.id).await;
     // The first dispatch decision also tidied the stale record away.
     assert!(db.read_local_worker_quarantine().unwrap().is_empty());
+}
+
+/// A stored unreadable-inventory pause used to stick until restart: ordinary
+/// admission refused before host selection, so re-judgement never ran. With
+/// the inventory readable again and nothing Ready, an ordinary request with
+/// no host must succeed.
+#[tokio::test]
+async fn an_ordinary_request_retries_an_unreadable_inventory_without_a_restart() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    db.write_local_worker_quarantine(&LocalWorkerQuarantine {
+        executions: Default::default(),
+        scan_error: Some("inventory unreadable".to_owned()),
+    })
+    .unwrap();
+    assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
+    assert!(db.list_ready_executions().unwrap().is_empty());
+
+    let chore = create_test_chore(&db, product.id.clone(), "Ordinary request after a readable inventory");
+    let coordinator = coordinator_for(
+        &db,
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    );
+    let execution = coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder().work_item_id(chore.id.clone()).build(),
+            Arc::new(LiveWorkerStateRegistry::new()),
+        )
+        .expect("ordinary admission must re-read the inventory and succeed without a restart");
+    assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
+    assert_eq!(execution.work_item_id, chore.id);
+}
+
+/// A held pid that dies while only that work item is pending used to stay
+/// held until unrelated work hit host selection. Re-judgement before the
+/// active-dispatch reconcile must drop the hold and redispatch.
+#[tokio::test]
+async fn a_dead_held_pid_is_redispatched_by_the_active_dispatch_rescan() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let (execution, held_item) = seed_unverifiable_worker(&db, &product.id, "Held worker whose pid later dies");
+    quarantine_historical_local_workers(&db).unwrap();
+    assert!(db.is_execution_quarantined(&execution).unwrap());
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn a short-lived process whose pid can stand in for a dead worker");
+    let pid = i64::from(child.id());
+    let _ = child.wait();
+    db.set_run_shell_pid_for_execution(&execution, pid).unwrap();
+    assert!(db.list_ready_executions().unwrap().is_empty());
+
+    let coordinator = coordinator_for(
+        &db,
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    );
+    assert!(
+        db.reconcile_active_dispatch(|_| false).unwrap().is_empty(),
+        "without re-judgement the still-held work item is skipped"
+    );
+    let redispatched = coordinator
+        .reevaluate_local_worker_holds_and_reconcile_active_dispatch_for_test(|_| false)
+        .unwrap();
+    assert!(
+        redispatched.contains(&held_item),
+        "re-judgement before reconcile must redispatch the work item whose pid is gone: {redispatched:?}"
+    );
+    assert!(!db.is_execution_quarantined(&execution).unwrap());
 }

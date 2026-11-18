@@ -28,7 +28,7 @@ use super::WorkDb;
 
 const METADATA_KEY: &str = "local_worker_startup_quarantine";
 
-/// Where an operator looks to see what is held and why.
+/// Where to look to see what is held and why.
 const INSPECT_HINT: &str = "`bossctl dispatch quarantine status` shows the evidence";
 
 /// The persisted hold: executions whose workers are not proven dead, and the
@@ -78,9 +78,36 @@ impl WorkDb {
 
     /// Replace the persisted hold with `quarantine`. The scan writes its
     /// complete verdict in one statement so dispatch admission never observes
-    /// a half-built record.
+    /// a half-built record. Tests and first-write fixtures use this; live
+    /// re-judgement and a manual clear use
+    /// [`Self::replace_local_worker_quarantine`] so a concurrent writer cannot
+    /// be overwritten.
     pub fn write_local_worker_quarantine(&self, quarantine: &LocalWorkerQuarantine) -> Result<()> {
         self.set_metadata(METADATA_KEY, &serde_json::to_string(quarantine)?)
+    }
+
+    /// Write `next` only when the stored record still equals `expected`.
+    /// Returns `false` when another writer changed the record first.
+    pub fn replace_local_worker_quarantine(
+        &self,
+        expected: &LocalWorkerQuarantine,
+        next: &LocalWorkerQuarantine,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = read_local_worker_quarantine_in(&tx)?;
+        if current != *expected {
+            return Ok(false);
+        }
+        if next != expected {
+            tx.execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![METADATA_KEY, serde_json::to_string(next)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// The hold as it applies right now: the persisted record minus every
@@ -146,7 +173,10 @@ impl WorkDb {
                      AND r.tmux_pane_pid IS NULL
                      AND NOT EXISTS (
                          SELECT 1 FROM work_runs sibling
-                         WHERE sibling.execution_id = e.id AND sibling.tmux_spawn_token IS NOT NULL
+                         WHERE sibling.execution_id = e.id
+                           AND sibling.id <> r.id
+                           AND sibling.finished_at IS NULL
+                           AND sibling.tmux_spawn_token IS NOT NULL
                      ))
              FROM work_executions e
              JOIN work_runs r ON r.id = (
@@ -177,17 +207,20 @@ fn inventory_unreadable_reason(error: &str) -> String {
     )
 }
 
-fn held_local_workers_in(conn: &Connection) -> Result<LocalWorkerQuarantine> {
+fn read_local_worker_quarantine_in(conn: &Connection) -> Result<LocalWorkerQuarantine> {
     let value: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = ?1", [METADATA_KEY], |row| {
             row.get(0)
         })
         .optional()?;
-    let Some(value) = value else {
-        return Ok(LocalWorkerQuarantine::default());
-    };
-    let mut quarantine: LocalWorkerQuarantine =
-        serde_json::from_str(&value).context("reading local worker quarantine")?;
+    match value {
+        None => Ok(LocalWorkerQuarantine::default()),
+        Some(value) => serde_json::from_str(&value).context("reading local worker quarantine"),
+    }
+}
+
+fn held_local_workers_in(conn: &Connection) -> Result<LocalWorkerQuarantine> {
+    let mut quarantine = read_local_worker_quarantine_in(conn)?;
     if quarantine.executions.is_empty() {
         return Ok(quarantine);
     }
@@ -513,5 +546,54 @@ mod tests {
                 .unwrap();
         }
         assert!(unidentified(&db).is_empty());
+    }
+
+    #[test]
+    fn a_finished_sibling_with_a_spawn_token_does_not_block_never_reached_tmux() {
+        let db = open_db();
+        insert_execution(&db, "exec-1", "item-1", "running");
+        insert_local_run(
+            &db,
+            "run-old",
+            "exec-1",
+            "100",
+            "tmux_hosted = 1, tmux_server_label = 'boss', tmux_session_name = 'boss-1-abc', \
+             tmux_spawn_token = 'token-1', tmux_spawn_state = 'intended', finished_at = '150'",
+        );
+        insert_local_run(&db, "run-new", "exec-1", "200", "tmux_hosted = 1");
+        assert_eq!(unidentified(&db), BTreeMap::from([("exec-1".to_owned(), true)]));
+    }
+
+    #[test]
+    fn tmux_spawn_intent_is_refused_once_the_execution_is_terminal() {
+        let db = open_db();
+        insert_execution(&db, "exec-1", "item-1", "running");
+        insert_local_run(&db, "run-1", "exec-1", "100", "tmux_hosted = 1");
+        set_status(&db, "exec-1", "orphaned");
+        assert!(
+            !db.record_tmux_spawn_intent_for_execution("exec-1", "boss", "boss-worker", "token")
+                .unwrap(),
+            "a terminal execution must not accept a late spawn intent"
+        );
+    }
+
+    #[test]
+    fn replace_writes_only_when_the_stored_record_still_matches() {
+        let db = open_db();
+        let first = held(&[("exec-1", "item-1")], None);
+        let second = held(&[("exec-2", "item-2")], None);
+        let third = held(&[("exec-3", "item-3")], None);
+
+        assert!(
+            db.replace_local_worker_quarantine(&LocalWorkerQuarantine::default(), &first)
+                .unwrap()
+        );
+        assert_eq!(db.read_local_worker_quarantine().unwrap(), first);
+
+        assert!(db.replace_local_worker_quarantine(&first, &second).unwrap());
+        assert_eq!(db.read_local_worker_quarantine().unwrap(), second);
+
+        assert!(!db.replace_local_worker_quarantine(&first, &third).unwrap());
+        assert_eq!(db.read_local_worker_quarantine().unwrap(), second);
     }
 }

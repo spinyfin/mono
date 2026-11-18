@@ -5,8 +5,8 @@
 //! complete tmux identity and whose process is not proven dead, and
 //! dispatches nothing else for that execution's work item. It lifts the hold
 //! itself when the execution goes terminal or the process is proven gone.
-//! These verbs show what is held and why, and let an operator release a hold
-//! the engine cannot lift, without editing the database by hand.
+//! These verbs show what is held and why, and release a hold the engine
+//! cannot lift, without editing the database by hand.
 //!
 //! All three read and write `state.db` directly, so they work while the
 //! engine is down or wedged. Dispatch reads the hold on every decision, so a
@@ -53,8 +53,9 @@ pub(crate) enum QuarantineAction {
         /// Release the hold on this execution. Repeatable.
         #[arg(long = "execution", value_name = "EXECUTION_ID", required_unless_present = "all")]
         executions: Vec<String>,
-        /// Release every hold, including a pause left by an unreadable run
-        /// inventory.
+        /// Release every hold. When the run inventory is unreadable, re-read
+        /// it and lift the pause only if that read succeeds; remaining
+        /// classified holds stay.
         #[arg(long, conflicts_with = "executions")]
         all: bool,
         /// Actually release. Check first that no worker from before tmux
@@ -135,8 +136,8 @@ fn clear(json: bool, state_root: Option<PathBuf>, executions: Vec<String>, all: 
             alive.join(", ")
         );
     }
-    let lifts_pause = all && before.scan_error.is_some();
-    if targets.is_empty() && !lifts_pause {
+    let inventory_unreadable = all && before.scan_error.is_some();
+    if targets.is_empty() && !inventory_unreadable {
         if json {
             println!("{}", serde_json::json!({ "released": [], "confirmed": confirm }));
         } else {
@@ -149,13 +150,47 @@ fn clear(json: bool, state_root: Option<PathBuf>, executions: Vec<String>, all: 
         for held in &targets {
             println!("  {}", held_line(held));
         }
-        if lifts_pause {
-            println!("  the pause on all local dispatch left by an unreadable run inventory");
+        if inventory_unreadable {
+            println!(
+                "  the pause on all local dispatch left by an unreadable run inventory \
+                 (re-read on --confirm; the pause lifts only if that read succeeds)"
+            );
         }
         bail!(
-            "not released: re-run with --confirm once you have checked that no worker from before tmux hosting \
-             is still running for these work items. Releasing lets the engine dispatch a second worker for them"
+            "not released: re-run with --confirm. When holds are listed above, check that no worker from before \
+             tmux hosting is still running for those work items. When the run inventory is unreadable, \
+             --confirm re-reads it and lifts the pause only if that read succeeds; remaining classified holds stay"
         );
+    }
+    if inventory_unreadable {
+        let reevaluation = reevaluate_local_worker_holds(&db)?;
+        let after = local_worker_hold_status(&db)?;
+        if let Some(error) = after.scan_error.as_deref() {
+            bail!(
+                "refusing to lift the pause: the run inventory is still unreadable ({error}). Nothing was \
+                 released. Retry once the inventory can be read, or inspect with `bossctl dispatch quarantine status`"
+            );
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "released": released_json(&reevaluation.released),
+                    "local_dispatch_pause_lifted": true,
+                    "confirmed": true,
+                }))?
+            );
+            return Ok(());
+        }
+        print_released(&reevaluation.released);
+        println!("lifted the pause on all local dispatch");
+        if !after.held.is_empty() {
+            println!(
+                "remaining classified holds stay until each execution is terminal, its process is proven gone, \
+                 or a named clear releases it"
+            );
+        }
+        return Ok(());
     }
     let released = if all {
         release_local_worker_holds(&db, None)?
@@ -167,16 +202,13 @@ fn clear(json: bool, state_root: Option<PathBuf>, executions: Vec<String>, all: 
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "released": released_json(&released),
-                "local_dispatch_pause_lifted": lifts_pause,
+                "local_dispatch_pause_lifted": false,
                 "confirmed": true,
             }))?
         );
         return Ok(());
     }
     print_released(&released);
-    if lifts_pause {
-        println!("lifted the pause on all local dispatch");
-    }
     println!(
         "the executions themselves are unchanged. The engine's liveness sweeps reap one whose worker is gone; \
          one that is still non-terminal and unverifiable is held again at the next engine start. Cancel it to \
@@ -279,7 +311,7 @@ fn held_line(held: &HeldLocalWorker) -> String {
     )
 }
 
-/// What lifts this hold without an operator release. Depends on the evidence:
+/// What lifts this hold without a manual clear. Depends on the evidence:
 /// a recorded pid can be proven gone, a missing one never can.
 fn releases_when(held: &HeldLocalWorker) -> String {
     let terminal = "the execution is cancelled or reaches any other terminal state";
@@ -301,7 +333,7 @@ mod tests {
 
     use boss_engine::durable_liveness::WorkerProcess;
     use boss_engine::local_worker_quarantine::quarantine_historical_local_workers;
-    use boss_engine::work::{CreateChoreInput, CreateProductInput, LocalWorkerQuarantine, WorkDb};
+    use boss_engine::work::{CreateChoreInput, CreateProductInput, WorkDb};
     use boss_protocol::RequestExecutionInput;
     use clap::Parser;
 
@@ -577,28 +609,52 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_releases_every_hold_and_an_unreadable_inventory_pause() {
-        let scratch = ScratchDir::new("clear-all");
+    fn clear_all_refuses_to_lift_an_unreadable_inventory_until_a_read_succeeds() {
+        let scratch = ScratchDir::new("clear-all-unreadable");
+        let (db, _held) = held_db(&scratch);
+        let mut recorded = db.read_local_worker_quarantine().unwrap();
+        recorded.scan_error = Some("database is locked".to_owned());
+        db.write_local_worker_quarantine(&recorded).unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "ALTER TABLE work_runs RENAME COLUMN tmux_session_name TO unavailable_identity",
+                [],
+            )
+            .unwrap();
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
+
+        let dry_run = run(false, clear_action(&[], true, false, &scratch))
+            .unwrap_err()
+            .to_string();
+        assert!(dry_run.contains("re-reads it"), "{dry_run}");
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
+
+        let refusal = run(false, clear_action(&[], true, true, &scratch))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("still unreadable"), "{refusal}");
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
+        assert!(!db.read_local_worker_quarantine().unwrap().executions.is_empty());
+    }
+
+    #[test]
+    fn clear_all_lifts_an_unreadable_inventory_pause_only_after_a_successful_recheck() {
+        let scratch = ScratchDir::new("clear-all-recheck");
         let (db, held) = held_db(&scratch);
         let mut recorded = db.read_local_worker_quarantine().unwrap();
         recorded.scan_error = Some("database is locked".to_owned());
         db.write_local_worker_quarantine(&recorded).unwrap();
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
 
-        assert!(run(false, clear_action(&[], true, false, &scratch)).is_err());
-        assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
-
         run(true, clear_action(&[], true, true, &scratch)).unwrap();
-        assert_eq!(
-            db.read_local_worker_quarantine().unwrap(),
-            LocalWorkerQuarantine::default()
-        );
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
+        // A successful re-read classifies the same unverifiable workers again;
+        // those holds stay. The pause is what lifted.
+        assert_eq!(db.read_local_worker_quarantine().unwrap().executions.len(), held.len());
         for (_, work_item_id) in &held {
-            db.ensure_work_item_not_quarantined(work_item_id).unwrap();
+            assert!(db.ensure_work_item_not_quarantined(work_item_id).is_err());
         }
-        // With nothing left, a further clear is a no-op, not an error.
-        run(false, clear_action(&[], true, true, &scratch)).unwrap();
     }
 
     #[test]

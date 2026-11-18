@@ -34,7 +34,7 @@ This is read-only and works with the engine down. For each held execution it pri
 
 Work down this list and stop at the first step that applies. None of them needs an engine restart; dispatch re-reads the hold on every decision.
 
-1. **Do nothing if the cause is already gone.** The engine re-judges every hold before each host selection. If the process has exited or the execution has gone terminal, the next dispatch decision releases it. To see the result immediately, or with the engine down:
+1. **Do nothing if the cause is already gone.** The engine re-judges every hold before each dispatch decision (admission, host selection, and the active-dispatch rescan). If the process has exited or the execution has gone terminal, that decision releases it. To see the result immediately, or with the engine down:
 
    ```sh
    bossctl dispatch quarantine recheck

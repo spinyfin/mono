@@ -30,7 +30,7 @@
 //! (the storage readers check this on every dispatch decision, so a cancel
 //! takes effect at once), the process being proven gone
 //! ([`reevaluate_local_worker_holds`], also run on every dispatch decision),
-//! or an operator's `bossctl dispatch quarantine clear`. None needs an engine
+//! or a manual `bossctl dispatch quarantine clear`. None needs an engine
 //! restart.
 //!
 //! Only a run inventory that cannot be read at all pauses local dispatch as a
@@ -39,7 +39,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::durable_liveness::{WorkerProcess, probe_execution_worker};
 use crate::work::{LocalWorkerQuarantine, UnidentifiedLocalRun, WorkDb};
@@ -54,6 +54,10 @@ pub(crate) use boss_engine_storage_values::attention_kinds::LOCAL_WORKER_STARTUP
 /// so it is generous; a row inside the margin simply stays held until the
 /// pid probe or a later boot can prove it.
 pub(crate) const PRE_BOOT_MARGIN_SECS: i64 = 3600;
+
+/// Bounded retries when a concurrent writer changed the hold record between
+/// the read and the conditional write.
+const HOLD_RECORD_CAS_ATTEMPTS: usize = 8;
 
 /// Recorded on an execution whose spawn stopped before it asked tmux for a
 /// session. Names the cause so the failure is not mistaken for a worker that
@@ -81,7 +85,7 @@ pub struct HoldReevaluation {
     pub held: LocalWorkerQuarantine,
 }
 
-/// One held execution and the evidence keeping it held, for operator display.
+/// One held execution and the evidence keeping it held, for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldLocalWorker {
     pub execution_id: String,
@@ -104,7 +108,7 @@ impl HeldLocalWorker {
     }
 }
 
-/// The hold as an operator needs to see it.
+/// The hold as it needs to be shown.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LocalWorkerHoldStatus {
     /// Set when the run inventory could not be read, which pauses all local dispatch.
@@ -142,10 +146,11 @@ pub fn quarantine_historical_local_workers(db: &WorkDb) -> Result<StartupQuarant
 
 /// Re-judge the existing hold and release whatever no longer needs it.
 ///
-/// Dispatch calls this before every host selection, so a hold never outlives
-/// its cause by more than one dispatch decision. It never adds a new
-/// execution to a hold that a successful scan established, and it does
-/// nothing at all, beyond one metadata read, while nothing is held.
+/// Dispatch calls this before every dispatch decision (admission, host
+/// selection, and the active-dispatch rescan), so a hold never outlives its
+/// cause by more than one decision. It never adds a new execution to a hold
+/// that a successful scan established, and it does nothing at all, beyond
+/// one metadata read, while nothing is held.
 pub fn reevaluate_local_worker_holds(db: &WorkDb) -> Result<HoldReevaluation> {
     reevaluate_with_probe(db, |id| probe_execution_worker(db, id), kernel_boot_epoch_secs())
 }
@@ -191,40 +196,47 @@ pub fn local_worker_hold_status(db: &WorkDb) -> Result<LocalWorkerHoldStatus> {
     })
 }
 
-/// Release holds on an operator's say-so. `execution_ids` of `None` releases
-/// everything, including a pause left by an unreadable inventory.
+/// Release the selected holds explicitly. `execution_ids` of `None` releases
+/// every held execution and leaves an unreadable-inventory pause in place:
+/// that pause lifts only after a successful inventory read.
 ///
 /// This removes the hold only. The executions themselves are left as they
 /// are: the engine's liveness sweeps reap one whose worker is gone, and an
 /// execution that is still non-terminal and unverifiable at the next engine
 /// start is held again. Cancel the execution to settle it for good.
 pub fn release_local_worker_holds(db: &WorkDb, execution_ids: Option<&[String]>) -> Result<BTreeMap<String, String>> {
-    let previous = db.read_local_worker_quarantine()?;
-    let mut remaining = previous.clone();
-    match execution_ids {
-        Some(ids) => remaining
+    for _ in 0..HOLD_RECORD_CAS_ATTEMPTS {
+        let previous = db.read_local_worker_quarantine()?;
+        let mut remaining = previous.clone();
+        match execution_ids {
+            Some(ids) => remaining
+                .executions
+                .retain(|execution_id, _| !ids.contains(execution_id)),
+            None => remaining.executions.clear(),
+        }
+        if remaining == previous {
+            return Ok(BTreeMap::new());
+        }
+        if !db.replace_local_worker_quarantine(&previous, &remaining)? {
+            continue;
+        }
+        let released: BTreeMap<String, String> = previous
             .executions
-            .retain(|execution_id, _| !ids.contains(execution_id)),
-        None => remaining = LocalWorkerQuarantine::default(),
+            .iter()
+            .filter(|(execution_id, _)| !remaining.executions.contains_key(*execution_id))
+            .map(|(execution_id, work_item_id)| (execution_id.clone(), work_item_id.clone()))
+            .collect();
+        for (execution_id, work_item_id) in &released {
+            tracing::warn!(
+                execution_id,
+                work_item_id,
+                "released the hold on an unverified local worker"
+            );
+        }
+        resolve_released_attention(db, &previous, &remaining);
+        return Ok(released);
     }
-    if remaining != previous {
-        db.write_local_worker_quarantine(&remaining)?;
-    }
-    let released: BTreeMap<String, String> = previous
-        .executions
-        .iter()
-        .filter(|(execution_id, _)| !remaining.executions.contains_key(*execution_id))
-        .map(|(execution_id, work_item_id)| (execution_id.clone(), work_item_id.clone()))
-        .collect();
-    for (execution_id, work_item_id) in &released {
-        tracing::warn!(
-            execution_id,
-            work_item_id,
-            "operator released the hold on an unverified local worker"
-        );
-    }
-    resolve_released_attention(db, &previous, &remaining);
-    Ok(released)
+    bail!("could not release the hold; the record changed concurrently. Retry the clear")
 }
 
 /// Epoch seconds at which the running kernel booted, or `None` when the
@@ -407,7 +419,16 @@ fn evaluate(
         }
     }
     if quarantine != *previous {
-        db.write_local_worker_quarantine(&quarantine)?;
+        match db.replace_local_worker_quarantine(previous, &quarantine) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    "local worker hold record changed concurrently; leaving it for the next dispatch decision"
+                );
+                return Ok(report);
+            }
+            Err(err) => return Err(err),
+        }
     }
     for (execution_id, work_item_id) in &previous.executions {
         if !quarantine.executions.contains_key(execution_id) {
@@ -419,7 +440,7 @@ fn evaluate(
         }
     }
     // The hold above is what dispatch admission reads; the attention items
-    // below are the operator-facing explanation. Filing them is best-effort:
+    // below are the display explanation. Filing them is best-effort:
     // a held execution can belong to a work item that was soft-deleted after
     // the worker spawned, and `upsert_external_tracker_attention` refuses a
     // tombstoned task. That refusal must not take the engine down at startup
@@ -715,7 +736,7 @@ mod tests {
         assert!(still_alive.held.executions.contains_key(&execution));
         assert!(db.ensure_work_item_not_quarantined(&item).is_err());
 
-        // The operator stops the old worker; no engine restart follows.
+        // The old worker exits; no engine restart follows.
         let gone = reevaluate_with_probe(&db, |_| WorkerProcess::Gone { shell_pid: 42 }, None).unwrap();
         assert_eq!(gone.released, BTreeMap::from([(execution.clone(), item.clone())]));
         assert!(gone.held.is_empty());
@@ -819,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn an_operator_release_lifts_the_named_hold_and_reports_the_rest() {
+    fn a_manual_release_lifts_the_named_hold_and_reports_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("work.db")).unwrap();
         let (first, first_item) = seed(&db, "first");
@@ -866,20 +887,21 @@ mod tests {
     }
 
     #[test]
-    fn releasing_everything_also_lifts_an_unreadable_inventory_pause() {
+    fn releasing_every_execution_leaves_an_unreadable_inventory_pause() {
         let dir = tempfile::tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("work.db")).unwrap();
         db.write_local_worker_quarantine(&LocalWorkerQuarantine {
-            executions: BTreeMap::new(),
+            executions: BTreeMap::from([("exec-1".to_owned(), "item-1".to_owned())]),
             scan_error: Some("database disk image is malformed".to_owned()),
         })
         .unwrap();
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
-        // Naming executions leaves the pause alone; only "everything" lifts it.
         release_local_worker_holds(&db, Some(&["exec_any".to_owned()])).unwrap();
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
-        release_local_worker_holds(&db, None).unwrap();
-        assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
+        let released = release_local_worker_holds(&db, None).unwrap();
+        assert_eq!(released, BTreeMap::from([("exec-1".to_owned(), "item-1".to_owned())]));
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
+        assert!(db.read_local_worker_quarantine().unwrap().executions.is_empty());
     }
 
     #[test]

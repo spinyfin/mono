@@ -248,7 +248,7 @@ Startup judges every non-terminal execution whose latest run is local and lacks 
 **A hold is re-judged on every dispatch decision.** It is persisted in database metadata so recovery sweeps that run between decisions respect it, but it is never sticky:
 
 - An execution that reaches any terminal status stops holding at once. The storage readers check the execution's current status, so cancelling a held execution releases its work item on the next dispatch decision with no rescan.
-- Before every host selection the coordinator re-probes each held execution and releases one whose process is now proven gone.
+- Before every dispatch decision (admission, host selection, and the active-dispatch rescan) the coordinator re-probes each held execution and releases one whose process is now proven gone.
 - After an unreadable inventory, every dispatch decision retries the read, and the pause lifts when one succeeds. A read that fails while the engine is dispatching leaves the existing record as it is; only startup, which has nothing to fall back on, turns an unreadable inventory into a pause.
 - Re-judging never adds an execution to a hold that a successful scan established. An unidentified run that appears while the engine is running is a spawn in flight, which the spawn itself completes or fails.
 
