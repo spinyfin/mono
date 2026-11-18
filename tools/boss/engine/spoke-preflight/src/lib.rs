@@ -104,6 +104,20 @@ pub fn run_storage(config: &Config) -> Vec<Outcome> {
     ]
 }
 
+/// The credential directory inside the state directory, where the installer
+/// leaves the files below for the daemon.
+pub const CREDENTIALS_DIR: &str = "credentials";
+
+/// `<state_dir>/credentials`. Callers that persist or check credential files
+/// go through this so the directory name cannot drift.
+pub fn credentials_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(CREDENTIALS_DIR)
+}
+/// The repositories the installer was told to check, NUL-separated.
+pub const REPOS_FILE: &str = "preflight-repos";
+/// Present from enrollment until the installer's preflight has succeeded.
+pub const BOOTSTRAP_PENDING_FILE: &str = "preflight-run-pending";
+
 /// Every check. Probes run one after another, each bounded by [`PROBE_TIMEOUT`].
 pub async fn run(config: &Config) -> Vec<Outcome> {
     let mut outcomes = run_storage(config);
@@ -123,7 +137,7 @@ pub async fn run(config: &Config) -> Vec<Outcome> {
     if let Some(hub) = &config.hub {
         outcomes.push(hub_reachable(hub).await);
     }
-    match std::fs::read_to_string(config.state_dir.join("credentials/preflight-repos")) {
+    match std::fs::read_to_string(credentials_dir(&config.state_dir).join(REPOS_FILE)) {
         Ok(text) => {
             let mut repos: std::collections::BTreeSet<String> = config.repos.iter().cloned().collect();
             repos.extend(text.split('\0').filter(|repo| !repo.is_empty()).map(str::to_owned));
@@ -143,7 +157,7 @@ pub async fn run(config: &Config) -> Vec<Outcome> {
         )),
     }
     if config.report_bootstrap {
-        match std::fs::symlink_metadata(config.state_dir.join("credentials/preflight-run-pending")) {
+        match std::fs::symlink_metadata(credentials_dir(&config.state_dir).join(BOOTSTRAP_PENDING_FILE)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => outcomes.push(Outcome::of(
                 "preflight_run",
@@ -158,7 +172,7 @@ pub async fn run(config: &Config) -> Vec<Outcome> {
 /// the service user and nobody else.
 pub fn private_storage(state_dir: &Path) -> Outcome {
     let result = (|| {
-        for dir in [state_dir.to_path_buf(), state_dir.join("credentials")] {
+        for dir in [state_dir.to_path_buf(), credentials_dir(state_dir)] {
             let metadata = match std::fs::symlink_metadata(&dir) {
                 Ok(metadata) => metadata,
                 // Not enrolled yet: there is no credential directory to protect.
@@ -426,7 +440,7 @@ mod tests {
         let state = temp.path().join("spoke");
         private_dir(&state);
         assert!(private_storage(&state).passed());
-        private_dir(&state.join("credentials"));
+        private_dir(&credentials_dir(&state));
         assert!(private_storage(&state).passed());
     }
 
@@ -439,7 +453,7 @@ mod tests {
         assert!(message(&private_storage(&state)).contains("owner-only"));
 
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
-        let credentials = state.join("credentials");
+        let credentials = credentials_dir(&state);
         private_dir(&credentials);
         fs::set_permissions(&credentials, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(message(&private_storage(&state)).contains("credentials"));

@@ -29,7 +29,7 @@ use boss_protocol_spoke::v1::{Certificate, EnrollRequest, RenewRequest};
 use rand::Rng;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use tokio::sync::watch;
-use tonic::transport::{Certificate as TlsCertificate, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate as TlsCertificate, ClientTlsConfig, Endpoint, Identity as TlsIdentity};
 use tonic::{Status, async_trait};
 
 pub use error::ClientError;
@@ -81,6 +81,31 @@ pub fn enrollment_client(hub_url: &str, ca_pem: &[u8]) -> Result<impl Exchange +
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .tls_config(ClientTlsConfig::new().ca_certificate(TlsCertificate::from_pem(ca_pem)))
+        .map_err(|e| ClientError::Endpoint(e.to_string()))?;
+    Ok(Client::new(endpoint.connect_lazy()))
+}
+
+/// A client for the hub's `Renew` endpoint. The connection is mutually
+/// authenticated: the hub is verified against `ca_pem`, and the request is
+/// made with the current `cert_pem` / `key_pem`. Built on first use, so a hub
+/// that is down surfaces as [`ClientError::Unavailable`] from `renew`.
+///
+/// Must be called inside a Tokio runtime.
+pub fn renewal_client(
+    hub_url: &str,
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<impl Exchange + use<>, ClientError> {
+    let endpoint = Endpoint::from_shared(hub_url.to_owned())
+        .map_err(|e| ClientError::Endpoint(e.to_string()))?
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(TlsCertificate::from_pem(ca_pem))
+                .identity(TlsIdentity::from_pem(cert_pem, key_pem)),
+        )
         .map_err(|e| ClientError::Endpoint(e.to_string()))?;
     Ok(Client::new(endpoint.connect_lazy()))
 }
