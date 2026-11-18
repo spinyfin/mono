@@ -17,8 +17,9 @@ use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent}
 
 use crate::driver::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, ModelMenu,
-    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan,
-    SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
+    ProgressSessionConfig, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
@@ -158,6 +159,34 @@ pub const GROK_HOOK_SESSION_JSONL: &str = concat!(
     "\n",
 );
 
+/// agy-hook ingress for the same logical one-tool turn, in the 1.5.5+
+/// camelCase dialect (`hookEventName` on every envelope, `toolCall`,
+/// `fullyIdle`). This synthetic turn uses native `args.CommandLine`.
+/// The normalizer preserves native fields and adds canonical `command`.
+/// Equivalence projects tool input onto that shared command field.
+/// `lastUserInput` repeats the prompt and must be stripped.
+///
+/// Documented dialect gaps versus [`expected_session_events`]:
+/// - no `UserPromptSubmit` hook (PreInvocation is dropped once the parent
+///   is claimed, not mapped to a prompt event);
+/// - `PostToolUse` carries `error=""` and no command output, so
+///   `tool_response` is `{}` (this is why agy does not declare
+///   `CommandOutcomeObservation`).
+pub const AGY_HOOK_SESSION_JSONL: &str = concat!(
+    r#"{"hookEventName":"SessionStart","conversationId":"019f974c-3d59-7533-b320-3963123c809b","modelName":"gemini-3.8-flash-low","cwd":"/tmp/ws","workspacePaths":["/tmp/ws"],"transcriptPath":"/tmp/brain/019f974c-3d59-7533-b320-3963123c809b/transcript_full.jsonl","lastUserInput":"the whole brief must not be logged"}"#,
+    "\n",
+    r#"{"hookEventName":"PreInvocation","conversationId":"019f974c-3d59-7533-b320-3963123c809b","invocationNum":0,"initialNumSteps":1,"lastUserInput":"the whole brief must not be logged"}"#,
+    "\n",
+    r#"{"hookEventName":"PreToolUse","conversationId":"019f974c-3d59-7533-b320-3963123c809b","modelName":"gemini-3.8-flash-low","lastUserInput":"the whole brief must not be logged","toolCall":{"id":"call_fixture","name":"run_command","args":{"CommandLine":"echo hooktest-exec"}}}"#,
+    "\n",
+    r#"{"hookEventName":"PostToolUse","conversationId":"019f974c-3d59-7533-b320-3963123c809b","error":"","lastUserInput":"the whole brief must not be logged","toolCall":{"id":"call_fixture","name":"run_command","args":{"CommandLine":"echo hooktest-exec"}}}"#,
+    "\n",
+    r#"{"hookEventName":"PostInvocation","conversationId":"019f974c-3d59-7533-b320-3963123c809b","invocationNum":0,"lastUserInput":"the whole brief must not be logged"}"#,
+    "\n",
+    r#"{"hookEventName":"Stop","conversationId":"019f974c-3d59-7533-b320-3963123c809b","fullyIdle":true,"terminationReason":"NO_TOOL_CALL","error":"","executionNum":0,"lastUserInput":"the whole brief must not be logged"}"#,
+    "\n",
+);
+
 /// Expected activity-machine event sequence for both fixture sides.
 pub fn expected_session_events() -> Vec<WorkerEvent> {
     vec![
@@ -187,6 +216,23 @@ pub fn expected_session_events() -> Vec<WorkerEvent> {
             stop_reason: StopReason::Completed,
         },
     ]
+}
+
+/// Expected activity-machine sequence for [`AGY_HOOK_SESSION_JSONL`].
+///
+/// Same shapes as [`expected_session_events`] minus the two documented
+/// dialect gaps: no `UserPromptSubmit`, and empty `PostToolUse.tool_response`.
+pub fn expected_agy_session_events() -> Vec<WorkerEvent> {
+    expected_session_events()
+        .into_iter()
+        .filter(|event| !matches!(event, WorkerEvent::UserPromptSubmit { .. }))
+        .map(|mut event| {
+            if let WorkerEvent::PostToolUse { tool_response, .. } = &mut event {
+                *tool_response = serde_json::json!({});
+            }
+            event
+        })
+        .collect()
 }
 
 /// Rewrite every event's session id so sequences from drivers that use
@@ -636,6 +682,50 @@ pub fn decode_jsonl(driver: &dyn AgentDriver, jsonl: &str) -> Vec<WorkerEvent> {
         }
     }
     events
+}
+
+/// Decode every JSONL line through the driver's progress session when it
+/// has one, else through the stateless [`AgentDriver::normalize_progress_event`].
+///
+/// agy boundary events (`SessionStart`, `PreInvocation`, `Stop`) require a
+/// per-run session — the stateless path rejects them. Claude, Grok, and the
+/// Codex-shaped double stay on the stateless path (`progress_session` is
+/// `None`). Unknown / filtered events are skipped the same way
+/// [`decode_jsonl`] skips [`NormalizeError::UnknownEvent`].
+pub fn decode_progress(driver: &dyn AgentDriver, jsonl: &str) -> Vec<WorkerEvent> {
+    match driver.progress_session(&ProgressSessionConfig::default()) {
+        Some(mut session) => decode_jsonl_session(session.as_mut(), jsonl),
+        None => decode_jsonl(driver, jsonl),
+    }
+}
+
+fn decode_jsonl_session(session: &mut dyn ProgressSessionNormalizer, jsonl: &str) -> Vec<WorkerEvent> {
+    let mut events = Vec::new();
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let raw: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("fixture JSONL line is not valid JSON ({e}): {line}"));
+        match session.normalize_progress_events(&raw) {
+            Ok(batch) => events.extend(batch),
+            Err(NormalizeError::UnknownEvent(_)) => {}
+            Err(err) => {
+                panic!("unexpected normalize error for line {line}: {err}");
+            }
+        }
+    }
+    events
+}
+
+/// Compare the canonical command without vendor-specific argument metadata.
+/// Callers separately assert native CommandLine translation before projecting.
+pub fn project_command(mut event: WorkerEvent) -> WorkerEvent {
+    if let WorkerEvent::PreToolUse { tool_input, .. } | WorkerEvent::PostToolUse { tool_input, .. } = &mut event {
+        *tool_input = serde_json::json!({"command": tool_input["command"]});
+    }
+    event
 }
 
 #[cfg(test)]

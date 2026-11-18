@@ -37,21 +37,18 @@ pub const AGY_CODESIGN_IDENTIFIER: &str = "cli";
 pub const AGY_CODESIGN_TEAM: &str = "EQHXZ8M8AV";
 
 /// Wall-clock limit for the short local probes (`agy --version`, `codesign`).
-pub(crate) const AGY_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const AGY_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Wall-clock limit for `agy models`, which may reach the network.
 pub(crate) const AGY_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run a vendor subprocess with a timeout, killing its process group on expiry.
 /// Shares the crate-wide in-flight registry so engine shutdown reaps it too.
 /// A timeout is an error naming the command.
-pub(crate) fn run_agy_bounded(
-    command: &mut Command,
-    timeout: std::time::Duration,
-) -> anyhow::Result<std::process::Output> {
+pub fn run_agy_bounded(command: &mut Command, timeout: std::time::Duration) -> anyhow::Result<std::process::Output> {
     crate::bounded_command::run_bounded_as(command, timeout, "Antigravity provisioning failed")
 }
 
-const DISABLE_AUTO_UPDATE_ENV: &str = "AGY_CLI_DISABLE_AUTO_UPDATE";
+pub const DISABLE_AUTO_UPDATE_ENV: &str = "AGY_CLI_DISABLE_AUTO_UPDATE";
 const HIDE_ACCOUNT_INFO_ENV: &str = "AGY_CLI_HIDE_ACCOUNT_INFO";
 
 /// Exact value that disables the updater. `=1` is ignored by `agy`.
@@ -446,7 +443,7 @@ fn read_agy_version(path: &Path) -> anyhow::Result<String> {
     parse_agy_version(&raw).with_context(|| format!("parsing agy version from {raw:?}"))
 }
 
-fn parse_agy_version(raw: &str) -> anyhow::Result<String> {
+pub fn parse_agy_version(raw: &str) -> anyhow::Result<String> {
     let token = raw
         .split_whitespace()
         .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))
@@ -458,7 +455,7 @@ fn parse_agy_version(raw: &str) -> anyhow::Result<String> {
     Ok(version.to_owned())
 }
 
-fn version_at_least(observed: &str, minimum: &str) -> bool {
+pub fn version_at_least(observed: &str, minimum: &str) -> bool {
     match (parse_semver_prefix(observed), parse_semver_prefix(minimum)) {
         (Some(obs), Some(min)) => obs >= min,
         _ => false,
