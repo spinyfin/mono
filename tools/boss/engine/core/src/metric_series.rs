@@ -1509,7 +1509,9 @@ mod tests {
         const N: i64 = 8_000;
         {
             let mut conn = db.connect().unwrap();
-            let tx = conn.transaction().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             for i in 0..N {
                 let finished = since + (i * (until - since)) / N;
                 let started = finished - 45;
