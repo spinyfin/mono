@@ -20,3 +20,20 @@ fn prepared_databases_keep_server_state_isolated_and_persistent() {
     let reopened = WorkDb::open_existing(first_dir.path().join("state.db")).unwrap();
     assert_eq!(reopened.get_metadata("fixture-only").unwrap().as_deref(), Some("first"));
 }
+
+/// Nothing a server state builds may keep its coordinator, or its database
+/// connection and page cache, alive after it is dropped. Every test here
+/// builds at least one server state, and a reference cycle between the
+/// coordinator and the publisher it owns once left about 1 MB behind for each.
+#[test]
+fn a_dropped_server_state_frees_its_coordinator_and_database() {
+    for (state, _dir) in [test_server_state(), test_server_state_with_fakes()] {
+        let work_db = Arc::downgrade(&state.work_db);
+        let coordinator = Arc::downgrade(&state.execution_coordinator);
+        let completion_handler = Arc::downgrade(&state.completion_handler);
+        drop(state);
+        assert_eq!(coordinator.strong_count(), 0, "execution coordinator");
+        assert_eq!(completion_handler.strong_count(), 0, "completion handler");
+        assert_eq!(work_db.strong_count(), 0, "work database");
+    }
+}

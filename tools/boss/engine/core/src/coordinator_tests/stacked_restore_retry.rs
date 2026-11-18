@@ -295,49 +295,117 @@ async fn every_integrity_verdict_retains_saved_work_and_allows_fresh_dispatch() 
     }
 }
 
-#[tokio::test]
-async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
+/// One test per execution kind: each case builds its own repositories through
+/// `jj`, and as a single looped test the twelve of them were the longest test
+/// in the binary. Separate tests run side by side and spread across shards.
+macro_rules! legacy_conflicts_remain_untouched_and_never_prevent_start {
+    ($($test:ident => $kind:ident),+ $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $test() {
+                legacy_conflict_remains_untouched_and_never_prevents_start(ExecutionKind::$kind).await;
+            }
+        )+
+    };
+}
+
+legacy_conflicts_remain_untouched_and_never_prevent_start! {
+    legacy_conflict_never_prevents_answer_agent_start => AnswerAgent,
+    legacy_conflict_never_prevents_automation_triage_start => AutomationTriage,
+    legacy_conflict_never_prevents_chore_implementation_start => ChoreImplementation,
+    legacy_conflict_never_prevents_ci_remediation_start => CiRemediation,
+    legacy_conflict_never_prevents_conflict_resolution_start => ConflictResolution,
+    legacy_conflict_never_prevents_investigation_implementation_start => InvestigationImplementation,
+    legacy_conflict_never_prevents_pr_review_start => PrReview,
+    legacy_conflict_never_prevents_pr_review_guide_start => PrReviewGuide,
+    legacy_conflict_never_prevents_product_design_start => ProductDesign,
+    legacy_conflict_never_prevents_project_design_start => ProjectDesign,
+    legacy_conflict_never_prevents_revision_implementation_start => RevisionImplementation,
+    legacy_conflict_never_prevents_task_implementation_start => TaskImplementation,
+}
+
+async fn legacy_conflict_remains_untouched_and_never_prevents_start(kind: ExecutionKind) {
     use boss_engine_test_git::jj::JjRepo;
-    for kind in [
-        ExecutionKind::AnswerAgent,
-        ExecutionKind::AutomationTriage,
-        ExecutionKind::ChoreImplementation,
-        ExecutionKind::CiRemediation,
-        ExecutionKind::ConflictResolution,
-        ExecutionKind::InvestigationImplementation,
-        ExecutionKind::PrReview,
-        ExecutionKind::PrReviewGuide,
-        ExecutionKind::ProductDesign,
-        ExecutionKind::ProjectDesign,
-        ExecutionKind::RevisionImplementation,
-        ExecutionKind::TaskImplementation,
-    ] {
-        let mut h = chain_harness(true, true, false).await;
-        let db = &h.coordinator.work_db();
-        // Resolve the fixture predecessor before changing its execution kind.
-        let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
-        db.clear_preserved_tip(&prior.id).unwrap();
-        db.connect()
+    let mut h = chain_harness(true, true, false).await;
+    let db = &h.coordinator.work_db();
+    // Resolve the fixture predecessor before changing its execution kind.
+    let prior = db.recovery_predecessor(&h.next).unwrap().unwrap();
+    db.clear_preserved_tip(&prior.id).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET kind = ?1 WHERE id IN (?2, ?3)",
+            rusqlite::params![kind.as_str(), prior.id, h.next.id],
+        )
+        .unwrap();
+    h.next = db.get_execution(&h.next.id).unwrap();
+    // A bookmark an earlier engine created, left conflicted by two concurrent
+    // rewrites. Nothing reads it, so it can neither block nor be touched.
+    let legacy = format!("boss-recovery/{}", prior.id);
+    JjRepo::run(&h.repo.worker, &["bookmark", "create", &legacy, "-r", "@"]);
+    let head = JjRepo::run(&h.repo.repo, &["log", "-r", &legacy, "--no-graph", "-T", "commit_id"]);
+    let op = JjRepo::run(&h.repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
+    for description in ["left recovery", "right recovery"] {
+        JjRepo::run(
+            &h.repo.repo,
+            &["--at-op", op.trim(), "describe", &head, "-m", description],
+        );
+    }
+    let twins = JjRepo::run(
+        &h.repo.repo,
+        &[
+            "log",
+            "-r",
+            &format!("bookmarks(exact:{legacy})"),
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert_eq!(twins.lines().count(), 2);
+    if kind == ExecutionKind::RevisionImplementation {
+        h.dispatch().await.unwrap();
+        assert_eq!(db.get_execution(&h.next.id).unwrap().status, ExecutionStatus::Running);
+    } else {
+        let lease = CubeWorkspaceLease {
+            lease_id: "lease-conflicted".into(),
+            workspace_id: "replacement".into(),
+            workspace_path: h.repo.replacement.clone(),
+            dirty_verified: Some(true),
+        };
+        assert!(
+            h.coordinator
+                .recover_execution_bookmark_for_test(
+                    &h.next,
+                    &lease,
+                    &h.coordinator.host_adapter(),
+                    "mono",
+                    Some(99),
+                    Some(99),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "{kind:?}"
+        );
+    }
+    assert_eq!(
+        db.get_execution(&h.next.id).unwrap().pre_start_failure_count,
+        0,
+        "{kind:?}"
+    );
+    if kind.never_writes_pr_branch() {
+        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+        return;
+    }
+    assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
+    assert!(
+        db.list_attention_items_for_work_item(&prior.work_item_id)
             .unwrap()
-            .execute(
-                "UPDATE work_executions SET kind = ?1 WHERE id IN (?2, ?3)",
-                rusqlite::params![kind.as_str(), prior.id, h.next.id],
-            )
-            .unwrap();
-        h.next = db.get_execution(&h.next.id).unwrap();
-        // A bookmark an earlier engine created, left conflicted by two concurrent
-        // rewrites. Nothing reads it, so it can neither block nor be touched.
-        let legacy = format!("boss-recovery/{}", prior.id);
-        JjRepo::run(&h.repo.worker, &["bookmark", "create", &legacy, "-r", "@"]);
-        let head = JjRepo::run(&h.repo.repo, &["log", "-r", &legacy, "--no-graph", "-T", "commit_id"]);
-        let op = JjRepo::run(&h.repo.repo, &["op", "log", "--no-graph", "-n", "1", "-T", "id"]);
-        for description in ["left recovery", "right recovery"] {
-            JjRepo::run(
-                &h.repo.repo,
-                &["--at-op", op.trim(), "describe", &head, "-m", description],
-            );
-        }
-        let twins = JjRepo::run(
+            .is_empty()
+    );
+    assert_eq!(
+        JjRepo::run(
             &h.repo.repo,
             &[
                 "log",
@@ -345,64 +413,9 @@ async fn legacy_conflicts_remain_untouched_and_never_prevent_start() {
                 &format!("bookmarks(exact:{legacy})"),
                 "--no-graph",
                 "-T",
-                "commit_id ++ \"\\n\"",
-            ],
-        );
-        assert_eq!(twins.lines().count(), 2);
-        if kind == ExecutionKind::RevisionImplementation {
-            h.dispatch().await.unwrap();
-            assert_eq!(db.get_execution(&h.next.id).unwrap().status, ExecutionStatus::Running);
-        } else {
-            let lease = CubeWorkspaceLease {
-                lease_id: "lease-conflicted".into(),
-                workspace_id: "replacement".into(),
-                workspace_path: h.repo.replacement.clone(),
-                dirty_verified: Some(true),
-            };
-            assert!(
-                h.coordinator
-                    .recover_execution_bookmark_for_test(
-                        &h.next,
-                        &lease,
-                        &h.coordinator.host_adapter(),
-                        "mono",
-                        Some(99),
-                        Some(99),
-                    )
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "{kind:?}"
-            );
-        }
-        assert_eq!(
-            db.get_execution(&h.next.id).unwrap().pre_start_failure_count,
-            0,
-            "{kind:?}"
-        );
-        if kind.never_writes_pr_branch() {
-            assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-            continue;
-        }
-        assert!(db.execution_bookmark_optional(&prior.id).unwrap().is_some());
-        assert!(
-            db.list_attention_items_for_work_item(&prior.work_item_id)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            JjRepo::run(
-                &h.repo.repo,
-                &[
-                    "log",
-                    "-r",
-                    &format!("bookmarks(exact:{legacy})"),
-                    "--no-graph",
-                    "-T",
-                    "commit_id ++ \"\\n\""
-                ]
-            ),
-            twins
-        );
-    }
+                "commit_id ++ \"\\n\""
+            ]
+        ),
+        twins
+    );
 }

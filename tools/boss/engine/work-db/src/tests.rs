@@ -648,8 +648,18 @@ mod work_item_write_tests;
 mod board_review_cache_tests;
 mod board_runtime_cache_tests;
 mod sweep_read_budget_tests;
+
+// Seeded-board scale tests and production-cardinality measurements. They are
+// compiled only into `:work_db_scale_test` (`--cfg=boss_scale_tests`), which
+// runs every test whose path contains `scale`. Keep that word in the name of
+// a module declared here, or the target that builds it never runs it. See the
+// target's comment in BUILD.bazel.
+#[cfg(boss_scale_tests)]
+mod board_projection_scale;
 mod wait_scale_fixture;
+#[cfg(boss_scale_tests)]
 mod wait_scale_tests;
+#[cfg(boss_scale_tests)]
 mod work_tree_scale_tests;
 
 mod board_lane_read_tests;
@@ -657,7 +667,6 @@ mod board_patch_tests;
 
 mod design_doc_contention_tests;
 
-mod board_projection_scale;
 mod board_projection_tests;
 mod navigator_projection_tests;
 

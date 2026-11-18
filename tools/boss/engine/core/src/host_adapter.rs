@@ -1995,22 +1995,28 @@ mod tests {
 
         let nested = workspace.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
-        let _inside = Reaped(
-            std::process::Command::new("sleep")
-                .arg("60")
+        // The child's chdir happens in the forked process, before it execs.
+        // The line it writes therefore proves its cwd is the nested
+        // directory, and `exec` keeps that process (and cwd) for the sleep.
+        // One scan then gives the verdict. Polling for OCCUPIED instead spent
+        // the whole five-second deadline wherever the scan can only ever
+        // answer UNKNOWN, which is every run under the macOS test sandbox.
+        let mut inside = Reaped(
+            std::process::Command::new("sh")
+                .args(["-c", "echo ready; exec sleep 60"])
                 .current_dir(&nested)
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
-        // The child's chdir happens in the forked process; poll until visible.
-        let mut seen = String::new();
-        for _ in 0..100 {
-            seen = run_occupancy_script(&workspace);
-            if seen == "OCCUPIED" {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(inside.0.stdout.take().unwrap()),
+            &mut ready,
+        )
+        .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let seen = run_occupancy_script(&workspace);
         if seen == "UNKNOWN" {
             // macOS hermetic sandbox denies `lsof`; a Linux host whose every
             // same-uid cwd is unreadable also cannot observe occupancy.
