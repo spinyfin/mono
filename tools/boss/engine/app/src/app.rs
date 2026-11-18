@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -2400,16 +2398,6 @@ impl ServerState {
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
         self.agy_background_tasks.forget(run_id);
-    }
-
-    /// Push a `boothby_passes` row on the `boothby.activity` topic. Called
-    /// whenever a pass opens or closes (via
-    /// [`boss_engine_runtime::boothby_scheduler::BoothbyActivitySink`], implemented below
-    /// for `ServerState`) so the Boothby tab's pass history and audit feed
-    /// update without polling.
-    pub async fn broadcast_boothby_activity(&self, pass: boss_protocol::BoothbyPass) {
-        let envelope = FrontendEventEnvelope::push(FrontendEvent::BoothbyActivity { pass });
-        self.topic_broker.publish(TOPIC_BOOTHBY_ACTIVITY, envelope).await;
     }
 
     fn current_work_revision(&self) -> u64 {

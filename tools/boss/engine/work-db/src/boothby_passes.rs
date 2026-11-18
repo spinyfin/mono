@@ -153,6 +153,20 @@ impl WorkDb {
         collect_rows(stmt.query_map([limit], map_boothby_pass)?)
     }
 
+    /// The most recent *finished* pass (`finished_at IS NOT NULL`), or `None`
+    /// if none has ever finished. Distinct from [`Self::list_boothby_passes`]
+    /// (which is unfiltered and so returns the in-flight pass itself
+    /// whenever one is open) — `GetBoothbyState`'s `last_pass` field needs
+    /// the last *finished* pass so the Boothby tab can render "current pass +
+    /// previous outcome" side by side.
+    pub fn last_finished_boothby_pass(&self) -> Result<Option<BoothbyPass>> {
+        let conn = self.connect()?;
+        let sql = format!("{BOOTHBY_PASS_SELECT} WHERE finished_at IS NOT NULL ORDER BY started_at DESC LIMIT 1");
+        conn.query_row(&sql, [], map_boothby_pass)
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// `started_at` (parsed as epoch seconds) of the most recent
     /// `trigger = 'schedule'` pass, or `None` if Boothby has never fired a
     /// scheduled pass. The scheduler anchors its cron-occurrence math on
@@ -317,6 +331,29 @@ mod tests {
         db.finish_boothby_pass(&scheduled.id, "6000", BOOTHBY_OUTCOME_NOTHING_TO_DO, None, None, None)
             .unwrap();
         assert_eq!(db.last_boothby_schedule_pass_started_at().unwrap(), Some(6000));
+    }
+
+    #[test]
+    fn last_finished_pass_ignores_the_open_pass() {
+        let (_d, db) = open_db();
+        let finished = db.open_boothby_pass(BOOTHBY_TRIGGER_SCHEDULE, "1000").unwrap().unwrap();
+        db.finish_boothby_pass(&finished.id, "1050", BOOTHBY_OUTCOME_NOTHING_TO_DO, None, None, None)
+            .unwrap();
+        let open_pass = db.open_boothby_pass(BOOTHBY_TRIGGER_MANUAL, "2000").unwrap().unwrap();
+
+        let last_finished = db.last_finished_boothby_pass().unwrap().unwrap();
+        assert_eq!(last_finished.id, finished.id);
+        assert_ne!(
+            open_pass.id, last_finished.id,
+            "the open pass must not be returned as the last finished pass"
+        );
+    }
+
+    #[test]
+    fn last_finished_pass_is_none_when_nothing_has_finished() {
+        let (_d, db) = open_db();
+        db.open_boothby_pass(BOOTHBY_TRIGGER_SCHEDULE, "1000").unwrap().unwrap();
+        assert_eq!(db.last_finished_boothby_pass().unwrap(), None);
     }
 
     #[test]

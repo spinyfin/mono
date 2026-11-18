@@ -1,5 +1,5 @@
 //! Coalescing event-trigger queue for the Boothby scheduler
-//! ([`crate::boothby_scheduler`]).
+//! (`boothby_scheduler` in the runtime crate).
 //!
 //! Per `tools/boss/docs/designs/boothby.md` §"Activation model", certain
 //! engine events indicate work worth a prompt visit rather than waiting for
@@ -8,45 +8,28 @@
 //! that debounce elapses coalesce into a single follow-up rather than
 //! stacking up separate passes. [`BoothbyEventQueue`] is that debounce: two
 //! producers arm it —
-//! [`crate::dispatch_events::BoothbyEventSink`] for the dispatch-stage
+//! `BoothbyEventSink` (runtime crate) for the dispatch-stage
 //! triggers, and the `work_attention_items` creation path
-//! ([`crate::work::WorkDb::create_attention_item`]) for the attention-kind
-//! triggers — and [`crate::boothby_scheduler`] is the sole consumer.
+//! ([`crate::WorkDb::create_attention_item`]) for the attention-kind
+//! triggers — and `boothby_scheduler` is the sole consumer.
 //!
 //! Kept as a standalone leaf module (no dependency on `WorkDb`, settings, or
-//! the scheduler) so both producers — one inside `work.rs`, one inside
-//! `dispatch_events.rs` — can depend on it without pulling in the scheduler.
+//! the scheduler) so both producers — one inside this crate, one inside the
+//! runtime crate's dispatch sinks — can depend on it without pulling in the scheduler.
 
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-/// Dispatch stages (see [`crate::dispatch_events::Stage::as_str`]) that arm a
-/// Boothby pass when they fire — each represents a state a sweep flagged but
-/// could not fully resolve (design table, §"Activation model"). Any other
-/// stage is a silent no-op by construction: it is simply absent from this
-/// list, so future `Stage` variants never need to touch this file to stay
-/// harmless.
-pub const BOOTHBY_TRIGGER_STAGES: &[&str] = &[
-    "dead_pid_reconcile",
-    "stale_worker_reconcile",
-    "orphan_active_redispatch",
-    "lost_workspace_reconcile",
-    "remote_lease_reconcile",
-    "husk_pane_reconcile",
-    "pool_claim_reconcile",
-    "spawn_ack_timeout",
-];
-
 /// `work_attention_items.kind` values that arm a Boothby pass when a *new*
 /// item is created with that kind (design table, §"Activation model"). Any
 /// other kind is a silent no-op — same rationale as
-/// [`BOOTHBY_TRIGGER_STAGES`].
+/// the dispatch-stage list in the runtime crate's `boothby_dispatch_sinks`.
 pub const BOOTHBY_TRIGGER_ATTENTION_KINDS: &[&str] = &[
-    "nudge_breaker_tripped",
-    "ci_remediation_exhausted",
-    "pr_review_died_without_findings",
-    "app_spawn_capability_unhealthy",
+    boss_engine_storage_values::attention_kinds::NUDGE_BREAKER_ATTENTION_KIND,
+    boss_engine_storage_values::attention_kinds::CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND,
+    boss_engine_storage_values::attention_kinds::PR_REVIEW_DIED_ATTENTION_KIND,
+    boss_engine_storage_values::attention_kinds::SPAWN_CAPABILITY_ATTENTION_KIND,
 ];
 
 /// Prefix `BoothbyEventQueue::arm` names its trigger with, so the scheduler
