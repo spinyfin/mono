@@ -26,9 +26,9 @@ pub(super) async fn handle_boothby_act(ctx: Dispatch, req: FrontendRequest) {
 
     // The design puts this verb on a `BoothbyOrApp` tier alongside the
     // transcript RPCs — a tier that does not exist yet, because it arrives
-    // with the `boothby_pid` trust root in breakdown task 5 (session spawn +
-    // privilege tier). `AppOrBoss` is the correct placeholder rather than a
-    // convenient one: task 5's design has Boothby's own descendants passing
+    // with Boothby session spawn and the `boothby_pid` trust root.
+    // `AppOrBoss` is the placeholder: the session-spawn design has
+    // Boothby's own descendants passing
     // `AppOrBoss` anyway, so this is the tier the real caller will hold, and
     // it already excludes worker panes. It is looser in exactly one respect —
     // the coordinator can reach it, which `BoothbyOrApp` would forbid — and

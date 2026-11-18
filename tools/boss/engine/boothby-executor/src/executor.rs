@@ -32,19 +32,18 @@
 //!
 //! ## What this module deliberately does not do
 //!
-//! It does not *implement* the verbs. The catalogue's effects are tasks 8
-//! (taxonomy) and 9 (operational) of the design's breakdown; they arrive as
-//! [`VerbHandler`] implementations registered on the executor. Until they
-//! land the registry is empty and every call refuses with
-//! `no handler is registered`, which is why this ships dark — same as task
-//! 1's migration.
+//! It does not *implement* the taxonomy or operational verbs. Their effects
+//! arrive as [`VerbHandler`] implementations registered on the executor.
+//! Until they land the registry is empty and every call refuses with
+//! `no handler is registered`, which is why this ships dark.
 //!
-//! It also does not own the undo engine, the pass lifecycle, the settings
-//! keys, or the conversion of a proposal into an attention group. Those are
-//! separate entries in the breakdown; [`BoothbyPolicy`] is the seam the
-//! scheduler (task 3) hands its settings through, and
-//! [`BoothbyActOutcome::Proposed`] is the seam the proposal flow (task 10)
-//! picks up.
+//! The undo half of the design’s guarded-executor-and-undo subsystem is
+//! tracked separately: conflict-checked restore, undo state, suppression,
+//! the undo RPC, and retention pruning are not implemented here.
+//! The pass lifecycle, settings keys, and proposal-to-attention conversion
+//! are also separate capabilities. [`BoothbyPolicy`] is the seam the
+//! scheduler hands settings through, and [`BoothbyActOutcome::Proposed`]
+//! is the seam the proposal flow consumes.
 
 use std::collections::HashMap;
 
@@ -91,9 +90,9 @@ pub enum BoothbyMode {
 /// The design keys these off `boothby.mode` / `boothby.max_actions_per_pass`
 /// / `boothby.human_touch_cooldown` in the settings registry, but the
 /// registry is boolean-valued today and the Boothby keys are an enum and two
-/// integers. Widening it is the scheduler's entry (task 3) in the breakdown,
+/// integers. Widening it belongs to the Boothby scheduler,
 /// so this struct is the seam: the executor takes its policy as a value and
-/// stays testable at every setting, and task 3 populates it from the
+/// stays testable at every setting, and the scheduler populates it from the
 /// registry without touching this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoothbyPolicy {
@@ -116,8 +115,8 @@ impl Default for BoothbyPolicy {
 
 /// What a catalogue verb actually does.
 ///
-/// Implemented by the verb sets in tasks 8 and 9. A handler is called *only*
-/// after every rail has cleared and — for a [`JournalMode::WorkDbCapture`]
+/// Implemented by the taxonomy and operational verb sets. A handler is
+/// called *only* after every rail has cleared and — for a [`JournalMode::WorkDbCapture`]
 /// verb — with the journal context already armed, so an implementation's
 /// whole job is the effect itself: no cap checking, no guard checking, no
 /// journalling.
@@ -245,6 +244,15 @@ impl BoothbyExecutor {
             }));
         }
 
+        // Tell the gate which pass we are in on EVERY call, not just the
+        // irreversible ones. The gate advances its generation when the pass
+        // changes, so if only I-class requests rolled it, a pass that did
+        // nothing but taxonomy work would be invisible to it — and a
+        // nomination from an arbitrarily old pass would still be sitting in
+        // the current generation, ready to confirm the next time anyone asked.
+        // See `a_nomination_survives_passes_that_did_other_work`.
+        self.gate.observe_pass(pass_id);
+
         // 3. Human veto is permanent and beats everything below it.
         if let Some(reason) = self.fingerprint_refusal(db, spec, &input.target_id)? {
             return Ok(refused(reason));
@@ -254,15 +262,6 @@ impl BoothbyExecutor {
         if let Some(reason) = self.proposal_reason(spec) {
             return Ok(BoothbyActOutcome::Proposed { reason });
         }
-
-        // Tell the gate which pass we are in on EVERY call, not just the
-        // irreversible ones. The gate advances its generation when the pass
-        // changes, so if only I-class requests rolled it, a pass that did
-        // nothing but taxonomy work would be invisible to it — and a
-        // nomination from an arbitrarily old pass would still be sitting in
-        // the current generation, ready to confirm the next time anyone asked.
-        // See `a_nomination_survives_passes_that_did_other_work`.
-        self.gate.observe_pass(pass_id);
 
         // 5. Blast-radius caps, counted from the journal.
         if let Some(reason) = self.cap_refusal(db, spec)? {
@@ -303,8 +302,8 @@ impl BoothbyExecutor {
         let handler = match self.handlers.get(spec.slug) {
             Some(handler) => handler,
             // Ships dark: the catalogue is complete but its effects arrive in
-            // tasks 8 and 9. Refusing (rather than erroring) keeps this on
-            // the same footing as every other "no" Boothby can get.
+            // the taxonomy and operational verb handlers. Refusing (rather than
+            // erroring) keeps this on the same footing as every other "no" Boothby can get.
             None => {
                 return Ok(refused(format!(
                     "{} has no handler registered in this engine build",
@@ -525,14 +524,14 @@ impl BoothbyExecutor {
 /// same key.
 ///
 /// Readable rather than hashed on purpose: it appears in refusal messages
-/// and in `boss boothby suppressions`, where `action:close_stale_task:task:T12`
+/// and in `boss boothby suppressions`, where `action:close_stale_task:task:task_123`
 /// tells an operator what they are clearing and a hex digest does not.
 pub fn action_fingerprint(verb: &str, target_kind: &str, target_id: &str) -> String {
     format!("action:{verb}:{target_kind}:{target_id}")
 }
 
-/// Actor string for every Boothby mutation. Re-exported so the verb sets in
-/// tasks 8/9 attribute their writes without importing the protocol directly.
+/// Actor string for every Boothby mutation. Re-exported so taxonomy and
+/// operational handlers attribute writes without importing the protocol.
 pub const BOOTHBY_ACTOR: &str = LAST_STATUS_ACTOR_BOOTHBY;
 
 fn refused(reason: String) -> BoothbyActOutcome {
@@ -1548,6 +1547,64 @@ mod tests {
     // ── two-pass confirmation ────────────────────────────────────────────
 
     #[test]
+    fn a_proposal_only_pass_expires_an_old_nomination() {
+        let (_dir, db) = open_db();
+        open_pass(&db, "bp_1");
+        let handler = SpyHandler::default();
+        let executor = executor_with(auto_policy(), "reap_dead_execution", Box::new(handler.clone()));
+        let request = input("reap_dead_execution", "exec_1");
+        assert!(matches!(
+            executor.act(&db, "bp_1", &request).unwrap(),
+            BoothbyActOutcome::Deferred { .. }
+        ));
+
+        roll_pass(&db, "bp_2");
+        let proposal = executor
+            .act(&db, "bp_2", &input("force_release_lease", "lease_1"))
+            .unwrap();
+        assert!(matches!(proposal, BoothbyActOutcome::Proposed { .. }), "{proposal:?}");
+
+        roll_pass(&db, "bp_3");
+        let outcome = executor.act(&db, "bp_3", &request).unwrap();
+        assert!(matches!(outcome, BoothbyActOutcome::Deferred { .. }), "{outcome:?}");
+        handler.assert_never_ran();
+    }
+
+    #[test]
+    fn a_fingerprint_refused_pass_expires_an_old_nomination() {
+        let (_dir, db) = open_db();
+        open_pass(&db, "bp_1");
+        let handler = SpyHandler::default();
+        let executor = executor_with(auto_policy(), "reap_dead_execution", Box::new(handler.clone()));
+        let request = input("reap_dead_execution", "exec_1");
+        assert!(matches!(
+            executor.act(&db, "bp_1", &request).unwrap(),
+            BoothbyActOutcome::Deferred { .. }
+        ));
+
+        roll_pass(&db, "bp_2");
+        let fingerprint = action_fingerprint("close_stale_task", "task", "task_123");
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO boothby_findings (id, fingerprint, kind, subject, first_seen, last_seen, status)
+                 VALUES ('bf_veto', ?1, 'taxonomy', '{}', '1', '1', 'suppressed')",
+                [&fingerprint],
+            )
+            .unwrap();
+        let veto = executor
+            .act(&db, "bp_2", &input("close_stale_task", "task_123"))
+            .unwrap();
+        assert!(matches!(veto, BoothbyActOutcome::Refused { .. }), "{veto:?}");
+        assert!(reason_of(&veto).contains("suppressed"));
+
+        roll_pass(&db, "bp_3");
+        let outcome = executor.act(&db, "bp_3", &request).unwrap();
+        assert!(matches!(outcome, BoothbyActOutcome::Deferred { .. }), "{outcome:?}");
+        handler.assert_never_ran();
+    }
+
+    #[test]
     fn an_irreversible_verb_defers_on_the_first_pass_and_fires_on_the_second() {
         let (_dir, db) = open_db();
         open_pass(&db, "bp_1");
@@ -1739,8 +1796,8 @@ mod tests {
     #[test]
     fn the_action_fingerprint_is_stable_and_readable() {
         assert_eq!(
-            action_fingerprint("close_stale_task", "task", "T12"),
-            "action:close_stale_task:task:T12",
+            action_fingerprint("close_stale_task", "task", "task_123"),
+            "action:close_stale_task:task:task_123",
         );
     }
 }

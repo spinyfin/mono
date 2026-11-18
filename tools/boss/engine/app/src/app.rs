@@ -1980,10 +1980,9 @@ impl ServerState {
                 .design_docs(design_docs_for_state)
                 // Default policy = `propose` mode: nothing Boothby asks for
                 // mutates anything until an operator turns it up. The
-                // scheduler (breakdown task 3) replaces this with the
-                // settings-derived policy once `boothby.*` keys exist; the
-                // verb handlers (tasks 8/9) register their effects. Until
-                // both land this executor refuses every call, which is the
+                // Boothby scheduler supplies the settings-derived policy once
+                // `boothby.*` keys exist; taxonomy and operational verb
+                // handlers register their effects. Until both land this executor refuses every call, which is the
                 // intended shipping-dark state.
                 .boothby_executor(Arc::new(boss_engine_boothby_executor::BoothbyExecutor::new(
                     boss_engine_boothby_executor::BoothbyPolicy::default(),
