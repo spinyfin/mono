@@ -739,7 +739,7 @@ static NEXT_MEM_DB_ID: AtomicU64 = AtomicU64::new(1);
 /// by `WorkDb::conn` (below) holding the one live connection to it, not by
 /// this struct.
 #[derive(Clone)]
-pub struct InMemoryAnchor {
+struct InMemoryAnchor {
     uri: String,
 }
 

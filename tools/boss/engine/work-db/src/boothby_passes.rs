@@ -68,6 +68,7 @@ fn validate_boothby_outcome(outcome: &str) -> Result<()> {
     bail!("invalid boothby pass outcome: {outcome:?}");
 }
 
+#[work_db_boundary::instrument]
 impl WorkDb {
     /// Open a new pass for `trigger` at `now` (UTC epoch seconds, as a
     /// string per the schema's TEXT-timestamp convention). Returns `Ok(None)`
