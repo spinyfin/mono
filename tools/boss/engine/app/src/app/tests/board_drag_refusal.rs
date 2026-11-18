@@ -275,6 +275,42 @@ async fn drag_of_merged_pr_item_not_yet_done_offers_no_revision() {
     assert!(!message.contains("add a revision"), "got: {message}");
 }
 
+/// A probe that errors (GitHub unreachable) leaves the state unknown: the
+/// refusal says the item can't be run again, offers no revision, and the
+/// status patch is rolled back.
+#[tokio::test]
+async fn bound_pr_refusal_with_failing_probe_offers_no_action_and_rolls_back() {
+    struct FailingChecker;
+    impl boss_work_db::PrStateChecker for FailingChecker {
+        fn check(&self, _pr_url: &str) -> anyhow::Result<boss_work_db::PrOpenState> {
+            anyhow::bail!("gh unreachable")
+        }
+    }
+    let (state, _dir) = test_server_state_with_pr_state_checker(Arc::new(FailingChecker));
+    let product = create_test_product_with_repo(&state.work_db, "FailBoard", Some("git@example.com:board/fail.git"));
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Unprobed");
+    bind_pr(&state, &chore.id, None);
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(dispatch(&state, &sink), drop_on(&chore.id, BoardColumn::Doing)).await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemRefused {
+            code,
+            message,
+            suggested_action,
+            ..
+        } => {
+            assert_eq!(code, BoardRefusalCode::BoundPr);
+            assert_eq!(suggested_action, None);
+            assert!(message.contains("so it can't be run again"), "got: {message}");
+        }
+        other => panic!("expected WorkItemRefused, got {other:?}"),
+    }
+    match state.work_db.get_work_item(&chore.id).expect("chore") {
+        WorkItem::Chore(task) | WorkItem::Task(task) => assert_ne!(task.status, TaskStatus::Active),
+        other => panic!("unexpected item {other:?}"),
+    }
+}
+
 /// An open PR is the one case that offers the revision action.
 #[tokio::test]
 async fn drag_of_item_with_open_pr_offers_add_revision() {

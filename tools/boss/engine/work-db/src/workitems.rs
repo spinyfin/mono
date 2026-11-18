@@ -1317,6 +1317,7 @@ impl WorkDb {
                 "SELECT id
                  FROM tasks
                  WHERE project_id = ?1 AND kind IN ('project_task', 'followup') AND deleted_at IS NULL
+                   AND status != 'archived'
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
             let rows = stmt.query_map([project_id], |row| row.get::<_, String>(0))?;
@@ -1326,7 +1327,7 @@ impl WorkDb {
         existing.sort();
         requested.sort();
         if existing != requested {
-            bail!("reorder request must include the full active task set for the project");
+            return Err(ReorderSetMismatch.into());
         }
 
         for (index, task_id) in task_ids.iter().enumerate() {

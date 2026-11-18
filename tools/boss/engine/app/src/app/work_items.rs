@@ -5,7 +5,7 @@
 //! behavioural change. See [`super::Dispatch`] for the per-request
 //! context every handler receives.
 
-use crate::app::handler_helpers::{BoardRefusal, send_refusal};
+use crate::app::handler_helpers::{BoardRefusal, board_dispatch_refusal, send_refusal};
 use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
 
 use super::*;
@@ -959,14 +959,8 @@ pub(super) async fn apply_work_item_patch_from(
                     .with_details(details),
                 )
                 .await;
-            let refusal = BoardRefusal::from_dispatch_error(
-                &work_db,
-                &id,
-                &err,
-                BoardRefusalCode::MissingRepo,
-                None,
-                server_state.pr_state_checker.as_ref(),
-            );
+            let refusal =
+                BoardRefusal::from_dispatch_error(&work_db, &id, &err, BoardRefusalCode::MissingRepo, None, None);
             send_refusal(&sink, &request_id, board_gesture, &id, refusal);
             return;
         }
@@ -1009,6 +1003,7 @@ pub(super) async fn apply_work_item_patch_from(
         match applied {
             Ok((mut item, unpark_report)) => {
                 // Dispatch refusals roll back the move and return the engine reason.
+                let mut dispatch_failure: Option<(anyhow::Error, BoardRefusalCode)> = None;
                 let mut dispatch_failure_response: Option<BoardRefusal> = None;
                 // Set only inside the pause-bypass arm's genuine claim branch
                 // (`dispatch_with_pause_bypass` actually claimed a `ready` row
@@ -1191,16 +1186,8 @@ pub(super) async fn apply_work_item_patch_from(
                                 (Some(outcome.execution.id), false, Some(reason))
                             }
                             Err(err) => {
-                                let refusal = BoardRefusal::from_dispatch_error(
-                                    &work_db,
-                                    &work_item_id_for_event,
-                                    &err,
-                                    BoardRefusalCode::PauseOverrideRefused,
-                                    previous_task_status.clone(),
-                                    server_state.pr_state_checker.as_ref(),
-                                );
                                 let reason = format!("{err:#}");
-                                dispatch_failure_response = Some(refusal);
+                                dispatch_failure = Some((err, BoardRefusalCode::PauseOverrideRefused));
                                 (None, false, Some(reason))
                             }
                         }
@@ -1220,16 +1207,8 @@ pub(super) async fn apply_work_item_patch_from(
                                 (Some(execution.id), true, None)
                             }
                             Err(err) => {
-                                let refusal = BoardRefusal::from_dispatch_error(
-                                    &work_db,
-                                    &work_item_id_for_event,
-                                    &err,
-                                    BoardRefusalCode::DispatchRefused,
-                                    previous_task_status.clone(),
-                                    server_state.pr_state_checker.as_ref(),
-                                );
                                 let reason = format!("{err:#}");
-                                dispatch_failure_response = Some(refusal);
+                                dispatch_failure = Some((err, BoardRefusalCode::DispatchRefused));
                                 (None, false, Some(reason))
                             }
                         }
@@ -1253,8 +1232,8 @@ pub(super) async fn apply_work_item_patch_from(
                             ),
                         )
                     };
-                    if let Some(refusal) = &dispatch_failure_response {
-                        tracing::warn!(work_item_id = %work_item_id_for_event, reason = %refusal.message, code = ?refusal.code,
+                    if let Some((dispatch_err, dispatch_code)) = dispatch_failure.take() {
+                        tracing::warn!(work_item_id = %work_item_id_for_event, reason = %format!("{dispatch_err:#}"), code = ?dispatch_code,
                             "UpdateWorkItem → active: dispatch refused; reverting status");
                         if let Some(prev_status) = &previous_task_status {
                             let (blocked_reason, blocked_detail) = previous_block.clone().unwrap_or_default();
@@ -1273,6 +1252,20 @@ pub(super) async fn apply_work_item_patch_from(
                                     "failed to revert status after dispatch refusal"),
                             }
                         }
+                        // Revert first, then phrase the refusal: building it may
+                        // probe GitHub, and the row must not sit `active` meanwhile.
+                        dispatch_failure_response = Some(
+                            board_dispatch_refusal(
+                                &server_state,
+                                &work_db,
+                                &work_item_id_for_event,
+                                &dispatch_err,
+                                dispatch_code,
+                                previous_task_status.clone(),
+                                board_gesture,
+                            )
+                            .await,
+                        );
                     }
                     // Pin the event's execution_id to the resolved exec id
                     // when dispatch landed, falling back to the work item
