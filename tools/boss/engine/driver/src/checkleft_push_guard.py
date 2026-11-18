@@ -12,10 +12,10 @@ needs a human decision is escalated with propose blocked -- workers do not
 add BYPASS_ directives themselves.
 
 All policy lives in checkleft: this script shells out and trusts the exit code
-(0 = allow, non-zero = block). It is fail-open by construction -- a non-push
-command, a repo with no checkleft binary, or any error resolving/running
-checkleft all approve -- so the gate can never wedge a session; its only
-deterministic action is to block a push that checkleft itself rejected.
+(0 = allow, non-zero = block). It approves non-push commands and pushes from
+repos that neither declare checkleft in REPOBIN.toml nor have bin/checkleft.
+For a repository that declares or installs checkleft, resolution and execution
+failures block with a diagnostic so a required gate cannot be silently skipped.
 
 The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
 stdout. The checkleft invocation is resolved from (in order) the
@@ -23,7 +23,8 @@ BOSS_CHECKLEFT_BIN env var (used as-is), `repobin exec checkleft` via a
 `repobin` found at `<repo-root>/bin/repobin` or on PATH -- gated on a
 `repobin exec checkleft --version` probe succeeding first -- then
 `<repo-root>/bin/checkleft` (a repobin-installed tool symlink), and finally a
-bare `checkleft` on PATH. See resolve_checkleft_command()'s docstring for why
+bare `checkleft` on PATH only when REPOBIN.toml does not declare checkleft. See
+resolve_checkleft_command()'s docstring for why
 repobin is preferred and why it is probed rather than trusted outright.
 """
 import json
@@ -48,10 +49,12 @@ CHECKLEFT_PROBE_TIMEOUT_SECONDS = 7200
 # Once the probe above has (if needed) warmed the dispatch cache, `checkleft
 # run` can still wait on Bazel (content-hash cache miss, lock contention,
 # a slow compile sharing the machine). Two hours is the floor so a still-
-# compiling build is not fail-opened into an unchecked push. On timeout we
-# fail open (approve) rather than strand the session -- the cube verb gates
-# are the belt for that rare case. A timeout must never be treated as a
-# reason to rerun the same command under the same cap.
+# compiling build is not fail-opened into an unchecked push. A repository
+# that declares checkleft in REPOBIN.toml (or has bin/checkleft) blocks on
+# timeout rather than silently approving; any other repo fails open (approve)
+# rather than strand the session -- the cube verb gates are the belt for that
+# rare case. A timeout must never be treated as a reason to rerun the same
+# command under the same cap.
 CHECKLEFT_TIMEOUT_SECONDS = 7200
 
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -161,6 +164,15 @@ def probe_repobin_checkleft(repobin):
         return False
 
 
+def repobin_declares_checkleft(root):
+    """Match [tools.checkleft] / [pins.checkleft], ignoring outer whitespace."""
+    try:
+        with open(os.path.join(root, "REPOBIN.toml"), encoding="utf-8") as config:
+            return any(line.strip() in ("[tools.checkleft]", "[pins.checkleft]") for line in config)
+    except OSError:
+        return False
+
+
 def resolve_checkleft_command(root):
     """Return the argv prefix that runs checkleft's `run` subcommand.
 
@@ -178,7 +190,8 @@ def resolve_checkleft_command(root):
        push gate down with it.
     4. `<root>/bin/checkleft`, then a `checkleft` on PATH. The PATH lookup is
        last because it can resolve an unrelated, stale build that fails the
-       gate closed with "unknown implementation" errors.
+       gate closed with "unknown implementation" errors. A repository that
+       declares checkleft in REPOBIN.toml never falls through to it.
     """
     override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
     if override:
@@ -197,6 +210,8 @@ def resolve_checkleft_command(root):
     candidate = os.path.join(root, "bin", "checkleft")
     if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
         return [candidate]
+    if repobin_declares_checkleft(root):
+        return None
     which = shutil.which("checkleft")
     return [which] if which else None
 
@@ -223,6 +238,10 @@ def main():
     root = find_repo_root(cwd)
     checkleft_cmd = resolve_checkleft_command(root)
     if not checkleft_cmd:
+        if repobin_declares_checkleft(root):
+            emit("block", "Push blocked: this repository declares checkleft in REPOBIN.toml, but "
+                 + os.path.join(root, "bin", "checkleft") + " is missing or not executable. "
+                 "Run bash tools/repobin/shim/install-workspace-shims.sh from the workspace root, then retry.")
         # No checkleft available -> nothing to enforce (repo may not use it).
         emit("approve")
 
@@ -236,8 +255,13 @@ def main():
             text=True,
             timeout=CHECKLEFT_TIMEOUT_SECONDS,
         )
-    except Exception:
-        # Could not run checkleft (timeout / exec error) -> fail open.
+    except Exception as error:
+        if repobin_declares_checkleft(root) or os.path.isfile(os.path.join(root, "bin", "checkleft")):
+            reason = "Push blocked: the required workspace checkleft did not complete: " + str(error)
+            if isinstance(error, subprocess.TimeoutExpired):
+                reason += ". Run bin/checkleft run once to warm the Bazel build, then retry the push."
+            emit("block", reason)
+        # Could not run checkleft in a non-repobin repo -> fail open.
         emit("approve")
 
     if proc.returncode == 0:
