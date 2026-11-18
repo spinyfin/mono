@@ -76,8 +76,10 @@ pub(super) fn is_idle_prompt_message(message: &str) -> bool {
 }
 
 /// A lapsed wait is overdue only for the park it applied to. Once the
-/// main session has resumed after that park, or kept working past this
-/// declaration, the expired record classifies as [`DeclaredWait::None`].
+/// main session has resumed after that park, the expired record classifies
+/// as [`DeclaredWait::None`]. Tool hooks from the declaring turn do not
+/// count as that resume. A declaration that never parked still classifies
+/// as none when the main session kept working past it (mid-turn expiry).
 pub(super) fn effective_wait(wait: DeclaredWait, lapsed_consumed: bool) -> DeclaredWait {
     if wait == DeclaredWait::Lapsed && lapsed_consumed {
         DeclaredWait::None

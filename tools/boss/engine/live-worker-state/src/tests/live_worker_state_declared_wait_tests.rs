@@ -30,6 +30,15 @@ fn working() -> WorkerEvent {
     }
 }
 
+fn post_tool() -> WorkerEvent {
+    WorkerEvent::PostToolUse {
+        session_id: "s".into(),
+        tool_name: "Bash".into(),
+        tool_input: serde_json::Value::Null,
+        tool_response: serde_json::Value::Null,
+    }
+}
+
 const IDLE_PROMPT: &str = "Claude is waiting for your input";
 
 /// A wait source whose answer the test flips, so a deadline can pass between
@@ -481,4 +490,56 @@ fn declaring_mid_turn_and_working_past_expiry_needs_input_not_overdue() {
     let parked = reg.get(1).unwrap();
     assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
     assert!(parked.activity.needs_human());
+}
+
+#[test]
+fn declaring_turn_tool_hooks_before_stop_do_not_consume_an_expired_wait() {
+    let (reg, waits) = fixture();
+    reg.apply_sequenced_event(1, Some(1), &working());
+    waits.declare_after(1);
+    reg.apply_sequenced_event(1, Some(2), &post_tool());
+    reg.apply_sequenced_event(1, Some(3), &stop());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingOnWork);
+
+    waits.set(DeclaredWait::Lapsed);
+    let changed = reg.reconcile_declared_waits(now());
+    assert_eq!(
+        changed,
+        vec![(1, WorkerActivity::WaitingOnWork, WorkerActivity::WaitOverdue)]
+    );
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+    assert_eq!(
+        reg.snapshot()[0].live_status.as_deref(),
+        Some(crate::WAIT_OVERDUE_LITERAL)
+    );
+
+    reg.apply_sequenced_event(1, Some(4), &notification(IDLE_PROMPT));
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+    assert!(reg.reconcile_declared_waits(now()).is_empty());
+
+    reg.apply_sequenced_event(1, Some(5), &working());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+    reg.apply_sequenced_event(1, Some(6), &stop());
+    reg.apply_sequenced_event(1, Some(7), &notification(IDLE_PROMPT));
+    let parked = reg.get(1).unwrap();
+    assert_eq!(parked.activity, WorkerActivity::WaitingForInput);
+    assert!(parked.activity.needs_human());
+}
+
+#[test]
+fn a_late_declaring_turn_post_tool_does_not_clear_overdue() {
+    let (reg, waits) = fixture();
+    reg.apply_sequenced_event(1, Some(1), &working());
+    waits.declare_after(1);
+    reg.apply_sequenced_event(1, Some(3), &stop());
+    waits.set(DeclaredWait::Lapsed);
+    reg.reconcile_declared_waits(now());
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+
+    let late = reg.apply_sequenced_event(1, Some(2), &post_tool());
+    assert!(matches!(late, ApplyEventOutcome::Stale { last_applied_seq: 3 }));
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+    reg.apply_sequenced_event(1, Some(4), &notification(IDLE_PROMPT));
+    assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitOverdue);
+    assert!(reg.reconcile_declared_waits(now()).is_empty());
 }
