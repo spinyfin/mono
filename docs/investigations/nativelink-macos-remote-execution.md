@@ -2,6 +2,7 @@
 
 - **Date:** 2026-09-17
 - **Status:** empirical companion and proposed next deployment; documentation only, no configuration enabled
+- **Since then:** the pool proposed here is deployed. Its configs, the clonefile fix carried forward to NativeLink 1.8.6 as a patch, and the runbook are in [`tools/remote-execution/`](../../tools/remote-execution/README.md). The setup steps below describe 1.6.6 and the fork branch and are kept as the record of the spike; do not follow them to set up a host.
 - **Provenance:** operator-supplied record of interactive coordinator spikes; original transcripts, profiles, and host logs were unavailable to this investigation
 - **Verification:** GitHub API and repository inspection on 2026-09-17, at mono `23d8281e`; no new remote build or host measurement
 - **Related designs:** [mono#2715](https://github.com/spinyfin/mono/pull/2715) and [mono#2718](https://github.com/spinyfin/mono/pull/2718), both open and unmerged when checked

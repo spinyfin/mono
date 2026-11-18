@@ -142,6 +142,21 @@ build:dev-remote-endpoint --remote_cache=
 build:dev-remote --disk_cache=~/.cache/bazelcache-remote
 # If the endpoint cannot be reached, build on this machine instead of failing.
 # A laptop is not always on the workers' network.
+#
+# The same fallback covers an action the executor gives up on. The scheduler
+# fails an action it cannot run or keep running (no worker connected, a worker
+# lost too often, too many retries) within minutes, and that action then runs
+# here. Measured: with every worker frozen, the action ran here two minutes
+# later.
+#
+# It does not cover an executor that stops answering part-way through a build.
+# Bazel 9.1 puts no deadline on an execution call: --remote_timeout applies to
+# cache calls only, and no flag in this version adds one. The build waits,
+# with no error, until the executor answers again or is restarted, and then
+# carries on by itself. To finish on this machine instead, interrupt it and
+# add --config=dev-local. A deadline needs Bazel 9.3 or later
+# (--remote_grpc_service_config). See tools/remote-execution/README.md, "What
+# bounds a stuck action".
 build:dev-remote --remote_local_fallback
 # Results of actions this machine ran itself (after a fallback, or because the
 # action cannot run remotely) stay on this machine and are not uploaded. The

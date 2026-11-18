@@ -1,0 +1,18 @@
+# One run of the hub's health check (hub-health.sh), started every minute by
+# nativelink-macos-hub-health.timer. The check prints one line and exits
+# non-zero while the hub is unhealthy, so this unit's state is the signal:
+#
+#   systemctl --user is-failed nativelink-macos-hub-health.service
+#   journalctl --user --unit nativelink-macos-hub-health.service --since -1h
+#
+# It only reports. It never restarts the hub: a hub that is running but not
+# scheduling is a fault to look at, and ../README.md, "Recovery", says how.
+[Unit]
+Description=Health check of the NativeLink hub for macOS remote execution
+
+[Service]
+Type=oneshot
+# The hub's own settings (the check reads NL_HUB_ADMIN_LISTEN) and the
+# check's: NL_HEALTH_EXPECTED_WORKERS, NL_HEALTH_ALERT_CMD.
+EnvironmentFile=%h/nativelink-macos-hub/hub.env
+ExecStart=%h/nativelink-macos-hub/hub-health.sh --journal-unit nativelink-macos-hub.service

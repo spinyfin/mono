@@ -1,0 +1,39 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# The remote-execution deployment: NativeLink configs, units and scripts for
+# the hub and the macOS workers. Nothing here is built by bazel or used by a
+# build; the files are installed on the hosts by hand (README.md). The tests
+# are what keeps them honest with each other and with what reads them.
+
+# The hub's health check against a stub hub: a scheduling hub is healthy, and
+# the eviction loop, missing workers, a queue that does not move and a hub that
+# does not answer are each reported.
+sh_test(
+    name = "hub_health_test",
+    size = "small",
+    srcs = ["tests/hub_health_test.sh"],
+    data = ["nativelink/hub-health.sh"],
+)
+
+# Pins what the files promise each other: every scheduler timeout and the
+# arithmetic between the hub's and the workers', the variables the configs
+# expand against the units that set them, the pinned NativeLink version across
+# the build script, the patch and the runbook, and that no address is written
+# into any of them.
+sh_test(
+    name = "config_test",
+    size = "small",
+    srcs = ["tests/config_test.sh"],
+    data = [
+        "README.md",
+        "nativelink/build-worker.sh",
+        "nativelink/com.brianduff.nativelink.plist",
+        "nativelink/hub.json5",
+        "nativelink/hub-health.sh",
+        "nativelink/nativelink-macos-hub.service",
+        "nativelink/nativelink-macos-hub-health.service",
+        "nativelink/nativelink-macos-hub-health.timer",
+        "nativelink/patches/macos-clonefile-executables.patch",
+        "nativelink/worker-macos.json5",
+    ],
+)

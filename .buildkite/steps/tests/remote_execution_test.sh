@@ -3,9 +3,9 @@
 # Tests for .buildkite/steps/remote-execution.sh, the library ci-env.sh uses to
 # decide whether a step's bazel actions execute on remote workers.
 #
-# `nc` is stubbed with a shell function: the hermetic test sandbox has no
-# network and its PATH does not carry nc, and a stub is also what lets the test
-# make the endpoint answer or not and see how it was probed.
+# `nc` and `curl` are stubbed with shell functions: the hermetic test sandbox
+# has no network and its PATH does not carry them, and a stub is also what
+# lets the test make the endpoint answer or not and see how it was probed.
 
 set -euo pipefail
 
@@ -88,6 +88,16 @@ nc() {
   return "$nc_status"
 }
 
+# The status request. curl_http is the HTTP status the endpoint answers with;
+# 000 is what curl prints, with a failing exit status, when nothing answered.
+curl_calls="${TEST_TMPDIR:?}/curl-calls"
+curl_http=200
+curl() {
+  printf '%s\n' "$*" >> "$curl_calls"
+  printf '%s' "$curl_http"
+  [[ "$curl_http" != "000" ]]
+}
+
 # decide <os_type> <allowed> <endpoint> <nc_status> [<arch>]: runs the decision
 # in this shell (it reports through globals) with a clean slate and the given
 # inputs. <arch> defaults to the architecture of each platform's agents.
@@ -100,6 +110,7 @@ decide() {
     esac
   fi
   : > "$nc_calls"
+  : > "$curl_calls"
   nc_status="$4"
   CI_REMOTE_EXECUTION_ALLOWED="$2"
   CI_BAZEL_REMOTE_EXECUTOR="$3"
@@ -127,6 +138,7 @@ expect_local() {
 decide darwin 0 "$endpoint" 0 || fail "not opted in: decide failed"
 expect_local "not opted in" 0
 expect_equal "" "$(cat "$nc_calls")" "not opted in: endpoint probed"
+expect_equal "" "$(cat "$curl_calls")" "not opted in: status requested"
 
 unset CI_REMOTE_EXECUTION_ALLOWED
 : > "$nc_calls"
@@ -170,11 +182,68 @@ expect_equal \
   "$CI_REMOTE_BAZEL_FLAGS" "remote: CI_REMOTE_BAZEL_FLAGS"
 expect_equal "--remote_download_minimal" "$CI_BAZEL_VERIFY_ONLY_FLAGS" "remote: CI_BAZEL_VERIFY_ONLY_FLAGS"
 expect_equal "-z -G ${CI_REMOTE_PROBE_TIMEOUT_SECS} executor.test 50051" "$(cat "$nc_calls")" "remote: probe command"
+expect_equal \
+  "--silent --output /dev/null --max-time ${CI_REMOTE_STATUS_TIMEOUT_SECS} --write-out %{http_code} http://executor.test:50051/status" \
+  "$(cat "$curl_calls")" "remote: status request"
 
 # The endpoint does not answer: the step builds on the agent, and says that it
-# was meant to execute remotely.
+# was meant to execute remotely. Nothing is asked of an endpoint that did not
+# even accept a connection.
 decide darwin 1 "$endpoint" 1 || fail "unreachable: decide failed"
 expect_local "unreachable" 1
+expect_equal "" "$(cat "$curl_calls")" "unreachable: status requested"
+
+# The endpoint accepts a connection and then says nothing. That is a process
+# that has stopped answering, and a bazel command sent to it would wait without
+# a limit, so the step builds on the agent.
+curl_http=000
+decide darwin 1 "$endpoint" 0 || fail "silent: decide failed"
+expect_local "silent" 1
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"did not answer a status request"* ]]; then
+  fail "silent: the reason does not say what was not answered: ${CI_REMOTE_EXECUTION_REASON}"
+fi
+decide linux 1 "$endpoint" 0 || fail "linux silent: decide failed"
+expect_local "linux silent" 1
+
+# The endpoint answers that a store has failed or stalled.
+curl_http=503
+decide darwin 1 "$endpoint" 0 || fail "unhealthy: decide failed"
+expect_local "unhealthy" 1
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"503"* ]]; then
+  fail "unhealthy: the reason does not name the answer: ${CI_REMOTE_EXECUTION_REASON}"
+fi
+
+# An endpoint that answers but serves no status page on this port (an executor
+# set up before the page was put there) is used as before: an answer of any
+# other kind proves the process is serving, and nothing more can be asked.
+curl_http=404
+decide darwin 1 "$endpoint" 0 || fail "no status page: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "no status page: CI_REMOTE_EXECUTION"
+expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "no status page: CI_REMOTE_EXECUTION_FELL_BACK"
+
+# So is any endpoint on an agent that has no curl: the connection is then all
+# there is to go on, as it was before the status request existed.
+command() {
+  if [[ "$1" == "-v" && "$2" == "curl" ]]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+curl_http=000
+decide darwin 1 "$endpoint" 0 || fail "no curl: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "no curl: CI_REMOTE_EXECUTION"
+expect_equal "" "$(cat "$curl_calls")" "no curl: curl was run"
+unset -f command
+curl_http=200
+
+# The URL of the status request: https for a TLS endpoint, and an IPv6 literal
+# bracketed again (it is bare for nc).
+: > "$curl_calls"
+expect_equal "200" "$(ci_remote_endpoint_status "grpcs://executor.test:443" "executor.test" 443)" "status of a TLS endpoint"
+expect_equal "200" "$(ci_remote_endpoint_status "grpc://[::1]:50051" "::1" 50051)" "status of an IPv6 endpoint"
+expect_equal \
+  "https://executor.test:443/status http://[::1]:50051/status" \
+  "$(awk '{ print $NF }' "$curl_calls" | tr '\n' ' ' | sed 's/ $//')" "status request URLs"
 
 # A Linux x86-64 agent: the Linux config, and the probe uses the connect
 # timeout flag of the Linux nc. Everything else is the same decision.
@@ -206,6 +275,50 @@ if decide darwin 1 "executor.test:50051" 0; then
 fi
 expect_equal "off" "$CI_REMOTE_EXECUTION" "malformed endpoint: CI_REMOTE_EXECUTION"
 expect_equal "" "$CI_REMOTE_BAZEL_FLAGS" "malformed endpoint: CI_REMOTE_BAZEL_FLAGS"
+
+# ---------------------------------------------------------------------------
+# ci_remote_failure_reason: telling an executor that failed from an action
+# that failed. The first and the last two of the five executor failures are
+# what Bazel 9.1.0 printed against NativeLink 1.8.6; the two between are
+# NativeLink 1.8.6's messages as its source formats them.
+# ---------------------------------------------------------------------------
+
+# expect_failure_reason <expected substring, or "" for none> <log text>
+expect_failure_reason() {
+  local log reason
+  log="$(mktemp "${TEST_TMPDIR:?}/bazel-log.XXXXXX")"
+  printf '%s\n' "$2" > "$log"
+  if reason="$(ci_remote_failure_reason "$log")"; then
+    if [[ -z "$1" ]]; then
+      fail "a log that shows no executor failure was given the reason '${reason}': $2"
+    elif [[ "$reason" != *"$1"* ]]; then
+      fail "expected a reason containing '$1', got '${reason}'"
+    fi
+  elif [[ -n "$1" ]]; then
+    fail "no reason for a log that shows an executor failure: $2"
+  fi
+}
+
+expect_failure_reason "no worker that could run an action" \
+  "ERROR: BUILD.bazel:10:8: Executing genrule //:slow failed: (Exit 34): Remote Execution Failure:
+Failed Precondition: Action cannot be scheduled, no worker is connected to the scheduler. No capable worker has been connected for 120s."
+expect_failure_reason "lost its worker" \
+  "Failed Precondition: The worker running this action was lost 7 times, more than max_worker_loss_retries (6); the action is likely what takes the worker down (OOM-killed pod, eviction). Give it a memory reservation or raise the pool's memory limit before retrying. for operation_id: 0eae26f4, maybe_worker_id: None"
+expect_failure_reason "retried an action until it gave up" \
+  "Failed Precondition: Job cancelled because it attempted to execute too many times 4 > 3 times for operation_id: 0eae26f4, maybe_worker_id: None"
+expect_failure_reason "connection to the remote executor failed" \
+  "ERROR: BUILD.bazel:10:8: Executing genrule //:slow failed: (Exit 34): UNAVAILABLE: io exception"
+expect_failure_reason "did not answer when the build started" \
+  "ERROR: BUILD.bazel:4:8: Executing genrule //:quick failed: Failed to query remote execution capabilities: DEADLINE_EXCEEDED: CallOptions deadline exceeded after 59.999937875s. Name resolution delay 0.000000000 seconds. [closed=[], open=[[buffered_nanos=60000624500, waiting_for_connection]]]"
+# An action that ran on a worker and failed, a test that failed, and a test
+# that timed out are the change's own business.
+expect_failure_reason "" \
+  "ERROR: BUILD.bazel:10:8: Compiling Rust rlib engine failed: (Exit 1): process_wrapper failed: error executing Rustc command"
+expect_failure_reason "" "//tools/boss/engine:engine_lib_test FAILED in 12.3s"
+expect_failure_reason "" "//tools/boss/engine:engine_lib_test TIMEOUT in 300.1s"
+if ci_remote_failure_reason "${TEST_TMPDIR}/no-such-log" > /dev/null; then
+  fail "a missing log was given a reason"
+fi
 
 # ---------------------------------------------------------------------------
 # The real .ci.bazelrc defines the config the flags select.

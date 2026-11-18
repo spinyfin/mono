@@ -114,6 +114,27 @@ if [[ "$OS_TYPE" == "darwin" ]]; then
   echo "$CURRENT_XCODE_VERSION" > "$XCODE_VERSION_FILE"
 fi
 
+# _ci_note_remote_failure <log of a failed bazel command>
+#
+# On a step that executes remotely, a bazel command can fail because the
+# remote executor failed it: no worker to run an action, an action that lost
+# its worker as often as the scheduler allows, a connection that broke. Such a
+# failure says nothing about the change, and in the log it is one line among
+# thousands. ci_remote_failure_reason (remote-execution.sh) recognises it; this
+# puts it on the build page. The step still fails: ci-remote forbids a local
+# fallback inside a step, and that does not change here.
+_ci_note_remote_failure() {
+  local reason
+  [[ "$CI_REMOTE_EXECUTION" == "on" ]] || return 0
+  reason="$(ci_remote_failure_reason "$1")" || return 0
+  echo "^^^ +++"
+  echo "[ci-env] this command failed because remote execution failed: ${reason}. See tools/remote-execution/README.md, \"Recovery\"."
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    buildkite-agent annotate --style error --context "ci-remote-execution-failed-${BUILDKITE_JOB_ID:-step}" \
+      "${BUILDKITE_LABEL:-A step} failed because remote execution failed, not because an action ran and failed: ${reason}. \`tools/remote-execution/README.md\`, \"Recovery\", says how to tell whether the executor is healthy again; retry the step once it is." || true
+  fi
+}
+
 # Wrap bazel and pass in ci configuration (CI_BAZEL_FLAGS, above).
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
 # cache after an Xcode upgrade) and recovers by running `bazel clean --expunge`
@@ -147,6 +168,7 @@ bazel() {
     return $?
   fi
 
+  _ci_note_remote_failure "$tmplog"
   rm -f "$tmplog"
   return 1
 }

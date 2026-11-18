@@ -31,10 +31,19 @@
 #      CI files, so an endpoint written there would have to be rebased into
 #      each of them when it moved, and removing the variable from an agent is
 #      the way to take that agent back to local builds without a merge.
-#   4. The endpoint accepts a TCP connection. With the scheduler down the step
-#      builds on the agent rather than failing, and says so. The fallback is
-#      decided once, here, for the whole step, so a step never mixes worker
-#      results with agent results silently.
+#   4. The endpoint accepts a TCP connection and, asked for its status page,
+#      answers. With the scheduler down or not answering the step builds on
+#      the agent rather than failing, and says so. The fallback is decided
+#      once, here, for the whole step, so a step never mixes worker results
+#      with agent results silently.
+#
+#      The second half is there because a connection proves little. The
+#      kernel accepts one for a process that has stopped answering, and a
+#      Bazel 9.1 client that sends its build to such a process waits without a
+#      limit: it puts no deadline on an execution call (measured: still
+#      waiting 17 minutes after the executor froze). A step that would have
+#      hung at its first bazel command builds on its agent instead. See
+#      tools/remote-execution/README.md, "What bounds a stuck action".
 #
 # What "remotely" covers differs by platform, and .ci.bazelrc has the config
 # for each:
@@ -54,6 +63,12 @@
 
 # How long the TCP probe waits for the endpoint.
 CI_REMOTE_PROBE_TIMEOUT_SECS=5
+
+# How long the endpoint gets to answer the status request. A healthy one
+# answers in milliseconds. One whose store has stalled gives up on its own
+# check after 5 s and answers 503, so this is long enough to be told that and
+# not merely time out.
+CI_REMOTE_STATUS_TIMEOUT_SECS=10
 
 _ci_remote_err() {
   echo "[ci-env] error: $*" >&2
@@ -99,6 +114,65 @@ ci_remote_endpoint_reachable() {
   nc -z "$timeout_flag" "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$2" "$3" > /dev/null 2>&1
 }
 
+# ci_remote_endpoint_status <endpoint> <host> <port>
+#
+# Asks the endpoint for its status page over HTTP, on the port Bazel uses,
+# and prints the HTTP status: 200 for an executor that is answering and whose
+# stores work, 503 for one that reports a failed or stalled store, and 000
+# for one that sent no answer within CI_REMOTE_STATUS_TIMEOUT_SECS. Any other
+# status means the endpoint answers but serves no status page on this port,
+# which is all that can be learned from it. An agent without curl prints
+# "unknown". Nothing is echoed: the endpoint is host configuration.
+ci_remote_endpoint_status() {
+  local scheme="http" host="$2" code
+  if [[ "$1" == grpcs://* ]]; then
+    scheme="https"
+  fi
+  # An IPv6 literal is bare for nc and bracketed in a URL.
+  if [[ "$host" == *:* ]]; then
+    host="[${host}]"
+  fi
+  if ! command -v curl > /dev/null 2>&1; then
+    echo unknown
+    return 0
+  fi
+  code="$(curl --silent --output /dev/null --max-time "$CI_REMOTE_STATUS_TIMEOUT_SECS" \
+    --write-out '%{http_code}' "${scheme}://${host}:$3/status" 2> /dev/null)" || true
+  echo "${code:-000}"
+}
+
+# ci_remote_failure_reason <bazel log file>
+#
+# Succeeds and prints one line if the log of a failed bazel command shows that
+# the remote executor failed the build, as opposed to an action that ran and
+# failed. These are the errors a build ends with when the executor cannot do
+# its job, and none of them says anything about the change under test:
+#
+#   - the scheduler had no worker to give an action to, or none that could
+#     run it (no_worker_action_timeout_s, unsatisfiable_action_timeout_s);
+#   - an action lost its worker, or was retried, as often as the scheduler
+#     allows (max_worker_loss_retries, max_job_retries);
+#   - the connection to the executor failed and stayed failed, or the
+#     executor never answered the build's first question to it.
+#
+# tools/remote-execution/README.md, "Timeouts", lists what produces each.
+ci_remote_failure_reason() {
+  local log="$1"
+  if grep -q "Action cannot be scheduled" "$log" 2> /dev/null; then
+    echo "the remote executor had no worker that could run an action"
+  elif grep -q "The worker running this action was lost" "$log" 2> /dev/null; then
+    echo "an action lost its worker as many times as the scheduler allows"
+  elif grep -q "attempted to execute too many times" "$log" 2> /dev/null; then
+    echo "the scheduler retried an action until it gave up"
+  elif grep -q "(Exit 34): UNAVAILABLE" "$log" 2> /dev/null; then
+    echo "the connection to the remote executor failed"
+  elif grep -q "Failed to query remote execution capabilities" "$log" 2> /dev/null; then
+    echo "the remote executor did not answer when the build started"
+  else
+    return 1
+  fi
+}
+
 # ci_remote_execution_decide <os_type> <arch>
 #
 # <os_type> is `uname -s` in lower case and <arch> is `uname -m`. Applies the
@@ -109,7 +183,8 @@ ci_remote_endpoint_reachable() {
 #   CI_REMOTE_EXECUTION            "on" or "off".
 #   CI_REMOTE_EXECUTION_REASON     One line for the step's log.
 #   CI_REMOTE_EXECUTION_FELL_BACK  1 when the step was meant to execute
-#                                  remotely and the endpoint did not answer.
+#                                  remotely and the endpoint did not answer,
+#                                  or answered that it is unhealthy.
 #   CI_REMOTE_BAZEL_FLAGS          Flags to append to CI_BAZEL_FLAGS; empty
 #                                  when off.
 #   CI_BAZEL_VERIFY_ONLY_FLAGS     Extra flags for a build or test command that
@@ -119,7 +194,7 @@ ci_remote_endpoint_reachable() {
 #
 # Returns non-zero only for a malformed endpoint.
 ci_remote_execution_decide() {
-  local os_type="$1" arch="${2:-}" endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port config scope
+  local os_type="$1" arch="${2:-}" endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port config scope http_status
   CI_REMOTE_EXECUTION=off
   CI_REMOTE_EXECUTION_REASON=""
   CI_REMOTE_EXECUTION_FELL_BACK=0
@@ -154,6 +229,19 @@ ci_remote_execution_decide() {
     CI_REMOTE_EXECUTION_REASON="the remote executor did not accept a connection within ${CI_REMOTE_PROBE_TIMEOUT_SECS}s, so this step builds on the agent"
     return 0
   fi
+  http_status="$(ci_remote_endpoint_status "$endpoint" "${host_port% *}" "${host_port##* }")"
+  case "$http_status" in
+    000)
+      CI_REMOTE_EXECUTION_FELL_BACK=1
+      CI_REMOTE_EXECUTION_REASON="the remote executor accepted a connection but did not answer a status request within ${CI_REMOTE_STATUS_TIMEOUT_SECS}s, so this step builds on the agent"
+      return 0
+      ;;
+    503)
+      CI_REMOTE_EXECUTION_FELL_BACK=1
+      CI_REMOTE_EXECUTION_REASON="the remote executor reports a failed or stalled store (its status page answers 503), so this step builds on the agent"
+      return 0
+      ;;
+  esac
 
   CI_REMOTE_EXECUTION=on
   CI_REMOTE_EXECUTION_REASON="$scope"

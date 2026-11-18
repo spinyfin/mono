@@ -3,11 +3,25 @@
 # Override queues when testing agents:
 #   BUILDKITE_ANY_QUEUE=agent-test
 #   BUILDKITE_MACOS_QUEUE=macos-test
+#
+# timeout_in_minutes on the three verification steps is the last bound on a
+# step that has stopped making progress, not a performance budget. Bazel 9.1
+# puts no deadline on a remote execution call, so a remote executor that stops
+# answering part-way through a step leaves its bazel command waiting for ever,
+# and nothing in a bazelrc can change that (tools/remote-execution/README.md,
+# "What bounds a stuck action"). On 2026-11-18 such steps sat for 52 to 75
+# minutes, until the executor was restarted. The values are about four times the
+# slowest passing run of each step among 1,800 builds sampled between
+# 2026-09-18 and 2026-11-18 (bazel-build-test 16 min, mac-app-build 15 min,
+# checks 8 min), so a cold cache does not reach them. boss-release has none:
+# by the time it builds, the tag is pushed and the draft exists, and a run
+# that is killed there leaves the release waiting for a manual one.
 
 steps:
   - label: ":bazel: bazel-build-test"
     key: "bazel-build-test"
     command: ".buildkite/steps/bazel-build-test.sh"
+    timeout_in_minutes: 60
     artifact_paths:
       - "bazel-out/**/extra_action_outputs/**/*"
       - "bazel-testlogs/**/test.log"
@@ -21,6 +35,7 @@ steps:
   - label: ":apple: mac-app-build"
     key: "mac-app-build"
     command: ".buildkite/steps/mac-app-build.sh"
+    timeout_in_minutes: 60
     agents:
       queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
     notify:
@@ -30,6 +45,7 @@ steps:
   - label: ":white_check_mark: checks"
     key: "checks"
     command: ".buildkite/steps/checks.sh"
+    timeout_in_minutes: 30
     agents:
       queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:

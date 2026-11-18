@@ -1,0 +1,15 @@
+# Runs the hub's health check once a minute. A minute is the resolution the
+# signal needs: the limits the check applies are counted over ten.
+[Unit]
+Description=Health check of the NativeLink hub for macOS remote execution, every minute
+
+[Timer]
+# Not straight after boot: the workers need about a minute to reconnect to a
+# hub that has just started, and until they have, "no worker is connected" is
+# true and uninteresting.
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
