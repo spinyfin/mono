@@ -112,6 +112,7 @@ extension ChatViewModel {
             // `.loading` for the rest of the session, so fail it with a
             // retry that re-opens the pending guide.
             failLoadingReviewGuideViewer(message: "Connection lost while loading this guide.")
+            navigatorReviewGuides.disconnect()
             // Same reasoning for a drag-to-Doing admission check in
             // flight: the socket drop means no `dispatch_admission_evaluated`
             // reply is ever coming, so nothing else would clear
@@ -219,6 +220,7 @@ extension ChatViewModel {
         case .boardReadFailed(let requestId):
             failBoardRead(requestID: requestId)
         case .workError(let message, let requestId):
+            if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
             failBoardRead(requestID: requestId)
             if settleOffsiteBackupError(message, requestID: requestId) { return }
             // An error carrying the answer's own request id is not ambiguous:
@@ -336,6 +338,7 @@ extension ChatViewModel {
             if settleArchiveWorkError(message: message, requestId: requestId) { return }
             handle(.error(message: message))
         case .error(let message, let requestId):
+            if navigatorReviewGuides.fail(message: message, requestID: requestId) { return }
             failBoardRead(requestID: requestId)
             if let requestId,
                let pending = pendingDragAdmissionChecks.values.first(where: { $0.requestID == requestId }),
@@ -444,8 +447,11 @@ extension ChatViewModel {
             } else {
                 reviewGuideFindingsBySeriesID.removeValue(forKey: seriesId)
             }
-        case .reviewGuideContent(let versionId, let content):
-            applyReviewGuideContent(versionId: versionId, content: content)
+        case .reviewGuideContent(let versionId, let content, let requestId):
+            navigatorReviewGuides.receive(versionID: versionId, content: content, requestID: requestId)
+            if let requestId, requestId == pendingReviewGuideRequestId {
+                applyReviewGuideContent(versionId: versionId, content: content, requestId: requestId)
+            }
         case .reviewGuideRetryQueued(let rootTaskId, _, _):
             applyReviewGuideRetryQueued(rootTaskId: rootTaskId)
         case .conflictResolutionsList(let attempts):
@@ -881,6 +887,7 @@ extension ChatViewModel {
         if !pendingMoveOriginByTaskID.isEmpty { return true }
         if !pendingDragAdmissionChecks.isEmpty { return true }
         if engineAttemptDetailRequestID != nil { return true }
+        if navigatorReviewGuides.readers.values.contains(where: { $0.requestID != nil }) { return true }
         // `pendingReviewGuideVersionId` is retained after a successful load
         // (it is the displayed version), so pair it with `.loading`.
         if pendingReviewGuideVersionId != nil, case .loading = asyncMarkdownViewerVM.state {

@@ -7,6 +7,13 @@ struct NavigatorDetailContext {
     let root: WorkTask
     let ask: WorkTask?
     let isReadOnly: Bool
+
+    /// Inline guide comments are read-only only for durable conditions. A
+    /// connection blip must not close an in-progress composer; offline comments
+    /// ride the engine's outbound retry ledger, as in the standalone reader.
+    @MainActor var isCommentsReadOnly: Bool {
+        root.deletedAt != nil || root.status == "archived" || model.task(withID: root.id) == nil
+    }
 }
 
 struct NavigatorDetailRegistry {
@@ -99,7 +106,7 @@ struct WorkNavigatorDetail: View {
         let ask = model.navigator.askID.flatMap { model.task(withID: $0) }
         let context = NavigatorDetailContext(model: model, root: root, ask: ask, isReadOnly: readOnly)
         if let body = registry.bodies[slot] {
-            body(context).disabled(readOnly)
+            body(context).disabled(readOnly && slot != .review && slot != .history)
         } else {
             NavigatorFallbackDetail(slot: slot, context: context)
         }

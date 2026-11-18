@@ -8,6 +8,7 @@ import Textual
 /// to its anchored text (flashes the highlighted span orange for ~900 ms).
 /// Dismiss button is at the top-right of each card.
 struct CommentSidebar: View {
+    @Environment(\.commentsReadOnly) private var readOnly
     @ObservedObject var layer: CommentLayer
     /// Collapses the sidebar back to the rail. `nil` hides the collapse control
     /// (e.g. hosting tests that render the sidebar in isolation).
@@ -100,6 +101,7 @@ struct CommentSidebar: View {
                     .toggleStyle(.checkbox)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("comment-show-resolved")
             }
         }
         .padding(.horizontal, 12)
@@ -115,12 +117,14 @@ struct CommentSidebar: View {
                     .font(.callout)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .accessibilityIdentifier("comment-sidebar-add")
             if layer.guideDraft != nil {
                 Button("Resume draft") { layer.resumeGuideDraft() }
                     .font(.callout)
             }
         }
         .buttonStyle(.borderless)
+        .disabled(readOnly)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
@@ -131,6 +135,7 @@ struct CommentSidebar: View {
 /// there's something to revise or something already revising — design §
 /// "Buckets 1 & 3 — unified" / "2d. Banner state on the comment read path".
 private struct ReviseBanner: View {
+    @Environment(\.commentsReadOnly) private var readOnly
     @ObservedObject var layer: CommentLayer
 
     var body: some View {
@@ -147,6 +152,8 @@ private struct ReviseBanner: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
+                    .disabled(readOnly)
+                    .accessibilityIdentifier("comment-revise")
                     .help(layer.guideVersionId == nil
                           ? "Address these comments on the document"
                           : "Changes the PR implementation and tests")
@@ -310,6 +317,7 @@ private struct AnswerFailedIndicatorView: View {
 /// The reply box under an `answered` bucket-2 thread — the UI half of the
 /// engine's `CommentsPostFollowup` RPC (design § "Follow-up loop").
 private struct FollowupComposer: View {
+    @Environment(\.commentsReadOnly) private var readOnly
     let comment: Comment
     @ObservedObject var layer: CommentLayer
     @State private var text: String = ""
@@ -320,12 +328,14 @@ private struct FollowupComposer: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .onSubmit(send)
+                .accessibilityIdentifier("comment-reply")
             Button(action: send) {
                 Image(systemName: "arrow.up.circle.fill")
             }
             .buttonStyle(.plain)
-            .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(readOnly || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+        .disabled(readOnly)
     }
 
     private func send() {
@@ -352,6 +362,7 @@ private struct FollowupClassifyingIndicator: View {
 /// Always clickable — opens a menu the operator uses to manually (re)classify
 /// the comment, mirroring the engine's `CommentsSetIntent` override RPC.
 private struct IntentBadge: View {
+    @Environment(\.commentsReadOnly) private var readOnly
     let comment: Comment
     @ObservedObject var layer: CommentLayer
 
@@ -373,6 +384,8 @@ private struct IntentBadge: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+        .disabled(readOnly)
+        .accessibilityIdentifier("comment-intent")
         .help(comment.intentOverriddenByUser
             ? "Manually classified as \(comment.intent?.displayName ?? "?") — click to reclassify"
             : "Click to classify this comment")
@@ -453,6 +466,7 @@ private struct CommentAgeChip: View {
 }
 
 private struct CommentRow: View {
+    @Environment(\.commentsReadOnly) private var readOnly
     let comment: Comment
     @ObservedObject var layer: CommentLayer
 
@@ -599,7 +613,9 @@ private struct CommentRow: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
+                .disabled(readOnly)
                 .help("Dismiss comment")
+                .accessibilityIdentifier("comment-dismiss")
             }
             .padding(.top, 8)
             .padding(.trailing, 8)

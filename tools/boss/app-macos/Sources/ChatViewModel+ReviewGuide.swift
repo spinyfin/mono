@@ -42,6 +42,19 @@ extension ChatViewModel {
         asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
         asyncMarkdownViewerOpener?()
         pendingReviewGuideRequestId = engine.sendGetReviewGuideContent(versionID: versionId)
+        if pendingReviewGuideRequestId == nil {
+            asyncMarkdownViewerVM.state = .failed(title: "Review guide", message: "Guide request could not be sent. Reconnect and retry.")
+            asyncMarkdownViewerVM.canRetry = true
+            asyncMarkdownViewerVM.onRetry = { [weak self] in
+                self?.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+            }
+        }
+    }
+
+    func loadNavigatorReviewGuide(for root: WorkTask, versionID: String? = nil, refresh: Bool = false) {
+        navigatorReviewGuides.load(root: root, versionID: versionID, refresh: refresh) {
+            engine.sendGetReviewGuideContent(versionID: $0)
+        }
     }
 
     /// Window title for a review guide, shared by the loading and loaded
@@ -58,8 +71,9 @@ extension ChatViewModel {
     /// `nil` content for the CURRENTLY pending version counts as a real
     /// failure worth showing.
     @MainActor
-    func applyReviewGuideContent(versionId: String, content: ReviewGuideVersionContent?) {
-        guard pendingReviewGuideVersionId == versionId else { return }
+    func applyReviewGuideContent(versionId: String, content: ReviewGuideVersionContent?, requestId: String? = nil) {
+        guard pendingReviewGuideVersionId == versionId,
+              requestId == nil || pendingReviewGuideRequestId == requestId else { return }
         pendingReviewGuideRequestId = nil
         guard let content else {
             asyncMarkdownViewerVM.state = .failed(

@@ -1133,7 +1133,7 @@ final class EngineClient: @unchecked Sendable {
                 else { return nil }
                 return try? JSONDecoder().decode(ReviewGuideVersionContent.self, from: contentData)
             }()
-            emit(.reviewGuideContent(versionId: versionId, content: content))
+            emit(.reviewGuideContent(versionId: versionId, content: content, requestId: envelopeRequestId))
         case "review_guide_retry_queued":
             guard let rootTaskId = payload["root_task_id"] as? String,
                   let attemptPayload = payload["attempt"] as? [String: Any],

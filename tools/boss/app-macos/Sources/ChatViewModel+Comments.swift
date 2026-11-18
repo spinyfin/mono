@@ -75,6 +75,7 @@ final class CommentEngineBridge: CommentBackend {
         let artifactId: String
     }
     private var registrations: [ObjectIdentifier: Registration] = [:]
+    var registeredLayersForTesting: [CommentLayer] { registrations.values.compactMap(\.layer) }
 
     /// FIFO queue of artifacts with an in-flight `comments_revise_doc` call.
     /// `CommentsReviseDocResult` carries no artifact identity on the wire

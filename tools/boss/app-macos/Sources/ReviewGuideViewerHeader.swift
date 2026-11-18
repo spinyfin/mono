@@ -28,11 +28,17 @@ struct ReviewGuideViewerHeader: View {
         chatModel: ChatViewModel,
         rootTaskId: String,
         generatedAt: String?,
-        findingsInitiallyExpanded: Bool = true
+        findingsInitiallyExpanded: Bool = true,
+        inlineGuide: InlineReviewGuideHeader? = nil,
+        isReadOnly: Bool = false,
+        isActive: Bool = true
     ) {
         self.chatModel = chatModel
         self.rootTaskId = rootTaskId
         self.generatedAt = generatedAt
+        self.inlineGuide = inlineGuide
+        self.isReadOnly = isReadOnly
+        self.isActive = isActive
         self.drafts = chatModel.commentBridge.draftStore
         _findingsExpanded = State(initialValue: findingsInitiallyExpanded)
     }
@@ -41,6 +47,34 @@ struct ReviewGuideViewerHeader: View {
     /// The open version's generation timestamp (RFC 3339), or `nil` while
     /// still loading.
     let generatedAt: String?
+    let inlineGuide: InlineReviewGuideHeader?
+    let isActive: Bool
+    let isReadOnly: Bool
+
+    var actionsDisabled: Bool { isReadOnly || !chatModel.isConnected }
+
+    static func showsMergeControl(_ task: WorkTask) -> Bool {
+        task.isMergeWhenReadyEligible && task.navigator?.root?.mergeEvidence == nil
+    }
+
+    static func sourceLabels(comparisonID: String, selectedID: String?) -> [String] {
+        var labels = ["Source comparison: \(comparisonID)"]
+        if let selectedID, selectedID != comparisonID {
+            labels.append("This guide covers an older source revision.")
+        }
+        return labels
+    }
+
+    private var artifact: CommentArtifactRef? {
+        if let inlineGuide { return inlineGuide.artifact }
+        if case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state { return artifact }
+        return nil
+    }
+
+    private func openVersion(_ versionID: String) {
+        if let inlineGuide { inlineGuide.openVersion(versionID) }
+        else { chatModel.openReviewGuide(versionId: versionID, rootTaskId: rootTaskId) }
+    }
 
     var body: some View {
         if let task = chatModel.task(withID: rootTaskId) {
@@ -50,10 +84,11 @@ struct ReviewGuideViewerHeader: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
-                    if task.isMergeWhenReadyEligible {
+                    if Self.showsMergeControl(task) {
                         MergeWhenReadyControl(isRequesting: chatModel.mergingWhenReadyIDs.contains(task.id), onConfirm: {
-                            chatModel.mergeWhenReady(for: task, origin: .reviewGuideViewer)
+                            chatModel.mergeWhenReady(for: task, origin: inlineGuide == nil ? .reviewGuideViewer : .board)
                         })
+                        .disabled(actionsDisabled)
                     }
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -72,14 +107,14 @@ struct ReviewGuideViewerHeader: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                if case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state {
+                if let artifact {
                     ForEach(drafts.byVersion.keys.sorted(), id: \.self) { versionId in
-                        if versionId != artifact?.guideVersionId {
-                            ForEach(drafts.drafts(for: versionId).filter { $0.seriesId == artifact?.id }, id: \.composerId) { draft in
+                        if versionId != artifact.guideVersionId {
+                            ForEach(drafts.drafts(for: versionId).filter { $0.seriesId == artifact.id }, id: \.composerId) { draft in
                                 Button("Resume draft: " + String(draft.body.prefix(32))) {
                                     drafts.pendingResumeVersionId = versionId
                                     drafts.pendingResumeComposerId = draft.composerId
-                                    chatModel.openReviewGuide(versionId: versionId, rootTaskId: rootTaskId)
+                                    openVersion(versionId)
                                 }
                                 .controlSize(.small)
                             }
@@ -125,11 +160,11 @@ struct ReviewGuideViewerHeader: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(Color.secondary.opacity(0.06))
-            .task(id: "\(rootTaskId)|\(displayedSeriesId ?? "")") {
+            .task(id: "\(rootTaskId)|\(displayedSeriesId ?? "")|\(isActive)") {
                 // Skip until the guide on screen has a series id, then
                 // re-poll immediately when that series changes (same root,
                 // replacement PR, or the artifact id arriving after load).
-                guard let seriesId = displayedSeriesId else { return }
+                guard isActive, let seriesId = displayedSeriesId else { return }
                 while !Task.isCancelled {
                     chatModel.engine.sendGetReviewGuideSummary(rootTaskId: rootTaskId, seriesId: seriesId)
                     do { try await Task.sleep(for: .seconds(5)) }
@@ -146,9 +181,7 @@ struct ReviewGuideViewerHeader: View {
     /// scope to this, not to `rootTaskId` alone, so a replacement PR on the
     /// same root cannot swap findings under a still-open older guide.
     private var displayedSeriesId: String? {
-        guard case .loaded(_, _, let artifact) = chatModel.asyncMarkdownViewerVM.state,
-              artifact?.kind == WireArtifactKind.reviewGuide
-        else { return nil }
+        guard artifact?.kind == WireArtifactKind.reviewGuide else { return nil }
         return artifact?.id
     }
 
@@ -195,16 +228,27 @@ struct ReviewGuideViewerHeader: View {
             lifecycle: task.reviewGuideLifecycle,
             readableVersionId: task.reviewGuideReadableVersionId,
             selectedComparisonId: task.reviewGuideSelectedComparisonId,
-            displayedVersionId: chatModel.pendingReviewGuideVersionId,
-            displayedComparisonId: chatModel.asyncMarkdownViewerVM.reviewGuideComparisonId,
+            displayedVersionId: inlineGuide != nil ? inlineGuide?.versionID : chatModel.pendingReviewGuideVersionId,
+            displayedComparisonId: inlineGuide != nil ? inlineGuide?.comparisonID : chatModel.asyncMarkdownViewerVM.reviewGuideComparisonId,
             error: task.reviewGuideError
         )
+        let comparisonID = inlineGuide != nil ? inlineGuide?.comparisonID : chatModel.asyncMarkdownViewerVM.reviewGuideComparisonId
+        if let comparisonID {
+            Text(Self.sourceLabels(comparisonID: comparisonID, selectedID: task.reviewGuideSelectedComparisonId)[0])
+                .font(.caption2.monospaced()).textSelection(.enabled)
+            if let stale = Self.sourceLabels(comparisonID: comparisonID, selectedID: task.reviewGuideSelectedComparisonId).dropFirst().first {
+                Label(stale, systemImage: "clock")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
         if currentness.showsOpenUpdatedGuide {
             HStack(spacing: 8) {
                 Text("A newer explanation is available.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("Open updated guide") { chatModel.openReviewGuide(for: task) }
+                Button("Open updated guide") {
+                    if let versionID = task.reviewGuideReadableVersionId { openVersion(versionID) }
+                }
                     .controlSize(.small)
             }
         }
@@ -250,6 +294,7 @@ struct ReviewGuideViewerHeader: View {
             }
             Button("Retry") { chatModel.retryReviewGuide(for: task) }
                 .controlSize(.small)
+                .disabled(actionsDisabled || chatModel.retryingReviewGuideRootTaskIDs.contains(task.id))
         }
         .help(error ?? headline)
     }
@@ -286,4 +331,12 @@ struct ReviewGuideFindingsAddendumList: View {
         }
         .frame(maxHeight: min(contentHeight ?? 0, Self.maxHeight))
     }
+}
+
+/// Display identity and navigation belong to the reader that owns this header.
+struct InlineReviewGuideHeader {
+    let versionID: String?
+    let comparisonID: String?
+    let artifact: CommentArtifactRef?
+    let openVersion: (String) -> Void
 }
