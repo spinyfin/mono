@@ -1,0 +1,24 @@
+{
+  "comparison": {
+    "id": "mono-2860",
+    "pr_url": "https://github.com/spinyfin/mono/pull/2860",
+    "base_tip_sha": "97db22f5bb3fcb02dc105cf6973cc57de3810104",
+    "merge_base_sha": "91567c86a7195ee78f3e340fbcf6c5bccc5ebedc",
+    "head_sha": "725bd759480d416ffffcd39c32ab5fa99d3acc97"
+  },
+  "packet_sha256": "e90f6b03f0609c00f917eb90303d232749b6f24c3fcc5bd9fba786cd9121fc11",
+  "codex_version": "codex-cli 0.169.0",
+  "renderer_source_sha256": "b215b5ac96b2267a2f47df90994df2b99b06dcc27f7bce1f4110c20c05c55f8b",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "saved_sources_matching_pinned_objects": 42,
+  "checkout": "checkouts/mono-2860",
+  "git_dir": "pinned-repos/spinyfin-mono/.git",
+  "task_context": {
+    "source": "saved packet PR title and body",
+    "revisions": [],
+    "project": null,
+    "limitation": "Historical engine task and project records are unavailable; PR metadata is an explicit substitute."
+  },
+  "submission": "local stdout capture with production validation; no live engine binding"
+}

@@ -1,0 +1,10 @@
+{
+  "prompt_version": "review-guide-v12",
+  "prompt_template_sha256": "5d6b6acbad43304b90e405f48419ecbcf4edca2f0052280a570f9f27d92d972c",
+  "binary_sha256": "a6e52eebe8f2806b8ebd4e1d2729c80937946e34f7de90d90f1564ddd8cd2eff",
+  "prompt_equivalence": {
+    "verified_against_binary_sha256": "b6d622809ab721003e4c436a087ed12a93f6d228299a7302b687e9cb779b7eec",
+    "prompts_matched": 12,
+    "comparison": "byte equality after deterministic publication redaction"
+  }
+}

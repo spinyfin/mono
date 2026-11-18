@@ -1,3 +1,1 @@
 tools/boss/app-macos/.build-cache
-# Standalone evaluation checkouts are separate repositories, not mono packages.
-.codex/corpus-work

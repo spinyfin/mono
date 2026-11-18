@@ -1,0 +1,24 @@
+{
+  "comparison": {
+    "id": "flunge-1552",
+    "pr_url": "https://github.com/brianduff/flunge/pull/1552",
+    "base_tip_sha": "54e4e293dfe4e142bf8a63761f4f0348af205a0e",
+    "merge_base_sha": "54e4e293dfe4e142bf8a63761f4f0348af205a0e",
+    "head_sha": "7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1"
+  },
+  "packet_sha256": "5bc7bc42a9869ace53458a051c4f614dd7d4add38593a2cd5aaada3ad8a1f8f5",
+  "codex_version": "codex-cli 0.169.0",
+  "renderer_source_sha256": "b215b5ac96b2267a2f47df90994df2b99b06dcc27f7bce1f4110c20c05c55f8b",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "saved_sources_matching_pinned_objects": 6,
+  "checkout": "checkouts/flunge-1552",
+  "git_dir": "pinned-repos/brianduff-flunge/.git",
+  "task_context": {
+    "source": "saved packet PR title and body",
+    "revisions": [],
+    "project": null,
+    "limitation": "Historical engine task and project records are unavailable; PR metadata is an explicit substitute."
+  },
+  "submission": "local stdout capture with production validation; no live engine binding"
+}

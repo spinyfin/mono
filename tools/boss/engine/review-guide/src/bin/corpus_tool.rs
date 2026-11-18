@@ -1,44 +1,5 @@
-//! Reproducible, standalone invocation recipe for the six-PR review-guide
-//! validation sample (see the design's "Reproducible six-PR sample" and the
-//! "Validate the production prompt on the six saved comparisons" task at
-//! `tools/boss/docs/designs/automatic-pr-review-guides.md`).
-//!
-//! This binary drives the exact production collector
-//! (`boss_pr_review_sources::collect_pinned_source_packet`) and the exact
-//! production prompt/validation crate (`boss_review_guide`) outside the
-//! running engine, so the six saved comparisons can be reconstructed from
-//! GitHub and re-prompted at a fixed model/effort without a live Boss
-//! instance, database, or driver dispatch. It does not call any model
-//! itself — that step shells out to the local `codex` CLI with the exact
-//! production model/effort override (`-m gpt-6-astra -c
-//! model_reasoning_effort=high`), matching
-//! `boss_engine_driver::codex::build_codex_command`. See
-//! `tools/boss/docs/evaluations/automatic-pr-review-guides/README.md` for
-//! the end-to-end recipe this binary is one step of.
-//!
-//! Subcommands:
-//! - `collect --pr-url <url> --base-sha <sha> --head-sha <sha> --out <path>`
-//!   Collects an immutable [`SourcePacket`] via the production collector and
-//!   writes it as pretty JSON. `merge_base_sha` is always recomputed live
-//!   from GitHub (see [`boss_pr_review_sources::collect_pinned_source_packet`]);
-//!   it is not a caller-supplied input.
-//! - `prompt --packet <path> --git-dir <path> --out <path> [--baseline]`
-//!   Renders the exact prompt text a production execution would compose
-//!   (`boss_review_guide::render_prompt` +
-//!   `boss_review_guide::render_source_context`), or the historical
-//!   evaluated-baseline slice with `--baseline`
-//!   (`boss_review_guide::render_baseline_prompt`).
-//! - `validate --packet <path> --markdown <path>`
-//!   Runs the exact production output validator
-//!   (`boss_review_guide::validate_guide_output`) against a raw model
-//!   response and prints `VALID` or every [`GuideValidationIssue`] found,
-//!   with a non-zero exit code on any issue.
-//! - `refs --markdown <path> --out <path>`
-//!   Extracts every `github.com` reference from a rendered guide
-//!   (`boss_review_guide::guide_references`) and writes it as a pretty JSON
-//!   array of `{section, href}`, in document order with duplicates removed.
-//!   Feeds the navigation/grounding review template — see
-//!   `tools/boss/docs/evaluations/automatic-pr-review-guides/README.md`.
+//! Standalone CLI for the review-guide prompt evaluation corpus.
+//! See tools/boss/docs/evaluations/automatic-pr-review-guides/README.md.
 
 use std::path::PathBuf;
 use std::{fs, process};
@@ -48,9 +9,40 @@ use boss_pr_review_sources::{
     PinnedComparison, SourcePacket, SourceSide, collect_pinned_source_packet, validate_pinned_reference,
 };
 use boss_review_guide::{
-    GuideReference, MAX_PROMPT_CHARS, PROMPT_TEMPLATE_SHA256, PROMPT_VERSION, PromptMetadata, guide_references,
-    render_baseline_prompt, render_prompt, render_source_context, validate_guide_output_with_resolver,
+    GuideContext, GuideReference, PROMPT_TEMPLATE_SHA256, PROMPT_VERSION, PromptMetadata, RootTask, compose_prompt,
+    guide_references, linked_range_ok, render_prompt, valid_linked_path, validate_guide_output_with_resolver,
 };
+
+/// Historical four-section request, preserved independently of production revisions.
+const BASELINE_PROMPT: &str = r#"I want you to provide me a guided summary of the changes in {{PR_URL}}. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code."#;
+
+/// Render the historical baseline with the current pinned-workspace access context.
+fn render_baseline_prompt(metadata: &PromptMetadata<'_>) -> Result<String> {
+    let full = render_prompt(metadata);
+    let context = full
+        .split_once("\n\nReview context:")
+        .context("production template lacks review context")?
+        .1;
+    let context = context
+        .split_once("\n\nGround the guide")
+        .context("production template lacks grounding boundary")?
+        .0;
+    Ok(format!(
+        "{}\n\nReview context:{context}",
+        BASELINE_PROMPT.replace("{{PR_URL}}", metadata.pr_url)
+    ))
+}
+
+const MAX_PROMPT_CHARS: usize = 1_000_000;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> process::ExitCode {
@@ -156,20 +148,26 @@ fn run_prompt(args: &[String]) -> Result<()> {
         head_sha: &packet.head_sha,
         git_dir: &git_dir,
     };
-    // Matches `runner::review_guide_prompt::compose_review_guide_prompt`
-    // exactly: the versioned template plus the embedded source context, with
-    // no extra system-prompt addenda (WorkerKind::ReviewGuide never receives
-    // one — see `boss_engine_driver::codex`).
-    let mut prompt = if baseline {
-        render_baseline_prompt(&metadata)
+    // Pinned PR metadata substitutes for unavailable historical engine records.
+    let context = GuideContext::builder()
+        .root(
+            RootTask::builder()
+                .name(&packet.title)
+                .maybe_description(packet.body.clone())
+                .build(),
+        )
+        .build();
+    let template = if baseline {
+        render_baseline_prompt(&metadata)?
     } else {
         render_prompt(&metadata)
     };
-    prompt.push_str("\n\n");
-    prompt.push_str(&render_source_context(&packet));
-    // These pinned GitHub comparisons have no repository-resident screenshot
-    // attachments. Match the engine's empty attachment manifest explicitly.
-    prompt.push_str("\n### Registered screenshots\n\nNo screenshots are registered for this task or its revisions.\n");
+    let prompt = compose_prompt(
+        template,
+        &packet,
+        &context,
+        "No screenshots are registered for this task or its revisions.\n",
+    );
 
     fs::write(&out, &prompt).with_context(|| format!("write {}", out.display()))?;
     let chars = prompt.chars().count();
@@ -185,14 +183,6 @@ fn run_prompt(args: &[String]) -> Result<()> {
         },
     );
     if chars > MAX_PROMPT_CHARS {
-        // Matches boss_review_guide::exceeds_prompt_budget's threshold
-        // (checked here against the actual composed string rather than via
-        // that helper, since this covers both the production and
-        // `--baseline` renderings it doesn't itself distinguish). See
-        // MAX_PROMPT_CHARS's doc: retrying an over-budget comparison at the
-        // same model/effort/packet always fails identically, so callers
-        // should treat this line, not a wasted generation attempt, as the
-        // authoritative signal.
         println!("PROMPT_TOO_LARGE chars={chars} budget={MAX_PROMPT_CHARS}");
     }
     Ok(())
@@ -243,11 +233,7 @@ fn run_validate(args: &[String]) -> Result<()> {
 }
 
 fn workspace_range_exists(workspace: &str, sha: &str, path: &str, start: u32, end: u32) -> bool {
-    if path.is_empty()
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) || !valid_linked_path(path) {
         return false;
     }
     // jj reads the pinned object without snapshotting or changing the checkout.
@@ -259,14 +245,7 @@ fn workspace_range_exists(workspace: &str, sha: &str, path: &str, start: u32, en
     else {
         return false;
     };
-    if !output.status.success() || output.stdout.len() > 16 * 1024 * 1024 {
-        return false;
-    }
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return false;
-    };
-    !text.contains('\0')
-        && ((start == 0 && end == 0) || (start > 0 && end >= start && end as usize <= text.lines().count()))
+    output.status.success() && linked_range_ok(path, start, end, &output.stdout)
 }
 
 fn run_refs(args: &[String]) -> Result<()> {

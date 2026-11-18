@@ -1,0 +1,41 @@
+{
+  "algorithm": "internal-id-redaction-v1",
+  "files": {
+    "mono-2860/packet.json": {
+      "original_sha256": "21246ea0bea12f3eb03489789fecbb672310719573c6aa02bfec576eac04518b",
+      "published_sha256": "e90f6b03f0609c00f917eb90303d232749b6f24c3fcc5bd9fba786cd9121fc11"
+    },
+    "mono-2860/prompt-baseline.txt": {
+      "original_sha256": "ea968a6d7a0e6e1e24911da7117a88bf5bd186cd5a50cd526daeb4addd9ca646",
+      "published_sha256": "100618f57700158f0fe7286bed02b64d8bca53830f63fc57737dadd033f118b7"
+    },
+    "mono-2860/prompt-production.txt": {
+      "original_sha256": "2efbb2158236262952e1eccd3ce5be8ad0ff88707a4bebbab6c4662294da6eab",
+      "published_sha256": "e2d0f71d63dd7e4616f5118330868ac3f9e61613e3858191cb74744b2ad09c68"
+    },
+    "mono-2886/events-production-attempt2.jsonl": {
+      "original_sha256": "b87609239318063a4b872ef343d1e4af805440d1468917b7a4333139a8a38e1a",
+      "published_sha256": "8c23eb2ad67f4e073fa196c6aa3eeb2689422012ddeacfd2f52aba0029cd63c7"
+    },
+    "mono-2890/events-production-attempt3.jsonl": {
+      "original_sha256": "2bb76e285759986069beec8f03fc2ea94d2f7f81cb759b53ad726f995ded989d",
+      "published_sha256": "cc38859b2490814d23a71e49b021715292b1cd7f1149352405475f266ef8557e"
+    },
+    "mono-2890/events-production.jsonl": {
+      "original_sha256": "2bb76e285759986069beec8f03fc2ea94d2f7f81cb759b53ad726f995ded989d",
+      "published_sha256": "cc38859b2490814d23a71e49b021715292b1cd7f1149352405475f266ef8557e"
+    },
+    "mono-2890/packet.json": {
+      "original_sha256": "3c52d529dd162057aa260b63ba66c346da584df9ec829ee535147ddb91c6345c",
+      "published_sha256": "2230f0d899c73a87aee56ad0acf83fd305eb5e3fd12c6228fc615775517afe8e"
+    },
+    "mono-2890/prompt-baseline.txt": {
+      "original_sha256": "9359a6d756df4f0744d14a2ff92eaf663ecb0c9af3bbd2cad95c447132fe0fb3",
+      "published_sha256": "a231ece3cd0373806edfc60f6bdf2eb4fc2573a88fe181d9f5ba83960bbc5212"
+    },
+    "mono-2890/prompt-production.txt": {
+      "original_sha256": "89e900f810e64e0092a05d3c0e9e91a380f5d100c1fafba37bcff429b94a88e2",
+      "published_sha256": "1cbbc3395ff97fb6c3c94161708d6e9a8b142943e45b3d80ad7ee6fd4f38f326"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # Production review-guide prompt comparison corpus
 
-This evaluation preserves the six pinned comparisons in the [design](../../designs/automatic-pr-review-guides.md). The saved September evidence remains in `cases/`; new runs go into a separate dated `runs/` directory. The historical archive reports are not modified. Model choice remains `gpt-6-astra` at `high`.
+This evaluation preserves the six pinned comparisons in the [design](../../designs/automatic-pr-review-guides.md). The saved September evidence remains in `cases/`; new runs go into a separate dated `runs/` directory. Published evidence uses the deterministic identifier redaction described below; source links and line numbers are preserved. The historical archive reports are not modified. Model choice remains `gpt-6-astra` at `high`.
 
 **Human grounding review and prompt acceptance are pending.** The [review template](grounding-review-template.md) enumerates references from both variants and all saved retry guides, with unchecked rows and empty verdict/notes columns. Reference kinds are mechanical heading-based hints. They are not assessments of whether the source supports a claim.
 
@@ -20,11 +20,15 @@ tools/boss/docs/evaluations/automatic-pr-review-guides/run-corpus.sh
 tools/boss/docs/evaluations/automatic-pr-review-guides/run-corpus.sh --template-only
 ```
 
+The work directory defaults to `$XDG_CACHE_HOME/boss-review-guide-corpus` (or `~/.cache/boss-review-guide-corpus`); pass `--work-dir /absolute/path` to both the recipe and `verify-links.py` to override it. Clones and checkouts stay outside the repository, and provenance records their paths relative to that work directory.
+
 Pass case ids to restrict a run, and `--run-dir /absolute/path` to record another attempt. Existing event streams cannot be overwritten, so a second attempt on the same day needs `--run-dir`. `--recollect` invokes `boss_pr_review_sources::collect_pinned_source_packet` against pinned GitHub revisions and saves a separate packet, then verifies its revision triple. It never overwrites the saved packet or historical reports. Preparation and reference extraction do not spend model quota; generation does.
 
-`run-corpus.sh` delegates to `run-corpus.py` and builds `//tools/boss/engine/review-guide:corpus-tool` through Bazel. The tool calls the production prompt renderer, source-context renderer, collector and output validator. Its baseline retains the historical four-section request and adds the same current pinned-workspace access context. Production uses the current versioned prompt unchanged. Both receive the same saved PR description/file manifest and an empty registered-screenshot manifest; no machine-local archive or engine database is read.
+`run-corpus.sh` delegates to `run-corpus.py` and builds `//tools/boss/engine/review-guide:corpus-tool` through Bazel. The tool calls the production prompt renderer, source-context renderer, collector and output validator. Its baseline retains the historical four-section request and adds the same current pinned-workspace access context. Production uses the current versioned prompt unchanged. Both receive the same saved PR description/file manifest, task context reconstructed from that packet’s PR title and body, and an empty registered-screenshot manifest. The runner and corpus tool share `compose_prompt`, which appends source context, mandatory task context and screenshots in the same order.
 
-Each new case directory records exact prompts, raw Codex events, stderr, final assistant messages, submitted guides, separate variant timing/usage, production validation, and source/renderer hashes. A missing or failed generation is an error, not a passing pair. `--prepare-only` renders prompts and verifies source availability without generating guides.
+**Context reconstruction limitation:** historical engine task, revision and project records are unavailable in the pinned repository evidence. The saved PR title and body explicitly substitute for the originating task; revisions are empty and project is absent. These inputs use the production composition contract but do not claim to reconstruct the original engine records. Each case’s provenance records this limitation; no project is invented and no machine-local archive or engine database is read. The shared renderer describes an empty revision list and absent project as no revisions and no containing project: those are controlled evaluation assumptions, not reconstructed historical facts. This run cannot establish the quality of historical project or revision orientation.
+
+Each new case directory records publication copies of prompts, Codex events, stderr, final assistant messages, submitted guides, separate variant timing/usage, production validation, and source/renderer hashes. A missing or failed generation is an error, not a passing pair. `--prepare-only` renders prompts and verifies source availability without generating guides.
 
 ## Standalone transport and fidelity
 
@@ -55,9 +59,9 @@ The following measurements belong only to the recovered September generations. T
 
 Source: the saved per-case `usage-*.json`, `events-*.jsonl`, `retries-production.json`, and `too-large.json` files. The reported mono-2890 production usage is the final unsuccessful attempt, not a validated acceptance. Individual attempts retain their separate measurements.
 
-## Fresh paired generations (2026-11-18)
+## Earlier paired generations without task context (2026-11-18)
 
-[runs/2026-11-18](runs/2026-11-18) holds one baseline and one production generation per case, all with `gpt-6-astra` at `high` through the production prompt renderer (`review-guide-v12`, template hash in `generator.json`). Every case directory has the exact prompts, raw event streams, stderr, final messages, submitted guides, `usage-*.json`, `validation-production.txt` and `provenance.json`. All six production guides passed the production validator (`VALID`), each after exactly one accepted submission. Baseline guides are the final assistant message and are not validator-gated, so their pass/fail status says nothing about their links; see the mechanical check below.
+**These earlier generations omit the mandatory task context and are not production-faithful evaluations.** They remain separate evidence, not acceptance results. [runs/2026-11-18](runs/2026-11-18) holds one baseline and one production generation per case, all with `gpt-6-astra` at `high` through the production prompt renderer (`review-guide-v12`, template hash in `generator.json`). Every case directory has the exact prompts, raw event streams, stderr, final messages, submitted guides, `usage-*.json`, `validation-production.txt` and `provenance.json`. All six production guides passed the production validator (`VALID`), each after exactly one accepted submission. Baseline guides are the final assistant message and are not validator-gated, so their pass/fail status says nothing about their links; see the mechanical check below.
 
 Timing and usage are separate per variant (token counts are cumulative over the whole turn, including cached re-reads of the checkout):
 
@@ -78,16 +82,49 @@ Timing and usage are separate per variant (token counts are cumulative over the 
 
 Unlike the saved September prompts, which embedded full source packets, the current prompts are small (about 5-20 KB) because the model reads source from the pinned checkout. Every case now runs; none is skipped for prompt size.
 
-[runs/2026-10-27](runs/2026-10-27) is an earlier, interrupted attempt kept as a record. Only `flunge-1545` finished there; the rest failed on network errors (`stderr-*.txt`, `turn_failed: true`) or never ran. It is not used by the template or the tables above.
+[runs/2026-10-27](runs/2026-10-27) is an earlier, interrupted attempt kept as a record. Only `flunge-1545` finished there; the rest failed on network errors (`stderr-*.txt`, `turn_failed: true`) or never ran. Its available guides are included in the reference template; it is not represented as a complete paired run.
+
+## Paired generations with reconstructed task context (2026-11-18)
+
+[runs/2026-11-18-context-complete](runs/2026-11-18-context-complete) contains six new pairs generated with the shared production composer and PR-derived task context. All twelve model turns exited successfully; all six production guides passed the production validator. Each variant retains separate prompts, events, timing and token usage. The historical engine-record limitation described above applies to this run too; human grounding and prompt acceptance remain pending.
+
+| Case        | Variant    | Wall time | Input tokens | Cached input tokens | Output tokens | Accepted submissions |
+| ----------- | ---------- | --------- | ------------ | ------------------- | ------------- | -------------------- |
+| flunge-1545 | baseline   | 74.5s     | 166,909      | 133,632             | 3,000         | 0                    |
+| flunge-1545 | production | 96.8s     | 227,868      | 191,104             | 3,954         | 1                    |
+| flunge-1552 | baseline   | 94.0s     | 188,506      | 169,344             | 3,700         | 0                    |
+| flunge-1552 | production | 106.2s    | 235,787      | 193,536             | 4,408         | 1                    |
+| flunge-1605 | baseline   | 119.4s    | 391,483      | 319,744             | 5,017         | 0                    |
+| flunge-1605 | production | 187.1s    | 690,865      | 605,568             | 7,525         | 1                    |
+| mono-2860   | baseline   | 137.1s    | 489,909      | 420,352             | 5,488         | 0                    |
+| mono-2860   | production | 176.2s    | 728,312      | 648,576             | 7,062         | 1                    |
+| mono-2886   | baseline   | 86.1s     | 220,976      | 169,600             | 3,521         | 0                    |
+| mono-2886   | production | 97.3s     | 238,395      | 193,792             | 4,098         | 1                    |
+| mono-2890   | baseline   | 123.2s    | 413,430      | 351,104             | 4,712         | 0                    |
+| mono-2890   | production | 163.0s    | 524,844      | 452,224             | 6,610         | 1                    |
+
+`runs/2026-11-18-context` preserves an interrupted attempt: its first baseline completed, then a concurrent Bazel invocation removed the local corpus-tool output before the next prompt could be rendered. The recipe now copies the built executable into a content-addressed location in the work directory before generating. The complete run above uses that stable copy; its binary hash is in `generator.json`.
 
 ## Mechanical link verification
 
-`verify-links.py` checks every pinned blob link in the template without judging support: the revision resolves in the pinned checkout, the file exists at that revision, and the line range lies inside the file. Result at the time of this run: 509 links pass; 9 are PR/diff links and 4 point at an external repository, which are not line-checked; 4 have a line range past the end of the file. All four are in saved September outputs, which are not edited: `cases/flunge-1552/guide-baseline.md` (`jest.config.cjs#L1-L8`, file has 7 lines), `cases/mono-2886/guide-production-attempt3.md` (`BossCaptureTests.swift#L347-L408`, 406 lines), `cases/mono-2890/guide-production-attempt1.md` (`MarkdownFindState.swift#L169-L189`, 173 lines) and `cases/mono-2890/guide-production-attempt2.md` (`MarkdownFindState.swift#L104-L182`, 173 lines). Every link in the fresh `runs/2026-11-18` guides passes. A pass here only means the link resolves, not that it shows what the guide claims. Baseline guides also contain links to machine-local checkout paths, which `checkleft` reports as `md/link-integrity` warnings; they are raw model output, are not GitHub references, and so are not template rows.
+`verify-links.py --work-dir /absolute/path` checks pinned blob links in the template without judging support: the revision resolves in the pinned checkout, the file exists at that revision, and the line range lies inside the file. Non-GitHub targets, including machine-local baseline links, have their own unchecked rows and are counted separately as not navigable. PR/diff links and external repositories are counted separately from checked blob ranges.
+
+The complete table has 826 unchecked rows: 727 pinned blob references pass, 74 non-GitHub targets are counted separately, 17 are PR/diff links, and four point at repositories not pinned locally. The verifier exits 1 for exactly the four annotated historical range failures below; no new pinned-link range failures were found. All twelve saved prompts match the final compiled composer after publication redaction, and all 131 captured source objects passed original-hash and sanitized-text verification.
+
+Four known out-of-bounds ranges in the saved September outputs are marked **mechanical failure** in the template’s Kind column, leaving all human judgement columns blank: `cases/flunge-1552/guide-baseline.md` (`jest.config.cjs#L1-L8`, file has 7 lines), `cases/mono-2886/guide-production-attempt3.md` (`BossCaptureTests.swift#L347-L408`, 406 lines), `cases/mono-2890/guide-production-attempt1.md` (`MarkdownFindState.swift#L169-L189`, 173 lines) and `cases/mono-2890/guide-production-attempt2.md` (`MarkdownFindState.swift#L104-L182`, 173 lines). Detection compares the range endpoints with the pinned object’s line count. Original targets remain unchanged; the annotation exposes the defect without rewriting model evidence or implying a grounding verdict.
 
 ## Evidence retention
 
-The repo owner approved preserving this fixed evaluation corpus together on 2026-10-27. `CHECKS.yaml` scopes the file-count exception to the saved cases and the dated run evidence (`runs/2026-10-27` and `runs/2026-11-18`), and the file-size exception to the eight original oversized prompt files. Implementation and every other check remain subject to normal validation.
+The repo owner approved the one-off evaluation file-length exception on 2026-10-27 and the one-PR file-count exception (up to 360 non-deleted files) on 2026-11-18 16:18 UTC. Commit-description directives carry these exceptions; there are no permanent corpus exclusions in `CHECKS.yaml`. Other checks remain unchanged.
+
+### Publication sanitization
+
+`run-corpus.py` applies `publication_text` to publication copies: standalone internal task/project identifiers are replaced with `[internal-id-redacted]`. JSON string values are transformed recursively, including source snapshots and event payloads; JSONL is transformed one record at a time. No lines are added or removed from source strings, and GitHub targets and revisions are unchanged. `publication.json` records original and published SHA-256 hashes for each transformed file. Packet content hashes remain the original capture hashes; they are provenance, not hashes of the redacted publication strings.
+
+The source verifier applies the identical transformation to both pinned object text and saved text before comparing them. The transformation is deterministic and idempotent; published evidence is explicitly not byte-for-byte raw evidence where a redaction occurred. Original objects remain recoverable by the pinned repository revisions. Existing timing/usage values and invalid link endpoints are preserved. Markdown publication copies follow repository formatting; event streams retain generated text except for identifier redaction. New runs apply publication sanitization before creating their local reference template.
 
 ## Human review
 
-Open every link in the [template](grounding-review-template.md) in GitHub. Confirm its intended file, immutable revision, before/after side, line range, and the claim or example it supports. Record a verdict and notes only after that human check. Objective structural/link validation is separate from this judgement. Prompt acceptance is intentionally blank until that review is complete. The template covers the saved September outputs and the fresh `runs/2026-11-18` guides; `run-corpus.sh --template-only` regenerates it, discarding any recorded verdicts, so do that only before review starts.
+Open every link in the [template](grounding-review-template.md). Confirm its intended file, immutable revision, before/after side, line range, and the claim or example it supports; record local-path navigation failures too. Record a verdict and notes only after that human check. Objective structural/link validation is separate from this judgement. Prompt acceptance remains pending until that review is complete.
+
+The committed template includes all saved guides and available dated-run guides, including interrupted runs. Only `--template-only` writes it; ordinary generation and `--prepare-only` write a template inside their run directory. External run directories are supported and receive stable `file:` source labels. Any checked box, nonempty verdict/notes cell, or completed sign-off prevents replacement unless `--force-template` is explicitly passed. The formatter-stable sign-off uses `(name)`, `(YYYY-MM-DD)` and `(pending)` placeholders.
