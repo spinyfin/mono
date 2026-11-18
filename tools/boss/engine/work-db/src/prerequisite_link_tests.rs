@@ -1,6 +1,9 @@
 use super::*;
 use boss_protocol::OperatorQuestion;
 
+#[path = "prerequisite_explicit_tests.rs"]
+mod explicit;
+
 fn question(answer_type: OperatorAnswerType) -> OperatorQuestion {
     OperatorQuestion {
         text: "placeholder".into(),
@@ -497,10 +500,7 @@ fn bare_number_without_a_local_owner_never_binds_a_foreign_owner() {
     let conn = db.connect().unwrap();
     let asking = query_task(&conn, &asking.id).unwrap().unwrap();
     assert!(rejected(&conn, Some(&asking), &link_pr("9")).contains("no open task owns"));
-    assert!(matches!(
-        ready(&conn, &asking, &create_pr("9")).answer_type,
-        OperatorAnswerType::CreatePrerequisiteTask { .. }
-    ));
+    assert!(rejected(&conn, Some(&asking), &create_pr("9")).contains("no open task owns"));
 }
 
 #[test]
@@ -877,10 +877,7 @@ fn inherited_product_repo_does_not_bind_a_foreign_owner_of_the_same_number() {
         Some(crate::test_support::TEST_REPO_REMOTE_URL)
     );
     assert!(rejected(&conn, Some(&asking), &link_pr("9")).contains("no open task owns"));
-    assert!(matches!(
-        ready(&conn, &asking, &create_pr("9")).answer_type,
-        OperatorAnswerType::CreatePrerequisiteTask { .. }
-    ));
+    assert!(rejected(&conn, Some(&asking), &create_pr("9")).contains("no open task owns"));
 }
 
 #[test]
@@ -971,7 +968,7 @@ fn create_brief_with_two_bound_prs_asks_for_an_explicit_prerequisite_pr() {
 }
 
 #[test]
-fn foreign_only_ambiguous_pr_holders_do_not_reject_create_questions() {
+fn foreign_only_ambiguous_pr_holders_reject_only_explicit_create_questions() {
     let (_tmp, db) = crate::test_support::open_db();
     let product = crate::test_support::create_test_product_named(&db, "Asking");
     let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
@@ -988,12 +985,9 @@ fn foreign_only_ambiguous_pr_holders_do_not_reject_create_questions() {
     )
     .unwrap();
     assert!(resolve_repo_for_work_item(&conn, &asking.id).unwrap().is_none());
-    for q in [
-        create_with_text("Land wiring", &format!("Finish {url}."), "Need it."),
-        create_pr(url),
-        create_pr("acme/widget#9"),
-        create_pr("9"),
-    ] {
-        assert_eq!(ready(&conn, &asking, &q), q);
+    let implicit = create_with_text("Land wiring", &format!("Finish {url}."), "Need it.");
+    assert_eq!(ready(&conn, &asking, &implicit), implicit);
+    for q in [create_pr(url), create_pr("acme/widget#9"), create_pr("9")] {
+        assert!(rejected(&conn, Some(&asking), &q).contains("more than one open task"));
     }
 }

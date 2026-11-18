@@ -1097,6 +1097,9 @@ fn operator_question_from_flags(args: &RunDoneArgs) -> Result<Option<boss_protoc
             "--file-count and --file-count-limit only apply to --answer-type create-prerequisite-task",
         ));
     }
+    if prerequisite_pr.as_deref().is_some_and(|value| value.trim().is_empty()) {
+        return Err(CliError::usage("--prerequisite-pr must name a pull request"));
+    }
     let existing_id = nonempty_flag(prerequisite_id);
     let existing_pr = nonempty_flag(prerequisite_pr);
     match answer_type {
@@ -1664,6 +1667,49 @@ mod tests {
         ];
         let Commands::Propose(args) = Cli::try_parse_from(yes_no_with_prerequisite).unwrap().command else {
             panic!("expected propose")
+        };
+        assert!(payload_for(args.command.unwrap()).is_err());
+    }
+
+    #[test]
+    fn create_prerequisite_flags_preserve_explicit_pr() {
+        let argv = [
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need existing work",
+            "--answer-type",
+            "create-prerequisite-task",
+            "--prerequisite-name",
+            "Different proposed name",
+            "--prerequisite-brief",
+            "Finish the existing work",
+            "--prerequisite-pr",
+            "https://github.com/acme/widget/pull/9",
+            "--explanation",
+            explanation::tests::VALID,
+        ];
+        let Commands::Propose(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("expected propose")
+        };
+        let (_, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        assert_eq!(
+            payload["question"]["answer_type"]["existing_pr"],
+            "https://github.com/acme/widget/pull/9"
+        );
+        assert_eq!(payload["question"]["answer_type"]["kind"], "create_prerequisite_task");
+        let blank = argv.map(|arg| {
+            if arg == "https://github.com/acme/widget/pull/9" {
+                " "
+            } else {
+                arg
+            }
+        });
+        let Commands::Propose(args) = Cli::try_parse_from(blank).unwrap().command else {
+            panic!("expected propose");
         };
         assert!(payload_for(args.command.unwrap()).is_err());
     }

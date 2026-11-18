@@ -1263,6 +1263,29 @@ mod operator_question_tests {
     }
 
     #[test]
+    fn create_prerequisite_preserves_explicit_pr_and_accepts_legacy_questions() {
+        let mut payload = json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
+            "text":"Create prerequisite",
+            "answer_type":{"kind":"create_prerequisite_task", "name":"Different proposed name",
+                "brief":"Finish the existing work", "existing_pr":"  https://github.com/acme/widget/pull/9  "},
+            "explanation":"The other change is already in review."
+        }});
+        let canonical = validate_payload(ProposalKind::RunDone, &payload).unwrap();
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical.canonical_json).unwrap();
+        assert_eq!(
+            parsed.question.unwrap().answer_type.existing_prerequisite_refs().1,
+            Some("https://github.com/acme/widget/pull/9")
+        );
+        payload["question"]["answer_type"]["existing_pr"] = json!(" ");
+        assert!(validate_payload(ProposalKind::RunDone, &payload).is_err());
+        payload["question"]["answer_type"]
+            .as_object_mut()
+            .unwrap()
+            .remove("existing_pr");
+        assert!(validate_payload(ProposalKind::RunDone, &payload).is_ok());
+    }
+
+    #[test]
     fn link_prerequisite_question_requires_an_id_or_pr_and_owns_its_wording() {
         let payload = json!({"outcome":"blocked", "summary":"Need the other PR first", "question":{
             "text":"Worker wording should be replaced",

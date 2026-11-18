@@ -1105,10 +1105,11 @@ pub enum OperatorAnswerType {
     /// When `file_count_bypass` is set, No authorizes a file-count exception
     /// for this PR instead of taking the ordinary declined path.
     ///
-    /// `existing_id` / `existing_pr` are optional hints. When the engine
+    /// `existing_id` / `existing_pr` are optional explicit references. When the engine
     /// resolves either to an open task that already owns the work, it
     /// rewrites the stored question to [`Self::LinkPrerequisiteTask`]
-    /// instead of offering to create a duplicate.
+    /// instead of offering to create a duplicate. An unresolved explicit reference
+    /// is rejected; only questions without references may create new work.
     CreatePrerequisiteTask {
         name: String,
         brief: String,
