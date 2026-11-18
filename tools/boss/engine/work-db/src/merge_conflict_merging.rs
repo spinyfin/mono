@@ -1,5 +1,6 @@
 //! A merge request remains live while the engine resolves its conflict.
 use super::*;
+use boss_protocol::OpenMergeRevision;
 
 pub const RESOLVING_MERGE_CONFLICT: &str = "resolving_conflicts";
 
@@ -28,10 +29,22 @@ fn human_reason(reason: &str) -> String {
 }
 
 pub(crate) fn start(conn: &Connection, id: &str, pr_url: &str, base: &str) -> Result<bool> {
+    // Revisions already open when the request was made were confirmed by the
+    // person asking (the merge handler refuses otherwise), so only newer ones
+    // can stop the continuation. An accepted GitHub request predates this call.
+    let requested_at: String = conn
+        .query_row(
+            "SELECT created_at FROM github_merge_intents WHERE work_item_id = ?1 AND status = 'active'",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(now_string);
     let detail = serde_json::json!({
         "source": "conflict_resolution",
+        "requested_at": requested_at,
         "status_label": format!("Resolving conflicts with {base}…"),
-        "section_order": 500000,
+        "section_order": boss_engine_storage_values::merge_queue_section::QUEUED_NO_POSITION_SECTION_ORDER,
     })
     .to_string();
     Ok(conn.execute(
@@ -42,25 +55,67 @@ pub(crate) fn start(conn: &Connection, id: &str, pr_url: &str, base: &str) -> Re
     )? > 0)
 }
 
+/// Intent status for a request stopped while GitHub auto-merge was armed: the
+/// engine still owes GitHub a `--disable-auto` before the stop is real.
+pub const DISARM_PENDING: &str = "disarm_pending";
+
+/// End the standing merge request. If GitHub had accepted the request (an
+/// active intent exists) its auto-merge is still armed, so the intent becomes
+/// [`DISARM_PENDING`] and the merge poller turns auto-merge off. The readable
+/// explanation stays in `merge_queue_detail`; `blocked_detail` is only filled
+/// for a blocked row that has none.
 pub(crate) fn stop(conn: &Connection, id: &str, reason: &str) -> Result<bool> {
-    let detail = serde_json::json!({
+    let human = human_reason(reason);
+    let refusal: Option<String> = conn
+        .query_row(
+            "SELECT CASE WHEN json_valid(merge_queue_detail)
+                    THEN json_extract(merge_queue_detail, '$.refusal') END
+             FROM tasks WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts'",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let mut detail = serde_json::json!({
         "source": "conflict_resolution",
-        "status_label": format!("Merge paused: {}", human_reason(reason)),
-    })
-    .to_string();
+        "status_label": format!("Merge paused: {human}"),
+    });
+    if let Some(refusal) = refusal {
+        detail["refusal"] = serde_json::Value::String(refusal);
+    }
+    let detail = detail.to_string();
     let changed = conn.execute(
-        "UPDATE tasks SET merge_queue_state = NULL, merge_queue_detail = ?3, blocked_detail = ?2
+        "UPDATE tasks SET merge_queue_state = NULL, merge_queue_detail = ?3,
+             blocked_detail = CASE WHEN status = 'blocked' THEN COALESCE(blocked_detail, ?2) ELSE blocked_detail END
          WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts'",
-        params![id, reason, detail],
+        params![id, human, detail],
     )? > 0;
     if changed {
         conn.execute(
-            "UPDATE github_merge_intents SET status = 'conflict_resolution_stopped'
-             WHERE work_item_id = ?1 AND status = 'active'",
-            [id],
+            "UPDATE github_merge_intents SET status = ?2 WHERE work_item_id = ?1 AND status = 'active'",
+            params![id, DISARM_PENDING],
         )?;
     }
     Ok(changed)
+}
+
+/// Drop a stopped-merge explanation once the thing it explained has ended
+/// (the conflict lifted, a sign-off was given, the card moved on). Never
+/// touches a live request or GitHub's own queue state.
+pub(crate) fn clear_stopped(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE tasks SET merge_queue_detail = NULL
+         WHERE id = ?1 AND merge_queue_state IS NULL
+           AND CASE WHEN json_valid(merge_queue_detail)
+               THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution' ELSE 0 END",
+        [id],
+    )? > 0)
+}
+
+fn is_conflict_stop_detail(detail: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(detail)
+        .ok()
+        .is_some_and(|v| v.get("source").and_then(|s| s.as_str()) == Some("conflict_resolution"))
 }
 
 /// A different PR binding or an explicit move out of review cancels the request.
@@ -85,6 +140,14 @@ pub(crate) fn cancel(conn: &Connection, id: &str) -> Result<()> {
 /// conflict block; human moves and other blocking reasons remain authoritative.
 pub(crate) fn project(tasks: &mut [Task], chores: &mut [Task]) {
     for task in tasks.iter_mut().chain(chores.iter_mut()) {
+        // A stopped-merge explanation only describes a card under review. A
+        // card that has moved on (for example back to work) must not show it.
+        if task.merge_queue_state.is_none()
+            && !matches!(task.status, TaskStatus::InReview | TaskStatus::Blocked)
+            && task.merge_queue_detail.as_deref().is_some_and(is_conflict_stop_detail)
+        {
+            task.merge_queue_detail = None;
+        }
         if task.merge_queue_state.as_deref() == Some(RESOLVING_MERGE_CONFLICT)
             && task.status == TaskStatus::Blocked
             && task.blocked_reason.as_deref() == Some("merge_conflict")
@@ -102,6 +165,17 @@ impl WorkDb {
     pub fn start_merge_conflict_resolution(&self, id: &str, pr_url: &str, base: &str) -> Result<bool> {
         let conn = self.connect()?;
         start(&conn, id, pr_url, base)
+    }
+
+    /// Keep GitHub's first refusal of the merge request with the standing
+    /// request, so a later stop can be diagnosed.
+    pub fn note_merge_refusal(&self, id: &str, message: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        Ok(conn.execute(
+            "UPDATE tasks SET merge_queue_detail = json_set(merge_queue_detail, '$.refusal', ?2)
+             WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts' AND json_valid(merge_queue_detail)",
+            params![id, message],
+        )? > 0)
     }
 
     pub fn stop_merge_conflict_resolution(&self, id: &str, reason: &str) -> Result<bool> {
@@ -135,6 +209,104 @@ impl WorkDb {
         )?)
     }
 
+    /// Open revisions created after the standing merge request was made. The
+    /// person who made the request already confirmed the revisions that were
+    /// open then, so only these can stop the continuation.
+    pub fn unconfirmed_merge_revisions(&self, id: &str) -> Result<Vec<OpenMergeRevision>> {
+        let since: Option<i64> = {
+            let conn = self.connect()?;
+            conn.query_row(
+                "SELECT CASE WHEN json_valid(merge_queue_detail)
+                        THEN json_extract(merge_queue_detail, '$.requested_at') END
+                 FROM tasks WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts'",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|text| text.parse().ok())
+        };
+        let Some(since) = since else {
+            return self.open_merge_revisions(id);
+        };
+        let open = self.open_merge_revisions(id)?;
+        let conn = self.connect()?;
+        let mut newer = Vec::new();
+        for revision in open {
+            let created: Option<i64> = conn
+                .query_row("SELECT created_at FROM tasks WHERE id = ?1", [&revision.id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?
+                .and_then(|text| text.parse().ok());
+            if created.is_none_or(|created| created > since) {
+                newer.push(revision);
+            }
+        }
+        Ok(newer)
+    }
+
+    /// Whether this request was stopped while GitHub auto-merge was armed and
+    /// still needs turning off. A newer live request for the card supersedes
+    /// it: that merge is wanted, so the stale marker is dropped instead.
+    pub fn merge_disarm_pending(&self, id: &str, pr_url: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM github_merge_intents
+             WHERE work_item_id = ?1 AND pr_url = ?2 AND status = ?3)",
+            params![id, pr_url, DISARM_PENDING],
+            |row| row.get(0),
+        )?;
+        if !pending {
+            return Ok(false);
+        }
+        let live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM github_merge_intents WHERE work_item_id = ?1 AND status = 'active')
+             OR EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts')",
+            [id],
+            |row| row.get(0),
+        )?;
+        if live {
+            tx.execute(
+                "UPDATE github_merge_intents SET status = 'cancelled' WHERE work_item_id = ?1 AND status = ?2",
+                params![id, DISARM_PENDING],
+            )?;
+        }
+        tx.commit()?;
+        Ok(!live)
+    }
+
+    /// GitHub auto-merge was turned off; the stop is now complete.
+    pub fn complete_merge_disarm(&self, id: &str, pr_url: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE github_merge_intents SET status = 'conflict_resolution_stopped'
+             WHERE work_item_id = ?1 AND pr_url = ?2 AND status = ?3",
+            params![id, pr_url, DISARM_PENDING],
+        )?;
+        Ok(())
+    }
+
+    /// Say on the card that the pause is not real yet: GitHub still has
+    /// auto-merge armed because turning it off failed.
+    pub fn record_merge_disarm_failure(&self, id: &str, error: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let detail = serde_json::json!({
+            "source": "conflict_resolution",
+            "status_label": format!("Merge not paused: couldn't turn off auto-merge on GitHub ({error})"),
+        })
+        .to_string();
+        Ok(conn.execute(
+            "UPDATE tasks SET merge_queue_detail = ?2
+             WHERE id = ?1 AND merge_queue_state IS NULL
+               AND COALESCE(merge_queue_detail, '') != ?2
+               AND CASE WHEN json_valid(merge_queue_detail)
+                   THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution' ELSE 0 END",
+            params![id, detail],
+        )? > 0)
+    }
+
     /// Replace the old, pre-rebase head with the head GitHub accepted. The
     /// transaction never exposes a gap in the card's Merging state.
     pub fn finish_merge_conflict_resolution(&self, id: &str, pr_url: &str, head: &str) -> Result<bool> {
@@ -153,14 +325,17 @@ impl WorkDb {
             "UPDATE github_merge_intents SET status = 'head_advanced' WHERE work_item_id = ?1 AND status = 'active'",
             [id],
         )?;
-        tx.execute(
-            "INSERT INTO github_merge_intents (id, work_item_id, pr_url, head_sha, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
-            params![next_id("gmi"), id, pr_url, head, now_string()],
+        crate::github_merge_intents::record_github_merge_intent_in_tx(
+            &tx,
+            &GithubMergeIntentInsertInput::builder()
+                .work_item_id(id)
+                .pr_url(pr_url)
+                .head_sha(head)
+                .build(),
+            &boss_engine_storage_values::merge_queue_section::queued_no_position_detail(),
         )?;
         tx.execute(
-            "UPDATE tasks SET merge_queue_state = 'queued', merge_queue_detail = '{\"section_order\":500000}', blocked_detail = NULL
-             WHERE id = ?1 AND pr_url = ?2 AND merge_queue_state = 'resolving_conflicts'",
+            "UPDATE tasks SET blocked_detail = NULL WHERE id = ?1 AND pr_url = ?2",
             params![id, pr_url],
         )?;
         tx.commit()?;
@@ -456,6 +631,153 @@ mod tests {
         let label = task.merge_queue_detail.unwrap();
         assert!(label.contains("stopped manually"), "{label}");
         assert!(!label.contains("manual_abandon"), "{label}");
+    }
+
+    fn add_open_revision(db: &WorkDb, product: &str, parent: &str, created_at: &str) -> String {
+        let revision = crate::test_support::create_test_chore_manual(db, product.to_owned(), "Revision");
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = 'revision', parent_task_id = ?2, status = 'active', created_at = ?3 WHERE id = ?1",
+                params![revision.id, parent, created_at],
+            )
+            .unwrap();
+        revision.id
+    }
+
+    fn poll_state(db: &WorkDb, id: &str, state: Option<&str>) {
+        db.update_task_pr_poll_state(
+            id,
+            PrPollStateInput {
+                caller: "merge_conflict_test",
+                merge_queue_state: state,
+                ci_required_state: "success",
+                pr_mergeable_state: "mergeable",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_revisions_opened_after_the_request_stop_the_continuation() {
+        let (db, product, id, _) = fixture(true);
+        let confirmed = add_open_revision(&db, &product, &id, "1");
+        assert!(db.unconfirmed_merge_revisions(&id).unwrap().is_empty());
+        let newer = add_open_revision(&db, &product, &id, "99999999999");
+        let open = db.unconfirmed_merge_revisions(&id).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, newer);
+        assert_ne!(open[0].id, confirmed);
+    }
+
+    #[test]
+    fn a_stopped_merge_is_turned_off_on_github_before_the_card_stays_paused() {
+        let (db, product, id, attempt) = fixture(true);
+        db.mark_conflict_resolution_failed(&attempt, "Rebase failed").unwrap();
+        assert!(db.get_active_github_merge_intent(&id, PR).unwrap().is_none());
+        assert!(db.merge_disarm_pending(&id, PR).unwrap(), "auto-merge is still armed");
+        // While the disarm is outstanding, GitHub's armed report cannot hide the pause.
+        poll_state(&db, &id, Some("auto_merge_enabled"));
+        assert_eq!(card(&db, &product, &id).merge_queue_state, None);
+        db.record_merge_disarm_failure(&id, "boom").unwrap();
+        assert!(
+            card(&db, &product, &id)
+                .merge_queue_detail
+                .unwrap()
+                .contains("couldn't turn off auto-merge")
+        );
+        db.complete_merge_disarm(&id, PR).unwrap();
+        assert!(!db.merge_disarm_pending(&id, PR).unwrap());
+        // Once disarmed, whatever GitHub reports is shown as it is.
+        poll_state(&db, &id, Some("auto_merge_enabled"));
+        assert_eq!(
+            card(&db, &product, &id).merge_queue_state.as_deref(),
+            Some("auto_merge_enabled")
+        );
+    }
+
+    #[test]
+    fn a_newer_merge_request_supersedes_a_pending_disarm() {
+        let (db, _, id, attempt) = fixture(true);
+        db.mark_conflict_resolution_failed(&attempt, "Rebase failed").unwrap();
+        db.record_github_merge_intent(
+            GithubMergeIntentInsertInput::builder()
+                .work_item_id(&id)
+                .pr_url(PR)
+                .head_sha("new-head")
+                .build(),
+            "{}",
+        )
+        .unwrap();
+        assert!(
+            !db.merge_disarm_pending(&id, PR).unwrap(),
+            "the new request must stay armed"
+        );
+        assert!(db.get_active_github_merge_intent(&id, PR).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_stopped_explanation_ends_with_its_cause() {
+        // A revision lands and the conflict lifts.
+        let (db, product, id, attempt) = fixture(true);
+        db.set_conflict_resolution_revision_task_id(&attempt, "revision")
+            .unwrap();
+        assert!(card(&db, &product, &id).merge_queue_detail.is_some());
+        db.clear_chore_blocked_merge_conflict(&id, PR).unwrap();
+        assert_eq!(card(&db, &product, &id).merge_queue_detail, None);
+
+        // A person approves the deletion sign-off by moving the card back to review.
+        let (db, product, id, _) = fixture(true);
+        db.mark_chore_blocked_deletion_signoff(&id, PR).unwrap();
+        let halted = card(&db, &product, &id);
+        assert!(
+            halted
+                .merge_queue_detail
+                .unwrap()
+                .contains("needs approval for deleted files")
+        );
+        db.update_work_item(
+            &id,
+            WorkItemPatch {
+                status: Some("in_review".into()),
+                blocked_reason: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(card(&db, &product, &id).merge_queue_detail, None);
+    }
+
+    #[test]
+    fn a_stopped_explanation_never_shows_on_a_card_that_moved_to_work() {
+        let (db, product, id, attempt) = fixture(true);
+        db.mark_conflict_resolution_failed(&attempt, "Rebase failed").unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'active', blocked_reason = NULL WHERE id = ?1",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(card(&db, &product, &id).merge_queue_detail, None);
+    }
+
+    #[test]
+    fn stopping_keeps_the_readable_blocked_detail_and_leaves_review_rows_alone() {
+        let (db, product, id, attempt) = fixture(true);
+        db.mark_conflict_resolution_abandoned(&attempt, "manual_abandon")
+            .unwrap();
+        let detail = card(&db, &product, &id).blocked_detail;
+        assert_ne!(detail.as_deref(), Some("manual_abandon"), "{detail:?}");
+
+        let (db, product, id, _) = fixture(true);
+        db.clear_chore_blocked_merge_conflict(&id, PR).unwrap();
+        assert!(
+            db.stop_merge_conflict_resolution(&id, "Merge failed after conflict resolution: x")
+                .unwrap()
+        );
+        assert_eq!(card(&db, &product, &id).blocked_detail, None);
     }
 
     #[test]

@@ -1805,6 +1805,7 @@ impl ServerState {
                 publisher.clone(),
                 cube_client.clone(),
             )
+            .with_merge_executor(direct_merge_executor_for_state.clone())
             .with_feature_flags(feature_flags.clone()),
         );
 

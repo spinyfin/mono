@@ -489,10 +489,7 @@ pub(crate) fn merge_queue_state_str(in_merge_queue: bool, auto_merge_enabled: bo
     }
 }
 
-/// `section_order` sentinel for a queued PR whose GitHub queue position
-/// wasn't reported (rare — schema allows it). Sorts below every PR with a
-/// real numbered position but above the merge-when-ready bucket.
-pub const QUEUED_NO_POSITION_SECTION_ORDER: i64 = 500_000;
+pub use boss_engine_storage_values::merge_queue_section::QUEUED_NO_POSITION_SECTION_ORDER;
 
 /// `section_order` fallback for a merge-when-ready PR whose
 /// `autoMergeRequest.enabledAt` GitHub didn't report. Sorts after every

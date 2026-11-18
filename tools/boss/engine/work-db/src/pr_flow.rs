@@ -1852,12 +1852,26 @@ impl WorkDb {
         // (via CASE, so the stored value passes through unchanged) and the
         // merge-queue arms of the changed-check, so a preserved row's
         // `changed` outcome reflects only CI/review movement.
-        // The local merge request owns its progress and terminal explanation.
-        // GitHub may still report auto-merge armed after a failed resolution.
-        let conflict_merge: bool = tx.query_row(
-            "SELECT CASE WHEN json_valid(merge_queue_detail) THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution' ELSE 0 END FROM tasks WHERE id = ?1",
-            [work_item_id], |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
-        ).optional()?.unwrap_or(false);
+        // The local merge request owns the card while conflicts are being
+        // resolved. After it stops, its explanation is kept only while GitHub
+        // reports nothing (or while the engine is still turning auto-merge
+        // off); a live GitHub queue/auto-merge state is shown as it is.
+        let (resolving, stopped_explanation, disarm_pending): (bool, bool, bool) = tx
+            .query_row(
+                "SELECT COALESCE(merge_queue_state = 'resolving_conflicts', 0),
+                        CASE WHEN json_valid(merge_queue_detail)
+                             THEN COALESCE(json_extract(merge_queue_detail, '$.source') = 'conflict_resolution', 0)
+                             ELSE 0 END,
+                        EXISTS(SELECT 1 FROM github_merge_intents
+                               WHERE work_item_id = tasks.id AND status = 'disarm_pending')
+                 FROM tasks WHERE id = ?1",
+                [work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .unwrap_or((false, false, false));
+        let conflict_merge =
+            resolving || (stopped_explanation && (input.merge_queue_state.is_none() || disarm_pending));
         let preserve = input.preserve_merge_queue_state || conflict_merge;
         let changed = tx.execute(
             "UPDATE tasks

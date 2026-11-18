@@ -1311,10 +1311,11 @@ async fn verify_deletion_tripwire(
 /// `succeeded` at `rung` (it did produce a mechanical resolution — the
 /// telemetry fact stands independent of the safety gate), flip the parent
 /// from `blocked: merge_conflict` to `blocked: deletion_signoff` via
-/// [`WorkDb::halt_conflict_resolution_for_deletion_signoff`], and file the same
+/// [`WorkDb::halt_conflict_resolution_for_deletion_signoff`], which files the same
 /// operator sign-off attention item `completion.rs`'s worker-driven
-/// `pr_review` path files for rung 2/3 — so a deletion halts identically
-/// regardless of which rung produced it. Does NOT publish
+/// `pr_review` path files for rung 2/3 inside its transaction (listing the
+/// removed surfaces recorded with the outcome) — so a deletion halts
+/// identically regardless of which rung produced it. Does NOT publish
 /// `ConflictResolutionSucceeded` (this is not a success) and does not spawn
 /// any worker (there is no automatic remediation for a flagged deletion —
 /// flagged deletions require explicit human approval).
@@ -1337,13 +1338,16 @@ async fn halt_attempt_for_deletion_signoff(
         ),
     );
 
-    record_tier(
-        work_db,
-        attempt,
+    let reason = format!("deletion tripwire: {}", deletions.join("; "));
+    if let Err(err) = work_db.record_conflict_ladder_outcome_with_deletions(
+        &attempt.id,
         if rung == 0 { "deterministic" } else { "engine_rebase" },
         "halted_for_signoff",
-        &format!("deletion tripwire: {}", deletions.join("; ")),
-    );
+        &reason,
+        deletions,
+    ) {
+        tracing::error!(attempt_id = %attempt.id, ?err, "conflict_ladder: could not persist tier decision");
+    }
     if let Err(err) = work_db.halt_conflict_resolution_for_deletion_signoff(&attempt.id, rung) {
         tracing::error!(attempt_id = %attempt.id, ?err, "could not persist atomic deletion-signoff halt");
         return;

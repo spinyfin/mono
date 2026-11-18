@@ -526,6 +526,7 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        crate::merge_conflict_merging::clear_stopped(&tx, work_item_id)?;
         // Phase 10 #31: keep the side table in sync (see the relaxed
         // sibling [`Self::clear_chore_blocked_merge_conflict`]).
         tx.execute(
@@ -2265,6 +2266,7 @@ pub(crate) fn clear_blocked_merge_conflict_in_tx(
     if rows == 0 {
         return Ok(None);
     }
+    crate::merge_conflict_merging::clear_stopped(conn, work_item_id)?;
     // Mark the matching side-table row(s) cleared so
     // the polymorphic clear dispatch doesn't re-fire on the next
     // probe. Mirrors `clear_chore_blocked_ci_failure`.
@@ -2365,17 +2367,25 @@ pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str,
     }
     let kind = boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND;
     if crate::attention_filing::reraise_open_work_item_attention(conn, work_item_id, kind)?.is_none() {
-        let reason: Option<String> = conn
+        let recorded: Option<(Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT json_extract(value, '$.reason') FROM conflict_resolutions cr,
+                "SELECT json_extract(value, '$.reason'), json_extract(value, '$.deletions') FROM conflict_resolutions cr,
                     json_each(COALESCE(cr.ladder_outcomes, '[]'))
              WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
                AND json_extract(value, '$.outcome') = 'halted_for_signoff'
              ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
                 params![work_item_id, pr_url],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        let (reason, deletions_json) = recorded.unwrap_or((None, None));
+        let mut deletions: Vec<String> = deletions_json
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        if deletions.is_empty() {
+            // Outcomes recorded before the list was kept carry only prose.
+            deletions.push(reason.unwrap_or_else(|| "Deletion tripwire requires operator sign-off".to_owned()));
+        }
         crate::workitems::insert_attention_item_row(
             conn,
             &CreateAttentionItemInput {
@@ -2383,8 +2393,7 @@ pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str,
                 kind: kind.to_owned(),
                 title: boss_engine_storage_values::merge_parent_signoff::SIGNOFF_ATTENTION_TITLE.to_owned(),
                 body_markdown: boss_engine_storage_values::merge_parent_signoff::render_signoff_attention_body(
-                    &[reason.unwrap_or_else(|| "Deletion tripwire requires operator sign-off".to_owned())],
-                    pr_url,
+                    &deletions, pr_url,
                 ),
                 execution_id: None,
                 status: None,

@@ -162,13 +162,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                             // the per-row intent keeps it from clobbering this
                             // state until the timeline or terminal probe says
                             // otherwise.
-                            let detail = serde_json::json!({
-                                "position": null,
-                                "state": null,
-                                "enqueued_at": null,
-                                "section_order": boss_engine_merge_poller::QUEUED_NO_POSITION_SECTION_ORDER,
-                            })
-                            .to_string();
+                            let detail = boss_engine_storage_values::merge_queue_section::queued_no_position_detail();
                             let record = work_db2.record_github_merge_intent(
                                 boss_work_db::GithubMergeIntentInsertInput::builder()
                                     .work_item_id(work_item_id2.clone())
@@ -234,6 +228,12 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                         }
                         Err(err) => {
                             let message = format!("{err:#}");
+                            tracing::warn!(
+                                work_item_id = %work_item_id2,
+                                pr_url = %pr_url2,
+                                error = %message,
+                                "merge_when_ready: GitHub refused the merge request",
+                            );
                             // A merge request is what a deferred conflict
                             // waits for, and GitHub can refuse the request
                             // *because* of that conflict. The request still
@@ -263,6 +263,10 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                     status: None,
                                     resolved_at: None,
                                 });
+                            }
+                            if conflict_released && let Err(err) = work_db2.note_merge_refusal(&work_item_id2, &message)
+                            {
+                                tracing::warn!(work_item_id = %work_item_id2, ?err, "merge_when_ready: could not keep the refusal");
                             }
                             let response = if conflict_released {
                                 FrontendEvent::MergeWhenReadyAccepted {
@@ -1521,6 +1525,10 @@ mod trunk_queue_tests {
             Ok(boss_engine_runtime::merge_when_ready::DirectMergeSuccess {
                 head_sha: self.head_sha.clone(),
             })
+        }
+
+        async fn disarm(&self, _pr_url: &str) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 

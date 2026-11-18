@@ -21,6 +21,10 @@ impl DirectMergeExecutor for MovingMerge<'_> {
             head_sha: "resolved".into(),
         })
     }
+
+    async fn disarm(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -30,6 +34,10 @@ impl DirectMergeExecutor for RecordingMerge {
         Ok(DirectMergeSuccess {
             head_sha: "resolved".into(),
         })
+    }
+
+    async fn disarm(&self, _: &str) -> Result<()> {
+        Ok(())
     }
 }
 

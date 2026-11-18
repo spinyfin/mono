@@ -20,11 +20,28 @@ impl WorkDb {
         outcome: &str,
         reason: &str,
     ) -> Result<()> {
+        self.record_conflict_ladder_outcome_with_deletions(attempt_id, tier, outcome, reason, &[])
+    }
+
+    /// As [`Self::record_conflict_ladder_outcome`], also keeping the removed
+    /// merged-parent surfaces as a list so a later sign-off surface can show
+    /// each one instead of re-parsing `reason`.
+    pub fn record_conflict_ladder_outcome_with_deletions(
+        &self,
+        attempt_id: &str,
+        tier: &str,
+        outcome: &str,
+        reason: &str,
+        deletions: &[String],
+    ) -> Result<()> {
         anyhow::ensure!(!reason.trim().is_empty(), "a ladder decision needs a reason");
         let conn = self.connect()?;
-        let event = serde_json::json!({
+        let mut event = serde_json::json!({
             "tier": tier, "outcome": outcome, "reason": reason, "recorded_at": now_string(),
         });
+        if !deletions.is_empty() {
+            event["deletions"] = serde_json::json!(deletions);
+        }
         let changed = conn.execute(
             "UPDATE conflict_resolutions
                 SET ladder_outcomes = json_insert(COALESCE(ladder_outcomes, '[]'), '$[#]', json(?2)),

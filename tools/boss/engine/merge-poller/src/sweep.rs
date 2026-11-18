@@ -1529,6 +1529,9 @@ pub(crate) async fn sweep_one(
             caller,
         )
         .await;
+        if !parked && let Some(host) = host {
+            host.disarm_stopped_merge(work_db, publisher, candidate).await;
+        }
         if !parked
             && open.mergeability == OpenPrMergeability::Clean
             && let Some(host) = host

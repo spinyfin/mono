@@ -17,7 +17,10 @@ pub struct GithubMergeIntent {
     pub head_sha: String,
     /// `active` while GitHub has not supplied terminal/dequeue evidence;
     /// `merged`, `closed`, `dequeued`, or `head_advanced` after that
-    /// evidence arrives.
+    /// evidence arrives. Engine-side endings are `cancelled` (the request was
+    /// withdrawn), `disarm_pending` (conflict resolution stopped while GitHub
+    /// auto-merge was armed; the poller must turn it off) and
+    /// `conflict_resolution_stopped` (stopped, nothing left armed).
     pub status: String,
     pub created_at: String,
 }
@@ -39,6 +42,56 @@ pub struct GithubMergeIntentRecordOutcome {
 }
 
 const GITHUB_MERGE_INTENT_COLUMNS: &str = "id, work_item_id, pr_url, head_sha, status, created_at";
+
+/// Record the request on the caller's transaction (see
+/// [`WorkDb::record_github_merge_intent`]).
+pub(crate) fn record_github_merge_intent_in_tx(
+    tx: &Connection,
+    input: &GithubMergeIntentInsertInput,
+    merge_queue_detail: &str,
+) -> Result<GithubMergeIntentRecordOutcome> {
+    let id = next_id("gmi");
+    let now = now_string();
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO github_merge_intents
+            (id, work_item_id, pr_url, head_sha, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+        params![id, input.work_item_id, input.pr_url, input.head_sha, now],
+    )? > 0;
+
+    if !inserted {
+        let active = query_active_github_merge_intent(tx, &input.work_item_id)?;
+        match active {
+            Some(active) if active.pr_url == input.pr_url && active.head_sha == input.head_sha => {}
+            Some(active) => {
+                bail!(
+                    "a GitHub merge intent is already active for {} at {}; cannot record {} at {}",
+                    active.pr_url,
+                    active.head_sha,
+                    input.pr_url,
+                    input.head_sha,
+                );
+            }
+            None => bail!(
+                "GitHub merge intent insert was ignored but no active intent was found for {}",
+                input.work_item_id,
+            ),
+        }
+    }
+
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET merge_queue_state = 'queued', merge_queue_detail = ?2
+         WHERE id = ?1
+           AND deleted_at IS NULL
+           AND (merge_queue_state IS NOT 'queued' OR merge_queue_detail IS NOT ?2)",
+        params![input.work_item_id, merge_queue_detail],
+    )? > 0;
+    Ok(GithubMergeIntentRecordOutcome {
+        inserted,
+        merge_queue_state_changed: changed,
+    })
+}
 
 fn map_github_merge_intent(row: &Row<'_>) -> rusqlite::Result<GithubMergeIntent> {
     Ok(GithubMergeIntent {
@@ -64,48 +117,9 @@ impl WorkDb {
     ) -> Result<GithubMergeIntentRecordOutcome> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let id = next_id("gmi");
-        let now = now_string();
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO github_merge_intents
-                (id, work_item_id, pr_url, head_sha, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
-            params![id, input.work_item_id, input.pr_url, input.head_sha, now],
-        )? > 0;
-
-        if !inserted {
-            let active = query_active_github_merge_intent(&tx, &input.work_item_id)?;
-            match active {
-                Some(active) if active.pr_url == input.pr_url && active.head_sha == input.head_sha => {}
-                Some(active) => {
-                    bail!(
-                        "a GitHub merge intent is already active for {} at {}; cannot record {} at {}",
-                        active.pr_url,
-                        active.head_sha,
-                        input.pr_url,
-                        input.head_sha,
-                    );
-                }
-                None => bail!(
-                    "GitHub merge intent insert was ignored but no active intent was found for {}",
-                    input.work_item_id,
-                ),
-            }
-        }
-
-        let changed = tx.execute(
-            "UPDATE tasks
-             SET merge_queue_state = 'queued', merge_queue_detail = ?2
-             WHERE id = ?1
-               AND deleted_at IS NULL
-               AND (merge_queue_state IS NOT 'queued' OR merge_queue_detail IS NOT ?2)",
-            params![input.work_item_id, merge_queue_detail],
-        )? > 0;
+        let outcome = record_github_merge_intent_in_tx(&tx, &input, merge_queue_detail)?;
         tx.commit()?;
-        Ok(GithubMergeIntentRecordOutcome {
-            inserted,
-            merge_queue_state_changed: changed,
-        })
+        Ok(outcome)
     }
 
     /// The active GitHub-native intent for this exact task and PR.

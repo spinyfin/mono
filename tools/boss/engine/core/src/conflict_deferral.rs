@@ -71,8 +71,11 @@ pub(crate) enum Gate {
 
 /// The evidence that a merge has been requested for this PR, or `None`.
 ///
-/// Four sources, any one of which is enough:
+/// Five sources, any one of which is enough:
 ///
+/// - The engine is already holding the person's merge request while it
+///   resolves the conflict (`merge_queue_state = 'resolving_conflicts'`).
+///   Checked first.
 /// - GitHub reports the PR in its merge queue, or with auto-merge armed.
 ///   These cover a merge requested on GitHub directly.
 /// - The engine holds an active GitHub merge intent for the PR: a Merge When
