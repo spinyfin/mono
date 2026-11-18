@@ -73,8 +73,6 @@ fn declare(waits: &StubWaits) {
     waits.set(DeclaredWait::Live);
 }
 
-
-
 #[test]
 fn stop_with_a_live_declared_wait_is_waiting_on_work_not_waiting_for_input() {
     let (reg, waits) = fixture();
@@ -191,7 +189,6 @@ fn without_a_wait_source_nothing_changes() {
     assert!(reg.reconcile_declared_waits(now()).is_empty());
 }
 
-
 #[test]
 fn expiry_before_stop_or_first_reconcile_is_overdue() {
     for already_parked in [false, true] {
@@ -233,7 +230,6 @@ fn published_subtitle_matches_activity_before_async_loop_runs() {
     reg.apply_event(1, &working());
     assert_eq!(reg.snapshot()[0].live_status, None);
 }
-
 
 #[test]
 fn subagent_activity_does_not_consume_the_main_sessions_wait() {
@@ -296,4 +292,3 @@ fn continuing_after_permission_without_a_stop_preserves_the_wait() {
     reg.apply_event(1, &stop());
     assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingOnWork);
 }
-

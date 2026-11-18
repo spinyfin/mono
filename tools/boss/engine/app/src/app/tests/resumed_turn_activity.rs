@@ -318,7 +318,7 @@ async fn a_user_prompt_after_stop_also_ends_the_declared_wait() {
 /// registry. Status replies must not manufacture strikes, even when the
 /// independent background-child grace period has already elapsed.
 #[tokio::test]
-async fn three_status_replies_during_a_live_job_preserve_waits_and_breaker_counts() {
+async fn three_status_replies_during_a_live_job_consume_waits_without_refund_or_strikes() {
     use boss_engine_completion::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
     use boss_engine_completion::tests::{FixedDescendantProbe, StubPrDetector, TestHarness};
     use boss_engine_completion::{NUDGE_BREAKER_ATTENTION_KIND, StopOutcome};
@@ -376,7 +376,8 @@ async fn three_status_replies_during_a_live_job_preserve_waits_and_breaker_count
             .enumerate()
         {
             let seq = 2 + index as u64 * 4;
-            let before = server_state.wait_registry.active(&execution_id, now).unwrap();
+            let had_wait = server_state.wait_registry.active(&execution_id, now).is_some();
+            let charged_before = server_state.wait_registry.total_granted_secs(&execution_id);
             dispatch_live_worker_state(
                 &server_state,
                 &hook(
@@ -391,30 +392,27 @@ async fn three_status_replies_during_a_live_job_preserve_waits_and_breaker_count
             .await;
             assert_eq!(snapshot(&server_state).activity, WorkerActivity::Working);
             assert!(snapshot(&server_state).wait_reason.is_none());
-            assert!(
-                server_state.wait_registry.active(&execution_id, now).is_none(),
-                "a status reply is main-session activity after Stop, so it consumes the wait",
-            );
-            dispatch_live_worker_state(&server_state, &stop(&execution_id, seq + 1)).await;
-            if !renew {
+            if had_wait {
                 assert!(
-                    !matches!(
-                        handler.on_stop(&execution_id).await,
-                        StopOutcome::WorkerWaitPending { .. }
-                    ),
-                    "the wait was consumed; a later Stop is not still waiting on work",
+                    server_state.wait_registry.active(&execution_id, now).is_none(),
+                    "a status reply is main-session activity after Stop, so it consumes the wait",
                 );
             }
+            dispatch_live_worker_state(&server_state, &stop(&execution_id, seq + 1)).await;
             assert_eq!(
-                before.granted_secs,
-                60 * 60,
-                "questions cannot refund the charged duration"
+                server_state.wait_registry.total_granted_secs(&execution_id),
+                charged_before,
+                "questions cannot refund the charged duration",
             );
+            // Do not call on_stop after the wait is consumed: that Stop is a
+            // normal idle boundary and would walk the nudge ladder. The
+            // consume itself must not record a strike.
             assert_eq!(breaker.counts(&execution_id), counts_before);
 
             if renew {
                 // The incident renewed in the following turn, after the
-                // status reply's Stop. That Stop must already be protected.
+                // status reply's Stop. The new declaration is what protects
+                // that later Stop.
                 dispatch_live_worker_state(&server_state, &pre_tool_use(&execution_id, "Bash", seq + 2)).await;
                 server_state
                     .wait_registry
@@ -432,11 +430,11 @@ async fn three_status_replies_during_a_live_job_preserve_waits_and_breaker_count
                     handler.on_stop(&execution_id).await,
                     StopOutcome::WorkerWaitPending { .. }
                 ));
+                assert!(matches!(
+                    handler.recheck_background_nudge(&execution_id).await,
+                    Some(StopOutcome::WorkerWaitPending { .. })
+                ));
             }
-            assert!(matches!(
-                handler.recheck_background_nudge(&execution_id).await,
-                Some(StopOutcome::WorkerWaitPending { .. })
-            ));
             assert_eq!(breaker.counts(&execution_id), counts_before);
         }
 
@@ -563,7 +561,8 @@ async fn a_subagents_tool_hooks_do_not_end_a_wait_the_main_session_is_still_in()
     );
 
     // A main-session resume must push the changed overlay even though the
-    // subagent already left the raw slot Working with no current tool.
+    // subagent already left the raw slot Working with no current tool, and
+    // it consumes the wait declared before that Stop.
     assert_eq!(snapshot(&server_state).wait_reason.as_deref(), Some(WAIT_REASON));
     let sink = make_session_sink();
     server_state
@@ -586,7 +585,7 @@ async fn a_subagents_tool_hooks_do_not_end_a_wait_the_main_session_is_still_in()
         ),
     )
     .await;
-    assert!(wait_is_held(&server_state, &execution_id));
+    assert!(!wait_is_held(&server_state, &execution_id));
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), sink.next())
         .await
         .expect("the main-session resume must broadcast its changed wait overlay")
@@ -616,7 +615,7 @@ async fn a_late_stop_after_only_subagent_hooks_leaves_the_wait_for_the_main_sess
     assert!(wait_is_held(&server_state, &execution_id));
 
     dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 5)).await;
-    assert!(wait_is_held(&server_state, &execution_id));
+    assert!(!wait_is_held(&server_state, &execution_id));
 }
 
 #[tokio::test]
@@ -640,7 +639,7 @@ async fn a_permission_prompt_mid_turn_does_not_end_a_wait_declared_earlier_in_th
 
     dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 5)).await;
     dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Read", 6)).await;
-    assert!(wait_is_held(&server_state, &execution_id));
+    assert!(!wait_is_held(&server_state, &execution_id));
 }
 
 #[tokio::test]
@@ -685,7 +684,7 @@ async fn accepted_but_unapplied_resume_protects_its_new_wait() {
 }
 
 #[tokio::test]
-async fn stale_main_hook_after_subagent_preserves_the_wait_without_refund() {
+async fn stale_main_hook_after_subagent_ends_the_wait_without_refund() {
     let (server_state, _dir) = test_server_state();
     let execution_id = spawned_worker(&server_state);
     dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
@@ -697,7 +696,7 @@ async fn stale_main_hook_after_subagent_preserves_the_wait_without_refund() {
     )
     .await;
     dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 3)).await;
-    assert!(wait_is_held(&server_state, &execution_id));
+    assert!(!wait_is_held(&server_state, &execution_id));
     assert_eq!(snapshot(&server_state).current_tool.as_deref(), Some("Grep"));
     assert_eq!(server_state.wait_registry.total_granted_secs(&execution_id), 45 * 60);
 }

@@ -102,6 +102,32 @@ final class NavigatorActivityTests: XCTestCase {
         XCTAssertFalse(view.isLiveSelected)
     }
 
+    func testDeclaredWaitActivitiesStayLiveAndDoNotEndTheRun() {
+        let root = activityTask(section: "working", activities: [
+            ["execution_id": "execution", "task_id": "revision", "run_id": "run"],
+        ])
+        let liveCases: [WorkerActivity] = [.waitingOnWork, .waitOverdue, .waitingForInput, .idle]
+        for activity in liveCases {
+            let model = NavigatorTestFixture.model([root])
+            model.selectWorkCard("root")
+            model.setWorkViewMode(.navigator)
+            model.applyEventForTest(.workerLiveStatesList(states: [liveState(runId: "run", activity: activity)]))
+            let view = WorkNavigatorActivity(context: context(model), workspace: nil)
+            XCTAssertTrue(view.isLiveSelected, "\(activity) should stay live")
+            XCTAssertFalse(view.selectedRunEnded, "\(activity) should not end the run")
+        }
+
+        for activity in [WorkerActivity.errored, .terminated] {
+            let model = NavigatorTestFixture.model([root])
+            model.selectWorkCard("root")
+            model.setWorkViewMode(.navigator)
+            model.applyEventForTest(.workerLiveStatesList(states: [liveState(runId: "run", activity: activity)]))
+            let view = WorkNavigatorActivity(context: context(model), workspace: nil)
+            XCTAssertFalse(view.isLiveSelected, "\(activity) is not live")
+            XCTAssertTrue(view.selectedRunEnded, "\(activity) ends the run")
+        }
+    }
+
     func testRestingVariantsHaveNoLiveIndicator() {
         let cases: [(String, String?, Bool, NavigatorActivityVariant)] = [
             ("backlog", "waiting_dependency", false, .backlog),
