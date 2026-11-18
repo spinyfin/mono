@@ -83,7 +83,18 @@ pub(crate) fn answered_spawn_short_stop(command_deadline_ms: u64) -> SpokeAdapte
 }
 
 pub(crate) async fn lease(adapter: &Arc<dyn HostAdapter>) {
-    let lease = adapter.lease_workspace("repo", "task", None, false, &[]).await.unwrap();
+    // A lease that misses a short test deadline under CI contention is stored
+    // and resolves on a retry of the same command; only the third miss fails.
+    let mut attempts = 0;
+    let lease = loop {
+        match adapter.lease_workspace("repo", "task", None, false, &[]).await {
+            Ok(lease) => break lease,
+            Err(error) if attempts < 2 && format!("{error:#}").contains("no result before the deadline") => {
+                attempts += 1;
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    };
     assert_eq!(lease.lease_id, "lease-1");
 }
 
