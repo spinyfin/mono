@@ -240,7 +240,7 @@ impl Scene {
             verifier.as_ref(),
             enqueuer,
             &self.flags,
-            5,
+            boss_engine_storage_values::pool_policy::DEFAULT_MAX_REVIEW_CYCLES,
             0,
             16,
             &execution,
@@ -373,13 +373,41 @@ async fn a_parked_revision_with_an_unreadable_head_completes_without_a_hold() {
         .finalize_declared_run_done(&scene.execution_id, boss_protocol::RunDoneOutcome::Delivered)
         .await;
 
-    assert!(
-        !matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { .. }),
-        "a revision that takes no hold is not failed for lack of a head: {outcome:?}"
-    );
-    assert_ne!(scene.run().status, ExecutionStatus::Failed);
-    assert_ne!(scene.status(), TaskStatus::Blocked);
+    assert!(matches!(outcome, StopOutcome::PrDetected { .. }), "{outcome:?}");
+    assert_eq!(scene.run().status, ExecutionStatus::Completed);
+    scene.run_post_effects(PUSHED, enqueuer.as_ref()).await;
+    assert_eq!(scene.status(), TaskStatus::InReview);
     assert_eq!(enqueuer.calls.load(Ordering::SeqCst), 0, "a parked row is not reviewed");
+}
+
+/// A revision at the review-cycle bound also takes no hold, so an unreadable
+/// head does not fail its delivery either.
+#[tokio::test]
+async fn a_cycle_bound_revision_with_an_unreadable_head_completes_without_a_hold() {
+    let workspace = tempdir().unwrap();
+    let scene = scene(workspace.path());
+    for _ in 0..boss_engine_storage_values::pool_policy::DEFAULT_MAX_REVIEW_CYCLES {
+        scene
+            .db
+            .increment_task_review_cycle(&scene.root_id(), Some(REVIEWED))
+            .unwrap();
+    }
+    let enqueuer = AdmitAtHead::at(PUSHED);
+    let handler = scene.handler(Err("gh api: 502 Bad Gateway"), HeadProbe(None), enqueuer.clone());
+
+    let outcome = handler
+        .finalize_declared_run_done(&scene.execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+
+    assert!(matches!(outcome, StopOutcome::PrDetected { .. }), "{outcome:?}");
+    assert_eq!(scene.run().status, ExecutionStatus::Completed);
+    scene.run_post_effects(PUSHED, enqueuer.as_ref()).await;
+    assert_eq!(scene.status(), TaskStatus::InReview);
+    assert_eq!(
+        enqueuer.calls.load(Ordering::SeqCst),
+        0,
+        "a cycle-bound row is not reviewed"
+    );
 }
 
 /// The batch for the pushed head was admitted for another row and reached its
@@ -577,6 +605,34 @@ async fn a_stop_completion_with_an_unreadable_head_fails_visibly_instead_of_hold
     assert_eq!(task.status, TaskStatus::Blocked, "not left `active` with nothing live");
     assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
     assert_eq!(enqueuer.calls.load(Ordering::SeqCst), 0);
+}
+
+/// A parked revision takes no hold at the Stop boundary either, so an
+/// unreadable head with no stamped head still completes to `in_review`.
+#[tokio::test]
+async fn a_parked_revision_stop_completion_with_an_unreadable_head_reaches_in_review() {
+    let workspace = tempdir().unwrap();
+    let scene = scene(workspace.path());
+    scene
+        .db
+        .park_work_item_as_actor(&scene.root_id(), true, Some("not now"), "human")
+        .unwrap();
+    let enqueuer = AdmitAtHead::at(PUSHED);
+    let handler = scene.handler(Err("gh api: 502 Bad Gateway"), HeadProbe(None), enqueuer.clone());
+
+    let outcome = handler
+        .finalize_pr_transition(
+            &scene.execution_id,
+            PR.into(),
+            WorkerPrCompletionTarget::InReview,
+            "stop_sha_delta",
+        )
+        .await;
+
+    assert_eq!(outcome, StopOutcome::PrDetected { pr_url: PR.into() });
+    assert_eq!(scene.run().status, ExecutionStatus::Completed);
+    assert_eq!(scene.status(), TaskStatus::InReview);
+    assert_eq!(enqueuer.calls.load(Ordering::SeqCst), 0, "a parked row is not reviewed");
 }
 
 /// The head the Stop boundary stamped is a head. With it the completion can

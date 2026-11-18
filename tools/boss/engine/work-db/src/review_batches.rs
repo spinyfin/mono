@@ -1279,12 +1279,13 @@ fn insufficient_quorum_attention(
 /// machine (insufficient leaf reports, exhausted supervisor, moved head)
 /// so they stay on one kind and one write path.
 fn fail_review_batch_with_attention(
+    pending: &mut PendingEvents,
     tx: &Transaction<'_>,
     batch: &ReviewBatch,
     now: &str,
     title: &str,
     body_markdown: String,
-) -> Result<PendingEvents> {
+) -> Result<()> {
     tx.execute(
         "UPDATE pr_review_batches SET status = 'failed', completed_at = ?2, updated_at = ?2 WHERE id = ?1",
         params![batch.id, now],
@@ -1304,17 +1305,16 @@ fn fail_review_batch_with_attention(
     // `record_awaited_review_head_in_tx`) is not matched and stays held.
     //
     // The revisions queued behind a released one are cascaded in the same
-    // transaction. The staged events are returned: a caller that owns the
-    // commit publishes them with `commit_and_publish`; the quorum state
-    // machine runs inside its caller's transaction, which has no event
-    // channel, so it drops them and the cascaded state is what dispatch reads.
-    let mut pending = PendingEvents::new();
+    // transaction. Their board events are staged on `pending`; a caller that
+    // owns the commit publishes them with `commit_and_publish`. Nested
+    // callers (proposal apply) pass the same `pending` through to that
+    // commit so the board learns the dependent is no longer gated.
     for released_id in
         release_held_revision_after_terminal_batch_in_tx(tx, &batch.cycle_root_id, &batch.target_sha, now)?
     {
-        super::cascade_dependents_after_prereq_status_change(&mut pending, tx, &released_id, "in_review", now)?;
+        super::cascade_dependents_after_prereq_status_change(pending, tx, &released_id, "in_review", now)?;
     }
-    Ok(pending)
+    Ok(())
 }
 
 /// Release every revision of `cycle_root_id` held for `target_sha`, once the
@@ -1583,10 +1583,13 @@ fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> R
 ///
 /// Must be called inside an already-open transaction — see
 /// [`WorkDb::try_advance_review_batch_quorum`] for the standalone wrapper.
+/// Board events from a cascade on failure are staged on `pending`; the
+/// caller publishes them with its commit.
 pub(crate) fn try_advance_review_batch_quorum_in_tx(
     tx: &Transaction<'_>,
     batch_id: &str,
     registry: &boss_engine_driver::DriverRegistry,
+    pending: &mut PendingEvents,
 ) -> Result<ReviewBatchQuorumOutcome> {
     let Some(batch) = review_batch_by_id_in(tx, batch_id)? else {
         return Ok(ReviewBatchQuorumOutcome::NoOp);
@@ -1616,7 +1619,8 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                     Ok(ReviewBatchQuorumOutcome::Applying)
                 }
                 Some(member) if member_attempt_is_settled(member) => {
-                    let _unpublished = fail_review_batch_with_attention(
+                    fail_review_batch_with_attention(
+                        pending,
                         tx,
                         &batch,
                         &now,
@@ -1678,7 +1682,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 Ok(ReviewBatchQuorumOutcome::SupervisorDispatched)
             } else {
                 let (title, body) = insufficient_quorum_attention(tx, &batch, &members)?;
-                let _unpublished = fail_review_batch_with_attention(tx, &batch, &now, &title, body)?;
+                fail_review_batch_with_attention(pending, tx, &batch, &now, &title, body)?;
                 Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
             }
         }
@@ -1697,7 +1701,8 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 Ok(ReviewBatchQuorumOutcome::Applying)
             }
             Some(member) if member_attempt_is_settled(member) => {
-                let _unpublished = fail_review_batch_with_attention(
+                fail_review_batch_with_attention(
+                    pending,
                     tx,
                     &batch,
                     &now,
@@ -2322,8 +2327,9 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let registry = boss_engine_driver::DriverRegistry::default();
-        let outcome = try_advance_review_batch_quorum_in_tx(&tx, batch_id, &registry)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let outcome = try_advance_review_batch_quorum_in_tx(&tx, batch_id, &registry, &mut pending)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(outcome)
     }
 
@@ -2589,8 +2595,9 @@ impl WorkDb {
             // batch can change, so check it before committing rather than
             // waiting for some other hook to notice.
             let registry = boss_engine_driver::DriverRegistry::default();
-            let outcome = try_advance_review_batch_quorum_in_tx(&tx, &member.batch_id, &registry)?;
-            tx.commit()?;
+            let mut pending = PendingEvents::new();
+            let outcome = try_advance_review_batch_quorum_in_tx(&tx, &member.batch_id, &registry, &mut pending)?;
+            commit_and_publish(tx, pending, &self.event_bus)?;
             return Ok(match outcome {
                 ReviewBatchQuorumOutcome::InsufficientQuorum => RetryDeadReviewBatchMember::BatchFailed,
                 _ => RetryDeadReviewBatchMember::NotRetried,
@@ -2663,7 +2670,9 @@ impl WorkDb {
              WHERE id = ?2 AND status IN ('pending', 'running')",
             params![now, member.id],
         )?;
-        let pending = fail_review_batch_with_attention(
+        let mut pending = PendingEvents::new();
+        fail_review_batch_with_attention(
+            &mut pending,
             &tx,
             &batch,
             &now,
@@ -2710,7 +2719,9 @@ impl WorkDb {
              WHERE id = ?2 AND status IN ('pending', 'running')",
             params![now, member.id],
         )?;
-        let pending = fail_review_batch_with_attention(
+        let mut pending = PendingEvents::new();
+        fail_review_batch_with_attention(
+            &mut pending,
             &tx,
             &batch,
             &now,
