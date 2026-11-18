@@ -203,3 +203,56 @@ async fn a_running_runs_process_keeps_the_lease_past_the_unowned_bound() {
     let _ = owned.kill();
     let _ = owned.wait();
 }
+
+#[tokio::test]
+async fn a_terminal_owners_live_shell_keeps_the_lease_past_the_bound() {
+    let (_dir, db) = open_db();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let current = orphaned(&db, workspace.path(), "lease-current");
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "terminal-owner");
+    let old = create_ready_chore_execution(&db, chore.id);
+    db.start_execution_run(&old.id, "worker", "mono", "lease-old", "ws-old", "/tmp/ws-old")
+        .unwrap();
+    let mut shell = spawn_detached(workspace.path(), Some(&old.id));
+    db.cancel_running_execution(&old.id).unwrap();
+    for execution in [&current, &old] {
+        set_finished_ago(&db, &execution.id, UNOWNED_OCCUPANT_BOUND_SECS + 5);
+    }
+
+    // Missing shell evidence also keeps the lease; age alone is insufficient.
+    let without_pid = release_with_host_occupancy(&db, &current).await;
+    assert!(
+        matches!(without_pid, LeaseReleaseOutcome::Kept { .. }),
+        "{without_pid:?}"
+    );
+    assert!(
+        db.set_run_shell_pid_for_execution(&old.id, i64::from(shell.id()))
+            .unwrap()
+    );
+    assert!(
+        boss_worker_processes::shell_alive("BOSS_RUN_ID", &old.id, shell.id())
+            .await
+            .unwrap()
+    );
+    let with_live_shell = release_with_host_occupancy(&db, &current).await;
+    let still_alive = shell.try_wait().unwrap().is_none();
+    let _ = shell.kill();
+    let _ = shell.wait();
+
+    assert!(
+        matches!(with_live_shell, LeaseReleaseOutcome::Kept { .. }),
+        "{with_live_shell:?}"
+    );
+    assert!(still_alive, "the live terminal worker must never be signalled");
+    assert_eq!(
+        db.get_execution(&current.id).unwrap().cube_lease_id.as_deref(),
+        Some("lease-current")
+    );
+    assert!(
+        !db.list_attention_items(&current.id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND)
+    );
+}

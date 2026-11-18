@@ -46,18 +46,27 @@ impl WorkspaceOccupancy for HostOccupancy {
             // or it now belongs to a process without that run's identity (a
             // reused PID). Unknown identities and terminal rows whose worker
             // is still alive are never signalled.
+            let mut protected_owners = std::collections::HashSet::new();
             for owner in result.owners.keys() {
                 if owner != &execution.id
                     && let Ok(old) = db.get_execution(owner)
                     && old.status.is_terminal()
-                    && db
+                {
+                    let shell_gone = if db
                         .execution_host_id(owner)
                         .is_ok_and(|host| host.is_none_or(|host| host == "local"))
-                    && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
-                    && let Ok(pid) = u32::try_from(pid)
-                    && !boss_worker_processes::shell_alive("BOSS_RUN_ID", owner, pid).await?
-                {
-                    boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
+                        && let Ok(Some(pid)) = db.latest_local_shell_pid_for_execution(owner)
+                        && let Ok(pid) = u32::try_from(pid)
+                    {
+                        !boss_worker_processes::shell_alive("BOSS_RUN_ID", owner, pid).await?
+                    } else {
+                        false
+                    };
+                    if shell_gone {
+                        boss_worker_processes::cleanup("BOSS_RUN_ID", owner, workspace).await?;
+                    } else {
+                        protected_owners.insert(owner.clone());
+                    }
                 }
             }
             if !result.owners.is_empty() {
@@ -66,6 +75,11 @@ impl WorkspaceOccupancy for HostOccupancy {
             let Some(report) = boss_worker_processes::Occupied::of(&result) else {
                 return Ok(Occupancy::Empty);
             };
+            // The remote bound has no shell probe. Locally, a live shell or
+            // incomplete shell evidence must keep its surviving occupants held.
+            if report.owners.keys().any(|owner| protected_owners.contains(owner)) {
+                return Err(report.into());
+            }
             // A scan on another host is classified by the same function, so a
             // run id the engine has never heard of is bounded here as it is
             // there, while a live run's processes keep the lease.
