@@ -2343,14 +2343,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thinking_intent_switch_timing() {
+    async fn manual_kind_switch_lands_before_answer_completion() {
         let (server_state, _dir) = test_server_state();
         let work_db = server_state.work_db.clone();
         let sink = make_session_sink();
         let (comment_id, _) = seed_answering_comment(&work_db);
-        let started = std::time::Instant::now();
         set_intent(&server_state, &work_db, &sink, &comment_id, INTENT_REVISION).await;
-        let elapsed = started.elapsed();
         let comment = work_db.get_comment(&comment_id).unwrap().unwrap();
         assert_eq!(comment.status, COMMENT_STATUS_ACTIVE);
         assert_eq!(comment.intent.as_deref(), Some(INTENT_REVISION));
@@ -2362,16 +2360,14 @@ mod tests {
                 .status,
             ANSWER_AGENT_RUN_STATUS_SUPERSEDED,
         );
-        eprintln!("thinking manual switch: {elapsed:?}; active before any answer completion");
 
-        // A label-only reclassification retains the historical delayed landing:
-        // the answer's terminal transition, rather than a timer, makes it active.
+        // This direct label-only write documents transition_comment_to_answered_on:
+        // it leaves the comment answering until the terminal transition lands it active.
+        // Production reclassification handles awaiting_followup, not answering rows.
         let (delayed_id, _) = seed_answering_comment(&work_db);
-        let started = std::time::Instant::now();
         work_db
             .reclassify_comment_intent(&delayed_id, INTENT_REVISION, 0.9)
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(
             work_db.get_comment(&delayed_id).unwrap().unwrap().status,
             COMMENT_STATUS_ANSWERING
@@ -2380,10 +2376,6 @@ mod tests {
         assert_eq!(
             work_db.get_comment(&delayed_id).unwrap().unwrap().status,
             COMMENT_STATUS_ACTIVE
-        );
-        eprintln!(
-            "label-only control: {:?}; active only after answer completion (100ms controlled hold)",
-            started.elapsed()
         );
     }
 

@@ -649,6 +649,44 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Reopen first.")
     }
 
+    func testDiscardDisconnectedPickClearsPendingAndShowsNotice() {
+        let model = ChatViewModel(socketPath: "/tmp/intent-discard-unused.sock")
+        let layer = CommentLayer()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: model.commentBridge)
+        layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", status: "answering", intent: "question")])
+        layer.setIntent(.revision, for: layer.comments[0])
+        XCTAssertEqual(layer.pendingIntent(for: layer.comments[0]), .revision)
+        XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Will send on Retry.")
+
+        model.dismissDisconnectedActions()
+
+        XCTAssertNil(layer.pendingIntent(for: layer.comments[0]))
+        XCTAssertTrue(model.commentBridge.pendingIntentRequests.isEmpty)
+        XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Kind change discarded.")
+        XCTAssertFalse(model.engine.hasUnsentActions)
+    }
+
+    func testDiscardAfterReconnectAndReloadUsesEngineKind() {
+        let model = ChatViewModel(socketPath: "/tmp/intent-discard-reconnect-unused.sock")
+        let layer = CommentLayer()
+        layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: model.commentBridge)
+        let authoritative = Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", status: "answering", intent: "question")
+        layer.applyList([authoritative])
+        layer.setIntent(.revision, for: layer.comments[0])
+        model.engine.simulateConnectedForTesting = true
+        model.commentBridge.handleReconnected()
+        XCTAssertEqual(layer.pendingIntent(for: layer.comments[0]), .revision)
+
+        model.dismissDisconnectedActions()
+        model.commentBridge.handleCommentsList(artifactKind: "work_item", artifactId: "t", comments: [authoritative])
+
+        XCTAssertEqual(layer.comments[0].intent, .question)
+        XCTAssertNil(layer.pendingIntent(for: layer.comments[0]))
+        XCTAssertTrue(model.commentBridge.pendingIntentRequests.isEmpty)
+        XCTAssertEqual(layer.intentRefusal(for: layer.comments[0]), "Kind change discarded.")
+        XCTAssertFalse(model.engine.hasUnsentActions)
+    }
+
     func testRejectedDisconnectedPickDoesNotStayPending() {
         let (engine, bridge, layer) = intentBridgeFixture(connected: false)
         for index in 0..<EngineClient.maxUnsentActions {

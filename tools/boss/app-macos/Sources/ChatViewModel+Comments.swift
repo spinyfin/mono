@@ -286,15 +286,8 @@ final class CommentEngineBridge: CommentBackend {
     func handleReconnected() {
         // Replies to requests sent before the drop are gone with the old
         // session; the reload below re-reads the engine's state instead.
-        for (requestId, commentId) in pendingIntentRequests where !engine.isAwaitingRetry(requestId) {
-            if latestIntentRequest[commentId] == requestId {
-                forEachLayer(containing: commentId) {
-                    $0.applyIntentRefusal(commentId: commentId, reason: "Request interrupted by reconnect. Pick a kind to try again.")
-                }
-                latestIntentRequest[commentId] = nil
-            }
-        }
-        pendingIntentRequests = pendingIntentRequests.filter { engine.isAwaitingRetry($0.key) }
+        abandonIntentRequests(pendingIntentRequests.keys.filter { !engine.isAwaitingRetry($0) },
+                              reason: "Request interrupted by reconnect. Pick a kind to try again.")
         var resubscribed = Set<String>()
         for reg in registrations.values {
             guard let layer = reg.layer else { continue }
@@ -303,6 +296,21 @@ final class CommentEngineBridge: CommentBackend {
                 engine.sendSubscribe(topics: [topic])
             }
             layer.reload()
+        }
+    }
+
+    func handleDiscardedRequests(_ requestIds: [String]) {
+        abandonIntentRequests(requestIds, reason: "Kind change discarded.")
+    }
+
+    private func abandonIntentRequests(_ requestIds: [String], reason: String) {
+        for requestId in requestIds {
+            guard let commentId = pendingIntentRequests.removeValue(forKey: requestId),
+                  latestIntentRequest[commentId] == requestId else { continue }
+            latestIntentRequest[commentId] = nil
+            forEachLayer(containing: commentId) {
+                $0.applyIntentRefusal(commentId: commentId, reason: reason)
+            }
         }
     }
 

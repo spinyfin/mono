@@ -125,7 +125,7 @@ extension ChatViewModel {
     func dismissDisconnectedActions() {
         let discardedDragIDs = engine.unsentDragTaskIDs()
         let discardingCoordinatorReset = engine.hasUnsentAction(kind: "recreate_coordinator")
-        engine.discardUnsentActions()
+        commentBridge.handleDiscardedRequests(engine.discardUnsentActions())
         retryingDisconnectedActions = engine.hasRetriedActions
         if !discardedDragIDs.isEmpty {
             for id in discardedDragIDs { pendingDragAdmissionChecks[id] = nil }
