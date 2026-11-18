@@ -61,6 +61,13 @@ pub(crate) fn run_bounded_as(command: &mut Command, timeout: Duration, failure_p
     run_bounded_in(&IN_FLIGHT, command, timeout, failure_prefix)
 }
 
+/// Spawn retries after `ETXTBSY`. A just-written executable can stay busy
+/// while another thread in this process forks and the child still inherits a
+/// write fd, or while the kernel still has the inode mapped after a previous
+/// exec. Linux then fails `execve` until that writer closes.
+const ETXTBSY_SPAWN_ATTEMPTS: u32 = 50;
+const ETXTBSY_SPAWN_RETRY_SLEEP: Duration = Duration::from_millis(20);
+
 pub(crate) fn run_bounded_in(
     in_flight: &InFlight,
     command: &mut Command,
@@ -68,25 +75,36 @@ pub(crate) fn run_bounded_in(
     failure_prefix: &str,
 ) -> anyhow::Result<Output> {
     let rendered = render_command(command);
-    let registered = std::cell::Cell::new(None);
-    let result = boss_command_runner::output_blocking_timeout_in_group(command, timeout, |pid| {
-        in_flight.map().insert(pid, rendered.clone());
-        registered.set(Some(pid));
-    });
-    if let Some(pid) = registered.get() {
-        in_flight.map().remove(&pid);
-    }
-    result.map_err(|err| {
-        if err.kind() == std::io::ErrorKind::TimedOut {
-            anyhow::anyhow!(
-                "{failure_prefix}: `{rendered}` did not complete within {}s and was killed \
-                 along with its process group",
-                timeout.as_secs()
-            )
-        } else {
-            anyhow::Error::new(err).context(format!("{failure_prefix}: running `{rendered}`"))
+    let mut attempt = 0;
+    loop {
+        let registered = std::cell::Cell::new(None);
+        let result = boss_command_runner::output_blocking_timeout_in_group(command, timeout, |pid| {
+            in_flight.map().insert(pid, rendered.clone());
+            registered.set(Some(pid));
+        });
+        if let Some(pid) = registered.get() {
+            in_flight.map().remove(&pid);
         }
-    })
+        match result {
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempt + 1 < ETXTBSY_SPAWN_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(ETXTBSY_SPAWN_RETRY_SLEEP);
+            }
+            result => {
+                return result.map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::TimedOut {
+                        anyhow::anyhow!(
+                            "{failure_prefix}: `{rendered}` did not complete within {}s and was killed \
+                             along with its process group",
+                            timeout.as_secs()
+                        )
+                    } else {
+                        anyhow::Error::new(err).context(format!("{failure_prefix}: running `{rendered}`"))
+                    }
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +119,44 @@ mod tests {
         assert!(output.status.success(), "status={}", output.status);
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("bounded-ok"),
+            "stdout={:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Linux refuses `execve` while any fd still has the file open for write.
+    /// Holding that writer on another thread, then closing it mid-retry, is
+    /// the race `agy --version` hits after a test overwrites a just-run binary.
+    #[test]
+    fn etxtbsy_from_an_open_writer_is_retried() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("busy.sh");
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&script)
+                .unwrap();
+            file.write_all(b"#!/bin/sh\necho ready\n").unwrap();
+            file.flush().unwrap();
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let holder = OpenOptions::new().write(true).open(&script).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(holder);
+        });
+        let mut command = Command::new(&script);
+        let output = run_bounded_as(&mut command, Duration::from_secs(5), "etxtbsy test").unwrap();
+        closer.join().unwrap();
+        assert!(output.status.success(), "status={}", output.status);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ready"),
             "stdout={:?}",
             String::from_utf8_lossy(&output.stdout)
         );
