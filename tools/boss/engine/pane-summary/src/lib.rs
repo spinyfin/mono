@@ -146,14 +146,17 @@ pub fn local_fallback(name: &str) -> Option<String> {
 /// articles, prepositions, conjunctions, and copulas. When a fragment
 /// must be cut, we walk the cut point back off any of these so the
 /// result doesn't stop mid-clause (e.g. on "the", "for", "is").
+/// Pronouns, negation, and auxiliary verbs also need their following clause.
 const DANGLING_STOPWORDS: &[&str] = &[
     "a", "an", "the", "of", "for", "to", "with", "by", "into", "onto", "on", "in", "and", "or", "but", "from", "as",
-    "at", "is", "are", "was", "were", "be",
+    "at", "is", "are", "was", "were", "be", "been", "that", "which", "this", "these", "those", "its", "their", "it",
+    "not", "so", "if", "when", "than", "then", "about", "over", "under", "via", "per", "has", "have", "had", "does",
+    "do", "nothing",
 ];
 
 /// Clause punctuation that should not sit immediately before an ellipsis,
 /// and that should not mask a dangling stopword (`"for,"`).
-const TRAILING_CLAUSE_PUNCT: [char; 4] = [',', ';', ':', '-'];
+const TRAILING_CLAUSE_PUNCT: [char; 7] = [',', ';', ':', '-', '\u{2014}', '\u{2013}', '&'];
 
 fn strip_trailing_clause_punct(word: &str) -> &str {
     word.trim_end_matches(TRAILING_CLAUSE_PUNCT)
@@ -170,20 +173,55 @@ fn is_dangling(word: &str) -> bool {
     word.is_empty() || ends_in_possessive(word) || DANGLING_STOPWORDS.contains(&word.to_lowercase().as_str())
 }
 
+/// Whether `text` ends inside an open quote or bracket. An apostrophe
+/// between two alphanumerics (`"don't"`, `"engine's"`) is not a quote.
+fn has_open_delimiter(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut depth: i32 = 0;
+    let mut in_double = false;
+    let mut in_single = false;
+    for (i, &c) in chars.iter().enumerate() {
+        let prev_alnum = i > 0 && chars[i - 1].is_alphanumeric();
+        let next_alnum = chars.get(i + 1).is_some_and(|n| n.is_alphanumeric());
+        match c {
+            '(' | '[' | '{' if !in_double && !in_single => depth += 1,
+            ')' | ']' | '}' if !in_double && !in_single => depth = (depth - 1).max(0),
+            '"' if !in_single => in_double = !in_double,
+            '\u{201c}' if !in_single => in_double = true,
+            '\u{201d}' if !in_single => in_double = false,
+            '\'' | '\u{2018}' | '\u{2019}' if prev_alnum && next_alnum => {}
+            '\'' | '\u{2019}'
+                if !in_single
+                    && i > 0
+                    && matches!(chars[i - 1], 's' | 'S')
+                    && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) => {}
+            '\'' if !in_double => in_single = !in_single,
+            '\u{2018}' if !in_double => in_single = true,
+            '\u{2019}' if !in_double => in_single = false,
+            _ => {}
+        }
+    }
+    depth > 0 || in_double || in_single
+}
+
+/// A word that ends in the middle of an identifier or path (`"foo::"`,
+/// `"src/"`, `"snake_"`, `"key="`).
+fn ends_mid_identifier(word: &str) -> bool {
+    word.ends_with("::") || word.ends_with(['/', '\\', '_', '=', '(', '[', '{', '<', '#', '@'])
+}
+
 /// Take up to `max_words` words from `task_name` for embedding in a
 /// derived pane-title phrase, preserving the name's original casing —
 /// the borrowed name is a proper noun / identifier fragment, not the
 /// fixed verb phrase it's spliced into, so it must not be lowercased.
 ///
 /// A name that already fits within `max_words` is returned whole and
-/// unmarked. A name that must be shortened has its cut point walked
-/// back off any trailing article, preposition, conjunction, copula, or
-/// possessive (see [`is_dangling`]) so it doesn't stop mid-clause, and
-/// gets a trailing "…" so the shortening reads as a deliberate
-/// abbreviation rather than data cut off by accident. Trailing `,`,
-/// `;`, `:`, and `-` on the last kept word are stripped before the
-/// ellipsis, and the same marks are ignored when classifying a word as
-/// dangling.
+/// unmarked. For a shortened name, walk the cut point back past:
+/// - dangling articles, prepositions, conjunctions, copulas, or possessives;
+/// - words ending mid-identifier;
+/// - fragments with an open quote or bracket.
+///
+/// Strip trailing clause punctuation and append "…" to mark the abbreviation.
 ///
 /// Returns `None` when the name is empty or reduces to nothing but
 /// dangling words, so the caller can fall back to its fixed short
@@ -199,7 +237,7 @@ fn name_fragment(task_name: &str, max_words: usize) -> Option<String> {
     }
     let mut candidate = &words[..max_words];
     while let Some(last) = candidate.last() {
-        if is_dangling(last) {
+        if is_dangling(last) || ends_mid_identifier(last) || has_open_delimiter(&candidate.join(" ")) {
             candidate = &candidate[..candidate.len() - 1];
         } else {
             break;
@@ -216,75 +254,118 @@ fn name_fragment(task_name: &str, max_words: usize) -> Option<String> {
     Some(format!("{fragment}…"))
 }
 
-/// Splice a fixed verb phrase together with a shortened, case-preserved
-/// fragment of `task_name` (see [`name_fragment`]), falling back to the
-/// shorter fixed `fallback` phrase when the name is empty or has no
-/// legible fragment to offer. Shared by [`conflict_resolution_summary`],
-/// [`ci_remediation_summary`], and [`pr_review_summary`], which differ
-/// only in their verb phrase, fallback text, and word budget.
-fn derived_task_phrase(verb_phrase: &str, fallback: &str, task_name: &str, max_words: usize) -> String {
-    match name_fragment(task_name, max_words) {
-        Some(fragment) => format!("{verb_phrase} {fragment}"),
-        None => fallback.to_owned(),
+/// Overall word budget for a derived title (verb plus whatever is spliced in),
+/// matching the ~7-word UI guidance for pane titles.
+const DERIVED_TITLE_WORD_BUDGET: usize = 7;
+
+/// How one derived execution kind words its pane title.
+struct DerivedPhrase {
+    /// Short verb used before `": <cached summary>"`.
+    cached_verb: &'static str,
+    /// Verb phrase spliced directly before the item name when nothing is cached.
+    name_verb: &'static str,
+    /// Shown when the name offers no legible fragment.
+    fallback: &'static str,
+    /// Word cap on the name fragment in the name-based phrase.
+    name_words: usize,
+}
+
+impl DerivedPhrase {
+    /// Prefer the item's cached implementer summary (`"reviewing: fixing
+    /// queued-reason labels on cards"`); otherwise splice a shortened,
+    /// case-preserved fragment of `task_name` (see [`name_fragment`]) after the
+    /// verb phrase, or use the fixed `fallback` when the name is empty or has
+    /// no legible fragment.
+    fn render(&self, task_name: &str, cached_summary: Option<&str>) -> String {
+        if let Some(cached) = cached_summary {
+            let budget = DERIVED_TITLE_WORD_BUDGET.saturating_sub(self.cached_verb.split_whitespace().count());
+            if let Some(fragment) = name_fragment(cached, budget.max(1)) {
+                return format!("{}: {fragment}", self.cached_verb);
+            }
+        }
+        match name_fragment(task_name, self.name_words) {
+            Some(fragment) => format!("{} {fragment}", self.name_verb),
+            None => self.fallback.to_owned(),
+        }
     }
 }
 
-/// Returns a fixed gerund phrase for conflict-resolution workers, overriding
-/// the original task's pane summary so the pane titlebar reads
-/// `"<Name> is resolving merge conflicts for <task-name>"` rather than
-/// `"<Name> is implementing …"` (the original task's gerund).
-///
-/// The task name is capped to 3 words so the combined phrase stays within
-/// the 7-word UI guidance. If the task name is empty the shorter
-/// `"resolving merge conflicts"` is returned instead.
-pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
-    Some(derived_task_phrase(
-        "resolving merge conflicts for",
-        "resolving merge conflicts",
-        task_name,
-        3,
-    ))
+/// Read the work item's cached implementer summary without writing it. The
+/// derived kinds share the implementer's `work_item_id`, so they may only
+/// *read* this slot — writing it would flap the implementer's pane. Returns
+/// `None` when nothing is cached or the lookup fails.
+pub fn cached_summary(db: &WorkDb, work_item_id: &str) -> Option<String> {
+    match db.get_pane_summary(work_item_id) {
+        Ok(Some((summary, _basis))) if !summary.trim().is_empty() => Some(summary),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(work_item_id, ?err, "pane_summary: cache read failed for derived title");
+            None
+        }
+    }
+}
+
+/// Pane summary for conflict-resolution workers, overriding the original
+/// task's gerund so the title reads `"<Name> is resolving conflicts: <summary>"`
+/// (cached implementer summary) or `"... resolving merge conflicts for
+/// <task-name>"` (name fallback, name capped to 3 words).
+pub fn conflict_resolution_summary(task_name: &str, cached_summary: Option<&str>) -> Option<String> {
+    Some(
+        DerivedPhrase {
+            cached_verb: "resolving conflicts",
+            name_verb: "resolving merge conflicts for",
+            fallback: "resolving merge conflicts",
+            name_words: 3,
+        }
+        .render(task_name, cached_summary),
+    )
 }
 
 /// Pane summary for `ci_remediation` workers — same rationale as
-/// [`conflict_resolution_summary`]. Reads as `"<Name> is fixing CI for
-/// <task-name>"` (or the shorter `"fixing CI"` when the task name is
-/// empty / unavailable).
-pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
-    Some(derived_task_phrase("fixing CI for", "fixing CI", task_name, 3))
+/// [`conflict_resolution_summary`]. Reads as `"fixing CI: <summary>"` or
+/// `"fixing CI for <task-name>"`, or the bare `"fixing CI"`.
+pub fn ci_remediation_summary(task_name: &str, cached_summary: Option<&str>) -> Option<String> {
+    Some(
+        DerivedPhrase {
+            cached_verb: "fixing CI",
+            name_verb: "fixing CI for",
+            fallback: "fixing CI",
+            name_words: 3,
+        }
+        .render(task_name, cached_summary),
+    )
 }
 
-/// Pane summary for `pr_review` workers. A reviewer's `work_item_id` is
-/// bound to the *reviewed* task (see `coordinator.rs`), so routing it
-/// through [`get_or_generate`] would read/overwrite the implementer's
-/// cached gerund for that same row — flapping both panes. Use a pure
-/// derived phrase instead, mirroring [`ci_remediation_summary`], so the
-/// pane reads `"<Name> is reviewing the PR for <task-name>"` rather than
-/// the implementer's own "addressing …" gerund.
-///
-/// The task name is capped to 3 words (not 4: `"reviewing the PR for"`
-/// is itself 4 words, so a 4-word fragment would blow the 7-word budget)
-/// so the combined phrase stays within the 7-word UI guidance.
-pub fn pr_review_summary(task_name: &str) -> Option<String> {
-    Some(derived_task_phrase(
-        "reviewing the PR for",
-        "reviewing a pull request",
-        task_name,
-        3,
-    ))
+/// Pane summary for `pr_review` workers. A reviewer's `work_item_id` is bound
+/// to the *reviewed* task, so this only reads that row's cached gerund (never
+/// [`get_or_generate`], which would overwrite it). Reads as `"reviewing:
+/// <summary>"` or `"reviewing the PR for <task-name>"` (name capped to 3 words).
+pub fn pr_review_summary(task_name: &str, cached_summary: Option<&str>) -> Option<String> {
+    Some(
+        DerivedPhrase {
+            cached_verb: "reviewing",
+            name_verb: "reviewing the PR for",
+            fallback: "reviewing a pull request",
+            name_words: 3,
+        }
+        .render(task_name, cached_summary),
+    )
 }
 
 /// Pane summary for the consolidating agent of an AI review. Distinct from
 /// [`pr_review_summary`] so the pane does not read as one more reviewer: it
-/// reads `"<Name> is consolidating review findings for <task-name>"`. The
-/// task name is capped to 2 words to stay within the 7-word UI guidance.
-pub fn pr_review_consolidation_summary(task_name: &str) -> Option<String> {
-    Some(derived_task_phrase(
-        "consolidating review findings for",
-        "consolidating review findings",
-        task_name,
-        2,
-    ))
+/// reads `"consolidating review: <summary>"` or `"consolidating review
+/// findings for <task-name>"` (name capped to 2 words).
+pub fn pr_review_consolidation_summary(task_name: &str, cached_summary: Option<&str>) -> Option<String> {
+    Some(
+        DerivedPhrase {
+            cached_verb: "consolidating review",
+            name_verb: "consolidating review findings for",
+            fallback: "consolidating review findings",
+            name_words: 2,
+        }
+        .render(task_name, cached_summary),
+    )
 }
 
 /// Pane summary for `answer_agent` workers. The synthetic work item's
@@ -292,52 +373,57 @@ pub fn pr_review_consolidation_summary(task_name: &str) -> Option<String> {
 /// (up to 600 raw chars of someone else's text as the "description") —
 /// feeding either through [`get_or_generate`] risks steering Claude toward
 /// the comment's own verb instead of "answering". A fixed derived phrase
-/// sidesteps the model call entirely, mirroring [`ci_remediation_summary`].
+/// sidesteps the model call entirely.
 pub fn answer_agent_summary() -> Option<String> {
     Some("answering a doc comment".to_owned())
 }
 
-/// Pane summary for `progression` agents — same rationale as
-/// [`ci_remediation_summary`]: the run's `work_item_id` is the stuck item
-/// itself, so the cached implementer gerund must not be read or overwritten.
-/// Reads as `"<Name> is unsticking <task-name>"`, or the shorter `"unsticking
-/// work"` when the task name is empty.
-pub fn progression_summary(task_name: &str) -> Option<String> {
-    Some(derived_task_phrase("unsticking", "unsticking work", task_name, 3))
+/// Pane summary for `progression` agents. The run's `work_item_id` is the stuck
+/// item itself, so the cached implementer gerund is read but never written.
+/// Reads as `"unsticking: <summary>"`, `"unsticking <task-name>"`, or the
+/// bare `"unsticking work"`.
+pub fn progression_summary(task_name: &str, cached_summary: Option<&str>) -> Option<String> {
+    Some(
+        DerivedPhrase {
+            cached_verb: "unsticking",
+            name_verb: "unsticking",
+            fallback: "unsticking work",
+            name_words: 3,
+        }
+        .render(task_name, cached_summary),
+    )
 }
 
-/// Derived phrase for [`ExecutionKind::PrReviewGuide`]. This kind's synthetic
-/// row is keyed by a source comparison id, not a real task, so there is no
-/// `work_item_id` cache slot worth sharing and no model call worth spending on
-/// a titlebar phrase. `task_name` is the owning root task's name (not the
-/// synthetic row's `Review guide: <PR title>`), so the pane reads
-/// `"<Name> is generating a review guide for <task-name>"`; it is capped to 2
-/// words because the verb phrase is already 5. Falls back to the bare phrase
-/// when the series has no owning task.
-pub fn review_guide_summary(task_name: &str) -> Option<String> {
-    Some(derived_task_phrase(
-        "generating a review guide for",
-        "generating a review guide",
-        task_name,
-        2,
-    ))
+/// Derived phrase for [`ExecutionKind::PrReviewGuide`]. `task_name` is the
+/// owning root task's name (not the synthetic row's `Review guide: <PR
+/// title>`) and `cached_summary` is that owning task's cache slot. Reads as
+/// `"review guide: <summary>"`, `"generating a review guide for
+/// <task-name>"` (name capped to 2 words), or the bare phrase when the series
+/// has no owning task.
+pub fn review_guide_summary(task_name: &str, cached_summary: Option<&str>) -> Option<String> {
+    Some(
+        DerivedPhrase {
+            cached_verb: "review guide",
+            name_verb: "generating a review guide for",
+            fallback: "generating a review guide",
+            name_words: 2,
+        }
+        .render(task_name, cached_summary),
+    )
 }
 
 /// Route an execution kind to a *derived* pane-titlebar phrase, bypassing
 /// [`get_or_generate`] entirely — or `None` to say "fall through to the
 /// cached/LLM path".
 ///
-/// `pane_summaries` is keyed by `work_item_id` alone, and `PrReview` and
-/// `ConflictResolution` executions bind `work_item_id` to the *reviewed/
-/// conflicted* task's own row (see `coordinator.rs`), same as
-/// `CiRemediation`. Routing any of them through `get_or_generate` — even
-/// with a kind-aware prompt — would read and overwrite the implementer's
-/// cached summary for that row, flapping both panes. `AnswerAgent`'s
-/// synthetic row has a different problem: its "description" is the raw
-/// body of the comment being answered, which can steer the model toward
-/// the comment's own verb instead of "answering". All four get a pure
-/// derived phrase instead, computed from data already in hand — no cache,
-/// no model call.
+/// `pane_summaries` is keyed by `work_item_id` alone, and `PrReview`,
+/// `ConflictResolution`, `CiRemediation` and `Progression` executions bind
+/// `work_item_id` to the implementer's own row. Routing them through
+/// `get_or_generate` would overwrite the implementer's cached summary and
+/// flap both panes. They instead read the stored phrase through [`cached_summary`]
+/// and never write it; no model call is made. `AnswerAgent`'s
+/// synthetic row has a different problem (its description is someone else's
+/// comment text), so it keeps a fixed phrase.
 ///
 /// Matches [`ExecutionKind`] exhaustively per its doc comment so a new
 /// variant forces a decision here rather than silently falling through.
@@ -345,16 +431,17 @@ pub fn derived_title_summary(
     kind: &ExecutionKind,
     review_stage: Option<ReviewStage>,
     task_name: &str,
+    cached_summary: Option<&str>,
 ) -> Option<Option<String>> {
     match kind {
-        ExecutionKind::CiRemediation => Some(ci_remediation_summary(task_name)),
-        ExecutionKind::ConflictResolution => Some(conflict_resolution_summary(task_name)),
+        ExecutionKind::CiRemediation => Some(ci_remediation_summary(task_name, cached_summary)),
+        ExecutionKind::ConflictResolution => Some(conflict_resolution_summary(task_name, cached_summary)),
         ExecutionKind::PrReview if review_stage == Some(ReviewStage::Consolidation) => {
-            Some(pr_review_consolidation_summary(task_name))
+            Some(pr_review_consolidation_summary(task_name, cached_summary))
         }
-        ExecutionKind::PrReview => Some(pr_review_summary(task_name)),
+        ExecutionKind::PrReview => Some(pr_review_summary(task_name, cached_summary)),
         ExecutionKind::AnswerAgent => Some(answer_agent_summary()),
-        ExecutionKind::PrReviewGuide => Some(review_guide_summary(task_name)),
+        ExecutionKind::PrReviewGuide => Some(review_guide_summary(task_name, cached_summary)),
         ExecutionKind::AutomationTriage
         | ExecutionKind::ChoreImplementation
         | ExecutionKind::InvestigationImplementation
@@ -362,10 +449,35 @@ pub fn derived_title_summary(
         | ExecutionKind::ProjectDesign
         | ExecutionKind::RevisionImplementation
         | ExecutionKind::TaskImplementation => None,
-        // A progression run is bound to the stuck item itself, so its row title
-        // is that item's own title: routing it through `get_or_generate` would
-        // read and overwrite the implementer's cached summary, flapping both.
-        ExecutionKind::Progression => Some(progression_summary(task_name)),
+        ExecutionKind::Progression => Some(progression_summary(task_name, cached_summary)),
+    }
+}
+
+/// Resolve the pane spawner's title, including review-guide ownership and the
+/// boundary between read-only derived titles and model-generated summaries.
+pub async fn title_for_spawn(
+    db: &WorkDb,
+    utility: &dyn UtilityModel,
+    kind: &ExecutionKind,
+    review_stage: Option<ReviewStage>,
+    execution_work_item_id: &str,
+    work_item: &WorkItem,
+) -> Option<String> {
+    let owner = (kind == &ExecutionKind::PrReviewGuide).then(|| db.owning_work_item_id(execution_work_item_id));
+    let owner_item = owner.as_deref().and_then(|id| db.get_work_item(id).ok());
+    let subject = if owner.is_some() {
+        owner_item
+            .as_ref()
+            .map(name_and_description)
+            .map(|(name, _)| name)
+            .unwrap_or_default()
+    } else {
+        name_and_description(work_item).0
+    };
+    let cached = cached_summary(db, owner.as_deref().unwrap_or_else(|| item_id(work_item)));
+    match derived_title_summary(kind, review_stage, subject, cached.as_deref()) {
+        Some(summary) => summary,
+        None => get_or_generate(db, utility, work_item).await,
     }
 }
 
@@ -549,6 +661,9 @@ fn clean_summary(raw: &str) -> String {
 }
 
 #[cfg(test)]
+mod derived_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use boss_protocol::{Task, TaskKind, TaskStatus};
@@ -564,7 +679,7 @@ mod tests {
         boss_engine_utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)
     }
 
-    fn sample_task(id: &str, name: &str, description: &str) -> WorkItem {
+    pub(super) fn sample_task(id: &str, name: &str, description: &str) -> WorkItem {
         WorkItem::Task(
             Task::builder()
                 .id(id)
@@ -634,7 +749,7 @@ mod tests {
     #[test]
     fn conflict_resolution_summary_walks_back_off_a_dangling_word_and_marks_the_cut() {
         assert_eq!(
-            conflict_resolution_summary("Implementing app and engine resolution path").as_deref(),
+            conflict_resolution_summary("Implementing app and engine resolution path", None).as_deref(),
             Some("resolving merge conflicts for Implementing app…"),
         );
     }
@@ -642,7 +757,7 @@ mod tests {
     #[test]
     fn conflict_resolution_summary_preserves_task_name_casing() {
         assert_eq!(
-            conflict_resolution_summary("Fix The Fencer Scraper").as_deref(),
+            conflict_resolution_summary("Fix The Fencer Scraper", None).as_deref(),
             Some("resolving merge conflicts for Fix The Fencer…"),
         );
     }
@@ -650,7 +765,7 @@ mod tests {
     #[test]
     fn conflict_resolution_summary_passes_short_task_name_through_unmarked() {
         assert_eq!(
-            conflict_resolution_summary("Fix it").as_deref(),
+            conflict_resolution_summary("Fix it", None).as_deref(),
             Some("resolving merge conflicts for Fix it"),
         );
     }
@@ -658,11 +773,11 @@ mod tests {
     #[test]
     fn conflict_resolution_summary_handles_empty_task_name() {
         assert_eq!(
-            conflict_resolution_summary("").as_deref(),
+            conflict_resolution_summary("", None).as_deref(),
             Some("resolving merge conflicts"),
         );
         assert_eq!(
-            conflict_resolution_summary("   ").as_deref(),
+            conflict_resolution_summary("   ", None).as_deref(),
             Some("resolving merge conflicts"),
         );
     }
@@ -670,29 +785,32 @@ mod tests {
     #[test]
     fn ci_remediation_summary_caps_at_three_words_preserving_case_and_marking_the_cut() {
         assert_eq!(
-            ci_remediation_summary("Fix flaky fencer scraper test").as_deref(),
+            ci_remediation_summary("Fix flaky fencer scraper test", None).as_deref(),
             Some("fixing CI for Fix flaky fencer…"),
         );
     }
 
     #[test]
     fn ci_remediation_summary_handles_empty_task_name() {
-        assert_eq!(ci_remediation_summary("").as_deref(), Some("fixing CI"));
-        assert_eq!(ci_remediation_summary("   ").as_deref(), Some("fixing CI"));
+        assert_eq!(ci_remediation_summary("", None).as_deref(), Some("fixing CI"));
+        assert_eq!(ci_remediation_summary("   ", None).as_deref(), Some("fixing CI"));
     }
 
     #[test]
     fn pr_review_summary_caps_at_three_words_to_stay_within_the_seven_word_budget() {
         assert_eq!(
-            pr_review_summary("Address automated PR review findings").as_deref(),
+            pr_review_summary("Address automated PR review findings", None).as_deref(),
             Some("reviewing the PR for Address automated PR…"),
         );
     }
 
     #[test]
     fn pr_review_summary_handles_empty_task_name() {
-        assert_eq!(pr_review_summary("").as_deref(), Some("reviewing a pull request"));
-        assert_eq!(pr_review_summary("   ").as_deref(), Some("reviewing a pull request"));
+        assert_eq!(pr_review_summary("", None).as_deref(), Some("reviewing a pull request"));
+        assert_eq!(
+            pr_review_summary("   ", None).as_deref(),
+            Some("reviewing a pull request")
+        );
     }
 
     /// A long sentence-shaped name whose first three words end on a
@@ -703,7 +821,8 @@ mod tests {
     fn pr_review_summary_walks_back_off_a_trailing_possessive() {
         assert_eq!(
             pr_review_summary(
-                "SessionEnd from the engine's own reap resurrects abandoned executions into unreapable phantoms"
+                "SessionEnd from the engine's own reap resurrects abandoned executions into unreapable phantoms",
+                None
             )
             .as_deref(),
             Some("reviewing the PR for SessionEnd…"),
@@ -713,20 +832,23 @@ mod tests {
     #[test]
     fn review_guide_summary_names_the_owning_task_and_falls_back_without_one() {
         assert_eq!(
-            review_guide_summary("Header metadata for panes").as_deref(),
+            review_guide_summary("Header metadata for panes", None).as_deref(),
             Some("generating a review guide for Header metadata…"),
         );
-        assert_eq!(review_guide_summary("").as_deref(), Some("generating a review guide"));
+        assert_eq!(
+            review_guide_summary("", None).as_deref(),
+            Some("generating a review guide")
+        );
     }
 
     #[test]
     fn pr_review_summary_trims_trailing_punctuation_before_the_ellipsis() {
         assert_eq!(
-            pr_review_summary("Fix the flake, then rerun CI").as_deref(),
+            pr_review_summary("Fix the flake, then rerun CI", None).as_deref(),
             Some("reviewing the PR for Fix the flake…"),
         );
         assert_eq!(
-            pr_review_summary("Read wire path: movement on the extra words").as_deref(),
+            pr_review_summary("Read wire path: movement on the extra words", None).as_deref(),
             Some("reviewing the PR for Read wire path…"),
         );
     }
@@ -734,7 +856,7 @@ mod tests {
     #[test]
     fn pr_review_summary_treats_punctuated_stopwords_as_dangling() {
         assert_eq!(
-            pr_review_summary("Ship feature for, extra words remaining").as_deref(),
+            pr_review_summary("Ship feature for, extra words remaining", None).as_deref(),
             Some("reviewing the PR for Ship feature…"),
         );
     }
@@ -742,7 +864,7 @@ mod tests {
     #[test]
     fn consolidation_stage_gets_its_own_pane_summary() {
         let summary = |stage| {
-            derived_title_summary(&ExecutionKind::PrReview, stage, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::PrReview, stage, "Fix flaky test", None)
                 .unwrap()
                 .unwrap()
         };
@@ -756,7 +878,7 @@ mod tests {
         );
         assert_eq!(summary(None), "reviewing the PR for Fix flaky test");
         assert_eq!(
-            pr_review_consolidation_summary("").as_deref(),
+            pr_review_consolidation_summary("", None).as_deref(),
             Some("consolidating review findings")
         );
     }
@@ -769,37 +891,37 @@ mod tests {
     #[test]
     fn derived_title_summary_routes_cache_hazard_kinds_to_derived_phrases() {
         assert_eq!(
-            derived_title_summary(&ExecutionKind::CiRemediation, None, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::CiRemediation, None, "Fix flaky test", None)
                 .unwrap()
                 .as_deref(),
             Some("fixing CI for Fix flaky test"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::ConflictResolution, None, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::ConflictResolution, None, "Fix flaky test", None)
                 .unwrap()
                 .as_deref(),
             Some("resolving merge conflicts for Fix flaky test"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::PrReview, None, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::PrReview, None, "Fix flaky test", None)
                 .unwrap()
                 .as_deref(),
             Some("reviewing the PR for Fix flaky test"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::AnswerAgent, None, "Answer comment: anything")
+            derived_title_summary(&ExecutionKind::AnswerAgent, None, "Answer comment: anything", None)
                 .unwrap()
                 .as_deref(),
             Some("answering a doc comment"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::Progression, None, "Fix flaky test")
+            derived_title_summary(&ExecutionKind::Progression, None, "Fix flaky test", None)
                 .unwrap()
                 .as_deref(),
             Some("unsticking Fix flaky test"),
         );
         assert_eq!(
-            derived_title_summary(&ExecutionKind::Progression, None, "")
+            derived_title_summary(&ExecutionKind::Progression, None, "", None)
                 .unwrap()
                 .as_deref(),
             Some("unsticking work"),
@@ -818,7 +940,7 @@ mod tests {
             ExecutionKind::TaskImplementation,
         ] {
             assert_eq!(
-                derived_title_summary(&kind, None, "Fix flaky test"),
+                derived_title_summary(&kind, None, "Fix flaky test", None),
                 None,
                 "{kind:?} should fall through to get_or_generate",
             );
