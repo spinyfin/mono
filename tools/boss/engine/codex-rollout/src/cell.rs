@@ -386,6 +386,7 @@ fn find_js_call(source: &str, name: &str) -> Option<usize> {
                     chars.next();
                     skip_js_block_comment(&mut chars);
                 }
+                _ if js_regex_allowed_before(source, at) => skip_js_regex_literal(&mut chars),
                 _ if js_call_at(source, at, name) => return Some(at),
                 _ => {}
             },
@@ -412,6 +413,60 @@ fn js_ident_boundary_at(source: &str, at: usize) -> bool {
         return true;
     };
     !preceding.is_ascii_alphanumeric() && preceding != '_' && preceding != '$'
+}
+
+/// Whether a `/` at byte offset `at` begins a regular-expression literal
+/// rather than a division, judged from the previous significant token: a
+/// regex can follow the start of input, an operator or opening punctuation,
+/// or a keyword such as `return`; it cannot follow an identifier, number,
+/// string or closing bracket.
+fn js_regex_allowed_before(source: &str, at: usize) -> bool {
+    let Some(prefix) = source.get(..at).map(str::trim_end) else {
+        return false;
+    };
+    let Some(last) = prefix.chars().next_back() else {
+        return true;
+    };
+    if last.is_ascii_alphanumeric() || last == '_' || last == '$' {
+        let word_start = prefix
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+            .map_or(0, |i| i + 1);
+        return matches!(
+            &prefix[word_start..],
+            "return"
+                | "typeof"
+                | "case"
+                | "do"
+                | "else"
+                | "in"
+                | "of"
+                | "void"
+                | "delete"
+                | "throw"
+                | "new"
+                | "yield"
+                | "await"
+        );
+    }
+    !matches!(last, ')' | ']' | '"' | '\'' | '`')
+}
+
+/// Skip a regex literal body (the opening `/` is already consumed): ends at
+/// the first unescaped `/` outside a `[...]` class, or at a newline.
+fn skip_js_regex_literal(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>) {
+    let mut in_class = false;
+    while let Some((_, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => return,
+            '\n' => return,
+            _ => {}
+        }
+    }
 }
 
 fn skip_js_line_comment(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>) {
@@ -471,7 +526,7 @@ fn object_literal_string_field(object: &str, field: &str) -> Option<String> {
 
 /// Take the balanced `{…}` object literal at the start of `source` (after
 /// any leading whitespace), respecting quoted string literals, comments,
-/// and escapes.
+/// regex literals, and escapes.
 fn balanced_object_literal(source: &str) -> Option<&str> {
     let trimmed = source.trim_start();
     let offset = source.len() - trimmed.len();
@@ -491,6 +546,7 @@ fn balanced_object_literal(source: &str) -> Option<&str> {
                     chars.next();
                     skip_js_block_comment(&mut chars);
                 }
+                _ if js_regex_allowed_before(trimmed, index) => skip_js_regex_literal(&mut chars),
                 _ => {}
             },
             '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
@@ -887,9 +943,31 @@ mod tests {
             cell_script_command(r#"await tools.exec_command({cmd:'a\0b\tc'});"#).as_deref(),
             Some("a\0b\tc")
         );
-        let unknown = r#"await tools.exec_command({cmd:"echo \q"});"#;
-        assert_eq!(cell_script_command(unknown), None);
-        assert!(script_issues_command(unknown));
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({env:"a\.b", cmd:"echo \$HOME \q"});"#).as_deref(),
+            Some("echo $HOME q")
+        );
+        for malformed in [r#"echo \x4"#, r#"echo \u00G1"#, r#"echo \u{110000}"#, r#"echo \7"#] {
+            let script = format!(r#"await tools.exec_command({{cmd:"{malformed}"}});"#);
+            assert_eq!(cell_script_command(&script), None, "{malformed}");
+            assert!(script_issues_command(&script));
+        }
+    }
+
+    const REGEX_SLASH_CELL: &str = r#"await tools.write_stdin({session_id:8467,chars:""}); const n = "a/b".replace(/\//g, "_"); await tools.exec_command({cmd:"sleep 999"});"#;
+
+    #[test]
+    fn a_regex_literal_containing_slashes_does_not_hide_a_later_exec_command() {
+        assert!(script_issues_command(REGEX_SLASH_CELL));
+        assert!(!script_is_continuation_only(REGEX_SLASH_CELL));
+        assert_eq!(cell_script_command(REGEX_SLASH_CELL).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_regex_that_looks_like_a_block_comment_does_not_hide_later_lines() {
+        let script = "await tools.write_stdin({session_id:8467,chars:\"\"});\nconst r = s.replace(/\\/*/g, \"\");\nawait tools.exec_command({cmd:\"sleep 999\"});\n";
+        assert!(!script_is_continuation_only(script));
+        assert_eq!(cell_script_command(script).as_deref(), Some("sleep 999"));
     }
 
     #[test]

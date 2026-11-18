@@ -90,7 +90,11 @@ fn decode_js_escape(chars: &mut Peekable<impl Iterator<Item = char>>, out: &mut 
             out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
         }
         'u' => decode_js_unicode_escape(chars, out)?,
-        _ => return None,
+        // Legacy octal escapes and `\8` / `\9` are rejected in strict code;
+        // refuse to guess at them.
+        '1'..='9' => return None,
+        // Every other escape is an identity escape: `\$` is `$`, `\q` is `q`.
+        other => out.push(other),
     }
     Some(())
 }
@@ -141,6 +145,8 @@ mod tests {
         assert_eq!(parsed["cmd"], "echo ABC");
         let parsed = parse_literal_object(r#"{cmd:'\x24BOSS_BIN propose done'}"#).unwrap();
         assert_eq!(parsed["cmd"], "$BOSS_BIN propose done");
+        let parsed = parse_literal_object(r#"{cmd:"echo \$HOME \q"}"#).unwrap();
+        assert_eq!(parsed["cmd"], "echo $HOME q");
     }
 
     #[test]
@@ -150,7 +156,6 @@ mod tests {
             "{cmd: 'boss ' + suffix}",
             "{cmd: `boss ${verb}`}",
             "{...options, cmd: 'boss propose done'}",
-            "{cmd: '\\q'}",
             "{cmd: 'unfinished}",
             "{cmd: ['boss',,]}",
             "{cmd: [,]}",
