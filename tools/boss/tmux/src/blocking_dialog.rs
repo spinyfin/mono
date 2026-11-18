@@ -100,7 +100,16 @@ fn dialog_contains(visible: &str, marker: &str) -> bool {
 /// The selected row of Antigravity's startup menus. Its trust dialog and its
 /// `Settings Error` screen carry no `esc to cancel` footer and no numbered
 /// choices; the answer is the `>`-marked row among unnumbered ones.
-const SELECTION_MENU_CHOICES: [&str; 2] = ["Yes, I trust this folder", "Exit and fix manually"];
+/// The cursor can rest on any row (a human arrow key), so every row of each
+/// menu's full option set is a blocking selection.
+const SELECTION_MENUS: [&[&str]; 2] = [
+    &["Yes, I trust this folder", "No, exit"],
+    &[
+        "Exit and fix manually",
+        "Continue with defaults this session",
+        "Overwrite the file with defaults",
+    ],
+];
 
 fn selection_menu_contains(visible: &str, marker: &str) -> bool {
     let mut lines: Vec<_> = visible.lines().collect();
@@ -121,7 +130,19 @@ fn selection_menu_contains(visible: &str, marker: &str) -> bool {
         .trim_start_matches(BOX_GLYPHS)
         .trim()
         .starts_with('>')
-        || !SELECTION_MENU_CHOICES.contains(&normalize_dialog_line(lines[selected]))
+    {
+        return false;
+    }
+    let selected_row = normalize_dialog_line(lines[selected]);
+    let Some(menu) = SELECTION_MENUS.iter().find(|menu| menu.contains(&selected_row)) else {
+        return false;
+    };
+    // The whole option set must sit around the selection, so a single quoted
+    // row in prose cannot qualify.
+    let window = &lines[selected.saturating_sub(menu.len())..(selected + menu.len()).min(lines.len())];
+    if !menu
+        .iter()
+        .all(|choice| window.iter().any(|line| normalize_dialog_line(line) == *choice))
     {
         return false;
     }

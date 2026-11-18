@@ -206,3 +206,55 @@ time.sleep(30)
     let log = fs::read_to_string(temp.path().join("initial-prompt.delivery.jsonl")).unwrap();
     assert!(log.contains("post_submit_failure"), "{log}");
 }
+
+#[test]
+fn launcher_ignores_the_marker_when_it_only_appears_in_the_brief_or_mid_row() {
+    use crate::AgentDriver;
+    let markers = crate::AgyDriver::default().post_submit_failure_markers();
+    let temp = tempfile::tempdir().unwrap();
+    provision(
+        temp.path(),
+        temp.path(),
+        "Eligibility check failed is quoted in this brief",
+        &crate::ClaudeDriver,
+    )
+    .unwrap();
+    let config_path = temp.path().join("initial-prompt.json");
+    let mut config: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["post_submit_failure_markers"] = serde_json::json!(markers);
+    fs::write(&config_path, config.to_string()).unwrap();
+    let stub = temp.path().join("driver.py");
+    // The stub renders the brief literally (as agy does), repaints, then prints
+    // agent output that mentions the phrase mid-row, and exits normally.
+    fs::write(
+        &stub,
+        r#"
+import os, tty, time
+tty.setraw(0)
+os.write(1, b'\x1b[?2004hClaude Code')
+data = b''
+while not data.endswith(b'\x1b[201~'):
+    data += os.read(0, 4096)
+os.write(1, b'\r\n> Eligibility check failed is quoted in this brief')
+while not data.endswith(b'\r'):
+    data += os.read(0, 4096)
+time.sleep(0.5)
+os.write(1, b'\r\n> Eligibility check failed is quoted in this brief')
+os.write(1, b'\r\ngrep: the string Eligibility check failed appears in docs\r\n')
+time.sleep(1.5)
+"#,
+    )
+    .unwrap();
+    let output = boss_command_runner::output_blocking_timeout(
+        std::process::Command::new("python3")
+            .arg(temp.path().join("initial-prompt.py"))
+            .arg("python3")
+            .arg(stub)
+            .stdin(std::process::Stdio::null()),
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("submitted brief was dropped"), "{stderr}");
+    assert!(delivered_marker_present(temp.path()));
+}

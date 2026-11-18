@@ -286,7 +286,14 @@ def _is_later_composer(line):
     return bool(row) and (PROMPT_MARK in row or row.startswith(b">"))
 
 
-SELECTION_MENU_CHOICES = (b"Yes, I trust this folder", b"Exit and fix manually")
+# Every row of Antigravity's two footer-less startup menus: the folder-trust
+# dialog and the `Settings Error` screen. The cursor can rest on any of them
+# (a human arrow key), so the guard must hold for each selection.
+SELECTION_MENUS = (
+    (b"Yes, I trust this folder", b"No, exit"),
+    (b"Exit and fix manually", b"Continue with defaults this session",
+     b"Overwrite the file with defaults"),
+)
 
 
 def _selection_menu_marker(lines, markers):
@@ -302,7 +309,14 @@ def _selection_menu_marker(lines, markers):
                      or PROMPT_MARK in _strip_box_glyphs(lines[index].strip())), None)
     if selected is None or not _strip_box_glyphs(lines[selected].strip()).startswith(b">"):
         return None
-    if _dialog_line(lines[selected]) not in SELECTION_MENU_CHOICES:
+    selected_row = _dialog_line(lines[selected])
+    menu = next((m for m in SELECTION_MENUS if selected_row in m), None)
+    if menu is None:
+        return None
+    # The whole option set must be on screen near the selection, so one
+    # quoted row in prose or a transcript cannot qualify.
+    nearby = {_dialog_line(row) for row in lines[max(0, selected - len(menu)):selected + len(menu)]}
+    if not all(choice in nearby for choice in menu):
         return None
     for marker in markers:
         for index in range(selected):
@@ -517,6 +531,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
     exit_status = None
     drain_until = None
     watch_until = 0
+    submit_rows = set()
     try:
         if outer_tty:
             tty.setraw(0, termios.TCSANOW)
@@ -578,8 +593,13 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     # An accepted paste does not prove a turn started: the CLI
                     # can discard the brief with a vendor error and fire no hook.
                     view.feed(output)
-                    visible = view.text()
-                    dropped = next((m for m in post_submit_failure_markers if m in visible), None)
+                    # Only rows that appeared after submit count: the pasted
+                    # brief and earlier output are in `submit_rows`. A vendor
+                    # error row starts with the marker, so quoted text mid-row
+                    # does not qualify.
+                    rows = [_dialog_line(row) for row in view.text().splitlines()]
+                    dropped = next((m for m in post_submit_failure_markers
+                                    if any(row.startswith(m) and row not in submit_rows for row in rows)), None)
                     if dropped is not None:
                         log("post_submit_failure", marker=dropped.decode("utf-8", "replace"))
                         raise BriefDropped(dropped)
@@ -638,6 +658,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     # written, not when the (long-lived) driver exits.
                     write_marker(DELIVERED_MARKER)
                     watch_until = time.monotonic() + POST_SUBMIT_WATCH
+                    submit_rows = {_dialog_line(row) for row in view.text().splitlines()}
                     log("submit_sent")
                 elif not pending and stage == "paste":
                     # Return follows only once the composer shows the brief.
