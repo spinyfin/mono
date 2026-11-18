@@ -3,8 +3,9 @@
 //! diagnose` (rebuilt from the dispatch event stream, so it still answers when
 //! the engine is wedged). Both print the same fields.
 
+use boss_engine::coordinator::outage_elapsed_phrase;
 use boss_engine::dispatch_events::DispatchEvent;
-use boss_execution_contracts::{OutageReplay, outage_elapsed_phrase, replay_outage_events};
+use boss_execution_contracts::{OutageReplay, replay_outage_events};
 use boss_protocol::DispatchOutage;
 use serde_json::Value;
 

@@ -532,9 +532,12 @@ impl ExecutionCoordinator {
             .work_db
             .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))
             .inspect_err(|_| {
-                // A failed startup worker scan holds every item, so this
-                // refusal is a global outage, not one item's problem.
-                self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+                // A failed startup worker scan holds every item, so a refusal
+                // by the hold is a global outage, not one item's problem. Any
+                // other error (an unresolvable repo, say) is not the hold.
+                if self.work_db.ensure_work_item_not_quarantined(&work_item_id).is_err() {
+                    self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+                }
             })?;
         if let Some(host_id) = requested_host_id {
             if execution.status != ExecutionStatus::Ready {

@@ -23,6 +23,24 @@ struct Fixture {
     _dir: tempfile::TempDir,
 }
 
+/// A coordinator over `db` writing to `events`, with an empty outage record.
+/// A second one over the same db and sink stands in for a restarted engine.
+fn new_coordinator(db: &Arc<WorkDb>, events: &Arc<RecordingDispatchEventSink>) -> Arc<ExecutionCoordinator> {
+    Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(4),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        )
+        .with_dispatch_events(events.clone())
+        .with_pre_start_retry_delays(Vec::new()),
+    )
+}
+
 /// `chores` queued chores on a registry of the local host and one remote.
 fn fixture(chores: usize) -> Fixture {
     let dir = tempdir().unwrap();
@@ -38,19 +56,7 @@ fn fixture(chores: usize) -> Fixture {
         })
         .collect();
     let events = Arc::new(RecordingDispatchEventSink::new());
-    let coordinator = Arc::new(
-        ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(4),
-            Arc::new(FakeCubeClient::default()),
-            Arc::new(FakeExecutionRunner {
-                pending: true,
-                ..FakeExecutionRunner::default()
-            }),
-        )
-        .with_dispatch_events(events.clone())
-        .with_pre_start_retry_delays(Vec::new()),
-    );
+    let coordinator = new_coordinator(&db, &events);
     Fixture {
         db,
         coordinator,
@@ -61,14 +67,16 @@ fn fixture(chores: usize) -> Fixture {
 }
 
 async fn dispatch(fixture: &Fixture, execution: &WorkExecution) -> Result<()> {
-    let worker_id = fixture
-        .coordinator
+    dispatch_on(&fixture.coordinator, execution).await
+}
+
+async fn dispatch_on(coordinator: &Arc<ExecutionCoordinator>, execution: &WorkExecution) -> Result<()> {
+    let worker_id = coordinator
         .worker_pool()
         .claim_worker(&execution.id, None)
         .await
         .expect("worker available");
-    fixture
-        .coordinator
+    coordinator
         .schedule_execution_for_test(execution, &worker_id, DispatchAdmission::Queued)
         .await
 }
@@ -342,7 +350,7 @@ async fn a_launch_refused_at_admission_by_a_startup_scan_failure_raises_the_outa
 async fn the_startup_sweep_reports_active_work_a_scan_failure_is_holding_back() {
     let fixture = fixture(1);
     // Healthy: nothing held, nothing reported.
-    fixture.coordinator.note_startup_scan_hold();
+    fixture.coordinator.sweep_scan_error_hold();
     assert_eq!(fixture.coordinator.dispatch_outage().active(), None);
 
     // The chore is active work with no live worker, which reconcile skips
@@ -352,8 +360,129 @@ async fn the_startup_sweep_reports_active_work_a_scan_failure_is_holding_back() 
         .force_task_status_for_test(&fixture.executions[0].work_item_id, "active")
         .unwrap();
     hold_every_item_with_a_scan_error(&fixture.db);
-    fixture.coordinator.note_startup_scan_hold();
+    fixture.coordinator.sweep_scan_error_hold();
 
     let outage = fixture.coordinator.dispatch_outage().active().expect("outage raised");
     assert_eq!(outage.refused_work_items, 1);
+}
+
+#[tokio::test]
+async fn a_restarted_engine_ends_a_restored_outage_with_the_first_production_claim() {
+    let fixture = fixture(3);
+    hold_local_dispatch(&fixture.db);
+    fixture.db.set_host_enabled("anaplian", false).unwrap();
+    dispatch(&fixture, &fixture.executions[0]).await.unwrap_err();
+    dispatch(&fixture, &fixture.executions[1]).await.unwrap_err();
+    let before = fixture.coordinator.dispatch_outage().active().expect("outage raised");
+    assert_eq!((before.refused_attempts, before.refused_work_items), (2, 2));
+
+    // The engine restarts: a fresh coordinator over the same db and event
+    // stream has no outage until the startup restore rebuilds it.
+    let restarted = new_coordinator(&fixture.db, &fixture.events);
+    assert_eq!(restarted.dispatch_outage().active(), None);
+    let restored = restarted
+        .dispatch_outage()
+        .restore_from_events(&fixture.events.events().await);
+    assert_eq!(restored, Some(before.started_epoch_s));
+    let active = restarted.dispatch_outage().active().expect("restored");
+    assert_eq!(active.started_epoch_s, before.started_epoch_s);
+    assert_eq!((active.refused_attempts, active.refused_work_items), (2, 2));
+
+    // The hold clears and a new dispatch claims the local host through the
+    // production path: that, not the flag, ends the restored outage.
+    fixture
+        .db
+        .write_local_worker_quarantine(&LocalWorkerQuarantine::default())
+        .unwrap();
+    assert!(restarted.dispatch_outage().active().is_some());
+    let _ = dispatch_on(&restarted, &fixture.executions[2]).await;
+
+    assert_eq!(restarted.dispatch_outage().active(), None);
+    let events = fixture.events.events().await;
+    let recovered = events
+        .iter()
+        .find(|event| event.stage == "dispatch_outage_recovered")
+        .unwrap_or_else(|| panic!("expected a recovery event: {events:#?}"));
+    assert_eq!(recovered.details["started_epoch_s"], before.started_epoch_s);
+    assert_eq!(recovered.details["refused_attempts"], 2);
+    assert_eq!(recovered.details["refused_work_items"], 2);
+    assert_eq!(
+        recovered.details["claimed_by_execution_id"],
+        fixture.executions[2].id.as_str()
+    );
+    assert_eq!(recovered.details["claimed_host_id"], "local");
+    let duration = recovered.details["duration_secs"].as_i64().unwrap();
+    assert_eq!(
+        duration,
+        recovered.details["recovered_epoch_s"].as_i64().unwrap() - before.started_epoch_s
+    );
+    assert!(
+        boss_execution_contracts::replay_outage_events(&events).active.is_none(),
+        "the stream also shows the outage ended",
+    );
+}
+
+#[tokio::test]
+async fn a_launch_the_scan_hold_refuses_outside_the_coordinator_is_reported_by_the_periodic_check() {
+    // Boot under a scan error with no active work: the startup sweep finds
+    // nothing, so nothing is reported yet.
+    let fixture = fixture(1);
+    hold_every_item_with_a_scan_error(&fixture.db);
+    fixture.coordinator.sweep_scan_error_hold();
+    assert_eq!(fixture.coordinator.dispatch_outage().active(), None);
+
+    // The board drop to Doing: the task goes active and the work db is asked
+    // directly, so the coordinator never sees the refusal.
+    let item = fixture.executions[0].work_item_id.clone();
+    fixture.db.force_task_status_for_test(&item, "active").unwrap();
+    let err = fixture
+        .db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(item.clone())
+                .explicit_start(true)
+                .build(),
+            |_| false,
+        )
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("quarantined"), "{err:#}");
+    assert_eq!(fixture.coordinator.dispatch_outage().active(), None);
+
+    // The periodic check is the seam every such path shares.
+    fixture.coordinator.sweep_scan_error_hold();
+    let outage = fixture.coordinator.dispatch_outage().active().expect("outage raised");
+    assert_eq!((outage.refused_attempts, outage.refused_work_items), (1, 1));
+    assert_eq!(outage.latest_work_item_id, item);
+    let local = outage.host_exclusions.iter().find(|h| h.host_id == "local").unwrap();
+    assert!(
+        local.cause.contains("tmux list-panes failed"),
+        "the scan error is carried verbatim: {}",
+        local.cause
+    );
+
+    // Re-checking the same held item does not inflate the attempt count.
+    fixture.coordinator.sweep_scan_error_hold();
+    fixture.coordinator.sweep_scan_error_hold();
+    assert_eq!(
+        fixture.coordinator.dispatch_outage().active().unwrap().refused_attempts,
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_admission_error_that_is_not_the_scan_hold_does_not_raise_the_outage() {
+    // Nothing is held, so a refused request is just that item's problem.
+    let fixture = fixture(1);
+
+    fixture
+        .coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id("task_does_not_exist".to_owned())
+                .build(),
+            Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
+        )
+        .unwrap_err();
+
+    assert_eq!(fixture.coordinator.dispatch_outage().active(), None);
 }
