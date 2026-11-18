@@ -409,7 +409,13 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
     if query_live_execution_for_work_item(conn, &task.id)?.is_some_and(|e| e.status == ExecutionStatus::WaitingHuman) {
         return Ok("S19_waiting_human".into());
     }
-    if let Some(reason) = task.dispatch_failed_reason.as_deref() {
+    // A row stopped by a cancel is a recorded decision, not a failure: it falls
+    // through to `S21_manual_start` (`todo`, automatic start off).
+    if let Some(reason) = task
+        .dispatch_failed_reason
+        .as_deref()
+        .filter(|reason| *reason != crate::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON)
+    {
         return Ok(match reason {
             "churn_guard" => "S2_churn_guard".into(),
             "deliberate_park" => "S3_deliberate_park".into(),

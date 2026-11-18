@@ -14,8 +14,9 @@
 //!   record a decision a human has not yet made, or evidence a progression
 //!   agent has not yet read: `blocked: awaiting_operator_answer` (a question is
 //!   already in front of the human), `blocked: question_dismissed` (the owner
-//!   closed the question without answering), `blocked: worker_failed` and a
-//!   `deliberate_park` stamp. A `worker_failed` row the owner refused (ledger
+//!   closed the question without answering), `blocked: worker_failed`, a
+//!   `deliberate_park` stamp and an `execution_cancelled` stop (the row stays
+//!   in Backlog with automatic start off, so its banner must keep saying why). A `worker_failed` row the owner refused (ledger
 //!   basis `operator_no`) is a recorded decision, a [`KeptHold::OperatorRefusal`];
 //!   every other producer's `worker_failed` is [`KeptHold::FailureEvidence`],
 //!   retained until progression clears it. Step 5 never redispatches either
@@ -61,8 +62,8 @@ pub enum HaltStamp {
     Absent,
     /// A stamp from before the park was cleared.
     Cleared { reason: String },
-    /// The stamp was kept: it is a `deliberate_park` hold, or it was written
-    /// after the park.
+    /// The stamp was kept: it is a `deliberate_park` hold or an
+    /// `execution_cancelled` stop, or it was written after the park.
     Kept { reason: String, why: &'static str },
 }
 
@@ -144,6 +145,10 @@ pub(crate) fn release_row(tx: &Connection, task: &Task, actor: &str) -> Result<U
         Some(reason) if reason == DELIBERATE_PARK_DISPATCH_FAILED_REASON => HaltStamp::Kept {
             reason: reason.to_owned(),
             why: "a worker-declared blocker awaiting a decision",
+        },
+        Some(reason) if reason == EXECUTION_CANCELLED_DISPATCH_FAILED_REASON => HaltStamp::Kept {
+            reason: reason.to_owned(),
+            why: "an explicit cancel; only a start resumes the row",
         },
         Some(reason) if stamped_after_park(task) => HaltStamp::Kept {
             reason: reason.to_owned(),

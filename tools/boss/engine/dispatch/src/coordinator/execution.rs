@@ -114,6 +114,22 @@ impl ExecutionCoordinator {
             .await;
     }
 
+    /// [`Self::record_engine_cancel`] for a cancel that left the owning row
+    /// alone. `execution` is the row as read before the cancel, so its status
+    /// is the one that was terminalized.
+    pub(crate) async fn record_engine_cancel_of(&self, execution: &WorkExecution, reason: &str) {
+        self.dispatch_events
+            .emit(crate::dispatch_events::execution_cancelled_event(
+                &execution.id,
+                &execution.work_item_id,
+                execution.status.as_str(),
+                StatusActor::Engine.as_str(),
+                reason,
+                false,
+            ))
+            .await;
+    }
+
     /// [`Self::record_engine_cancel`] for a synchronous caller: the emit is
     /// handed to the task scope so the timeline still gets the event.
     pub(crate) fn record_engine_cancel_detached(

@@ -2450,15 +2450,7 @@ impl ExecutionCoordinator {
 
         match self.work_db.cancel_running_execution_for_requeue(&victim.execution_id) {
             Ok(true) => {
-                self.dispatch_events
-                    .emit(crate::dispatch_events::execution_cancelled_event(
-                        &victim.execution_id,
-                        &victim_execution.work_item_id,
-                        victim_execution.status.as_str(),
-                        boss_protocol::StatusActor::Engine.as_str(),
-                        "preempted; requeued as a fresh execution",
-                        false,
-                    ))
+                self.record_engine_cancel_of(&victim_execution, "preempted; requeued as a fresh execution")
                     .await;
             }
             Ok(false) => {}

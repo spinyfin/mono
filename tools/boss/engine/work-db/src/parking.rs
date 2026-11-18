@@ -1027,7 +1027,11 @@ pub(crate) fn cancel_pending_executions(
             CancelExecutionOpts {
                 reason: Some(CANCEL_REASON_PARKED.to_owned()),
                 queued_only: true,
-                record_failure_reason: false,
+                // The park owns this row's state, and un-parking mints the
+                // execution afresh (`cancelled_by_park`): stopping the row in
+                // Backlog here would leave it stopped after the un-park.
+                keep_work_item_schedulable: true,
+                ..CancelExecutionOpts::default()
             },
         )?;
     }
