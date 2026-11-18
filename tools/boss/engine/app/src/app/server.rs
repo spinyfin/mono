@@ -2593,6 +2593,9 @@ async fn serve_scoped(
     // Same seam for pre-start spawn-failure streak alerts: raise, in-place
     // update and resolve each push a fresh health snapshot to the app.
     let _spawn_streak_health_handle = server_state.spawn_spawn_streak_health_broadcaster();
+    // And for the global dispatch outage: start, end and the per-minute
+    // refresh of its relative times.
+    let _dispatch_outage_health_handle = server_state.spawn_dispatch_outage_health_broadcaster();
     if _dispatch_ready_subscriber_handle.is_some() {
         // Boot-time sanity check that the bus injected via `set_event_bus`
         // in `app.rs` is the same one the subscriber just attached to —

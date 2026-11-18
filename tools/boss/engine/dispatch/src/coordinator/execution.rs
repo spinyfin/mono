@@ -16,9 +16,14 @@ pub(super) struct PreStartFailureReported;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
-struct HostSelectionFailure {
+pub(super) struct HostSelectionFailure {
     report: Vec<Eligibility>,
     message: String,
+    /// Why each registered host is excluded, when every one is excluded for
+    /// a reason that does not depend on the work item — a global dispatch
+    /// outage rather than an item that does not fit. `None` for an ordinary
+    /// per-item refusal.
+    pub(super) global_exclusions: Option<Vec<DispatchOutageHostExclusion>>,
 }
 
 /// Where `cube workspace goto` should position the working copy: a PR
@@ -246,6 +251,7 @@ impl ExecutionCoordinator {
         self.work_db.ensure_work_item_not_quarantined(work_item.primary_id())?;
         let quarantine_reason = self.work_db.local_dispatch_quarantine_reason()?;
         let mut hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
+        let registry = hosts.clone();
         if quarantine_reason.is_some() {
             hosts.retain(|host| host.id != "local");
         }
@@ -300,6 +306,7 @@ impl ExecutionCoordinator {
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
             None => Err(anyhow!(HostSelectionFailure {
                 report: report.clone(),
+                global_exclusions: self.global_host_exclusions(&registry, quarantine_reason.as_deref()),
                 message: format!(
                     "no eligible host for work item {}: {}{}",
                     work_item.primary_id(),
@@ -1132,6 +1139,7 @@ impl ExecutionCoordinator {
                             .with_details(serde_json::json!({ "reason": "no_eligible_host" })),
                     )
                     .await;
+                self.record_dispatch_refusal(execution, &err).await;
                 if had_requested_host {
                     return Err(err);
                 }
@@ -1205,6 +1213,7 @@ impl ExecutionCoordinator {
                     .with_details(serde_json::json!({ "host_id": selected_host.id.clone() })),
             )
             .await;
+        self.record_dispatch_claim(execution, &selected_host.id).await;
         tracing::info!(
             execution_id = %execution.id,
             work_item_id = %execution.work_item_id,

@@ -18,10 +18,12 @@ use boss_engine_storage_values::attention_kinds::{
     EXECUTION_BOOKMARK_RECOVERY_FAILED_ATTENTION_KIND as RECOVERY_FAILED, SPOKE_ASSIGNMENT_IN_DOUBT_ATTENTION_KIND,
 };
 use boss_execution_contracts::{
-    ChoreRequirements, Eligibility, FailureEffect, HostSlot, IneligibilityReason, LeaseReleaseOutcome,
-    LifecycleServices, LiveWorkerLiveness, PidStatus, PreStartStreakTracker, TeardownReason, TerminalCause,
-    WorkerPaneReleaser, driver_capability, select_host,
+    ChoreRequirements, DispatchOutageTracker, Eligibility, FailureEffect, HostSlot, IneligibilityReason,
+    LeaseReleaseOutcome, LifecycleServices, LiveWorkerLiveness, LocalHold, PidStatus, PreStartStreakTracker,
+    RefusalEffect, TeardownReason, TerminalCause, WorkerPaneReleaser, classify_host_exclusions, driver_capability,
+    select_host,
 };
+use boss_protocol::DispatchOutageHostExclusion;
 
 use crate::conflict_diagnosis;
 use crate::dispatch_events::{
@@ -871,6 +873,13 @@ pub struct ExecutionCoordinator {
     /// consults it. See `boss_engine::pre_start_streak`.
     #[builder(default)]
     pre_start_streaks: Arc<PreStartStreakTracker>,
+    /// The global dispatch outage record: every host excluded for every
+    /// item. Fed by host selection (refusals) and by the first dispatch that
+    /// claims a host afterwards (recovery), read by the engine health report
+    /// and the `dispatch state` verb. Visibility only — nothing in dispatch
+    /// consults it, and the refused items' own retry is untouched.
+    #[builder(default)]
+    dispatch_outage: Arc<DispatchOutageTracker>,
     /// Per-repo bound on concurrent cube workspace-lease attempts. Drain
     /// takes a permit before claiming a slot so a lease storm cannot fill
     /// the interactive pool. Defaults to
@@ -918,6 +927,7 @@ mod allocation_refusal;
 mod blocked_workspace;
 mod config;
 mod dispatch_admission;
+mod dispatch_outage;
 mod execution;
 mod lease_limiter;
 mod permanent_start_failure;

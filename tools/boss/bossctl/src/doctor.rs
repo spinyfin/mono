@@ -1965,6 +1965,10 @@ fn diagnose_report(
     // `dispatch stats` — one pass over current.jsonl.
     let fleet_read = dispatch_reader::read_current(root).unwrap_or_default();
     let fleet = fleet_read.events;
+    // A global dispatch outage is a fact about the whole fleet, not about the
+    // id asked for: an item that "will not dispatch" is usually one of the
+    // refusals it counts. Read from the stream so it answers with the engine down.
+    let outage = crate::dispatch_outage::from_events(&fleet);
 
     // One deduplicated integrity view over every file this command read: the
     // per-execution mirrors, the flat stream loaded for reconstruction, and the
@@ -2129,6 +2133,13 @@ fn diagnose_report(
             payload.insert("events".into(), events_value);
         }
         payload.insert("timelines".into(), Value::Object(timelines));
+        payload.insert(
+            "dispatch_outage".into(),
+            crate::dispatch_outage::to_json(outage.active.as_ref()),
+        );
+        if let Some(recovery) = &outage.last_recovery {
+            payload.insert("last_dispatch_outage_recovery".into(), recovery.clone());
+        }
         if let Some(focus) = &focus_diagnosis {
             payload.insert("focus".into(), focus.to_json());
         }
@@ -2183,6 +2194,14 @@ fn diagnose_report(
     // Warn about lost records before the timeline. Fully recovered damage is
     // summarized after the findings because it leaves no holes in the evidence.
     out.push_str(&integrity.render_banner());
+
+    if let Some(active) = &outage.active {
+        for line in crate::dispatch_outage::lines(active, i64::try_from(now_ms / 1000).unwrap_or(i64::MAX)) {
+            println!("{line}");
+        }
+    } else if let Some(recovery) = &outage.last_recovery {
+        println!("{}", crate::dispatch_outage::recovery_line(recovery));
+    }
 
     if let Some(focus) = focus_diagnosis.as_ref().filter(|f| f.focus.is_active()) {
         for line in focus.lines() {

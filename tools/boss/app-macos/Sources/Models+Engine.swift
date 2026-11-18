@@ -160,6 +160,12 @@ struct EngineHealthIssue: Identifiable, Hashable {
     /// Engine-emitted kind for a global automation pause. Kept on the
     /// health report; the toolbar toggle is the presentation surface.
     static let automationPausedKind = "automation_paused"
+
+    /// Engine-emitted kind for a global dispatch outage: every host is
+    /// excluded, so no new worker can start. Unlike every other issue the
+    /// banner keeps it expanded — the cause, duration and recovery action are
+    /// the point — and there is no way to collapse it away while it lasts.
+    static let dispatchOutageKind = "dispatch_outage"
 }
 
 /// Live `getQueue` smoke-check outcome against a `trunk_queue`-mechanism

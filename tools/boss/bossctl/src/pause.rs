@@ -365,12 +365,33 @@ fn focus_report_json(focus: &Result<boss_protocol::DispatchFocusState, String>) 
     }
 }
 
+/// The global dispatch outage section of `dispatch state` / `state`. It is
+/// printed only while one lasts; a running, healthy engine adds no line.
+fn print_outage_report(outage: Option<&boss_protocol::DispatchOutage>) {
+    if let Some(outage) = outage {
+        let now = i64::try_from(super::now_epoch_ms() / 1000).unwrap_or(i64::MAX);
+        for line in super::dispatch_outage::lines(outage, now) {
+            println!("{line}");
+        }
+    }
+}
+
 pub(super) async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> {
     let state = get_dispatch_state_raw(socket_path).await?;
     let focus = focus_report(socket_path).await;
+    // The outage rides the health report. An engine that predates it, or a
+    // failed read, must not hide the pause state, so it degrades to "none".
+    let outage = get_engine_health_raw(socket_path)
+        .await
+        .map(|health| health.dispatch_outage)
+        .unwrap_or_else(|err| {
+            eprintln!("warning: dispatch outage unavailable: {err:#}");
+            None
+        });
     if json {
         let mut value = state.to_json();
         value["focus"] = focus_report_json(&focus);
+        value["dispatch_outage"] = super::dispatch_outage::to_json(outage.as_ref());
         println!("{value}");
         return Ok(());
     }
@@ -398,6 +419,7 @@ pub(super) async fn dispatch_state(socket_path: &Option<String>, json: bool) -> 
     } else {
         println!("state: running");
     }
+    print_outage_report(outage.as_ref());
     print_focus_report(&focus);
     Ok(())
 }
@@ -537,17 +559,18 @@ pub(super) fn format_state_summary(paused: bool, paused_since_epoch_s: Option<u6
     }
 }
 
-/// Active pre-start spawn-failure streak alerts, read from the engine
-/// health report — the same report the app's banner renders, so the CLI and
-/// the app can never disagree about whether an alert is up.
-async fn get_spawn_failure_streaks_raw(socket_path: &Option<String>) -> Result<Vec<SpawnFailureStreak>> {
+/// The engine health report: the source of both the pre-start spawn-failure
+/// streak alerts and the global dispatch outage — the same report the app's
+/// banner renders, so the CLI and the app can never disagree about whether an
+/// alert is up.
+async fn get_engine_health_raw(socket_path: &Option<String>) -> Result<boss_protocol::EngineHealthReport> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::GetEngineHealth)
         .await
         .context("sending GetEngineHealth")?;
     match response {
-        FrontendEvent::EngineHealthResult { report } => Ok(report.spawn_failure_streaks),
+        FrontendEvent::EngineHealthResult { report } => Ok(report),
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             bail!("engine rejected GetEngineHealth: {message}")
         }
@@ -590,7 +613,8 @@ pub(super) fn format_spawn_failure_streak_lines(streaks: &[SpawnFailureStreak]) 
 pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> Result<()> {
     let dispatch = get_dispatch_state_raw(socket_path).await?;
     let automation = get_automation_state_raw(socket_path).await?;
-    let spawn_failure_streaks = get_spawn_failure_streaks_raw(socket_path).await?;
+    let health = get_engine_health_raw(socket_path).await?;
+    let (spawn_failure_streaks, outage) = (health.spawn_failure_streaks, health.dispatch_outage);
     let focus = focus_report(socket_path).await;
 
     if json {
@@ -598,6 +622,7 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
             "{}",
             serde_json::json!({
                 "dispatch": dispatch.to_json(),
+                "dispatch_outage": super::dispatch_outage::to_json(outage.as_ref()),
                 "focus": focus_report_json(&focus),
                 "automation": {
                     "paused": automation.paused,
@@ -629,6 +654,7 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
             println!("            scope: {}", scope.as_str());
             println!("            {reviews}");
         }
+        print_outage_report(outage.as_ref());
         print_focus_report(&focus);
         println!(
             "automation: {}",
