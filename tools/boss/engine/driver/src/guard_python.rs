@@ -17,7 +17,7 @@ pub const REVIEWER_BLOCKED_PROGRAMS_PY: &str = crate::render_reviewer_blocked_pr
 macro_rules! render_command_tokenizer {
     ($before:expr, $after:expr) => { concat!($before, r#"
 DELIMS = {'&&', '||', ';', '|', '&'}
-WRAPPERS = {'env', 'command', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic'}
+WRAPPERS = {'env', 'command', 'builtin', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic'}
 ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
 SHLEX_WS = ' \t\r\n'
@@ -551,6 +551,15 @@ for command in ('command -v cube', 'command -V boss', 'command -v bossctl',
     assert strip_prefixes(shlex.split(command)) == [], command
 assert strip_prefixes(shlex.split('command cube')) == ['cube']
 assert strip_prefixes(shlex.split('command -- bossctl')) == ['bossctl']
+for command, expected in (
+    ('builtin eval', ['eval']),
+    ('builtin source ./f', ['source', './f']),
+    ('builtin cd /tmp', ['cd', '/tmp']),
+    ('builtin command export NAME=x', ['export', 'NAME=x']),
+    ('command builtin command export NAME=x', ['export', 'NAME=x']),
+    ('builtin -- cd /tmp', ['cd', '/tmp']),
+):
+    assert strip_prefixes(shlex.split(command)) == expected, command
 "#,
         );
         let output = std::process::Command::new("python3")

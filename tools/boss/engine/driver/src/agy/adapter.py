@@ -314,7 +314,7 @@ def nested_shell_bodies(group):
     if rest and any(c in rest[0] for c in "<>"):
         fail_closed("unsupported redirection attached to an executable")
     base = os.path.basename(rest[0]) if rest else ""
-    if base in {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "case", "esac", "{", "}", "!", "eval", "source", "."}:
+    if base in {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "case", "esac", "{", "}", "!", "eval", "source", ".", "trap"}:
         fail_closed("unsupported shell control or dynamic execution")
     if rest and os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
         for index, arg in enumerate(rest[1:], 1):
@@ -411,8 +411,9 @@ def has_redirect(command):
 
 # Resolve the exact environment inherited from the worker at spawn.
 # Commands cannot rebind these variables and use the trusted resolution.
-# Every name expand_exported substitutes is rebound-protected, matching
-# exact word-bounded names in assignments, binding builtins and printf -v.
+# Every name expand_exported substitutes is rebound-protected: assignments,
+# binding builtins, printf -v, and any non-expansion mention of the name
+# (arithmetic, subscripts, `[[ ]]`) in a command that also expands one.
 TRUSTED_PATH_VARS = EXPORTED_PATH_VARS
 TRUSTED_NAMES = "|".join(TRUSTED_PATH_VARS)
 TRUSTED_VAR_RE = re.compile(r"\$(?:(%s)\b|\{(%s)\})" % (TRUSTED_NAMES, TRUSTED_NAMES))
@@ -429,6 +430,12 @@ ANY_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
 
 def reject_trusted_rebinding(command, groups):
     uses_trusted = TRUSTED_VAR_RE.search(command) is not None
+    # Arithmetic, subscripts and `[[ ]]` assign without a binding word. Mask
+    # `$NAME` / `${NAME}` expansions; a remaining mention of a trusted name
+    # in a command that also expands one is a rebinding expand_exported
+    # would miss. Bare names as search text (`rg BOSS_BIN`) stay allowed.
+    if uses_trusted and TRUSTED_NAME_IN_TOKEN_RE.search(TRUSTED_VAR_RE.sub("", command)):
+        fail_closed("reassigning an engine-provided path variable is denied")
     for group in groups:
         normalized = without_redirections(group)
         rest = list(strip_prefixes(group))
@@ -442,11 +449,6 @@ def reject_trusted_rebinding(command, groups):
         for token in assigned:
             if TRUSTED_VAR_ASSIGN_RE.match(token):
                 fail_closed("reassigning an engine-provided path variable is denied")
-        # `builtin` dispatches to the builtin named by its argument.
-        while rest and os.path.basename(rest[0]) == "builtin":
-            rest.pop(0)
-            while rest and rest[0].startswith("-"):
-                rest.pop(0)
         if not rest:
             continue
         program = os.path.basename(rest[0])
@@ -740,31 +742,31 @@ def path_operand_positions(group):
                 elif name in value_flags:
                     skip_next, skip_as_path = True, False
             else:
-                consumed = False
-                for i, char in enumerate(token[1:], 1):
-                    flag = '-' + char
-                    if flag in text_flags or flag in file_flags:
-                        attached = token[i + 1:]
-                        pattern_seen = True
-                        if attached:
-                            if flag in file_flags:
-                                positions[index] = 'attached'
+                if has_unquoted_glob_or_expansion(token, token_literal(group, index)):
+                    positions[index] = 'operand'
+                else:
+                    consumed = False
+                    for i, char in enumerate(token[1:], 1):
+                        flag = '-' + char
+                        if flag in text_flags or flag in file_flags:
+                            attached = token[i + 1:]
+                            pattern_seen = True
+                            if attached:
+                                if flag in file_flags:
+                                    positions[index] = 'attached'
+                                else:
+                                    mark_text_slot(index, token, 'attached')
+                            elif flag in file_flags:
+                                skip_next, skip_as_path = True, True
                             else:
-                                mark_text_slot(index, token, 'attached')
-                        elif flag in file_flags:
-                            skip_next, skip_as_path = True, True
-                        else:
+                                skip_next, skip_as_path = True, False
+                            consumed = True
+                            break
+                        if flag in value_flags and i + 1 == len(token):
                             skip_next, skip_as_path = True, False
-                        consumed = True
-                        break
-                    if flag in value_flags and i + 1 == len(token):
-                        skip_next, skip_as_path = True, False
-                        consumed = True
-                        break
-                if not consumed:
-                    if has_unquoted_glob_or_expansion(token, token_literal(group, index)):
-                        positions[index] = 'operand'
-                    elif '=' in token:
+                            consumed = True
+                            break
+                    if not consumed and '=' in token:
                         positions[index] = 'option'
         elif program in NON_PATH_PROGRAMS:
             pass

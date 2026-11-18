@@ -313,6 +313,10 @@ fn exported_path_variables_cannot_be_rebound_then_expanded() {
         "read BOSS_STRUCTURED_OUTPUT < f".into(),
         "builtin read BOSS_STRUCTURED_OUTPUT < f".into(),
         format!("builtin export BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!("builtin command export BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
+        format!(
+            "command builtin command export BOSS_STRUCTURED_OUTPUT={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""
+        ),
         format!("BOSS_STRUCTURED_OUTPUT[0]={prefix}; cat \"${{BOSS_STRUCTURED_OUTPUT}}{suffix}\""),
         format!("BOSS_BIN_DIR+={data_prefix}; cat \"$BOSS_BIN_DIR{data_suffix}/secret\""),
         "export BOSS_STRUCTURED_OUTPUT=/tmp/agy-ho".into(),
@@ -387,6 +391,8 @@ fn multi_word_expansions_option_bundles_and_braces_are_denied() {
         "set -- x /tmp/y; grep \"$@mes/z\"".to_string(),
         "grep -v$X f".to_string(),
         "grep -e . -A$X f".to_string(),
+        "grep -${X}e f".to_string(),
+        "grep -${X}A f".to_string(),
         format!("grep {{x,{hooks}}}"),
         format!("cat {{{hooks},}}"),
     ] {
@@ -408,4 +414,74 @@ fn symlink_parent_glob_is_denied_after_physical_dotdot() {
     let leaf = format!("{}/process-home/.gemini/config/hooks.json", fx.run_id);
     let body = deny_at(&fx, &format!("cat link/../hom?s/{leaf}"), &fx.workspace());
     assert!(body["reason"].as_str().unwrap().contains("protected"), "{body}");
+}
+
+#[test]
+fn builtin_and_trap_cannot_hide_eval_source_cd_or_export() {
+    {
+        let fx = Fixture::new("run-builtin-wrappers");
+        fx.install(WorkerKind::Standard);
+        let protected = fx.process_home.join(".gemini/config/hooks.json");
+        let protected = protected.display();
+        let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+        for command in [
+            format!("builtin eval 'cat {protected}'"),
+            "builtin source ./f".into(),
+            "builtin . ./f".into(),
+            format!("builtin cd {}; cat {relative}", fx.tmp.path().display()),
+            format!("trap 'cat {protected}' EXIT"),
+            "trap 'rm -rf ~' EXIT".into(),
+        ] {
+            deny_at(&fx, &command, &fx.workspace());
+        }
+    }
+    let reviewer = Fixture::new("run-builtin-reviewer");
+    reviewer.install_with(WorkerKind::Reviewer, |c| {
+        c.is_standard_worker = false;
+        c.is_reviewer = true;
+    });
+    deny_at(&reviewer, "builtin eval 'jj describe -m x'", &reviewer.workspace());
+}
+
+#[test]
+fn option_bundle_expansions_before_a_recognized_flag_are_denied() {
+    let fx = Fixture::new("run-option-bundle-prefix");
+    fx.install(WorkerKind::Standard);
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    fs::write(
+        fx.workspace().join("input"),
+        format!("v NEVERMATCH {} junk", hooks.display()),
+    )
+    .unwrap();
+    for command in [
+        "grep -${X}e f".to_string(),
+        "grep -${X}A f".to_string(),
+        "read X < input; grep -${X}e f".to_string(),
+        "read X < input; grep -${X}A f".to_string(),
+    ] {
+        deny_at(&fx, &command, &fx.workspace());
+    }
+}
+
+#[test]
+fn arithmetic_contexts_cannot_rebind_trusted_path_variables() {
+    let fx = Fixture::new("run-arithmetic-rebind");
+    fx.install(WorkerKind::Standard);
+    let relative = format!("homes/{}/process-home/.gemini/config/hooks.json", fx.run_id);
+    let env = [
+        ("BOSS_STRUCTURED_OUTPUT", "/artifacts/out.json"),
+        ("BOSS_BIN_DIR", "/opt/boss-tools"),
+    ];
+    for command in [
+        format!(r#"(( BOSS_STRUCTURED_OUTPUT = 0 )); cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"$[BOSS_STRUCTURED_OUTPUT=0]; cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"echo "${{a[BOSS_STRUCTURED_OUTPUT=0]}}"; cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"[[ 1 -eq BOSS_STRUCTURED_OUTPUT=0 ]]; cat "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"(( BOSS_STRUCTURED_OUTPUT = 0 )); echo x > "${{BOSS_STRUCTURED_OUTPUT}}/../T/{relative}""#),
+        format!(r#"(( HOME = 0 )); cat "${{HOME}}/../T/{relative}""#),
+        format!(r#"(( BOSS_BIN_DIR = 0 )); cat "${{BOSS_BIN_DIR}}/../T/{relative}""#),
+    ] {
+        let (_, body, stderr) = authorize_with_env(&fx.process_home, &run_command_payload(&command), &env);
+        assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+    }
 }

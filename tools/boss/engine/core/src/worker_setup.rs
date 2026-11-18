@@ -1136,6 +1136,14 @@ def main():
         except Exception:
             tokens = command.split()
         candidates.extend(tokens)
+        # Arithmetic, subscripts and `[[ ]]` rebind BOSS_DATA_DIR without an
+        # assignment word. Mask `$BOSS_DATA_DIR` / `${BOSS_DATA_DIR}`; a
+        # remaining mention in a command that also expands the name would
+        # make expandvars check the inherited path while bash opens another.
+        data_dir_expansion = re.compile(r"\$(?:BOSS_DATA_DIR\b|\{BOSS_DATA_DIR\})")
+        data_dir_name = re.compile(r"(?<![A-Za-z0-9_])BOSS_DATA_DIR(?![A-Za-z0-9_])")
+        if data_dir_expansion.search(raw_command) and data_dir_name.search(data_dir_expansion.sub("", raw_command)):
+            emit("block", RECOVERY)
     elif tool == "apply_patch":
         # Codex's freeform apply_patch: the patch body is the "command".
         patch = tool_input.get("command")
