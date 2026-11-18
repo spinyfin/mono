@@ -28,6 +28,28 @@ impl ExecutionCoordinator {
         classify_host_exclusions(registry, local_hold.as_ref())
     }
 
+    /// Exclusions for the global hold a failed startup worker scan puts on
+    /// every work item, `None` when no scan error is recorded. Unlike a
+    /// per-item quarantine this holds every host, so it is an outage whatever
+    /// the registry looks like.
+    pub(super) fn scan_error_hold_exclusions(&self) -> Option<Vec<DispatchOutageHostExclusion>> {
+        let hold = self.work_db.read_local_worker_quarantine().ok()?;
+        let scan_error = hold.scan_error.clone()?;
+        let hosts = self.work_db.list_hosts().ok()?;
+        let reason = self
+            .work_db
+            .local_dispatch_quarantine_reason()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| format!("every work item is quarantined: startup worker scan failed: {scan_error}"));
+        let hold = LocalHold {
+            reason,
+            held_executions: hold.executions.keys().cloned().collect(),
+            scan_error: Some(scan_error),
+        };
+        Some(scan_error_exclusions(&hosts, &hold))
+    }
+
     /// Fold a refused host selection into the global dispatch outage record
     /// when it was a global refusal. The per-item failure handling that
     /// follows is unchanged: each item keeps its own retry, and this only

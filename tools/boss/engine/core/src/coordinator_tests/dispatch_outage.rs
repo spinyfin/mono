@@ -226,3 +226,55 @@ async fn the_first_successful_claim_ends_the_outage_and_records_how_long_it_last
     );
     assert_eq!(recovered.details["claimed_host_id"], "local");
 }
+
+#[tokio::test]
+async fn a_failed_startup_scan_holds_every_item_and_is_reported_as_an_outage() {
+    let fixture = fixture(2);
+    fixture
+        .db
+        .write_local_worker_quarantine(&LocalWorkerQuarantine {
+            executions: Default::default(),
+            scan_error: Some("tmux list-panes failed".to_owned()),
+        })
+        .unwrap();
+    fixture.db.set_host_enabled("anaplian", false).unwrap();
+
+    for execution in &fixture.executions {
+        dispatch(&fixture, execution).await.unwrap_err();
+    }
+
+    let outage = fixture.coordinator.dispatch_outage().active().expect("outage raised");
+    assert_eq!(outage.refused_attempts, 2);
+    let local = outage.host_exclusions.iter().find(|h| h.host_id == "local").unwrap();
+    assert!(local.cause.contains("tmux list-panes failed"), "{}", local.cause);
+}
+
+#[tokio::test]
+async fn reconciling_a_held_spoke_execution_on_a_disabled_remote_does_not_end_the_outage() {
+    let fixture = fixture(2);
+    hold_local_dispatch(&fixture.db);
+    fixture.db.set_host_enabled("anaplian", false).unwrap();
+    dispatch(&fixture, &fixture.executions[0]).await.unwrap_err();
+    let before = fixture.coordinator.dispatch_outage().active().expect("outage raised");
+
+    // The second execution already owns an assignment on the disabled remote,
+    // so reconciling it returns that host without selecting one.
+    fixture
+        .db
+        .reserve_spoke_assignment(&fixture.executions[1].id, "anaplian")
+        .unwrap();
+    let _ = dispatch(&fixture, &fixture.executions[1]).await;
+
+    let after = fixture
+        .coordinator
+        .dispatch_outage()
+        .active()
+        .expect("outage stays active");
+    assert_eq!(after.started_epoch_s, before.started_epoch_s);
+    assert!(
+        !engine_stages(&fixture)
+            .await
+            .contains(&"dispatch_outage_recovered".to_owned()),
+        "a held-spoke reconciliation is not a new claim",
+    );
+}

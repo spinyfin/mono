@@ -21,7 +21,7 @@ use boss_execution_contracts::{
     ChoreRequirements, DispatchOutageTracker, Eligibility, FailureEffect, HostSlot, IneligibilityReason,
     LeaseReleaseOutcome, LifecycleServices, LiveWorkerLiveness, LocalHold, PidStatus, PreStartStreakTracker,
     RefusalEffect, TeardownReason, TerminalCause, WorkerPaneReleaser, classify_host_exclusions, driver_capability,
-    select_host,
+    scan_error_exclusions, select_host,
 };
 use boss_protocol::DispatchOutageHostExclusion;
 

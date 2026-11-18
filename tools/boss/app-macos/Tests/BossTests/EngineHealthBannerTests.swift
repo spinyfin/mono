@@ -361,7 +361,7 @@ final class EngineHealthBannerTests: XCTestCase {
         let outage = EngineHealthIssue(
             kind: EngineHealthIssue.dispatchOutageKind,
             severity: "error",
-            title: "Dispatch is down: no host can start new workers (for 13 min)",
+            title: "Dispatch is down: no host can start new workers (started 13 minutes ago)",
             body: "Cause:\n• local: held by the startup quarantine\n\nRecovery:\n• anaplian: Run `bossctl hosts enable anaplian`."
         )
         let other = EngineHealthIssue(kind: "missing_anthropic_api_key", severity: "warning", title: "key", body: "set it")
