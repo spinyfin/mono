@@ -399,6 +399,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-blocked-pr-diagnosis"
+version = "0.1.0"
+dependencies = [
+ "bon",
+]
+
+[[package]]
 name = "boss-board-projection"
 version = "0.1.0"
 dependencies = [
