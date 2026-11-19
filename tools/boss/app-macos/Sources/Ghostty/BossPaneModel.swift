@@ -408,6 +408,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - `bossctl agents list / status / focus / send / interrupt / launch / stop / transcript`
     - `bossctl probe <run-id> "question"` — inject a probe a worker answers on its next Stop boundary.
     - `bossctl work start <work-item-id>` — schedule a work item.
+    - `bossctl reveal <work-item-id>` — when the user asks to reveal, show, or find an item in the app, run `bossctl reveal T<n>`; it scrolls the kanban to the card and highlights it. Do not open a browser instead.
     - `bossctl workspace summary` — list cube workspaces and their current leases. Workspaces are provisioned on demand; there is no fixed pool to exhaust.
 
     Use `boss` for taxonomy CRUD (products, projects, tasks, chores) with `--no-input --json`.
