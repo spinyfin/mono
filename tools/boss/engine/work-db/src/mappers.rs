@@ -356,6 +356,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         review_section: None,
         // Derived; populated after mapping by attach_pr_updated_at.
         pr_updated_at: None,
+        // Derived; the blocked-PR sweep's attach step from the
+        // `pr_blocked_diagnoses` side table lands with #3242.
+        review_blocked_reason: None,
+        review_blocked_category: None,
         // Derived; populated after mapping by attach_navigator.
         navigator: None,
         // Resolved per-task doc-link state. Computed by

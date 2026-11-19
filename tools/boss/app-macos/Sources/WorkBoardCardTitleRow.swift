@@ -18,9 +18,12 @@ struct WorkBoardCardTitleRowSlice: Equatable {
     let name: String
     /// Used only for the revision 2-line name cap.
     let kind: String
-    /// "Blocked by" / "Waiting on:" when a blocked-by line is painted; nil
-    /// otherwise. Derived at init so raw `status` is not compared when the
-    /// line is absent (status only selects this prefix for paint).
+    /// "Blocked by" / "Waiting on:" when a blocked-by line is painted from
+    /// `blockedBy`; nil when the line is absent, or when
+    /// `reviewBlockedReason` is shown (the engine already phrased that
+    /// sentence, including "Needs you:" / "CI retrying:"). Derived at init
+    /// so raw `status` is not compared when the line is absent (status only
+    /// selects this prefix for paint).
     let blockedByPrefix: String?
     let blockedBy: String?
     let hasTagChips: Bool
@@ -37,6 +40,11 @@ struct WorkBoardCardTitleRowSlice: Equatable {
             self.blockedBy = blockedBy
             self.blockedByPrefix = snapshot.status == "blocked"
                 ? "Blocked by" : "Waiting on:"
+        } else if let reason = snapshot.reviewBlockedReason, !reason.isEmpty {
+            // The engine's blocked-PR diagnosis: rendered verbatim, the
+            // engine already phrased it ("Needs you: …" / "CI retrying: …").
+            self.blockedBy = reason
+            self.blockedByPrefix = nil
         } else {
             self.blockedBy = nil
             self.blockedByPrefix = nil
@@ -106,12 +114,13 @@ struct WorkBoardCardTitleRow: View, @MainActor Equatable {
                             .lineLimit(slice.kind == "revision" ? 2 : nil)
                             .truncationMode(.tail)
                     }
-                    if let blockedBy = slice.blockedBy, let prefix = slice.blockedByPrefix {
-                        Text("\(prefix) \(blockedBy)")
+                    if let blockedBy = slice.blockedBy {
+                        let line = slice.blockedByPrefix.map { "\($0) \(blockedBy)" } ?? blockedBy
+                        Text(line)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
-                            .help("\(prefix) \(blockedBy)")
+                            .help(line)
                     }
                 }
                 // Pin the title column to the remaining lane width so the

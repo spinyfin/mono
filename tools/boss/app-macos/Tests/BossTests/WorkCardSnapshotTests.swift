@@ -87,6 +87,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "reviewGuideReadableVersionId",
         "reviewGuideStaleSource",
         "reviewGuideError",
+        "reviewBlockedReason",
     ]
 
     /// `WorkTask` fields the snapshot intentionally ignores. Changing any of
@@ -113,6 +114,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "reviewSectionReported",
         "boardFoldedRevision",
         "prUpdatedAt",
+        "reviewBlockedCategory",
         "docLinkState",
         "reviewGuideSelectedComparisonId",
         "originTaskShortId",
@@ -282,6 +284,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             ("reviewSection", { t in var t = t; t.reviewSection = .blocked; return t }),
             ("reviewSectionReported", { t in var t = t; t.reviewSectionReported = true; return t }),
             ("prUpdatedAt", { t in var t = t; t.prUpdatedAt = "2026-05-25T00:00:00Z"; return t }),
+            ("reviewBlockedCategory", { t in var t = t; t.reviewBlockedCategory = "ci_failing"; return t }),
             ("docLinkState", { t in
                 var t = t; t.docLinkState = .notSet; return t
             }),
@@ -850,6 +853,20 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.prMergeableState = "conflicting"; return t
+                }
+            ),
+            Case(
+                name: "reviewBlockedReason",
+                context: review,
+                base: {
+                    Self.makeTask(
+                        id: "task_1",
+                        status: "in_review",
+                        prURL: "https://github.com/x/y/pull/3"
+                    )
+                },
+                mutate: {
+                    var t = $0; t.reviewBlockedReason = "Needs you: merge conflict with main"; return t
                 }
             ),
         ]
@@ -2015,6 +2032,33 @@ final class WorkCardSnapshotTests: XCTestCase {
             WorkBoardCardTitleRowSlice(snapshot: waiting),
             WorkBoardCardTitleRowSlice(snapshot: blocked)
         )
+    }
+
+    /// Engine-written review-blocked reasons already include their lead-in
+    /// ("Needs you:" / "CI retrying:"); the title row must not add "Blocked:".
+    func testTitleSliceRendersReviewBlockedReasonWithoutPrefix() {
+        func slice(reason: String) -> WorkBoardCardTitleRowSlice {
+            var task = Self.makeTask(
+                id: "task_review_reason",
+                status: "in_review",
+                prURL: "https://github.com/x/y/pull/3"
+            )
+            task.reviewBlockedReason = reason
+            return WorkBoardCardTitleRowSlice(
+                snapshot: WorkCardSnapshot.build(
+                    task: task,
+                    context: WorkCardSnapshotContext(column: .review)
+                )
+            )
+        }
+
+        let needsYou = slice(reason: "Needs you: merge conflict with main")
+        XCTAssertNil(needsYou.blockedByPrefix)
+        XCTAssertEqual(needsYou.blockedBy, "Needs you: merge conflict with main")
+
+        let retrying = slice(reason: "CI retrying: HTTP 504 in checks (1/2)")
+        XCTAssertNil(retrying.blockedByPrefix)
+        XCTAssertEqual(retrying.blockedBy, "CI retrying: HTTP 504 in checks (1/2)")
     }
 
     // MARK: - WorkCardLiveStatus (entry 6 observation detach)
