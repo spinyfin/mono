@@ -119,6 +119,13 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostart: Option<bool>,
 
+    /// Acknowledge the item's [`crate::Task::auto_stop_notice`] up to and
+    /// including this ledger row id (the notice's `audit_id`). `None` → leave
+    /// unchanged. A stop recorded after this id is not acknowledged, and an
+    /// older acknowledgment is never lowered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledge_auto_stop_through: Option<i64>,
+
     /// Flip the `deferred` (future-scope) classification. `None` → leave
     /// unchanged. `Some(false)` approves the item (pulls it into scope so
     /// it can be dispatched); `Some(true)` re-defers it. See

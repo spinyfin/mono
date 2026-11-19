@@ -1487,6 +1487,7 @@ pub(crate) fn attach_task_derived_projections_traced(
     tasks = attach_revision_projections(tasks, &chores);
     attach_in_progress_revision_flag(&mut tasks, &mut chores);
     super::board_patch::attach_conflict_deferral(conn, &mut tasks, &mut chores, "attach_task_derived_projections");
+    super::auto_stop_notice::attach(conn, &mut tasks, &mut chores, "attach_task_derived_projections");
     attach_ready_for_review_flag(&mut tasks, &mut chores);
     if let Err(err) = attach_ai_reviewing_flag(conn, &mut tasks, &mut chores) {
         tracing::warn!(
@@ -1545,6 +1546,7 @@ fn copy_derived_projection_fields(dst: &mut Task, src: &Task) {
     dst.in_revision_blocked_only = src.in_revision_blocked_only;
     dst.has_attachments = src.has_attachments;
     dst.conflict_resolution_deferred = src.conflict_resolution_deferred;
+    dst.auto_stop_notice = src.auto_stop_notice.clone();
     dst.ai_reviewing = src.ai_reviewing;
     dst.ai_review_stage = src.ai_review_stage.clone();
     dst.ai_review_state = src.ai_review_state.clone();

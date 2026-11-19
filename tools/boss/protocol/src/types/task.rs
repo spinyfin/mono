@@ -991,6 +991,15 @@ pub struct Task {
     #[builder(default)]
     pub conflict_resolution_deferred: bool,
 
+    /// The engine stopped this never-started item on its own (turned off
+    /// autostart, or abandoned its queued execution without replacing it) and
+    /// no human has acknowledged it. A derived projection from the
+    /// `task_status_audit` ledger, not a stored column: it clears when the
+    /// item starts a run or when [`WorkItemPatch::acknowledge_auto_stop_through`]
+    /// covers it, and survives status changes in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_stop_notice: Option<AutoStopNotice>,
+
     /// Explicit model slug override. `None` → resolve via the design's
     /// Q3 precedence (effort default → product default → engine default).
     /// Stored verbatim — the engine does not validate the slug.
@@ -1442,6 +1451,32 @@ pub struct TaskFieldAuditRow {
     /// Whether any execution of the item had ever started or produced a run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_ever_ran: Option<bool>,
+}
+
+/// An unacknowledged engine-initiated stop of a never-started work item, shown
+/// on its card. Built from the ledger rows behind `boss task show --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct AutoStopNotice {
+    /// Highest ledger row id the notice covers. Send it back as
+    /// `acknowledge_auto_stop_through`; a stop recorded after it stays visible.
+    pub audit_id: i64,
+    /// Stable code of the writer behind the most recent covered row.
+    pub reason_code: String,
+    /// Human-readable cause of that row; may be reworded. `None` when the
+    /// writer recorded none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Unix epoch seconds (decimal string) of the most recent covered row.
+    pub changed_at: String,
+    /// The engine cleared the item's autostart flag.
+    #[serde(default)]
+    #[builder(default)]
+    pub autostart_disabled: bool,
+    /// The engine abandoned a never-started execution that was not replaced.
+    #[serde(default)]
+    #[builder(default)]
+    pub execution_abandoned: bool,
 }
 
 /// Live runtime status for a single task/chore — the current execution
