@@ -1,6 +1,6 @@
 //! The GitHub OAuth auth-state forwarder loop.
 //!
-//! Watches a [`GitHubAuthController`]'s state channel and does two jobs, each
+//! Watches a [`GitHubAuthController`](crate::github_oauth::GitHubAuthController)'s state channel and does two jobs, each
 //! on an explicit trigger rather than on every wake-up:
 //!
 //! - **Broadcast** the display-safe [`GitHubAuthStateDto`] — only when it
@@ -23,23 +23,22 @@ use std::future::Future;
 
 use boss_protocol::{GitHubAuthStateDto, OrgAuthState};
 
-use crate::github_oauth::{GitHubAuthController, GitHubAuthState};
+use crate::github_oauth::GitHubAuthState;
 
 /// Run the forwarder until the controller's sender is dropped (the engine is
 /// shutting down).
 ///
 /// `rx` should be a receiver obtained *after* any boot-time
 /// `restore_from_store`, so the first iteration sees the restored state.
-/// `probe` is handed the stored token and returns the resolved org state;
+/// `probe` requests a probe for the stored token through the shared worker;
 /// `broadcast` is handed each DTO that differs from the previous one.
 pub async fn run_auth_forwarder<P, PF, B, BF>(
-    controller: &GitHubAuthController,
     mut rx: tokio::sync::watch::Receiver<GitHubAuthState>,
     probe: P,
     broadcast: B,
 ) where
     P: Fn(String) -> PF,
-    PF: Future<Output = OrgAuthState>,
+    PF: Future<Output = ()>,
     B: Fn(GitHubAuthStateDto) -> BF,
     BF: Future<Output = ()>,
 {
@@ -64,8 +63,7 @@ pub async fn run_auth_forwarder<P, PF, B, BF>(
                 org_state: OrgAuthState::Unknown,
             } if probed_token.as_deref() != Some(record.token.as_str()) => {
                 probed_token = Some(record.token.clone());
-                let resolved = probe(record.token.clone()).await;
-                controller.update_org_state(resolved);
+                probe(record.token.clone()).await;
             }
             GitHubAuthState::Authorized { .. } => {}
             _ => probed_token = None,
