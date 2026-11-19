@@ -854,6 +854,10 @@ impl ExecutionRunner for PaneSpawnRunner {
         workspace_path: &Path,
         cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
+        // How long each step before the pane exists took. Reported with
+        // "pane spawned for execution", so a slow spawn names its step.
+        let spawn_began = std::time::Instant::now();
+        let mut pre_pane = PrePaneTimings::default();
         let factory = self
             .server_state
             .get()
@@ -947,6 +951,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // taught to make would hold every run to the run-done backstop.
         let run_done_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("run_done_proposals_seam");
+        let compose_began = std::time::Instant::now();
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -985,6 +990,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 execution.id
             )
         })?;
+        pre_pane.compose = compose_began.elapsed();
 
         // Resolve the driver once via the registry on the slug
         // `compose_worker_spawn` already validated. Every subsequent trait
@@ -1010,6 +1016,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // on the execution so every teardown path can hand it back after
         // engine restart / orphan recovery / workspace release without
         // inferring a home from the engine environment.
+        let provision_began = std::time::Instant::now();
         let runtime_state = boss_host_execution::input::provision(
             driver.as_ref(),
             workspace_path,
@@ -1029,6 +1036,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 execution.id,
             )
         })?;
+        pre_pane.provision = provision_began.elapsed();
         // Persist must succeed when the driver returned state (Codex
         // CODEX_HOME): a silent failure would make every teardown path
         // no-op, leak Boss-owned homes, and skip auth adopt. Fail the
@@ -1177,6 +1185,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             git_store_guard_script: git_store_guard_script.clone(),
             codex_sandbox_enforced: self.feature_flags.is_enabled("codex_sandbox_enforced"),
         };
+        let permission_config_began = std::time::Instant::now();
         let permission_artifacts = driver
             .write_permission_config(&permission_input, &settings_dir)
             .await
@@ -1187,6 +1196,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                     driver.descriptor().name
                 )
             })?;
+        pre_pane.permission_config = permission_config_began.elapsed();
 
         let mut spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
             model: &spawn_config.model,
@@ -1300,6 +1310,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // (no credential, API error, cache miss) so a slow or unreachable
         // provider never blocks the spawn.
         let utility = self.cfg.utility.clone();
+        let title_began = std::time::Instant::now();
         let title_summary = pane_summary::title_for_spawn(
             &self.work_db,
             utility.as_ref(),
@@ -1309,6 +1320,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
         )
         .await;
+        pre_pane.title = title_began.elapsed();
 
         let work_item_binding = Some(WorkItemBinding {
             work_item_id: work_item_id(work_item).to_owned(),
@@ -1345,6 +1357,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             .context("local dispatch requires a tmux worker host")?;
 
         self.work_db.begin_prompt_confirmation(&execution.id)?;
+        let pane_start_began = std::time::Instant::now();
         let started = spawner
             .start_worker(
                 StartWorkerInput::builder()
@@ -1399,6 +1412,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             )
             .await
             .with_context(|| format!("spawning worker pane for run {}", execution.id))?;
+        pre_pane.pane_start = pane_start_began.elapsed();
 
         let spawned_at = std::time::Instant::now();
         tracing::info!(
@@ -1412,6 +1426,13 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .unwrap_or("none"),
             effort_value = spawn_config.effort_value.unwrap_or("default"),
             model = %spawn_config.model,
+            driver = driver.descriptor().name,
+            compose_ms = pre_pane.compose.as_millis() as u64,
+            provision_ms = pre_pane.provision.as_millis() as u64,
+            permission_config_ms = pre_pane.permission_config.as_millis() as u64,
+            title_ms = pre_pane.title.as_millis() as u64,
+            pane_start_ms = pre_pane.pane_start.as_millis() as u64,
+            pre_pane_ms = spawn_began.elapsed().as_millis() as u64,
             "pane spawned for execution",
         );
 
@@ -1738,6 +1759,27 @@ async fn confirm_prompt_phase(
         return Err(boss_tmux::BlockingDialogOnScreen { marker }.into());
     }
     result
+}
+
+/// Wall-clock time of each step a local spawn takes before its pane exists.
+///
+/// `provision` is the driver's own preparation and is where drivers differ:
+/// Claude and Codex write files, while Grok also runs its posture and
+/// capability checks as subprocesses. Whatever `pre_pane_ms` holds beyond
+/// these five is the work between them (database reads, guard scripts, the
+/// launcher script).
+#[derive(Default)]
+struct PrePaneTimings {
+    /// Composing the prompt and resolving the model, effort and driver.
+    compose: StdDuration,
+    /// The driver's `provision_workspace`.
+    provision: StdDuration,
+    /// The driver's `write_permission_config`.
+    permission_config: StdDuration,
+    /// The pane title, which can ask the utility model for a summary.
+    title: StdDuration,
+    /// Creating the tmux worker pane.
+    pane_start: StdDuration,
 }
 
 /// The bounds on each of spawn confirmation's waits.
