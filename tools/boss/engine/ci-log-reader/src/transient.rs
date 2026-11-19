@@ -13,8 +13,9 @@
 //!    opposed to `1` for a real finding (`tools/checkleft/README.md`, "Exit
 //!    codes"). A failed PR-description lookup that answers HTTP 5xx is **not**
 //!    yet a distinct outcome: checkleft reports it as an error finding with
-//!    exit `1`, so that case (the original incident) is classified by step 3
-//!    from the log text, not by exit status.
+//!    exit `1`, so that case is classified by step 3
+//!    from the log text, not by exit status (see the `PR_DESCRIPTION_504_LOG`
+//!    fixture).
 //! 3. A conservative allowlist of upstream-unavailable log signatures (HTTP
 //!    5xx from an API, gateway timeouts, connection resets, DNS failures),
 //!    applied only when the same log carries no deterministic marker (a
@@ -166,7 +167,10 @@ const CHECKLEFT_INPUT_UNAVAILABLE_LINES: &[&str] = &[
 const DETERMINISTIC_MARKERS: &[(&str, &str)] = &[
     ("FAIL: //", "test target failed"),
     ("TIMEOUT: //", "test target timed out"),
-    ("FAILED: Build did NOT complete", "build failed"),
+    // Covers both the execution-phase `FAILED:` and the loading/analysis-phase
+    // `ERROR:` terminators.
+    ("Build did NOT complete successfully", "build failed"),
+    ("ERROR: Analysis of target", "build analysis failed"),
     ("error[E", "compiler error"),
     ("** TEST FAILED **", "test failed"),
     ("** BUILD FAILED **", "build failed"),
@@ -426,26 +430,9 @@ pub fn clean_buildkite_log(raw: &str) -> String {
     out
 }
 
-/// Keep the last `n` lines of `log`.
-pub fn tail_lines_of(log: &str, n: usize) -> String {
-    let lines: Vec<&str> = log.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
 /// Whether one more retry fits the per-head budget.
 pub fn retry_allowed(retries_used: u32, additional: u32, budget: u32) -> bool {
     retries_used.saturating_add(additional) <= budget
-}
-
-/// Card label while a retry is in flight: `CI retrying: HTTP 504 in checks (1/2)`.
-pub fn retrying_label(summary: &str, check_name: &str, attempt: u32, budget: u32) -> String {
-    format!("CI retrying: {summary} in {check_name} ({attempt}/{budget})")
-}
-
-/// Card label once the budget is spent: `CI retry budget exhausted (2/2): HTTP 504 in checks`.
-pub fn exhausted_label(summary: &str, check_name: &str, used: u32, budget: u32) -> String {
-    format!("CI retry budget exhausted ({used}/{budget}): {summary} in {check_name}")
 }
 
 #[cfg(test)]
@@ -648,6 +635,15 @@ error: GitHub API call timed out after 30 seconds while looking up the open PR f
     }
 
     #[test]
+    fn upstream_noise_before_an_analysis_failure_is_still_deterministic() {
+        let log = "WARNING: Remote Cache: 503 Service Unavailable\n\
+ERROR: /w/BUILD.bazel:3:10: in rust_library rule //x:y: target '//a:b' is not visible\n\
+ERROR: Analysis of target '//x:y' failed; build aborted\n\
+ERROR: Build did NOT complete successfully\n";
+        assert!(matches!(classify_job(&failed(1, log)), Verdict::Deterministic { .. }));
+    }
+
+    #[test]
     fn exit_3_without_checkleft_corroboration_is_indeterminate() {
         // Exit 3 alone (e.g. a shallow clone with no merge base) is not
         // evidence of a transient fault.
@@ -743,12 +739,6 @@ error: GitHub API call timed out after 30 seconds while looking up the open PR f
     }
 
     #[test]
-    fn tail_lines_keeps_only_the_last_n() {
-        assert_eq!(tail_lines_of("a\nb\nc\nd", 2), "c\nd");
-        assert_eq!(tail_lines_of("a\nb", 5), "a\nb");
-    }
-
-    #[test]
     fn retry_budget_is_per_head_and_counts_every_requested_retry() {
         let budget = TRANSIENT_RETRY_BUDGET_PER_HEAD;
         assert!(retry_allowed(0, 1, budget));
@@ -760,17 +750,5 @@ error: GitHub API call timed out after 30 seconds while looking up the open PR f
         );
         assert!(!retry_allowed(2, 1, budget), "budget exhausted after two retries");
         assert!(!retry_allowed(0, 3, budget));
-    }
-
-    #[test]
-    fn card_labels_name_signal_check_and_attempt() {
-        assert_eq!(
-            retrying_label("HTTP 504", "buildkite/mono/checks", 1, 2),
-            "CI retrying: HTTP 504 in buildkite/mono/checks (1/2)"
-        );
-        assert_eq!(
-            exhausted_label("HTTP 504", "buildkite/mono/checks", 2, 2),
-            "CI retry budget exhausted (2/2): HTTP 504 in buildkite/mono/checks"
-        );
     }
 }

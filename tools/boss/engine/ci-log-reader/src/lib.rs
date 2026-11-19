@@ -651,7 +651,7 @@ fn parse_trunk_eviction_build(builds: &serde_json::Value, branch_prefix: &str) -
 /// Trim `s` to its last `n` lines (preserving order). Used by the
 /// `read_log_tail` impls — neither provider CLI exposes a server-side
 /// tail, so we fetch all and trim locally.
-fn tail_lines(s: &str, n: usize) -> String {
+pub fn tail_lines(s: &str, n: usize) -> String {
     if n == 0 {
         return String::new();
     }
