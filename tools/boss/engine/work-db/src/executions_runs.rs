@@ -1343,7 +1343,7 @@ impl WorkDb {
         let run_start_operation = crate::task_status_audit::begin_operation_on(&tx)?;
         crate::task_status_audit::execute(
             &tx,
-            "start_execution_run_on_host_with_tmux_hosting",
+            crate::task_status_audit::START_EXECUTION_RUN_BASIS,
             "engine",
             "UPDATE tasks
              SET status = 'active',
@@ -1385,7 +1385,7 @@ impl WorkDb {
         // disjunct and must remain symmetric.
         crate::task_status_audit::execute(
             &tx,
-            "start_execution_run_on_host_with_tmux_hosting",
+            crate::task_status_audit::START_EXECUTION_RUN_BASIS,
             "engine",
             "UPDATE tasks
              SET autostart = 0,
@@ -1431,7 +1431,7 @@ impl WorkDb {
         // engine process that predates this call.
         crate::task_status_audit::execute(
             &tx,
-            "start_execution_run_on_host_with_tmux_hosting",
+            crate::task_status_audit::START_EXECUTION_RUN_BASIS,
             "engine",
             "UPDATE tasks
              SET dispatch_failed_reason = NULL,

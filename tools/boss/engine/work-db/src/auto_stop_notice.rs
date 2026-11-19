@@ -1,4 +1,4 @@
-//! The card notice for an engine-initiated stop of a never-started item.
+//! The card notice for an engine-initiated stop of an item.
 //!
 //! The ledger (`task_status_audit`) already records every engine write that
 //! clears a task's `autostart` or moves one of its executions to `abandoned`,
@@ -12,22 +12,23 @@
 //! a human has seen). A stop recorded after that id is a new notice.
 //!
 //! A row raises the notice only while all of these hold:
-//! - the engine wrote it, and the item had never started a run at that moment
-//!   (a normal run-start consumption of `autostart` is the engine's own write
-//!   too, so it is excluded by its reason code as well);
-//! - the item has still never started a run, so the notice clears by itself
-//!   when the item starts;
-//! - the item is live, not held on purpose (closed, deferred or parked), and
-//!   its `autostart` is off, so the engine will not start it by itself;
-//! - for an abandonment, the execution was a never-started one, no in-flight
-//!   execution replaced it, and the cause is not one of
-//!   [`BENIGN_ABANDON_CAUSES`], where withdrawing the execution is the
-//!   intended outcome rather than a stop. Any other cause, including a write
-//!   that bypassed the ledger helpers, raises the notice.
+//! - the engine wrote it (a normal run-start consumption of `autostart` is
+//!   the engine's own write too, so it is excluded by its reason code);
+//! - no run has started at or after the stop, so a later start clears it
+//!   without hiding a stop that followed an earlier finished run;
+//! - no execution is queued or running, so queueing a replacement clears it;
+//! - the item is live and not held on purpose (closed, deferred or parked);
+//! - for an autostart `1 → 0` write, autostart is still off;
+//! - for an abandonment, the execution itself never started a run, and the
+//!   cause is not one of [`BENIGN_ABANDON_CAUSES`], where withdrawing the
+//!   execution is the intended outcome rather than a stop. Autostart may
+//!   still be on: an unreplaced never-started abandonment is a stall even
+//!   when the reconciler is supposed to re-mint. Any other cause, including
+//!   a write that bypassed the ledger helpers, raises the notice.
 //!
 //! Which items get stopped is unchanged; this only makes the stop visible.
 use super::*;
-use crate::task_status_audit::{AbandonCause, EXECUTION_ABANDONED_PROPERTY, abandon_cause};
+use crate::task_status_audit::{AbandonCause, EXECUTION_ABANDONED_PROPERTY, START_EXECUTION_RUN_BASIS, abandon_cause};
 use boss_protocol::AutoStopNotice;
 use std::collections::HashMap;
 
@@ -83,35 +84,37 @@ fn candidate_sql() -> String {
            AND t.status NOT IN ('done', 'archived')
            AND t.deferred = 0
            AND t.parked_at IS NULL
-           AND t.autostart = 0
            AND a.actor = 'engine'
-           AND a.item_ever_ran = 0
            AND a.id > COALESCE((SELECT k.acked_audit_id FROM task_auto_stop_ack k WHERE k.work_item_id = t.id), 0)
            AND (
                 (a.property = 'autostart' AND a.old_value = '1' AND a.new_value = '0'
+                 AND t.autostart = 0
                  AND a.reason_code IS NOT '{run_start}')
                 OR
                 (a.property = '{abandoned}' AND a.execution_ever_ran = 0
-                 AND COALESCE(a.reason_code, '') NOT IN ({benign})
-                 AND NOT EXISTS (SELECT 1 FROM work_executions live
-                                 WHERE live.work_item_id = t.id AND live.status IN ({in_flight})))
+                 AND COALESCE(a.reason_code, '') NOT IN ({benign}))
            )
+           AND NOT EXISTS (
+                SELECT 1 FROM work_executions live
+                WHERE live.work_item_id = t.id AND live.status IN ({in_flight}))
            AND NOT EXISTS (
                 SELECT 1 FROM work_executions we
                 WHERE we.work_item_id = t.id
-                  AND (we.started_at IS NOT NULL
-                       OR EXISTS (SELECT 1 FROM work_runs wr WHERE wr.execution_id = we.id)))
+                  AND (
+                    (we.started_at IS NOT NULL
+                     AND CAST(we.started_at AS INTEGER) >= CAST(a.changed_at AS INTEGER))
+                    OR EXISTS (
+                        SELECT 1 FROM work_runs wr
+                        WHERE wr.execution_id = we.id
+                          AND wr.started_at IS NOT NULL
+                          AND CAST(wr.started_at AS INTEGER) >= CAST(a.changed_at AS INTEGER))))
          ORDER BY a.work_item_id, a.id",
-        run_start = RUN_START_CONSUMPTION_CODE,
+        run_start = START_EXECUTION_RUN_BASIS,
         abandoned = EXECUTION_ABANDONED_PROPERTY,
         in_flight = IN_FLIGHT_EXECUTION_STATUSES,
         benign = benign,
     )
 }
-
-/// `reason_code` of the ledger row for the run start that consumes an item's
-/// `autostart`. That is the expected end of autostart, not a stop.
-const RUN_START_CONSUMPTION_CODE: &str = "start_execution_run_on_host_with_tmux_hosting";
 
 /// The notice of each item in `ids` that has one.
 pub(crate) fn notices_among(conn: &Connection, ids: &[&str]) -> Result<HashMap<String, AutoStopNotice>> {
