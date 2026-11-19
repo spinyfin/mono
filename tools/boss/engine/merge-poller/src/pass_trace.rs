@@ -49,7 +49,9 @@ pub enum PassPhase {
 }
 
 impl PassPhase {
-    /// Every phase, in pass order.
+    /// Every phase a pass can run. Terminal merge observation always
+    /// precedes the rest; open walk, local upkeep and the per-execution
+    /// families rotate their starting order across passes.
     pub const ALL: [PassPhase; 14] = [
         PassPhase::ListCandidates,
         PassPhase::MergeDisarm,
@@ -217,6 +219,14 @@ impl PassTimings {
             .sum()
     }
 
+    /// The open walk listed more candidates than it finished: this pass
+    /// yielded at the reserve or was dropped before covering every open PR.
+    pub fn open_walk_truncated(&self) -> bool {
+        self.all()
+            .find(|phase| phase.phase == PassPhase::OpenWalk)
+            .is_some_and(|phase| phase.items_done < phase.items_total)
+    }
+
     /// Publish this pass's duration, item counts and per-phase cost. A phase
     /// the pass never reached reads `0`, so a stale value from an earlier
     /// pass is never mistaken for this one's.
@@ -367,10 +377,10 @@ impl PassTrace {
 /// health report.
 pub const DETECTION_STALL_ISSUE_KIND: &str = "merge_detection_stalled";
 
-/// Full detection passes are being abandoned: the poller ran out of its
-/// time budget before finishing a pass. Raised by the first abandoned pass,
-/// updated in place by each further one, and cleared by the next pass that
-/// runs to its end.
+/// Full detection passes are not finishing their open-PR walk: the poller
+/// ran out of budget, or it yielded at the open-walk reserve with candidates
+/// still unwalked. Raised by the first such pass, updated in place by each
+/// further one, and cleared by the next pass that walks every open candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectionStall {
     /// Abandoned passes since the last pass that ran to its end.
@@ -425,6 +435,23 @@ pub(crate) fn record_completed_pass(signal: &DetectionStallSignal) {
     signal.send_if_modified(|stall| stall.take().is_some());
 }
 
+/// Record whether this pass finished its open-PR walk. A pass that returns
+/// from its future but left open candidates unwalked is still a stall: the
+/// health banner stays up until a pass covers every open PR.
+pub(crate) fn record_pass_result(
+    signal: &DetectionStallSignal,
+    completed: bool,
+    timings: &PassTimings,
+    budget: Duration,
+    now_epoch_secs: i64,
+) {
+    if completed && !timings.open_walk_truncated() {
+        record_completed_pass(signal);
+    } else {
+        record_abandoned_pass(signal, budget, timings.clone(), now_epoch_secs);
+    }
+}
+
 /// Render the stall as the engine-health issue the app banner and `bossctl`
 /// show. The engine owns the wording; the app renders it verbatim.
 ///
@@ -444,7 +471,19 @@ pub fn detection_stall_health_issue(stall: &DetectionStall, now_epoch_secs: i64)
             phase.items_done,
             phase.items_total,
         ),
-        None => "The most recent one was cut off between phases.".to_owned(),
+        None => match stall
+            .timings
+            .phases
+            .iter()
+            .find(|phase| phase.phase == PassPhase::OpenWalk)
+            .filter(|phase| phase.items_done < phase.items_total)
+        {
+            Some(open) => format!(
+                "The most recent one walked {} of {} open PR(s) and left the rest for the next pass.",
+                open.items_done, open.items_total,
+            ),
+            None => "The most recent one was cut off between phases.".to_owned(),
+        },
     };
     EngineHealthIssue {
         kind: DETECTION_STALL_ISSUE_KIND.to_owned(),
@@ -456,12 +495,12 @@ pub fn detection_stall_health_issue(stall: &DetectionStall, now_epoch_secs: i64)
         .to_owned(),
         title: format!("PR merge detection is running out of time: {passes} did not finish"),
         body: format!(
-            "Starting {since}, {passes} ran past the {budget}s budget and stopped early. {cut_off}\n\n\
+            "Starting {since}, {passes} did not finish within the {budget}s budget. {cut_off}\n\n\
              Merged and closed PRs are recorded first on every pass, and each pass resumes with the \
-             items the previous one did not reach, so nothing is skipped. Until passes finish again, \
-             CI, review and merge-queue state on the board can be several minutes behind GitHub.\n\n\
+             items the previous one did not reach, so nothing is skipped. Until a pass walks every \
+             open PR, CI, review and merge-queue state on the board can be several minutes behind GitHub.\n\n\
              Phase timings of the most recent pass ({unfinished} item(s) left unfinished):\n{breakdown}\n\n\
-             This notice clears itself once a pass runs to its end.",
+             This notice clears itself once a pass walks every open candidate.",
             budget = stall.budget.as_secs(),
             unfinished = stall.timings.items_unfinished(),
             breakdown = stall.timings.breakdown(),

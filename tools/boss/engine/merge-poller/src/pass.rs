@@ -29,40 +29,62 @@ pub(crate) const PROBE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
 /// safe because every candidate list is rebuilt from the DB next pass.
 pub(crate) const MAX_PROBE_REFRESHES_PER_PASS: u8 = 2;
 
-/// Share of the pass budget the open walk leaves for everything after it.
-/// Without this, a walk that costs more than the budget never yields, and
-/// stranded recovery, reviewer upkeep, PR recheck and late-PR recovery
-/// never run.
+/// Share of the pass budget the open walk leaves for everything after it
+/// when later groups have not yet run this pass. Without this, a walk that
+/// costs more than the budget never yields, and stranded recovery, reviewer
+/// upkeep, PR recheck and late-PR recovery never run in that pass.
 pub(crate) const OPEN_WALK_RESERVE_DIVISOR: u32 = 4;
 
+/// How much earlier the in-pass clock expires than the outer timeout, so
+/// `remaining().is_zero()` can fire and the pass can finish instead of
+/// being dropped mid-item. Sized for bookkeeping, not another GitHub-bound
+/// candidate.
+pub(crate) const PASS_YIELD_MARGIN: Duration = Duration::from_secs(2);
+
 /// Wall-clock of one pass, used to stop a walk before it consumes the
-/// reserve later phases need. `deadline` is `None` when the caller did not
-/// bound the pass (`Duration::MAX`), so self-limiting is off.
+/// reserve later phases need, and to yield before the outer timeout. Both
+/// deadlines are `None` when the caller did not bound the pass
+/// (`Duration::MAX`), so self-limiting is off.
 struct PassClock {
-    deadline: Option<tokio::time::Instant>,
+    /// When the outer `tokio::time::timeout` fires.
+    timeout_at: Option<tokio::time::Instant>,
+    /// `timeout_at` minus [`PASS_YIELD_MARGIN`]: `remaining()` hits zero here.
+    yield_at: Option<tokio::time::Instant>,
     budget: Duration,
 }
 
 impl PassClock {
     fn start(budget: Duration) -> Self {
         let now = tokio::time::Instant::now();
+        let timeout_at = now.checked_add(budget);
+        let yield_at = timeout_at.and_then(|deadline| deadline.checked_sub(PASS_YIELD_MARGIN));
         Self {
-            deadline: now.checked_add(budget),
+            timeout_at,
+            yield_at,
             budget,
         }
     }
 
     fn remaining(&self) -> Duration {
-        match self.deadline {
+        match self.yield_at {
             Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
             None => Duration::MAX,
         }
     }
 
     /// True when continuing this walk would leave later phases less than
-    /// `budget / divisor`.
+    /// `budget / divisor` before the outer timeout.
     fn past_reserve(&self, divisor: u32) -> bool {
-        self.deadline.is_some() && self.remaining() <= self.budget / divisor
+        let Some(timeout_at) = self.timeout_at else {
+            return false;
+        };
+        timeout_at.saturating_duration_since(tokio::time::Instant::now()) <= self.budget / divisor
+    }
+
+    /// Stop starting more work. `leave_open_walk_reserve` is true for the
+    /// open walk while later groups have not run this pass.
+    fn should_yield(&self, leave_open_walk_reserve: bool) -> bool {
+        (leave_open_walk_reserve && self.past_reserve(OPEN_WALK_RESERVE_DIVISOR)) || self.remaining().is_zero()
     }
 }
 
@@ -71,6 +93,16 @@ enum LatePhase {
     PrRecheck,
     BackgroundNudges,
     LatePr,
+}
+
+/// Groups after the terminal walk. Terminal merge observation always runs
+/// first; these three rotate so a slow open walk or slow upkeep cannot
+/// starve recovery forever.
+#[derive(Clone, Copy)]
+enum PostTerminalGroup {
+    OpenWalk,
+    Upkeep,
+    LateFamilies,
 }
 
 /// The batched probe result for one pass, plus the age bookkeeping that
@@ -84,6 +116,9 @@ pub(crate) struct ProbeSnapshot {
     /// std clock outside a paused runtime.
     taken_at: tokio::time::Instant,
     refreshes_left: u8,
+    /// Set by the most recent [`Self::ensure_fresh`] call: true only when
+    /// that call actually re-probed.
+    refreshed_last_call: bool,
 }
 
 impl ProbeSnapshot {
@@ -92,6 +127,7 @@ impl ProbeSnapshot {
             results,
             taken_at: tokio::time::Instant::now(),
             refreshes_left: MAX_PROBE_REFRESHES_PER_PASS,
+            refreshed_last_call: false,
         }
     }
 
@@ -117,6 +153,7 @@ impl ProbeSnapshot {
         probe: &dyn MergeProbe,
         remaining_urls: impl FnOnce() -> Vec<String>,
     ) -> bool {
+        self.refreshed_last_call = false;
         let age = self.taken_at.elapsed();
         if age <= PROBE_SNAPSHOT_MAX_AGE {
             return true;
@@ -141,6 +178,7 @@ impl ProbeSnapshot {
         );
         self.results = probe.probe_batch(&urls).await;
         self.taken_at = tokio::time::Instant::now();
+        self.refreshed_last_call = true;
         true
     }
 }
@@ -166,6 +204,24 @@ fn parked_ids_for_pass<'a>(
             HashSet::new()
         }
     }
+}
+
+/// Re-take the parked set when [`ProbeSnapshot::ensure_fresh`] actually
+/// re-probed: a row parked during a slow walk must not keep the snapshot
+/// from the start of the pass.
+async fn ensure_fresh_refreshing_parked<'a>(
+    snapshot: &mut ProbeSnapshot,
+    probe: &dyn MergeProbe,
+    work_db: &WorkDb,
+    parked_ids: &mut HashSet<String>,
+    parked_scope: &[&'a PendingMergeCheck],
+    remaining: impl IntoIterator<Item = &'a PendingMergeCheck>,
+) -> bool {
+    let ok = snapshot.ensure_fresh(probe, || remaining_probe_urls(remaining)).await;
+    if ok && snapshot.refreshed_last_call {
+        *parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
+    }
+    ok
 }
 
 /// The still-unprocessed candidates' PR urls, de-duplicated and in walk
@@ -316,22 +372,21 @@ fn probed_terminal(results: &HashMap<String, std::result::Result<PrLifecycleProb
 ///    is recorded before any open-PR upkeep runs. A merge costs the list
 ///    queries, the probe and its own transition — never the upkeep of the
 ///    candidates listed ahead of it.
-/// 3. **Open walk.** Upkeep of the still-open PRs, least recently attended
-///    first (see `walk_order`). Stops when the remaining budget is the
-///    reserve later phases need; unwalked candidates are not stamped.
-/// 4. **Batched and local phases.** Stranded remediation, the merge-queue
-///    dequeue query, reviewer fallback and review-pool upkeep.
-/// 5. **Per-execution rechecks.** PR detection for live workers and recently
-///    terminal executions makes GitHub calls per execution, so its cost
-///    scales with how many workers are running. The three families rotate
-///    their starting order across passes so a slow recheck cannot starve
-///    late-PR recovery.
+/// 3. **Open walk, local upkeep, per-execution families.** These three
+///    groups rotate their starting order across passes so a slow open walk
+///    or slow upkeep cannot starve recovery forever. Terminal observation
+///    always stays first. The open walk also stops when a quarter of the
+///    budget remains *if later groups have not run this pass*; unwalked
+///    candidates are not stamped. The in-pass clock expires a small margin
+///    before the outer timeout so later groups can yield instead of being
+///    dropped. Per-execution families (PR recheck, background nudges,
+///    late PR) rotate among themselves the same way.
 ///
-/// `budget` is the same cap the loop applies as a timeout. The pass uses it
-/// to stop the open walk with a reserve; `Duration::MAX` disables that.
-/// A pass dropped at its budget leaves `state` describing how far it got;
-/// nothing it did not reach is lost, because the next pass's rotation
-/// starts with exactly those candidates.
+/// `budget` is the same cap the loop applies as a timeout. The in-pass
+/// clock uses a shorter deadline so groups can yield; `Duration::MAX`
+/// disables that. A pass dropped at its budget leaves `state` describing
+/// how far it got; nothing it did not reach is lost, because the next
+/// pass's rotation starts with exactly those candidates.
 pub async fn run_one_pass_tracked(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
@@ -466,6 +521,9 @@ pub async fn run_one_pass_tracked(
         rotations
             .recheck
             .retain(&pending_pr_recheck.iter().map(String::as_str).collect());
+        rotations
+            .background_nudge
+            .retain(&pending_background_nudges.iter().map(String::as_str).collect());
         rotations.late_pr.retain(
             &late_pr_candidates
                 .iter()
@@ -521,39 +579,44 @@ pub async fn run_one_pass_tracked(
     let (terminal, open): (Vec<&PendingMergeCheck>, Vec<&PendingMergeCheck>) = candidates
         .into_iter()
         .partition(|candidate| probed_terminal(&snapshot.results, &candidate.pr_url));
-    let terminal_count = terminal.len();
-    let sweep_walk: Vec<&PendingMergeCheck> = {
+    let terminal_walk: Vec<&PendingMergeCheck> = {
         let rotations = state.rotations();
-        let mut walk = rotations
+        rotations
             .walk
-            .order(terminal, |candidate| candidate.work_item_id.as_str());
-        walk.extend(rotations.walk.order(open, |candidate| candidate.work_item_id.as_str()));
-        walk
+            .order(terminal, |candidate| candidate.work_item_id.as_str())
     };
-    let parked_ids = parked_ids_for_pass(work_db, sweep_walk.iter().copied().chain(stranded_blocked.iter()));
-    trace.enter(PassPhase::TerminalWalk, terminal_count);
-    for idx in 0..sweep_walk.len() {
-        if idx == terminal_count {
-            trace.enter(PassPhase::OpenWalk, sweep_walk.len() - terminal_count);
-        }
-        if idx >= terminal_count && clock.past_reserve(OPEN_WALK_RESERVE_DIVISOR) {
-            // Leave the rest unstamped so the next pass starts with them.
-            break;
-        }
-        let candidate = sweep_walk[idx];
+    let open_walk: Vec<&PendingMergeCheck> = {
+        let rotations = state.rotations();
+        rotations.walk.order(open, |candidate| candidate.work_item_id.as_str())
+    };
+    let parked_scope: Vec<&PendingMergeCheck> = terminal_walk
+        .iter()
+        .copied()
+        .chain(open_walk.iter().copied())
+        .chain(stranded_blocked.iter())
+        .collect();
+    let mut parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
+    // Terminal merge observation always runs first and is never rotated.
+    trace.enter(PassPhase::TerminalWalk, terminal_walk.len());
+    for idx in 0..terminal_walk.len() {
+        let candidate = terminal_walk[idx];
         trace.start_item(&candidate.work_item_id);
-        // Never transition off a snapshot that has gone stale under a
-        // long-running pass — see [`ProbeSnapshot`].
-        if !snapshot
-            .ensure_fresh(probe, || {
-                remaining_probe_urls(sweep_walk[idx..].iter().copied().chain(stranded_blocked.iter()))
-            })
-            .await
+        if !ensure_fresh_refreshing_parked(
+            &mut snapshot,
+            probe,
+            work_db,
+            &mut parked_ids,
+            &parked_scope,
+            terminal_walk[idx..]
+                .iter()
+                .copied()
+                .chain(open_walk.iter().copied())
+                .chain(stranded_blocked.iter()),
+        )
+        .await
         {
             break;
         }
-        // Stamped before the candidate is handled, so a pass cut off inside
-        // it resumes with the candidates after it — see `walk_order`.
         state.rotations().walk.stamp(&candidate.work_item_id);
         sweep_one(
             work_db,
@@ -572,235 +635,295 @@ pub async fn run_one_pass_tracked(
         .await;
         trace.finish_item();
     }
-    if sweep_walk.len() == terminal_count {
-        // Nothing open to walk; still record the phase so every pass's
-        // trace names the same phases.
-        trace.enter(PassPhase::OpenWalk, 0);
-    }
-    // Rescue stranded ci_remediations attempts: `pending` rows with no live
-    // execution. These arise when two dequeue events land in the same sweep —
-    // the first flips the task (consuming the WHERE guard on
-    // `mark_chore_blocked_ci_failure`) and the second inserts a ci_remediations
-    // row but cannot create an execution. Re-emit a fresh execution so a worker
-    // is dispatched without waiting for the task to return to `in_review`.
-    trace.enter(PassPhase::StrandedCi, stranded_ci_attempts.len());
-    for attempt in &stranded_ci_attempts {
-        trace.start_item(&attempt.work_item_id);
-        if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
-            outcome.ci_remediation_redispatched += 1;
-        }
-        trace.finish_item();
-    }
-    // Reconcile stranded `blocked` parents (NULL scalar reason, empty
-    // active-signal set, remediation-owned, bound PR). These fell out of
-    // every scalar-reason-keyed candidate list above, so a still-dirty PR
-    // would otherwise never be re-probed and no remediation revision would
-    // ever (re)spawn — the invariant violation where a parent rests
-    // `blocked` with no signal while its PR conflicts/fails. Re-probe each,
-    // re-canonicalise a still-dirty row back into the standard
-    // merge_conflict / ci_failure loop, and let the normal detection path
-    // spawn a fresh revision.
-    trace.enter(PassPhase::StrandedBlocked, stranded_blocked.len());
-    for idx in 0..stranded_blocked.len() {
-        trace.start_item(&stranded_blocked[idx].work_item_id);
-        if !snapshot
-            .ensure_fresh(probe, || remaining_probe_urls(stranded_blocked[idx..].iter()))
-            .await
-        {
-            break;
-        }
-        sweep_stranded_blocked_remediation(
-            work_db,
-            &snapshot.results,
-            publisher,
-            host,
-            &stranded_blocked[idx],
-            &mut outcome,
-        )
-        .await;
-        trace.finish_item();
-    }
-    // Merge-queue rebounce pass: for every `in_review` PR and every
-    // `blocked: ci_failure` PR, poll the GitHub timeline for
-    // `RemovedFromMergeQueueEvent` rows with `reason=FAILED_CHECKS`.
-    // This is a separate pass from the probe loop above — the probe
-    // covers per-PR CI and merge-conflict signals, while this pass
-    // specifically looks for queue dequeues. Including `blocked_ci`
-    // candidates ensures that a second dequeue (on a PR already blocked
-    // by a prior dequeue) inserts a ci_remediations row so the stranded
-    // rescue above can dispatch an execution for it.
-    // The `INSERT OR IGNORE` idempotency on `ci_remediations` ensures
-    // that events already processed on a prior sweep are no-ops.
-    //
-    // Every candidate's dequeue events are fetched in one batched GraphQL
-    // round trip (`fetch_merge_queue_dequeue_events_batch`) instead of one
-    // `gh api graphql` call per candidate — this was the dominant
-    // per-pass request volume behind the hourly GitHub quota exhaustion
-    // (O(open rows) unbatched requests, every 60s, on top of everything
-    // else sharing the token).
-    // A `trunk_queue`-mechanism product's dequeue/eviction signal is owned
-    // by the Trunk queue poller, not GitHub's merge-queue timeline — its
-    // PRs never actually sit in GitHub's native queue (see
-    // `is_trunk_queue_product`), so a `RemovedFromMergeQueueEvent` lookup
-    // here would either find nothing or, worse, race the Trunk-owned
-    // coordination state with a GitHub-side signal that was never armed
-    // for this product.
-    trace.enter(PassPhase::QueueRebounce, 0);
-    run_merge_queue_rebounce_pass(
-        work_db,
-        publisher,
-        &in_review,
-        &blocked_ci,
-        Some(&parked_ids),
-        &mut outcome,
-    )
-    .await;
 
-    // reviewer-fallback sweep: tasks held in `active` (PendingReview)
-    // while waiting for an AI reviewer pass that has since finished or timed
-    // out. A pass that recorded a ReviewResult may advance to Review; a pass
-    // that produced no result is re-fired and stays in Doing. Timeout: 10
-    // minutes — long enough for the reviewer to complete normally, short
-    // enough to surface and recover a wedged pass promptly.
-    trace.enter(PassPhase::StalledReviewer, 0);
-    let reviewer_stale_secs: u64 = 10 * 60;
-    let stalled_candidates = match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks");
-            Vec::new()
-        }
-    };
-    trace.set_items_total(stalled_candidates.len());
+    // Advance before any rotated group runs so a pass dropped in the open
+    // walk still rotates: next pass starts with a later group.
+    let turn = state.next_phase_turn();
+    let mut groups = [
+        PostTerminalGroup::OpenWalk,
+        PostTerminalGroup::Upkeep,
+        PostTerminalGroup::LateFamilies,
+    ];
+    groups.rotate_left((turn % 3) as usize);
     let skip_unbatched_review_holds = completion_handler
         .map(|handler| handler.review_batch_fanout_enabled())
         .unwrap_or(false);
-    for (task_id, product_id, pr_url, review_result_written) in &stalled_candidates {
-        trace.start_item(task_id);
-        sweep_stalled_reviewer(
-            work_db,
-            publisher,
-            StalledReview {
-                task_id,
-                product_id,
-                pr_url,
-                review_result_written: *review_result_written,
-                skip_unbatched_review_holds,
-            },
-            &GhPrStateChecker,
-            &mut outcome,
-        )
-        .await;
-        trace.finish_item();
-    }
 
-    trace.enter(PassPhase::ReviewAdmission, 0);
-    if skip_unbatched_review_holds && let Some(handler) = completion_handler {
-        let pool_size = handler.review_pool_size();
-        sweep_deferred_review_admission_with(
-            work_db,
-            publisher,
-            handler.review_batch_enqueuer(),
-            None,
-            pool_size,
-            &mut outcome,
-        )
-        .await;
-    }
-    trace.enter(PassPhase::ReviewBatchUpkeep, 0);
-    if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
-        tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
-    }
-    match work_db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
-        Ok(reaped) => {
-            outcome.review_batches_reaped = reaped.len();
-            if !reaped.is_empty() {
-                tracing::info!(
-                    reaped = reaped.len(),
-                    "merge poller: reaped inert review batches to release pool reservations"
-                );
+    for group in groups {
+        match group {
+            PostTerminalGroup::OpenWalk => {
+                trace.enter(PassPhase::OpenWalk, open_walk.len());
+                for idx in 0..open_walk.len() {
+                    // Always leave the reserve: an item started with less
+                    // than a quarter of the budget left is dropped by the
+                    // outer timeout and would be stamped, starving the tail.
+                    if clock.should_yield(true) {
+                        tracing::warn!(
+                            deferred = open_walk.len() - idx,
+                            walked = idx,
+                            open_total = open_walk.len(),
+                            "merge poller: open walk stopped to leave time for later phases; \
+                             deferred open candidates are first next pass",
+                        );
+                        break;
+                    }
+                    let candidate = open_walk[idx];
+                    trace.start_item(&candidate.work_item_id);
+                    if !ensure_fresh_refreshing_parked(
+                        &mut snapshot,
+                        probe,
+                        work_db,
+                        &mut parked_ids,
+                        &parked_scope,
+                        open_walk[idx..].iter().copied().chain(stranded_blocked.iter()),
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    state.rotations().walk.stamp(&candidate.work_item_id);
+                    sweep_one(
+                        work_db,
+                        &snapshot.results,
+                        &source_observation_sequences,
+                        (publisher, "full_sweep"),
+                        SweepHandlers {
+                            cube_client,
+                            completion_handler,
+                            host,
+                            parked_ids: Some(&parked_ids),
+                        },
+                        candidate,
+                        &mut outcome,
+                    )
+                    .await;
+                    trace.finish_item();
+                }
             }
-        }
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to reap inert review batches");
-        }
-    }
-    sample_review_pool_gauges(work_db, &mut outcome);
+            PostTerminalGroup::Upkeep => {
+                // Rescue stranded ci_remediations attempts: `pending` rows with no live
+                // execution. These arise when two dequeue events land in the same sweep —
+                // the first flips the task (consuming the WHERE guard on
+                // `mark_chore_blocked_ci_failure`) and the second inserts a ci_remediations
+                // row but cannot create an execution.
+                trace.enter(PassPhase::StrandedCi, stranded_ci_attempts.len());
+                for attempt in &stranded_ci_attempts {
+                    if clock.should_yield(false) {
+                        break;
+                    }
+                    trace.start_item(&attempt.work_item_id);
+                    if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
+                        outcome.ci_remediation_redispatched += 1;
+                    }
+                    trace.finish_item();
+                }
+                // Reconcile stranded `blocked` parents (NULL scalar reason, empty
+                // active-signal set, remediation-owned, bound PR).
+                trace.enter(PassPhase::StrandedBlocked, stranded_blocked.len());
+                for idx in 0..stranded_blocked.len() {
+                    if clock.should_yield(false) {
+                        break;
+                    }
+                    trace.start_item(&stranded_blocked[idx].work_item_id);
+                    if !ensure_fresh_refreshing_parked(
+                        &mut snapshot,
+                        probe,
+                        work_db,
+                        &mut parked_ids,
+                        &parked_scope,
+                        stranded_blocked[idx..].iter(),
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    sweep_stranded_blocked_remediation(
+                        work_db,
+                        &snapshot.results,
+                        publisher,
+                        host,
+                        &stranded_blocked[idx],
+                        &mut outcome,
+                    )
+                    .await;
+                    trace.finish_item();
+                }
+                // Merge-queue rebounce: one batched GraphQL round trip, then
+                // per-candidate checks. Refresh parked rows first so a row
+                // parked during the open walk is not bounced.
+                trace.enter(PassPhase::QueueRebounce, 0);
+                if !clock.should_yield(false) {
+                    parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
+                    run_merge_queue_rebounce_pass(
+                        work_db,
+                        publisher,
+                        &in_review,
+                        &blocked_ci,
+                        Some(&parked_ids),
+                        &mut outcome,
+                    )
+                    .await;
+                }
+                // Reviewer-fallback: tasks held in `active` (PendingReview)
+                // while waiting for an AI reviewer pass that has since finished
+                // or timed out. Timeout: 10 minutes.
+                trace.enter(PassPhase::StalledReviewer, 0);
+                let reviewer_stale_secs: u64 = 10 * 60;
+                let stalled_candidates = match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
+                    Ok(items) => items,
+                    Err(err) => {
+                        tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks");
+                        Vec::new()
+                    }
+                };
+                trace.set_items_total(stalled_candidates.len());
+                for (task_id, product_id, pr_url, review_result_written) in &stalled_candidates {
+                    if clock.should_yield(false) {
+                        break;
+                    }
+                    trace.start_item(task_id);
+                    sweep_stalled_reviewer(
+                        work_db,
+                        publisher,
+                        StalledReview {
+                            task_id,
+                            product_id,
+                            pr_url,
+                            review_result_written: *review_result_written,
+                            skip_unbatched_review_holds,
+                        },
+                        &GhPrStateChecker,
+                        &mut outcome,
+                    )
+                    .await;
+                    trace.finish_item();
+                }
 
-    // The per-execution rechecks run last. Each one is its own GitHub
-    // round trip (or several), so together they cost time in proportion to
-    // the number of live workers, not the number of tracked PRs. Their
-    // starting family rotates across passes so a slow recheck cannot
-    // starve late-PR recovery; each family's own rotation hands unreached
-    // executions to the next pass that starts with that family.
-    if let Some(handler) = completion_handler {
-        let rechecks = state
-            .rotations()
-            .recheck
-            .order(pending_pr_recheck.iter().collect(), |execution_id| {
-                execution_id.as_str()
-            });
-        let late = state
-            .rotations()
-            .late_pr
-            .order(late_pr_candidates.iter().collect(), |candidate| {
-                candidate.execution_id.as_str()
-            });
-        let mut late_phases = [LatePhase::PrRecheck, LatePhase::BackgroundNudges, LatePhase::LatePr];
-        late_phases.rotate_left((state.next_late_phase_turn() % 3) as usize);
-        for phase in late_phases {
-            if clock.remaining().is_zero() {
-                break;
+                trace.enter(PassPhase::ReviewAdmission, 0);
+                if !clock.should_yield(false)
+                    && skip_unbatched_review_holds
+                    && let Some(handler) = completion_handler
+                {
+                    let pool_size = handler.review_pool_size();
+                    sweep_deferred_review_admission_with(
+                        work_db,
+                        publisher,
+                        handler.review_batch_enqueuer(),
+                        None,
+                        pool_size,
+                        &mut outcome,
+                    )
+                    .await;
+                }
+                trace.enter(PassPhase::ReviewBatchUpkeep, 0);
+                if !clock.should_yield(false) {
+                    if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
+                        tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
+                    }
+                    match work_db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
+                        Ok(reaped) => {
+                            outcome.review_batches_reaped = reaped.len();
+                            if !reaped.is_empty() {
+                                tracing::info!(
+                                    reaped = reaped.len(),
+                                    "merge poller: reaped inert review batches to release pool reservations"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "merge poller: failed to reap inert review batches");
+                        }
+                    }
+                    sample_review_pool_gauges(work_db, &mut outcome);
+                }
             }
-            match phase {
-                LatePhase::PrRecheck => {
-                    trace.enter(PassPhase::PrRecheck, rechecks.len());
-                    for execution_id in &rechecks {
-                        if clock.remaining().is_zero() {
+            PostTerminalGroup::LateFamilies => {
+                if let Some(handler) = completion_handler {
+                    if clock.should_yield(true) {
+                        continue;
+                    }
+                    // Only a pass that actually has time for this group
+                    // advances family rotation, so a family is not charged
+                    // for a pass that already spent its budget on the walk.
+                    let family_turn = state.next_late_family_turn();
+                    let rechecks = state
+                        .rotations()
+                        .recheck
+                        .order(pending_pr_recheck.iter().collect(), |execution_id| {
+                            execution_id.as_str()
+                        });
+                    let nudges = state
+                        .rotations()
+                        .background_nudge
+                        .order(pending_background_nudges.iter().collect(), |execution_id| {
+                            execution_id.as_str()
+                        });
+                    let late = state
+                        .rotations()
+                        .late_pr
+                        .order(late_pr_candidates.iter().collect(), |candidate| {
+                            candidate.execution_id.as_str()
+                        });
+                    let mut late_phases = [LatePhase::PrRecheck, LatePhase::BackgroundNudges, LatePhase::LatePr];
+                    late_phases.rotate_left((family_turn % 3) as usize);
+                    for phase in late_phases {
+                        if clock.should_yield(true) {
                             break;
                         }
-                        trace.start_item(execution_id);
-                        state.rotations().recheck.stamp(execution_id);
-                        sweep_pending_pr(handler, execution_id, &mut outcome).await;
-                        trace.finish_item();
-                    }
-                }
-                LatePhase::BackgroundNudges => {
-                    trace.enter(PassPhase::BackgroundNudges, pending_background_nudges.len());
-                    for execution_id in &pending_background_nudges {
-                        if clock.remaining().is_zero() {
-                            break;
+                        match phase {
+                            LatePhase::PrRecheck => {
+                                trace.enter(PassPhase::PrRecheck, rechecks.len());
+                                for execution_id in &rechecks {
+                                    if clock.should_yield(true) {
+                                        break;
+                                    }
+                                    trace.start_item(execution_id);
+                                    state.rotations().recheck.stamp(execution_id);
+                                    sweep_pending_pr(handler, execution_id, &mut outcome).await;
+                                    trace.finish_item();
+                                }
+                            }
+                            LatePhase::BackgroundNudges => {
+                                trace.enter(PassPhase::BackgroundNudges, nudges.len());
+                                for execution_id in &nudges {
+                                    if clock.should_yield(true) {
+                                        break;
+                                    }
+                                    trace.start_item(execution_id);
+                                    state.rotations().background_nudge.stamp(execution_id);
+                                    if let Some(recheck_outcome) = handler.recheck_background_nudge(execution_id).await
+                                    {
+                                        tracing::info!(
+                                            execution_id,
+                                            outcome = ?recheck_outcome,
+                                            "merge poller: recurring background-child nudge recheck completed",
+                                        );
+                                    }
+                                    trace.finish_item();
+                                }
+                            }
+                            LatePhase::LatePr => {
+                                trace.enter(PassPhase::LatePr, late.len());
+                                for candidate in &late {
+                                    if clock.should_yield(true) {
+                                        break;
+                                    }
+                                    trace.start_item(&candidate.execution_id);
+                                    state.rotations().late_pr.stamp(&candidate.execution_id);
+                                    sweep_late_pr(handler, candidate, &mut outcome).await;
+                                    trace.finish_item();
+                                }
+                            }
                         }
-                        trace.start_item(execution_id);
-                        if let Some(recheck_outcome) = handler.recheck_background_nudge(execution_id).await {
-                            tracing::info!(
-                                execution_id,
-                                outcome = ?recheck_outcome,
-                                "merge poller: recurring background-child nudge recheck completed",
-                            );
-                        }
-                        trace.finish_item();
                     }
-                }
-                LatePhase::LatePr => {
-                    trace.enter(PassPhase::LatePr, late.len());
-                    for candidate in &late {
-                        if clock.remaining().is_zero() {
-                            break;
-                        }
-                        trace.start_item(&candidate.execution_id);
-                        state.rotations().late_pr.stamp(&candidate.execution_id);
-                        sweep_late_pr(handler, candidate, &mut outcome).await;
-                        trace.finish_item();
-                    }
+                } else if !pending_pr_recheck.is_empty() {
+                    tracing::debug!(
+                        count = pending_pr_recheck.len(),
+                        "merge poller: pending PR-detection candidates skipped (no completion_handler wired)",
+                    );
                 }
             }
         }
-    } else if !pending_pr_recheck.is_empty() {
-        tracing::debug!(
-            count = pending_pr_recheck.len(),
-            "merge poller: pending PR-detection candidates skipped (no completion_handler wired)",
-        );
     }
     trace.end();
 

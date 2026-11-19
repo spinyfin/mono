@@ -33,29 +33,36 @@ Two properties follow from that order:
 - **A merge is recorded before any open-PR upkeep.** Observing a merge costs
   the list queries, the probe and that PR's own transition. It does not wait
   behind the upkeep of every PR listed ahead of it.
-- **The open walk leaves a reserve for later phases.** It stops when a
-  quarter of the pass budget remains, and does not stamp the candidates it
-  did not start, so the next pass resumes them. Stranded recovery, queue
-  rebounce, reviewer upkeep, PR recheck, background nudges and late-PR
-  recovery still run in that reserved time. The three per-execution
-  families rotate which one starts after that upkeep, so a slow recheck
-  cannot starve late-PR recovery across passes.
+- **Open walk, local upkeep and per-execution families rotate.** Terminal
+  observation always stays first. The other three groups take turns starting
+  after it, so a slow open walk or slow upkeep cannot starve recovery
+  forever. The open walk also stops when a quarter of the pass budget
+  remains, and does not stamp the candidates it did not start. Starting an
+  item with less than that left would be dropped by the outer timeout and
+  starve the tail. The in-pass clock expires a small margin before the
+  outer timeout so a group can yield instead of being dropped.
+  The three per-execution families (PR recheck, background nudges, late PR)
+  rotate which one starts, and each family's candidates are ordered
+  least-recently-attended first.
 
 ## When a pass runs out of time
 
 The loop drops a pass that exceeds its budget. Four things keep that from
 turning into PRs that are never observed:
 
-- **Open-walk reserve.** The walk of still-open PRs stops while a quarter of
-  the budget remains, so later phases are not starved when that walk alone
-  would exceed 180 s. Unwalked candidates are not stamped.
-- **Rotation.** The PR walk and the per-execution rechecks are ordered least
-  recently attended first, and that memory is kept across passes. Whatever
-  one pass did not reach is what the next pass starts with. A candidate is
-  marked when the pass starts on it, so a candidate whose own handling is
-  what exhausts the budget goes to the back of the next pass instead of
-  cutting every pass off in the same place. The three per-execution
-  families also rotate their starting order across passes.
+- **Open-walk reserve.** The walk of still-open PRs, and the per-execution
+  families, stop starting new items while a quarter of the budget remains.
+  Unstarted candidates are not stamped. A candidate that is already in
+  flight can still overrun the reserve; the next pass then starts with a
+  later group so recovery still makes progress.
+- **Rotation.** The PR walk, background nudges and the per-execution rechecks
+  are ordered least recently attended first, and that memory is kept across
+  passes. Whatever one pass did not reach is what the next pass starts with.
+  A candidate is marked when the pass starts on it, so a candidate whose own
+  handling is what exhausts the budget goes to the back of the next pass
+  instead of cutting every pass off in the same place. Open walk, local
+  upkeep and the per-execution families rotate their starting order at the
+  start of that work, so a pass dropped in the open walk still rotates.
 - **The adaptive schedule is left alone.** An abandoned pass has no
   observations. It is not treated as a pass that saw no candidates, which
   would retire every per-PR adaptive slot; hot PRs keep being reconciled
@@ -66,12 +73,13 @@ turning into PRs that are never observed:
 
 ## Health signal
 
-An abandoned pass raises a `merge_detection_stalled` issue on the engine
-health report (the app's health banner, `bossctl` health output). It is a
-warning after one abandoned pass and an error after two in a row. The body
-names the phase the most recent pass was cut off in, how many of that
+An abandoned pass, or a pass that yields at the open-walk reserve with
+open PRs still unwalked, raises a `merge_detection_stalled` issue on the
+engine health report (the app's health banner, `bossctl` health output).
+It is a warning after one such pass and an error after two in a row. The
+body names the phase the most recent pass was cut off in, how many of that
 phase's items it had finished, and the phase timings. The issue clears
-itself when a pass runs to its end.
+itself when a pass walks every open candidate.
 
 ## Finding where the time went
 

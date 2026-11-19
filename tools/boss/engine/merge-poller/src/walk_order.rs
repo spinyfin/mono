@@ -65,6 +65,8 @@ pub(crate) struct PassRotations {
     pub(crate) walk: Rotation,
     /// The live-worker PR-detection recheck, keyed by execution id.
     pub(crate) recheck: Rotation,
+    /// Background-nudge rechecks, keyed by execution id.
+    pub(crate) background_nudge: Rotation,
     /// The late-PR recheck of terminal executions, keyed by execution id.
     pub(crate) late_pr: Rotation,
 }
@@ -77,11 +79,15 @@ pub(crate) struct PassRotations {
 pub struct PassState {
     pub(crate) trace: PassTrace,
     rotations: Mutex<PassRotations>,
-    /// Which of the per-execution families (PR recheck, background nudges,
-    /// late PR) this pass starts with after the open walk and local upkeep.
-    /// Advanced each pass that reaches those families so a slow recheck
-    /// cannot starve late-PR recovery forever.
-    late_phase_turn: AtomicU64,
+    /// Starting offset among the post-terminal groups (open walk, local
+    /// upkeep, per-execution families). Advanced at the start of that work,
+    /// before any of it runs, so a pass dropped in the open walk still
+    /// rotates.
+    phase_turn: AtomicU64,
+    /// Starting offset among the three per-execution families. Advanced
+    /// only when that group actually has time, so a family is not charged
+    /// for a pass that yielded before it started.
+    late_family_turn: AtomicU64,
 }
 
 impl PassState {
@@ -96,8 +102,16 @@ impl PassState {
         self.rotations.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Take the next starting offset among the three per-execution families.
-    pub(crate) fn next_late_phase_turn(&self) -> u64 {
-        self.late_phase_turn.fetch_add(1, Ordering::Relaxed)
+    /// Take the next starting offset among post-terminal groups and
+    /// per-execution families. Call once per pass, after the terminal
+    /// walk and before any rotated group runs.
+    pub(crate) fn next_phase_turn(&self) -> u64 {
+        self.phase_turn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Take the next starting offset among PR recheck, background nudges
+    /// and late PR. Call when the per-execution group has time to run.
+    pub(crate) fn next_late_family_turn(&self) -> u64 {
+        self.late_family_turn.fetch_add(1, Ordering::Relaxed)
     }
 }

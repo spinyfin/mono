@@ -193,6 +193,10 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
     let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();
     let dequeue_events = fetch_merge_queue_dequeue_events_batch(&rebounce_urls).await;
     for candidate in &rebounce_candidates {
+        // Confirm at the mint path: the batched parked set can be a walk stale.
+        if work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge_queue rebounce") {
+            continue;
+        }
         clear_github_merge_intent_on_observed_dequeue(work_db, publisher, candidate, &dequeue_events).await;
         check_merge_queue_rebounce(
             work_db,

@@ -688,17 +688,17 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
             )
             .await;
             let last_run_at = Instant::now();
-            // An abandoned pass is a health signal, not only a log line: it
-            // goes on the engine health report until a pass runs to its end.
-            match &completed {
-                Some(_) => record_completed_pass(&detection_stall),
-                None => record_abandoned_pass(
-                    &detection_stall,
-                    budget,
-                    pass_state.trace().timings(),
-                    boss_engine_utils::epoch_time::now_epoch_secs(),
-                ),
-            }
+            // An abandoned pass, or a pass that yielded at the open-walk
+            // reserve with open PRs still unwalked, is a health signal: it
+            // stays on the engine health report until a pass walks every
+            // open candidate.
+            record_pass_result(
+                &detection_stall,
+                completed.is_some(),
+                &pass_state.trace().timings(),
+                budget,
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            );
             let (outcome, observations) = match completed {
                 Some((outcome, observations)) => (outcome, Some(observations)),
                 None => (SweepOutcome::default(), None),

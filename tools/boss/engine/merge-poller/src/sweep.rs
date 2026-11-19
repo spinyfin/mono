@@ -717,11 +717,14 @@ pub(crate) async fn sweep_one(
     // when none remains).
     let mut known_active_queue_failure: Option<Option<CiRemediation>> = None;
     // Read before any transition: a merge moves the row to `done`, after which
-    // it no longer reads as parked.
+    // it no longer reads as parked. The batched set is a fast skip for rows
+    // already parked at load; a row parked since then is confirmed on the
+    // mint/resume paths below.
     let parked = match parked_ids {
         Some(ids) => ids.contains(&candidate.work_item_id),
         None => work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep"),
     };
+    let parked_for_action = || parked || work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep");
     match &probe_result.state {
         PrLifecycleState::Merged => {
             match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "merged") {
@@ -837,7 +840,13 @@ pub(crate) async fn sweep_one(
                     let ladder_enabled = completion_handler
                         .map(|h| h.mechanical_rebase_enabled())
                         .unwrap_or(false);
-                    if let Some(host) = host
+                    if parked_for_action() {
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            "merge poller: row is parked; skipping conflict remediation",
+                        );
+                    } else if let Some(host) = host
                         && host
                             .on_conflict_detected(
                                 work_db,
@@ -997,7 +1006,7 @@ pub(crate) async fn sweep_one(
             caller,
         )
         .await;
-        if !parked
+        if !parked_for_action()
             && open.mergeability == OpenPrMergeability::Clean
             && let Some(host) = host
         {

@@ -410,6 +410,7 @@ fn abandoned_passes_raise_a_stall_that_a_completed_pass_clears() {
     assert!(issue.body.contains("12 of 46"), "{}", issue.body);
     assert!(issue.body.contains("180s budget"), "{}", issue.body);
     assert!(issue.body.contains("[cut off at chore_x]"), "{}", issue.body);
+    assert!(issue.body.contains("walks every open candidate"), "{}", issue.body);
 
     record_completed_pass(&signal);
     assert!(changes.has_changed().unwrap(), "clearing must notify");
@@ -498,8 +499,8 @@ impl CompletionRequests for SlowRecheckHandler {
         self.pending_nudges.clone()
     }
     async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
-        self.nudges.lock().unwrap().push(execution_id.to_owned());
         tokio::time::sleep(UPKEEP).await;
+        self.nudges.lock().unwrap().push(execution_id.to_owned());
         None
     }
     fn review_batch_fanout_enabled(&self) -> bool {
@@ -518,13 +519,13 @@ impl CompletionRequests for SlowRecheckHandler {
     }
     async fn force_stop_execution(&self, _execution_id: &str) {}
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {
-        self.rechecked.lock().unwrap().push(execution_id.to_owned());
         tokio::time::sleep(UPKEEP).await;
+        self.rechecked.lock().unwrap().push(execution_id.to_owned());
         StopOutcome::AwaitingInput
     }
     async fn recheck_for_pr_late(&self, candidate: &LatePrCandidate) -> StopOutcome {
-        self.late.lock().unwrap().push(candidate.execution_id.clone());
         tokio::time::sleep(UPKEEP).await;
+        self.late.lock().unwrap().push(candidate.execution_id.clone());
         StopOutcome::AwaitingInput
     }
     fn reconcile_review_guide_source_from_probe(
@@ -583,9 +584,10 @@ fn late_pr_execution(db: &WorkDb, product_id: &str, label: &str) -> String {
     id
 }
 
-/// Slow open-PR upkeep exceeds the budget. Later phases still run: upkeep
-/// in the same pass (the open-walk reserve), and pending-recheck / late-PR
-/// work within a bounded number of rotated passes.
+/// Slow open-PR upkeep exceeds the reserve (each candidate costs more than
+/// the remaining quarter). Upkeep and recovery still complete within a
+/// bounded number of rotated passes; completion is recorded after the
+/// handler delay, so a dropped in-flight item does not count.
 #[tokio::test(start_paused = true)]
 async fn slow_open_walk_still_reaches_recheck_late_pr_and_upkeep() {
     let (_dir, db) = open_db();
@@ -601,28 +603,33 @@ async fn slow_open_walk_still_reaches_recheck_late_pr_and_upkeep() {
     let publisher = SlowUpkeepPublisher::default();
     let handler = SlowRecheckHandler::new(Vec::new());
     let state = PassState::default();
+    let mut upkeep_ran = false;
 
-    for (n, ci) in [OpenPrCiStatus::Clean, OpenPrCiStatus::InFlight, OpenPrCiStatus::Clean]
-        .into_iter()
-        .enumerate()
-    {
+    for ci in [
+        OpenPrCiStatus::Clean,
+        OpenPrCiStatus::InFlight,
+        OpenPrCiStatus::Clean,
+        OpenPrCiStatus::InFlight,
+        OpenPrCiStatus::Clean,
+        OpenPrCiStatus::InFlight,
+    ] {
         set_all_open(&stub, &listed, ci);
         let _ = budgeted_pass_with(&db, &stub, &publisher, Some(&handler), &metrics, &state).await;
-        let timings = state.trace().timings();
-        assert!(
-            phase_ran(&timings, PassPhase::StrandedCi),
-            "pass {n} must still reach upkeep after a slow open walk: {}",
-            timings.breakdown(),
-        );
+        upkeep_ran |= phase_ran(&state.trace().timings(), PassPhase::StrandedCi);
     }
 
     assert!(
+        upkeep_ran,
+        "local upkeep must run within three rotated passes: {}",
+        state.trace().timings().breakdown(),
+    );
+    assert!(
         !handler.rechecked.lock().unwrap().is_empty(),
-        "pending rechecks must be reached within three reserved passes",
+        "pending rechecks must complete within six rotated passes",
     );
     assert!(
         !handler.late.lock().unwrap().is_empty(),
-        "late-PR recovery must be reached within three reserved passes",
+        "late-PR recovery must complete within six rotated passes",
     );
 }
 
@@ -647,13 +654,13 @@ async fn slow_rechecks_still_service_late_pr() {
     let handler = SlowRecheckHandler::new(Vec::new());
     let state = PassState::default();
 
-    for _ in 0..3 {
+    for _ in 0..6 {
         let _ = budgeted_pass_with(&db, &stub, &publisher, Some(&handler), &metrics, &state).await;
     }
 
     assert!(
         !handler.late.lock().unwrap().is_empty(),
-        "late-PR recovery must run even when rechecks are slow: rechecked={:?} late={:?}",
+        "late-PR recovery must complete even when rechecks are slow: rechecked={:?} late={:?}",
         handler.rechecked.lock().unwrap(),
         handler.late.lock().unwrap(),
     );
@@ -728,4 +735,83 @@ async fn a_headless_pass_over_current_pr_counts_finishes_inside_the_budget() {
         .find(|phase| phase.phase == PassPhase::OpenWalk)
         .expect("open walk ran");
     assert_eq!(open.items_done, 50, "{open:?}");
+}
+
+/// A pass that yields at the open-walk reserve still raises the stall, and a
+/// later pass that walks every open candidate clears it.
+#[tokio::test(start_paused = true)]
+async fn a_reserve_truncated_open_walk_keeps_the_stall_until_a_full_walk() {
+    let (_dir, db) = open_db();
+    let metrics = Registry::new();
+    crate::init(&metrics);
+    let listed = tracked_prs(&db, 9);
+    let stub = StubProbe::new();
+    set_all_open(&stub, &listed, OpenPrCiStatus::Clean);
+    let slow = SlowUpkeepPublisher::default();
+    let state = PassState::default();
+    let signal = detection_stall_signal();
+
+    let completed = budgeted_pass(&db, &stub, &slow, &metrics, &state).await;
+    assert!(
+        completed.is_some(),
+        "the pass yields at the reserve rather than timing out"
+    );
+    let timings = state.trace().timings();
+    assert!(
+        timings.open_walk_truncated(),
+        "nine slow open PRs cannot all fit before the reserve: {}",
+        timings.breakdown(),
+    );
+    record_pass_result(&signal, true, &timings, BUDGET, 1_000);
+    assert!(
+        signal.borrow().is_some(),
+        "a truncated open walk must keep merge_detection_stalled raised",
+    );
+    let issue = detection_stall_health_issue(signal.borrow().as_ref().unwrap(), 1_030);
+    assert!(
+        issue.body.contains("left the rest for the next pass") || issue.body.contains("open PR"),
+        "{}",
+        issue.body,
+    );
+
+    set_all_open(&stub, &listed, OpenPrCiStatus::InFlight);
+    let fast = RecordingPublisher::default();
+    let completed = budgeted_pass(&db, &stub, &fast, &metrics, &state).await;
+    assert!(completed.is_some());
+    let timings = state.trace().timings();
+    assert!(
+        !timings.open_walk_truncated(),
+        "a cheap pass must walk every open candidate: {}",
+        timings.breakdown(),
+    );
+    record_pass_result(&signal, true, &timings, BUDGET, 1_100);
+    assert!(signal.borrow().is_none(), "a full open walk must clear the stall",);
+}
+
+/// Background-nudge IDs rotate and are stamped, so a list whose total cost
+/// exceeds one pass still services every ID across passes.
+#[tokio::test(start_paused = true)]
+async fn slow_background_nudges_service_every_id_across_passes() {
+    let (_dir, db) = open_db();
+    let metrics = Registry::new();
+    crate::init(&metrics);
+    let listed = tracked_prs(&db, 1);
+    let stub = StubProbe::new();
+    set_all_open(&stub, &listed, OpenPrCiStatus::Clean);
+    let publisher = RecordingPublisher::default();
+    let nudge_ids: Vec<String> = (1..=4).map(|i| format!("nudge-{i}")).collect();
+    let handler = SlowRecheckHandler::new(nudge_ids.clone());
+    let state = PassState::default();
+
+    for _ in 0..9 {
+        let _ = budgeted_pass_with(&db, &stub, &publisher, Some(&handler), &metrics, &state).await;
+    }
+
+    let mut seen = handler.nudges.lock().unwrap().clone();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen, nudge_ids,
+        "every background-nudge id must complete across rotated passes, got {seen:?}"
+    );
 }
