@@ -181,6 +181,22 @@ const DETERMINISTIC_MARKERS: &[(&str, &str)] = &[
 /// their own lines (`ERROR: Analysis of target`, permanent downloads).
 const LOADING_TERMINATOR: &str = "ERROR: Build did NOT complete successfully";
 
+/// A loading-phase defect in the change's own packages: a missing in-repo
+/// target or package, or a visibility violation. These stay deterministic
+/// even when the log also carries a retryable download failure, which would
+/// otherwise exempt the bare [`LOADING_TERMINATOR`]. External-repo labels
+/// (`@repo//...`) are excluded because a failed fetch surfaces as
+/// `no such package '@repo//...'`.
+fn is_loading_change_defect(line: &str) -> bool {
+    let missing_in_repo = |needle: &str| {
+        line.find(needle)
+            .is_some_and(|i| !line[i + needle.len()..].starts_with("'@"))
+    };
+    missing_in_repo("no such target ")
+        || missing_in_repo("no such package ")
+        || line.contains(" is not visible from target ")
+}
+
 /// Upstream-unavailable log signatures: `(needle, summary)`. Matched
 /// case-sensitively against each log line; the summary is the card label.
 const UPSTREAM_SIGNATURES: &[(&str, &str)] = &[
@@ -364,6 +380,9 @@ fn first_deterministic_marker(log: &str) -> Option<(String, &'static str)> {
         if !retryable_download && trimmed.contains(LOADING_TERMINATOR) {
             return Some((truncate(trimmed, 300), "build failed"));
         }
+        if is_loading_change_defect(trimmed) {
+            return Some((truncate(trimmed, 300), "build loading failed"));
+        }
         if let Some((_, summary)) = DETERMINISTIC_MARKERS.iter().find(|(m, _)| trimmed.contains(m)) {
             return Some((truncate(trimmed, 300), summary));
         }
@@ -533,6 +552,35 @@ summary: 1 error(s), 1 warning(s), 0 info finding(s)
             ),
             "{verdict:?}"
         );
+    }
+
+    #[test]
+    fn loading_defect_alongside_retryable_download_is_deterministic() {
+        for defect in [
+            "ERROR: no such target '//tools/foo:bar': target 'bar' not declared",
+            "ERROR: no such package 'tools/foo': BUILD file not found",
+            "ERROR: Target '//a:b' is not visible from target '//c:d'",
+        ] {
+            let log = format!(
+                "{}\n{defect}\nERROR: Build did NOT complete successfully\n",
+                download_line("Read timed out")
+            );
+            let verdict = classify_job(&failed(1, &log));
+            assert!(
+                matches!(verdict, Verdict::Deterministic { .. }),
+                "{defect:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_repo_missing_package_from_failed_fetch_stays_transient() {
+        let log = format!(
+            "{}\nERROR: no such package '@@foo//bar': Error downloading\nERROR: Build did NOT complete successfully\n",
+            download_line("Read timed out")
+        );
+        let verdict = classify_job(&failed(1, &log));
+        assert!(matches!(verdict, Verdict::Transient { .. }), "{verdict:?}");
     }
 
     #[test]

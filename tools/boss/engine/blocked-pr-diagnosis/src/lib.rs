@@ -338,9 +338,22 @@ pub struct BlockedFacts {
     pub review: ReviewFacts,
 }
 
-/// The cause bucket. `key` is stored and shipped to the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Category {
+/// Declares [`Category`] and `Category::ALL` from one variant list, so a
+/// new variant cannot be left out of `ALL`.
+macro_rules! categories {
+    ($($variant:ident),+ $(,)?) => {
+        /// The cause bucket. `key` is stored and shipped to the client.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Category { $($variant),+ }
+
+        impl Category {
+            /// Every variant, generated from the enum definition.
+            pub const ALL: &'static [Category] = &[$(Category::$variant),+];
+        }
+    };
+}
+
+categories! {
     ReviewFeedback,
     MergeConflictResolving,
     MergeConflictRevisionDead,
@@ -367,64 +380,6 @@ pub enum Category {
 }
 
 impl Category {
-    /// Every variant. `_index` has no wildcard arm, so a new variant must be
-    /// given an index there, and `all_lists_every_category_at_its_index`
-    /// fails until `ALL` holds it at that index.
-    pub const ALL: [Category; 23] = [
-        Self::ReviewFeedback,
-        Self::MergeConflictResolving,
-        Self::MergeConflictRevisionDead,
-        Self::MergeConflictNoRemediation,
-        Self::CiTransientRetrying,
-        Self::CiTransientExhausted,
-        Self::CiFixExhausted,
-        Self::CiFixRevisionLive,
-        Self::CiFixRevisionDead,
-        Self::CiFixRevisionBlocked,
-        Self::CiFailingNoRemediation,
-        Self::RevisionBlocked,
-        Self::RevisionDead,
-        Self::DispatchStalled,
-        Self::RevisionHalted,
-        Self::ReviewUnreviewedAfterReap,
-        Self::ReviewReadmissionPending,
-        Self::ReviewAwaitingApproval,
-        Self::ReviewFindingsUnaddressed,
-        Self::ReviewGaveUp,
-        Self::ReviewNotAdmitted,
-        Self::ReviewerStalled,
-        Self::BlockedOther,
-    ];
-
-    #[cfg(test)]
-    fn _index(c: Category) -> usize {
-        match c {
-            Category::ReviewFeedback => 0,
-            Category::MergeConflictResolving => 1,
-            Category::MergeConflictRevisionDead => 2,
-            Category::MergeConflictNoRemediation => 3,
-            Category::CiTransientRetrying => 4,
-            Category::CiTransientExhausted => 5,
-            Category::CiFixExhausted => 6,
-            Category::CiFixRevisionLive => 7,
-            Category::CiFixRevisionDead => 8,
-            Category::CiFixRevisionBlocked => 9,
-            Category::CiFailingNoRemediation => 10,
-            Category::RevisionBlocked => 11,
-            Category::RevisionDead => 12,
-            Category::DispatchStalled => 13,
-            Category::RevisionHalted => 14,
-            Category::ReviewUnreviewedAfterReap => 15,
-            Category::ReviewReadmissionPending => 16,
-            Category::ReviewAwaitingApproval => 17,
-            Category::ReviewFindingsUnaddressed => 18,
-            Category::ReviewGaveUp => 19,
-            Category::ReviewNotAdmitted => 20,
-            Category::ReviewerStalled => 21,
-            Category::BlockedOther => 22,
-        }
-    }
-
     pub fn key(self) -> &'static str {
         match self {
             Self::ReviewFeedback => "review_feedback",
@@ -1672,51 +1627,10 @@ mod tests {
     }
 
     #[test]
-    fn all_lists_every_category_at_its_index() {
-        for (i, c) in Category::ALL.iter().enumerate() {
-            assert_eq!(Category::_index(*c), i, "{c:?}");
-        }
-    }
-
-    #[test]
     fn status_helpers_agree_with_protocol_predicates() {
-        // No wildcard: a new `ExecutionStatus` variant must be added here.
-        fn _covered(s: &ExecutionStatus) {
-            match s {
-                ExecutionStatus::Queued
-                | ExecutionStatus::Ready
-                | ExecutionStatus::WaitingDependency
-                | ExecutionStatus::Claimed
-                | ExecutionStatus::Running
-                | ExecutionStatus::WaitingHuman
-                | ExecutionStatus::WaitingReview
-                | ExecutionStatus::WaitingMerge
-                | ExecutionStatus::Completed
-                | ExecutionStatus::Failed
-                | ExecutionStatus::Abandoned
-                | ExecutionStatus::Cancelled
-                | ExecutionStatus::Orphaned => {}
-            }
-        }
-        let wire = [
-            "queued",
-            "ready",
-            "waiting_dependency",
-            "claimed",
-            "running",
-            "waiting_human",
-            "waiting_review",
-            "waiting_merge",
-            "completed",
-            "failed",
-            "abandoned",
-            "cancelled",
-            "orphaned",
-        ];
-        for w in wire {
-            let status: ExecutionStatus = w.parse().unwrap();
-            _covered(&status);
-            assert_eq!(status.as_str(), w);
+        for status in ExecutionStatus::ALL {
+            let w = status.as_str();
+            assert_eq!(w.parse::<ExecutionStatus>().as_ref(), Ok(status));
             let e = exec(w, 0);
             assert_eq!(e.is_terminal(), status.is_terminal(), "{status:?}");
             assert_eq!(e.is_running(), status.is_live(), "{status:?}");
