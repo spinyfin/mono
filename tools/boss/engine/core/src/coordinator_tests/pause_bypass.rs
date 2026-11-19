@@ -779,3 +779,36 @@ async fn operator_force_launch_is_recorded_on_the_execution() {
         .expect("an operator force launch bypasses the pause");
     assert!(db.execution_force_launched(&execution.id).unwrap());
 }
+
+/// The drain admitting a persisted `operator_forced_admission` row records
+/// the same force-launch lineage as an immediate `force_dispatch`.
+#[tokio::test]
+async fn drain_records_force_launch_when_admitting_operator_forced_work() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Answered work");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    db.mark_operator_forced_admission(&chore.id).unwrap();
+    assert!(!db.execution_force_launched(&execution.id).unwrap());
+
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    coordinator.pause_dispatch(
+        1_700_000_000,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("test: investigating worker failures").unwrap(),
+    );
+    coordinator.drain_ready_queue_for_test().await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+    assert!(
+        db.execution_force_launched(&execution.id).unwrap(),
+        "drain-time OperatorForced admission must record force-launch lineage"
+    );
+    assert!(!db.execution_has_operator_forced_admission(&execution.id).unwrap());
+}
