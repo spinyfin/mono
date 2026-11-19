@@ -69,8 +69,9 @@ pub struct PrepareRequest<'a> {
     /// A link to the CI build. It is recorded on the draft so that a later run
     /// can say which run left the draft behind.
     pub build_url: Option<&'a str>,
-    /// An operator's instruction to resume a draft for this commit from a
-    /// scheduled build, whatever its claim and however often it was retried.
+    /// Set from `RELEASE_RESUME_DRAFT=1`: resume a draft for this commit from a
+    /// scheduled build, whatever its claim and however many scheduled attempts
+    /// it has used.
     pub resume_draft: bool,
 }
 
@@ -335,7 +336,7 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
         );
     }
 
-    let mut to_verify = required_assets;
+    let mut to_verify = required_assets.clone();
     for asset in &optional_assets {
         if remote_assets.contains_key(asset.as_str()) {
             let checksum = format!("{asset}.sha256");
@@ -359,7 +360,10 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
     let latest = view_release(runner, config, tag).with_context(|| {
         format!("verification passed, but {tag} could not be read again before publishing; leaving the release draft")
     })?;
-    for asset in &to_verify {
+    // Every configured asset, required or optional, including those that were
+    // absent when verification started. An optional file uploaded during the
+    // download would otherwise be published without a checksum check.
+    for asset in required_assets.iter().chain(optional_assets.iter()) {
         for name in [asset.clone(), format!("{asset}.sha256")] {
             let verified = remote_assets.get(name.as_str()).copied();
             let current = latest.assets.iter().find(|asset| asset.name == name);
@@ -439,9 +443,9 @@ pub(crate) struct ReleaseViewAsset {
 
 /// Reads a release by tag. Unlike GitHub's lookup by tag, this finds drafts.
 pub(crate) fn view_release(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -> Result<ReleaseView> {
-    let output = run_checked(
+    let output = retry_checked(
         runner,
-        Command::new(
+        &Command::new(
             "gh",
             [
                 "release".to_owned(),
@@ -453,6 +457,9 @@ pub(crate) fn view_release(runner: &impl CommandRunner, config: &ReleaseConfig, 
                 "apiUrl,assets,body,isDraft".to_owned(),
             ],
         ),
+        UPLOAD_ATTEMPTS,
+        "release view",
+        || {},
     )?;
     serde_json::from_str(&output.stdout)
         .with_context(|| format!("could not read GitHub's description of release {tag}"))
@@ -862,12 +869,23 @@ fn retry_command(
     command: &Command,
     attempts: usize,
     what: &str,
-    mut before_retry: impl FnMut(),
+    before_retry: impl FnMut(),
 ) -> Result<()> {
+    retry_checked(runner, command, attempts, what, before_retry).map(|_| ())
+}
+
+/// Like [`retry_command`], but returns the successful output.
+fn retry_checked(
+    runner: &impl CommandRunner,
+    command: &Command,
+    attempts: usize,
+    what: &str,
+    mut before_retry: impl FnMut(),
+) -> Result<CommandOutput> {
     let mut last_error = String::new();
     for attempt in 1..=attempts {
         match runner.run(command) {
-            Ok(output) if output.success => return Ok(()),
+            Ok(output) if output.success => return Ok(output),
             Ok(output) => last_error = command_failure(command, &output),
             Err(error) => last_error = error.to_string(),
         }
@@ -2033,6 +2051,121 @@ source = "github-generated"
             "{error:#}"
         );
         assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn publish_leaves_the_release_draft_when_an_optional_asset_appears_during_verification() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let required = ["demo-linux", "demo-linux.sha256"];
+        let with_optional = ["demo-linux", "demo-linux.sha256", "demo-darwin", "demo-darwin.sha256"];
+        let runner = FixtureRunner::new([
+            success(&view_json(&required, "notes\n", true, 1).to_string()),
+            success(""),
+            success(&view_json(&with_optional, "notes\n", true, 1).to_string()),
+        ])
+        .with_matching_download();
+
+        let error = publish(&runner, &config, "demo-v1.0.0")
+            .expect_err("an optional asset that was not verified must not be published");
+
+        assert!(
+            error
+                .to_string()
+                .contains("demo-darwin on demo-v1.0.0 changed while it was being verified"),
+            "{error:#}"
+        );
+        assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn publish_leaves_the_release_draft_when_an_optional_asset_appears_without_its_sidecar() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let required = ["demo-linux", "demo-linux.sha256"];
+        let optional_alone = ["demo-linux", "demo-linux.sha256", "demo-darwin"];
+        let runner = FixtureRunner::new([
+            success(&view_json(&required, "notes\n", true, 1).to_string()),
+            success(""),
+            success(&view_json(&optional_alone, "notes\n", true, 1).to_string()),
+        ])
+        .with_matching_download();
+
+        let error = publish(&runner, &config, "demo-v1.0.0")
+            .expect_err("an optional asset without a sidecar must not be published");
+
+        assert!(
+            error
+                .to_string()
+                .contains("demo-darwin on demo-v1.0.0 changed while it was being verified"),
+            "{error:#}"
+        );
+        assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn upload_retries_a_failed_release_view() {
+        let source_dir = tempdir().expect("source dir");
+        let source = source_dir.path().join("binary");
+        fs::write(&source, b"release bytes").expect("write source");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            failure("HTTP 502"),
+            release_view(&[], "notes\n"),
+            success(""),
+            success(""),
+        ]);
+
+        upload(
+            &runner,
+            &config,
+            "demo-v1.0.0",
+            &[Asset {
+                name: "demo-linux".to_owned(),
+                source,
+            }],
+        )
+        .expect("the second view succeeds");
+
+        let views = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.args.starts_with(&["release".to_owned(), "view".to_owned()]))
+            .count();
+        assert_eq!(views, 2);
+        assert_eq!(*runner.sleeps.borrow(), vec![Duration::from_secs(15)]);
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.args.starts_with(&["release".to_owned(), "upload".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn publish_retries_a_failed_release_view() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let assets = ["demo-linux", "demo-linux.sha256"];
+        let runner = FixtureRunner::new([
+            failure("HTTP 502"),
+            release_view(&assets, "notes\n"),
+            success(""),
+            release_view(&assets, "notes\n"),
+            success(""),
+        ])
+        .with_matching_download();
+
+        publish(&runner, &config, "demo-v1.0.0").expect("the second view succeeds");
+
+        let views = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.args.starts_with(&["release".to_owned(), "view".to_owned()]))
+            .count();
+        assert_eq!(views, 3, "one retried view before verification, one after");
+        assert_eq!(*runner.sleeps.borrow(), vec![Duration::from_secs(15)]);
+        assert!(published_draft(&runner));
     }
 
     #[test]

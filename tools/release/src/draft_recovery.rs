@@ -228,21 +228,32 @@ pub(crate) fn handle_head_draft<R: CommandRunner>(
     let tag = draft.release.tag_name.as_str();
     let repo = context.config.repo.as_str();
     let recovery = &context.config.recovery;
-    let last_run = last_run_phrase(draft.claim.as_ref());
-    match head_draft_action(trigger, forced, draft.claim.as_ref(), context.now, recovery) {
+    // The family list was read at the start of prepare. Another run may have
+    // claimed or resumed this draft since, so the action is taken from a
+    // fresh read, and any claim written is derived from that read.
+    let current = read_current_draft(context.runner, repo, &draft.release)?;
+    let claim = current.body.as_deref().and_then(DraftClaim::from_notes);
+    let last_run = last_run_phrase(claim.as_ref());
+    match head_draft_action(trigger, forced, claim.as_ref(), context.now, recovery) {
         HeadDraftAction::Wait {
             minutes_left,
             attempts_left,
             first_sighting,
         } => {
             let seen = if first_sighting {
-                record_claim(context.runner, repo, &draft.release, &first_sighting_claim(context)).with_context(
-                    || {
-                        format!(
-                            "release {tag} is an unpublished draft for this commit with no record of when a run last worked on it, and that record could not be started"
-                        )
-                    },
-                )?;
+                write_claim(
+                    context.runner,
+                    repo,
+                    draft.release.id,
+                    tag,
+                    current.body.as_deref().unwrap_or_default(),
+                    &first_sighting_claim(context),
+                )
+                .with_context(|| {
+                    format!(
+                        "release {tag} is an unpublished draft for this commit with no record of when a run last worked on it, and that record could not be started"
+                    )
+                })?;
                 "with no record of when a run last worked on it. This scheduled run recorded the time and leaves it alone, because it may still be building.".to_owned()
             } else {
                 format!(
@@ -276,13 +287,20 @@ pub(crate) fn handle_head_draft<R: CommandRunner>(
             bail!(message)
         }
         HeadDraftAction::Resume { scheduled_attempt } => {
-            let claim = DraftClaim {
+            let next_claim = DraftClaim {
                 claimed_at: context.now,
                 scheduled_resumes: scheduled_attempt
-                    .unwrap_or_else(|| draft.claim.as_ref().map_or(0, |claim| claim.scheduled_resumes)),
+                    .unwrap_or_else(|| claim.as_ref().map_or(0, |claim| claim.scheduled_resumes)),
                 build_url: context.build_url.map(str::to_owned),
             };
-            let recorded = record_claim(context.runner, repo, &draft.release, &claim);
+            let recorded = write_claim(
+                context.runner,
+                repo,
+                draft.release.id,
+                tag,
+                current.body.as_deref().unwrap_or_default(),
+                &next_claim,
+            );
             match (scheduled_attempt, recorded) {
                 (Some(attempt), Err(error)) => bail!(
                     "release {tag} is an unpublished draft for this commit, but scheduled resume attempt {attempt} could not be recorded on it, and an attempt that is not recorded cannot be limited; not resuming: {error:#}"
@@ -495,12 +513,9 @@ fn read_release(runner: &impl CommandRunner, repo: &str, release_id: u64) -> Res
     serde_json::from_str(&output.stdout).context("GitHub's description of the release could not be read")
 }
 
-/// Writes `claim` into the notes of the draft `release`.
-///
-/// The notes are read again first, so the write starts from what the draft
-/// holds now and not from the release list read earlier in the run. It is
-/// refused if the release has been published in the meantime.
-fn record_claim(runner: &impl CommandRunner, repo: &str, release: &GitHubRelease, claim: &DraftClaim) -> Result<()> {
+/// Reads one draft again by id. Refused if it has been published since the
+/// release list was taken, or if GitHub did not report an id for it.
+fn read_current_draft(runner: &impl CommandRunner, repo: &str, release: &GitHubRelease) -> Result<GitHubRelease> {
     let tag = release.tag_name.as_str();
     if release.id == 0 {
         bail!("GitHub did not report an id for draft {tag}; cannot edit it");
@@ -509,13 +524,45 @@ fn record_claim(runner: &impl CommandRunner, repo: &str, release: &GitHubRelease
     if !current.draft {
         bail!("release {tag} is no longer a draft");
     }
-    write_notes(
+    Ok(current)
+}
+
+/// Writes `claim` into the notes of the draft `release`.
+///
+/// The notes are read again first, so the write starts from what the draft
+/// holds now and not from the release list read earlier in the run. It is
+/// refused if the release has been published in the meantime. The attempt
+/// count written is never lower than the count already on the draft.
+fn record_claim(runner: &impl CommandRunner, repo: &str, release: &GitHubRelease, claim: &DraftClaim) -> Result<()> {
+    let current = read_current_draft(runner, repo, release)?;
+    write_claim(
         runner,
         repo,
         release.id,
-        tag,
-        &claim.write_into(current.body.as_deref().unwrap_or_default()),
+        release.tag_name.as_str(),
+        current.body.as_deref().unwrap_or_default(),
+        claim,
     )
+}
+
+/// Writes `claim` into `notes`, keeping any higher attempt count already there.
+fn write_claim(
+    runner: &impl CommandRunner,
+    repo: &str,
+    release_id: u64,
+    tag: &str,
+    notes: &str,
+    claim: &DraftClaim,
+) -> Result<()> {
+    let previous = DraftClaim::from_notes(notes);
+    let claim = DraftClaim {
+        claimed_at: claim.claimed_at,
+        scheduled_resumes: claim
+            .scheduled_resumes
+            .max(previous.as_ref().map_or(0, |claim| claim.scheduled_resumes)),
+        build_url: claim.build_url.clone(),
+    };
+    write_notes(runner, repo, release_id, tag, &claim.write_into(notes))
 }
 
 /// Replaces the notes of one release. Only the notes are sent, so the edit
@@ -967,9 +1014,8 @@ source = "github-generated"
         failing: Vec<&'static str>,
         /// Releases, by id, that turn out to be published when read again.
         published_meanwhile: Vec<u64>,
-        /// Releases, by id, that a run turns out to have started working on
-        /// when they are read again.
-        claimed_meanwhile: Vec<u64>,
+        /// Releases, by id, whose notes have changed when they are read again.
+        claimed_meanwhile: Vec<(u64, String)>,
         calls: RefCell<Vec<String>>,
         /// Notes written to a release, by the release's API path.
         written_notes: RefCell<Vec<(String, String)>>,
@@ -1028,8 +1074,13 @@ source = "github-generated"
             self
         }
 
-        fn claimed_meanwhile(mut self, counter: u64) -> Self {
-            self.claimed_meanwhile.push(counter);
+        fn claimed_meanwhile(self, counter: u64) -> Self {
+            self.claimed_meanwhile_as(counter, claimed(0, 0))
+        }
+
+        /// A later read of this draft finds `notes` instead of the list snapshot.
+        fn claimed_meanwhile_as(mut self, counter: u64, notes: String) -> Self {
+            self.claimed_meanwhile.push((counter, notes));
             self
         }
 
@@ -1054,8 +1105,8 @@ source = "github-generated"
             if self.published_meanwhile.contains(&id) {
                 release["draft"] = serde_json::json!(false);
             }
-            if self.claimed_meanwhile.contains(&id) {
-                release["body"] = serde_json::json!(claimed(0, 0));
+            if let Some((_, notes)) = self.claimed_meanwhile.iter().find(|(release, _)| *release == id) {
+                release["body"] = serde_json::json!(notes);
             }
             Some(release)
         }
@@ -1259,22 +1310,74 @@ source = "github-generated"
     }
 
     #[test]
-    fn a_claim_is_written_onto_the_notes_as_they_are_now() {
-        // The release list is read at the start of prepare. A claim written
-        // from that copy would undo whatever changed on the draft since.
+    fn a_scheduled_run_waits_when_another_run_claimed_the_draft_since_the_list_was_read() {
+        // The list said the draft was idle. By the time it is read again,
+        // another run has dated its claim, so this run must not resume it.
         let forge = FakeForge::new()
             .published(4, "c4")
             .draft(5, HEAD, &claimed(120, 1))
             .claimed_meanwhile(5);
 
-        prepare(&forge, &config(""), scheduled()).expect("scheduled resume");
+        let outcome = prepare(&forge, &config(""), scheduled()).expect("nothing to do");
 
-        assert!(
-            forge
-                .position("gh api repos/example/project/releases/5")
-                .expect("read again")
-                < forge.position("gh api -X PATCH").expect("claim recorded")
+        assert_eq!(
+            outcome,
+            PrepareOutcome::InProgress {
+                tag: "demo-v1.0.5".to_owned()
+            }
         );
+        assert!(forge.ran("gh api repos/example/project/releases/5"));
+        assert!(!forge.ran("gh api -X PATCH"), "another run's claim is not overwritten");
+        assert!(!forge.ran("buildkite-agent meta-data set"));
+        let (message, style) = forge.annotation().expect("the wait is reported");
+        assert_eq!(style, "info");
+        assert!(message.contains("may still be building"), "{message}");
+    }
+
+    #[test]
+    fn a_resume_keeps_the_higher_attempt_count_written_since_the_list_was_read() {
+        // The list said one scheduled resume had been used. Another run
+        // recorded a second before this one wrote, and that claim is also
+        // idle, so this run resumes as attempt 3, not 2.
+        let forge = FakeForge::new()
+            .published(4, "c4")
+            .draft(5, HEAD, &claimed(120, 1))
+            .claimed_meanwhile_as(5, claimed(120, 2));
+
+        let outcome = prepare(&forge, &config(""), scheduled()).expect("scheduled resume");
+
+        assert_eq!(
+            outcome,
+            PrepareOutcome::Resumed {
+                tag: "demo-v1.0.5".to_owned()
+            }
+        );
+        let notes = forge.notes_written_to(5).expect("claim recorded");
+        assert!(
+            notes.contains("scheduled-resumes=3"),
+            "the count is taken from the fresh claim: {notes}"
+        );
+        let (message, _) = forge.annotation().expect("the resume is reported");
+        assert!(message.contains("attempt 3 of 3"), "{message}");
+    }
+
+    #[test]
+    fn a_draft_without_a_claim_is_left_alone_when_another_run_claimed_it_meanwhile() {
+        let forge = FakeForge::new()
+            .published(4, "c4")
+            .draft(5, HEAD, "## Changes\n")
+            .claimed_meanwhile(5);
+
+        let outcome = prepare(&forge, &config(""), scheduled()).expect("nothing to do yet");
+
+        assert_eq!(
+            outcome,
+            PrepareOutcome::InProgress {
+                tag: "demo-v1.0.5".to_owned()
+            }
+        );
+        assert!(!forge.ran("gh api -X PATCH"), "the other run's claim is not replaced");
+        assert!(!forge.ran("buildkite-agent meta-data set"));
     }
 
     #[test]
@@ -1431,7 +1534,7 @@ source = "github-generated"
     }
 
     #[test]
-    fn the_operator_override_resumes_a_draft_whose_attempts_are_used_up() {
+    fn the_resume_override_resumes_a_draft_whose_attempts_are_used_up() {
         let forge = FakeForge::new().published(4, "c4").draft(5, HEAD, &claimed(1, 3));
         let request = PrepareRequest {
             resume_draft: true,
@@ -1450,6 +1553,32 @@ source = "github-generated"
         assert!(
             notes.contains("scheduled-resumes=3"),
             "an override neither uses nor resets the attempts: {notes}"
+        );
+    }
+
+    #[test]
+    fn a_forced_resume_keeps_the_higher_attempt_count_written_since_the_list_was_read() {
+        let forge = FakeForge::new()
+            .published(4, "c4")
+            .draft(5, HEAD, &claimed(120, 1))
+            .claimed_meanwhile_as(5, claimed(1, 3));
+        let request = PrepareRequest {
+            trigger_source: "ui",
+            ..scheduled()
+        };
+
+        let outcome = prepare(&forge, &config(""), request).expect("forced resume");
+
+        assert_eq!(
+            outcome,
+            PrepareOutcome::Resumed {
+                tag: "demo-v1.0.5".to_owned()
+            }
+        );
+        let notes = forge.notes_written_to(5).expect("claim recorded");
+        assert!(
+            notes.contains("scheduled-resumes=3"),
+            "a resume a person asked for does not lower the count: {notes}"
         );
     }
 

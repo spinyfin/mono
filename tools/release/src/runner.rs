@@ -1,9 +1,5 @@
-use std::io::Read;
 use std::process::Stdio;
-use std::time::{Duration, Instant, SystemTime};
-
-/// How often a time-bounded command is checked for completion.
-const TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+use std::time::{Duration, SystemTime};
 
 /// One subprocess invocation, represented as data so tests can inject a
 /// captured runner instead of executing programs.
@@ -111,66 +107,30 @@ impl CommandRunner for ProcessCommandRunner {
 }
 
 /// Runs `process` to completion, or kills it once `timeout` has passed.
-///
-/// Both pipes are drained on their own threads so a command that fills one
-/// cannot block before it exits. After a kill the readers are left to finish
-/// on their own instead of being joined: a descendant that inherited a pipe
-/// could otherwise keep this call waiting past the bound it exists to enforce.
 fn run_with_timeout(
     mut process: std::process::Command,
     program: &str,
     timeout: Duration,
 ) -> std::result::Result<CommandOutput, RunnerError> {
-    let mut child = process
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| RunnerError::new(format!("failed to run {program}: {error}")))?;
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RunnerError::new(format!(
-                    "{program} did not finish within {} seconds and was stopped",
-                    timeout.as_secs()
-                )));
-            }
-            Ok(None) => std::thread::sleep(TIMEOUT_POLL_INTERVAL),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RunnerError::new(format!("failed to wait for {program}: {error}")));
-            }
-        }
-    };
-
-    Ok(CommandOutput {
-        success: status.success(),
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
-    })
-}
-
-fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
-    })
+    process.stdin(Stdio::null());
+    match process_runner::output_blocking_timeout(&mut process, timeout) {
+        Ok(output) => Ok(CommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Err(RunnerError::new(format!(
+            "{program} did not finish within {} seconds and was stopped",
+            timeout.as_secs()
+        ))),
+        Err(error) => Err(RunnerError::new(format!("failed to run {program}: {error}"))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn a_bounded_command_that_finishes_in_time_returns_its_output() {

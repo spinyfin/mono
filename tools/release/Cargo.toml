@@ -21,6 +21,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 git_changelog = { path = "../changelog" }
+process-runner = { path = "../../lib/rust/process_runner" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

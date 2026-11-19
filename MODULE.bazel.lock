@@ -1270,7 +1270,7 @@
           "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
-          "FILE:@@//Cargo.lock d3c791df09055b3d4abb16008bd65cd905abc2918829976c1049dcfbd179208f",
+          "FILE:@@//Cargo.lock 7978c0a3317ec0bc4627c01d0a464eff57bf5d9de6f79c81f1ce31c31d3f6974",
           "FILE:@@//Cargo.toml 27308d471016d5645b805d8b5cb7956b188f268d4127ff46b518fd125e23e153",
           "FILE:@@//lib/rust/broker-robinhood/Cargo.toml 283446ff4724eb01b6f89291264a15a3904596fb9df32f157c50f8f691c3ed23",
           "FILE:@@//lib/rust/git_utils/Cargo.toml be3e4d5fc347d5d3652d576bd80903dc4067b500bbb6ba3a4dda143317b6a63f",
@@ -1404,7 +1404,7 @@
           "FILE:@@//tools/checkleft_package/Cargo.toml f8383dfa8115a2c2ab6301762d6c33cb3fb3f3c780216660f04706c7073168d2",
           "FILE:@@//tools/cube/Cargo.toml 1f23cee732ef5f926374880c96f74dcf297db3e260effe2b6b9574883d21ee33",
           "FILE:@@//tools/repobin/Cargo.toml bdab8b4f060561374424f8f0be4fa9d32a7620ef6caaec22e7f85e57b78e2710",
-          "FILE:@@//tools/release/Cargo.toml 7d1fa0d3f8e168a85f9add5afa36b635d9192e62afb7c1383c21d90994a1e439",
+          "FILE:@@//tools/release/Cargo.toml 467bbfba72d540db58cfca3ee505dc70f6fe24d9263d225b99f65a7ebcf3e6df",
           "FILE:@@//tools/changelog/Cargo.toml 8cd4fc2abc0cf4091516dc7881a4853af708212e62ba9bac2f182224c6477842"
         ],
         "generatedRepoSpecs": {

@@ -18,6 +18,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = ["//tools/release:__pkg__"],
     deps = [
+        "//lib/rust/process_runner",
         "//tools/changelog:git_changelog_lib",
     ] + all_crate_deps(normal = True),
 )

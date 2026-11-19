@@ -191,7 +191,7 @@ A draft is not always a failure: it also exists while a release is in progress. 
 
 Boss sets `in_flight_minutes = 0`. The whole release is one `boss-release` job, and that step has `concurrency: 1` in `mono-boss-release`, so a second release job cannot start until the first has ended. Any draft a job finds was left behind, and the next scheduled run can resume or abandon it at once. Pipelines that run `prepare`, the builds and `publish` as separate jobs keep the default of 60 minutes, because there a second build's `prepare` can start while the first build is still compiling. If `boss-release` is ever split across jobs, raise the value above the longest gap between two phases, which is the slowest build including time spent waiting for an agent.
 
-Two checks back this up for pipelines where runs can overlap. `upload` refuses a release that is already published, so a second run cannot replace verified assets. `publish` reads the release again after verifying and stops if an asset was replaced in the meantime, so what it publishes is what it verified.
+Two checks back this up for pipelines where runs can overlap. `upload` refuses a release that is already published, so a second run cannot replace verified assets. `publish` reads the release again after verifying and stops if any configured asset — required or optional, including one that appeared during the download — changed identity or presence, so what it publishes is exactly the set it verified.
 
 ### Recovering by hand
 
@@ -207,6 +207,31 @@ Two checks back this up for pipelines where runs can overlap. `upload` refuses a
   ```
 
 (If `prepare` itself fails before the Release is created, the tool deletes any tag it pushed, so a fresh run starts clean.)
+
+### November 2026 unpublished drafts
+
+Four Boss drafts were left unpublished on 2026-11-18/19. Scheduled runs then failed at `prepare` ("scheduled runs do not resume drafts automatically") until a person resumed one by hand. The table is from those job logs (`bk job log`).
+
+| Draft            | Build / agent            | Job (UTC)               | Failed phase                                             | Error                                                                                                                                                                                                                                                          |
+| ---------------- | ------------------------ | ----------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `boss-v1.0.1051` | 27411, `determinist-1`   | 11-18 23:19:04–23:19:30 | build (`bazel build -c opt //tools/boss/app-macos:Boss`) | `Lost inputs no longer available remotely` for cargo build-script outputs. Bazel retried the build five times (`Found transient remote cache error, retrying the build...`), each time hitting another lost input, then `Build did NOT complete successfully`. |
+| `boss-v1.0.1054` | 27470, `skaffen.local-2` | 11-19 02:15:56–02:51:12 | publish (verification download)                          | `gh release download … failed: stream error: stream ID 3; PROTOCOL_ERROR; received from peer`, 1,908 s after the download started                                                                                                                              |
+| `boss-v1.0.1055` | 27485, `skaffen.local-2` | 11-19 02:51:13–03:34:23 | publish (verification download)                          | same `PROTOCOL_ERROR`, stream ID 1, after 2,416 s                                                                                                                                                                                                              |
+| `boss-v1.0.1056` | 27488, `skaffen.local-2` | 11-19 03:34:23–04:08:12 | publish (verification download)                          | same `PROTOCOL_ERROR`, stream ID 1, after 1,860 s                                                                                                                                                                                                              |
+
+1054, 1055 and 1056 had already built and uploaded; both assets were on each draft. The failure was the download `publish` uses to verify the upload. Manual resume build 27498 ran on the same agent (`skaffen.local-2`) and published `boss-v1.0.1056` at 05:46 UTC; its publish phase took 258 s. Downloading those still-draft assets from another machine took 104 s, and the zip SHA-256 (`3b07f18b…7665`) matched its sidecar.
+
+The tool bug for 1054–1056: the verification download ran once, with no time limit. One stalled HTTP/2 stream held the `mono-boss-release` concurrency group for 31–40 minutes and then failed the release. `publish` now gives that download three attempts, each limited to two minutes plus the time the asset needs at 1 Mbit/s.
+
+1051 failed in the Bazel build, before any asset was uploaded: the remote cache no longer held outputs the build expected to fetch. That is a cache condition, not a release-tool or step bug, so the build flags and the Bazel invocation were left alone. Resume of that draft rebuilds from the same commit.
+
+Once 1056 existed and `main` did not move, every later scheduled run failed at `prepare` (builds 27489 and 27491–27497). 1051, 1054 and 1055 were no longer blocking a new version, because `main` had moved, but nothing cleaned them up.
+
+**Cleanup of those leftovers is the automatic abandon path**, not a one-off script:
+
+- `boss-v1.0.877` (2026-10-31), `1051`, `1054` and `1055` are older drafts behind `main`. Boss sets `in_flight_minutes = 0`, so the first Boss release cut after this change merges deletes them and lists them in the abandonment annotation. `1056` is already published.
+- `checkleft-v0.1.0-alpha.138` (2026-08-14) has no claim, and checkleft keeps the 60 minute period, so the next checkleft release dates it and the one after abandons it.
+- Appoint's leftover `v0.1.139` lives in `brianduff/appoint`, a different GitHub repository. This pipeline cannot delete it. Appoint's next release after it is running this tool abandons drafts behind its own `main` the same way; until then that draft is deleted by hand with `gh release delete` in that repository.
 
 ## Abandoning a draft release
 
