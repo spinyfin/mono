@@ -467,17 +467,16 @@ pub(super) fn inherit_force_launch_continuation(
     if !super::dispatch::execution_force_launched_in(tx, asking_execution_id)? {
         return Ok(None);
     }
-    if let Some(execution) = query_latest_execution_for_work_item(tx, task_id)?
-        && !execution.status.is_terminal()
-    {
-        super::dispatch::mark_execution_force_launched_in(tx, &execution.id)?;
-    }
+    // Resolve the continuation once so the lineage stamp and the operator-forced
+    // mark always land on the same row.
+    let Some(execution) = query_latest_execution_for_work_item(tx, task_id)?.filter(|e| !e.status.is_terminal()) else {
+        return Ok(None);
+    };
+    super::dispatch::mark_execution_force_launched_in(tx, &execution.id)?;
     if suppress_start {
         return Ok(None);
     }
-    if !super::conflict_mismatch::mark_operator_forced_admission_in_tx(tx, task_id)? {
-        return Ok(None);
-    }
+    super::conflict_mismatch::mark_execution_operator_forced_admission_in_tx(tx, &execution.id)?;
     Ok(Some(task_id.to_string()))
 }
 

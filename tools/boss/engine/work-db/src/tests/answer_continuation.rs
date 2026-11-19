@@ -156,3 +156,30 @@ fn suppressed_answer_on_a_retired_attempt_revision_requests_no_start_and_settles
     assert_eq!(task_status(db, &fixture.revision_id), "todo");
     assert_dependent_still_gated(&fixture);
 }
+
+#[test]
+fn suppressed_answer_from_a_force_launched_asker_on_a_retired_attempt_revision_names_no_launch() {
+    let fixture = retired_conflict_revision_awaiting_answer("answer-retired-force-launched");
+    let db = &fixture.db;
+    let asking = executions_for(db, &fixture.revision_id)[0].0.clone();
+    db.mark_execution_force_launched(&asking).unwrap();
+    let outcome = db
+        .answer_operator_question_from(
+            &fixture.revision_id,
+            boss_protocol::OperatorAnswer::YesNo { value: true },
+            &GhPrStateChecker,
+            boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+            None,
+            true,
+        )
+        .unwrap();
+    assert!(!outcome.minted_execution);
+    assert_eq!(
+        outcome.dispatch_work_item_id, None,
+        "no continuation exists, so there is nothing to launch"
+    );
+    let executions = executions_for(db, &fixture.revision_id);
+    assert_eq!(executions.len(), 1, "no continuation is queued: {executions:?}");
+    assert!(!db.execution_has_operator_forced_admission(&asking).unwrap());
+    assert_dependent_still_gated(&fixture);
+}
