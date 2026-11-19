@@ -45,6 +45,10 @@ REPLY_BODY = {
 }
 
 
+_CSI = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+_OSC_END = re.compile(r"\x07|\x1b\\")
+
+
 class TerminalTail:
     """Bounded current-screen text for startup detection, excluding scrollback."""
 
@@ -55,25 +59,38 @@ class TerminalTail:
         self.pending = ""
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
+    MAX_PENDING = 4096
+
     def feed(self, output):
-        self.pending += self.decoder.decode(output)
-        while self.pending:
-            char = self.pending[0]
+        text = self.pending + self.decoder.decode(output)
+        pos = 0
+        size = len(text)
+        while pos < size:
+            char = text[pos]
             consumed = 1
             if char == "\x1b":
-                if len(self.pending) < 2:
+                if size - pos < 2:
                     break
-                if self.pending[1] == "[":
-                    match = re.match(r"\x1b\[([0-?]*)([ -/]*)([@-~])", self.pending)
+                nxt = text[pos + 1]
+                if nxt == "[":
+                    match = _CSI.match(text, pos)
                     if not match:
-                        break
-                    self.control(match[1], match[3])
-                    consumed = match.end()
-                elif self.pending[1] == "]":
-                    match = re.search(r"\x07|\x1b\\", self.pending)
+                        if size - pos > self.MAX_PENDING:
+                            consumed = 2  # unterminated sequence: drop the introducer
+                        else:
+                            break
+                    else:
+                        self.control(match[1], match[3])
+                        consumed = match.end() - pos
+                elif nxt == "]":
+                    match = _OSC_END.search(text, pos)
                     if not match:
-                        break
-                    consumed = match.end()
+                        if size - pos > self.MAX_PENDING:
+                            consumed = 2  # unterminated OSC: drop it, bounded memory
+                        else:
+                            break
+                    else:
+                        consumed = match.end() - pos
                 else:
                     consumed = 2
             elif char == "\r":
@@ -93,7 +110,8 @@ class TerminalTail:
                 row[self.x] = char
                 self.x += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
             self.scroll()
-            self.pending = self.pending[consumed:]
+            pos += consumed
+        self.pending = text[pos:]
 
     def scroll(self):
         while self.y >= self.height:
@@ -384,6 +402,12 @@ def check_relay_input(view, markers, pending):
         raise BlockingDialogOnScreen(menu)
 
 
+def has_user_bytes(pending):
+    """True when pending holds anything other than recognised terminal replies."""
+    _, rest, refused = take_terminal_replies(pending, b"")
+    return bool(refused or rest)
+
+
 def take_terminal_replies(data, buffer):
     """Split stdin into recognised terminal replies vs other input.
 
@@ -561,6 +585,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
     drain_until = None
     watch_until = 0
     submit_rows = set()
+    guard_enabled = True
     payload_squashed = _squash(prompt)
     try:
         if outer_tty:
@@ -622,10 +647,20 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     query_buffer = query_buffer[consumed:][-32:]
                 # The screen stays current for the whole relay: later input is
                 # checked against it, not only the initial delivery.
-                view.feed(output)
+                if not delivered:
+                    view.feed(output)
+                elif guard_enabled:
+                    try:
+                        view.feed(output)
+                    except Exception as error:
+                        # Fail open, loudly: the brief is already delivered and the
+                        # worker is long-lived, so an emulator bug disables the
+                        # relay-input guard instead of terminating the session.
+                        guard_enabled = False
+                        log("relay_guard_disabled", error=repr(error))
                 if not delivered:
                     check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
-                elif post_submit_failure_markers and now < watch_until:
+                elif guard_enabled and post_submit_failure_markers and now < watch_until:
                     # An accepted paste does not prove a turn started: the CLI
                     # can discard the brief with a vendor error and fire no hook.
                     # Only rows that appeared after submit count, and only
@@ -682,11 +717,15 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             if master in writable:
                 # Drain already available output before checking the current screen.
                 # A dialog may have appeared after readiness or during the paste.
-                if not delivered and select.select([master], [], [], 0)[0]:
+                # After delivery the same drain applies whenever the pending bytes
+                # are anything but terminal-query replies: a menu already queued
+                # on the master must reach the screen view before user bytes
+                # are forwarded to it.
+                if (not delivered or has_user_bytes(pending)) and select.select([master], [], [], 0)[0]:
                     continue
                 if not delivered:
                     check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
-                else:
+                elif guard_enabled:
                     check_relay_input(view, blocking_dialog_markers, pending)
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]

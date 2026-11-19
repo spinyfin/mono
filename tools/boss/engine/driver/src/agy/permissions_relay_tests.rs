@@ -412,6 +412,38 @@ assert os.read(0, 1) == b'\r'
     }
 }
 
+/// The relay's screen emulator runs for the worker's whole life, so a stream
+/// that never terminates an escape sequence must not grow memory or slow it
+/// down, and ordinary text after such a stream must still be tracked.
+#[test]
+fn screen_view_bounds_unterminated_escape_sequences() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("initial-prompt.py"), LAUNCHER).unwrap();
+    let harness = r#"
+import importlib.util, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("launcher", root / "initial-prompt.py")
+launcher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher)
+for opener, body in ((b"\x1b]0;", b"x" * 65000), (b"\x1b[", b"1;" * 32000)):
+    view = launcher.TerminalTail()
+    for _ in range(64):
+        view.feed(opener + body)
+    assert len(view.pending) <= 2 * launcher.TerminalTail.MAX_PENDING, len(view.pending)
+    view.feed(b"\x1b[2J\x1b[Hstill tracked")
+    assert b"still tracked" in view.text(), view.text()
+"#;
+    let output = boss_command_runner::output_blocking_timeout(
+        std::process::Command::new("python3")
+            .args(["-c", harness])
+            .arg(root.path())
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
 /// A CLI that finds no credential in the run's home stops on its sign-in menu,
 /// where Return selects `Google OAuth` and opens a browser. The relay must
 /// write nothing to that screen and must fail the delivery naming it. Closed
@@ -494,10 +526,12 @@ for mode in ("menu", "composer"):
     assert_eq!(read("received-composer"), b"\x1b[200~private sentinel\x1b[201~\r");
 }
 
-/// Relay stdin, through an outer PTY, must never reach the sign-in menu: not
-/// when it is already showing before delivery (input pending while the menu is
-/// displayed), and not when it appears after the brief was delivered
-/// (credential expiry mid-run). Either way the relay fails loudly.
+/// Relay stdin, through an outer PTY, must never reach the sign-in menu when
+/// it appears after the brief was delivered (credential expiry mid-run): text
+/// and Return typed at it on the outer terminal are refused and the relay
+/// fails loudly. Only this post-delivery case drives relay stdin; the initial
+/// menu, which aborts the launcher on its first output chunk, is covered by
+/// `relay_sends_nothing_to_the_sign_in_menu`.
 #[test]
 fn relay_stdin_never_reaches_the_sign_in_menu() {
     let root = tempfile::tempdir().unwrap();
@@ -515,10 +549,10 @@ tty.setraw(0)
 menu = (b' Welcome to the Antigravity CLI. You are currently not signed in.\r\n'
         b' Select login method:\r\n > 1. Google OAuth\r\n   2. Use a Google Cloud project\r\n'
         b'   \xe2\x86\x91/\xe2\x86\x93 Navigate \xc2\xb7 enter Select\r\n')
-os.write(1, b'\x1b[?2004h' + (menu if mode == 'initial' else b'') + b'? for shortcuts')
+os.write(1, b'\x1b[?2004h? for shortcuts')
 received = root / ('received-' + mode)
 received.write_bytes(b'')
-shown = mode == 'initial'
+shown = False
 data = b''
 while True:
     if select.select([0], [], [], 0.05)[0]:
@@ -571,12 +605,16 @@ while child.poll() is None and time.time() < deadline:
         seen += chunk
     if not typed and b"Select login method" in seen:
         # The menu is on the outer terminal: type text and Return at it.
-        os.write(master, b"hello\r")
+        try:
+            os.write(master, b"hello\r")
+        except OSError:
+            pass  # the relay already refused and closed its terminal
         typed = True
 child.wait(timeout=10)
 assert typed, "the sign-in menu never appeared"
 "#;
-    for mode in ["initial", "late"] {
+    {
+        let mode = "late";
         let output = boss_command_runner::output_blocking_timeout(
             std::process::Command::new("python3")
                 .args(["-c", outer])
