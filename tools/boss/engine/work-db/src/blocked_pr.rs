@@ -429,7 +429,8 @@ impl WorkDb {
             for (id, description, rev_status, created_via, rev_reason, rev_detail) in rows {
                 let latest_execution = conn
                     .query_row(
-                        "SELECT id, status, CAST(created_at AS INTEGER), dispatch_wait_reason, last_error
+                        "SELECT id, status, CAST(created_at AS INTEGER), dispatch_wait_reason, last_error,
+                                CAST(finished_at AS INTEGER)
                          FROM work_executions WHERE work_item_id = ?1
                          ORDER BY created_at DESC, id DESC LIMIT 1",
                         [&id],
@@ -438,6 +439,9 @@ impl WorkDb {
                                 id: row.get(0)?,
                                 status: row.get(1)?,
                                 age_secs: now - row.get::<_, i64>(2)?,
+                                // Downtime of a dead run counts from when it
+                                // ended, not from when it was created.
+                                ended_age_secs: row.get::<_, Option<i64>>(5)?.map(|ended| now - ended),
                                 dispatch_wait_reason: row.get(3)?,
                                 last_error: row.get(4)?,
                             })
@@ -736,6 +740,8 @@ impl WorkDb {
                     id: row.get(0)?,
                     status: row.get(1)?,
                     age_secs: now - row.get::<_, i64>(2)?,
+                    // Only live reviewers are selected, so none has ended.
+                    ended_age_secs: None,
                     dispatch_wait_reason: row.get(3)?,
                     last_error: row.get(4)?,
                 })

@@ -45,11 +45,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use boss_ci_log_reader::transient::{
     JobEvidence, LOG_TAIL_LINES, TRANSIENT_RETRY_BUDGET_PER_HEAD, Verdict, classify_job, clean_buildkite_log,
-    retry_allowed, tail_lines_of,
+    retry_allowed,
 };
 use boss_ci_log_reader::{
     BuildkiteBuild, BuildkiteJob, BuildkiteLogReader, CiLogReader, fetch_buildkite_build, parse_buildkite_build_id,
-    parse_buildkite_pipeline_slug, retry_buildkite_job,
+    parse_buildkite_pipeline_slug, retry_buildkite_job, tail_lines,
 };
 
 use crate::work::{
@@ -341,7 +341,7 @@ pub async fn try_transient_retry(
             JobPhase::Failed => {}
         }
         let log_tail = match retrier.read_job_log(&build_url, &job.id).await {
-            Ok(raw) => Some(tail_lines_of(&clean_buildkite_log(&raw), LOG_TAIL_LINES)),
+            Ok(raw) => Some(tail_lines(&clean_buildkite_log(&raw), LOG_TAIL_LINES)),
             Err(err) => {
                 tracing::debug!(job_id = %job.id, error = %format!("{err:#}"), "ci_transient_retry: no job log");
                 None
