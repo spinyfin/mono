@@ -268,14 +268,17 @@ bazel() {
     return $?
   fi
 
-  # "Lost inputs no longer available remotely" after Bazel's own restarts: the
-  # disk cache's action cache names blobs the remote cache no longer has, so
-  # every restart hits the same entry. Remove the entries naming lost blobs
-  # (only those) and run the command once more; the producing actions re-run
-  # and re-upload. See lost-inputs-repair.sh. One retry per invocation:
-  # CI_LOST_INPUTS_RETRIED is set for the nested call, which therefore returns
-  # its own exit status whatever it finds.
-  if [[ -z "${CI_LOST_INPUTS_RETRIED:-}" ]] && ci_repair_lost_inputs "$tmplog" "$CI_DISK_CACHE_DIR"; then
+  # "Lost inputs no longer available remotely" after Bazel's own restarts.
+  # When the disk cache holds an action-cache entry naming a lost blob, every
+  # restart hits that entry. Remove the entries naming lost blobs (only those)
+  # and run the command once more; the producing actions re-run and re-upload.
+  # See lost-inputs-repair.sh. One retry per invocation: CI_LOST_INPUTS_RETRIED
+  # is set for the nested call, which prunes and retries nothing but still logs
+  # the cache state and raises the "NOT repaired" annotation, then returns its
+  # own exit status.
+  if [[ -n "${CI_LOST_INPUTS_RETRIED:-}" ]]; then
+    ci_diagnose_lost_inputs "$tmplog" "$CI_DISK_CACHE_DIR" || true
+  elif ci_repair_lost_inputs "$tmplog" "$CI_DISK_CACHE_DIR"; then
     echo "--- Lost inputs: pruned dangling disk-cache entries; retrying bazel $subcommand once"
     rm -f "$tmplog" "$tmplog.watchdog"
     CI_LOST_INPUTS_RETRIED=1 bazel "$subcommand" "$@"

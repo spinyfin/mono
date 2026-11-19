@@ -170,6 +170,9 @@ run_scenario still_failing 0 1 1 7
 # same result): still exactly one retry, and the retry's status comes back.
 REAPPEAR=1 run_scenario reappear 0 1 1 9
 [[ "$scenario_rc" == 9 && "$calls" == 2 ]] || fail "reappearing entry: want rc=9 calls=2, got rc=${scenario_rc} calls=${calls}"
+# The failed retry still reports: the unrepaired group and the per-digest cache state.
+grep -q 'Lost inputs NOT repaired' "${FAKE_STATE}/out" || fail "reappearing entry: failed retry did not log 'Lost inputs NOT repaired'"
+grep -q "lost blob ${dangling}: in disk-cache cas=" "${FAKE_STATE}/out" || fail "reappearing entry: failed retry did not log the per-digest cache state"
 
 # Removal fails (read-only directory): not counted as progress, so no retry.
 READONLY_AC=1 run_scenario unremovable 0 1 1 5

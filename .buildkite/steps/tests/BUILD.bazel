@@ -1,3 +1,4 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 # Script-level test for the per-host Bazel disk-cache GC cap that ci-env.sh
@@ -45,4 +46,19 @@ sh_test(
         "//.buildkite/steps:ci-env.sh",
         "//.buildkite/steps:lost-inputs-repair.sh",
     ],
+)
+
+# Opt-in end-to-end check of the repair against real Bazel and a loopback
+# cache. Manual so `bazel test //...` never picks it up: it starts a nested
+# Bazel server, which the hermetic test sandbox denies, so run the script
+# directly with `bash` (see its header). The target keeps its inputs visible to
+# the build graph.
+sh_binary(
+    name = "lost_inputs_integration",
+    srcs = ["lost_inputs_integration.sh"],
+    data = [
+        "loopback_cache.py",
+        "//.buildkite/steps:lost-inputs-repair.sh",
+    ],
+    tags = ["manual"],
 )

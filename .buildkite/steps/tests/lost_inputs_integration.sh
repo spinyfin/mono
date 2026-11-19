@@ -23,6 +23,9 @@
 # It also checks that a blob missing from both caches needs no repair: Bazel
 # drops that disk-cache entry itself and re-executes the producer.
 #
+# Run it a second time with EXTRA_BAZEL_FLAGS=--remote_cache_compression to cover
+# the compressed layout .ci.bazelrc uses (the loopback cache stores bytes as given).
+#
 # It cannot produce the remote executor's own error; that needs a remote
 # execution service, which a loopback cache is not.
 
@@ -63,7 +66,7 @@ build() {
   round=$((round + 1))
   echo "round ${round}" > "${ws}/c.txt"
   (cd "$ws" && bazel --output_base="${tmp}/ob${round}" build \
-    --remote_cache="$cache_url" --disk_cache="$disk" --remote_download_minimal \
+    --remote_cache="$cache_url" --disk_cache="$disk" --remote_download_minimal ${EXTRA_BAZEL_FLAGS:-} \
     //:consumer) > "${tmp}/$1.log" 2>&1 || {
     cat "${tmp}/$1.log" >&2
     fail "bazel build ($1) failed"

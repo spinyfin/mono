@@ -8,29 +8,27 @@
 # The failure signature: a step dies with
 #   Testing //x:y failed: Lost inputs no longer available remotely: p/y.zip (<sha256>/<size>)
 # after Bazel's own automatic restarts (--experimental_remote_cache_eviction_retries)
-# have all lost an input. Tests never ran, and the restarts finish in seconds
-# without executing anything: they are served from the agent's disk cache.
+# have all lost an input.
 #
-# Mechanism, as shown against real Bazel by tests/lost_inputs_integration.sh.
-# An action-cache (AC) entry names output blobs by digest, and Bazel does not
-# download outputs it is not asked for, so a cached producer counts as done
-# without its blob being fetched. Bazel drops a disk-cache AC entry itself when
-# the blob is in neither the disk cache's cas/ nor the remote cache, and re-runs
-# the producer. When the blob is still in cas/ but gone from the remote cache
-# the entry stays, the producer is skipped, and a remote action handed the
-# digest as an input cannot find it: the failure above.
+# Mechanism, as shown against real Bazel by tests/lost_inputs_integration.sh:
+# when the disk cache holds an action-cache (AC) entry naming a blob that the
+# remote cache no longer has, but the blob is still in the disk cache's cas/,
+# Bazel treats the producer as done without downloading the blob, and a remote
+# action handed that digest as an input cannot find it. (When the blob is in
+# neither place, Bazel drops the entry itself and re-runs the producer.)
 #
 # The repair deletes the disk-cache AC entries that name a lost digest (cas/
-# blobs stay). That is enough only when the remote AC does not name the blob
-# too: the next attempt then misses on those entries, re-runs the producer and
-# uploads the blob again. If the remote AC also names it, the pruned build is
-# answered by a remote cache hit and the blob stays missing; the agent cannot
-# prune the remote AC, so that case needs the cache's operator. The attempt
-# is bounded to one retry either way, and no cache is bypassed or disabled.
+# blobs stay), so the next attempt misses on them and re-runs the producer.
+# It addresses only that layer. It does nothing when the dangling reference is
+# held elsewhere, e.g. by the remote action cache or by the output base's
+# action cache, and which layer holds it on the affected agents has not been
+# established. The attempt is bounded to one retry, and no cache is bypassed or
+# disabled.
 #
-# When no disk-cache entry matches, or the retry does not help, the log carries
-# every lost digest, whether cas/ has it and how big the disk AC is, and a
-# Buildkite annotation raises the occurrence.
+# Whenever no disk-cache entry matches, or the retry fails again, the log
+# carries every lost digest, whether cas/ has it, how many AC entries named it
+# and how many AC entries the cache holds, and a Buildkite annotation raises
+# the occurrence (ci_diagnose_lost_inputs).
 
 # ci_lost_input_digests <logfile>
 #
@@ -98,6 +96,38 @@ ci_prune_dangling_ac_entries() {
   echo "$removed"
 }
 
+# ci_diagnose_lost_inputs <logfile> <disk_cache_dir>
+#
+# Non-mutating: logs, for every lost digest in the log, whether the disk
+# cache's cas/ has it and how many disk-cache AC entries name it, plus the size
+# of the AC, then raises the "NOT repaired" log group and Buildkite annotation.
+# Removes nothing and retries nothing; used when no repair is possible or when
+# the one allowed retry has already failed. Returns 0 if the log named any lost
+# digest, 1 otherwise.
+ci_diagnose_lost_inputs() {
+  local logfile="$1" cache="$2"
+  local -a digests=()
+  local d in_cas n_ac total_ac
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && digests+=("$d")
+  done < <(ci_lost_input_digests "$logfile")
+  [[ ${#digests[@]} -gt 0 ]] || return 1
+  total_ac="$(find "${cache}/ac" -type f 2> /dev/null | wc -l | tr -d ' ')"
+  echo "[lost-inputs-repair] ${cache}/ac holds ${total_ac} entries" >&2
+  for d in "${digests[@]}"; do
+    if [[ -n "$(find "${cache}/cas" -name "${d}*" -print -quit 2> /dev/null)" ]]; then in_cas=yes; else in_cas=no; fi
+    n_ac="$(grep -rlaF -- "$d" "${cache}/ac" 2> /dev/null | wc -l | tr -d ' ')"
+    echo "[lost-inputs-repair] lost blob ${d}: in disk-cache cas=${in_cas}, disk-cache action-cache entries naming it=${n_ac}" >&2
+  done
+  echo "+++ Lost inputs NOT repaired: the disk cache cannot account for ${#digests[@]} lost blob(s) (or a retry after pruning lost inputs again); the dangling reference is held by another layer" >&2
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    buildkite-agent annotate --style warning --context lost-inputs-unrepaired \
+      "Bazel lost ${#digests[@]} input(s) the remote cache no longer has and the repair did not resolve it. Digests: ${digests[*]}. If the remote action cache names them, its operator must purge those entries." \
+      > /dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 # ci_repair_lost_inputs <logfile> <disk_cache_dir>
 #
 # Returns 0 when the log shows lost inputs and at least one action-cache entry
@@ -115,12 +145,7 @@ ci_repair_lost_inputs() {
   echo "[lost-inputs-repair] ${#digests[@]} blob(s) reported lost; checking ${cache} for action-cache entries that name them" >&2
   removed="$(ci_prune_dangling_ac_entries "$cache" "${digests[@]}")"
   if [[ "$removed" -eq 0 ]]; then
-    echo "+++ Lost inputs NOT repaired: no removable disk-cache entry names a lost blob; the dangling reference is not in this disk cache, so a retry would fail the same way" >&2
-    if command -v buildkite-agent > /dev/null 2>&1; then
-      buildkite-agent annotate --style warning --context lost-inputs-unrepaired \
-        "Bazel lost ${#digests[@]} input(s) the remote cache no longer has, and no disk-cache entry on this agent names them. Digests: ${digests[*]}. If the remote action cache names them, its operator must purge those entries." \
-        > /dev/null 2>&1 || true
-    fi
+    ci_diagnose_lost_inputs "$logfile" "$cache" || true
   fi
   [[ "$removed" -gt 0 ]]
 }
