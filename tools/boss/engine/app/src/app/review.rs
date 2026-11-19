@@ -80,7 +80,10 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        match work_db.open_merge_revisions(&work_item_id) {
+        // The open revisions the person confirmed with this request. They are
+        // stored with the request only once it is about to reach GitHub, so
+        // every refusal before that point leaves nothing behind.
+        let confirmed_now = match work_db.open_merge_revisions(&work_item_id) {
             Ok(revisions) if revisions.iter().any(|revision| !confirmed_revisions.contains(revision)) => {
                 send_response(
                     &sink,
@@ -92,12 +95,12 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 );
                 return;
             }
-            Ok(_) => {}
+            Ok(revisions) => revisions,
             Err(err) => {
                 refuse_merge_when_ready(&sink, &request_id, &work_item_id, err.to_string());
                 return;
             }
-        }
+        };
         let product = match work_db.get_product(&product_id) {
             Ok(Some(product)) => product,
             Ok(None) => {
@@ -141,6 +144,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let product_slug = product.slug.clone();
                 let publisher = server_state.publisher.clone();
                 let product_id2 = product_id.clone();
+                let confirmed_revisions_now = confirmed_now;
                 tracing::info!(%request_id, elapsed_ms = recv_instant.elapsed().as_secs_f64() * 1000.0, "merge request preflight completed");
                 boss_task_scope::spawn(async move {
                     tracing::info!(
@@ -148,6 +152,19 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                         pr_url = %pr_url2,
                         "merge_when_ready: requesting GitHub-native merge",
                     );
+                    // Persist what the person confirmed, bound to this request,
+                    // before GitHub is called so the continuation can compare.
+                    let confirmation = match work_db2.remember_confirmed_merge_revisions(
+                        &work_item_id2,
+                        &pr_url2,
+                        &confirmed_revisions_now,
+                    ) {
+                        Ok(confirmation) => confirmation,
+                        Err(err) => {
+                            refuse_merge_when_ready(&sink2, &request_id2, &work_item_id2, err.to_string());
+                            return;
+                        }
+                    };
                     let external_started = std::time::Instant::now();
                     match direct_merge_executor.execute(&pr_url2).await {
                         Ok(success) => {
@@ -162,24 +179,22 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                             // the per-row intent keeps it from clobbering this
                             // state until the timeline or terminal probe says
                             // otherwise.
-                            let detail = serde_json::json!({
-                                "position": null,
-                                "state": null,
-                                "enqueued_at": null,
-                                "section_order": boss_engine_merge_poller::QUEUED_NO_POSITION_SECTION_ORDER,
-                            })
-                            .to_string();
+                            let detail = boss_engine_storage_values::merge_queue_section::queued_no_position_detail();
                             let record = work_db2.record_github_merge_intent(
                                 boss_work_db::GithubMergeIntentInsertInput::builder()
                                     .work_item_id(work_item_id2.clone())
                                     .pr_url(pr_url2.clone())
                                     .head_sha(success.head_sha.clone())
+                                    .confirmation_request_id(confirmation.clone())
                                     .build(),
                                 &detail,
                             );
                             let record = match record {
                                 Ok(record) => record,
                                 Err(err) => {
+                                    if let Err(forget) = work_db2.forget_confirmed_merge_revisions(&confirmation) {
+                                        tracing::warn!(work_item_id = %work_item_id2, ?forget, "merge_when_ready: could not drop the unrecorded request's confirmation");
+                                    }
                                     tracing::error!(
                                         work_item_id = %work_item_id2,
                                         pr_url = %pr_url2,
@@ -234,6 +249,12 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                         }
                         Err(err) => {
                             let message = format!("{err:#}");
+                            tracing::warn!(
+                                work_item_id = %work_item_id2,
+                                pr_url = %pr_url2,
+                                error = %message,
+                                "merge_when_ready: GitHub refused the merge request",
+                            );
                             // A merge request is what a deferred conflict
                             // waits for, and GitHub can refuse the request
                             // *because* of that conflict. The request still
@@ -246,6 +267,20 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                 (&product_id2, &work_item_id2, &pr_url2),
                             )
                             .await;
+                            // A released conflict becomes the standing request,
+                            // which keeps what this request confirmed.
+                            let confirmation_kept = conflict_released
+                                && work_db2
+                                    .attach_confirmed_merge_revisions(&work_item_id2, &pr_url2, &confirmation)
+                                    .unwrap_or(false);
+                            if !confirmation_kept {
+                                // The refused request never stood, so what it
+                                // confirmed must not carry into a later one.
+                                // Only this request's snapshot goes.
+                                if let Err(err) = work_db2.forget_confirmed_merge_revisions(&confirmation) {
+                                    tracing::warn!(work_item_id = %work_item_id2, ?err, "merge_when_ready: could not drop the refused request's confirmation");
+                                }
+                            }
                             if boss_engine_runtime::merge_mechanism::is_push_restriction_error(&message) {
                                 let _ = work_db2.create_attention_item(boss_work_db::CreateAttentionItemInput {
                                     work_item_id: Some(work_item_id2.clone()),
@@ -263,6 +298,10 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                                     status: None,
                                     resolved_at: None,
                                 });
+                            }
+                            if conflict_released && let Err(err) = work_db2.note_merge_refusal(&work_item_id2, &message)
+                            {
+                                tracing::warn!(work_item_id = %work_item_id2, ?err, "merge_when_ready: could not keep the refusal");
                             }
                             let response = if conflict_released {
                                 FrontendEvent::MergeWhenReadyAccepted {
@@ -1522,6 +1561,10 @@ mod trunk_queue_tests {
                 head_sha: self.head_sha.clone(),
             })
         }
+
+        async fn disarm(&self, _pr_url: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     /// A product with `merge_mechanism` `NULL` still routes through the
@@ -2397,5 +2440,89 @@ mod trunk_queue_tests {
             ),
             "in_review revisions have already published and must not prompt"
         );
+    }
+
+    /// The Direct-merge executor injected on [`ServerState`] is the same
+    /// object the poller's sweep host uses to continue a merge after
+    /// conflict resolution. The one-line `with_merge_executor` wiring in
+    /// `app.rs` is the production path this pins.
+    #[tokio::test]
+    async fn server_state_direct_merge_executor_sees_poller_continuation() {
+        let server = MockServer::start().await;
+        let pr_url = "https://github.com/brianduff/flunge/pull/998";
+        let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("resolved-head"));
+        let (state, _temp) =
+            test_server_state_with_direct_executor(trunk_client_for(server.uri()), Some(direct_executor.clone()));
+        let product = create_test_product_with_repo(
+            &state.work_db,
+            "poller-continuation-product",
+            Some("git@github.com:brianduff/flunge.git"),
+        );
+        let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "poller-continuation-chore");
+        state
+            .work_db
+            .update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    pr_url: Some(pr_url.into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        state
+            .work_db
+            .start_merge_conflict_resolution(&chore.id, pr_url, "main")
+            .unwrap();
+        state
+            .work_db
+            .mark_chore_blocked_merge_conflict(&chore.id, pr_url)
+            .unwrap();
+        let attempt = state
+            .work_db
+            .insert_conflict_resolution(
+                boss_work_db::ConflictResolutionInsertInput::builder()
+                    .product_id(product.id.clone())
+                    .work_item_id(chore.id.clone())
+                    .pr_url(pr_url)
+                    .pr_number(998)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger("base")
+                    .head_sha_before("old-head")
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        state
+            .work_db
+            .clear_chore_blocked_merge_conflict(&chore.id, pr_url)
+            .unwrap();
+        state
+            .work_db
+            .mark_conflict_resolution_succeeded_at_rung(&attempt.id, Some("resolved-head"), 1)
+            .unwrap();
+
+        let probe = boss_engine_merge_poller::tests::StubProbe::new();
+        probe.set(
+            pr_url,
+            boss_engine_merge_poller::PrLifecycleState::Open(boss_engine_merge_poller::OpenPrStatus::clean()),
+        );
+        boss_engine_merge_poller::run_one_pass(
+            &state.work_db,
+            probe.as_ref(),
+            state.publisher.as_ref(),
+            None,
+            None,
+            Some(state.sweep_host.as_ref() as &dyn boss_engine_merge_poller::SweepHost),
+        )
+        .await;
+
+        assert_eq!(
+            direct_executor.calls.lock().unwrap().as_slice(),
+            &[pr_url.to_owned()],
+            "the injected ServerState executor must be the one the poller continuation calls"
+        );
+        server.verify().await;
     }
 }

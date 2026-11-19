@@ -95,7 +95,7 @@ pub(crate) fn clear_resolved_signal_in_tx(
             )
             .optional()?;
         if let Some(id) = rejected {
-            crate::blocking::mark_deletion_signoff_in_tx(conn, item, pr)?;
+            crate::blocking::mark_deletion_signoff_in_tx(conn, item, pr, None, Some(&id))?;
             let attempt = query_conflict_resolution(conn, &id)?.expect("selected conflict attempt");
             let rung = attempt
                 .resolved_by_rung

@@ -827,6 +827,11 @@ impl WorkDb {
         {
             crate::merge_conflict_merging::cancel(&tx, id)?;
         }
+        if previous_status != task.status || previous_blocked_reason != task.blocked_reason {
+            // A stopped-merge explanation ends with the state it described
+            // (a sign-off, a landed revision, a human move).
+            crate::merge_conflict_merging::clear_stopped(&tx, id)?;
+        }
         let mut updated = query_task(&tx, id).require("task", id)?;
         // Audit the stored status before applying the board presentation.
         boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;

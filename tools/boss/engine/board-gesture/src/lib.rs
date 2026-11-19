@@ -48,7 +48,9 @@ pub struct BoardRow {
     pub blocked_reason: Option<String>,
     /// `tasks.merge_queue_state` — `Some("queued")` while the PR is in a
     /// merge queue, `Some("auto_merge_enabled")` with Merge When Ready armed,
-    /// `None` otherwise. Engine-owned: only the merge/queue pollers write it.
+    /// `None` otherwise. Engine-owned: the merge/queue pollers, the Direct merge handler
+    /// (recording an accepted request) and conflict-resolution merging
+    /// (`resolving_conflicts`) write it.
     pub merge_queue_state: Option<String>,
 }
 

@@ -447,13 +447,45 @@ impl WorkDb {
         self.halt_deletion_signoff(work_item_id, pr_url, None)
     }
 
-    /// Retire the attempt and stop the standing merge in the same transaction.
-    /// Also repairs an older succeeded attempt with a still-blocked parent.
-    pub fn halt_conflict_resolution_for_deletion_signoff(&self, attempt_id: &str, rung: i64) -> Result<Option<Task>> {
+    /// Retire the attempt, persist the deletion list, and stop the standing
+    /// merge in the same transaction. Also repairs an older succeeded attempt
+    /// with a still-blocked parent.
+    pub fn halt_conflict_resolution_for_deletion_signoff(
+        &self,
+        attempt_id: &str,
+        rung: i64,
+        deletions: &[String],
+    ) -> Result<Option<Task>> {
         let attempt = self
             .get_conflict_resolution(attempt_id)?
             .with_context(|| format!("unknown conflict attempt: {attempt_id}"))?;
-        self.halt_deletion_signoff(&attempt.work_item_id, &attempt.pr_url, Some((attempt_id, rung)))
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tier = if rung == 0 { "deterministic" } else { "engine_rebase" };
+        let reason = format!("deletion tripwire: {}", deletions.join("; "));
+        crate::conflict_ladder_telemetry::append_ladder_outcome_in_tx(
+            &tx,
+            attempt_id,
+            tier,
+            "halted_for_signoff",
+            &reason,
+            deletions,
+        )?;
+        crate::conflict_res::mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, attempt_id, None, rung)?;
+        let updated = mark_deletion_signoff_in_tx(
+            &tx,
+            &attempt.work_item_id,
+            &attempt.pr_url,
+            Some(deletions),
+            Some(attempt_id),
+        )?;
+        tx.commit()?;
+        self.metrics_registry().counter_inc_by_dynamic(
+            &format!("conflict_ladder.{tier}.halted_for_signoff"),
+            "Conflict ladder tier decisions since engine start.",
+            1,
+        );
+        Ok(updated)
     }
 
     fn halt_deletion_signoff(
@@ -467,7 +499,7 @@ impl WorkDb {
         if let Some((id, rung)) = attempt {
             crate::conflict_res::mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, id, None, rung)?;
         }
-        let updated = mark_deletion_signoff_in_tx(&tx, work_item_id, pr_url)?;
+        let updated = mark_deletion_signoff_in_tx(&tx, work_item_id, pr_url, None, attempt.map(|(id, _)| id))?;
         tx.commit()?;
         Ok(updated)
     }
@@ -526,6 +558,7 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        crate::merge_conflict_merging::clear_stopped(&tx, work_item_id)?;
         // Phase 10 #31: keep the side table in sync (see the relaxed
         // sibling [`Self::clear_chore_blocked_merge_conflict`]).
         tx.execute(
@@ -2265,6 +2298,7 @@ pub(crate) fn clear_blocked_merge_conflict_in_tx(
     if rows == 0 {
         return Ok(None);
     }
+    crate::merge_conflict_merging::clear_stopped(conn, work_item_id)?;
     // Mark the matching side-table row(s) cleared so
     // the polymorphic clear dispatch doesn't re-fire on the next
     // probe. Mirrors `clear_chore_blocked_ci_failure`.
@@ -2340,7 +2374,52 @@ pub(crate) fn clear_blocked_ci_failure_in_tx(
     Ok(Some(updated))
 }
 
-pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
+fn halted_signoff_deletions(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_url: &str,
+    attempt_id: Option<&str>,
+) -> Vec<String> {
+    let recorded: Option<Option<String>> = if let Some(attempt_id) = attempt_id {
+        conn.query_row(
+            "SELECT json_extract(value, '$.deletions') FROM conflict_resolutions cr,
+                    json_each(COALESCE(cr.ladder_outcomes, '[]'))
+             WHERE cr.id = ?1
+               AND json_extract(value, '$.outcome') = 'halted_for_signoff'
+             ORDER BY json_extract(value, '$.recorded_at') DESC LIMIT 1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    } else {
+        conn.query_row(
+            "SELECT json_extract(value, '$.deletions') FROM conflict_resolutions cr,
+                    json_each(COALESCE(cr.ladder_outcomes, '[]'))
+             WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
+               AND json_extract(value, '$.outcome') = 'halted_for_signoff'
+             ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
+            params![work_item_id, pr_url],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    };
+    recorded
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn mark_deletion_signoff_in_tx(
+    conn: &Connection,
+    work_item_id: &str,
+    pr_url: &str,
+    live_deletions: Option<&[String]>,
+    attempt_id: Option<&str>,
+) -> Result<Option<Task>> {
     let now = now_string();
     let rows = crate::task_status_audit::execute(
         conn,
@@ -2365,17 +2444,9 @@ pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str,
     }
     let kind = boss_engine_storage_values::attention_kinds::MERGED_PARENT_DELETION_SIGNOFF_ATTENTION_KIND;
     if crate::attention_filing::reraise_open_work_item_attention(conn, work_item_id, kind)?.is_none() {
-        let reason: Option<String> = conn
-            .query_row(
-                "SELECT json_extract(value, '$.reason') FROM conflict_resolutions cr,
-                    json_each(COALESCE(cr.ladder_outcomes, '[]'))
-             WHERE cr.work_item_id = ?1 AND cr.pr_url = ?2
-               AND json_extract(value, '$.outcome') = 'halted_for_signoff'
-             ORDER BY cr.created_at DESC, cr.id DESC LIMIT 1",
-                params![work_item_id, pr_url],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let deletions = live_deletions
+            .map(|live| live.to_vec())
+            .unwrap_or_else(|| halted_signoff_deletions(conn, work_item_id, pr_url, attempt_id));
         crate::workitems::insert_attention_item_row(
             conn,
             &CreateAttentionItemInput {
@@ -2383,8 +2454,7 @@ pub(crate) fn mark_deletion_signoff_in_tx(conn: &Connection, work_item_id: &str,
                 kind: kind.to_owned(),
                 title: boss_engine_storage_values::merge_parent_signoff::SIGNOFF_ATTENTION_TITLE.to_owned(),
                 body_markdown: boss_engine_storage_values::merge_parent_signoff::render_signoff_attention_body(
-                    &[reason.unwrap_or_else(|| "Deletion tripwire requires operator sign-off".to_owned())],
-                    pr_url,
+                    &deletions, pr_url,
                 ),
                 execution_id: None,
                 status: None,

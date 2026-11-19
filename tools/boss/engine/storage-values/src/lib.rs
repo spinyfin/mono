@@ -11,6 +11,7 @@ pub mod dispatch_pause;
 pub mod dispatch_wait;
 pub mod merge_mechanism;
 pub mod merge_parent_signoff;
+pub mod merge_queue_section;
 pub mod pool_policy;
 pub mod postmortem_brief;
 pub mod progression;

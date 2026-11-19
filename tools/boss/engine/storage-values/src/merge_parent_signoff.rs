@@ -17,13 +17,29 @@ pub const SIGNOFF_ATTENTION_TITLE: &str =
 /// sign-off halt. `deletions` are the already-described
 /// removed surfaces and `pr_url` the PR the halt applies to.
 pub fn render_signoff_attention_body(deletions: &[String], pr_url: &str) -> String {
-    let removed_list = deletions
-        .iter()
-        .map(|d| format!("- {d}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "This PR resolves a merge / forward-port. The engine diffed the \
+    if deletions.is_empty() {
+        format!(
+            "This PR resolves a merge / forward-port. The engine diffed the \
+     resolution against **both merge parents** and found it removes \
+     surfaces a **merged** parent had already added — the \
+     incident-002 failure class (a forward-port silently deleting a \
+     just-merged feature). The list of removed surfaces is \
+     **evidence unavailable** (it was not recorded with this halt).\n\n\
+     Auto-progression is **halted**; the task is blocked pending your \
+     sign-off.\n\n\
+     If the removal is genuinely correct (a design-doc-authorised \
+     supersession), move this task back to Review to sign off. \
+     Otherwise the resolution must be revised to restore the \
+     surface (integrate both parents).\n\nPR: {pr_url}"
+        )
+    } else {
+        let removed_list = deletions
+            .iter()
+            .map(|d| format!("- {d}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "This PR resolves a merge / forward-port. The engine diffed the \
      resolution against **both merge parents** and found it removes \
      {n} surface(s) a **merged** parent had already added — the \
      incident-002 failure class (a forward-port silently deleting a \
@@ -35,8 +51,9 @@ pub fn render_signoff_attention_body(deletions: &[String], pr_url: &str) -> Stri
      supersession), move this task back to Review to sign off. \
      Otherwise the resolution must be revised to restore the \
      surface (integrate both parents).\n\nPR: {pr_url}",
-        n = deletions.len(),
-    )
+            n = deletions.len(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -52,6 +69,14 @@ mod tests {
         assert!(body.contains("- a.tsx"));
         assert!(body.contains("- b.tsx"));
         assert!(body.contains("2 surface(s)"));
+        assert!(body.contains("PR: https://github.com/org/repo/pull/1"));
+    }
+
+    #[test]
+    fn signoff_body_does_not_invent_a_deleted_surface_when_evidence_is_missing() {
+        let body = render_signoff_attention_body(&[], "https://github.com/org/repo/pull/1");
+        assert!(body.contains("evidence unavailable"));
+        assert!(!body.contains("1 surface(s)"));
         assert!(body.contains("PR: https://github.com/org/repo/pull/1"));
     }
 }

@@ -294,6 +294,9 @@ pub async fn run_one_pass_observed(
     } else {
         Vec::new()
     };
+    if let Some(host) = host {
+        super::disarm_drain::drain_pending_merge_disarms(work_db, probe, publisher, host).await;
+    }
     let total = in_review.len()
         + blocked_conflict.len()
         + blocked_ci.len()
@@ -639,6 +642,9 @@ pub async fn reconcile_batch(
     let wanted: std::collections::HashSet<&str> = pr_urls.iter().map(String::as_str).collect();
     if wanted.is_empty() {
         return (outcome, Vec::new());
+    }
+    if let Some(host) = host {
+        super::disarm_drain::drain_pending_merge_disarms(work_db, probe, publisher, host).await;
     }
 
     let in_review = candidates_for_pr_urls(work_db.list_chores_pending_merge_check(), &wanted);

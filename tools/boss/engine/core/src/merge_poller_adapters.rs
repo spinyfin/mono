@@ -67,11 +67,9 @@ impl CoreSweepHost {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_merge_executor(
-        mut self,
-        executor: Arc<dyn crate::merge_when_ready::DirectMergeExecutor>,
-    ) -> Self {
+    /// Use `executor` for the merge continuation and for turning auto-merge
+    /// off, so the poller and the merge handler share one executor.
+    pub fn with_merge_executor(mut self, executor: Arc<dyn crate::merge_when_ready::DirectMergeExecutor>) -> Self {
         self.merge_executor = executor;
         self
     }
@@ -139,6 +137,16 @@ impl ConflictHandling for CoreSweepHost {
         candidate: &PendingMergeCheck,
     ) {
         crate::merge_when_ready::resume_after_conflict(work_db, publisher, candidate, self.merge_executor.as_ref())
+            .await;
+    }
+
+    async fn disarm_stopped_merge(
+        &self,
+        work_db: &WorkDb,
+        publisher: &dyn ExecutionPublisher,
+        candidate: &PendingMergeCheck,
+    ) {
+        crate::merge_when_ready::disarm_stopped_merge(work_db, publisher, candidate, self.merge_executor.as_ref())
             .await;
     }
 

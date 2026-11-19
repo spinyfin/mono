@@ -852,10 +852,11 @@ impl WorkDb {
 
     /// Clear the mechanical-rung-in-flight marker (and the mechanical
     /// lease/workspace it stamped) once a mechanical rung has concluded —
-    /// whether it retired the attempt, halted it for sign-off, or fell
-    /// through to a worker. Called unconditionally by
+    /// whether it retired the attempt or fell through to a worker. Called by
     /// `boss_engine::conflict_ladder::try_mechanical_rungs` right before it
-    /// releases the leased workspace, so a row only ever carries a
+    /// releases the leased workspace, except after a halt for sign-off (the
+    /// halt stamps the attempt itself, so the mechanical lease/workspace stay
+    /// recorded on the succeeded row), so a row only ever carries a
     /// non-`NULL` `mechanical_rung_in_flight` while a rung is genuinely
     /// executing. Nulling the lease/workspace here is safe: the mechanical
     /// lease is released immediately afterwards, and a fall-through worker
@@ -909,7 +910,7 @@ impl WorkDb {
         {
             retire_superseded_pending_conflict_attempts_in_tx(&tx, &updated.work_item_id, attempt_id, &now)?;
         }
-        if rows > 0 && reason != "superseded_stale_head" {
+        if rows > 0 && reason != crate::merge_conflict_merging::SUPERSEDED_STALE_HEAD {
             conflict_stop::surface_conflict_stop(&tx, attempt_id)?;
         }
         if rows > 0
@@ -1509,7 +1510,13 @@ impl WorkDb {
                     .as_ref()
                     .is_some_and(|outcomes| outcomes.iter().any(|outcome| outcome.outcome == "halted_for_signoff"))
             {
-                crate::blocking::mark_deletion_signoff_in_tx(&tx, &work_item_id, &pr_url)?;
+                crate::blocking::mark_deletion_signoff_in_tx(
+                    &tx,
+                    &work_item_id,
+                    &pr_url,
+                    None,
+                    blocked_attempt_id.as_deref(),
+                )?;
                 mark_conflict_resolution_succeeded_at_rung_in_tx(&tx, attempt_id, None, rung.unwrap_or(0))?;
                 recovered.push(RecoveredConflictLadderAttempt {
                     work_item_id,

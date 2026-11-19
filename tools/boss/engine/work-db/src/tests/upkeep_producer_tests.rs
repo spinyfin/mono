@@ -281,6 +281,24 @@ fn seed_blocked_other_with_pr(db: &WorkDb, product: &str) -> String {
     id
 }
 
+fn seed_pending_merge_disarm(db: &WorkDb, product: &str) -> String {
+    let id = chore(db, product, "pending disarm");
+    let pr = fresh_pr();
+    set_blocking_state(db, &id, "in_review", None, Some(&pr), "100");
+    db.record_github_merge_intent(
+        GithubMergeIntentInsertInput::builder()
+            .work_item_id(&id)
+            .pr_url(&pr)
+            .head_sha("head")
+            .build(),
+        "{}",
+    )
+    .unwrap();
+    db.start_merge_conflict_resolution(&id, &pr, "main").unwrap();
+    db.stop_merge_conflict_resolution(&id, "manual_abandon").unwrap();
+    id
+}
+
 fn seed_dependency_blocked(db: &WorkDb, product: &str) -> String {
     let id = chore(db, product, "blocked on a dependency");
     set_blocking_state(db, &id, "blocked", Some("dependency"), None, "100");
@@ -509,6 +527,14 @@ const PRODUCERS: &[Producer] = &[
                 c.work_item_id.clone()
             })
         },
+    },
+    Producer {
+        name: "merge poller, pending GitHub auto-merge disarms (list_pending_merge_disarms)",
+        stance: Stance::KeepsParked {
+            why: "turning off GitHub auto-merge is owed even when the card is parked, moved, or waiting on deletion sign-off",
+        },
+        seed: seed_pending_merge_disarm,
+        nominated: |db| ids(db.list_pending_merge_disarms().unwrap(), |c| c.work_item_id.clone()),
     },
     Producer {
         name: "dependency cascade (list_dependency_blocked_candidates)",

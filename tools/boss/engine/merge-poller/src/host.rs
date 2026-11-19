@@ -95,6 +95,16 @@ pub trait ConflictHandling: Send + Sync {
     ) {
     }
 
+    /// Turn off GitHub auto-merge for a merge request that conflict resolution
+    /// stopped while it was armed.
+    async fn disarm_stopped_merge(
+        &self,
+        _work_db: &WorkDb,
+        _publisher: &dyn ExecutionPublisher,
+        _candidate: &PendingMergeCheck,
+    ) {
+    }
+
     /// Archives conflict-fix revisions that are moot now the PR is mergeable.
     /// Returns how many were closed.
     fn retire_moot_conflict_revisions(
