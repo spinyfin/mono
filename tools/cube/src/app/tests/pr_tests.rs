@@ -238,7 +238,7 @@ fn ensure_pr_exists_json_has_action_url_number() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
     ]);
 
@@ -265,6 +265,73 @@ fn ensure_pr_exists_json_has_action_url_number() {
         "publication writes no pr/<n> alias: {}",
         result.payload
     );
+}
+
+/// Cube supports stacked changes for humans; the default-branch rule for managed
+/// work is enforced by the engine where it binds PRs, not by `cube pr`.
+#[test]
+fn ensure_pr_for_a_stacked_pr_still_succeeds() {
+    let cwd = std::env::current_dir().expect("cwd");
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "git",
+                "push",
+                "-b",
+                "my-feature",
+                "--remote",
+                "origin",
+                "--allow-new",
+                "--ignore-working-copy",
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+            "abc123\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+            "abc123\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
+            r#"[{"base":{"ref":"feature/parent","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+        ),
+    ]);
+
+    let cli = Cli::parse_from([
+        "cube",
+        "pr",
+        "ensure",
+        "--branch",
+        "my-feature",
+        "--title",
+        "Existing PR",
+    ]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
+    let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr exists");
+    runner.assert_exhausted();
+
+    assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/7");
+    assert_eq!(result.payload["action"], "exists");
+    assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/7");
+    assert_eq!(result.payload["number"], 7);
 }
 
 #[test]
@@ -562,7 +629,7 @@ fn ensure_pr_creates_no_pr_bookmark_on_existing_pr() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/33"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/33"}]"#,
         ),
         // Bookmark set must happen even on the reuse/backfill path.
     ]);
@@ -631,7 +698,7 @@ fn ensure_pr_errors_on_multiple_open_prs() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/10"},{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/11"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/10"},{"html_url":"https://github.com/spinyfin/mono/pull/11"}]"#,
         ),
     ]);
 
@@ -761,7 +828,7 @@ fn pr_create_is_idempotent_when_pr_already_exists() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         // No push, no `gh pr create`: the local branch is only compared with GitHub.
         ExpectedCommand::ok(
@@ -806,7 +873,7 @@ fn pr_create_existing_pr_with_new_local_commits_recommends_update() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -856,7 +923,7 @@ fn pr_update_pushes_when_pr_exists() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1035,7 +1102,7 @@ fn pr_update_proceeds_when_working_copy_is_empty_child_of_branch_head() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1091,7 +1158,7 @@ fn pr_update_allow_detached_push_skips_working_copy_check() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"base":{"ref":"main","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -1199,29 +1266,4 @@ fn resolve_pr_body_is_none_when_neither_flag_supplied() {
     let resolved = crate::app::pr::resolve_pr_body(&args).unwrap();
     assert_eq!(resolved.text, None);
     assert_eq!(resolved.file_path, None);
-}
-
-#[test]
-fn pr_create_refuses_existing_pr_with_non_default_base_before_publishing() {
-    let cwd = std::env::current_dir().unwrap();
-    let runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(
-            cwd.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            cwd,
-            "gh",
-            &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7","base":{"ref":"feature/parent","repo":{"default_branch":"trunk"}}}]"#,
-        ),
-    ]);
-    let cli = Cli::parse_from(["cube", "pr", "create", "--branch", "my-feature"]);
-    let error = run_with_dependencies(cli, None, &runner).unwrap_err().to_string();
-    assert!(error.contains("feature/parent"), "{error}");
-    assert!(error.contains("trunk"), "{error}");
-    assert!(error.contains("prerequisite"), "{error}");
-    runner.assert_exhausted();
 }

@@ -595,15 +595,21 @@ pub(super) async fn submit_for_caller(
         let payload: boss_protocol::PrCreatedProposalPayload = serde_json::from_str(canonical_json)
             .map_err(|err| ProposalSubmissionError::new(ProposalErrorCode::Internal, err.to_string()))?;
         let checker = server_state.pr_state_checker.clone();
-        tokio::task::spawn_blocking(move || checker.check(&payload.pr_url))
+        let verdict = tokio::task::spawn_blocking(move || checker.base_verdict(&payload.pr_url))
             .await
             .map_err(|err| ProposalSubmissionError::new(ProposalErrorCode::Internal, err.to_string()))?
             .map_err(|err| {
                 ProposalSubmissionError::validation(vec![ProposalFieldError::new(
                     "pr_url",
-                    format!("PR binding refused: {err}"),
+                    format!("PR base could not be verified; try again shortly: {err}"),
                 )])
             })?;
+        if let boss_work_db::PrBaseVerdict::Refused(reason) = verdict {
+            return Err(ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                "pr_url",
+                format!("PR binding refused: {reason}"),
+            )]));
+        }
     }
 
     // Serialise the whole wait submission per execution (replay lookup,

@@ -425,6 +425,28 @@ async fn repair_candidate(
         );
         return park_unresolved(work_db, candidate, &detail, outcome);
     }
+    match pr_checker.base_verdict(&own_pr_url) {
+        Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+            let detail = format!(
+                "This row was bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its \
+                 branch `{expected_branch}`, {own_pr_url}, cannot be adopted: {reason} The engine cleared the \
+                 wrong binding.",
+                bound = candidate.bound_pr_url,
+                exec = candidate.execution_id,
+            );
+            if let Err(err) = work_db.upsert_work_item_attention(
+                &candidate.task_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+                "PR base could not be accepted",
+                &detail,
+            ) {
+                tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: could not surface PR base refusal");
+            }
+            return park_unresolved(work_db, candidate, &detail, outcome);
+        }
+        Ok(_) => {}
+        Err(err) => return Err(Inconclusive::GitHub(format!("PR base check for {own_pr_url}: {err:#}"))),
+    }
     let scan = doc_refresher
         .scan(&candidate.task_id, &own_pr_url)
         .await
@@ -821,6 +843,45 @@ mod tests {
         );
         // Idempotent: the row is no longer a candidate.
         assert!(db.list_pr_binding_repair_candidates().unwrap().is_empty());
+    }
+
+    struct ParentBranchChecker;
+
+    impl PrStateChecker for ParentBranchChecker {
+        fn check(&self, _: &str) -> anyhow::Result<PrOpenState> {
+            Ok(PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+            Ok(crate::work::PrBaseVerdict::Refused(
+                "PR targets `feature/parent`.".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn pr_on_a_non_default_base_is_not_adopted_by_the_repair() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+        let detector = FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default());
+        let docs = RecordingDocRefresher::default();
+        let mut attempts = HashMap::new();
+
+        let outcome = run_one_pass(&db, &detector, &verifier, &ParentBranchChecker, &docs, &mut attempts).await;
+
+        assert_eq!(outcome.rebound, 0, "{outcome:?}");
+        assert_eq!(outcome.unresolved, 1, "{outcome:?}");
+        assert_eq!(task(&db, &task_id).pr_url, None);
+        assert!(docs.0.lock().unwrap().is_empty());
+        assert!(
+            db.list_attention_items_for_work_item(&task_id)
+                .unwrap()
+                .iter()
+                .any(|a| {
+                    a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+                        && a.body_markdown.contains("feature/parent")
+                })
+        );
     }
 
     #[tokio::test]

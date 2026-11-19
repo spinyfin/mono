@@ -5,8 +5,8 @@ use crate::worker_setup::{WorkerSetupInput, render_claude_md, worker_kind_for_ex
 fn assert_prepush_rebase(text: &str, label: &str) {
     for instruction in [
         "Stacked changes are not supported",
-        "create-prerequisite-task proposal",
-        "existing task as a prerequisite",
+        "--answer-type link-prerequisite-task --prerequisite-pr <that PR's URL>",
+        "Use `create-prerequisite-task` only when no open task owns the PR",
         "Wait until its PR lands in the default branch",
         "Before the first push and every later push",
         "fetch and compare the branch's base with its current upstream tip",

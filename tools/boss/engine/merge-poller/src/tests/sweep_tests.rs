@@ -1599,7 +1599,10 @@ async fn merge_into_parent_branch_preserves_dependency_hold() {
         assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
         assert_eq!(db.gating_prereqs_for(&dependent.id).unwrap(), vec![parent.clone()]);
         let attentions = db.list_attention_items_for_work_item(&parent).unwrap();
-        let refusals: Vec<_> = attentions.iter().filter(|a| a.kind == "pr_base_refused").collect();
+        let refusals: Vec<_> = attentions
+            .iter()
+            .filter(|a| a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+            .collect();
         assert_eq!(refusals.len(), 1, "repeated polling deduplicates the attention");
         assert!(refusals[0].body_markdown.contains(base));
 

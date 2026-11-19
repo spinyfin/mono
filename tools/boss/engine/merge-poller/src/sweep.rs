@@ -2,6 +2,7 @@ use super::deferred_review_admission::sweep_deferred_review_admission_with;
 use super::host::{ConflictCleared, ConflictResponse, PopulationRequest, SweepHost};
 use super::post_merge_review::maybe_trigger_post_merge_review;
 use super::*;
+use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
 
 /// The engine services one sweep step may call. Each is absent when the sweep
 /// runs bare — a pass that only observes and promotes.
@@ -719,19 +720,19 @@ pub(crate) async fn sweep_one(
         );
         if let Err(err) = work_db.upsert_work_item_attention(
             &candidate.work_item_id,
-            "pr_base_refused",
+            PR_BASE_REFUSED,
             "PR has not landed in the default branch",
             &detail,
         ) {
             tracing::warn!(?err, "merge poller: could not surface PR base refusal");
         }
         publisher
-            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "pr_base_refused")
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, PR_BASE_REFUSED)
             .await;
         return;
     }
     if !matches!(probe_result.state, PrLifecycleState::ClosedUnmerged)
-        && let Err(err) = work_db.resolve_external_tracker_attention(&candidate.work_item_id, "pr_base_refused")
+        && let Err(err) = work_db.resolve_external_tracker_attention(&candidate.work_item_id, PR_BASE_REFUSED)
     {
         tracing::warn!(?err, "merge poller: could not clear PR base refusal");
     }

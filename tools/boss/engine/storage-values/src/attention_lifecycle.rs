@@ -154,7 +154,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Conflict remediation clears the signal after workspace preparation succeeds, a retry resumes, or the PR becomes clean.",
     ),
     entry(
-        "pr_base_refused",
+        PR_BASE_REFUSED,
         ClearedBy::ProducerReconciles,
         "Completion and merge polling clear the refusal only after a fresh GitHub observation verifies the repository default branch; unrelated worker progress cannot clear it.",
     ),

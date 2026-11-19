@@ -113,7 +113,7 @@ use boss_protocol::WorkItem;
 use crate::completion::{CommandPrDetector, PrDetector, PrStatus, expected_branch_name, parse_repo_slug};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::sweep_loop::{SweepOutcome, spawn_sweep_loop};
-use crate::work::{LatePrCandidate, WorkDb};
+use crate::work::{LatePrCandidate, PrBaseVerdict, PrStateChecker, WorkDb};
 
 /// How often the sweep runs. Deliberately slower than most reconcilers
 /// (dead-pid / orphan sweep run every 60s) — see the module doc's "Retry,
@@ -705,6 +705,14 @@ async fn bind_and_record(
         Ok(crate::work::PrBaseVerdict::DefaultBranch | crate::work::PrBaseVerdict::NotChecked) => {}
         Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
             tracing::warn!(%reason, pr_url, "abandoned PR base refused; leaving binding untouched");
+            if let Err(err) = work_db.upsert_work_item_attention(
+                &candidate.work_item_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+                "PR base could not be accepted",
+                &format!("Cannot bind {pr_url}: {reason}"),
+            ) {
+                tracing::warn!(?err, "could not surface recovered PR base refusal");
+            }
             outcome.base_refused += 1;
             return;
         }
@@ -1057,6 +1065,41 @@ mod tests {
             gh: fake,
             default_branch_cache: AsyncMutex::new(HashMap::new()),
         }
+    }
+
+    /// A checker that reports every PR as targeting a non-default branch.
+    struct ParentBranchChecker;
+
+    impl PrStateChecker for ParentBranchChecker {
+        fn check(&self, _pr_url: &str) -> anyhow::Result<crate::work::PrOpenState> {
+            Ok(crate::work::PrOpenState::Merged)
+        }
+        fn base_verdict(&self, _pr_url: &str) -> anyhow::Result<PrBaseVerdict> {
+            Ok(PrBaseVerdict::Refused("PR targets `feature/parent`".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn pr_on_a_non_default_base_is_not_adopted() {
+        let (_dir, db) = open_db();
+        let (chore_id, _exec_id) = make_candidate_chore(&db, "stacked-pr");
+        let detector = FixedPrDetector(PrStatus::Merged {
+            url: "https://github.com/foo/bar/pull/8".to_owned(),
+        });
+        let creator = QueuePrAutoCreator::new(vec![]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut failures = HashMap::new();
+
+        let outcome = run_one_pass(&db, &detector, &creator, Arc::new(ParentBranchChecker), &sink, &mut failures).await;
+        assert_eq!(outcome.recovered, 0);
+        let (status, pr_url) = task_status_and_pr_url(&db, &chore_id);
+        assert_ne!(status, "in_review");
+        assert!(pr_url.is_none());
+        let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
+        assert!(items.iter().any(|a| {
+            a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+                && a.body_markdown.contains("feature/parent")
+        }));
     }
 
     #[tokio::test]

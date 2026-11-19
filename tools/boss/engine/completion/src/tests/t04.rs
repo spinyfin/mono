@@ -977,7 +977,6 @@ async fn pr_review_pass_no_result_reprompts_instead_of_silently_advancing() {
         probe_queuer.clone(),
         CompletionCollaborators::noop(),
     )
-    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_pr_state_checker(open_pr_checker())
     .with_structured_output_dir(out_dir.path().to_path_buf())
     .with_max_unproductive_nudges(2);
@@ -1050,7 +1049,6 @@ async fn pr_review_pass_malformed_result_reprompt_stays_driver_agnostic() {
         probe_queuer.clone(),
         CompletionCollaborators::noop(),
     )
-    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_pr_state_checker(open_pr_checker())
     .with_structured_output_dir(out_dir.path().to_path_buf())
     .with_max_unproductive_nudges(2);
@@ -1254,7 +1252,6 @@ async fn pr_review_pass_malformed_artifact_probe_includes_parse_error() {
         probe_queuer.clone(),
         CompletionCollaborators::noop(),
     )
-    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_pr_state_checker(open_pr_checker())
     .with_structured_output_dir(out_dir.path().to_path_buf())
     .with_max_unproductive_nudges(2);

@@ -922,10 +922,26 @@ pub(super) async fn apply_work_item_patch_from(
     {
         let checker = server_state.pr_state_checker.clone();
         let pr_url = pr_url.clone();
-        match tokio::task::spawn_blocking(move || checker.check(&pr_url)).await {
+        match tokio::task::spawn_blocking(move || checker.base_verdict(&pr_url)).await {
+            Ok(Ok(boss_work_db::PrBaseVerdict::Refused(reason))) => {
+                send_work_error(&sink, &request_id, format!("PR binding refused: {reason}"));
+                return;
+            }
             Ok(Ok(_)) => {}
-            result => {
-                send_work_error(&sink, &request_id, anyhow!("PR binding refused: {result:?}"));
+            Ok(Err(err)) => {
+                send_work_error(
+                    &sink,
+                    &request_id,
+                    format!("PR binding refused: the PR base could not be verified; try again shortly: {err}"),
+                );
+                return;
+            }
+            Err(err) => {
+                send_work_error(
+                    &sink,
+                    &request_id,
+                    format!("PR binding refused: base check failed: {err}"),
+                );
                 return;
             }
         }

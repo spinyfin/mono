@@ -429,6 +429,10 @@ pub const REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND: &str = "pr_review_ve
 /// (`attention_lifecycle::ClearedBy::WorkResumed`).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 
+/// A PR the engine will not bind or count as landed because it targets a
+/// branch other than the repository default branch.
+pub const PR_BASE_REFUSED: &str = "pr_base_refused";
+
 /// Cube refused to position a workspace because the repository state needs
 /// repair (closed or merged PR, missing head, missing branch). This one string
 /// is the `tasks.blocked_reason`, the attention kind and the dispatch-wait

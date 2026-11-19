@@ -495,11 +495,6 @@ mod tests {
         assert_eq!(parse_http_status("gh: API rate limit exceeded (HTTP 429)"), Some(429));
         assert_eq!(parse_http_status("no status here"), None);
     }
-}
-
-#[cfg(test)]
-mod pr_base_tests {
-    use super::*;
 
     #[test]
     fn uses_actual_default_and_refuses_missing_metadata() {

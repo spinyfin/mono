@@ -193,13 +193,6 @@ fn list_open_pr(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, branch
         )));
     }
 
-    if let Some(pr) = prs.first() {
-        git_utils::gh_cli::require_default_branch(
-            pr["base"]["ref"].as_str(),
-            pr["base"]["repo"]["default_branch"].as_str(),
-        )
-        .map_err(CubeError::InvalidArgument)?;
-    }
     Ok(prs
         .first()
         .and_then(|pr| pr.get("html_url"))
@@ -275,8 +268,12 @@ fn gh_create_pr(
         ))
         .map_err(|e| CubeError::InvalidArgument(format!("cannot resolve repository default branch: {e}")))?;
     let default_branch = default_branch.trim();
-    git_utils::gh_cli::require_default_branch(Some(default_branch), Some(default_branch))
-        .map_err(CubeError::InvalidArgument)?;
+    if default_branch.is_empty() {
+        return Err(CubeError::InvalidArgument(format!(
+            "GitHub returned an empty default branch for {}; cannot choose the PR base",
+            ctx.owner_repo
+        )));
+    }
     let mut create_args: Vec<&str> = vec![
         "pr",
         "create",
