@@ -878,6 +878,11 @@ pub async fn run_one_pass_with_terminal_and_grace(
         // inspector returns `None` (`tmux_run_for_execution` excludes
         // terminal executions). Manual stop / finalize also resolve via
         // [`resolve_stale_worker_attention`] in `release_worker_pane`.
+        // Progression timeout is evaluated before the Spawning skip: an
+        // engine restart adopts live panes as Spawning, Grok never reports
+        // AwaitingInput, and a restricted run left on an approval prompt
+        // therefore stays Spawning. Skipping those slots used to leave them
+        // holding the pool until an operator reaped them.
         let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
             work_db,
             &state.run_id,
