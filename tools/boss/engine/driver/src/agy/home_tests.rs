@@ -167,7 +167,31 @@ fn posture_refuses_unpinned_or_immediate_input() {
         fs::write(&path, settings.to_string()).unwrap();
         let error = assert_agy_posture(&runtime.process_home, tmp.path()).unwrap_err();
         assert!(error.to_string().contains("queuedMessages"), "{error:#}");
+        // The refusal says what the file holds, so it can be diagnosed from
+        // the spawn failure alone once the home has been reclaimed.
+        let found = mode.map_or("found no queuedMessages key".to_owned(), |mode| {
+            format!("found \"{mode}\"")
+        });
+        assert!(error.to_string().contains(&found), "{error:#}");
     }
+}
+
+#[test]
+fn settings_key_changes_names_what_a_cli_start_did_to_the_file() {
+    let before = r#"{"queuedMessages": "queue", "trustedWorkspaces": ["/ws"], "toolPermission": "strict"}"#;
+    let after = r#"{"trustedWorkspaces": ["/ws"], "toolPermission": "request-review", "colorScheme": "dark"}"#;
+    assert_eq!(
+        settings_key_changes(before, after),
+        (
+            vec!["queuedMessages".to_owned()],
+            vec!["toolPermission".to_owned()],
+            vec!["colorScheme".to_owned()]
+        )
+    );
+    // A file the CLI left unreadable has lost every key.
+    let (dropped, changed, added) = settings_key_changes(before, "{broken");
+    assert_eq!(dropped.len(), 3);
+    assert!(changed.is_empty() && added.is_empty());
 }
 
 #[test]

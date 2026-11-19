@@ -411,3 +411,80 @@ assert os.read(0, 1) == b'\r'
         }
     }
 }
+
+/// A CLI that finds no credential in the run's home stops on its sign-in menu,
+/// where Return selects `Google OAuth` and opens a browser. The relay must
+/// write nothing to that screen and must fail the delivery naming it.
+#[test]
+fn relay_sends_nothing_to_the_sign_in_menu() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("initial-prompt.py"), LAUNCHER).unwrap();
+    fs::write(
+        root.path().join("initial-prompt.json"),
+        initial_prompt::launcher_config(&crate::agy::AgyDriver::default()).unwrap(),
+    )
+    .unwrap();
+    // The menu as `agy` 1.5.5 draws it (pane study, startup screens). A
+    // composer hint and bracketed paste are on in both modes, so the menu's
+    // own text is the only thing holding the brief back.
+    let stub = r#"
+import os, pathlib, select, sys, tty
+root = pathlib.Path(__file__).parent
+tty.setraw(0)
+menu = (b' Welcome to the Antigravity CLI. You are currently not signed in.\r\n'
+        b' Select login method:\r\n > 1. Google OAuth\r\n   2. Use a Google Cloud project\r\n'
+        b'   \xe2\x86\x91/\xe2\x86\x93 Navigate \xc2\xb7 enter Select\r\n')
+os.write(1, b'\x1b[?2004h' + (menu if sys.argv[1] == 'menu' else b'') + b'? for shortcuts')
+received = root / ('received-' + sys.argv[1])
+received.write_bytes(b'')
+data = b''
+while not data.endswith(b'\r'):
+    if select.select([0], [], [], 0.05)[0]:
+        chunk = os.read(0, 4096)
+        data += chunk
+        with received.open('ab') as out:
+            out.write(chunk)
+        if data.endswith(b'\x1b[201~'):
+            os.write(1, b'\r\nprivate sentinel')
+"#;
+    fs::write(root.path().join("stub.py"), stub).unwrap();
+    let harness = r#"
+import importlib.util, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("launcher", root / "initial-prompt.py")
+launcher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher)
+config = json.loads((root / "initial-prompt.json").read_text())
+markers = lambda key: [s.encode() for s in config[key]]
+for mode in ("menu", "composer"):
+    try:
+        launcher.run([sys.executable, str(root / "stub.py"), mode], b"private sentinel",
+                     markers("agent_markers"), markers("starting_markers"), readiness_timeout=2,
+                     blocking_dialog_markers=markers("blocking_dialog_markers"))
+        outcome = "delivered"
+    except Exception as error:
+        outcome = f"{type(error).__name__}: {error}"
+    (root / ("outcome-" + mode)).write_text(outcome)
+"#;
+    let output = boss_command_runner::output_blocking_timeout(
+        std::process::Command::new("python3")
+            .args(["-c", harness])
+            .arg(root.path())
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let read = |name: &str| fs::read(root.path().join(name)).unwrap();
+
+    assert_eq!(
+        String::from_utf8(read("outcome-menu")).unwrap(),
+        "TimeoutError: driver did not become ready for initial brief within 2s; it was still showing \
+         'You are currently not signed in'"
+    );
+    assert_eq!(read("received-menu"), b"", "nothing may be typed into the sign-in menu");
+    // The same stub without the menu is given the brief and Return, so the
+    // menu is what held delivery back.
+    assert_eq!(String::from_utf8(read("outcome-composer")).unwrap(), "delivered");
+    assert_eq!(read("received-composer"), b"\x1b[200~private sentinel\x1b[201~\r");
+}

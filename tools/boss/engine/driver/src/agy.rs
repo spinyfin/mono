@@ -687,7 +687,8 @@ impl AgentDriver for AgyDriver {
 
     fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
         // Pane viability study Q6: queued input runs at the next Stop, even
-        // fullyIdle=false. Provisioning pins queuedMessages to queue.
+        // fullyIdle=false. The session's `--settings` pin queuedMessages to
+        // queue; the private settings carry the same pin up to the launch.
         MidTurnPaneInput::Buffers
     }
 
@@ -1259,6 +1260,103 @@ mod tests {
             "SessionStart must forward progress after authorization install: {hooks_doc:#}"
         );
         assert!(!driver.launch_ready());
+    }
+
+    /// A host home for the live-probe tests. With `login_keychain`, provisioning
+    /// has a credential to bridge into the run's home.
+    fn host_home(tmp: &TempDir, login_keychain: bool) -> PathBuf {
+        let home = tmp.path().join("host-home");
+        fs::create_dir_all(home.join("Library/Keychains")).unwrap();
+        if login_keychain {
+            fs::write(home.join("Library/Keychains/login.keychain-db"), b"dummy-keychain").unwrap();
+        }
+        home
+    }
+
+    #[tokio::test]
+    async fn provisioned_run_passes_startup_verification_after_the_cli_rewrites_its_settings() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let _home = home_override(&host_home(&tmp, true));
+        let _guard = test_environment::env_for_provision_with_live_probe(&homes);
+        let driver = AgyDriver::default();
+        let run_id = "run-agy-live-probe";
+
+        let state = driver
+            .provision_workspace(&workspace, "hello", run_id)
+            .await
+            .expect("provision with the live models probe")
+            .expect("agy returns runtime state");
+        let runtime = AgyRuntimeState::from_driver_runtime_state(&state).unwrap();
+
+        // The CLI stand-in started once, in the home that is verified below,
+        // and that start took the default-valued pin out of the settings.
+        let starts = test_environment::fake_agy_starts(&homes);
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0]["home"], runtime.process_home.display().to_string());
+        assert_eq!(starts[0]["argv"].as_array().unwrap().last().unwrap(), "models");
+        assert_eq!(starts[0]["dropped"], serde_json::json!(["queuedMessages"]));
+
+        let input = permission_input(&tmp, run_id, workspace);
+        driver
+            .write_permission_config(&input, tmp.path())
+            .await
+            .expect("a provisioned run passes its own startup verification");
+        assert!(verify_startup_authorization(&input).unwrap().ok);
+        // The launch reads the settings Boss rendered, not the ones the CLI left.
+        let settings = runtime.process_home.join(".gemini/antigravity-cli/settings.json");
+        let private: serde_json::Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(private["queuedMessages"], "queue");
+        let plan = driver.spawn_invocation(spawn_request("gemini-4-carbon-high", None, Some(run_id)));
+        assert!(plan.command.contains("initial-prompt.py"), "{}", plan.command);
+
+        // The pin itself is not relaxed: a start after provisioning (the pane
+        // launch is one) leaves a file that the same checks still refuse.
+        let mut started: serde_json::Value = private.clone();
+        started.as_object_mut().unwrap().remove("queuedMessages");
+        fs::write(&settings, serde_json::to_string_pretty(&started).unwrap()).unwrap();
+        let error = verify_startup_authorization(&input).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("must pin queuedMessages to queue (found no queuedMessages key"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_fails_when_the_run_home_holds_no_credential() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        // No login keychain on the host, so none is bridged into the run's home.
+        let _home = home_override(&host_home(&tmp, false));
+        let _guard = test_environment::env_for_provision_with_live_probe(&homes);
+        let driver = AgyDriver::default();
+        let run_id = "run-agy-no-credential";
+
+        let error = driver
+            .provision_workspace(&workspace, "hello", run_id)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("live agy models posture probe"), "{text}");
+        assert!(text.contains("Please sign in to view available models"), "{text}");
+
+        // The one CLI start was the non-interactive `models` probe in the
+        // run's home. Nothing was launched to sign in, and no pane command
+        // exists for a run that failed here.
+        let starts = test_environment::fake_agy_starts(&homes);
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(
+            starts[0]["home"],
+            process_home_for_run(run_id).unwrap().display().to_string()
+        );
+        assert_eq!(starts[0]["argv"].as_array().unwrap().last().unwrap(), "models");
+        let plan = driver.spawn_invocation(spawn_request("gemini-4-carbon-high", None, Some(run_id)));
+        assert!(plan.command.starts_with("printf"), "{}", plan.command);
+        assert!(plan.command.contains("agy spawn refused"), "{}", plan.command);
     }
     // ── TranscriptAccess ────────────────────────────────────────────────────
 

@@ -170,7 +170,9 @@ GhosttyKit pane (what the operator reads: agy's own TUI)
        │    └─ hooks.json                 ← global-root hooks: boss-event forwarder +
        │                                     PreToolUse guards behind the adapter
        └─ antigravity-cli/
-            ├─ settings.json              ← private CLI state; posture/trust supplied via --settings
+            ├─ settings.json              ← private CLI state; posture/trust supplied via --settings.
+            │                                The CLI rewrites it on every start without default-valued
+            │                                keys, so Boss renders it again after the provisioning probe
             ├─ onboarding.json            ← pre-seeded (skips onboarding; not a consent answer)
             ├─ conversation_summaries.db  ← run-private
             ├─ presence/, conversations/, brain/, log/, cache/

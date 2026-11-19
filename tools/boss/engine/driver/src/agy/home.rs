@@ -14,7 +14,7 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use super::environment::{AgyProcessEnvironment, resolve_agy_binary, skip_binary_assert};
+use super::environment::{AgyProcessEnvironment, resolve_agy_binary};
 #[cfg(test)]
 use crate::scoped_home::LOGIN_KEYCHAIN_LEAF;
 use crate::transcript_store::{
@@ -30,7 +30,9 @@ pub use crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK as AGY_HOMES_ENV_TEST_LOCK
 /// Env override for the root under which per-run `agy` homes live.
 pub const AGY_HOMES_ROOT_ENV: &str = "BOSS_AGY_HOMES_DIR";
 
-/// When set to `1`/`true`, skip the live `agy` posture probe.
+/// When set to `1`/`true`, skip the live `agy` posture probe. This is the only
+/// switch for the probe: skipping the binary identity checks does not skip it,
+/// so a stand-in binary can take the vendor CLI's place in a provisioning test.
 pub const AGY_SKIP_POSTURE_ASSERT_ENV: &str = "BOSS_AGY_SKIP_POSTURE_ASSERT";
 
 /// Default leaf under the system temp when [`AGY_HOMES_ROOT_ENV`] is unset.
@@ -76,6 +78,13 @@ pub fn contains_agy_transcripts(container: &Path) -> bool {
 /// `<process-home>/.gemini/antigravity-cli`.
 fn agy_state_dir(process_home: &Path) -> PathBuf {
     process_home.join(GEMINI_DIR).join(STATE_DIR)
+}
+
+/// The CLI's own `settings.json`: `<process-home>/.gemini/antigravity-cli/settings.json`.
+/// Boss seeds it and the CLI rewrites it on every start; see
+/// [`restore_private_cli_settings_after_cli_start`].
+fn private_cli_settings_path(process_home: &Path) -> PathBuf {
+    agy_state_dir(process_home).join("settings.json")
 }
 
 /// The path of the durable-transcript link: `<process-home>/.gemini/antigravity-cli/brain`.
@@ -445,9 +454,7 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     // enableTelemetry is not written, and the Terms checkbox is not ticked.
     fs::write(antigravity.join("cache/onboarding.json"), render_onboarding_json())
         .with_context(|| format!("writing onboarding.json under {}", antigravity.display()))?;
-    let trust_json = render_private_cli_settings_json(workspace);
-    fs::write(antigravity.join("settings.json"), &trust_json)
-        .with_context(|| format!("writing private CLI settings under {}", antigravity.display()))?;
+    write_private_cli_settings(&process_home, workspace)?;
     fs::write(&session_settings_path, render_session_settings_json(workspace))
         .with_context(|| format!("writing session settings {}", session_settings_path.display()))?;
     // SessionStart `true` canary so the global-root file exists before
@@ -485,8 +492,12 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
 
     assert_agy_posture(&process_home, workspace)?;
 
-    if !skip_posture_assert() && !skip_binary_assert() {
+    if !skip_posture_assert() {
         probe_agy_models(&environment).context("live agy models posture probe")?;
+        // The probe is a CLI start in this home, and a start does not leave
+        // the private settings as they were written above.
+        restore_private_cli_settings_after_cli_start(&process_home, workspace)
+            .context("restoring the private CLI settings after the agy models probe")?;
     }
 
     Ok(AgyRuntimeState::builder()
@@ -497,6 +508,74 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
         .workspace_path(workspace_abs)
         .agy_binary(agy_binary)
         .build())
+}
+
+/// Write the private CLI settings the next `agy` start in this home reads.
+fn write_private_cli_settings(process_home: &Path, workspace: &Path) -> anyhow::Result<()> {
+    let path = private_cli_settings_path(process_home);
+    fs::write(&path, render_private_cli_settings_json(workspace))
+        .with_context(|| format!("writing private CLI settings {}", path.display()))
+}
+
+/// Put the private CLI settings back after an `agy` start in this home, and
+/// check the posture of the home as the pane launch will find it.
+///
+/// An `agy` start rewrites `settings.json` while it loads its settings: it
+/// parses the file, serialises it again in its own sparse form, and writes the
+/// result back when the bytes differ. The sparse form leaves out every key
+/// whose value equals the CLI's built-in default, and `"queue"` is the built-in
+/// default for `queuedMessages`. So the pin [`assert_agy_posture`] requires
+/// does not survive a start, the `models` probe included. Read from the pinned
+/// 1.5.9 binary: `store.NewManager` runs `initCliSettings` → `ReadCliSettings`
+/// → `validateCliSettings`, which calls `CliSetting.MarshalSparse` (a per-field
+/// comparison against the default settings), compares the result with the
+/// bytes on disk and calls `WriteCliSettings`; `models` is dispatched after
+/// `NewManager` returns.
+///
+/// Provisioning used to assert the posture before the probe only. The home it
+/// returned was then the one the CLI had rewritten, and the next posture check
+/// (startup verification in `write_permission_config`) refused every
+/// provisioned run. The file is rendered again here so the launch reads what
+/// Boss rendered, whatever the CLI left, and the posture is asserted on that
+/// final state. The private tree is validated first, so nothing the CLI
+/// created is written through. What the CLI changed is logged by key name.
+///
+/// The pane launch is a start too, so the pin is gone again once the worker is
+/// running. Nothing checks this file after the launch; the mode a session runs
+/// in comes from `--settings`, which the CLI never writes back.
+fn restore_private_cli_settings_after_cli_start(process_home: &Path, workspace: &Path) -> anyhow::Result<()> {
+    validate_private_layout(process_home)?;
+    let path = private_cli_settings_path(process_home);
+    let rendered = render_private_cli_settings_json(workspace);
+    let left = fs::read_to_string(&path).unwrap_or_default();
+    if left != rendered {
+        let (dropped, changed, added) = settings_key_changes(&rendered, &left);
+        tracing::info!(
+            process_home = %process_home.display(),
+            ?dropped,
+            ?changed,
+            ?added,
+            "agy rewrote its private settings during the models probe; rendering them again for the launch",
+        );
+        write_private_cli_settings(process_home, workspace)?;
+    }
+    assert_agy_posture(process_home, workspace)
+}
+
+/// Top-level keys that `after` lacks, holds with another value, or holds in
+/// addition, relative to `before`. Text that is not a JSON object has no keys.
+fn settings_key_changes(before: &str, after: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let keys =
+        |text: &str| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).unwrap_or_default();
+    let (before, after) = (keys(before), keys(after));
+    let dropped = before.keys().filter(|key| !after.contains_key(*key)).cloned().collect();
+    let changed = before
+        .iter()
+        .filter(|(key, value)| after.get(*key).is_some_and(|now| now != *value))
+        .map(|(key, _)| key.clone())
+        .collect();
+    let added = after.keys().filter(|key| !before.contains_key(*key)).cloned().collect();
+    (dropped, changed, added)
 }
 
 fn refuse_host_gemini_as_home(process_home: &Path) -> anyhow::Result<()> {
@@ -530,16 +609,24 @@ pub fn assert_agy_posture(process_home: &Path, workspace: &Path) -> anyhow::Resu
         bail!("provisioned onboarding.json does not skip the onboarding screen");
     }
 
-    let settings = fs::read_to_string(process_home.join(".gemini/antigravity-cli/settings.json"))
-        .context("reading private CLI settings.json")?;
+    let settings =
+        fs::read_to_string(private_cli_settings_path(process_home)).context("reading private CLI settings.json")?;
     let settings_json: serde_json::Value =
         serde_json::from_str(&settings).context("parsing private CLI settings.json")?;
     if settings_json.get("enableTelemetry").is_some() {
         bail!("private CLI settings must not answer data-collection consent (enableTelemetry)");
     }
-    if settings_json.get("queuedMessages").and_then(|value| value.as_str()) != Some(super::permissions::QUEUED_MESSAGES)
-    {
-        bail!("private CLI settings must pin queuedMessages to queue");
+    let queued_messages = settings_json.get("queuedMessages");
+    if queued_messages.and_then(|value| value.as_str()) != Some(super::permissions::QUEUED_MESSAGES) {
+        // Say what the file holds: a missing key and another mode have
+        // different causes, and the home is reclaimed with the failed spawn.
+        match queued_messages {
+            Some(found) => bail!("private CLI settings must pin queuedMessages to queue (found {found})"),
+            None => bail!(
+                "private CLI settings must pin queuedMessages to queue (found no queuedMessages key, \
+                 which is how an agy start leaves the file)"
+            ),
+        }
     }
     let trusted = settings_json
         .get("trustedWorkspaces")
