@@ -88,6 +88,47 @@ platform_line="$(line_number 'common --enable_platform_specific_config')"
 line_number 'build:dev-remote --grpc_keepalive_time=30s' > /dev/null
 line_number 'build:dev-remote --grpc_keepalive_timeout=20s' > /dev/null
 line_number 'build:dev-remote --workspace_status_command=tools/remote-execution/dev-remote-workspace-status.sh' > /dev/null
+# Default workspace-status uses the same precedence as the disk cache: a
+# `common` line above the platform-config line. A plain `build` line is
+# applied after macos -> dev-remote-endpoint -> dev-remote and would replace
+# the watchdog.
+workspace_status_line="$(line_number 'common --workspace_status_command=tools/boss/installer/workspace-status.sh')"
+((workspace_status_line < platform_line)) || fail "the default workspace-status command must come before the platform-config line"
+[[ "$(count_active '^(build|test|run) .*--workspace_status_command')" == "0" ]] ||
+  fail "a plain build/test/run --workspace_status_command line is applied after dev-remote and overrides it"
+
+# Effective --workspace_status_command through the automatic macOS config
+# (common, then macos -> endpoint -> dev-remote, then plain build lines).
+winning_workspace_status() {
+  local val="" cfg line
+  for cfg in "$@"; do
+    case "$cfg" in
+      common)
+        line="$(grep -E '^common --workspace_status_command=' "${bazelrc}" | tail -n 1 || true)"
+        ;;
+      build)
+        line="$(grep -E '^build --workspace_status_command=' "${bazelrc}" | tail -n 1 || true)"
+        ;;
+      *)
+        line="$(grep -E "^build:${cfg} --workspace_status_command=" "${bazelrc}" | tail -n 1 || true)"
+        ;;
+    esac
+    if [[ -n "$line" ]]; then
+      val="${line#*--workspace_status_command=}"
+    fi
+  done
+  printf '%s\n' "$val"
+}
+
+effective="$(winning_workspace_status common macos dev-remote-endpoint dev-remote build)"
+[[ "$effective" == "tools/remote-execution/dev-remote-workspace-status.sh" ]] ||
+  fail "opted-in macOS path must select the developer watchdog, got '${effective}'"
+effective="$(winning_workspace_status common macos dev-remote-endpoint build)"
+[[ "$effective" == "tools/boss/installer/workspace-status.sh" ]] ||
+  fail "macOS path without ~/.bazelrc must keep the default stamp script, got '${effective}'"
+effective="$(winning_workspace_status common macos dev-remote-endpoint dev-remote build dev-local)"
+[[ "$effective" == "tools/boss/installer/workspace-status.sh" ]] ||
+  fail "--config=dev-local must restore the default stamp script, got '${effective}'"
 line_number 'build:dev-remote --remote_local_fallback' > /dev/null
 # Without this a result a developer's Mac produced after a fallback is uploaded
 # under the key CI's remote steps use, and a CI step can be satisfied by it.
@@ -105,6 +146,7 @@ line_number 'build:dev-local --remote_executor=' > /dev/null
 line_number 'build:dev-local --remote_cache=' > /dev/null
 # The same disk cache as the default, so a dev-local build shares it.
 line_number 'build:dev-local --disk_cache=~/.cache/bazelcache' > /dev/null
+line_number 'build:dev-local --workspace_status_command=tools/boss/installer/workspace-status.sh' > /dev/null
 line_number 'test:dev-local --test_env==MONO_TEST_REMOTE_EXECUTION' > /dev/null
 [[ "$(count_active '^[a-z]+:dev-local .*--strategy')" == "0" ]] ||
   fail "dev-local must not name a strategy"

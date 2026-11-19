@@ -23,6 +23,7 @@ build="${dir}/nativelink/build-worker.sh"
 patch="${dir}/nativelink/patches/macos-clonefile-executables.patch"
 readme="${dir}/README.md"
 dev_watchdog="${dir}/dev-remote-workspace-status.sh"
+remote_status="${dir}/remote-status.sh"
 
 failures=0
 fail() {
@@ -224,6 +225,134 @@ if ! grep -q 'exec "$original"' "$dev_watchdog" && ! grep -q 'exec "$original" "
 fi
 if ! grep -q 'dev-remote-workspace-status.sh' "$readme"; then
   fail "README.md must name the developer status watchdog"
+fi
+if [[ ! -f "$remote_status" ]]; then
+  fail "remote-status.sh must exist"
+fi
+if ! grep -q 'source "${here}/remote-status.sh"' "$dev_watchdog"; then
+  fail "dev-remote-workspace-status.sh must source remote-status.sh"
+fi
+if ! grep -q 'ci-env.sh' "$readme" || ! grep -q 'repobin and checkleft' "$readme"; then
+  fail "README.md must say the CI step watchdog covers bazel clients repobin and checkleft launch"
+fi
+if ! grep -q '~15 s + 10 s (derived)' "$readme"; then
+  fail "README.md must mark the during-a-build bound as derived"
+fi
+
+# ---------------------------------------------------------------------------
+# remote-status.sh: endpoint parsing, TCP-then-HTTP probe, stuck classification.
+# ---------------------------------------------------------------------------
+# shellcheck source=../remote-status.sh
+source "$remote_status"
+
+expect_equal() {
+  if [[ "$1" != "$2" ]]; then
+    fail "$3: expected '$1', got '$2'"
+  fi
+}
+
+expect_host_port() {
+  local actual
+  if ! actual="$(remote_status_endpoint_host_port "$2")"; then
+    fail "endpoint '$2': expected '$1', call failed"
+    return
+  fi
+  expect_equal "$1" "$actual" "endpoint '$2'"
+}
+
+expect_malformed() {
+  local stdout
+  if stdout="$(remote_status_endpoint_host_port "$1")"; then
+    fail "endpoint '$1': expected failure, succeeded with '${stdout}'"
+    return
+  fi
+  if [[ -n "$stdout" ]]; then
+    fail "endpoint '$1': a failing call must print nothing on stdout, printed '${stdout}'"
+  fi
+}
+
+expect_host_port "executor.test 50051" "grpc://executor.test:50051"
+expect_host_port "executor.test 443" "grpcs://executor.test:443"
+expect_host_port "100.64.0.7 50051" "grpc://100.64.0.7:50051"
+expect_host_port "::1 50051" "grpc://[::1]:50051"
+expect_malformed "executor.test:50051"
+expect_malformed "http://executor.test:50051"
+expect_malformed "grpc://executor.test"
+expect_malformed "grpc://:50051"
+expect_malformed "grpc://executor.test:port"
+expect_malformed "grpc://executor.test:50051/instance"
+expect_malformed "grpc://executor test:50051"
+expect_malformed "grpc://:"
+
+tmp="${TEST_TMPDIR:?}"
+nc_calls="${tmp}/nc-calls"
+nc_status=0
+nc() {
+  printf '%s\n' "$*" >> "$nc_calls"
+  return "$nc_status"
+}
+
+curl_calls="${tmp}/curl-calls"
+curl_http=200
+curl_fail_exit=""
+curl() {
+  printf '%s\n' "$*" >> "$curl_calls"
+  printf '%s' "$curl_http"
+  if [[ -n "$curl_fail_exit" ]]; then
+    return "$curl_fail_exit"
+  fi
+  if [[ "$curl_http" == "000" ]]; then
+    return 28
+  fi
+  return 0
+}
+
+: > "$nc_calls"
+expect_equal "0" "$(remote_status_tcp_reachable darwin hub.test 50051 5 && echo 0 || echo 1)" "tcp reachable"
+expect_equal "-z -G 5 hub.test 50051" "$(cat "$nc_calls")" "darwin nc flags"
+: > "$nc_calls"
+remote_status_tcp_reachable linux hub.test 50051 5 || true
+expect_equal "-z -w 5 hub.test 50051" "$(cat "$nc_calls")" "linux nc flags"
+nc_status=1
+expect_equal "1" "$(remote_status_tcp_reachable darwin hub.test 50051 5 && echo 0 || echo 1)" "tcp unreachable"
+nc_status=0
+
+: > "$curl_calls"
+expect_equal "200" "$(remote_status_http "grpc://hub.test:50051" "hub.test" 50051 10)" "http 200"
+expect_equal \
+  "--silent --output /dev/null --max-time 10 --write-out %{http_code} http://hub.test:50051/status" \
+  "$(cat "$curl_calls")" "http curl args"
+curl_http=000
+expect_equal "timeout" "$(remote_status_http "grpc://hub.test:50051" "hub.test" 50051 10)" "http timeout"
+curl_fail_exit=52
+expect_equal "curl:52" "$(remote_status_http "grpc://hub.test:50051" "hub.test" 50051 10)" "http curl 52"
+curl_fail_exit=""
+curl_http=503
+expect_equal "503" "$(remote_status_http "grpc://hub.test:50051" "hub.test" 50051 10)" "http 503"
+curl_http=200
+expect_equal "200" "$(remote_status_http "grpcs://hub.test:443" "hub.test" 443 10)" "https"
+
+nc_status=1
+: > "$curl_calls"
+expect_equal "unreachable" "$(remote_status_probe "grpc://hub.test:50051" darwin 5 10)" "probe unreachable"
+expect_equal "" "$(cat "$curl_calls")" "probe unreachable: curl was not run"
+if remote_status_stuck unreachable; then
+  fail "unreachable must not be stuck"
+fi
+nc_status=0
+curl_http=000
+expect_equal "timeout" "$(remote_status_probe "grpc://hub.test:50051" darwin 5 10)" "probe timeout after connect"
+if ! remote_status_stuck timeout; then
+  fail "timeout must be stuck"
+fi
+if ! remote_status_stuck 503; then
+  fail "503 must be stuck"
+fi
+if remote_status_stuck "curl:52"; then
+  fail "curl:52 must not be stuck"
+fi
+if remote_status_stuck 200; then
+  fail "200 must not be stuck"
 fi
 
 if [[ "$failures" -ne 0 ]]; then

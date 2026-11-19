@@ -395,6 +395,16 @@ if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
 fi
 curl_http=200
 
+# A hub we cannot connect to is not stuck: Bazel falls back, and a
+# --config=dev-local / off-network build must not be killed.
+nc_status=1
+: > "$curl_calls"
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: an unreachable hub was treated as stuck"
+fi
+expect_equal "" "$(cat "$curl_calls")" "watchdog tick unreachable: curl was run"
+nc_status=0
+
 # The loop signals the bazel pid when a tick is stuck. Interval 0 so the
 # test does not wait the production 15 s.
 CI_REMOTE_WATCHDOG_INTERVAL_SECS=0
@@ -414,13 +424,24 @@ if [[ ! -s "$reason_file" ]] || ! grep -q "did not answer a status request" "$re
 fi
 curl_http=200
 
-# SIGTERM diagnostic: names the executor and what a probe then saw.
+# SIGTERM diagnostic: the immediate line names the executor with no probe,
+# so a silent hub cannot use up Buildkite's cancel grace period. A short
+# probe then amends the reason.
 CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
 CI_REMOTE_ENDPOINT_HOST_PORT="executor.test 50051"
+: > "$curl_calls"
+msg="$(ci_remote_sigterm_reason_immediate)"
+if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"executor.test port 50051"* ]]; then
+  fail "sigterm immediate: '${msg}'"
+fi
+expect_equal "" "$(cat "$curl_calls")" "sigterm immediate: curl was run"
 curl_http=000
 msg="$(ci_remote_sigterm_reason)"
 if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"executor.test port 50051"* ]] || [[ "$msg" != *"did not answer a status request"* ]]; then
   fail "sigterm reason (timeout): '${msg}'"
+fi
+if [[ "$msg" != *"within ${CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS}s"* ]]; then
+  fail "sigterm reason (timeout) must use the short probe budget: '${msg}'"
 fi
 curl_http=200
 msg="$(ci_remote_sigterm_reason)"
@@ -428,12 +449,90 @@ if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"then returned 200"* ]]; then
   fail "sigterm reason (healthy): '${msg}'"
 fi
 unset CI_BAZEL_REMOTE_EXECUTOR
-msg="$(ci_remote_sigterm_reason)"
+unset CI_REMOTE_ENDPOINT_HOST_PORT
+msg="$(ci_remote_sigterm_reason_immediate)"
 if [[ "$msg" != *"SIGTERM while remote execution was on"* ]] || [[ "$msg" == *"executor.test"* ]]; then
-  fail "sigterm reason (no endpoint): '${msg}'"
+  fail "sigterm immediate (no endpoint): '${msg}'"
 fi
 CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+CI_REMOTE_ENDPOINT_HOST_PORT="executor.test 50051"
 curl_http=200
+
+# Bazel clients started outside the shell wrapper (repobin, checkleft) are
+# still signalled. A sibling sleep is not. `ps` is denied in the hermetic
+# sandbox, so the process table is a stub the test fills in.
+mkdir -p "${TEST_TMPDIR:?}/fake-bin" "${TEST_TMPDIR:?}/ps-rows"
+printf '%s\n' '#!/bin/bash' 'trap "exit 0" TERM' 'while true; do sleep 1; done' \
+  > "${TEST_TMPDIR}/fake-bin/bazel"
+chmod +x "${TEST_TMPDIR}/fake-bin/bazel"
+ps() {
+  printf '%s %s %s\n' "$$" "$PPID" "$0"
+  local row
+  for row in "${TEST_TMPDIR}/ps-rows"/*; do
+    [[ -e "$row" ]] || continue
+    cat "$row"
+  done
+}
+"${TEST_TMPDIR}/fake-bin/bazel" &
+fake_bazel=$!
+sleep 60 &
+fake_other=$!
+printf '%s %s %s\n' "$fake_bazel" "$$" "${TEST_TMPDIR}/fake-bin/bazel" \
+  > "${TEST_TMPDIR}/ps-rows/bazel"
+printf '%s %s %s\n' "$fake_other" "$$" "sleep 60" \
+  > "${TEST_TMPDIR}/ps-rows/sleep"
+ci_remote_signal_bazel_clients "$$"
+wait "$fake_bazel" 2> /dev/null || true
+if kill -0 "$fake_bazel" 2> /dev/null; then
+  kill -KILL "$fake_bazel" 2> /dev/null || true
+  kill -KILL "$fake_other" 2> /dev/null || true
+  fail "signal_bazel_clients: the bazel child was still running"
+fi
+if ! kill -0 "$fake_other" 2> /dev/null; then
+  fail "signal_bazel_clients: a non-bazel child was signalled"
+fi
+kill -KILL "$fake_other" 2> /dev/null || true
+wait "$fake_other" 2> /dev/null || true
+rm -f "${TEST_TMPDIR}/ps-rows/bazel" "${TEST_TMPDIR}/ps-rows/sleep"
+
+# Step-level loop: a silent hub stops bazel descendants of the root pid.
+CI_REMOTE_WATCHDOG_INTERVAL_SECS=0
+"${TEST_TMPDIR}/fake-bin/bazel" &
+tree_bazel=$!
+printf '%s %s %s\n' "$tree_bazel" "$$" "${TEST_TMPDIR}/fake-bin/bazel" \
+  > "${TEST_TMPDIR}/ps-rows/bazel"
+reason_file="${TEST_TMPDIR:?}/watchdog-tree-reason"
+rm -f "$reason_file"
+curl_http=000
+ci_remote_watchdog_loop_tree "$$" "$reason_file" "$endpoint"
+wait "$tree_bazel" 2> /dev/null || true
+if kill -0 "$tree_bazel" 2> /dev/null; then
+  kill -KILL "$tree_bazel" 2> /dev/null || true
+  fail "watchdog loop tree: the bazel child was still running after a silent hub"
+fi
+if [[ ! -s "$reason_file" ]] || ! grep -q "did not answer a status request" "$reason_file"; then
+  fail "watchdog loop tree: missing reason file: $(cat "$reason_file" 2>/dev/null)"
+fi
+curl_http=200
+rm -f "${TEST_TMPDIR}/ps-rows/bazel"
+unset -f ps
+
+# The step-level watchdog (covers bazel clients repobin/checkleft launch)
+# and the SIGTERM trap live in ci-env.sh; this file holds the functions they
+# call. Pin the contracts those call sites depend on.
+lib="${workspace}/.buildkite/steps/remote-execution.sh"
+if ! grep -q 'ci_remote_watchdog_loop_tree()' "$lib"; then
+  fail "remote-execution.sh must define ci_remote_watchdog_loop_tree"
+fi
+if ! grep -q 'CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS="${CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS:-3}"' "$lib"; then
+  fail "SIGTERM probe budget must default to 3s so it fits in Buildkite's cancel grace period"
+fi
+if ! grep -q 'ci_remote_sigterm_reason_immediate' "$lib"; then
+  fail "remote-execution.sh must define ci_remote_sigterm_reason_immediate"
+fi
+if ! grep -q 'tools/remote-execution/remote-status.sh' "$lib"; then
+  fail "remote-execution.sh must source the shared remote-status helper"
+fi
 
 # ---------------------------------------------------------------------------
 # The real .ci.bazelrc defines the config the flags select.

@@ -43,8 +43,9 @@ fi
 echo "--- [ci-env] remote execution ${CI_REMOTE_EXECUTION}: ${CI_REMOTE_EXECUTION_REASON}"
 if [[ "$CI_REMOTE_EXECUTION" == "on" ]]; then
   # Buildkite sends SIGTERM when timeout_in_minutes hits, then SIGKILL a few
-  # seconds later. Without this trap the log ends with no line naming the
-  # executor. Keep the handler short: one status probe (10 s) and an annotation.
+  # seconds later. Write the executor-naming line first, then a short probe:
+  # a 10 s probe against a silent hub uses up the whole cancel grace period
+  # and SIGKILL can arrive before the annotation.
   trap '_ci_remote_on_term' TERM
 fi
 if [[ "$CI_REMOTE_EXECUTION_FELL_BACK" == "1" ]] && command -v buildkite-agent > /dev/null 2>&1; then
@@ -152,15 +153,45 @@ _ci_note_watchdog_failure() {
   fi
 }
 
+_ci_remote_cleanup_step_watchdog() {
+  if [[ -n "${CI_REMOTE_STEP_WATCHDOG_PID:-}" ]]; then
+    kill "$CI_REMOTE_STEP_WATCHDOG_PID" 2>/dev/null || true
+    wait "$CI_REMOTE_STEP_WATCHDOG_PID" 2>/dev/null || true
+  fi
+}
+
+if [[ "$CI_REMOTE_EXECUTION" == "on" ]]; then
+  # Cover bazel clients this step starts, including ones repobin and
+  # checkleft spawn with Command::new("bazel") rather than the bazel()
+  # wrapper. Started here so _ci_note_watchdog_failure already exists in
+  # the watchdog's subshell. _ci_run_bazel still watches each wrapped
+  # command as well.
+  CI_REMOTE_WATCHDOG_REASON_FILE="${TMPDIR:-/tmp}/ci-remote-watchdog-${BUILDKITE_JOB_ID:-$$}.reason"
+  rm -f "$CI_REMOTE_WATCHDOG_REASON_FILE"
+  ci_remote_watchdog_stuck_hook() {
+    _ci_note_watchdog_failure "$1"
+  }
+  ci_remote_watchdog_loop_tree "$$" "$CI_REMOTE_WATCHDOG_REASON_FILE" "${CI_BAZEL_REMOTE_EXECUTOR}" &
+  CI_REMOTE_STEP_WATCHDOG_PID=$!
+  trap '_ci_remote_cleanup_step_watchdog' EXIT
+fi
+
 _ci_remote_on_term() {
-  local msg
-  msg="$(ci_remote_sigterm_reason)"
+  local msg probed
+  msg="$(ci_remote_sigterm_reason_immediate)"
   echo "^^^ +++"
   echo "[ci-env] ${msg}. See tools/remote-execution/README.md, \"What bounds a stuck action\"."
   if command -v buildkite-agent > /dev/null 2>&1; then
     buildkite-agent annotate --style error --context "ci-remote-execution-timeout-${BUILDKITE_JOB_ID:-step}" \
       "${BUILDKITE_LABEL:-A step} was killed (SIGTERM) while remote execution was on: ${msg}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\"." || true
   fi
+  probed="$(ci_remote_sigterm_reason)"
+  echo "[ci-env] ${probed}."
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    buildkite-agent annotate --style error --context "ci-remote-execution-timeout-${BUILDKITE_JOB_ID:-step}" \
+      "${BUILDKITE_LABEL:-A step} was killed (SIGTERM) while remote execution was on: ${probed}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\"." || true
+  fi
+  _ci_remote_cleanup_step_watchdog
   exit 143
 }
 
@@ -231,6 +262,12 @@ bazel() {
 
   if [[ -s "$tmplog.watchdog" ]]; then
     _ci_note_watchdog_failure "$tmplog.watchdog"
+    rm -f "$tmplog" "$tmplog.watchdog"
+    return 1
+  fi
+
+  if [[ -n "${CI_REMOTE_WATCHDOG_REASON_FILE:-}" && -s "$CI_REMOTE_WATCHDOG_REASON_FILE" ]]; then
+    _ci_note_watchdog_failure "$CI_REMOTE_WATCHDOG_REASON_FILE"
     rm -f "$tmplog" "$tmplog.watchdog"
     return 1
   fi

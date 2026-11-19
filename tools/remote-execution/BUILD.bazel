@@ -5,6 +5,11 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 # build; the files are installed on the hosts by hand (README.md). The tests
 # are what keeps them honest with each other and with what reads them.
 
+exports_files(
+    ["remote-status.sh"],
+    visibility = ["//.buildkite/steps/tests:__pkg__"],
+)
+
 # The hub's health check against a stub hub: a scheduling hub is healthy, and
 # the eviction loop, missing workers, a queue that does not move and a hub that
 # does not answer are each reported.
@@ -21,7 +26,10 @@ sh_test(
     name = "dev_remote_watchdog_test",
     size = "small",
     srcs = ["tests/dev_remote_watchdog_test.sh"],
-    data = ["dev-remote-workspace-status.sh"],
+    data = [
+        "dev-remote-workspace-status.sh",
+        "remote-status.sh",
+    ],
 )
 
 # Pins what the files promise each other: every scheduler timeout and the
@@ -45,5 +53,6 @@ sh_test(
         "nativelink/nativelink-macos-hub-health.timer",
         "nativelink/patches/macos-clonefile-executables.patch",
         "nativelink/worker-macos.json5",
+        "remote-status.sh",
     ],
 )
