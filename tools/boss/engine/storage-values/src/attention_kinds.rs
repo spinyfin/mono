@@ -523,7 +523,7 @@ pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc
 /// Retired: an answered question could not start its queued resume. No
 /// producer remains, but databases written by earlier builds may still hold
 /// open rows of this kind, so its lifecycle stays registered to clear them.
-pub const QUESTION_RESUME_DISPATCH_FAILED: &str = "question_resume_dispatch_failed";
+pub const LEGACY_QUESTION_RESUME_DISPATCH_FAILED_ATTENTION_KIND: &str = "question_resume_dispatch_failed";
 
 /// `work_attention_items.kind` filed when a row's binding could not be
 /// repaired automatically (no PR on its branch, a foreign PR, or repeated

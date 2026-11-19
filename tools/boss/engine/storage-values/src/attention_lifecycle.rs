@@ -169,7 +169,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "The live-worker sweep resolves warnings when progress resumes or the owning item has no hung or adopting execution.",
     ),
     entry(
-        QUESTION_RESUME_DISPATCH_FAILED,
+        LEGACY_QUESTION_RESUME_DISPATCH_FAILED_ATTENTION_KIND,
         ClearedBy::WorkResumed,
         "Retired kind (no producer): rows persisted by earlier builds clear once that same resume starts.",
     ),

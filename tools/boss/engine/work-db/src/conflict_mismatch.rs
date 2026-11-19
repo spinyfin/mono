@@ -247,6 +247,15 @@ pub(super) fn conflict_revision_awaits_mismatch_answer(conn: &Connection, revisi
     )?)
 }
 
+/// Flag one specific execution as operator-forced.
+pub(crate) fn mark_execution_operator_forced_admission_in_tx(tx: &Transaction<'_>, execution_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE work_executions SET operator_forced_admission = 1 WHERE id = ?1",
+        [execution_id],
+    )?;
+    Ok(())
+}
+
 /// Flag the newest non-terminal execution of `work_item_id` as
 /// operator-forced. Returns whether a row was marked.
 pub(crate) fn mark_operator_forced_admission_in_tx(tx: &Transaction<'_>, work_item_id: &str) -> Result<bool> {
