@@ -289,6 +289,40 @@ impl ServerState {
         })
     }
 
+    /// Push a fresh engine-health snapshot whenever the merge poller raises,
+    /// updates or withdraws its abandoned-pass notice. Built like
+    /// [`Self::spawn_spawn_streak_health_broadcaster`], for the same reason:
+    /// the notice exists so a card stuck behind a stalled detection pass is
+    /// explained on the banner while it is happening.
+    pub fn spawn_merge_detection_stall_health_broadcaster(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let weak_state = Arc::downgrade(self);
+        boss_event_bus::spawn_supervised("engine_merge_detection_stall_health", move || {
+            let weak_state = weak_state.clone();
+            async move {
+                let Some(state) = weak_state.upgrade() else {
+                    return;
+                };
+                let mut stall_changes = state.merge_detection_stall.subscribe();
+                state.broadcast_engine_health().await;
+                drop(state);
+                while stall_changes.changed().await.is_ok() {
+                    let Some(state) = weak_state.upgrade() else {
+                        return;
+                    };
+                    tracing::debug!(
+                        stalled = stall_changes.borrow().is_some(),
+                        "merge detection stall changed — broadcasting engine health to subscribed frontends",
+                    );
+                    state.broadcast_engine_health().await;
+                }
+                tracing::warn!(
+                    "merge-detection-stall broadcaster: notifier closed, subscription ended; \
+                     abandoned detection passes will no longer push engine health",
+                );
+            }
+        })
+    }
+
     /// Push a fresh engine-health snapshot whenever the progression sweep
     /// starts, changes or ends its launch backoff notice, and every minute
     /// while it remains active so relative times stay current. Built like

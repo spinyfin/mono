@@ -795,6 +795,10 @@ struct ServerState {
     /// Progression's launch backoff, published by the progression sweep.
     #[builder(default = boss_engine_runtime::progression_sweep::launch_backoff_signal())]
     progression_launch_backoff: Arc<boss_engine_runtime::progression_sweep::LaunchBackoffSignal>,
+    /// Set by the merge poller while its full detection passes are being
+    /// abandoned at their time budget; cleared by the next pass that finishes.
+    #[builder(default = boss_engine_merge_poller::detection_stall_signal())]
+    merge_detection_stall: Arc<boss_engine_merge_poller::DetectionStallSignal>,
     /// What the startup pass that retries pre-start-failed review guides
     /// did. Set once, before the engine serves requests; empty until then.
     #[builder(default)]

@@ -98,6 +98,39 @@ impl WorkDb {
         .context("allocate PR review-guide source observation sequence")
     }
 
+    /// [`Self::allocate_pr_review_guide_source_observation_sequence`] for
+    /// `count` reads about to start together: one contiguous, ascending
+    /// block of sequences, allocated in a single statement.
+    ///
+    /// A batched probe covers every tracked PR in one request. Allocating
+    /// its sequences one call at a time took the connection lock once per
+    /// PR before the request could even be sent, so the wait for the lock
+    /// was paid as many times as there are tracked PRs. The block is the
+    /// same set of values those calls would have returned back to back.
+    pub fn allocate_pr_review_guide_source_observation_sequences(&self, count: usize) -> Result<Vec<i64>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let count = i64::try_from(count).context("review-guide source observation sequence block is too large")?;
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO pr_review_guide_source_observation_sequence (id, last_sequence)
+             VALUES (1, 0)",
+            [],
+        )?;
+        let last: i64 = conn
+            .query_row(
+                "UPDATE pr_review_guide_source_observation_sequence
+                 SET last_sequence = last_sequence + ?1
+                 WHERE id = 1
+                 RETURNING last_sequence",
+                [count],
+                |row| row.get(0),
+            )
+            .context("allocate PR review-guide source observation sequence block")?;
+        Ok((last - count + 1..=last).collect())
+    }
+
     /// Resolve an execution to the canonical task that owns its PR series.
     /// Revision rows deliberately collapse to their first non-revision parent;
     /// the revision task itself must never create a second comparison series.

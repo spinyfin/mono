@@ -309,6 +309,25 @@ impl PrPollSchedule {
         self.next_poll_at.retain(|url, _| keep.contains(url.as_str()));
         counts
     }
+
+    /// [`Self::apply_sweep_observations`] for a pass that may have been
+    /// abandoned at its budget (`observations` is `None`).
+    ///
+    /// Only a pass that ran to its end has observations to reconcile
+    /// against. An abandoned pass must not be treated as one that observed
+    /// nothing: an empty observation set means "no PR is a candidate any
+    /// more" and retires every adaptive slot, so the one layer still able
+    /// to observe a hot PR between sweeps would go dark exactly when the
+    /// sweep itself is failing to finish. `None` leaves the schedule as the
+    /// last completed pass built it and returns `None`.
+    pub(crate) fn apply_pass_observations(
+        &mut self,
+        observations: Option<&[PollObservation]>,
+        now: Instant,
+        sweep_interval: Duration,
+    ) -> Option<AdaptiveExclusionCounts> {
+        observations.map(|observations| self.apply_sweep_observations(observations, now, sweep_interval))
+    }
 }
 
 /// Per-reason tally of PRs a sweep's observations excluded from the adaptive
@@ -379,6 +398,11 @@ pub(crate) fn pass_budget(interval: Duration) -> Duration {
     interval.saturating_mul(PASS_TIMEOUT_MULTIPLIER).max(MIN_PASS_TIMEOUT)
 }
 
+/// A completed pass at least this long has its phase timings logged at
+/// `info`. Shorter passes log them at `debug`: a healthy pass is a second
+/// or two, and one line a minute saying so is noise.
+pub(crate) const SLOW_PASS_LOG_THRESHOLD: Duration = Duration::from_secs(10);
+
 /// Run one detection pass under a hard time budget, and make an overrun
 /// loud either way.
 ///
@@ -386,7 +410,13 @@ pub(crate) fn pass_budget(interval: Duration) -> Duration {
 /// mid-flight. Dropping the future cancels it at its next await point; each
 /// state write inside a pass is its own synchronous DB transaction, so a
 /// cancelled pass leaves no half-written transition — just unprocessed
-/// candidates, which the next pass re-lists.
+/// candidates, which the next pass starts with (see `walk_order`).
+///
+/// `trace` is the pass's own phase timing, written by the pass and read
+/// here once it has returned or been dropped. Its per-phase cost is
+/// published as gauges on every pass and named in the log line of any pass
+/// that was slow, overran its cadence, or was abandoned — an abandoned pass
+/// names the phase and item it was cut off in.
 ///
 /// The silent version of this was the whole problem: a pass that ran 32
 /// minutes over its 60-second cadence produced no log line at all, so the
@@ -397,6 +427,7 @@ pub(crate) async fn run_pass_within_budget<T, F>(
     budget: Duration,
     cadence: Duration,
     metrics: &Registry,
+    trace: &PassTrace,
     pass: F,
 ) -> Option<T>
 where
@@ -409,6 +440,8 @@ where
     match tokio::time::timeout(budget, pass).await {
         Ok(outcome) => {
             let elapsed = started.elapsed();
+            let timings = trace.timings();
+            timings.publish(metrics, elapsed);
             if elapsed > cadence {
                 PASS_OVERRUN.inc_by(metrics, 1);
                 tracing::warn!(
@@ -416,8 +449,23 @@ where
                     elapsed_ms = elapsed.as_millis(),
                     cadence_ms = cadence.as_millis(),
                     budget_ms = budget.as_millis(),
+                    phases = %timings.breakdown(),
                     "merge poller: detection pass took longer than its own cadence — every tracked PR's \
                      lifecycle went unobserved for that whole window",
+                );
+            } else if elapsed >= SLOW_PASS_LOG_THRESHOLD {
+                tracing::info!(
+                    label,
+                    elapsed_ms = elapsed.as_millis(),
+                    phases = %timings.breakdown(),
+                    "merge poller: detection pass phase timings",
+                );
+            } else {
+                tracing::debug!(
+                    label,
+                    elapsed_ms = elapsed.as_millis(),
+                    phases = %timings.breakdown(),
+                    "merge poller: detection pass phase timings",
                 );
             }
             Some(outcome)
@@ -425,12 +473,19 @@ where
         Err(_) => {
             PASS_TIMED_OUT.inc_by(metrics, 1);
             PASS_OVERRUN.inc_by(metrics, 1);
+            let timings = trace.timings();
+            timings.publish(metrics, budget);
+            let cut_off = timings.in_flight.as_ref();
             tracing::warn!(
                 label,
                 budget_ms = budget.as_millis(),
                 cadence_ms = cadence.as_millis(),
+                cut_off_phase = cut_off.map(|phase| phase.phase.as_str()),
+                cut_off_item = cut_off.and_then(|phase| phase.item.as_deref()),
+                items_unfinished = timings.items_unfinished(),
+                phases = %timings.breakdown(),
                 "merge poller: detection pass exceeded its time budget and was abandoned mid-flight; \
-                 remaining candidates are re-listed by the next pass",
+                 the next pass starts with the candidates this one did not reach",
             );
             None
         }
@@ -508,6 +563,9 @@ pub struct LoopServices<C> {
     /// Conflict handling, design-doc maintenance, population and the optional
     /// passes that ride the full-sweep cadence.
     pub host: Arc<dyn SweepHost>,
+    /// Where the loop reports that full detection passes are being
+    /// abandoned, for the engine health report.
+    pub detection_stall: Arc<DetectionStallSignal>,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
@@ -576,11 +634,16 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
         completion_handler,
         trunk_queue_api,
         host,
+        detection_stall,
     } = services;
     let (kick, mut pr_reconcile_requests) = kicks;
     boss_task_scope::spawn(async move {
         let quiesce_window = Duration::from_secs(15);
         let mut schedule = PrPollSchedule::default();
+        // Phase timing and the walk rotations, kept across passes and
+        // outside each pass future so both survive a pass dropped at its
+        // budget.
+        let pass_state = PassState::default();
         let mut pr_requests_closed = false;
         let mut trunk_probe = crate::trunk_queue_poller::TrunkQueueProbe::new();
         let mut passes = host.start_passes();
@@ -600,26 +663,44 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
             // with the per-PR path below. The two have very different
             // per-point efficiency, and a single "merge_poller" bucket
             // would confirm whichever culprit you already suspected.
-            let (outcome, observations) = run_pass_within_budget(
+            let completed = run_pass_within_budget(
                 "full_sweep",
                 budget,
                 interval,
                 &metrics,
+                pass_state.trace(),
                 gh_scope(
                     callers::MERGE_POLLER_SWEEP,
-                    run_one_pass_observed(
+                    run_one_pass_tracked(
                         work_db.as_ref(),
                         probe.as_ref(),
                         publisher.as_ref(),
-                        Some(cube_client.as_ref()),
-                        Some(completion_handler.as_ref()),
-                        Some(host.as_ref()),
+                        SweepHandlers {
+                            cube_client: Some(cube_client.as_ref()),
+                            completion_handler: Some(completion_handler.as_ref()),
+                            host: Some(host.as_ref()),
+                        },
+                        &pass_state,
                     ),
                 ),
             )
-            .await
-            .unwrap_or_default();
+            .await;
             let last_run_at = Instant::now();
+            // An abandoned pass is a health signal, not only a log line: it
+            // goes on the engine health report until a pass runs to its end.
+            match &completed {
+                Some(_) => record_completed_pass(&detection_stall),
+                None => record_abandoned_pass(
+                    &detection_stall,
+                    budget,
+                    pass_state.trace().timings(),
+                    boss_engine_utils::epoch_time::now_epoch_secs(),
+                ),
+            }
+            let (outcome, observations) = match completed {
+                Some((outcome, observations)) => (outcome, Some(observations)),
+                None => (SweepOutcome::default(), None),
+            };
             record_sweep_metrics(&metrics, &outcome);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
@@ -651,16 +732,21 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
             // no slot at all: an adaptive poll for them is a duplicate of a
             // probe the sweep just made. They are still polled — by the
             // sweep, sooner — and every exclusion is logged with its reason.
-            let exclusions = schedule.apply_sweep_observations(&observations, last_run_at, interval);
-            ADAPTIVE_TRACKED.set(&metrics, schedule.tracked() as i64);
-            if exclusions.total() > 0 || schedule.tracked() > 0 {
-                tracing::debug!(
-                    adaptive_tracked = schedule.tracked(),
-                    observed = observations.len(),
-                    excluded_terminal = exclusions.terminal,
-                    excluded_covered_by_full_sweep = exclusions.covered_by_full_sweep,
-                    "merge poller: adaptive poll schedule reconciled against sweep observations",
-                );
+            //
+            // An abandoned pass has no observations, and the schedule is
+            // left as the last completed pass built it — see
+            // `apply_pass_observations`.
+            if let Some(exclusions) = schedule.apply_pass_observations(observations.as_deref(), last_run_at, interval) {
+                ADAPTIVE_TRACKED.set(&metrics, schedule.tracked() as i64);
+                if exclusions.total() > 0 || schedule.tracked() > 0 {
+                    tracing::debug!(
+                        adaptive_tracked = schedule.tracked(),
+                        observed = observations.as_ref().map_or(0, Vec::len),
+                        excluded_terminal = exclusions.terminal,
+                        excluded_covered_by_full_sweep = exclusions.covered_by_full_sweep,
+                        "merge poller: adaptive poll schedule reconciled against sweep observations",
+                    );
+                }
             }
 
             // Layer 4: piggyback the speculative conflict-prediction

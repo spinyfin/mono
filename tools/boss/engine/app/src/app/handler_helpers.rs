@@ -159,6 +159,14 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         ));
     }
 
+    // Merge detection running out of time. Without this entry a card whose
+    // PR has merged just sits in Review, and nothing says why.
+    if let Some(stall) = server_state.merge_detection_stall.borrow().as_ref() {
+        issues.push(boss_engine_merge_poller::detection_stall_health_issue(
+            stall, streak_now,
+        ));
+    }
+
     issues.extend(
         server_state
             .tmux_health_issues

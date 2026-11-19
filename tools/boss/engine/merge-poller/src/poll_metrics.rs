@@ -320,6 +320,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&REVIEW_ADMISSION_DEFERRED);
     registry.register_counter(&REVIEW_ADMISSION_RECOVERED);
     registry.register_counter(&REVIEW_BATCH_REAPED);
+    crate::pass_trace::register_pass_metrics(registry);
 }
 
 // ── GitHub API quota budget ─────────────────────────────────────────────

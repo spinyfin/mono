@@ -177,6 +177,7 @@ mod tests {
                 "merge_poller.merged",
                 "merge_poller.pass_overrun",
                 "merge_poller.pass_timed_out",
+                "merge_poller.passes",
                 "merge_poller.pr_recheck_recovered",
                 "merge_poller.pr_recheck_unresolved",
                 "merge_poller.revision_invalidated",
@@ -273,6 +274,23 @@ mod tests {
                 "github_api.graphql.remaining",
                 "github_api.rest.remaining",
                 "merge_poller.adaptive_tracked",
+                "merge_poller.items_per_pass",
+                "merge_poller.items_unfinished",
+                "merge_poller.pass_duration_ms",
+                "merge_poller.phase_ms.background_nudges",
+                "merge_poller.phase_ms.late_pr",
+                "merge_poller.phase_ms.list_candidates",
+                "merge_poller.phase_ms.merge_disarm",
+                "merge_poller.phase_ms.open_walk",
+                "merge_poller.phase_ms.pr_recheck",
+                "merge_poller.phase_ms.probe",
+                "merge_poller.phase_ms.queue_rebounce",
+                "merge_poller.phase_ms.review_admission",
+                "merge_poller.phase_ms.review_batch_upkeep",
+                "merge_poller.phase_ms.stalled_reviewer",
+                "merge_poller.phase_ms.stranded_blocked",
+                "merge_poller.phase_ms.stranded_ci",
+                "merge_poller.phase_ms.terminal_walk",
                 "review_pool.deferred_pre_merge",
                 "review_pool.reserved_units",
                 "task_stuck.engine_stuck",
@@ -289,8 +307,8 @@ mod tests {
                 "terminal_work_sweep.tick_interval_ms",
             ],
             "init_all must register the dep_unblock gauge, the queue-level dispatch gauges, \
-             the GitHub remaining-quota gauges, the adaptive-schedule size gauge, and the \
-             background-sweep pass gauges",
+             the GitHub remaining-quota gauges, the adaptive-schedule size gauge, the merge \
+             poller's pass and per-phase timing gauges, and the background-sweep pass gauges",
         );
     }
 }
