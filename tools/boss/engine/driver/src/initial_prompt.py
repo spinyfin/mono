@@ -369,6 +369,21 @@ def check_blocking_dialog(view, markers, payload=b""):
                     raise BlockingDialogOnScreen(marker)
 
 
+def check_relay_input(view, markers, pending):
+    """Refuse to forward relay input into a selection menu after delivery.
+
+    A menu that appears mid-run (for example expired credentials showing the
+    sign-in menu) must not receive Return or text. Pure terminal-query replies
+    still pass so the CLI is not starved of them.
+    """
+    menu = _selection_menu_marker(view.text().splitlines(), markers)
+    if menu is None:
+        return
+    _, rest, refused = take_terminal_replies(pending, b"")
+    if refused or rest:
+        raise BlockingDialogOnScreen(menu)
+
+
 def take_terminal_replies(data, buffer):
     """Split stdin into recognised terminal replies vs other input.
 
@@ -605,13 +620,14 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                         pending += REPLIES[query[1]]
                         consumed = query.end()
                     query_buffer = query_buffer[consumed:][-32:]
+                # The screen stays current for the whole relay: later input is
+                # checked against it, not only the initial delivery.
+                view.feed(output)
                 if not delivered:
-                    view.feed(output)
                     check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
                 elif post_submit_failure_markers and now < watch_until:
                     # An accepted paste does not prove a turn started: the CLI
                     # can discard the brief with a vendor error and fire no hook.
-                    view.feed(output)
                     # Only rows that appeared after submit count, and only
                     # ones that are not a piece of the brief itself (however
                     # far it scrolled or however it was re-wrapped) and that
@@ -670,6 +686,8 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                     continue
                 if not delivered:
                     check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
+                else:
+                    check_relay_input(view, blocking_dialog_markers, pending)
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]
                 if not pending and submitting and not delivered:

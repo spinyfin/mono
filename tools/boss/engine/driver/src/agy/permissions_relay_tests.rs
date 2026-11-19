@@ -416,8 +416,12 @@ assert os.read(0, 1) == b'\r'
 /// where Return selects `Google OAuth` and opens a browser. The relay must
 /// write nothing to that screen and must fail the delivery naming it. Closed
 /// stdin still exercises the same write-time blocking-dialog check that
-/// forwards later pane input; text and Return against this layout are the
-/// shared fixture corpus (`launcher_refuses_every_selected_startup_menu_row`).
+/// forwards later pane input. This test covers only the initial menu with a
+/// null stdin; relay stdin (text and Return typed at the menu, before and after
+/// delivery) is `relay_stdin_never_reaches_the_sign_in_menu`, and every
+/// selected menu row is in
+/// `launcher_refuses_every_selected_startup_menu_row_before_paste_and_before_return`
+/// (`initial_prompt/blocking_dialog_tests.rs`).
 #[test]
 fn relay_sends_nothing_to_the_sign_in_menu() {
     let root = tempfile::tempdir().unwrap();
@@ -488,4 +492,112 @@ for mode in ("menu", "composer"):
     // menu is what held delivery back.
     assert_eq!(String::from_utf8(read("outcome-composer")).unwrap(), "delivered");
     assert_eq!(read("received-composer"), b"\x1b[200~private sentinel\x1b[201~\r");
+}
+
+/// Relay stdin, through an outer PTY, must never reach the sign-in menu: not
+/// when it is already showing before delivery (input pending while the menu is
+/// displayed), and not when it appears after the brief was delivered
+/// (credential expiry mid-run). Either way the relay fails loudly.
+#[test]
+fn relay_stdin_never_reaches_the_sign_in_menu() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("initial-prompt.py"), LAUNCHER).unwrap();
+    fs::write(
+        root.path().join("initial-prompt.json"),
+        initial_prompt::launcher_config(&crate::agy::AgyDriver::default()).unwrap(),
+    )
+    .unwrap();
+    let stub = r#"
+import os, pathlib, select, sys, tty
+root = pathlib.Path(__file__).parent
+mode = sys.argv[1]
+tty.setraw(0)
+menu = (b' Welcome to the Antigravity CLI. You are currently not signed in.\r\n'
+        b' Select login method:\r\n > 1. Google OAuth\r\n   2. Use a Google Cloud project\r\n'
+        b'   \xe2\x86\x91/\xe2\x86\x93 Navigate \xc2\xb7 enter Select\r\n')
+os.write(1, b'\x1b[?2004h' + (menu if mode == 'initial' else b'') + b'? for shortcuts')
+received = root / ('received-' + mode)
+received.write_bytes(b'')
+shown = mode == 'initial'
+data = b''
+while True:
+    if select.select([0], [], [], 0.05)[0]:
+        chunk = os.read(0, 4096)
+        if shown:
+            with received.open('ab') as out:
+                out.write(chunk)
+        else:
+            data += chunk
+            if data.endswith(b'\x1b[201~'):
+                os.write(1, b'\r\nprivate sentinel')
+            if data.endswith(b'\r'):
+                shown = True
+                os.write(1, b'\r\n' + menu)
+"#;
+    fs::write(root.path().join("stub.py"), stub).unwrap();
+    let relay = r#"
+import importlib.util, json, pathlib, sys
+root = pathlib.Path(sys.argv[2])
+mode = sys.argv[1]
+spec = importlib.util.spec_from_file_location("launcher", root / "initial-prompt.py")
+launcher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher)
+config = json.loads((root / "initial-prompt.json").read_text())
+markers = lambda key: [s.encode() for s in config[key]]
+try:
+    launcher.run([sys.executable, str(root / "stub.py"), mode], b"private sentinel",
+                 markers("agent_markers"), markers("starting_markers"), readiness_timeout=5,
+                 blocking_dialog_markers=markers("blocking_dialog_markers"))
+    outcome = "delivered"
+except Exception as error:
+    outcome = f"{type(error).__name__}: {error}"
+(root / ("outcome-" + mode)).write_text(outcome)
+"#;
+    fs::write(root.path().join("relay.py"), relay).unwrap();
+    let outer = r#"
+import os, pty, select, subprocess, sys, time
+root, mode = sys.argv[1], sys.argv[2]
+master, slave = pty.openpty()
+child = subprocess.Popen([sys.executable, root + "/relay.py", mode, root],
+                         stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+seen, typed, deadline = b"", False, time.time() + 25
+while child.poll() is None and time.time() < deadline:
+    if select.select([master], [], [], 0.05)[0]:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        seen += chunk
+    if not typed and b"Select login method" in seen:
+        # The menu is on the outer terminal: type text and Return at it.
+        os.write(master, b"hello\r")
+        typed = True
+child.wait(timeout=10)
+assert typed, "the sign-in menu never appeared"
+"#;
+    for mode in ["initial", "late"] {
+        let output = boss_command_runner::output_blocking_timeout(
+            std::process::Command::new("python3")
+                .args(["-c", outer])
+                .arg(root.path())
+                .arg(mode)
+                .stdin(std::process::Stdio::null()),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let outcome = fs::read_to_string(root.path().join(format!("outcome-{mode}"))).unwrap();
+        assert!(outcome.starts_with("BlockingDialogOnScreen:"), "{mode}: {outcome}");
+        assert!(outcome.contains("Select login method:"), "{mode}: {outcome}");
+        assert_eq!(
+            fs::read(root.path().join(format!("received-{mode}"))).unwrap(),
+            b"",
+            "{mode}: nothing typed at the sign-in menu may reach it"
+        );
+    }
 }
