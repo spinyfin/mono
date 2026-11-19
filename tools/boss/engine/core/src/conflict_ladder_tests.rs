@@ -239,6 +239,13 @@ fn chore_state(db: &WorkDb, id: &str) -> (String, Option<String>) {
     }
 }
 
+fn chore_merge_queue_detail(db: &WorkDb, id: &str) -> Option<String> {
+    match db.get_work_item(id).unwrap() {
+        WorkItem::Chore(t) => t.merge_queue_detail,
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn rung1_clean_rebase_retires_attempt_at_rung_1_with_no_worker() {
     let dir = tempdir().unwrap();
@@ -1433,6 +1440,67 @@ async fn retire_with_already_terminal_attempt_still_clears_signal_and_broadcasts
             .iter()
             .any(|(_, e)| matches!(e, FrontendEvent::ConflictResolutionSucceeded { .. })),
         "no success push for an attempt that did not succeed"
+    );
+}
+
+#[tokio::test]
+async fn mechanical_retire_clears_a_label_left_by_an_earlier_stop() {
+    use boss_event_bus::{EventKind, TopicFilter};
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, first, chore_id) = blocked_with_attempt(&db);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    assert!(db.start_merge_conflict_resolution(&chore_id, PR, "main").unwrap());
+    db.mark_conflict_resolution_failed(&first.id, "Rebase failed").unwrap();
+    assert!(
+        chore_merge_queue_detail(&db, &chore_id)
+            .unwrap()
+            .contains("Merge paused"),
+        "stopping a requested merge must leave the paused label"
+    );
+
+    db.clear_chore_blocked_merge_conflict(&chore_id, PR).unwrap();
+    assert!(
+        db.mark_chore_blocked_merge_conflict(&chore_id, PR).unwrap().is_some(),
+        "a new conflict must re-block the parent"
+    );
+    assert!(
+        chore_merge_queue_detail(&db, &chore_id)
+            .as_ref()
+            .is_some_and(|d| d.contains("Merge paused")),
+        "re-blocking must keep the paused label from the earlier stop"
+    );
+
+    let attempt = db
+        .insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: candidate.product_id.clone(),
+            work_item_id: chore_id.clone(),
+            pr_url: PR.to_owned(),
+            pr_number: 42,
+            head_branch: "feature".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: Some("base2".to_owned()),
+            head_sha_before: Some("new-head".to_owned()),
+        })
+        .unwrap()
+        .expect("fresh attempt for the new conflict");
+    let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::WorkItemChanged));
+
+    retire_attempt_at_rung(&db, pub_.as_ref(), &candidate, &attempt, 1, &[]).await;
+
+    assert_eq!(
+        chore_merge_queue_detail(&db, &chore_id),
+        None,
+        "mechanical retire must clear the paused label left by the earlier stop"
+    );
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await;
+    assert!(event.is_ok(), "clearing the label must notify the board");
+    assert!(
+        pub_.lifecycle_reasons()
+            .await
+            .contains(&"merge_conflict_resolved".to_owned()),
+        "parent transition must still be broadcast"
     );
 }
 

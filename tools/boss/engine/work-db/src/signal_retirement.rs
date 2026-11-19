@@ -223,7 +223,13 @@ pub(crate) fn clear_resolved_signal_in_tx(
         "('merge_conflict')"
     };
     let now = now_string();
-    let signal_cleared = if ci || retire || task_transitioned {
+    // A label-only conflict retirement (in_review parent, already-terminal
+    // attempt) still has to clear the live `merge_conflict` signal: later
+    // clean probes treat a missing label as `Nothing` and would otherwise
+    // leave the signal uncleared forever. `label_cleared` is only set on
+    // the conflict path, after the parked / in-flight-rung / queue-side
+    // gates above have already refused.
+    let signal_cleared = if ci || retire || task_transitioned || label_cleared {
         conn.execute(&format!(
             "UPDATE task_blocked_signals SET cleared_at = ?2 WHERE work_item_id = ?1 AND reason IN {reasons} AND cleared_at IS NULL"
         ), params![item, now])? > 0
@@ -493,14 +499,23 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn a_stale_paused_label_alone_is_cleared_and_published() {
-        use boss_event_bus::{EventKind, TopicFilter};
-        let db = db();
-        let product = create_test_product(&db).id;
-        let (item, pr) = blocked_on_conflict(&db, &product, "Label only");
-        let attempt = conflict_attempt(&db, &product, &item, &pr, "h1");
-        // Already back in review with the attempt finished, but a paused label lingers.
+    fn merge_conflict_signal_cleared_at(db: &WorkDb, item: &str) -> Option<String> {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT cleared_at FROM task_blocked_signals
+                 WHERE work_item_id = ?1 AND reason = 'merge_conflict'",
+                [item],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten()
+    }
+
+    fn in_review_with_paused_label_and_terminal_attempt(db: &WorkDb, product: &str, name: &str) -> (String, String) {
+        let (item, pr) = blocked_on_conflict(db, product, name);
+        let attempt = conflict_attempt(db, product, &item, &pr, "h1");
         db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, 3)
             .unwrap();
         db.connect()
@@ -512,6 +527,16 @@ mod tests {
                 [&item],
             )
             .unwrap();
+        (item, pr)
+    }
+
+    #[tokio::test]
+    async fn a_stale_paused_label_alone_is_cleared_and_published() {
+        use boss_event_bus::{EventKind, TopicFilter};
+        let db = db();
+        let product = create_test_product(&db).id;
+        let (item, pr) = in_review_with_paused_label_and_terminal_attempt(&db, &product, "Label only");
+        // Signal already retired; this is the pure label-only remainder.
         db.connect()
             .unwrap()
             .execute(
@@ -532,6 +557,41 @@ mod tests {
         );
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await;
         assert!(event.is_ok(), "clearing the label must notify the board");
+        assert_eq!(
+            merge_conflict_signal_cleared_at(&db, &item).as_deref(),
+            Some("2020-01-01"),
+            "an already-cleared signal must stay as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_label_only_retirement_of_a_terminal_attempt_clears_the_active_signal() {
+        use boss_event_bus::{EventKind, TopicFilter};
+        let db = db();
+        let product = create_test_product(&db).id;
+        let (item, pr) = in_review_with_paused_label_and_terminal_attempt(&db, &product, "Label with live signal");
+        assert_eq!(
+            merge_conflict_signal_cleared_at(&db, &item),
+            None,
+            "fixture must leave the merge_conflict signal active"
+        );
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::WorkItemChanged));
+
+        let outcome = db.clear_resolved_pr_signal(&item, &pr, false).unwrap();
+        assert!(matches!(outcome, ClearResolvedSignal::Applied(_)), "{outcome:?}");
+        assert_eq!(
+            query_task(&db.connect().unwrap(), &item)
+                .unwrap()
+                .unwrap()
+                .merge_queue_detail,
+            None
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await;
+        assert!(event.is_ok(), "clearing the label must notify the board");
+        assert!(
+            merge_conflict_signal_cleared_at(&db, &item).is_some(),
+            "label-only retirement of a terminal attempt must still clear the live signal"
+        );
     }
 
     #[test]
