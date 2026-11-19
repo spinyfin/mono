@@ -406,8 +406,20 @@ async fn a_fetch_beyond_the_global_limit_gets_the_busy_error_and_frees_on_releas
     })
     .await
     .unwrap();
+    // Responses are enqueued before the fetch task drops its permit, so
+    // wait for that drop before tearing the connection down.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while limiter.available_permits() < crate::app::coordinator_guidance::MAX_CONCURRENT_FETCHES {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("guidance fetch permits were not released after the in-flight fetches completed");
     drop(lines);
     drop(write);
     handler.await.unwrap().unwrap();
-    assert_eq!(limiter.available_permits(), 4);
+    assert_eq!(
+        limiter.available_permits(),
+        crate::app::coordinator_guidance::MAX_CONCURRENT_FETCHES
+    );
 }
