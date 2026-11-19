@@ -3,6 +3,7 @@
 exports_files(
     [
         "disk-cache-gc-cap.sh",
+        "lost-inputs-repair.sh",
         "remote-execution.sh",
     ],
     visibility = ["//.buildkite/steps/tests:__pkg__"],

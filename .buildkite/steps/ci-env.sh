@@ -14,6 +14,9 @@ OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
 # value: if the cache's filesystem cannot be determined, the step fails.
 # shellcheck source=disk-cache-gc-cap.sh
 source "$(dirname "${BASH_SOURCE[0]}")/disk-cache-gc-cap.sh"
+# ci_repair_lost_inputs, used by the bazel() wrapper below.
+# shellcheck source=lost-inputs-repair.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lost-inputs-repair.sh"
 
 CI_BAZELRC=".ci.bazelrc"
 if ! CI_DISK_CACHE_DIR="$(ci_disk_cache_path "$OS_TYPE" "$CI_BAZELRC")" \
@@ -257,6 +260,18 @@ bazel() {
     command bazel $BAZEL_STARTUP_FLAGS clean --expunge
     rm -f "$tmplog" "$tmplog.watchdog"
     _ci_run_bazel "$tmplog" "$subcommand" "$@"
+    return $?
+  fi
+
+  # "Lost inputs no longer available remotely" after Bazel's own restarts: the
+  # disk cache's action cache names blobs that exist nowhere, so every restart
+  # hits the same dangling entry. Remove those entries (only those) and run
+  # the command once more; the producing actions re-run and re-upload. See
+  # lost-inputs-repair.sh. Repeat only while a repair changed something.
+  if ci_repair_lost_inputs "$tmplog" "$CI_DISK_CACHE_DIR"; then
+    echo "--- Lost inputs: pruned dangling disk-cache entries; retrying bazel $subcommand"
+    rm -f "$tmplog" "$tmplog.watchdog"
+    bazel "$subcommand" "$@"
     return $?
   fi
 

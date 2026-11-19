@@ -30,3 +30,15 @@ sh_test(
         "//tools/remote-execution:remote-status.sh",
     ],
 )
+
+# Script-level test for the repair ci-env.sh's bazel() wrapper runs when Bazel
+# gives up with "Lost inputs no longer available remotely": it reads the lost
+# digests from the log and removes only the disk-cache action-cache entries
+# that name a lost blob the cache cannot supply, leaving every other entry and
+# every cas blob alone.
+sh_test(
+    name = "lost_inputs_repair_test",
+    size = "small",
+    srcs = ["lost_inputs_repair_test.sh"],
+    data = ["//.buildkite/steps:lost-inputs-repair.sh"],
+)
