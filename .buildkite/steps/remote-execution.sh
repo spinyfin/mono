@@ -39,10 +39,12 @@
 #
 #      The second half is there because a connection proves little. The
 #      kernel accepts one for a process that has stopped answering, and a
-#      Bazel 9.1 client that sends its build to such a process waits without a
-#      per-RPC deadline (measured with the 60s keepalive default: still
-#      waiting 17 minutes after the executor froze). A step that would have
-#      hung at its first bazel command builds on its agent instead. See
+#      Bazel 9.1 client that sends its build to such a process has no
+#      per-RPC deadline. Keepalive was measured not to end that wait
+#      (17 minutes against a stopped hub with the 60s default). A step that
+#      would have hung at its first bazel command builds on its agent
+#      instead. A hub that stops answering after the step has started is
+#      bounded by the status watchdog in ci-env.sh. See
 #      tools/remote-execution/README.md, "What bounds a stuck action".
 #
 # What "remotely" covers differs by platform, and .ci.bazelrc has the config
@@ -69,6 +71,12 @@ CI_REMOTE_PROBE_TIMEOUT_SECS=5
 # check after 5 s and answers 503, so this is long enough to be told that and
 # not merely time out.
 CI_REMOTE_STATUS_TIMEOUT_SECS=10
+
+# How often a running remote bazel command re-asks the executor for its
+# status. Together with CI_REMOTE_STATUS_TIMEOUT_SECS this is the bound on a
+# hub that stops answering after the step has started. gRPC keepalive was
+# measured not to provide that bound. Tests set this to 0.
+CI_REMOTE_WATCHDOG_INTERVAL_SECS="${CI_REMOTE_WATCHDOG_INTERVAL_SECS:-15}"
 
 _ci_remote_err() {
   echo "[ci-env] error: $*" >&2
@@ -150,6 +158,100 @@ ci_remote_endpoint_status() {
   echo "${code:-000}"
 }
 
+# ci_remote_stuck_status <status token>
+#
+# Succeeds for the same answers the start-of-step probe falls back on: the
+# executor sent no status page within CI_REMOTE_STATUS_TIMEOUT_SECS (curl
+# exit 28), or it reported a failed or stalled store (HTTP 503). Other
+# tokens (another HTTP status, curl:<n>, unknown) are not stuck: the process
+# is serving, or the probe could not tell.
+ci_remote_stuck_status() {
+  case "$1" in
+    timeout | 503) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ci_remote_watchdog_reason <status token>
+#
+# One line naming the executor (host and port from CI_REMOTE_ENDPOINT_HOST_PORT
+# when set) and what the status probe saw. For the step log and the annotation.
+ci_remote_watchdog_reason() {
+  local where="the remote executor"
+  if [[ -n "${CI_REMOTE_ENDPOINT_HOST_PORT:-}" ]]; then
+    where="the remote executor at ${CI_REMOTE_ENDPOINT_HOST_PORT% *} port ${CI_REMOTE_ENDPOINT_HOST_PORT##* }"
+  fi
+  case "$1" in
+    timeout)
+      echo "${where} accepted a connection but did not answer a status request within ${CI_REMOTE_STATUS_TIMEOUT_SECS}s while this command was running"
+      ;;
+    503)
+      echo "${where} reports a failed or stalled store (status 503) while this command was running"
+      ;;
+    *)
+      echo "${where} stopped answering while this command was running (status ${1})"
+      ;;
+  esac
+}
+
+# ci_remote_watchdog_tick <endpoint>
+#
+# One status probe. Prints a reason and returns 1 when the executor is stuck;
+# returns 0 when the bazel command should keep running.
+ci_remote_watchdog_tick() {
+  local endpoint="$1" host_port status
+  host_port="$(ci_remote_endpoint_host_port "$endpoint")" || return 0
+  status="$(ci_remote_endpoint_status "$endpoint" "${host_port% *}" "${host_port##* }")"
+  if ci_remote_stuck_status "$status"; then
+    ci_remote_watchdog_reason "$status"
+    return 1
+  fi
+  return 0
+}
+
+# ci_remote_watchdog_loop <pid> <reason_file> <endpoint>
+#
+# While <pid> lives, probe the endpoint every CI_REMOTE_WATCHDOG_INTERVAL_SECS.
+# On a stuck status, write the reason to <reason_file> and send SIGTERM to
+# <pid>. Returns once <pid> has exited or has been signalled.
+ci_remote_watchdog_loop() {
+  local pid="$1" reason_file="$2" endpoint="$3" reason
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$CI_REMOTE_WATCHDOG_INTERVAL_SECS"
+    kill -0 "$pid" 2>/dev/null || return 0
+    if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
+      continue
+    fi
+    printf '%s\n' "$reason" > "$reason_file"
+    kill -TERM "$pid" 2>/dev/null || true
+    return 0
+  done
+}
+
+# ci_remote_sigterm_reason
+#
+# One line for a Buildkite SIGTERM (timeout_in_minutes, cancel). Re-asks the
+# executor for its status so the annotation names the endpoint and what a
+# probe then saw, rather than only "the step was killed".
+ci_remote_sigterm_reason() {
+  local endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port status
+  if [[ -z "$endpoint" ]]; then
+    echo "this step was sent SIGTERM while remote execution was on"
+    return 0
+  fi
+  if ! host_port="$(ci_remote_endpoint_host_port "$endpoint" 2>/dev/null)"; then
+    echo "this step was sent SIGTERM while remote execution was on; the configured endpoint is malformed"
+    return 0
+  fi
+  status="$(ci_remote_endpoint_status "$endpoint" "${host_port% *}" "${host_port##* }")"
+  CI_REMOTE_ENDPOINT_HOST_PORT="$host_port"
+  if ci_remote_stuck_status "$status"; then
+    echo "this step was sent SIGTERM while remote execution was on; $(ci_remote_watchdog_reason "$status")"
+  else
+    echo "this step was sent SIGTERM while remote execution was on; a status probe of the remote executor at ${host_port% *} port ${host_port##* } then returned ${status}"
+  fi
+}
+
 # ci_remote_failure_reason <bazel log file>
 #
 # Succeeds and prints one line if the log of a failed bazel command shows that
@@ -196,6 +298,9 @@ ci_remote_failure_reason() {
 #                                  or answered that it is unhealthy.
 #   CI_REMOTE_BAZEL_FLAGS          Flags to append to CI_BAZEL_FLAGS; empty
 #                                  when off.
+#   CI_REMOTE_ENDPOINT_HOST_PORT   "<host> <port>" of the endpoint when it was
+#                                  parsed, even if the step then fell back;
+#                                  empty when there is no endpoint.
 #   CI_BAZEL_VERIFY_ONLY_FLAGS     Extra flags for a build or test command that
 #                                  is run only for its result, so nothing reads
 #                                  its outputs from disk afterwards; empty when
@@ -208,6 +313,7 @@ ci_remote_execution_decide() {
   CI_REMOTE_EXECUTION_REASON=""
   CI_REMOTE_EXECUTION_FELL_BACK=0
   CI_REMOTE_BAZEL_FLAGS=""
+  CI_REMOTE_ENDPOINT_HOST_PORT=""
   CI_BAZEL_VERIFY_ONLY_FLAGS=""
 
   if [[ "${CI_REMOTE_EXECUTION_ALLOWED:-0}" != "1" ]]; then
@@ -233,6 +339,7 @@ ci_remote_execution_decide() {
     return 0
   fi
   host_port="$(ci_remote_endpoint_host_port "$endpoint")" || return 1
+  CI_REMOTE_ENDPOINT_HOST_PORT="$host_port"
   if ! ci_remote_endpoint_reachable "$os_type" "${host_port% *}" "${host_port##* }"; then
     CI_REMOTE_EXECUTION_FELL_BACK=1
     CI_REMOTE_EXECUTION_REASON="the remote executor did not accept a connection within ${CI_REMOTE_PROBE_TIMEOUT_SECS}s, so this step builds on the agent"

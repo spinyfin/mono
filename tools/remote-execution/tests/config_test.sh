@@ -22,6 +22,7 @@ health="${dir}/nativelink/hub-health.sh"
 build="${dir}/nativelink/build-worker.sh"
 patch="${dir}/nativelink/patches/macos-clonefile-executables.patch"
 readme="${dir}/README.md"
+dev_watchdog="${dir}/dev-remote-workspace-status.sh"
 
 failures=0
 fail() {
@@ -212,6 +213,18 @@ for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer"
     fail "$(basename "$file") names a remote endpoint"
   fi
 done
+
+# The developer-side bound on a silent hub is this script, and it must still
+# produce the same workspace-status keys every other build uses.
+if [[ ! -x "$dev_watchdog" ]]; then
+  fail "dev-remote-workspace-status.sh must exist and be executable"
+fi
+if ! grep -q 'exec "$original"' "$dev_watchdog" && ! grep -q 'exec "$original" "$@"' "$dev_watchdog"; then
+  fail "dev-remote-workspace-status.sh must exec the original workspace-status command"
+fi
+if ! grep -q 'dev-remote-workspace-status.sh' "$readme"; then
+  fail "README.md must name the developer status watchdog"
+fi
 
 if [[ "$failures" -ne 0 ]]; then
   echo "${failures} assertion(s) failed" >&2

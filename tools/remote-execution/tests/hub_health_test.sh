@@ -357,6 +357,26 @@ status=0
 line="$(env -u NL_HUB_ADMIN_LISTEN "$health" --log-file "$log" 2>&1)" || status=$?
 expect "no admin address" 2 "NL_HUB_ADMIN_LISTEN is not set"
 
+# A configuration error alerts once: state_file is set before validation, so
+# a missing NL_HUB_ADMIN_LISTEN does not fire the hook every minute.
+: > "${tmp}/alerts"
+alert="printf '%s|%s\n' \"\$NL_HEALTH_STATE\" \"\$NL_HEALTH_LINE\" >> '${tmp}/alerts'"
+rm -f "${tmp}/health.state"
+status=0
+line="$(env -u NL_HUB_ADMIN_LISTEN NL_HEALTH_STATE_FILE="${tmp}/health.state" \
+  NL_HEALTH_ALERT_CMD="$alert" "$health" --log-file "$log" 2>&1)" || status=$?
+expect "no admin address alerts" 2 "NL_HUB_ADMIN_LISTEN is not set"
+if ! grep -q '^error|hub-health: error: NL_HUB_ADMIN_LISTEN is not set' "${tmp}/alerts"; then
+  fail "no admin address: expected an error alert, got: $(cat "${tmp}/alerts" 2>/dev/null)"
+fi
+status=0
+line="$(env -u NL_HUB_ADMIN_LISTEN NL_HEALTH_STATE_FILE="${tmp}/health.state" \
+  NL_HEALTH_ALERT_CMD="$alert" "$health" --log-file "$log" 2>&1)" || status=$?
+expect "no admin address alerts again" 2 "NL_HUB_ADMIN_LISTEN is not set"
+if [[ "$(wc -l < "${tmp}/alerts" | tr -d ' ')" != "1" ]]; then
+  fail "no admin address: expected one alert for two runs, got: $(cat "${tmp}/alerts")"
+fi
+
 status=0
 line="$(env NL_HUB_ADMIN_LISTEN=127.0.0.1:50071 "$health" 2>&1)" || status=$?
 expect "no log source" 2 "one of --journal-unit or --log-file is required"

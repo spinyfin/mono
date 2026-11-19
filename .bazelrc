@@ -149,20 +149,21 @@ build:dev-remote --disk_cache=~/.cache/bazelcache-remote
 # here. Measured: with every worker frozen, the action ran here two minutes
 # later.
 #
-# It does not cover an executor that stops answering part-way through a build
-# while still ACKing HTTP/2 PINGs. Bazel 9.1 puts no deadline on an execution
-# call: --remote_timeout applies to cache calls only. --grpc_keepalive_time
-# defaults to 60s in 9.1 (pings after that much quiet, while a call is
-# pending); 0 would disable them. These two lines set 30s / 20s so the values
-# live in this file. A hub that does not ACK PINGs then drops the transport,
-# Bazel retries, and this fallback runs the action here. Measured with the
-# 60s default: a hub stopped in the middle of an action was still waiting 17
-# minutes later, so a hub whose HTTP/2 stack still ACKs PINGs is not bounded
-# here. Interrupt such a build and add --config=dev-local. A per-RPC deadline
-# needs Bazel 9.3 or later (--remote_grpc_service_config). See
+# It does not cover an executor that stops answering part-way through a build.
+# Bazel 9.1 puts no deadline on an execution call: --remote_timeout applies
+# to cache calls only. --grpc_keepalive_time defaults to 60s in 9.1 (pings
+# after that much quiet, while a call is pending); 0 would disable them.
+# These two lines set 30s / 20s so the values live in this file, and so a
+# future Bazel that defaults them to 0 still pings. They are not the bound
+# for a stopped hub: measured with keepalive on at the 60s default, a hub
+# stopped in the middle of an action was still waiting 17 minutes later.
+# The bound is the workspace-status command below, which repeats the same
+# status request CI uses and stops this Bazel server if the hub does not
+# answer. Re-run with --config=dev-local to finish on this Mac. See
 # tools/remote-execution/README.md, "What bounds a stuck action".
 build:dev-remote --grpc_keepalive_time=30s
 build:dev-remote --grpc_keepalive_timeout=20s
+build:dev-remote --workspace_status_command=tools/remote-execution/dev-remote-workspace-status.sh
 build:dev-remote --remote_local_fallback
 # Results of actions this machine ran itself (after a fallback, or because the
 # action cannot run remotely) stay on this machine and are not uploaded. The

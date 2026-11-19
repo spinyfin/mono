@@ -4,19 +4,20 @@
 #   BUILDKITE_ANY_QUEUE=agent-test
 #   BUILDKITE_MACOS_QUEUE=macos-test
 #
-# timeout_in_minutes on every remote-enabled step is the last bound on a step
-# that has stopped making progress, not a performance budget. Bazel 9.1 puts
-# no per-RPC deadline on a remote execution call; --grpc_keepalive_time (set
-# on ci-remote / ci-remote-linux) drops the transport only if HTTP/2 PINGs go
-# unanswered (tools/remote-execution/README.md, "What bounds a stuck action").
-# On 2026-11-18 such steps sat for 52 to 75 minutes, until the executor was
-# restarted. The verification-step values are about four times the slowest
-# passing run of each among 1,800 builds sampled between 2026-09-18 and
-# 2026-11-18 (bazel-build-test 16 min, mac-app-build 15 min, checks 8 min), so
-# a cold cache does not reach them. boss-release is 90 min: by the time it
-# builds, the tag is pushed and the draft exists, and a run that is killed
-# there leaves the release waiting for a manual one, but an unbounded hang
-# against a frozen hub is worse.
+# timeout_in_minutes on every remote-enabled step is the last resort on a
+# step that has stopped making progress, not a performance budget. The bound
+# on a hub that goes silent mid-step is the status watchdog in ci-env.sh
+# (tools/remote-execution/README.md, "What bounds a stuck action"). Bazel 9.1
+# puts no per-RPC deadline on a remote execution call, and keepalive was
+# measured not to end a wait against a stopped hub. On 2026-11-18 such steps
+# sat for 52 to 75 minutes, until the executor was restarted. The
+# verification-step values are about four times the slowest passing run of
+# each among 1,800 builds sampled between 2026-09-18 and 2026-11-18
+# (bazel-build-test 16 min, mac-app-build 15 min, checks 8 min), so a cold
+# cache does not reach them. boss-release is 90 min: by the time it builds,
+# the tag is pushed and the draft exists, and a run that is killed there
+# leaves the release waiting for a manual one, but an unbounded hang against
+# a frozen hub is worse.
 
 steps:
   - label: ":bazel: bazel-build-test"

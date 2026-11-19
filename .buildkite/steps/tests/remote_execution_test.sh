@@ -354,6 +354,88 @@ if ci_remote_failure_reason "${TEST_TMPDIR}/no-such-log" > /dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
+# Status watchdog: the same probe as the start-of-step fallback, repeated
+# while bazel runs. A silent hub (timeout) or a stalled store (503) stops
+# the command; other probe failures do not.
+# ---------------------------------------------------------------------------
+
+CI_REMOTE_ENDPOINT_HOST_PORT="executor.test 50051"
+CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+curl_http=200
+curl_fail_exit=""
+: > "$curl_calls"
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: a 200 hub was treated as stuck"
+fi
+curl_http=000
+reason=""
+if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
+  fail "watchdog tick: a silent hub was not treated as stuck"
+fi
+if [[ "$reason" != *"executor.test port 50051"* ]] || [[ "$reason" != *"did not answer a status request"* ]]; then
+  fail "watchdog tick: timeout reason was '${reason}'"
+fi
+curl_http=503
+reason=""
+if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
+  fail "watchdog tick: a 503 hub was not treated as stuck"
+fi
+if [[ "$reason" != *"status 503"* ]]; then
+  fail "watchdog tick: 503 reason was '${reason}'"
+fi
+curl_http=000
+curl_fail_exit=52
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: curl 52 was treated as stuck"
+fi
+curl_fail_exit=""
+curl_http=404
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: HTTP 404 was treated as stuck"
+fi
+curl_http=200
+
+# The loop signals the bazel pid when a tick is stuck. Interval 0 so the
+# test does not wait the production 15 s.
+CI_REMOTE_WATCHDOG_INTERVAL_SECS=0
+sleep 30 &
+watch_pid=$!
+reason_file="${TEST_TMPDIR:?}/watchdog-reason"
+rm -f "$reason_file"
+curl_http=000
+ci_remote_watchdog_loop "$watch_pid" "$reason_file" "$endpoint"
+wait "$watch_pid" 2>/dev/null || true
+if kill -0 "$watch_pid" 2>/dev/null; then
+  kill -KILL "$watch_pid" 2>/dev/null || true
+  fail "watchdog loop: the process was still running after a silent hub"
+fi
+if [[ ! -s "$reason_file" ]] || ! grep -q "did not answer a status request" "$reason_file"; then
+  fail "watchdog loop: missing reason file: $(cat "$reason_file" 2>/dev/null)"
+fi
+curl_http=200
+
+# SIGTERM diagnostic: names the executor and what a probe then saw.
+CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+CI_REMOTE_ENDPOINT_HOST_PORT="executor.test 50051"
+curl_http=000
+msg="$(ci_remote_sigterm_reason)"
+if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"executor.test port 50051"* ]] || [[ "$msg" != *"did not answer a status request"* ]]; then
+  fail "sigterm reason (timeout): '${msg}'"
+fi
+curl_http=200
+msg="$(ci_remote_sigterm_reason)"
+if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"then returned 200"* ]]; then
+  fail "sigterm reason (healthy): '${msg}'"
+fi
+unset CI_BAZEL_REMOTE_EXECUTOR
+msg="$(ci_remote_sigterm_reason)"
+if [[ "$msg" != *"SIGTERM while remote execution was on"* ]] || [[ "$msg" == *"executor.test"* ]]; then
+  fail "sigterm reason (no endpoint): '${msg}'"
+fi
+CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+curl_http=200
+
+# ---------------------------------------------------------------------------
 # The real .ci.bazelrc defines the config the flags select.
 # ---------------------------------------------------------------------------
 

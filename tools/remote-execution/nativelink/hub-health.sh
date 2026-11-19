@@ -29,10 +29,11 @@
 #   NL_HUB_ADMIN_LISTEN         127.0.0.1:<port>, as in hub.json5.
 #   NL_HEALTH_EXPECTED_WORKERS  How many workers the pool has. Fewer connected
 #                               is unhealthy. Unset: only none at all is.
-#   NL_HEALTH_ALERT_CMD         Run with `sh -c` when the hub becomes unhealthy
-#                               and when it recovers. It gets the line this
-#                               script prints in NL_HEALTH_LINE and "unhealthy"
-#                               or "healthy" in NL_HEALTH_STATE.
+#   NL_HEALTH_ALERT_CMD         Run with `sh -c` when the hub becomes unhealthy,
+#                               when it recovers, and when the check cannot run.
+#                               It gets the line this script prints in
+#                               NL_HEALTH_LINE and "unhealthy", "healthy" or
+#                               "error" in NL_HEALTH_STATE.
 #   NL_HEALTH_STATE_FILE        Where the last state is kept between runs.
 #                               Default: health.state next to this script.
 #
@@ -58,10 +59,16 @@ SCHEDULER_NAME="MAIN_SCHEDULER"
 # not answering at all.
 REQUEST_TIMEOUT_S=10
 
+# Set before any die() so a repeating configuration error (a missing
+# NL_HUB_ADMIN_LISTEN, a bad argument) alerts once, not every minute. The
+# default lives next to this script on the hub; tests pass NL_HEALTH_STATE_FILE.
+state_file="${NL_HEALTH_STATE_FILE:-$(dirname "${BASH_SOURCE[0]}")/health.state}"
+
 die() {
   echo "hub-health: error: $*" >&2
   # A check that could not run is as much a signal as an unhealthy hub.
-  # Usage errors fire before state_file is set and skip the hook.
+  # state_file is set before argument and environment validation, so every
+  # die() goes through the same dedup path as an unhealthy verdict.
   if [[ -n "${NL_HEALTH_ALERT_CMD:-}" ]]; then
     previous=healthy
     if [[ -n "${state_file:-}" ]]; then
@@ -100,7 +107,6 @@ max_operation_timeouts="${NL_HEALTH_MAX_OPERATION_TIMEOUTS:-4}"
 max_lost_results="${NL_HEALTH_MAX_LOST_RESULTS:-4}"
 max_queue_age_s="${NL_HEALTH_MAX_QUEUE_AGE_S:-300}"
 expected_workers="${NL_HEALTH_EXPECTED_WORKERS:-}"
-state_file="${NL_HEALTH_STATE_FILE:-$(dirname "${BASH_SOURCE[0]}")/health.state}"
 for value in "$window_s" "$max_forced_evictions" "$max_operation_timeouts" "$max_lost_results" "$max_queue_age_s" "${expected_workers:-0}"; do
   [[ "$value" =~ ^[0-9]+$ ]] || die "a limit is not a whole number: '$value'"
 done

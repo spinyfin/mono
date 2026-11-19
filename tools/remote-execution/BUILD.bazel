@@ -15,6 +15,15 @@ sh_test(
     data = ["nativelink/hub-health.sh"],
 )
 
+# The developer-side bound on a hub that goes silent mid-build: the same
+# status request CI uses, against the endpoint in ~/.bazelrc.
+sh_test(
+    name = "dev_remote_watchdog_test",
+    size = "small",
+    srcs = ["tests/dev_remote_watchdog_test.sh"],
+    data = ["dev-remote-workspace-status.sh"],
+)
+
 # Pins what the files promise each other: every scheduler timeout and the
 # arithmetic between the hub's and the workers', the variables the configs
 # expand against the units that set them, the pinned NativeLink version across
@@ -26,6 +35,7 @@ sh_test(
     srcs = ["tests/config_test.sh"],
     data = [
         "README.md",
+        "dev-remote-workspace-status.sh",
         "nativelink/build-worker.sh",
         "nativelink/com.brianduff.nativelink.plist",
         "nativelink/hub.json5",
