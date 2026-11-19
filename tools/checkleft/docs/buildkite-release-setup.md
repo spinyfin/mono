@@ -150,15 +150,74 @@ gh release view checkleft-v0.1.0-alpha.9 --repo spinyfin/mono
 ## Recovering from a draft
 
 When a build or verification fails, the tag, draft, and any uploaded assets are
-preserved deliberately.
+preserved deliberately. A failed `release upload` or `release publish` adds an
+error annotation to the build with the error, whether the release is still a
+draft, and how many scheduled attempts it has left.
+
+### What the next run does
+
+The shared tool handles a draft an earlier run left behind. These rules apply to
+every product released with `bin/release`:
+
+- **A draft for the commit being released is resumed.** A scheduled prepare run
+  re-adopts that commit's draft and fans out the build steps again, with a
+  warning annotation naming the draft, the attempt number and the run that left
+  it. `release upload` uses `--clobber`, and `publish` verifies every asset
+  before publishing, exactly as for a new release.
+- **The attempts are limited.** Scheduled runs resume one draft at most
+  `scheduled_resume_attempts` times (default 3). The count is stored on the
+  draft. After that, scheduled prepare runs fail with an error annotation that
+  says the release is stranded and how to retry or abandon it. They do not
+  retry, so a release that cannot be published is not rebuilt on every cron
+  tick forever.
+- **A draft that may still be building is left alone.** The build steps are not
+  serialized with `prepare`, so a second run's `prepare` can start while the
+  first run is still compiling. For `in_flight_minutes` (default 60) after a
+  run last started `prepare`, `upload` or `publish` on a draft, a scheduled run
+  treats it as in progress: it reports that in an info annotation, exits 0 and
+  uploads no build phases. The value must be longer than the longest gap
+  between two phases, which is the slowest build including time its job spends
+  waiting for an agent.
+- **A draft for an older commit is abandoned.** Once the branch has moved, no
+  run would ever resume the old draft. The run that releases the newer commit
+  deletes each older unpublished draft and its tag after creating its own, and
+  lists what it deleted in a warning annotation. Drafts a run worked on within
+  `in_flight_minutes` are skipped. The new release takes the next number, so
+  abandoning a draft never frees its number for a different commit.
+- **A draft with no claim is given time first.** A draft created before claims
+  existed carries no record of when a run last worked on it. The first run to
+  see it records the time and otherwise leaves it alone; it is resumed or
+  abandoned once `in_flight_minutes` have passed. An old leftover draft is
+  therefore abandoned by the second release after this behaviour arrives, not
+  the first.
+
+Both limits are optional keys in the product's `release.toml`:
+
+```toml
+[recovery]
+scheduled_resume_attempts = 3
+in_flight_minutes = 60
+```
+
+A run records its claim (when it last worked on the draft, scheduled resumes so
+far, and its build URL) as an HTML comment in the draft's notes. A run that
+cannot write its claim does not resume the draft. `publish` removes the comment
+in the edit that publishes.
+
+Because runs can overlap here, two more checks apply. `release upload` refuses a
+release that is already published, so a second run cannot replace verified
+assets. `release publish` reads the release again after verifying and stops if
+an asset was replaced in the meantime.
+
+### Recovering by hand
 
 - Retry the failed Buildkite job. `bin/release tag` reads the tag recorded by
   prepare, and `release upload` uses `--clobber`, so the job can replace its
   assets safely. Retry `publish` after the build jobs complete.
 - Re-run the whole pipeline manually on the same commit. A manual prepare run
-  re-adopts that commit's draft and fans out the build steps again. Scheduled
-  runs refuse to resume drafts automatically; set `RELEASE_RESUME_DRAFT=1` only
-  when intentionally resuming one from a schedule.
+  always re-adopts that commit's draft, whatever its claim says, and does not
+  use up a scheduled attempt. Setting `RELEASE_RESUME_DRAFT=1` on a scheduled
+  build does the same.
 - To repair an asset outside Buildkite, build it from the tagged checkout and
   invoke the shared tool directly, for example:
 
@@ -170,13 +229,18 @@ preserved deliberately.
 
   The command writes and uploads the checksum sidecar with the asset.
 
-- To abandon a persistently broken draft, delete both the release and its tag
-  before starting a fresh release:
+- To abandon the draft for the current commit instead of resuming it, delete
+  both the release and its tag before starting a fresh release:
 
   ```sh
   gh release delete checkleft-v0.1.0-alpha.9 --repo spinyfin/mono --yes
   git push origin :refs/tags/checkleft-v0.1.0-alpha.9
   ```
+
+  Deleting the newest tag by hand frees its number. If the branch moves before
+  the next release, that number goes to a different commit. An agent checkout
+  that still holds the old tag then fails `git fetch --tags`, reporting
+  `would clobber existing tag`, until the stale tag is deleted there.
 
 ## The shared tool's own release
 

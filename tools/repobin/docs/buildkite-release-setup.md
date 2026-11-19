@@ -8,6 +8,7 @@ The pipeline is a thin wrapper over the shared `bin/release` tool (`prepare` / `
 - Tags: `repobin-vX.Y.Z-alpha.N` (`alpha-counter` scheme against `tools/repobin/Cargo.toml`, which carries `0.1.0-alpha.1`). Bump the manifest by hand to move the series.
 - Build target: `bazel build -c opt //tools/repobin:repobin` on each platform. No cargo cross-builds are used.
 - Change detection covers `tools/repobin/` and the pipeline/script files (`change_paths` in `release.toml`).
+- Draft recovery follows the shared tool, not the changelog script: a scheduled run resumes an unpublished draft for its commit a limited number of times, and a run on a newer commit abandons an older draft. See "Recovering from a draft" in [`../../checkleft/docs/buildkite-release-setup.md`](../../checkleft/docs/buildkite-release-setup.md).
 
 Registration is **not** automatic and is an admin action outside this repo: the in-repo files take effect only once the Buildkite pipeline `mono-repobin-release` is created and pointed at `.buildkite/pipeline-repobin-release.yml` (steps 1-5 of the changelog doc) and someone triggers a first manual build. Until then no `repobin-v*` release exists.
 

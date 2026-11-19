@@ -19,3 +19,16 @@ major_minor = "1.0"
 [notes]
 source = "changelog"
 project = "tools/boss/PROJECT.yaml"
+
+# A failed run leaves its draft behind. The next scheduled run on the same
+# commit resumes it, at most `scheduled_resume_attempts` times (default 3).
+#
+# `in_flight_minutes` is how long a draft is assumed to still be building
+# after a run last worked on it. Boss's prepare, build, upload and publish all
+# run in the one `boss-release` job, and that step has a concurrency limit of
+# one, so a second release job cannot start until the first has finished. A
+# draft a later job finds was therefore left behind, never still in progress,
+# and can be resumed or abandoned at once. Raise this above the longest build
+# if the release is ever split across jobs.
+[recovery]
+in_flight_minutes = 0

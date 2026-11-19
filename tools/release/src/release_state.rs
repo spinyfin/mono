@@ -7,12 +7,20 @@ use crate::{Command, CommandRunner, ReleaseConfig, ReleaseError, Result};
 
 const RELEASE_LIST_ATTEMPTS: usize = 3;
 
-/// The release fields needed by resolution and skip decisions. GitHub's API
-/// supplies more fields, which Serde intentionally ignores.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The release fields needed by resolution, skip decisions and draft recovery.
+/// GitHub's API supplies more fields, which Serde intentionally ignores.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
     pub draft: bool,
+    /// GitHub's id for the release. Edits and deletions address a draft by id
+    /// because a draft's tag name is not guaranteed to be unique.
+    #[serde(default)]
+    pub id: u64,
+    /// The release notes. On a draft they also carry the claim of the run that
+    /// last worked on it.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 /// Most-recent published and draft releases, held separately so a draft never
@@ -82,6 +90,28 @@ pub fn resolve_last_release(
         published: published.map(|(_, release)| release),
         draft: draft.map(|(_, release)| release),
     })
+}
+
+/// Every unpublished draft in the configured version family, paired with its
+/// counter and ordered from the highest counter down.
+pub(crate) fn family_drafts(
+    releases: &[GitHubRelease],
+    config: &ReleaseConfig,
+    manifest_contents: Option<&str>,
+) -> Result<Vec<(u64, GitHubRelease)>> {
+    let mut drafts = Vec::new();
+    for release in releases.iter().filter(|release| release.draft) {
+        if let Some(counter) = matching_tag_counter(
+            &config.version,
+            &config.tag_prefix,
+            manifest_contents,
+            &release.tag_name,
+        )? {
+            drafts.push((counter, release.clone()));
+        }
+    }
+    drafts.sort_by_key(|(counter, _)| std::cmp::Reverse(*counter));
+    Ok(drafts)
 }
 
 fn list_releases(runner: &impl CommandRunner, repo: &str) -> Result<Vec<GitHubRelease>> {
@@ -246,6 +276,49 @@ mod tests {
         })
     }
 
+    fn release(tag: &str, draft: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.to_owned(),
+            draft,
+            ..GitHubRelease::default()
+        }
+    }
+
+    #[test]
+    fn lists_every_family_draft_from_the_highest_counter_down() {
+        let config = ReleaseConfig::parse(CONFIG).expect("parse config");
+        let releases = vec![
+            release("demo-v0.4.1-alpha.7", true),
+            release("demo-v0.4.1-alpha.12", false),
+            release("demo-v0.3.9-alpha.99", true),
+            release("demo-v0.4.1-alpha.11", true),
+            release("other-v0.4.1-alpha.20", true),
+        ];
+
+        let drafts = family_drafts(&releases, &config, Some(MANIFEST)).expect("list drafts");
+
+        assert_eq!(
+            drafts
+                .iter()
+                .map(|(counter, release)| (*counter, release.tag_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(11, "demo-v0.4.1-alpha.11"), (7, "demo-v0.4.1-alpha.7")]
+        );
+    }
+
+    #[test]
+    fn reads_the_id_and_notes_a_draft_is_edited_by() {
+        let releases: Vec<GitHubRelease> = serde_json::from_str(
+            r#"[{"id":42,"tag_name":"demo-v0.4.1-alpha.9","draft":true,"body":"notes"},{"tag_name":"demo-v0.4.1-alpha.8","draft":false,"body":null}]"#,
+        )
+        .expect("parse releases");
+
+        assert_eq!(releases[0].id, 42);
+        assert_eq!(releases[0].body.as_deref(), Some("notes"));
+        assert_eq!(releases[1].id, 0);
+        assert_eq!(releases[1].body, None);
+    }
+
     #[test]
     fn splits_published_and_draft_releases_from_captured_json() {
         let releases: Vec<GitHubRelease> = serde_json::from_str(RELEASES).expect("parse captured JSON");
@@ -260,26 +333,11 @@ mod tests {
     fn selects_the_highest_release_in_the_configured_version_family() {
         let config = ReleaseConfig::parse(CONFIG).expect("parse config");
         let releases = vec![
-            GitHubRelease {
-                tag_name: "demo-v0.3.9-alpha.99".to_owned(),
-                draft: false,
-            },
-            GitHubRelease {
-                tag_name: "demo-v0.4.1-alpha.8".to_owned(),
-                draft: false,
-            },
-            GitHubRelease {
-                tag_name: "demo-v0.4.1-alpha.10".to_owned(),
-                draft: false,
-            },
-            GitHubRelease {
-                tag_name: "demo-v0.4.1-alpha.bad".to_owned(),
-                draft: true,
-            },
-            GitHubRelease {
-                tag_name: "demo-v0.4.1-alpha.9".to_owned(),
-                draft: true,
-            },
+            release("demo-v0.3.9-alpha.99", false),
+            release("demo-v0.4.1-alpha.8", false),
+            release("demo-v0.4.1-alpha.10", false),
+            release("demo-v0.4.1-alpha.bad", true),
+            release("demo-v0.4.1-alpha.9", true),
         ];
 
         let last = resolve_last_release(&releases, &config, Some(MANIFEST)).expect("resolve last releases");

@@ -62,6 +62,7 @@ fn run(cli: Cli) -> Result<()> {
             let config = commands::load_config(&config_path(&args.config))?;
             let trigger_source = env::var("BUILDKITE_SOURCE").unwrap_or_default();
             let buildkite_job_id = env::var("BUILDKITE_JOB_ID").ok();
+            let build_url = env::var("BUILDKITE_BUILD_URL").ok();
             // Prefer the product-neutral name; keep the checkleft-era spelling
             // as a fallback so existing scheduled-build recovery still works.
             let resume_draft = env::var("RELEASE_RESUME_DRAFT")
@@ -70,14 +71,19 @@ fn run(cli: Cli) -> Result<()> {
             match commands::prepare(
                 &runner,
                 &config,
-                &trigger_source,
-                buildkite_job_id.as_deref(),
-                resume_draft,
+                commands::PrepareRequest {
+                    trigger_source: &trigger_source,
+                    buildkite_job_id: buildkite_job_id.as_deref(),
+                    build_url: build_url.as_deref(),
+                    resume_draft,
+                },
             )? {
                 commands::PrepareOutcome::Created { tag } | commands::PrepareOutcome::Resumed { tag } => {
                     println!("{tag}")
                 }
-                commands::PrepareOutcome::Skipped => {}
+                // Printing no tag tells the calling step there is nothing for
+                // it to build. Why is already on stderr and on the build page.
+                commands::PrepareOutcome::InProgress { .. } | commands::PrepareOutcome::Skipped => {}
             }
         }
         ReleaseCommand::Tag => {
@@ -99,14 +105,29 @@ fn run(cli: Cli) -> Result<()> {
                 .iter()
                 .map(|asset| commands::Asset::parse(asset))
                 .collect::<Result<Vec<_>>>()?;
-            commands::upload(&runner, &config, &tag, &assets)?;
+            commands::upload(&runner, &config, &tag, &assets)
+                .inspect_err(|error| report_unpublished(&runner, &config, &tag, "the asset upload", error))?;
         }
         ReleaseCommand::Publish { config: args, tag } => {
             let config = commands::load_config(&config_path(&args.config))?;
-            commands::publish(&runner, &config, &tag)?;
+            commands::publish(&runner, &config, &tag)
+                .inspect_err(|error| report_unpublished(&runner, &config, &tag, "verification or publishing", error))?;
         }
     }
     Ok(())
+}
+
+/// A failed upload or publish leaves the release as a draft. Say so on the
+/// build page, with what happens to the draft next, not only in the job log.
+fn report_unpublished(
+    runner: &ProcessCommandRunner,
+    config: &release::ReleaseConfig,
+    tag: &str,
+    phase: &str,
+    error: &anyhow::Error,
+) {
+    let buildkite_job_id = env::var("BUILDKITE_JOB_ID").ok();
+    commands::report_unpublished(runner, config, buildkite_job_id.as_deref(), tag, phase, error);
 }
 
 fn main() -> ExitCode {
