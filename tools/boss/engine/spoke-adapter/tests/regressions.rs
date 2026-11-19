@@ -149,13 +149,10 @@ async fn lost_release_reply_resolves_on_reconnect_without_releasing_again() {
     for kind in [Kind::Release, Kind::ReleaseWithReset, Kind::ForceRelease] {
         // Lease is answered; Release is left unanswered so `command_deadline`
         // must fire before the reconnect path runs. Lease and Release share
-        // that field, so they cannot be split the way spawn vs Stop can.
-        // The coordinator lease-miss `workspace_slack` documents (a 300ms
-        // lease recorded as `dispatch_not_before` before spawn) does not
-        // apply: this test is not on the dispatch path, and a slow lease
-        // fails the setup unwrap rather than being swallowed as a pre-start
-        // failure.
-        let fx = Fixture::with(short(300)).await;
+        // that field, so the deadline is load-tolerant (5s) rather than short:
+        // a slow Lease reply must not panic the setup before the unanswered
+        // Release is exercised. The cost is one 5s wait per release kind.
+        let fx = Fixture::with(workspace_slack(5_000)).await;
         fx.ready(HOST);
         let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
         let first = fx
