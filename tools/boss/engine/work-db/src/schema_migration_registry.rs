@@ -289,6 +289,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: pre_start_failure::migrate_dispatch_failure_history,
         },
         Migration {
+            id: task_status_audit::EXECUTION_ABANDON_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: task_status_audit::migrate_execution_abandon,
+        },
+        Migration {
             id: execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID.into(),
             legacy_version: None,
             apply: execution_bookmarks::migrate_has_recovery_head,

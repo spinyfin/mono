@@ -1355,8 +1355,10 @@ pub fn parked_via_project(project_id: &str) -> String {
 /// client shows it as an unexpected state, never as an ordinary queue reason.
 pub const DISPATCH_WAIT_REASON_UNCLASSIFIED: &str = "unclassified";
 
-/// One recorded change to a task's `deferred` or `autostart` flag, from the
-/// engine's field-change ledger. `actor` is who the engine attributes the write
+/// One recorded change to a task's `deferred` or `autostart` flag, or one
+/// engine abandonment of an execution (`property` `execution_abandoned`), from
+/// the engine's field-change ledger. A `status` row appears only when it was
+/// written in the same operation as one of those. `actor` is who the engine attributes the write
 /// to (`human`, `boss`, `engine`, `progression`, ...); `basis` names the code
 /// path that made it and, for a write that arrived over the socket, the
 /// calling process and request so it can be joined to the engine logs. A
@@ -1366,7 +1368,9 @@ pub const DISPATCH_WAIT_REASON_UNCLASSIFIED: &str = "unclassified";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct TaskFieldAuditRow {
-    /// `deferred` or `autostart`.
+    /// `deferred`, `autostart`, `execution_abandoned` (an execution moved to
+    /// `abandoned`; `old_value` is its previous status), or `status` (a status
+    /// move that shares `operation_id` with one of the others).
     pub property: String,
     /// Value before the change; `None` for the row recorded at creation.
     pub old_value: Option<String>,
@@ -1378,6 +1382,37 @@ pub struct TaskFieldAuditRow {
     #[serde(default)]
     #[builder(default)]
     pub age_is_lower_bound: bool,
+    /// Stable machine-readable cause (for example `deferred`,
+    /// `ghost_active_demoted`, `unattributed_write`), kept apart from the
+    /// reword-able `detail`. `None` for rows recorded before the engine
+    /// captured causes: nothing is inferred for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// Human-readable diagnostic text for the cause; not stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Shared by every row written by one atomic operation, so a combined
+    /// change (abandon, autostart off, status demotion) can be told apart from
+    /// unrelated writes in the same second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// The execution an `execution_abandoned` row is about. The execution row
+    /// may since have been pruned; this row is retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    /// The task's recorded dispatch-failure time at the moment of the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_stamp: Option<String>,
+    /// The execution's last error, else the task's dispatch-failure diagnostic
+    /// text (`dispatch_failed_error`), at the moment of the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_error: Option<String>,
+    /// Whether the abandoned execution had ever started or produced a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ever_ran: Option<bool>,
+    /// Whether any execution of the item had ever started or produced a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_ever_ran: Option<bool>,
 }
 
 /// Live runtime status for a single task/chore — the current execution

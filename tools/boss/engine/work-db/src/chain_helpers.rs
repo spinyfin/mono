@@ -285,14 +285,18 @@ pub(crate) fn collect_chain_revision_ids_including_deleted(
 /// another orphan. A live (`running` / `waiting_human`) execution is left
 /// alone; it self-retires when its worker stops.
 ///
+/// `cause` is recorded in the audit ledger; every caller passes its own so the
+/// history names the caller, not this helper.
+///
 /// Returns the number of execution rows abandoned.
 pub(crate) fn abandon_pending_executions(
     pending: &mut PendingEvents,
     conn: &Connection,
     work_item_id: &str,
     now: &str,
+    cause: crate::task_status_audit::AbandonCause<'_>,
 ) -> Result<usize> {
-    abandon_pending_executions_filtered(pending, conn, work_item_id, now, true)
+    abandon_pending_executions_filtered(pending, conn, work_item_id, now, true, cause)
 }
 
 /// Like [`abandon_pending_executions`] but leaves queued `progression` runs
@@ -305,8 +309,9 @@ pub(crate) fn abandon_pending_item_work_executions(
     conn: &Connection,
     work_item_id: &str,
     now: &str,
+    cause: crate::task_status_audit::AbandonCause<'_>,
 ) -> Result<usize> {
-    abandon_pending_executions_filtered(pending, conn, work_item_id, now, false)
+    abandon_pending_executions_filtered(pending, conn, work_item_id, now, false, cause)
 }
 
 fn abandon_pending_executions_filtered(
@@ -315,6 +320,7 @@ fn abandon_pending_executions_filtered(
     work_item_id: &str,
     now: &str,
     include_progression: bool,
+    cause: crate::task_status_audit::AbandonCause<'_>,
 ) -> Result<usize> {
     let kind_filter = if include_progression {
         ""
@@ -335,7 +341,9 @@ fn abandon_pending_executions_filtered(
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
-    let abandoned = conn.execute(
+    let abandoned = crate::task_status_audit::abandon(
+        conn,
+        cause,
         &format!(
             "UPDATE work_executions
              SET status = 'abandoned',
@@ -698,7 +706,15 @@ pub fn block_pending_revisions_on_parent_close(
         }
 
         // Drop any not-yet-live execution row before archiving the task.
-        abandon_pending_executions(pending, conn, rev_id, now)?;
+        // One operation so the archive/status row is listed with the abandonment.
+        let operation = crate::task_status_audit::begin_operation_on(conn)?;
+        abandon_pending_executions(
+            pending,
+            conn,
+            rev_id,
+            now,
+            crate::task_status_audit::abandon_cause::PARENT_CLOSE_SWEEP,
+        )?;
 
         resolve_revision_on_parent_close(
             pending,
@@ -709,6 +725,7 @@ pub fn block_pending_revisions_on_parent_close(
             "block_pending_revisions",
             ARCHIVE_MECHANISM_PARENT_CLOSE_SWEEP,
         )?;
+        operation.end()?;
     }
     Ok(())
 }

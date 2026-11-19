@@ -685,8 +685,13 @@ mod tests {
             ))
             .unwrap();
         }
-        conn.execute_batch("DROP TABLE IF EXISTS task_status_audit; DROP TABLE IF EXISTS task_status_audit_context;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS task_status_audit_abandon_execution;
+             DROP TABLE IF EXISTS task_status_audit;
+             DROP TABLE IF EXISTS task_status_audit_context;
+             DROP TABLE IF EXISTS task_status_audit_operation;",
+        )
+        .unwrap();
     }
 
     #[test]

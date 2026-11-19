@@ -653,6 +653,233 @@ fn reconcile_revision_execution_archives_and_tombstones_moot_revision_at_dispatc
     assert_eq!(actor, "engine");
 }
 
+/// Reconciling a revision whose parent PR already closed withdraws its
+/// not-yet-live execution, and the ledger names that path (not the shared
+/// helper) as the cause.
+#[test]
+fn parent_close_reconcile_records_its_own_abandonment_cause() {
+    let db = open_db();
+    let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+    let chore_id = insert_raw_task(&db.connect().unwrap(), &product, "chore", None);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'done', pr_url = 'https://github.com/spinyfin/mono/pull/57' WHERE id = ?1",
+            params![chore_id],
+        )
+        .unwrap();
+    let revision_id = next_id("task");
+    let now = now_string();
+    let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}rem_audit");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, \
+             created_at, updated_at, parent_task_id, autostart, priority, created_via) \
+             VALUES (?1, ?2, 'revision', 'Rev', '', 'todo', ?3, ?3, ?4, 1, 'medium', ?5)",
+            params![revision_id, product, now, chore_id, created_via],
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let revision_task = query_task(&db.connect().unwrap(), &revision_id).unwrap().unwrap();
+    {
+        let mut conn = db.connect().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let mut pending = PendingEvents::new();
+        let mut result = ExecutionReconcileResult::default();
+        reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        abandonment_codes(&db, &revision_id),
+        [(
+            execution.id,
+            "parent_closed_revision".to_owned(),
+            "waiting_dependency".to_owned()
+        )]
+    );
+    assert_status_shares_abandonment_and_unrelated_stays_distinct(&db, &revision_id, "archived");
+}
+
+/// The sweep that blocks pending revisions when the parent closes records a
+/// different cause than the dispatch-time reconcile does, though both call
+/// the same abandonment helper.
+#[test]
+fn parent_close_sweep_records_its_own_abandonment_cause() {
+    let db = open_db();
+    let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+    let chore_id = insert_raw_task(&db.connect().unwrap(), &product, "chore", None);
+    let revision_id = next_id("task");
+    let now = now_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, \
+             created_at, updated_at, parent_task_id, autostart, priority) \
+             VALUES (?1, ?2, 'revision', 'Rev', '', 'todo', ?3, ?3, ?4, 1, 'medium')",
+            params![revision_id, product, now, chore_id],
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    {
+        let mut conn = db.connect().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let mut pending = PendingEvents::new();
+        block_pending_revisions_on_parent_close(&mut pending, &tx, &chore_id, &now_string()).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        abandonment_codes(&db, &revision_id),
+        [(execution.id, "parent_close_sweep".to_owned(), "ready".to_owned())]
+    );
+    assert_status_shares_abandonment_and_unrelated_stays_distinct(&db, &revision_id, "archived");
+}
+
+/// A revision whose spawning attempt was retired withdraws its pending
+/// item-work executions under its own cause.
+#[test]
+fn retired_spawning_attempt_gate_records_its_own_abandonment_cause() {
+    let db = open_db();
+    let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+    let chore_id = insert_raw_task(&db.connect().unwrap(), &product, "chore", None);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/spinyfin/mono/pull/58' WHERE id = ?1",
+            params![chore_id],
+        )
+        .unwrap();
+    let attempt_id = next_id("crz");
+    let revision_id = next_id("task");
+    let now = now_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO conflict_resolutions
+                 (id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch, status, created_at)
+             VALUES (?1, ?2, ?3, 'https://github.com/spinyfin/mono/pull/58', 58, 'feat', 'main', 'abandoned', ?4)",
+            params![attempt_id, product, chore_id, now],
+        )
+        .unwrap();
+    let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{attempt_id}");
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO tasks (id, product_id, kind, name, description, status, \
+             created_at, updated_at, parent_task_id, autostart, priority, created_via) \
+             VALUES (?1, ?2, 'revision', 'Rev', '', 'todo', ?3, ?3, ?4, 1, 'medium', ?5)",
+            params![revision_id, product, now, chore_id, created_via],
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision_id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::WaitingDependency)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let revision_task = query_task(&db.connect().unwrap(), &revision_id).unwrap().unwrap();
+    {
+        let mut conn = db.connect().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let mut pending = PendingEvents::new();
+        let mut result = ExecutionReconcileResult::default();
+        reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        abandonment_codes(&db, &revision_id),
+        [(
+            execution.id,
+            "retired_spawning_attempt".to_owned(),
+            "waiting_dependency".to_owned()
+        )]
+    );
+    assert_status_shares_abandonment_and_unrelated_stays_distinct(&db, &revision_id, "blocked");
+}
+
+/// The combined write listed a status demotion that shares the abandonment's
+/// `operation_id`, and a later unrelated flag write does not join it.
+fn assert_status_shares_abandonment_and_unrelated_stays_distinct(
+    db: &WorkDb,
+    work_item_id: &str,
+    expected_status: &str,
+) {
+    let rows = db.list_task_field_audit(work_item_id).unwrap();
+    let abandon = rows
+        .iter()
+        .rfind(|row| row.property == "execution_abandoned")
+        .expect("abandonment row");
+    let status = rows
+        .iter()
+        .rfind(|row| row.property == "status" && row.new_value.as_deref() == Some(expected_status))
+        .expect("status demotion should be listed with the abandonment");
+    assert_eq!(status.operation_id, abandon.operation_id);
+    assert!(abandon.operation_id.is_some());
+
+    crate::task_status_audit::execute(
+        &db.connect().unwrap(),
+        "unrelated_write",
+        "human",
+        "UPDATE tasks SET autostart = 0 WHERE id = ?1 AND autostart = 1",
+        [work_item_id],
+    )
+    .unwrap();
+    let after = db.list_task_field_audit(work_item_id).unwrap();
+    let later = after
+        .iter()
+        .rfind(|row| {
+            row.property == "autostart" && row.new_value.as_deref() == Some("0") && row.basis == "unrelated_write"
+        })
+        .expect("unrelated autostart write");
+    assert_ne!(later.operation_id, abandon.operation_id);
+    assert!(later.operation_id.is_some());
+}
+
+/// `(execution id, reason code, previous status)` of each abandonment the
+/// ledger holds for `work_item_id`.
+fn abandonment_codes(db: &WorkDb, work_item_id: &str) -> Vec<(String, String, String)> {
+    db.list_task_field_audit(work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.property == "execution_abandoned")
+        .map(|row| {
+            (
+                row.execution_id.unwrap(),
+                row.reason_code.unwrap(),
+                row.old_value.unwrap(),
+            )
+        })
+        .collect()
+}
+
 /// A revision that slipped through with `merge_queue_state = 'queued'`
 /// still set (e.g. it briefly entered GitHub's merge queue before the
 /// parent chore's own merge made it moot) must not leave that state

@@ -823,6 +823,47 @@ fn linking_to_a_runnable_backlog_task_still_schedules_it() {
 }
 
 #[test]
+fn approval_correlates_autostart_enable_with_the_final_blocked_demotion() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let product = crate::test_support::create_test_product(&db);
+    let asking = crate::test_support::create_test_chore(&db, product.id.clone(), "Startup check");
+    let target = crate::test_support::create_test_chore_manual(&db, product.id, "Shared fixture");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 0 WHERE id = ?1", [&asking.id])
+        .unwrap();
+    yes_on_stored_link(&db, &asking, &target);
+    assert_parked_behind(&db, &asking.id, &target.id);
+    let rows = db.list_task_field_audit(&asking.id).unwrap();
+    let autostart = rows
+        .iter()
+        .rev()
+        .find(|row| row.property == "autostart" && row.new_value.as_deref() == Some("1"))
+        .expect("autostart enable is recorded");
+    let operation_id = autostart
+        .operation_id
+        .clone()
+        .expect("autostart row carries an operation id");
+    let blocked = rows
+        .iter()
+        .rev()
+        .find(|row| row.property == "status" && row.new_value.as_deref() == Some("blocked"))
+        .expect("the final blocked demotion is part of the history");
+    assert_eq!(blocked.operation_id.as_deref(), Some(operation_id.as_str()));
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 0 WHERE id = ?1", [&asking.id])
+        .unwrap();
+    let rows = db.list_task_field_audit(&asking.id).unwrap();
+    let later = rows
+        .iter()
+        .rev()
+        .find(|row| row.property == "autostart" && row.new_value.as_deref() == Some("0"))
+        .expect("later write recorded");
+    assert_ne!(later.operation_id.as_deref(), Some(operation_id.as_str()));
+}
+
+#[test]
 fn inherited_product_repo_does_not_bind_a_foreign_owner_of_the_same_number() {
     let (_tmp, db) = crate::test_support::open_db();
     let product = crate::test_support::create_test_product(&db);

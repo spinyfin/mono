@@ -221,7 +221,12 @@ impl WorkDb {
                 stmt.query_map(params![work_item_id], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?
             };
-            tx.execute(
+            // One operation per healed item: the abandonments and the
+            // status demotion below share an `operation_id`.
+            let operation = crate::task_status_audit::begin_operation(&tx)?;
+            crate::task_status_audit::abandon(
+                &tx,
+                crate::task_status_audit::abandon_cause::GHOST_ACTIVE_DEMOTED,
                 "UPDATE work_executions
                  SET status = 'abandoned',
                      finished_at = COALESCE(finished_at, ?2)
@@ -258,6 +263,7 @@ impl WorkDb {
                    AND deleted_at IS NULL",
                 params![work_item_id, now],
             )?;
+            operation.end()?;
             if updated > 0 {
                 healed.push(HealedGhostActive {
                     work_item_id,
@@ -319,7 +325,9 @@ impl WorkDb {
         let mut abandoned = Vec::new();
         let mut pending = PendingEvents::new();
         for (execution_id, work_item_id) in candidates {
-            let updated = tx.execute(
+            let updated = crate::task_status_audit::abandon(
+                &tx,
+                crate::task_status_audit::abandon_cause::CLOSED_ITEM_STRANDED,
                 "UPDATE work_executions
                  SET status = 'abandoned',
                      finished_at = COALESCE(finished_at, ?2)
@@ -1726,7 +1734,9 @@ impl WorkDb {
         let existing = query_execution(&conn, execution_id)?;
         let now = now_string();
         let updated = match &existing {
-            Some(existing) if !existing.status.is_terminal() => conn.execute(
+            Some(existing) if !existing.status.is_terminal() => crate::task_status_audit::abandon(
+                &conn,
+                crate::task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
                 "UPDATE work_executions
                  SET status = 'abandoned',
                      finished_at = COALESCE(finished_at, ?2)
@@ -1858,7 +1868,11 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_string();
-        let execution_rows = tx.execute(
+        // The abandonment and the task's move to `in_review` are one operation.
+        let operation = crate::task_status_audit::begin_operation(&tx)?;
+        let execution_rows = crate::task_status_audit::abandon(
+            &tx,
+            crate::task_status_audit::abandon_cause::STALE_REVISION_RETIRED,
             "UPDATE work_executions
              SET status = 'abandoned',
                  finished_at = COALESCE(finished_at, ?2)
@@ -1884,6 +1898,7 @@ impl WorkDb {
                 AND status IN ('todo', 'active')",
             params![task_id, now],
         )?;
+        operation.end()?;
         if task_rows > 0 {
             cascade_dependents_after_prereq_status_change(&mut pending, &tx, task_id, "in_review", &now)?;
         }

@@ -1724,20 +1724,31 @@ pub(crate) async fn run_task_executions(
             // "history" means for a coordinator scrolling for a prior run.
             executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
             let execution_runs = list_execution_runs(client, &executions).await?;
+            // The engine's abandonment and flag history outlives the execution
+            // rows themselves (retention prunes never-started ones), so it is
+            // shown beside them rather than derived from them.
+            let field_audit = crate::work_cmds::field_audit_from_reply(
+                client
+                    .send_request(&FrontendRequest::ListTaskFieldAudit {
+                        id: work_item_id.clone(),
+                    })
+                    .await,
+            );
             print_entity(
                 ctx,
                 &serde_json::json!({
                     "work_item_id": work_item_id,
                     "executions": execution_runs,
+                    "field_audit": field_audit,
                 }),
                 || {
                     if execution_runs.is_empty() {
                         println!("no executions for {work_item_id}");
-                        return;
                     }
                     for detail in &execution_runs {
                         print_execution_history_row(detail);
                     }
+                    crate::work_cmds::print_field_audit_section(&field_audit);
                 },
             )
         }

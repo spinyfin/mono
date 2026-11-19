@@ -1639,8 +1639,9 @@ pub(crate) async fn run_show_leaf(
             "attention_groups".to_owned(),
             serde_json::to_value(&attention_groups).map_err(CliError::internal)?,
         );
-        // Every recorded change to `deferred` / `autostart`, oldest first,
-        // each with the actor and the code path (and calling process) behind it.
+        // Every recorded change to `deferred` / `autostart` and every
+        // execution abandonment, oldest first, each with the actor, stable
+        // reason code and code path (and calling process) behind it.
         map.insert(
             "field_audit".to_owned(),
             serde_json::to_value(&field_audit).map_err(CliError::internal)?,
@@ -1666,7 +1667,7 @@ pub(crate) async fn run_show_leaf(
 
 /// Flag history is additive: an older engine, or a failed history read, must
 /// not fail `boss task show`. Treat those replies as no history and warn.
-fn field_audit_from_reply(
+pub(crate) fn field_audit_from_reply(
     reply: anyhow::Result<boss_protocol::FrontendEvent>,
 ) -> Vec<boss_protocol::TaskFieldAuditRow> {
     match reply {
@@ -1688,22 +1689,58 @@ fn field_audit_from_reply(
     }
 }
 
-/// The `deferred` / `autostart` history of a task, oldest first: what changed,
-/// who the engine attributes it to, and the code path that wrote it.
-fn print_field_audit_section(rows: &[boss_protocol::TaskFieldAuditRow]) {
+/// A task's flag and abandonment history, oldest first: what changed, who the
+/// engine attributes it to, the stable reason code and the code path that
+/// wrote it, and the operation id that ties together writes made atomically.
+pub(crate) fn print_field_audit_section(rows: &[boss_protocol::TaskFieldAuditRow]) {
     if rows.is_empty() {
         return;
     }
     println!();
-    println!("Flag history ({}):", rows.len());
+    println!("Flag and abandonment history ({}):", rows.len());
     for row in rows {
         let old = row.old_value.as_deref().unwrap_or("-");
         let new = row.new_value.as_deref().unwrap_or("-");
         let lower_bound = if row.age_is_lower_bound { " (or earlier)" } else { "" };
+        let subject = row
+            .execution_id
+            .as_deref()
+            .map_or_else(|| row.property.clone(), |id| format!("{} {id}", row.property));
         println!(
-            "  {} {} -> {} by {} at {}{} via {}",
-            row.property, old, new, row.actor, row.changed_at, lower_bound, row.basis
+            "  {subject} {old} -> {new} by {} at {}{lower_bound} via {}",
+            row.actor, row.changed_at, row.basis
         );
+        if let Some(code) = &row.reason_code {
+            println!("    reason: {code}");
+        }
+        if let Some(detail) = &row.detail {
+            println!("    detail: {detail}");
+        }
+        if let Some(operation) = &row.operation_id {
+            println!("    operation: {operation}");
+        }
+        if row.failure_stamp.is_some() || row.failure_error.is_some() {
+            println!(
+                "    failure: {} at {}",
+                row.failure_error.as_deref().unwrap_or("-"),
+                row.failure_stamp.as_deref().unwrap_or("-")
+            );
+        }
+        if row.execution_ever_ran.is_some() || row.item_ever_ran.is_some() {
+            println!(
+                "    ever ran: execution={} item={}",
+                ran_label(row.execution_ever_ran),
+                ran_label(row.item_ever_ran)
+            );
+        }
+    }
+}
+
+fn ran_label(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
     }
 }
 
@@ -2326,6 +2363,14 @@ mod field_audit_show_tests {
             basis: "insert_task_in_tx_as_actor".into(),
             changed_at: "1".into(),
             age_is_lower_bound: false,
+            reason_code: Some("insert_task_in_tx_as_actor".into()),
+            detail: None,
+            operation_id: Some("auditop_1".into()),
+            execution_id: None,
+            failure_stamp: None,
+            failure_error: None,
+            execution_ever_ran: None,
+            item_ever_ran: Some(false),
         }];
         let got = field_audit_from_reply(Ok(FrontendEvent::TaskFieldAuditList {
             work_item_id: "task_1".into(),

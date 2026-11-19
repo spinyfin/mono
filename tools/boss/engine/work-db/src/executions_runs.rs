@@ -1338,6 +1338,9 @@ impl WorkDb {
         // old blanket guard's incidental loop-halt for that specific
         // failure mode is given up in exchange for the live worker
         // actually showing on the kanban), not a defect in this query.
+        // Status, autostart, and the dispatch-failure clear are one operation
+        // so the related writes share an `operation_id`.
+        let run_start_operation = crate::task_status_audit::begin_operation_on(&tx)?;
         crate::task_status_audit::execute(
             &tx,
             "start_execution_run_on_host_with_tmux_hosting",
@@ -1438,6 +1441,7 @@ impl WorkDb {
                AND dispatch_failed_reason IS NOT NULL",
             params![execution.work_item_id],
         )?;
+        run_start_operation.end()?;
 
         let run_id = next_id("run");
         tx.execute(
@@ -1895,7 +1899,14 @@ impl WorkDb {
             && execution_status.is_terminal()
             && execution_status != ExecutionStatus::Completed;
 
-        tx.execute(
+        // The caller picks the terminal status; when it is `abandoned` the
+        // ledger records this writer as the cause. Worker-failure parking
+        // below shares this operation so the status demotion is listed
+        // with the abandonment.
+        let operation = crate::task_status_audit::begin_operation_on(&tx)?;
+        crate::task_status_audit::abandon(
+            &tx,
+            crate::task_status_audit::abandon_cause::RUN_FINISHED_ABANDONED,
             "UPDATE work_executions
              SET status = ?2,
                  cube_lease_id = CASE WHEN ?3 THEN NULL ELSE cube_lease_id END,
@@ -1980,6 +1991,7 @@ impl WorkDb {
         if worker_failure_basis.is_some() {
             crate::pr_flow::cascade_dependents_if_worker_failed(&mut pending, &tx, &execution.work_item_id, &now)?;
         }
+        operation.end()?;
         if execution_status.is_terminal() {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
             tracing::warn!(

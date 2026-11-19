@@ -392,8 +392,12 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
             .unwrap();
         }
         crate::progression_candidates::drop_views(&conn).unwrap();
-        conn.execute_batch("DROP TABLE task_status_audit; DROP TABLE task_status_audit_context;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER task_status_audit_abandon_execution;
+             DROP TABLE task_status_audit; DROP TABLE task_status_audit_context;
+             DROP TABLE task_status_audit_operation;",
+        )
+        .unwrap();
         if let Some(version) = version {
             conn.execute_batch(
                 "DROP TABLE dispatch_start_failures;
@@ -418,10 +422,11 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
             .unwrap();
         } else {
             conn.execute(
-                "DELETE FROM schema_migrations WHERE id IN (?1, ?2)",
+                "DELETE FROM schema_migrations WHERE id IN (?1, ?2, ?3)",
                 [
                     task_status_audit::MIGRATION_ID,
                     task_status_audit::DEFERRED_MIGRATION_ID,
+                    task_status_audit::EXECUTION_ABANDON_MIGRATION_ID,
                 ],
             )
             .unwrap();
@@ -746,7 +751,7 @@ fn a_write_that_bypasses_the_helper_is_still_recorded_as_unattributed() {
 }
 
 #[test]
-fn field_audit_listing_reports_only_the_two_flags_oldest_first() {
+fn field_audit_listing_reports_flags_and_correlated_status_oldest_first() {
     let db = WorkDb::open(temp_db_path("flag-audit-list")).unwrap();
     let product = create_test_product_named(&db, "Flag list");
     let chore = create_test_chore_manual(&db, &product.id, "Listed");
@@ -760,16 +765,23 @@ fn field_audit_listing_reports_only_the_two_flags_oldest_first() {
     )
     .unwrap();
     let rows = db.list_task_field_audit(&chore.id).unwrap();
+    // The status move rode in the same operation as the deferral, so it is
+    // reported with it; the item's earlier, unrelated writes are not.
     assert!(
         rows.iter()
-            .all(|row| row.property == "deferred" || row.property == "autostart")
+            .all(|row| matches!(row.property.as_str(), "deferred" | "autostart" | "status"))
     );
-    assert_eq!(rows.len(), 3, "creation rows for both flags plus the deferral");
-    let last = rows.last().unwrap();
     assert_eq!(
-        (last.property.as_str(), last.new_value.as_deref()),
-        ("deferred", Some("1"))
+        rows.len(),
+        5,
+        "creation rows for both flags and the status, the deferral and its status move"
     );
+    let deferral = rows.iter().rfind(|row| row.property == "deferred").unwrap();
+    assert_eq!(deferral.new_value.as_deref(), Some("1"));
+    let status = rows.iter().rfind(|row| row.property == "status").unwrap();
+    assert_eq!(status.operation_id, deferral.operation_id);
+    assert!(deferral.operation_id.is_some());
+    let last = deferral;
     assert!(!last.age_is_lower_bound);
     assert!(last.changed_at.parse::<i64>().unwrap() > 0);
     assert!(db.list_task_field_audit("task_missing").unwrap().is_empty());
@@ -995,4 +1007,596 @@ fn upgrade_refreshes_blocked_reason_trigger_for_repeated_dialog_failures() {
     assert_eq!(old_value, "worker_failed");
     assert_eq!(new_value, "worker_failed");
     assert_eq!(basis, "blocking_dialog_on_screen");
+}
+
+// ── Execution abandonment history ──────────────────────────────────────────
+//
+// Every engine write that moves an execution to `abandoned` must leave a
+// ledger row with a stable reason code, the previous status, and snapshots
+// that stay true after the execution is pruned or the item moves on.
+
+type AbandonRow = boss_protocol::TaskFieldAuditRow;
+
+fn abandonments(db: &WorkDb, work_item_id: &str) -> Vec<AbandonRow> {
+    db.list_task_field_audit(work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.property == task_status_audit::EXECUTION_ABANDONED_PROPERTY)
+        .collect()
+}
+
+fn the_abandonment(db: &WorkDb, work_item_id: &str, code: &str) -> AbandonRow {
+    let rows = abandonments(db, work_item_id);
+    assert_eq!(rows.len(), 1, "exactly one abandonment expected, got {rows:?}");
+    let row = rows.into_iter().next().unwrap();
+    assert_eq!(row.reason_code.as_deref(), Some(code));
+    assert_eq!(row.new_value.as_deref(), Some("abandoned"));
+    assert!(row.execution_id.is_some());
+    assert!(row.detail.as_deref().is_some_and(|detail| !detail.is_empty()));
+    assert_ne!(row.basis, task_status_audit::UNATTRIBUTED_WRITE);
+    row
+}
+
+fn execution_with_status(db: &WorkDb, work_item_id: &str, status: ExecutionStatus) -> WorkExecution {
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id)
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(status)
+            .repo_remote_url("git@github.com:foo/bar.git")
+            .build(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn redundant_duplicate_records_code_previous_status_and_never_ran_snapshots() {
+    let db = WorkDb::open(temp_db_path("abandon-redundant")).unwrap();
+    let product = create_test_product_named(&db, "Abandon redundant");
+    let chore = create_test_chore_manual(&db, &product.id, "Duplicate");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    db.mark_execution_redundant(&execution.id).unwrap();
+
+    let row = the_abandonment(&db, &chore.id, "redundant_duplicate");
+    assert_eq!(row.old_value.as_deref(), Some("ready"));
+    assert_eq!(row.execution_id.as_deref(), Some(execution.id.as_str()));
+    assert_eq!(row.actor, "engine");
+    assert_eq!(row.basis, "mark_execution_redundant");
+    assert_eq!((row.execution_ever_ran, row.item_ever_ran), (Some(false), Some(false)));
+    assert!(row.operation_id.is_some());
+    assert!(row.changed_at.parse::<i64>().unwrap() > 0);
+}
+
+#[test]
+fn ghost_active_heal_abandons_and_demotes_in_one_operation() {
+    let db = WorkDb::open(temp_db_path("abandon-ghost")).unwrap();
+    let product = create_test_product_named(&db, "Abandon ghost");
+    let chore = create_test_chore_manual(&db, &product.id, "Ghost");
+    db.update_work_item_as_actor(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+        "human",
+    )
+    .unwrap();
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    assert_eq!(db.heal_ghost_active_chores().unwrap().len(), 1);
+
+    let row = the_abandonment(&db, &chore.id, "ghost_active_demoted");
+    assert_eq!(row.execution_id.as_deref(), Some(execution.id.as_str()));
+    let rows = db.list_task_field_audit(&chore.id).unwrap();
+    let demotion = rows
+        .iter()
+        .find(|r| r.property == "status" && r.old_value.as_deref() == Some("active"))
+        .expect("the demotion shares an operation with the abandonment, so it is listed");
+    assert_eq!(demotion.new_value.as_deref(), Some("todo"));
+    assert_eq!(demotion.operation_id, row.operation_id);
+    assert_eq!(demotion.reason_code.as_deref(), Some("heal_ghost_active_chores"));
+    assert_eq!(demotion.item_ever_ran, Some(false));
+    assert!(
+        !rows.iter().any(|r| r.property == "status"
+            && r.old_value.as_deref() == Some("todo")
+            && r.new_value.as_deref() == Some("active")),
+        "the human's earlier todo -> active write is a different operation and is not listed"
+    );
+}
+
+#[test]
+fn stranded_execution_on_a_closed_item_is_attributed_to_the_sweep() {
+    let db = WorkDb::open(temp_db_path("abandon-stranded")).unwrap();
+    let product = create_test_product_named(&db, "Abandon stranded");
+    let chore = create_test_chore_manual(&db, &product.id, "Closed");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::WaitingDependency);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [&chore.id])
+        .unwrap();
+    assert_eq!(db.abandon_stranded_executions_on_closed_work_items().unwrap().len(), 1);
+    let row = the_abandonment(&db, &chore.id, "closed_item_stranded");
+    assert_eq!(row.old_value.as_deref(), Some("waiting_dependency"));
+    assert_eq!(row.execution_id.as_deref(), Some(execution.id.as_str()));
+}
+
+#[test]
+fn stale_revision_retirement_abandons_and_moves_to_review_together() {
+    let db = WorkDb::open(temp_db_path("abandon-stale-revision")).unwrap();
+    let product = create_test_product_named(&db, "Abandon stale revision");
+    let chore = create_test_chore_manual(&db, &product.id, "Stale");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    assert!(
+        db.retire_stale_revision_before_dispatch(&execution.id, &chore.id)
+            .unwrap()
+    );
+    let row = the_abandonment(&db, &chore.id, "stale_revision_retired");
+    let status = db
+        .list_task_field_audit(&chore.id)
+        .unwrap()
+        .into_iter()
+        .rfind(|r| r.property == "status")
+        .unwrap();
+    assert_eq!(status.new_value.as_deref(), Some("in_review"));
+    assert_eq!(status.operation_id, row.operation_id);
+}
+
+#[test]
+fn stale_governing_execution_redispatch_is_attributed_and_knows_it_ran() {
+    let db = WorkDb::open(temp_db_path("abandon-redispatch")).unwrap();
+    let product = create_test_product_named(&db, "Abandon redispatch");
+    let chore = create_test_chore_manual(&db, &product.id, "Redispatch");
+    let stale = execution_with_status(&db, &chore.id, ExecutionStatus::WaitingHuman);
+    db.request_execution_with_live_check(
+        RequestExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .audit_actor("human")
+            .build(),
+        |_| false,
+    )
+    .unwrap();
+    let row = the_abandonment(&db, &chore.id, "stale_governing_redispatch");
+    assert_eq!(row.old_value.as_deref(), Some("waiting_human"));
+    assert_eq!(row.execution_id.as_deref(), Some(stale.id.as_str()));
+    assert_eq!(row.actor, "human");
+}
+
+#[test]
+fn deferral_with_autostart_off_is_one_correlated_operation_by_the_callers_actor() {
+    let db = WorkDb::open(temp_db_path("abandon-deferral")).unwrap();
+    let product = create_test_product_named(&db, "Abandon deferral");
+    let chore = create_test_chore(&db, &product.id, "Defer me");
+    // An autostart chore may already carry its pending execution.
+    let execution = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| execution_with_status(&db, &chore.id, ExecutionStatus::Ready));
+    db.update_work_item_as_actor(
+        &chore.id,
+        WorkItemPatch {
+            deferred: Some(true),
+            autostart: Some(false),
+            ..WorkItemPatch::default()
+        },
+        "boss",
+    )
+    .unwrap();
+    // An unrelated write in the same second must not share the operation.
+    db.update_work_item_as_actor(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("blocked".to_owned()),
+            ..WorkItemPatch::default()
+        },
+        "human",
+    )
+    .unwrap();
+
+    let row = the_abandonment(&db, &chore.id, "deferred");
+    assert_eq!(row.actor, "boss");
+    assert_eq!(row.old_value.as_deref(), Some(execution.status.as_str()));
+    assert_eq!(row.execution_id.as_deref(), Some(execution.id.as_str()));
+    let rows = db.list_task_field_audit(&chore.id).unwrap();
+    let in_operation = |property: &str| {
+        rows.iter()
+            .rfind(|r| r.property == property && r.operation_id == row.operation_id)
+            .unwrap_or_else(|| panic!("{property} missing from the deferral operation: {rows:?}"))
+    };
+    assert_eq!(in_operation("deferred").new_value.as_deref(), Some("1"));
+    assert_eq!(in_operation("autostart").new_value.as_deref(), Some("0"));
+    let unrelated = rows.iter().rfind(|r| r.property == "status").unwrap();
+    assert_ne!(unrelated.operation_id, row.operation_id);
+    assert!(unrelated.operation_id.is_some());
+}
+
+#[test]
+fn finishing_a_run_as_abandoned_is_recorded_with_the_run_snapshot() {
+    let db = WorkDb::open(temp_db_path("abandon-finish-run")).unwrap();
+    let product = create_test_product_named(&db, "Abandon finish");
+    let chore = create_test_chore_manual(&db, &product.id, "Finish");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    let (execution, run) = db
+        .start_execution_run(&execution.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&execution.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::Abandoned)
+            .run_status("abandoned")
+            .build(),
+    )
+    .unwrap();
+    let row = the_abandonment(&db, &chore.id, "run_finished_abandoned");
+    assert_eq!(row.old_value.as_deref(), Some("running"));
+    assert_eq!((row.execution_ever_ran, row.item_ever_ran), (Some(true), Some(true)));
+}
+
+#[test]
+fn finishing_a_run_as_abandoned_parks_worker_failure_in_the_same_operation() {
+    let db = WorkDb::open(temp_db_path("abandon-finish-run-park")).unwrap();
+    let product = create_test_product_named(&db, "Abandon finish park");
+    let chore = create_test_chore_manual(&db, &product.id, "Finish park");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    let (execution, run) = db
+        .start_execution_run(&execution.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&execution.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::Abandoned)
+            .run_status("abandoned")
+            .error_text("pane refused input")
+            .record_last_error(true)
+            .worker_failure_basis(WorkerFailureBasis::BlockingDialogOnScreen)
+            .build(),
+    )
+    .unwrap();
+    let row = the_abandonment(&db, &chore.id, "run_finished_abandoned");
+    let status = db
+        .list_task_field_audit(&chore.id)
+        .unwrap()
+        .into_iter()
+        .rfind(|r| r.property == "status" && r.new_value.as_deref() == Some("blocked"))
+        .expect("worker-failure park shares an operation with the abandonment");
+    assert_eq!(status.operation_id, row.operation_id);
+    assert!(row.operation_id.is_some());
+}
+
+#[test]
+fn dispatch_failure_history_keeps_the_error_text_after_the_stamp_is_cleared() {
+    let db = WorkDb::open(temp_db_path("abandon-failure-error")).unwrap();
+    let product = create_test_product_named(&db, "Abandon failure error");
+    let chore = create_test_chore(&db, &product.id, "Failed start");
+    assert!(
+        db.bounce_dispatch_failed_to_backlog(&chore.id, "lease_failed", "cube refused the lease")
+            .unwrap()
+    );
+    let task = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert_eq!(task.dispatch_failed_reason.as_deref(), Some("lease_failed"));
+    assert_eq!(task.dispatch_failed_error.as_deref(), Some("cube refused the lease"));
+    let stamp = task
+        .dispatch_failed_at
+        .clone()
+        .expect("bounce stamps dispatch_failed_at");
+
+    let parked = db
+        .list_task_field_audit(&chore.id)
+        .unwrap()
+        .into_iter()
+        .rfind(|row| row.property == "autostart" && row.new_value.as_deref() == Some("0"))
+        .unwrap();
+    assert_eq!(parked.failure_error.as_deref(), Some("cube refused the lease"));
+    assert_ne!(parked.failure_error.as_deref(), Some("lease_failed"));
+    assert_eq!(parked.failure_stamp.as_deref(), Some(stamp.as_str()));
+
+    let execution = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| execution_with_status(&db, &chore.id, ExecutionStatus::Ready));
+    db.mark_execution_redundant(&execution.id).unwrap();
+    let abandonment = the_abandonment(&db, &chore.id, "redundant_duplicate");
+    assert_eq!(abandonment.failure_error.as_deref(), Some("cube refused the lease"));
+    assert_eq!(abandonment.failure_stamp.as_deref(), Some(stamp.as_str()));
+
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let task = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(task) | WorkItem::Task(task) => task,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert!(task.dispatch_failed_reason.is_none());
+    assert!(task.dispatch_failed_error.is_none());
+    assert!(task.dispatch_failed_at.is_none());
+
+    let after = db.list_task_field_audit(&chore.id).unwrap();
+    let abandonment = after
+        .iter()
+        .find(|row| row.reason_code.as_deref() == Some("redundant_duplicate"))
+        .unwrap();
+    assert_eq!(abandonment.failure_error.as_deref(), Some("cube refused the lease"));
+    assert_eq!(abandonment.failure_stamp.as_deref(), Some(stamp.as_str()));
+    let parked = after
+        .iter()
+        .rfind(|row| row.property == "autostart" && row.new_value.as_deref() == Some("0"))
+        .unwrap();
+    assert_eq!(parked.failure_error.as_deref(), Some("cube refused the lease"));
+    assert_eq!(parked.failure_stamp.as_deref(), Some(stamp.as_str()));
+}
+
+#[test]
+fn item_ever_ran_matches_execution_ever_ran_when_started_without_a_run_row() {
+    let db = WorkDb::open(temp_db_path("abandon-started-no-run")).unwrap();
+    let product = create_test_product_named(&db, "Abandon started");
+    let chore = create_test_chore_manual(&db, &product.id, "Started");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET started_at = '1700000000' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    db.mark_execution_redundant(&execution.id).unwrap();
+    let row = the_abandonment(&db, &chore.id, "redundant_duplicate");
+    assert_eq!((row.execution_ever_ran, row.item_ever_ran), (Some(true), Some(true)));
+}
+
+#[test]
+fn dropping_an_operation_without_end_does_not_correlate_later_writes() {
+    let db = WorkDb::open(temp_db_path("abandon-drop-op")).unwrap();
+    let product = create_test_product_named(&db, "Abandon drop");
+    let chore = create_test_chore_manual(&db, &product.id, "Drop");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    let mut conn = db.connect().unwrap();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    {
+        let _operation = task_status_audit::begin_operation(&tx).unwrap();
+        task_status_audit::abandon(
+            &tx,
+            task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
+            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    }
+    task_status_audit::execute(
+        &tx,
+        "unrelated_status",
+        "human",
+        "UPDATE tasks SET status = 'blocked', last_status_actor = 'human' WHERE id = ?1",
+        [&chore.id],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(conn);
+    let row = the_abandonment(&db, &chore.id, "redundant_duplicate");
+    let later: (Option<String>,) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT operation_id FROM task_status_audit
+             WHERE work_item_id = ?1 AND property = 'status' AND new_value = 'blocked'
+             ORDER BY id DESC LIMIT 1",
+            [&chore.id],
+            |r| Ok((r.get(0)?,)),
+        )
+        .unwrap();
+    assert_ne!(later.0, row.operation_id);
+    assert!(row.operation_id.is_some());
+    assert!(later.0.is_some());
+}
+
+#[test]
+fn starting_a_run_records_status_and_autostart_in_one_operation() {
+    let db = WorkDb::open(temp_db_path("abandon-run-start-op")).unwrap();
+    let product = create_test_product_named(&db, "Run start op");
+    let chore = create_test_chore(&db, &product.id, "Start");
+    let execution = db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| execution_with_status(&db, &chore.id, ExecutionStatus::Ready));
+    db.start_execution_run(&execution.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    let rows = db.list_task_field_audit(&chore.id).unwrap();
+    let autostart = rows
+        .iter()
+        .rfind(|row| row.property == "autostart" && row.new_value.as_deref() == Some("0"))
+        .unwrap();
+    let status = rows
+        .iter()
+        .rfind(|row| row.property == "status" && row.new_value.as_deref() == Some("active"))
+        .expect("status move shares an operation with the autostart clear");
+    assert_eq!(status.operation_id, autostart.operation_id);
+    assert!(autostart.operation_id.is_some());
+}
+
+#[test]
+fn a_write_that_bypasses_the_helper_is_recorded_as_an_unattributed_abandonment() {
+    let db = WorkDb::open(temp_db_path("abandon-unattributed")).unwrap();
+    let product = create_test_product_named(&db, "Abandon raw");
+    let chore = create_test_chore_manual(&db, &product.id, "Raw");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    let rows = abandonments(&db, &chore.id);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reason_code.as_deref(), Some("unattributed_write"));
+    assert_eq!(rows[0].basis, "unattributed_write");
+    assert_eq!(rows[0].operation_id, None);
+}
+
+#[test]
+fn abandon_history_rolls_back_with_its_transaction_and_leaves_no_context_behind() {
+    let db = WorkDb::open(temp_db_path("abandon-rollback")).unwrap();
+    let product = create_test_product_named(&db, "Abandon rollback");
+    let chore = create_test_chore_manual(&db, &product.id, "Rollback");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    let mut conn = db.connect().unwrap();
+    {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let operation = task_status_audit::begin_operation(&tx).unwrap();
+        task_status_audit::abandon(
+            &tx,
+            task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
+            "UPDATE work_executions SET status = 'abandoned' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+        operation.end().unwrap();
+        // Dropping the transaction rolls the state change and its history back.
+    }
+    drop(conn);
+    assert!(abandonments(&db, &chore.id).is_empty());
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Ready);
+
+    // A statement that fails inside the helper is undone by its savepoint,
+    // leaving neither the cause context nor the operation behind.
+    let conn = db.connect().unwrap();
+    let failed = task_status_audit::abandon(
+        &conn,
+        task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
+        "UPDATE no_such_table SET status = 'abandoned'",
+        [],
+    );
+    assert!(failed.is_err());
+    for table in ["task_status_audit_context", "task_status_audit_operation"] {
+        let rows: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "{table} must be empty after a failed write");
+    }
+}
+
+#[test]
+fn abandon_history_survives_later_status_changes_and_pruning_of_the_execution() {
+    let db = WorkDb::open(temp_db_path("abandon-retained")).unwrap();
+    let product = create_test_product_named(&db, "Abandon retained");
+    let chore = create_test_chore_manual(&db, &product.id, "Retained");
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    db.mark_execution_redundant(&execution.id).unwrap();
+    let before = the_abandonment(&db, &chore.id, "redundant_duplicate");
+
+    // A later status change, and the execution row disappearing as retention
+    // does for a never-started terminal row, leave the history as it was.
+    db.update_work_item_as_actor(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+        "human",
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM work_executions WHERE id = ?1", [&execution.id])
+        .unwrap();
+    assert!(db.list_executions(Some(&chore.id)).unwrap().is_empty());
+    let after = the_abandonment(&db, &chore.id, "redundant_duplicate");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn upgrading_keeps_old_ledger_rows_unattributed_and_records_new_abandonments() {
+    let (_dir, path) = disk_db_path("abandon-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_named(&db, "Abandon upgrade");
+    let chore = create_test_chore_manual(&db, &product.id, "Upgrade");
+    let conn = db.connect().unwrap();
+    // Reconstruct the ledger as it was before this migration: old recorders,
+    // none of the added columns, no operation table.
+    for property in [
+        "status",
+        "blocked_reason",
+        "dispatch_failed_reason",
+        "autostart",
+        "deferred",
+    ] {
+        conn.execute_batch(&format!(
+            "DROP TRIGGER task_status_audit_insert_{property}; DROP TRIGGER task_status_audit_update_{property};"
+        ))
+        .unwrap();
+    }
+    conn.execute_batch(
+        "DROP TRIGGER task_status_audit_abandon_execution;
+         DROP INDEX task_status_audit_operation_id;
+         DROP TABLE task_status_audit_operation;
+         ALTER TABLE task_status_audit DROP COLUMN operation_id;
+         ALTER TABLE task_status_audit DROP COLUMN reason_code;
+         ALTER TABLE task_status_audit DROP COLUMN detail;
+         ALTER TABLE task_status_audit DROP COLUMN execution_id;
+         ALTER TABLE task_status_audit DROP COLUMN failure_stamp;
+         ALTER TABLE task_status_audit DROP COLUMN failure_error;
+         ALTER TABLE task_status_audit DROP COLUMN execution_ever_ran;
+         ALTER TABLE task_status_audit DROP COLUMN item_ever_ran;
+         ALTER TABLE task_status_audit_context DROP COLUMN reason_code;
+         ALTER TABLE task_status_audit_context DROP COLUMN detail;",
+    )
+    .unwrap();
+    for property in [
+        "status",
+        "blocked_reason",
+        "dispatch_failed_reason",
+        "autostart",
+        "deferred",
+    ] {
+        task_status_audit::install_property_triggers(&conn, property).unwrap();
+    }
+    conn.execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&chore.id])
+        .unwrap();
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE id = ?1",
+        [task_status_audit::EXECUTION_ABANDON_MIGRATION_ID],
+    )
+    .unwrap();
+    drop(conn);
+    drop(db);
+
+    for _ in 0..2 {
+        let db = WorkDb::open(path.clone()).unwrap();
+        schema_init::assert_all_migrations_applied(&db.connect().unwrap());
+        let old = db
+            .list_task_field_audit(&chore.id)
+            .unwrap()
+            .into_iter()
+            .rfind(|r| r.property == "autostart")
+            .unwrap();
+        assert_eq!(
+            old.basis, "unattributed_write",
+            "the pre-migration write is kept as recorded"
+        );
+        assert_eq!(
+            (
+                &old.reason_code,
+                &old.operation_id,
+                &old.item_ever_ran,
+                &old.execution_id
+            ),
+            (&None, &None, &None, &None),
+            "nothing is invented for a transition recorded before causes were captured"
+        );
+    }
+    let db = WorkDb::open(path).unwrap();
+    let execution = execution_with_status(&db, &chore.id, ExecutionStatus::Ready);
+    db.mark_execution_redundant(&execution.id).unwrap();
+    the_abandonment(&db, &chore.id, "redundant_duplicate");
 }
