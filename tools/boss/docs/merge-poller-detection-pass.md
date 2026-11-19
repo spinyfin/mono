@@ -33,21 +33,29 @@ Two properties follow from that order:
 - **A merge is recorded before any open-PR upkeep.** Observing a merge costs
   the list queries, the probe and that PR's own transition. It does not wait
   behind the upkeep of every PR listed ahead of it.
-- **The per-execution rechecks can only delay themselves.** They make GitHub
-  calls per live worker, so their cost grows with how many workers are
-  running. They run after every batched and local phase.
+- **The open walk leaves a reserve for later phases.** It stops when a
+  quarter of the pass budget remains, and does not stamp the candidates it
+  did not start, so the next pass resumes them. Stranded recovery, queue
+  rebounce, reviewer upkeep, PR recheck, background nudges and late-PR
+  recovery still run in that reserved time. The three per-execution
+  families rotate which one starts after that upkeep, so a slow recheck
+  cannot starve late-PR recovery across passes.
 
 ## When a pass runs out of time
 
-The loop drops a pass that exceeds its budget. Three things keep that from
+The loop drops a pass that exceeds its budget. Four things keep that from
 turning into PRs that are never observed:
 
+- **Open-walk reserve.** The walk of still-open PRs stops while a quarter of
+  the budget remains, so later phases are not starved when that walk alone
+  would exceed 180 s. Unwalked candidates are not stamped.
 - **Rotation.** The PR walk and the per-execution rechecks are ordered least
   recently attended first, and that memory is kept across passes. Whatever
   one pass did not reach is what the next pass starts with. A candidate is
   marked when the pass starts on it, so a candidate whose own handling is
   what exhausts the budget goes to the back of the next pass instead of
-  cutting every pass off in the same place.
+  cutting every pass off in the same place. The three per-execution
+  families also rotate their starting order across passes.
 - **The adaptive schedule is left alone.** An abandoned pass has no
   observations. It is not treated as a pass that saw no candidates, which
   would retire every per-PR adaptive slot; hot PRs keep being reconciled

@@ -11,7 +11,9 @@
 //! Time is tokio's virtual clock throughout: "open-PR upkeep is slow" is a
 //! publisher that sleeps, not a real stall.
 
-use boss_protocol::FrontendEvent;
+use crate::work::{LatePrCandidate, ReviewBatchDispatch};
+use boss_observation_contracts::ReviewBatchEnqueuer;
+use boss_protocol::{FrontendEvent, WorkExecution};
 
 use super::*;
 
@@ -102,7 +104,18 @@ fn is_done(db: &WorkDb, work_item_id: &str) -> bool {
 async fn budgeted_pass(
     db: &WorkDb,
     probe: &StubProbe,
-    publisher: &SlowUpkeepPublisher,
+    publisher: &dyn ExecutionPublisher,
+    metrics: &Registry,
+    state: &PassState,
+) -> Option<(SweepOutcome, Vec<PollObservation>)> {
+    budgeted_pass_with(db, probe, publisher, None, metrics, state).await
+}
+
+async fn budgeted_pass_with(
+    db: &WorkDb,
+    probe: &StubProbe,
+    publisher: &dyn ExecutionPublisher,
+    completion_handler: Option<&dyn CompletionRequests>,
     metrics: &Registry,
     state: &PassState,
 ) -> Option<(SweepOutcome, Vec<PollObservation>)> {
@@ -118,10 +131,12 @@ async fn budgeted_pass(
             publisher,
             SweepHandlers {
                 cube_client: None,
-                completion_handler: None,
+                completion_handler,
                 host: None,
+                parked_ids: None,
             },
             state,
+            BUDGET,
         ),
     )
     .await
@@ -144,15 +159,13 @@ async fn a_merge_listed_last_is_recorded_by_a_pass_that_is_then_abandoned() {
     let publisher = SlowUpkeepPublisher::default();
     let state = PassState::default();
 
-    let completed = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
+    let _completed = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
 
-    assert!(completed.is_none(), "eight 50s upkeeps cannot fit a 180s budget");
     assert!(
         is_done(&db, &merged.work_item_id),
         "a merged PR must be recorded even when it is listed behind more open-PR upkeep than the pass has time for",
     );
 
-    // The trace survives the dropped pass and names where it was cut off.
     let timings = state.trace().timings();
     let terminal = timings
         .phases
@@ -160,20 +173,23 @@ async fn a_merge_listed_last_is_recorded_by_a_pass_that_is_then_abandoned() {
         .find(|phase| phase.phase == PassPhase::TerminalWalk)
         .expect("the terminal walk finished");
     assert_eq!((terminal.items_done, terminal.items_total), (1, 1));
-    let cut_off = timings.in_flight.as_ref().expect("the pass was cut off mid-phase");
-    assert_eq!(cut_off.phase, PassPhase::OpenWalk);
-    assert_eq!(cut_off.items_total, 8);
-    assert!(cut_off.items_done < 8, "{cut_off:?}");
-    assert!(cut_off.item.is_some(), "the candidate in flight must be named");
+    let open = timings
+        .phases
+        .iter()
+        .chain(timings.in_flight.as_ref())
+        .find(|phase| phase.phase == PassPhase::OpenWalk)
+        .expect("the open walk ran");
+    assert_eq!(open.items_total, 8);
+    assert!(open.items_done < 8, "{open:?}");
+    assert!(
+        timings.phases.iter().any(|phase| phase.phase == PassPhase::StrandedCi),
+        "the open walk must leave a reserve so later upkeep still runs: {}",
+        timings.breakdown(),
+    );
     assert!(timings.breakdown().contains("open_walk="), "{}", timings.breakdown());
-    assert!(timings.breakdown().contains("[cut off at "), "{}", timings.breakdown());
-
-    // And it is published, so the phase is readable without the log.
-    assert_eq!(metrics.gauge_value("merge_poller.pass_duration_ms"), Some(180_000));
     assert!(metrics.gauge_value("merge_poller.phase_ms.open_walk").unwrap() > 100_000);
     assert!(metrics.gauge_value("merge_poller.items_unfinished").unwrap() > 0);
     assert_eq!(metrics.counter_value("merge_poller.passes"), Some(1));
-    assert_eq!(metrics.counter_value("merge_poller.pass_timed_out"), Some(1));
 }
 
 /// Progress across abandoned passes. Nine open PRs, each costing 50s of
@@ -194,8 +210,7 @@ async fn successive_abandoned_passes_attend_to_every_open_candidate() {
     let mut attended: Vec<Vec<String>> = Vec::new();
     for ci in ci_by_pass {
         set_all_open(&stub, &listed, ci);
-        let completed = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
-        assert!(completed.is_none(), "every pass here runs out of budget");
+        let _completed = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
         attended.push(publisher.take_upkept());
     }
 
@@ -231,7 +246,7 @@ async fn without_carried_state_every_abandoned_pass_walks_the_same_head() {
     for ci in [OpenPrCiStatus::Clean, OpenPrCiStatus::InFlight] {
         set_all_open(&stub, &listed, ci);
         let fresh = PassState::default();
-        assert!(budgeted_pass(&db, &stub, &publisher, &metrics, &fresh).await.is_none());
+        let _ = budgeted_pass(&db, &stub, &publisher, &metrics, &fresh).await;
         attended.push(publisher.take_upkept());
     }
 
@@ -426,4 +441,291 @@ fn an_abandoned_pass_leaves_the_adaptive_schedule_in_place() {
     // A pass that completed with nothing to observe still retires them.
     assert!(schedule.apply_pass_observations(Some(&[]), now, CADENCE).is_some());
     assert_eq!(schedule.tracked(), 0);
+}
+
+fn phase_ran(timings: &PassTimings, phase: PassPhase) -> bool {
+    timings
+        .phases
+        .iter()
+        .chain(timings.in_flight.as_ref())
+        .any(|timing| timing.phase == phase)
+}
+
+struct NoopEnqueuer;
+
+#[async_trait]
+impl ReviewBatchEnqueuer for NoopEnqueuer {
+    async fn enqueue(
+        &self,
+        _work_db: &WorkDb,
+        _work_item_id: &str,
+        _repo_remote_url: &str,
+        _pr_url: &str,
+        _review_pool_size: usize,
+    ) -> Result<ReviewBatchDispatch> {
+        unreachable!("review batch fanout is off in this fixture")
+    }
+}
+
+/// Completion handler whose PR recheck, late-PR, and background-nudge
+/// paths each take [`UPKEEP`], so those families contend for the budget.
+struct SlowRecheckHandler {
+    rechecked: std::sync::Mutex<Vec<String>>,
+    late: std::sync::Mutex<Vec<String>>,
+    nudges: std::sync::Mutex<Vec<String>>,
+    pending_nudges: Vec<String>,
+    enqueuer: NoopEnqueuer,
+}
+
+impl SlowRecheckHandler {
+    fn new(pending_nudges: Vec<String>) -> Self {
+        Self {
+            rechecked: std::sync::Mutex::new(Vec::new()),
+            late: std::sync::Mutex::new(Vec::new()),
+            nudges: std::sync::Mutex::new(Vec::new()),
+            pending_nudges,
+            enqueuer: NoopEnqueuer,
+        }
+    }
+}
+
+#[async_trait]
+impl CompletionRequests for SlowRecheckHandler {
+    fn review_guide_source_capture_enabled(&self) -> bool {
+        false
+    }
+    fn pending_background_nudge_execution_ids(&self) -> Vec<String> {
+        self.pending_nudges.clone()
+    }
+    async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
+        self.nudges.lock().unwrap().push(execution_id.to_owned());
+        tokio::time::sleep(UPKEEP).await;
+        None
+    }
+    fn review_batch_fanout_enabled(&self) -> bool {
+        false
+    }
+    fn review_pool_size(&self) -> usize {
+        0
+    }
+    async fn force_release(&self, _execution_id: &str) {}
+    async fn record_parent_pr_merge_cancellation(
+        &self,
+        _execution: &WorkExecution,
+        _prior_status: ExecutionStatus,
+        _chain_root_id: &str,
+    ) {
+    }
+    async fn force_stop_execution(&self, _execution_id: &str) {}
+    async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {
+        self.rechecked.lock().unwrap().push(execution_id.to_owned());
+        tokio::time::sleep(UPKEEP).await;
+        StopOutcome::AwaitingInput
+    }
+    async fn recheck_for_pr_late(&self, candidate: &LatePrCandidate) -> StopOutcome {
+        self.late.lock().unwrap().push(candidate.execution_id.clone());
+        tokio::time::sleep(UPKEEP).await;
+        StopOutcome::AwaitingInput
+    }
+    fn reconcile_review_guide_source_from_probe(
+        &self,
+        _root_task_id: &str,
+        _pr_url: &str,
+        _base_sha: &str,
+        _head_sha: &str,
+        _observation_sequence: i64,
+    ) {
+    }
+    fn speculative_conflict_prediction_enabled(&self) -> bool {
+        false
+    }
+    fn stacked_pr_auto_structuring_enabled(&self) -> bool {
+        false
+    }
+    fn mechanical_rebase_enabled(&self) -> bool {
+        false
+    }
+    fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
+        &self.enqueuer
+    }
+}
+
+fn waiting_human_execution(db: &WorkDb, product_id: &str, label: &str) -> String {
+    let chore = create_test_chore_manual(db, product_id.to_owned(), format!("Recheck {label}"));
+    let exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build(),
+        )
+        .unwrap();
+    let (exec, run) = db
+        .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/workspaces/ws-1")
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&exec.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .build(),
+    )
+    .unwrap();
+    exec.id
+}
+
+fn late_pr_execution(db: &WorkDb, product_id: &str, label: &str) -> String {
+    let id = waiting_human_execution(db, product_id, label);
+    db.mark_execution_redundant(&id).unwrap();
+    id
+}
+
+/// Slow open-PR upkeep exceeds the budget. Later phases still run: upkeep
+/// in the same pass (the open-walk reserve), and pending-recheck / late-PR
+/// work within a bounded number of rotated passes.
+#[tokio::test(start_paused = true)]
+async fn slow_open_walk_still_reaches_recheck_late_pr_and_upkeep() {
+    let (_dir, db) = open_db();
+    let metrics = Registry::new();
+    crate::init(&metrics);
+    let listed = tracked_prs(&db, 9);
+    let product_id = listed[0].product_id.clone();
+    for i in 1..=3 {
+        waiting_human_execution(&db, &product_id, &format!("live-{i}"));
+        late_pr_execution(&db, &product_id, &format!("late-{i}"));
+    }
+    let stub = StubProbe::new();
+    let publisher = SlowUpkeepPublisher::default();
+    let handler = SlowRecheckHandler::new(Vec::new());
+    let state = PassState::default();
+
+    for (n, ci) in [OpenPrCiStatus::Clean, OpenPrCiStatus::InFlight, OpenPrCiStatus::Clean]
+        .into_iter()
+        .enumerate()
+    {
+        set_all_open(&stub, &listed, ci);
+        let _ = budgeted_pass_with(&db, &stub, &publisher, Some(&handler), &metrics, &state).await;
+        let timings = state.trace().timings();
+        assert!(
+            phase_ran(&timings, PassPhase::StrandedCi),
+            "pass {n} must still reach upkeep after a slow open walk: {}",
+            timings.breakdown(),
+        );
+    }
+
+    assert!(
+        !handler.rechecked.lock().unwrap().is_empty(),
+        "pending rechecks must be reached within three reserved passes",
+    );
+    assert!(
+        !handler.late.lock().unwrap().is_empty(),
+        "late-PR recovery must be reached within three reserved passes",
+    );
+}
+
+/// Slow PR rechecks plus late candidates: late_pr is still serviced because
+/// the three per-execution families rotate which one starts after upkeep.
+#[tokio::test(start_paused = true)]
+async fn slow_rechecks_still_service_late_pr() {
+    let (_dir, db) = open_db();
+    let metrics = Registry::new();
+    crate::init(&metrics);
+    let listed = tracked_prs(&db, 1);
+    let product_id = listed[0].product_id.clone();
+    for i in 1..=4 {
+        waiting_human_execution(&db, &product_id, &format!("live-{i}"));
+    }
+    for i in 1..=3 {
+        late_pr_execution(&db, &product_id, &format!("late-{i}"));
+    }
+    let stub = StubProbe::new();
+    set_all_open(&stub, &listed, OpenPrCiStatus::Clean);
+    let publisher = RecordingPublisher::default();
+    let handler = SlowRecheckHandler::new(Vec::new());
+    let state = PassState::default();
+
+    for _ in 0..3 {
+        let _ = budgeted_pass_with(&db, &stub, &publisher, Some(&handler), &metrics, &state).await;
+    }
+
+    assert!(
+        !handler.late.lock().unwrap().is_empty(),
+        "late-PR recovery must run even when rechecks are slow: rechecked={:?} late={:?}",
+        handler.rechecked.lock().unwrap(),
+        handler.late.lock().unwrap(),
+    );
+}
+
+/// A completed pass with a non-empty probe batch records the probe as
+/// finished, so items_unfinished is zero.
+#[tokio::test(start_paused = true)]
+async fn a_completed_pass_with_probed_prs_reports_zero_unfinished_items() {
+    let (_dir, db) = open_db();
+    let metrics = Registry::new();
+    crate::init(&metrics);
+    let listed = tracked_prs(&db, 3);
+    let stub = StubProbe::new();
+    set_all_open(&stub, &listed, OpenPrCiStatus::Clean);
+    let publisher = RecordingPublisher::default();
+    let state = PassState::default();
+
+    let completed = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
+    assert!(completed.is_some(), "three cheap candidates fit the budget");
+
+    let timings = state.trace().timings();
+    assert!(timings.in_flight.is_none(), "{}", timings.breakdown());
+    assert_eq!(timings.items_unfinished(), 0, "{}", timings.breakdown());
+    let probe = timings
+        .phases
+        .iter()
+        .find(|phase| phase.phase == PassPhase::Probe)
+        .expect("probe ran");
+    assert_eq!((probe.items_done, probe.items_total), (1, 1), "{probe:?}");
+}
+
+/// Representative headless load: fifty tracked PRs, stub probe, local DB
+/// only. The open walk observes every candidate inside the unchanged 180 s
+/// budget.
+#[tokio::test]
+async fn a_headless_pass_over_current_pr_counts_finishes_inside_the_budget() {
+    let (_dir, db) = open_db();
+    let listed = tracked_prs(&db, 50);
+    let stub = StubProbe::new();
+    set_all_open(&stub, &listed, OpenPrCiStatus::Clean);
+    let publisher = RecordingPublisher::default();
+    let state = PassState::default();
+    let started = std::time::Instant::now();
+
+    let _outcome = run_one_pass_tracked(
+        &db,
+        stub.as_ref(),
+        &publisher,
+        SweepHandlers {
+            cube_client: None,
+            completion_handler: None,
+            host: None,
+            parked_ids: None,
+        },
+        &state,
+        BUDGET,
+    )
+    .await;
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < BUDGET,
+        "headless pass over 50 PRs took {elapsed:?}, over the {BUDGET:?} budget"
+    );
+    let timings = state.trace().timings();
+    assert!(timings.in_flight.is_none(), "{}", timings.breakdown());
+    assert_eq!(timings.items_unfinished(), 0, "{}", timings.breakdown());
+    let open = timings
+        .phases
+        .iter()
+        .find(|phase| phase.phase == PassPhase::OpenWalk)
+        .expect("open walk ran");
+    assert_eq!(open.items_done, 50, "{open:?}");
 }

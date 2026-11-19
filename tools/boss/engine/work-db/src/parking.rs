@@ -150,6 +150,8 @@
 //! born parked or moved into a parked project carries the basis of the write
 //! that created or moved it.
 
+use std::collections::HashSet;
+
 use super::*;
 use crate::executions_runs::CancelExecutionOpts;
 use crate::parking_reconcile::{self, UnparkReport};
@@ -706,6 +708,28 @@ impl WorkDb {
                 false
             }
         }
+    }
+
+    /// [`Self::is_parked`] for every id in `ids`, in one query per 500 ids.
+    /// Missing or non-task ids are absent from the result (not parked).
+    pub fn parked_work_item_ids(&self, ids: &[String]) -> Result<HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let conn = self.connect()?;
+        const CHUNK: usize = 500;
+        let mut parked = HashSet::new();
+        let predicate = parked_task_sql("t");
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT t.id FROM tasks t WHERE t.id IN ({placeholders}) AND {predicate}");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| row.get::<_, String>(0))?;
+            for id in rows {
+                parked.insert(id?);
+            }
+        }
+        Ok(parked)
     }
 
     /// See [`upkeep_eligible`].

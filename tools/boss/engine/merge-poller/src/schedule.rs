@@ -679,8 +679,10 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
                             cube_client: Some(cube_client.as_ref()),
                             completion_handler: Some(completion_handler.as_ref()),
                             host: Some(host.as_ref()),
+                            parked_ids: None,
                         },
                         &pass_state,
+                        budget,
                     ),
                 ),
             )

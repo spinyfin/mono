@@ -174,6 +174,7 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
     publisher: &dyn ExecutionPublisher,
     in_review: &[PendingMergeCheck],
     blocked_ci: &[PendingMergeCheck],
+    parked_ids: Option<&std::collections::HashSet<String>>,
     outcome: &mut SweepOutcome,
 ) {
     let mut rebounce_seen = std::collections::HashSet::new();
@@ -183,7 +184,10 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
         .filter(|candidate| rebounce_seen.insert(candidate.work_item_id.clone()))
         // Rebounce detection mints a CI-fix attempt and clearing an intent is
         // merge-queue upkeep: neither runs for a parked row.
-        .filter(|candidate| !work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge_queue rebounce"))
+        .filter(|candidate| !match parked_ids {
+            Some(ids) => ids.contains(&candidate.work_item_id),
+            None => work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge_queue rebounce"),
+        })
         .filter(|candidate| !is_trunk_queue_product(work_db, &candidate.product_id))
         .collect();
     let rebounce_urls: Vec<String> = rebounce_candidates.iter().map(|c| c.pr_url.clone()).collect();

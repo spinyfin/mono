@@ -12,6 +12,7 @@
 //! not reach is what the next pass starts with.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::pass_trace::PassTrace;
@@ -76,6 +77,11 @@ pub(crate) struct PassRotations {
 pub struct PassState {
     pub(crate) trace: PassTrace,
     rotations: Mutex<PassRotations>,
+    /// Which of the per-execution families (PR recheck, background nudges,
+    /// late PR) this pass starts with after the open walk and local upkeep.
+    /// Advanced each pass that reaches those families so a slow recheck
+    /// cannot starve late-PR recovery forever.
+    late_phase_turn: AtomicU64,
 }
 
 impl PassState {
@@ -88,5 +94,10 @@ impl PassState {
     pub(crate) fn rotations(&self) -> MutexGuard<'_, PassRotations> {
         // Plain bookkeeping with no invariant a panic could break.
         self.rotations.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Take the next starting offset among the three per-execution families.
+    pub(crate) fn next_late_phase_turn(&self) -> u64 {
+        self.late_phase_turn.fetch_add(1, Ordering::Relaxed)
     }
 }

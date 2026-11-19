@@ -79,40 +79,26 @@ impl WorkDb {
     /// source read. The returned sequence, rather than a response timestamp,
     /// fences delayed GitHub responses from replacing a newer observation.
     pub fn allocate_pr_review_guide_source_observation_sequence(&self) -> Result<i64> {
-        let conn = self.connect()?;
-        // Seed the singleton on first use. Subsequent allocations preserve
-        // the sequence persisted by earlier engine versions.
-        conn.execute(
-            "INSERT OR IGNORE INTO pr_review_guide_source_observation_sequence (id, last_sequence)
-             VALUES (1, 0)",
-            [],
-        )?;
-        conn.query_row(
-            "UPDATE pr_review_guide_source_observation_sequence
-             SET last_sequence = last_sequence + 1
-             WHERE id = 1
-             RETURNING last_sequence",
-            [],
-            |row| row.get(0),
-        )
-        .context("allocate PR review-guide source observation sequence")
+        self.allocate_pr_review_guide_source_observation_sequences(1)?
+            .into_iter()
+            .next()
+            .context("block allocator returned no sequence for a unit allocation")
     }
 
     /// [`Self::allocate_pr_review_guide_source_observation_sequence`] for
     /// `count` reads about to start together: one contiguous, ascending
     /// block of sequences, allocated in a single statement.
     ///
-    /// A batched probe covers every tracked PR in one request. Allocating
-    /// its sequences one call at a time took the connection lock once per
-    /// PR before the request could even be sent, so the wait for the lock
-    /// was paid as many times as there are tracked PRs. The block is the
-    /// same set of values those calls would have returned back to back.
+    /// One statement for the whole batch, so the connection lock is taken
+    /// once per probe rather than once per PR.
     pub fn allocate_pr_review_guide_source_observation_sequences(&self, count: usize) -> Result<Vec<i64>> {
         if count == 0 {
             return Ok(Vec::new());
         }
         let count = i64::try_from(count).context("review-guide source observation sequence block is too large")?;
         let conn = self.connect()?;
+        // Seed the singleton on first use. Subsequent allocations preserve
+        // the sequence persisted by earlier engine versions.
         conn.execute(
             "INSERT OR IGNORE INTO pr_review_guide_source_observation_sequence (id, last_sequence)
              VALUES (1, 0)",

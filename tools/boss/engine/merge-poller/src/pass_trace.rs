@@ -3,11 +3,9 @@
 //!
 //! A pass is one future on the poller's task. When it exceeds its budget the
 //! loop drops it, and everything the pass knew about its own progress goes
-//! with it: the only record used to be "the pass was abandoned", with no way
-//! to tell a slow GitHub round trip from a slow candidate walk from a slow
-//! per-worker recheck. [`PassTrace`] lives outside the pass future, so the
-//! loop can still read which phase was in flight, how far through its items
-//! it was, and what every earlier phase cost.
+//! with it. [`PassTrace`] lives outside the pass future, so the loop can
+//! still read which phase was in flight, how far through its items it was,
+//! and what every earlier phase cost.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;

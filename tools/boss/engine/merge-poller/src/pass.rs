@@ -2,6 +2,8 @@
 //! record what the probe says, then run the upkeep that rides the same
 //! cadence. See [`run_one_pass_tracked`] for the order and why it matters.
 
+use std::collections::HashSet;
+
 use super::deferred_review_admission::sweep_deferred_review_admission_with;
 use super::host::SweepHost;
 use super::pass_trace::PassPhase;
@@ -26,6 +28,50 @@ pub(crate) const PROBE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
 /// into an unbounded GitHub-quota amplifier; abandoning the remainder is
 /// safe because every candidate list is rebuilt from the DB next pass.
 pub(crate) const MAX_PROBE_REFRESHES_PER_PASS: u8 = 2;
+
+/// Share of the pass budget the open walk leaves for everything after it.
+/// Without this, a walk that costs more than the budget never yields, and
+/// stranded recovery, reviewer upkeep, PR recheck and late-PR recovery
+/// never run.
+pub(crate) const OPEN_WALK_RESERVE_DIVISOR: u32 = 4;
+
+/// Wall-clock of one pass, used to stop a walk before it consumes the
+/// reserve later phases need. `deadline` is `None` when the caller did not
+/// bound the pass (`Duration::MAX`), so self-limiting is off.
+struct PassClock {
+    deadline: Option<tokio::time::Instant>,
+    budget: Duration,
+}
+
+impl PassClock {
+    fn start(budget: Duration) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            deadline: now.checked_add(budget),
+            budget,
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        match self.deadline {
+            Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
+            None => Duration::MAX,
+        }
+    }
+
+    /// True when continuing this walk would leave later phases less than
+    /// `budget / divisor`.
+    fn past_reserve(&self, divisor: u32) -> bool {
+        self.deadline.is_some() && self.remaining() <= self.budget / divisor
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LatePhase {
+    PrRecheck,
+    BackgroundNudges,
+    LatePr,
+}
 
 /// The batched probe result for one pass, plus the age bookkeeping that
 /// keeps a long pass from transitioning work items off a stale view of
@@ -96,6 +142,29 @@ impl ProbeSnapshot {
         self.results = probe.probe_batch(&urls).await;
         self.taken_at = tokio::time::Instant::now();
         true
+    }
+}
+
+/// Parked rows for every candidate this pass will walk or rebounce, in one
+/// query. A failed read treats none as parked, matching
+/// [`WorkDb::is_parked_or_assume_not`].
+fn parked_ids_for_pass<'a>(
+    work_db: &WorkDb,
+    candidates: impl IntoIterator<Item = &'a PendingMergeCheck>,
+) -> HashSet<String> {
+    let ids: Vec<String> = candidates
+        .into_iter()
+        .map(|candidate| candidate.work_item_id.clone())
+        .collect();
+    match work_db.parked_work_item_ids(&ids) {
+        Ok(parked) => parked,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: failed to batch-load parked rows; treating none as parked",
+            );
+            HashSet::new()
+        }
     }
 }
 
@@ -216,8 +285,10 @@ pub async fn run_one_pass_observed(
             cube_client,
             completion_handler,
             host,
+            parked_ids: None,
         },
         &PassState::default(),
+        Duration::MAX,
     )
     .await
 }
@@ -246,14 +317,18 @@ fn probed_terminal(results: &HashMap<String, std::result::Result<PrLifecycleProb
 ///    queries, the probe and its own transition — never the upkeep of the
 ///    candidates listed ahead of it.
 /// 3. **Open walk.** Upkeep of the still-open PRs, least recently attended
-///    first (see `walk_order`).
+///    first (see `walk_order`). Stops when the remaining budget is the
+///    reserve later phases need; unwalked candidates are not stamped.
 /// 4. **Batched and local phases.** Stranded remediation, the merge-queue
 ///    dequeue query, reviewer fallback and review-pool upkeep.
 /// 5. **Per-execution rechecks.** PR detection for live workers and recently
 ///    terminal executions makes GitHub calls per execution, so its cost
-///    scales with how many workers are running. It goes last, rotated like
-///    the walk, so it can only ever delay itself.
+///    scales with how many workers are running. The three families rotate
+///    their starting order across passes so a slow recheck cannot starve
+///    late-PR recovery.
 ///
+/// `budget` is the same cap the loop applies as a timeout. The pass uses it
+/// to stop the open walk with a reserve; `Duration::MAX` disables that.
 /// A pass dropped at its budget leaves `state` describing how far it got;
 /// nothing it did not reach is lost, because the next pass's rotation
 /// starts with exactly those candidates.
@@ -263,14 +338,17 @@ pub async fn run_one_pass_tracked(
     publisher: &dyn ExecutionPublisher,
     handlers: SweepHandlers<'_>,
     state: &PassState,
+    budget: Duration,
 ) -> (SweepOutcome, Vec<PollObservation>) {
     let SweepHandlers {
         cube_client,
         completion_handler,
         host,
+        parked_ids: _,
     } = handlers;
     let trace = &state.trace;
     trace.begin();
+    let clock = PassClock::start(budget);
     trace.enter(PassPhase::ListCandidates, 0);
     let in_review = match work_db.list_chores_pending_merge_check() {
         Ok(items) => items,
@@ -428,9 +506,13 @@ pub async fn run_one_pass_tracked(
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
-    trace.enter(PassPhase::Probe, probe_urls.len());
+    // One batched GitHub request, so the phase is one item: entering with
+    // `probe_urls.len()` and never finishing those items would report every
+    // probed URL as unfinished even on a healthy pass.
+    trace.enter(PassPhase::Probe, 1);
     let source_observation_sequences = allocate_source_observation_sequences(work_db, completion_handler, &probe_urls);
     let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
+    trace.finish_item();
 
     // The pass's candidate walk, materialised so a mid-pass re-probe can be
     // scoped to the part of it that has not happened yet — see
@@ -448,10 +530,15 @@ pub async fn run_one_pass_tracked(
         walk.extend(rotations.walk.order(open, |candidate| candidate.work_item_id.as_str()));
         walk
     };
+    let parked_ids = parked_ids_for_pass(work_db, sweep_walk.iter().copied().chain(stranded_blocked.iter()));
     trace.enter(PassPhase::TerminalWalk, terminal_count);
     for idx in 0..sweep_walk.len() {
         if idx == terminal_count {
             trace.enter(PassPhase::OpenWalk, sweep_walk.len() - terminal_count);
+        }
+        if idx >= terminal_count && clock.past_reserve(OPEN_WALK_RESERVE_DIVISOR) {
+            // Leave the rest unstamped so the next pass starts with them.
+            break;
         }
         let candidate = sweep_walk[idx];
         trace.start_item(&candidate.work_item_id);
@@ -477,6 +564,7 @@ pub async fn run_one_pass_tracked(
                 cube_client,
                 completion_handler,
                 host,
+                parked_ids: Some(&parked_ids),
             },
             candidate,
             &mut outcome,
@@ -558,7 +646,15 @@ pub async fn run_one_pass_tracked(
     // coordination state with a GitHub-side signal that was never armed
     // for this product.
     trace.enter(PassPhase::QueueRebounce, 0);
-    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
+    run_merge_queue_rebounce_pass(
+        work_db,
+        publisher,
+        &in_review,
+        &blocked_ci,
+        Some(&parked_ids),
+        &mut outcome,
+    )
+    .await;
 
     // reviewer-fallback sweep: tasks held in `active` (PendingReview)
     // while waiting for an AI reviewer pass that has since finished or timed
@@ -633,10 +729,10 @@ pub async fn run_one_pass_tracked(
 
     // The per-execution rechecks run last. Each one is its own GitHub
     // round trip (or several), so together they cost time in proportion to
-    // the number of live workers, not the number of tracked PRs. Ahead of
-    // the phases above they could hold the whole pass past its budget;
-    // here they can only cut themselves short, and their rotation hands
-    // the unreached executions to the next pass.
+    // the number of live workers, not the number of tracked PRs. Their
+    // starting family rotates across passes so a slow recheck cannot
+    // starve late-PR recovery; each family's own rotation hands unreached
+    // executions to the next pass that starts with that family.
     if let Some(handler) = completion_handler {
         let rechecks = state
             .rotations()
@@ -644,39 +740,61 @@ pub async fn run_one_pass_tracked(
             .order(pending_pr_recheck.iter().collect(), |execution_id| {
                 execution_id.as_str()
             });
-        trace.enter(PassPhase::PrRecheck, rechecks.len());
-        for execution_id in rechecks {
-            trace.start_item(execution_id);
-            state.rotations().recheck.stamp(execution_id);
-            sweep_pending_pr(handler, execution_id, &mut outcome).await;
-            trace.finish_item();
-        }
-        trace.enter(PassPhase::BackgroundNudges, pending_background_nudges.len());
-        for execution_id in &pending_background_nudges {
-            trace.start_item(execution_id);
-            if let Some(recheck_outcome) = handler.recheck_background_nudge(execution_id).await {
-                tracing::info!(
-                    execution_id,
-                    outcome = ?recheck_outcome,
-                    "merge poller: recurring background-child nudge recheck completed",
-                );
-            }
-            trace.finish_item();
-        }
-        // Late-PR sweep (Bug B): recover terminal executions whose pane
-        // pushed a PR after the execution was marked abandoned.
         let late = state
             .rotations()
             .late_pr
             .order(late_pr_candidates.iter().collect(), |candidate| {
                 candidate.execution_id.as_str()
             });
-        trace.enter(PassPhase::LatePr, late.len());
-        for candidate in late {
-            trace.start_item(&candidate.execution_id);
-            state.rotations().late_pr.stamp(&candidate.execution_id);
-            sweep_late_pr(handler, candidate, &mut outcome).await;
-            trace.finish_item();
+        let mut late_phases = [LatePhase::PrRecheck, LatePhase::BackgroundNudges, LatePhase::LatePr];
+        late_phases.rotate_left((state.next_late_phase_turn() % 3) as usize);
+        for phase in late_phases {
+            if clock.remaining().is_zero() {
+                break;
+            }
+            match phase {
+                LatePhase::PrRecheck => {
+                    trace.enter(PassPhase::PrRecheck, rechecks.len());
+                    for execution_id in &rechecks {
+                        if clock.remaining().is_zero() {
+                            break;
+                        }
+                        trace.start_item(execution_id);
+                        state.rotations().recheck.stamp(execution_id);
+                        sweep_pending_pr(handler, execution_id, &mut outcome).await;
+                        trace.finish_item();
+                    }
+                }
+                LatePhase::BackgroundNudges => {
+                    trace.enter(PassPhase::BackgroundNudges, pending_background_nudges.len());
+                    for execution_id in &pending_background_nudges {
+                        if clock.remaining().is_zero() {
+                            break;
+                        }
+                        trace.start_item(execution_id);
+                        if let Some(recheck_outcome) = handler.recheck_background_nudge(execution_id).await {
+                            tracing::info!(
+                                execution_id,
+                                outcome = ?recheck_outcome,
+                                "merge poller: recurring background-child nudge recheck completed",
+                            );
+                        }
+                        trace.finish_item();
+                    }
+                }
+                LatePhase::LatePr => {
+                    trace.enter(PassPhase::LatePr, late.len());
+                    for candidate in &late {
+                        if clock.remaining().is_zero() {
+                            break;
+                        }
+                        trace.start_item(&candidate.execution_id);
+                        state.rotations().late_pr.stamp(&candidate.execution_id);
+                        sweep_late_pr(handler, candidate, &mut outcome).await;
+                        trace.finish_item();
+                    }
+                }
+            }
         }
     } else if !pending_pr_recheck.is_empty() {
         tracing::debug!(

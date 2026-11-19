@@ -582,6 +582,7 @@ async fn rearm_restores_the_parent_signal_not_the_revisions() {
             cube_client: None,
             completion_handler: None,
             host: Some(&crate::merge_poller_adapters::CoreSweepHost::with_remediation(None)),
+            parked_ids: None,
         },
         &candidate,
         &probe,

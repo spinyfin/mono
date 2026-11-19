@@ -309,9 +309,9 @@ impl CommandMergeProbe {
         // A response can carry a top-level `errors` array alongside partial
         // `data` (one PR or repo alias doesn't resolve, the rest do). Only the
         // PRs an error names are untrusted; the others are read from this
-        // response as usual. Re-probing all of them individually instead —
-        // what this used to do — turned one unresolvable PR into two or three
-        // serial `gh` calls for *every* tracked PR on every pass.
+        // response as usual. Re-probing every PR individually would cost two
+        // or three serial `gh` calls per tracked PR, so only the named PRs
+        // are re-probed.
         let untrusted: std::collections::HashSet<String> = match batch_error_scope(&body, &alias_map) {
             BatchErrorScope::Clean => Default::default(),
             BatchErrorScope::Urls(urls) => {

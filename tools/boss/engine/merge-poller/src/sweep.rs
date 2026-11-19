@@ -13,6 +13,9 @@ pub struct SweepHandlers<'a> {
     pub completion_handler: Option<&'a dyn CompletionRequests>,
     /// Conflict handling, design-doc maintenance, population and the loop passes.
     pub host: Option<&'a dyn SweepHost>,
+    /// Parked work-item ids preloaded for this pass. `None` looks up each
+    /// candidate on its own.
+    pub parked_ids: Option<&'a std::collections::HashSet<String>>,
 }
 
 /// Reconcile exactly one PR instead of sweeping every candidate (doc
@@ -148,6 +151,7 @@ pub async fn reconcile_batch(
                 cube_client,
                 completion_handler,
                 host,
+                parked_ids: None,
             },
             candidate,
             &mut outcome,
@@ -161,7 +165,7 @@ pub async fn reconcile_batch(
     // dequeue/eviction signal is owned by the Trunk queue poller, not
     // GitHub's merge-queue timeline. One batched dequeue query for the whole
     // due set, exactly like the full sweep's.
-    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
+    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, None, &mut outcome).await;
 
     let reviewer_stale_secs: u64 = 10 * 60;
     let skip_unbatched_review_holds = completion_handler
@@ -684,6 +688,7 @@ pub(crate) async fn sweep_one(
         cube_client,
         completion_handler,
         host,
+        parked_ids,
     } = handlers;
     let probe_result = match probe_results.get(&candidate.pr_url) {
         Some(Ok(state)) => state.clone(),
@@ -713,7 +718,10 @@ pub(crate) async fn sweep_one(
     let mut known_active_queue_failure: Option<Option<CiRemediation>> = None;
     // Read before any transition: a merge moves the row to `done`, after which
     // it no longer reads as parked.
-    let parked = work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep");
+    let parked = match parked_ids {
+        Some(ids) => ids.contains(&candidate.work_item_id),
+        None => work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep"),
+    };
     match &probe_result.state {
         PrLifecycleState::Merged => {
             match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "merged") {
@@ -869,6 +877,7 @@ pub(crate) async fn sweep_one(
                             cube_client,
                             completion_handler,
                             host,
+                            parked_ids,
                         },
                         candidate,
                         &probe_result,
@@ -898,6 +907,7 @@ pub(crate) async fn sweep_one(
                             cube_client,
                             completion_handler,
                             host,
+                            parked_ids,
                         },
                         candidate,
                         &probe_result,
@@ -1475,6 +1485,7 @@ pub async fn maybe_clear_blocked(
         cube_client,
         completion_handler,
         host,
+        parked_ids: _,
     } = handlers;
     let labels = &probe_result.labels;
     let raw_mergeable = probe_result.raw_mergeable.as_str();
