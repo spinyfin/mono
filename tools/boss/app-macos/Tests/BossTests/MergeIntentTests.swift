@@ -80,10 +80,14 @@ final class MergeIntentTests: XCTestCase {
         XCTAssertNil(WorkMergeIntent.parse("not an object"))
     }
 
-    func testAnEndedRequestExplainsItselfOnTheCardAheadOfAWorkerStatus() throws {
+    func testAnEndedRequestExplainsItselfOnTheCardAheadOfAStaleMergeLabel() throws {
         let task = try reviewTask(mergeIntent: intentPayload(status: "needs_review", ended: true))
         XCTAssertEqual(cardLine(task), explanation)
-        XCTAssertEqual(cardLine(task, workerStatus: "Running tests"), explanation)
+        XCTAssertEqual(
+            cardLine(task, workerStatus: "Next up"),
+            "Next up",
+            "a live queued revision's status is newer than the ended sentence"
+        )
     }
 
     func testAnEndedRequestReplacesAnEarlierMergePausedLabelButNotLiveMergeProgress() throws {

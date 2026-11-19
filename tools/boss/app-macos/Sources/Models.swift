@@ -869,8 +869,9 @@ struct WorkMergeIntent: Hashable {
 
     var isActive: Bool { status == "active" }
 
-    /// The engine's explanation of a request that ended. It outranks a live
-    /// worker status on the card, because it is why the card is back.
+    /// The engine's explanation of a request that ended. A live worker or
+    /// dispatch status outranks it on the card; it still outranks a leftover
+    /// merge-paused label.
     var endedDetail: String? { isActive ? nil : detail }
 
     /// The fallback line for a request that still stands on a card that is

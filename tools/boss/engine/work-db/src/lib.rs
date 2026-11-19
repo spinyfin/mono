@@ -1102,7 +1102,7 @@ pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
 pub use mappers::ProducerConflictInsertInput;
 pub use mappers::SpeculativeConflictInsertInput;
-pub use merge_intent::{MergeIntentEnd, MergeIntentRemediation, MergeQueueDeparture};
+pub use merge_intent::{MergeIntentCiFixDecline, MergeIntentEnd, MergeIntentRemediation, MergeQueueDeparture};
 // Metrics vocabulary, owned by the metrics framework rather than by
 // `work`. Re-exported here so the `WorkDb::metrics_*` signatures read
 // the same as every other row type in this module.

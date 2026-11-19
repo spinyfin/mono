@@ -287,20 +287,32 @@ struct WorkCardSnapshot: Equatable {
         // The engine's merge explanation only describes a card that is under
         // review or merging; in Doing the worker's live status is what matters.
         // A merge request that ended explains why the card is back in
-        // Review. Outside Merging it is the engine's latest word on the
-        // merge, so it outranks an earlier "Merge paused" label and a worker
-        // status. A request that still stands is only a fallback line.
+        // Review. A live worker or dispatch status (including a queued
+        // revision's "Next up") is newer, so it outranks that sentence.
+        // The sentence still outranks a leftover "Merge paused" label.
+        // A request that still stands is only a fallback line. In Merging
+        // the merge's own progress is the line.
         let endedMergeRequest = (column == .doing || task.isInMergingSection) ? nil : task.mergeIntent?.endedDetail
-        let engineStatusLabel: String? = column == .doing
+        let queueLabel: String? = column == .doing
             ? nil
             : MergeQueueDetail.parse(task.mergeQueueDetail)?.statusLabel
         let standingMergeRequest = column == .doing
             ? nil
             : task.mergeIntent?.standingLabel(inMergingSection: task.isInMergingSection)
-        let liveStatus = endedMergeRequest
-            ?? engineStatusLabel
-            ?? context.liveStatus
-            ?? standingMergeRequest
+        let liveStatus: String? = {
+            if column == .doing {
+                return context.liveStatus
+            }
+            if task.isInMergingSection {
+                return queueLabel
+                    ?? context.liveStatus
+                    ?? standingMergeRequest
+            }
+            return context.liveStatus
+                ?? endedMergeRequest
+                ?? queueLabel
+                ?? standingMergeRequest
+        }()
         let liveStatusActivity: WorkerActivity? = {
             if isDispatchPending { return nil }
             if let explicit = context.liveStatusActivity { return explicit }

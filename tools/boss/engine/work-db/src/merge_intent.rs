@@ -28,22 +28,29 @@
 //! the card moves to `done` (see `retire_github_merge_intent`); a newer
 //! request supersedes it; and the engine ends it when the item is mergeable
 //! again and a person has to look first ([`WorkDb::end_merge_intent`]).
+//! A failed-checks dequeue that will not mint a CI fix (maintenance off,
+//! budget spent or zero, a human suppression, or an existing attempt for
+//! the same merge-queue episode) ends the intent immediately rather than
+//! leave it standing for a fix that never starts.
 //!
 //! # What the card shows
 //!
 //! `card_merge_intents` exposes at most one row per work item, the one with
 //! `on_card = 1`, as the JSON `Task::merge_intent` deserialises. An intent
 //! that ended needing attention stays on the card until the card leaves
-//! review, is bound to another PR, or a merge is requested again.
+//! review, is bound to another PR, a merge is requested again, a new
+//! revision is inserted, or the PR head moves past the head the ending
+//! compared.
 
 use super::*;
 use boss_protocol::{
     CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, MERGE_INTENT_ACTIVE, MERGE_INTENT_CLOSED,
-    MERGE_INTENT_INVALIDATED, MERGE_INTENT_LAPSED, MERGE_INTENT_MERGED, MERGE_INTENT_REASON_BLOCKED,
-    MERGE_INTENT_REASON_CHANGES_REQUESTED, MERGE_INTENT_REASON_MERGED, MERGE_INTENT_REASON_MOVED_OUT_OF_REVIEW,
-    MERGE_INTENT_REASON_NEW_REQUEST, MERGE_INTENT_REASON_NON_REMEDIATION_REVISION, MERGE_INTENT_REASON_PARKED,
-    MERGE_INTENT_REASON_PR_REBOUND, MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE, MERGE_INTENT_REASON_TASK_DELETED,
-    MERGE_INTENT_REASON_TASK_FINISHED, MERGE_INTENT_SUPERSEDED, MERGE_INTENT_WITHDRAWN, MergeIntent,
+    MERGE_INTENT_INVALIDATED, MERGE_INTENT_LAPSED, MERGE_INTENT_MERGED, MERGE_INTENT_NEEDS_REVIEW,
+    MERGE_INTENT_REASON_BLOCKED, MERGE_INTENT_REASON_CHANGES_REQUESTED, MERGE_INTENT_REASON_MERGED,
+    MERGE_INTENT_REASON_MOVED_OUT_OF_REVIEW, MERGE_INTENT_REASON_NEW_REQUEST, MERGE_INTENT_REASON_NO_DECISION,
+    MERGE_INTENT_REASON_NON_REMEDIATION_REVISION, MERGE_INTENT_REASON_PARKED, MERGE_INTENT_REASON_PR_REBOUND,
+    MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE, MERGE_INTENT_REASON_TASK_DELETED, MERGE_INTENT_REASON_TASK_FINISHED,
+    MERGE_INTENT_SUPERSEDED, MERGE_INTENT_WITHDRAWN, MergeIntent,
 };
 
 pub(super) const MIGRATION_ID: &str = "20261118_2035_merge_intents";
@@ -86,10 +93,18 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
          DROP VIEW IF EXISTS card_merge_intents;
          CREATE VIEW card_merge_intents AS
             SELECT work_item_id, {INTENT_JSON} AS view_json FROM merge_intents WHERE on_card = 1;
+         DROP TRIGGER IF EXISTS merge_intents_follow_task;
+         DROP TRIGGER IF EXISTS merge_intents_end_on_revision;
+         DROP TRIGGER IF EXISTS merge_intents_clear_ended_on_revision;
+         DROP TRIGGER IF EXISTS merge_intents_clear_ended_on_head_move;
          {FOLLOW_TASK_TRIGGER}
-         {REVISION_TRIGGER}",
+         {REVISION_TRIGGER}
+         {CLEAR_ENDED_ON_REVISION}
+         {CLEAR_ENDED_ON_HEAD_MOVE}",
         FOLLOW_TASK_TRIGGER = follow_task_trigger(),
         REVISION_TRIGGER = revision_trigger(),
+        CLEAR_ENDED_ON_REVISION = clear_ended_on_revision_trigger(),
+        CLEAR_ENDED_ON_HEAD_MOVE = clear_ended_on_head_move_trigger(),
     ))?;
     install_journal_triggers(conn)
 }
@@ -163,6 +178,41 @@ fn revision_trigger() -> String {
                 ended_at = strftime('%s', 'now'),
                 fix_owed_since = NULL
             WHERE work_item_id = NEW.parent_task_id AND status = '{MERGE_INTENT_ACTIVE}';
+         END;"
+    )
+}
+
+/// A later revision, including a CI fix or conflict resolution, means the
+/// sentence an already-ended intent put on the card is about a previous
+/// head. Clear it so a queued or running revision's status can show.
+/// Active intents are left for [`revision_trigger`] to invalidate.
+fn clear_ended_on_revision_trigger() -> String {
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS merge_intents_clear_ended_on_revision
+         AFTER INSERT ON tasks
+         WHEN NEW.kind = 'revision' AND NEW.parent_task_id IS NOT NULL
+         BEGIN
+            UPDATE merge_intents SET on_card = 0
+            WHERE work_item_id = NEW.parent_task_id AND on_card = 1
+              AND status != '{MERGE_INTENT_ACTIVE}';
+         END;"
+    )
+}
+
+/// Once the PR head has moved past the one the ending compared, the
+/// sentence names a pair that is no longer current.
+fn clear_ended_on_head_move_trigger() -> String {
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS merge_intents_clear_ended_on_head_move
+         AFTER UPDATE OF pr_head_sha ON tasks
+         WHEN NEW.pr_head_sha IS NOT OLD.pr_head_sha
+          AND NULLIF(NEW.pr_head_sha, '') IS NOT NULL
+         BEGIN
+            UPDATE merge_intents SET on_card = 0
+            WHERE work_item_id = NEW.id AND on_card = 1
+              AND status != '{MERGE_INTENT_ACTIVE}'
+              AND decided_head_sha IS NOT NULL
+              AND decided_head_sha IS NOT NEW.pr_head_sha;
          END;"
     )
 }
@@ -296,12 +346,57 @@ pub(crate) fn end_on_pr_terminal(conn: &Connection, work_item_id: &str, pr_url: 
 pub struct MergeIntentRemediation {
     /// The merge attempt left the queue on failed checks and no CI fix has
     /// been started for it yet. One is owed; nothing can be concluded until
-    /// it exists.
+    /// it exists. An existing merge-queue attempt for the same head, even
+    /// one created before this dequeue, counts as handling the obligation.
     pub fix_owed: bool,
+    /// Seconds since `fix_owed_since` when [`Self::fix_owed`] is true.
+    pub fix_owed_age_secs: Option<i64>,
     /// CI-fix attempts started since the request.
     pub ci_fixes: usize,
     /// Conflict resolutions started since the request.
     pub conflict_resolutions: usize,
+}
+
+/// Why a failed-checks dequeue will not mint a CI-fix attempt. The standing
+/// merge request ends instead of waiting for a row that never arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeIntentCiFixDecline {
+    /// The product (or PR label) has automatic PR maintenance turned off.
+    MaintenanceDisabled,
+    /// The CI-fix budget is zero or already spent.
+    BudgetExhausted,
+    /// A `ci_remediations` row already exists for this merge-queue episode.
+    EpisodeAlreadyHandled,
+    /// A person suppressed CI remediation for this head.
+    Suppressed,
+}
+
+impl MergeIntentCiFixDecline {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::MaintenanceDisabled => {
+                "Review before merging again: automatic PR maintenance is off, so the merge that failed checks will not be retried."
+            }
+            Self::BudgetExhausted => {
+                "Review before merging again: the CI-fix budget is spent, so the merge that failed checks will not be retried automatically."
+            }
+            Self::EpisodeAlreadyHandled => {
+                "Review before merging again: this PR head already had a CI fix after a merge-queue failure. Merge again to retry."
+            }
+            Self::Suppressed => {
+                "Review before merging again: automatic CI fixes are suppressed for this PR head. Merge again when you want them retried."
+            }
+        }
+    }
+
+    fn end(self, decided_head_sha: Option<String>) -> MergeIntentEnd {
+        MergeIntentEnd {
+            status: MERGE_INTENT_NEEDS_REVIEW,
+            reason: MERGE_INTENT_REASON_NO_DECISION,
+            detail: Some(self.detail().to_owned()),
+            decided_head_sha,
+        }
+    }
 }
 
 /// What a merge-queue departure meant for the standing request.
@@ -313,6 +408,123 @@ pub enum MergeQueueDeparture {
     Standing,
     /// Nothing the engine fixes removed the PR, so the request ended.
     Ended,
+}
+
+/// Same identity as [`WorkDb::ci_remediation_exists_for_merge_queue_episode`]
+/// when only the PR head is known: `mq:<head>`, the raw head, or that head
+/// stored as the synthetic queue commit.
+fn merge_queue_episode_exists(conn: &Connection, work_item_id: &str, head_sha: &str) -> Result<bool> {
+    if head_sha.is_empty() {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM ci_remediations
+              WHERE work_item_id = ?1
+                AND failure_kind = 'merge_queue_rebounce'
+                AND (
+                     head_sha_at_trigger = 'mq:' || ?2
+                  OR head_sha_at_trigger = ?2
+                  OR before_commit_sha = ?2
+                )
+         )",
+        params![work_item_id, head_sha],
+        |row| row.get(0),
+    )?)
+}
+
+fn ci_failure_suppressed_for_head(conn: &Connection, work_item_id: &str, head_sha: &str) -> Result<bool> {
+    if head_sha.is_empty() {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM ci_failure_suppressions
+              WHERE work_item_id = ?1 AND head_sha = ?2
+         )",
+        params![work_item_id, head_sha],
+        |row| row.get(0),
+    )?)
+}
+
+fn effective_ci_budget_on(conn: &Connection, work_item_id: &str) -> Result<i64> {
+    let raw: Option<(Option<i64>, i64)> = conn
+        .query_row(
+            "SELECT t.ci_attempt_budget, COALESCE(p.ci_attempt_budget, 3)
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.id = ?1",
+            [work_item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(raw
+        .map(|(per_pr, product)| per_pr.unwrap_or(product).clamp(0, 10))
+        .unwrap_or(3))
+}
+
+/// Whether a failed-checks dequeue will mint a CI fix, and the head to name
+/// if it will not.
+fn failed_checks_fix_will_not_run(
+    conn: &Connection,
+    work_item_id: &str,
+    intent: &MergeIntent,
+) -> Result<Option<(MergeIntentCiFixDecline, Option<String>)>> {
+    let (product_id, pr_head, used): (String, Option<String>, i64) = conn.query_row(
+        "SELECT product_id, NULLIF(pr_head_sha, ''), COALESCE(ci_attempts_used, 0)
+         FROM tasks WHERE id = ?1",
+        [work_item_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let head = intent
+        .approved_head_sha
+        .as_deref()
+        .or(pr_head.as_deref())
+        .map(str::to_owned);
+    let maintenance_on: bool = conn
+        .query_row(
+            "SELECT COALESCE(auto_pr_maintenance_enabled, 1) != 0 FROM products WHERE id = ?1",
+            [&product_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(true);
+    if !maintenance_on {
+        return Ok(Some((MergeIntentCiFixDecline::MaintenanceDisabled, head)));
+    }
+    if used >= effective_ci_budget_on(conn, work_item_id)? {
+        return Ok(Some((MergeIntentCiFixDecline::BudgetExhausted, head)));
+    }
+    for candidate in [intent.approved_head_sha.as_deref(), pr_head.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if ci_failure_suppressed_for_head(conn, work_item_id, candidate)? {
+            return Ok(Some((MergeIntentCiFixDecline::Suppressed, Some(candidate.to_owned()))));
+        }
+        if merge_queue_episode_exists(conn, work_item_id, candidate)? {
+            return Ok(Some((
+                MergeIntentCiFixDecline::EpisodeAlreadyHandled,
+                Some(candidate.to_owned()),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn end_owed_ci_fix(conn: &Connection, work_item_id: &str, pr_url: &str, why: MergeIntentCiFixDecline) -> Result<bool> {
+    let Some(intent) = query_active(conn, work_item_id, pr_url)? else {
+        return Ok(false);
+    };
+    let stamped: bool = conn.query_row(
+        "SELECT fix_owed_since IS NOT NULL FROM merge_intents WHERE id = ?1",
+        [&intent.id],
+        |row| row.get(0),
+    )?;
+    if !stamped {
+        return Ok(false);
+    }
+    let head = intent.approved_head_sha.clone();
+    end_by_id(conn, &intent.id, &why.end(head))
 }
 
 #[work_db_boundary::instrument]
@@ -372,7 +584,8 @@ impl WorkDb {
 
     /// The PR's merge attempt left GitHub's merge queue for `queue_reason`.
     /// Failed checks and a merge conflict are what the engine fixes, so the
-    /// request stands through them. Anything else (someone removed it, the
+    /// request stands through them unless a CI fix will not be minted (see
+    /// [`MergeIntentCiFixDecline`]). Anything else (someone removed it, the
     /// queue was cleared, a reason this engine does not know) is not the
     /// engine's to undo and ends the request rather than leave it standing
     /// for a later fix to act on.
@@ -388,11 +601,16 @@ impl WorkDb {
             return Ok(MergeQueueDeparture::NoIntent);
         };
         let departure = if queue_reason.eq_ignore_ascii_case("failed_checks") {
-            tx.execute(
-                "UPDATE merge_intents SET fix_owed_since = ?2 WHERE id = ?1",
-                params![intent.id, now_string()],
-            )?;
-            MergeQueueDeparture::Standing
+            if let Some((why, head)) = failed_checks_fix_will_not_run(&tx, work_item_id, &intent)? {
+                end_by_id(&tx, &intent.id, &why.end(head))?;
+                MergeQueueDeparture::Ended
+            } else {
+                tx.execute(
+                    "UPDATE merge_intents SET fix_owed_since = ?2 WHERE id = ?1",
+                    params![intent.id, now_string()],
+                )?;
+                MergeQueueDeparture::Standing
+            }
         } else if queue_reason.eq_ignore_ascii_case("merge_conflict") {
             MergeQueueDeparture::Standing
         } else {
@@ -409,6 +627,20 @@ impl WorkDb {
         };
         tx.commit()?;
         Ok(departure)
+    }
+
+    /// End a standing request that is waiting for a CI fix that the rebounce
+    /// path has declined to mint. No-ops unless `fix_owed_since` is set, so
+    /// a conflict-only request or a request whose fix already started is
+    /// left alone.
+    pub fn decline_owed_merge_intent_ci_fix(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        why: MergeIntentCiFixDecline,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        end_owed_ci_fix(&conn, work_item_id, pr_url, why)
     }
 
     /// Fixes the engine has started for this item since `intent` was
@@ -432,19 +664,39 @@ impl WorkDb {
              WHERE work_item_id = ?1 AND status NOT IN ('deferred', 'predicted')
                AND CAST(created_at AS INTEGER) >= CAST(?2 AS INTEGER)",
         )?;
-        let fix_owed: bool = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM merge_intents mi
-                WHERE mi.id = ?1 AND mi.fix_owed_since IS NOT NULL
+        let (fix_owed, fix_owed_age_secs): (bool, Option<i64>) = conn.query_row(
+            "SELECT
+                mi.fix_owed_since IS NOT NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM ci_remediations cr
                     WHERE cr.work_item_id = mi.work_item_id
-                      AND CAST(cr.created_at AS INTEGER) >= CAST(mi.fix_owed_since AS INTEGER)))",
+                      AND (
+                        CAST(cr.created_at AS INTEGER) >= CAST(mi.fix_owed_since AS INTEGER)
+                        OR (
+                          cr.failure_kind = 'merge_queue_rebounce'
+                          AND (
+                            (NULLIF(mi.approved_head_sha, '') IS NOT NULL AND (
+                                cr.head_sha_at_trigger = 'mq:' || mi.approved_head_sha
+                             OR cr.head_sha_at_trigger = mi.approved_head_sha
+                             OR cr.before_commit_sha = mi.approved_head_sha))
+                            OR EXISTS (
+                                SELECT 1 FROM tasks t
+                                 WHERE t.id = mi.work_item_id
+                                   AND NULLIF(t.pr_head_sha, '') IS NOT NULL
+                                   AND (
+                                       cr.head_sha_at_trigger = 'mq:' || t.pr_head_sha
+                                    OR cr.head_sha_at_trigger = t.pr_head_sha
+                                    OR cr.before_commit_sha = t.pr_head_sha)))))),
+                CASE WHEN mi.fix_owed_since IS NOT NULL
+                     THEN CAST(strftime('%s', 'now') AS INTEGER) - CAST(mi.fix_owed_since AS INTEGER)
+                     ELSE NULL END
+             FROM merge_intents mi WHERE mi.id = ?1",
             [&intent.id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(MergeIntentRemediation {
             fix_owed,
+            fix_owed_age_secs: if fix_owed { fix_owed_age_secs } else { None },
             ci_fixes,
             conflict_resolutions,
         })
@@ -647,6 +899,187 @@ mod tests {
         assert!(!remediation.fix_owed, "the fix that was owed has been started");
         assert_eq!(remediation.ci_fixes, 1);
         assert_eq!(remediation.conflict_resolutions, 0);
+    }
+
+    #[test]
+    fn a_failed_checks_dequeue_ends_when_automatic_maintenance_is_off() {
+        let f = fixture();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE products SET auto_pr_maintenance_enabled = 0 WHERE id = ?1",
+                [&f.product],
+            )
+            .unwrap();
+        let intent = f.request();
+        assert_eq!(
+            f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
+            MergeQueueDeparture::Ended
+        );
+        let ended = f.stored(&intent.id);
+        assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
+        assert_eq!(ended.reason.as_deref(), Some(MERGE_INTENT_REASON_NO_DECISION));
+        assert!(
+            ended.detail.unwrap().contains("automatic PR maintenance is off"),
+            "the card says why the merge will not be retried"
+        );
+        assert!(f.db.active_merge_intent(&f.task, PR).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_checks_dequeue_ends_when_the_ci_fix_budget_is_zero() {
+        let f = fixture();
+        f.db.set_ci_attempt_budget(&f.task, Some(0)).unwrap();
+        let intent = f.request();
+        assert_eq!(
+            f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
+            MergeQueueDeparture::Ended
+        );
+        let ended = f.stored(&intent.id);
+        assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
+        assert!(ended.detail.unwrap().contains("CI-fix budget is spent"));
+        assert!(f.db.active_merge_intent(&f.task, PR).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_checks_dequeue_ends_when_the_same_head_already_had_a_ci_fix() {
+        let f = fixture();
+        f.request();
+        f.db.insert_ci_remediation(
+            CiRemediationInsertInput::builder()
+                .product_id(&f.product)
+                .work_item_id(&f.task)
+                .pr_url(PR)
+                .pr_number(42)
+                .head_branch("feature")
+                .head_sha_at_trigger("mq:head-1")
+                .attempt_kind("fix")
+                .consumes_budget(1)
+                .failed_checks("[]")
+                .failure_kind("merge_queue_rebounce")
+                .before_commit_sha("queue-commit")
+                .build(),
+        )
+        .unwrap()
+        .unwrap();
+        // A new merge request of the same head, then the queue rejects it
+        // again. Rebounce will not mint a second attempt for this episode.
+        let second = f.db.record_merge_intent(&f.task, PR, Some("head-1")).unwrap();
+        assert_eq!(
+            f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
+            MergeQueueDeparture::Ended
+        );
+        let ended = f.stored(&second.id);
+        assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
+        assert!(ended.detail.unwrap().contains("already had a CI fix"));
+        assert!(f.db.active_merge_intent(&f.task, PR).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_older_same_head_attempt_counts_as_handling_an_owed_fix() {
+        let f = fixture();
+        let intent = f.request();
+        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap();
+        assert!(f.db.merge_intent_remediation(&intent).unwrap().fix_owed);
+        let attempt =
+            f.db.insert_ci_remediation(
+                CiRemediationInsertInput::builder()
+                    .product_id(&f.product)
+                    .work_item_id(&f.task)
+                    .pr_url(PR)
+                    .pr_number(42)
+                    .head_branch("feature")
+                    .head_sha_at_trigger("mq:head-1")
+                    .attempt_kind("fix")
+                    .consumes_budget(1)
+                    .failed_checks("[]")
+                    .failure_kind("merge_queue_rebounce")
+                    .before_commit_sha("queue-commit")
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        // Clock skew / a row minted before the dequeue stamp still counts.
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE ci_remediations SET created_at = '1' WHERE id = ?1",
+                [&attempt.id],
+            )
+            .unwrap();
+        let remediation = f.db.merge_intent_remediation(&intent).unwrap();
+        assert!(!remediation.fix_owed, "the same-head episode is already handled");
+    }
+
+    #[test]
+    fn declining_an_owed_fix_from_the_rebounce_path_ends_the_request() {
+        let f = fixture();
+        let intent = f.request();
+        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap();
+        assert!(f.db.merge_intent_remediation(&intent).unwrap().fix_owed);
+        assert!(
+            f.db.decline_owed_merge_intent_ci_fix(&f.task, PR, MergeIntentCiFixDecline::Suppressed)
+                .unwrap()
+        );
+        let ended = f.stored(&intent.id);
+        assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
+        assert!(ended.detail.unwrap().contains("suppressed"));
+        assert!(
+            !f.db
+                .decline_owed_merge_intent_ci_fix(&f.task, PR, MergeIntentCiFixDecline::Suppressed)
+                .unwrap(),
+            "already ended"
+        );
+    }
+
+    #[test]
+    fn a_later_revision_or_head_move_takes_an_ended_request_off_the_card() {
+        let f = fixture();
+        let intent = f.request();
+        f.db.end_merge_intent(
+            &intent.id,
+            &MergeIntentEnd {
+                status: MERGE_INTENT_NEEDS_REVIEW,
+                reason: MERGE_INTENT_REASON_NO_DECISION,
+                detail: Some("Review before merging again: an automatic CI fix changed the PR.".into()),
+                decided_head_sha: Some("head-1".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(f.on_card().unwrap().id, intent.id);
+
+        let f = fixture();
+        let intent = f.request();
+        f.db.end_merge_intent(
+            &intent.id,
+            &MergeIntentEnd {
+                status: MERGE_INTENT_NEEDS_REVIEW,
+                reason: MERGE_INTENT_REASON_NO_DECISION,
+                detail: Some("The PR changed.".into()),
+                decided_head_sha: Some("head-1".into()),
+            },
+        )
+        .unwrap();
+        f.revision(&format!("{CREATED_VIA_CI_FIX_PREFIX}later"));
+        assert!(f.on_card().is_none(), "a new revision means the old sentence is stale");
+
+        let f = fixture();
+        let intent = f.request();
+        f.db.end_merge_intent(
+            &intent.id,
+            &MergeIntentEnd {
+                status: MERGE_INTENT_NEEDS_REVIEW,
+                reason: MERGE_INTENT_REASON_NO_DECISION,
+                detail: Some("The PR changed.".into()),
+                decided_head_sha: Some("head-1".into()),
+            },
+        )
+        .unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET pr_head_sha = 'head-2' WHERE id = ?1", [&f.task])
+            .unwrap();
+        assert!(f.on_card().is_none(), "the PR head moved past the one the ending named");
     }
 
     #[test]

@@ -29,29 +29,30 @@ A request GitHub or Trunk refused for any other reason records nothing: the pers
 
 ## What ends an intent
 
-| Event                                                                                        | Status                     | Reason                     | Stays on the card |
-| -------------------------------------------------------------------------------------------- | -------------------------- | -------------------------- | ----------------- |
-| The merge poller observes the PR merged                                                      | `merged`                   | `merged`                   | no                |
-| The item finishes any other way (PR closed unmerged, marked done, archived)                  | `closed`                   | `task_finished`            | no                |
-| The item is deleted                                                                          | `closed`                   | `task_deleted`             | no                |
-| The card is moved out of review                                                              | `withdrawn`                | `moved_out_of_review`      | no                |
-| The item is bound to a different PR                                                          | `withdrawn`                | `pr_rebound`               | no                |
-| A merge is requested again                                                                   | `superseded`               | `new_request`              | no                |
-| The item is parked, directly or through its project                                          | `invalidated`              | `parked`                   | yes               |
-| A reviewer requests changes                                                                  | `invalidated`              | `changes_requested`        | yes               |
-| A revision is created that is not a CI fix or conflict resolution                            | `invalidated`              | `non_remediation_revision` | yes               |
-| The item becomes blocked for a reason other than a merge conflict or CI failure              | `invalidated`              | `blocked`                  | yes               |
-| The PR leaves GitHub's merge queue for a reason other than failed checks or a merge conflict | `lapsed`                   | `removed_from_merge_queue` | yes               |
-| The item is mergeable again (see [the next section](#when-the-item-is-mergeable-again))      | `needs_review` or `lapsed` | see below                  | yes               |
+| Event                                                                                                                                        | Status                     | Reason                     | Stays on the card |
+| -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- | -------------------------- | ----------------- |
+| The merge poller observes the PR merged                                                                                                      | `merged`                   | `merged`                   | no                |
+| The item finishes any other way (PR closed unmerged, marked done, archived)                                                                  | `closed`                   | `task_finished`            | no                |
+| The item is deleted                                                                                                                          | `closed`                   | `task_deleted`             | no                |
+| The card is moved out of review                                                                                                              | `withdrawn`                | `moved_out_of_review`      | no                |
+| The item is bound to a different PR                                                                                                          | `withdrawn`                | `pr_rebound`               | no                |
+| A merge is requested again                                                                                                                   | `superseded`               | `new_request`              | no                |
+| The item is parked, directly or through its project                                                                                          | `invalidated`              | `parked`                   | yes               |
+| A reviewer requests changes                                                                                                                  | `invalidated`              | `changes_requested`        | yes               |
+| A revision is created that is not a CI fix or conflict resolution                                                                            | `invalidated`              | `non_remediation_revision` | yes               |
+| The item becomes blocked for a reason other than a merge conflict or CI failure                                                              | `invalidated`              | `blocked`                  | yes               |
+| The PR leaves GitHub's merge queue for a reason other than failed checks or a merge conflict                                                 | `lapsed`                   | `removed_from_merge_queue` | yes               |
+| Failed checks, and a CI fix will not be minted (maintenance off, budget spent or zero, suppressed, or the same-head episode already handled) | `needs_review`             | `no_decision`              | yes               |
+| The item is mergeable again (see [the next section](#when-the-item-is-mergeable-again))                                                      | `needs_review` or `lapsed` | see below                  | yes               |
 
 Notes on the rows that are easy to get wrong:
 
 - **Automatic fixes never end it.** `blocked: ci_failure`, `blocked: ci_failure_exhausted` and `blocked: merge_conflict`, and revisions created by CI remediation (`created_via` starting `ci-fix:`) or conflict resolution (`merge-conflict:`), are the engine fixing what ended the attempt. Every other revision source ends the intent: automated review findings, review-guide and document comments, a person's request, a progression run.
-- **Removal from the queue by hand is a withdrawal.** The dequeue reason comes from GitHub's timeline. Failed checks and a merge conflict are what the engine fixes, so the intent stands through them. Any other reason, including one the engine does not recognise, ends it, so that a later fix cannot act on a request someone took back.
+- **Removal from the queue by hand is a withdrawal.** The dequeue reason comes from GitHub's timeline. Failed checks and a merge conflict are what the engine fixes, so the intent stands through them — unless a CI fix will not be minted, in which case it ends as `needs_review` rather than wait forever. Any other reason, including one the engine does not recognise, ends it, so that a later fix cannot act on a request someone took back.
 - **Un-parking does not revive it.** A parked item gets no upkeep, so what was approved may be stale by the time it returns.
-- **The rules are enforced where the card is written.** Finishing, deletion, a move out of review, a PR rebind, parking, requested changes, a non-remediation revision and an unrelated block are two SQLite triggers on `tasks` (`merge_intents_follow_task`, `merge_intents_end_on_revision`), so every writer of those columns is covered without knowing about intents. The module documentation in `tools/boss/engine/work-db/src/merge_intent.rs` is the reference.
+- **The rules are enforced where the card is written.** Finishing, deletion, a move out of review, a PR rebind, parking, requested changes, a non-remediation revision and an unrelated block are SQLite triggers on `tasks` (`merge_intents_follow_task`, `merge_intents_end_on_revision`), so every writer of those columns is covered without knowing about intents. An already-ended sentence is taken off the card when a new revision is inserted (`merge_intents_clear_ended_on_revision`) or the PR head moves past the one the ending named (`merge_intents_clear_ended_on_head_move`). The module documentation in `tools/boss/engine/work-db/src/merge_intent.rs` is the reference.
 
-An intent that "stays on the card" is shown until the card leaves review, is bound to another PR, or a merge is requested again.
+An intent that "stays on the card" is shown until the card leaves review, is bound to another PR, a merge is requested again, a new revision is inserted, or the PR head moves past the head the ending compared.
 
 ## When the item is mergeable again
 
@@ -60,7 +61,7 @@ On every clean probe of an open PR that is not parked, the merge poller's host s
 1. The card is in Review's **Ready** section: in review, not blocked, no revision queued or running, no AI review pending or with unaddressed findings, required CI green, mergeable. This is the engine's existing definition of "could be merged right now" (`classify_review_section`), not a second one.
 2. No submission is live: no active `github_merge_intents` row and no active `trunk_merge_intents` row. A live submission owns what happens next.
 3. No CI remediation or conflict resolution attempt is pending or running.
-4. No fix is owed. If the PR left the merge queue on failed checks, the intent waits until a CI remediation attempt created after that departure exists, so an attempt that has not been minted yet is not mistaken for "nothing to fix".
+4. No fix is owed. If the PR left the merge queue on failed checks, the intent waits until a CI remediation attempt exists for that merge-queue episode (the same identity as `ci_remediation_exists_for_merge_queue_episode`), including an older terminal attempt for the same head. If no attempt will be minted — automatic PR maintenance is off, the CI-fix budget is spent or zero, a person suppressed CI remediation, or the episode is already handled — the intent ends immediately as `needs_review` instead of standing. As a backstop, an owed fix older than ten minutes with no attempt is treated as no decision and the card returns to Review.
 
 Then it compares the approved head with the head the poller last stored, and ends the intent:
 
@@ -79,7 +80,7 @@ A standing intent also counts as "a merge has been requested" for [just-in-time 
 
 ## Where it shows
 
-- **Card.** Outside the Merging section, a request that ended shows the engine's sentence under the title, ahead of an earlier "Merge paused" label and any worker status. A request that still stands shows "Merge requested" when nothing more specific is showing. A card in Merging shows the merge's own progress.
+- **Card.** Outside the Merging section, a request that ended shows the engine's sentence under the title, ahead of an earlier "Merge paused" label. A live worker or dispatch status (including a queued revision's "Next up") outranks that sentence. A request that still stands shows "Merge requested" when nothing more specific is showing. A card in Merging shows the merge's own progress.
 - **Card popover.** A "Merge request" row: the sentence, the two short heads when a decision compared them, and the count of automatic re-merges when there are any.
 - **`boss task show` / `boss chore show`.** `Merge request: <status> (requested <time>)`, the approved head, the head when decided, the reason code and the sentence. `--json` carries the same record as `merge_intent`.
 - **Engine log.** `merge intent: item is mergeable again; request ended and card left in review`, with `status`, `reason` and `decided_head_sha`. The board refresh it triggers carries the reason `merge_intent_settled`.

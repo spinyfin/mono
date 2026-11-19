@@ -45,8 +45,8 @@ use serde::Serialize;
 use crate::blocking_signal::{self, SignalKind};
 use crate::work::{
     ARCHIVE_MECHANISM_CI_WATCH_SUPERSESSION, ArchiveProvenance, CiRemediation, CiRemediationInsertInput,
-    ClearResolvedSignal, CreateExecutionInput, InFlightCiFixRevision, PendingMergeCheck, PrStateChecker,
-    SignalRetirement, StrandedCiRemediationAttempt, WorkDb,
+    ClearResolvedSignal, CreateExecutionInput, InFlightCiFixRevision, MergeIntentCiFixDecline, PendingMergeCheck,
+    PrStateChecker, SignalRetirement, StrandedCiRemediationAttempt, WorkDb,
 };
 use crate::{
     OpenPrCiStatus, OpenPrMergeability, PrLifecycleProbe, PrLifecycleState, RequiredCheckFailure, pr_labels_opt_out,
@@ -1171,7 +1171,10 @@ pub async fn on_merge_queue_rebounce_detected(
     let publisher = context.publisher;
     match work_db.ci_remediation_exists_for_merge_queue_episode(&candidate.work_item_id, pr_head_sha, before_commit_sha)
     {
-        Ok(true) => return false,
+        Ok(true) => {
+            end_merge_intent_if_ci_fix_declined(work_db, candidate, MergeIntentCiFixDecline::EpisodeAlreadyHandled);
+            return false;
+        }
         Ok(false) => {}
         Err(err) => {
             tracing::warn!(?err, "failed to inspect merge-queue episode; deferring detection");
@@ -1200,6 +1203,30 @@ pub async fn on_merge_queue_rebounce_detected(
         failures,
     )
     .await
+}
+
+/// End a standing merge request that is waiting for a CI fix this path has
+/// declined to mint. No-ops unless the request stamped `fix_owed_since`.
+pub(crate) fn end_merge_intent_if_ci_fix_declined(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+    why: MergeIntentCiFixDecline,
+) {
+    match work_db.decline_owed_merge_intent_ci_fix(&candidate.work_item_id, &candidate.pr_url, why) {
+        Ok(true) => tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            ?why,
+            "ci_watch: merge request ended because a CI fix will not be minted",
+        ),
+        Ok(false) => {}
+        Err(err) => tracing::debug!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            ?err,
+            "ci_watch: could not end a merge request whose CI fix will not be minted",
+        ),
+    }
 }
 
 /// The per-caller facts [`on_queue_side_failure_detected`] needs — bundled
@@ -1277,6 +1304,7 @@ async fn on_queue_side_failure_detected(
         );
     }
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
+        end_merge_intent_if_ci_fix_declined(work_db, candidate, MergeIntentCiFixDecline::MaintenanceDisabled);
         return false;
     }
     match work_db.has_active_rebase_attempt_for_pr(&candidate.pr_url) {
@@ -1342,6 +1370,7 @@ async fn on_queue_side_failure_detected(
                 failure_kind,
                 "ci_watch: ci_failure suppression active for this discriminator; skipping",
             );
+            end_merge_intent_if_ci_fix_declined(work_db, candidate, MergeIntentCiFixDecline::Suppressed);
             return false;
         }
         Ok(false) => {}
@@ -1394,6 +1423,7 @@ async fn on_queue_side_failure_detected(
                     failure_kind,
                     "ci_watch: queue-side-failure budget exhausted; parent flipped to blocked: ci_failure_exhausted",
                 );
+                end_merge_intent_if_ci_fix_declined(work_db, candidate, MergeIntentCiFixDecline::BudgetExhausted);
                 return true;
             }
             Ok(None) => {
@@ -1403,6 +1433,7 @@ async fn on_queue_side_failure_detected(
                     failure_kind,
                     "ci_watch: queue-side-failure ci_failure_exhausted WHERE guard missed",
                 );
+                end_merge_intent_if_ci_fix_declined(work_db, candidate, MergeIntentCiFixDecline::BudgetExhausted);
                 return false;
             }
             Err(err) => {
@@ -1487,6 +1518,7 @@ async fn on_queue_side_failure_detected(
                 "ci_watch: queue-side failure already recorded for this discriminator; \
                  idempotent no-op (not re-bouncing on an unchanged episode)",
             );
+            end_merge_intent_if_ci_fix_declined(work_db, candidate, MergeIntentCiFixDecline::EpisodeAlreadyHandled);
             return false;
         }
         Err(err) => {

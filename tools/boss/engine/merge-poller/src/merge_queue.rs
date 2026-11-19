@@ -421,6 +421,11 @@ pub(crate) async fn check_merge_queue_rebounce(
                     before_commit_sha,
                     "merge poller: rebounce episode already recorded; skipping re-fetch",
                 );
+                ci_watch::end_merge_intent_if_ci_fix_declined(
+                    work_db,
+                    candidate,
+                    crate::work::MergeIntentCiFixDecline::EpisodeAlreadyHandled,
+                );
                 continue;
             }
             Ok(false) => {}

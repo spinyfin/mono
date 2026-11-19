@@ -343,9 +343,9 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
 /// Record the person's merge request so it stands through a failed merge
 /// attempt and the automatic fix that follows (`WorkDb::record_merge_intent`).
 /// Returns whether it was recorded. The submission it belongs to has already
-/// been accepted, so a failed write is logged rather than surfaced: the item
-/// then simply returns to Review after a failed attempt, as it did before
-/// requests were remembered.
+/// been accepted, so a failed write is logged rather than surfaced: with no
+/// recorded request, a failed attempt returns the item to Review with no
+/// merge-request explanation on the card.
 fn remember_merge_request(work_db: &WorkDb, work_item_id: &str, pr_url: &str, approved_head_sha: Option<&str>) -> bool {
     match work_db.record_merge_intent(work_item_id, pr_url, approved_head_sha) {
         Ok(_) => true,
