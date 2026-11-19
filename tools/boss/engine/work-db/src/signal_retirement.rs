@@ -188,7 +188,11 @@ pub(crate) fn clear_resolved_signal_in_tx(
         // recorded as its owner: a stale or foreign `blocked_attempt_id` must
         // never keep a mergeable PR blocked. Attempt retirement is handled
         // separately below.
-        crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some()
+        let transitioned = crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some();
+        // The conflict is gone, so the "Merge paused" explanation for it is too,
+        // whether the parent was blocked or already back in review.
+        crate::merge_conflict_merging::clear_stopped_on_conflict_lift(conn, item)?;
+        transitioned
     };
     let retire_conflict = conflict
         .as_ref()

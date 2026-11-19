@@ -2298,7 +2298,9 @@ pub(crate) fn clear_blocked_merge_conflict_in_tx(
     if rows == 0 {
         return Ok(None);
     }
-    crate::merge_conflict_merging::clear_stopped(conn, work_item_id)?;
+    // The "Merge paused" explanation is deliberately kept here: this runs when a
+    // revision is handed the conflict, which is when the card needs the reason.
+    // It is cleared where the conflict signal is retired.
     // Mark the matching side-table row(s) cleared so
     // the polymorphic clear dispatch doesn't re-fire on the next
     // probe. Mirrors `clear_chore_blocked_ci_failure`.
@@ -2438,7 +2440,11 @@ pub(crate) fn mark_deletion_signoff_in_tx(
                 AND deleted_at IS NULL",
         params![work_item_id, pr_url, now],
     )?;
-    crate::merge_conflict_merging::stop(conn, work_item_id, "Resolution needs approval for deleted files")?;
+    crate::merge_conflict_merging::stop(
+        conn,
+        work_item_id,
+        crate::merge_conflict_merging::DELETION_SIGNOFF_REASON,
+    )?;
     if rows == 0 {
         return Ok(None);
     }
