@@ -4,8 +4,9 @@
 # bazel() wrapper. The digests are read from Bazel's "Lost inputs no longer
 # available remotely" errors; the disk-cache action-cache entries that name a
 # lost blob are removed (whether or not the blob is in cas/) and nothing else
-# is; and the wrapper retries exactly once per repair that removed something,
-# returning the original exit status otherwise.
+# is; and the wrapper retries at most once per invocation, only after a repair
+# that really removed something, returning the retry's (or else the original)
+# exit status.
 #
 # Fixtures are written with printf, not here-documents: bash 3.2 (the macOS
 # /bin/bash) backs here-documents with files under /tmp regardless of TMPDIR,
@@ -82,7 +83,7 @@ grep -qF "lost blob ${dangling2}: in disk-cache cas=no, action-cache entries tha
 if ci_repair_lost_inputs "$log" "$cache" 2> "$repair_log"; then
   fail "a repair that removed nothing must return non-zero"
 fi
-grep -qF "no disk-cache entry names a lost blob" "$repair_log" || fail "a no-op repair must say why"
+grep -qF "Lost inputs NOT repaired" "$repair_log" || fail "a no-op repair must say why"
 
 # A log with no lost inputs, and a cache with no ac/ directory, are no-ops.
 printf 'ERROR: some other failure\n' > "${tmp}/other.log"
@@ -111,6 +112,7 @@ printf '%s\n' \
   '#!/bin/bash' \
   'echo "$*" >> "${FAKE_STATE}/calls"' \
   'if [[ -n "${FAKE_ALWAYS_FAIL:-}" ]] || { [[ ! -e "${FAKE_STATE}/remote_blob" ]] && grep -rlaF "$BLOB" "${FAKE_CACHE}/ac" > /dev/null 2>&1; }; then' \
+  '  [[ -z "${FAKE_REAPPEAR:-}" ]] || printf "out/b.zip\\n%s\\n" "$BLOB" > "${FAKE_CACHE}/ac/aa/names-lost-blob"' \
   '  echo "ERROR: /w/BUILD.bazel:1:1: Testing //a:b failed: Lost inputs no longer available remotely: a/b.zip (${BLOB}/100)"' \
   '  exit "${FAKE_EXIT:-1}"' \
   'fi' \
@@ -130,10 +132,13 @@ run_scenario() {
   [[ "$has_entry" == 1 ]] && printf 'out/b.zip\n%s\n' "$dangling" > "${FAKE_CACHE}/ac/aa/names-lost-blob"
   printf 'out/unrelated\n%s\n' "$other" > "${FAKE_CACHE}/ac/bb/unrelated"
   [[ "$in_cas" == 1 ]] && printf 'blob' > "${FAKE_CACHE}/cas/${dangling:0:2}/${dangling}"
+  if [[ "${REAPPEAR:-0}" == 1 ]]; then export FAKE_REAPPEAR=1; else unset FAKE_REAPPEAR; fi
   if [[ "$always" == 1 ]]; then export FAKE_ALWAYS_FAIL=1; else unset FAKE_ALWAYS_FAIL; fi
   CI_DISK_CACHE_DIR="$FAKE_CACHE"
+  [[ "${READONLY_AC:-0}" == 1 ]] && chmod a-w "${FAKE_CACHE}/ac/aa"
   scenario_rc=0
   bazel test //a:b > "${FAKE_STATE}/out" 2>&1 || scenario_rc=$?
+  chmod u+w "${FAKE_CACHE}/ac/aa"
   scenario_out="$(cat "${FAKE_STATE}/out" 2> /dev/null || true)"
   calls="$(wc -l < "${FAKE_STATE}/calls" | tr -d ' ')"
   reexec="$( (cat "${FAKE_STATE}/reexec" 2> /dev/null || true) | wc -l | tr -d ' ')"
@@ -160,6 +165,16 @@ run_scenario remote_only 0 0 1 7
 # retry (the second failure removes nothing), then the original status.
 run_scenario still_failing 0 1 1 7
 [[ "$scenario_rc" == 7 && "$calls" == 2 ]] || fail "still-failing: want rc=7 calls=2, got rc=${scenario_rc} calls=${calls}"
+
+# The entry reappears on every failed attempt (a remote that keeps serving the
+# same result): still exactly one retry, and the retry's status comes back.
+REAPPEAR=1 run_scenario reappear 0 1 1 9
+[[ "$scenario_rc" == 9 && "$calls" == 2 ]] || fail "reappearing entry: want rc=9 calls=2, got rc=${scenario_rc} calls=${calls}"
+
+# Removal fails (read-only directory): not counted as progress, so no retry.
+READONLY_AC=1 run_scenario unremovable 0 1 1 5
+[[ "$scenario_rc" == 5 && "$calls" == 1 ]] || fail "unremovable entry: want rc=5 calls=1, got rc=${scenario_rc} calls=${calls}"
+[[ -e "${FAKE_CACHE}/ac/aa/names-lost-blob" ]] || fail "unremovable entry should still be present"
 
 # A failure that is not lost inputs is not retried and keeps its status.
 fakefail="${fakebin}/bazel"
