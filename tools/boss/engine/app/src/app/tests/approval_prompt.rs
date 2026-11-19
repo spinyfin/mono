@@ -7,7 +7,7 @@ use boss_engine_runtime::events_socket::IncomingHookEvent;
 use boss_engine_runtime::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND;
 use boss_protocol::{ExecutionStatus, WorkerEvent};
 
-use crate::app::approval_prompt::UNANSWERED_APPROVAL_PROMPT_GRACE;
+use crate::app::approval_prompt::{UNANSWERED_APPROVAL_PROMPT_GRACE, UnansweredPromptOutcome};
 
 const SLOT: u8 = 1;
 const SESSION: &str = "76744658-0402-42f7-a644-68dd52f6dad4";
@@ -95,10 +95,11 @@ async fn a_progression_run_left_on_an_approval_prompt_is_failed_with_the_reason_
         .expect("a deny-by-default run that reports an approval prompt is watched");
     assert_eq!(watched, run);
 
-    assert!(
+    assert_eq!(
         state
             .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
-            .await
+            .await,
+        UnansweredPromptOutcome::Failed
     );
 
     assert_eq!(
@@ -140,10 +141,11 @@ async fn a_progression_run_left_on_an_approval_prompt_is_failed_with_the_reason_
         "no attention is raised on the stuck item"
     );
     // A second check after the failure is a no-op, not a second failure.
-    assert!(
-        !state
+    assert_eq!(
+        state
             .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
-            .await
+            .await,
+        UnansweredPromptOutcome::NotApplicable
     );
 }
 
@@ -160,29 +162,30 @@ async fn a_prompt_followed_by_a_dialog_closing_event_is_not_a_failure() {
     dispatch_live_worker_state(&state, &finished).await;
     state.watch_approval_prompt(&finished);
 
-    assert!(
-        !state
+    assert_eq!(
+        state
             .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
-            .await
+            .await,
+        UnansweredPromptOutcome::NotApplicable
     );
     assert!(!state.work_db.get_execution(&run).unwrap().status.is_terminal());
     assert_eq!(state.worker_registry.slot_for_run(&run), Some(SLOT));
 }
 
-/// A failed failure-write still releases the pane and slot. A transient DB
-/// error at the grace deadline must not recreate the silent hold.
+/// A failed failure-write must not drop tracking: the pane may still be alive
+/// and the run still holds its pool claim. The watch stays armed, and a retry
+/// once writes work again records the failure, verifies the teardown and
+/// frees the pool capacity.
 #[tokio::test]
-async fn a_failed_failure_write_still_releases_the_pane_and_slot() {
+async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_claim() {
     let (state, _dir) = test_server_state();
-    // No tmux identity: `release_worker_pane` cannot reap a session, so the
-    // in-memory slot drop after a failed failure-write is what this covers.
-    let run = register_working_worker_with_driver(&state, SLOT, Some("grok"));
-    state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute("UPDATE work_executions SET kind = 'progression' WHERE id = ?1", [&run])
-        .unwrap();
+    let run = working_run(&state, "grok", true);
+    let pool = state.execution_coordinator.worker_pool();
+    let held = pool.claim_worker(&run, None).await.expect("test pool has a free slot");
+    assert_eq!(held, "worker-1");
+    let idle_while_held = pool.idle_count().await;
+    let sink = make_session_sink();
+    state.register_app_session("session-app".into(), sink.clone()).await;
 
     let prompt = approval_prompt(&run, 7);
     dispatch_live_worker_state(&state, &prompt).await;
@@ -195,20 +198,87 @@ async fn a_failed_failure_write_still_releases_the_pane_and_slot() {
         .execute_batch("PRAGMA query_only = ON;")
         .unwrap();
 
-    assert!(
+    assert_eq!(
         state
             .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
             .await,
-        "the watch still acts when the failure write itself fails"
+        UnansweredPromptOutcome::Incomplete,
+        "the failure write failed, so the failure is not complete"
     );
     assert!(
         !state.work_db.get_execution(&run).unwrap().status.is_terminal(),
         "query_only blocked the durable failure write"
     );
+    assert_eq!(
+        state.worker_registry.slot_for_run(&run),
+        Some(SLOT),
+        "tracking is kept while the failure is incomplete"
+    );
+    assert!(pool.claimed_execution_ids().await.contains(&run));
+
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("PRAGMA query_only = OFF;")
+        .unwrap();
+    // The first attempt's own teardown used the scripted replies; the retry
+    // verifies and reaps the pane again.
+    let env = format!("BOSS_SPAWN_TOKEN=token-{run}\n");
+    let (tmux, _) = super::tmux_stub::fake_tmux([
+        super::tmux_stub::ok(&env),
+        super::tmux_stub::ok("0"),
+        super::tmux_stub::ok(&env),
+        super::tmux_stub::ok(""),
+        super::tmux_stub::ok(""),
+    ]);
+    state.set_tmux_override_for_test(tmux);
+    let ack = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let envelope = sink.next().await.expect("the app is asked to detach the pane");
+            let FrontendEvent::EngineRequest {
+                request_id, request, ..
+            } = envelope.payload
+            else {
+                panic!("expected an EngineRequest, got {:?}", envelope.payload);
+            };
+            assert!(
+                matches!(request, EngineToAppRequest::DetachWorkerPane(_)),
+                "{request:?}"
+            );
+            state
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::DetachWorkerPane {
+                        result: Ok(boss_protocol::DetachWorkerPaneResult {}),
+                    },
+                )
+                .await;
+        }
+    });
+
+    assert_eq!(
+        state
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .await,
+        UnansweredPromptOutcome::Failed
+    );
+    assert_eq!(
+        state.work_db.get_execution(&run).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    ack.await.unwrap();
     assert!(
         state.worker_registry.slot_for_run(&run).is_none(),
-        "the slot is released even when the failure write fails"
+        "the verified teardown released the slot"
     );
+    assert!(
+        !pool.claimed_execution_ids().await.contains(&run),
+        "the pool claim is freed"
+    );
+    assert!(pool.idle_count().await > idle_while_held, "pool capacity is back");
 }
 
 /// Grok's background `task_complete` is an ordinary Notification. It must
@@ -225,10 +295,11 @@ async fn a_prompt_followed_by_task_complete_still_fails_after_the_grace() {
     dispatch_live_worker_state(&state, &complete).await;
     state.watch_approval_prompt(&complete);
 
-    assert!(
+    assert_eq!(
         state
             .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
-            .await
+            .await,
+        UnansweredPromptOutcome::Failed
     );
     assert_eq!(
         state.work_db.get_execution(&run).unwrap().status,
@@ -247,7 +318,9 @@ async fn a_prompt_overtaken_by_a_newer_event_is_not_watched() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
 
-    dispatch_live_worker_state(&state, &tool_finished(&run, 8)).await;
+    let finished = tool_finished(&run, 8);
+    dispatch_live_worker_state(&state, &finished).await;
+    state.watch_approval_prompt(&finished);
     let prompt = approval_prompt(&run, 7);
     dispatch_live_worker_state(&state, &prompt).await;
 
@@ -322,5 +395,63 @@ async fn the_prompt_event_starts_a_watch_that_fails_the_run_after_the_grace_peri
     assert!(
         state.worker_registry.slot_for_run(&run).is_none(),
         "the slot is released"
+    );
+}
+
+/// Hook connections are dispatched concurrently: a `task_complete` that was
+/// sent after the prompt can be applied first. It is not evidence the dialog
+/// closed, so the late prompt must still be watched and still fail the run.
+#[tokio::test]
+async fn a_prompt_dispatched_after_a_later_task_complete_is_still_watched() {
+    let (state, _dir) = test_server_state();
+    let run = working_run(&state, "grok", true);
+
+    let complete = task_complete(&run, 8);
+    dispatch_live_worker_state(&state, &complete).await;
+    state.watch_approval_prompt(&complete);
+    let prompt = approval_prompt(&run, 7);
+    dispatch_live_worker_state(&state, &prompt).await;
+    let (_, mark) = state
+        .approval_prompt_to_watch(&prompt)
+        .expect("a later Notification does not suppress an earlier prompt");
+
+    assert_eq!(
+        state
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .await,
+        UnansweredPromptOutcome::Failed
+    );
+}
+
+/// The PreToolUse for the very call that raised the prompt has a lower
+/// sequence than the prompt. Dispatched after it, it must not clear it.
+#[tokio::test]
+async fn an_older_tool_event_dispatched_after_the_prompt_does_not_clear_it() {
+    let (state, _dir) = test_server_state();
+    let run = working_run(&state, "grok", true);
+
+    let prompt = approval_prompt(&run, 7);
+    dispatch_live_worker_state(&state, &prompt).await;
+    let (_, mark) = state.approval_prompt_to_watch(&prompt).unwrap();
+    let older = IncomingHookEvent::resolve(
+        driver("grok").as_ref(),
+        WorkerEvent::PreToolUse {
+            session_id: SESSION.into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+        },
+        Some(run.clone()),
+        None,
+        None,
+    )
+    .with_ingress_seq(6);
+    dispatch_live_worker_state(&state, &older).await;
+    state.watch_approval_prompt(&older);
+
+    assert_eq!(
+        state
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .await,
+        UnansweredPromptOutcome::Failed
     );
 }
