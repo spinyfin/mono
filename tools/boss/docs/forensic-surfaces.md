@@ -235,23 +235,26 @@ execution changes they cause.
 ### The card notice
 
 The same rows drive a persistent notice on the item's card
-(`Task.auto_stop_notice`, drawn by `WorkAutoStopBanner`), so a never-started
-item the engine stopped on its own is marked until a human sees it. The notice
-is derived from the ledger on every read (full board, incremental card
-re-read, single-item reads), never stored, so the card and
-`boss task show --json` cannot disagree. No attention is raised for it.
+(`Task.auto_stop_notice`, drawn by `WorkAutoStopBanner`), so an item the
+engine stopped on its own is marked until a human sees it. A previous
+finished run does not hide a later stop. The notice is derived from the
+ledger on every read (full board, incremental card re-read, single-item
+reads), never stored, so the card and `boss task show --json` cannot
+disagree. No attention is raised for it.
 
-A ledger row raises it when the engine wrote it, the item had never started a
-run when it was written, and the item still has not: either an `autostart`
-`1 → 0` write (not the normal consumption at run start), or an abandonment of
-a never-started execution that nothing replaced and whose cause is not one of
-the deliberate withdrawals (`BENIGN_ABANDON_CAUSES` in
-`work-db/src/auto_stop_notice.rs`). It additionally needs the item to be live,
-not deferred or parked, and still `autostart = 0`. It clears when the item
-starts a run, when `autostart` is turned back on, when an execution is queued
-again, or when a human acknowledges it. The card names whether autostart was
-turned off, the queued run was withdrawn, or both (one operation), plus the
-reason code and time of the latest stop.
+A ledger row raises it when the engine wrote it and no run has started at
+or after that row: either an `autostart` `1 → 0` write (not the normal
+consumption at run start) while autostart is still off, or an abandonment of
+a never-started execution whose cause is not one of the deliberate
+withdrawals (`BENIGN_ABANDON_CAUSES` in `work-db/src/auto_stop_notice.rs`).
+The abandonment branch does not require autostart to be off: an unreplaced
+never-started execution is a stall even when the reconciler is supposed to
+re-mint. It additionally needs the item to be live, not deferred or parked,
+and to have no queued or running execution. It clears when a later run
+starts, when an execution is queued again, when autostart is turned back on
+(autostart-off notices), or when a human acknowledges it. The card names
+whether autostart was turned off, the queued run was withdrawn, or both
+(one operation), plus the reason code and time of the latest stop.
 
 Acknowledgment is the existing `UpdateWorkItem` request with
 `acknowledge_auto_stop_through = <audit_id>` (the id the card showed). It is

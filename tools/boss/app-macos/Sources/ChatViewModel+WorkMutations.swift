@@ -389,7 +389,7 @@ extension ChatViewModel {
     /// card was drawn stays visible.
     func acknowledgeAutoStopNotice(for task: WorkTask) {
         guard let notice = task.autoStopNotice else { return }
-        engine.sendUpdateWorkItem(id: task.id, patch: ["acknowledge_auto_stop_through": notice.auditId])
+        engine.sendUpdateWorkItem(id: task.id, patch: notice.acknowledgePatch)
     }
 
     func navigatorBriefDraft(for taskID: String) -> NavigatorBriefDraft? {

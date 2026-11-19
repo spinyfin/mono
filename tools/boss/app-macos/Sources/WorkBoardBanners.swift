@@ -102,10 +102,10 @@ struct WorkDispatchFailureBanner: View {
     }
 }
 
-/// An engine-initiated stop of a never-started item that no human has
-/// acknowledged: the engine turned its autostart off, or withdrew its queued
-/// execution without replacing it. Mirrors `AutoStopNotice` on the wire, which
-/// the engine derives from the same audit rows `boss task show` lists.
+/// An engine-initiated stop that no human has acknowledged: the engine
+/// turned autostart off, or withdrew a queued execution without replacing
+/// it. Mirrors `AutoStopNotice` on the wire, which the engine derives from
+/// the same audit rows `boss task show` lists.
 struct AutoStopNotice: Hashable {
     /// Highest audit row the notice covers; sent back to acknowledge it.
     let auditId: Int64
@@ -116,6 +116,20 @@ struct AutoStopNotice: Hashable {
     let changedAt: String
     let autostartDisabled: Bool
     let executionAbandoned: Bool
+
+    /// Patch sent on Acknowledge. The key must stay
+    /// `acknowledge_auto_stop_through`; serde ignores unknown fields, so a
+    /// typo would make the button a silent no-op.
+    var acknowledgePatch: [String: Any] {
+        ["acknowledge_auto_stop_through": auditId]
+    }
+
+    /// A dispatch-failure banner already explains why autostart is off, so
+    /// the engine-stop banner stays hidden while that reason is set.
+    static func visibleNotice(on task: WorkTask) -> AutoStopNotice? {
+        guard task.dispatchFailedReason == nil else { return nil }
+        return task.autoStopNotice
+    }
 
     static func parse(_ value: Any?) -> AutoStopNotice? {
         guard let payload = value as? [String: Any],

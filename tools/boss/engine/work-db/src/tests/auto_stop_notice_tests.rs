@@ -1,6 +1,5 @@
-//! The card notice for an engine-initiated stop of a never-started item: which
-//! ledger rows raise it, what clears it, and that every read path ships the
-//! same notice.
+//! The card notice for an engine-initiated stop: which ledger rows raise it,
+//! what clears it, and that every read path ships the same notice.
 use super::board_projection_tests::check;
 use super::*;
 use crate::task_status_audit::{self, abandon_cause};
@@ -24,7 +23,17 @@ fn ready_execution(db: &WorkDb, work_item_id: &str) -> WorkExecution {
 /// A never-started item whose pending execution the heal abandons. The chore
 /// is created with autostart off, as an item the engine will not re-mint.
 fn ghost_demoted(db: &WorkDb, product: &str, name: &str) -> (String, String) {
-    let chore = create_test_chore_manual(db, product, name);
+    ghost_demoted_with_autostart(db, product, name, false)
+}
+
+/// Same heal as [`ghost_demoted`], with autostart left on so the reconciler
+/// is supposed to re-mint. The notice still raises until something is queued.
+fn ghost_demoted_with_autostart(db: &WorkDb, product: &str, name: &str, autostart: bool) -> (String, String) {
+    let chore = if autostart {
+        create_test_chore(db, product, name)
+    } else {
+        create_test_chore_manual(db, product, name)
+    };
     db.update_work_item_as_actor(
         &chore.id,
         WorkItemPatch {
@@ -37,6 +46,32 @@ fn ghost_demoted(db: &WorkDb, product: &str, name: &str) -> (String, String) {
     let execution = ready_execution(db, &chore.id);
     assert_eq!(db.heal_ghost_active_chores().unwrap().len(), 1);
     (chore.id, execution.id)
+}
+
+/// One finished run whose timestamps sit before a later stop, so a historical
+/// run cannot consume the notice by same-second comparison.
+fn finish_a_run_then_backdate(db: &WorkDb, item: &str) {
+    let execution = db
+        .list_executions(Some(item))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ready_execution(db, item));
+    let (_, run) = db
+        .start_execution_run(&execution.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&execution.id)
+            .run_id(&run.id)
+            .execution_status(ExecutionStatus::Completed)
+            .run_status("completed")
+            .build(),
+    )
+    .unwrap();
+    let past = boss_engine_utils::epoch_time::now_epoch_secs() - 10;
+    db.force_started_at_for_test(&execution.id, past).unwrap();
+    db.force_latest_run_started_at_for_test(&execution.id, past).unwrap();
 }
 
 /// An abandonment written without the ledger helpers, as an unknown writer would.
@@ -171,6 +206,96 @@ fn a_dispatch_failure_bounce_raises_the_notice_until_autostart_is_rearmed() {
     )
     .unwrap();
     assert_eq!(stop_notice(&db, &chore.id), None);
+}
+
+#[test]
+fn a_queued_execution_clears_an_autostart_off_notice_without_rearming() {
+    let db = WorkDb::open(temp_db_path("auto-stop-queue-clears")).unwrap();
+    let product = create_test_product_named(&db, "Auto stop queue");
+    let chore = create_test_chore(&db, &product.id, "Queued");
+    assert!(
+        db.bounce_dispatch_failed_to_backlog(&chore.id, "cube_workspace_lease_failed", "no workspace")
+            .unwrap()
+    );
+    assert!(stop_notice(&db, &chore.id).unwrap().autostart_disabled);
+
+    db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    assert!(!card(&db, &chore.id).autostart);
+    assert_eq!(
+        stop_notice(&db, &chore.id),
+        None,
+        "a queued execution means the item is moving again even with autostart still off"
+    );
+}
+
+#[test]
+fn an_abandoned_never_started_execution_raises_the_notice_while_autostart_is_on() {
+    let db = WorkDb::open(temp_db_path("auto-stop-abandon-autostart-on")).unwrap();
+    let product = create_test_product_named(&db, "Auto stop autostart on");
+    let (item, _) = ghost_demoted_with_autostart(&db, &product.id, "Ghost armed", true);
+    assert!(card(&db, &item).autostart);
+    let notice = stop_notice(&db, &item).expect("an unreplaced abandon is a stall even with autostart on");
+    assert!(notice.execution_abandoned && !notice.autostart_disabled);
+}
+
+#[test]
+fn a_previous_run_does_not_hide_an_engine_autostart_off() {
+    let db = WorkDb::open(temp_db_path("auto-stop-after-run-bounce")).unwrap();
+    let product = create_test_product_named(&db, "Auto stop after run bounce");
+    let acked = create_test_chore(&db, &product.id, "Acked");
+    let started = create_test_chore(&db, &product.id, "Started");
+    finish_a_run_then_backdate(&db, &acked.id);
+    finish_a_run_then_backdate(&db, &started.id);
+
+    for item in [&acked.id, &started.id] {
+        db.update_work_item_as_actor(
+            item,
+            WorkItemPatch {
+                autostart: Some(true),
+                status: Some("todo".to_owned()),
+                ..WorkItemPatch::default()
+            },
+            "human",
+        )
+        .unwrap();
+        assert!(
+            db.bounce_dispatch_failed_to_backlog(item, "cube_workspace_lease_failed", "no workspace")
+                .unwrap()
+        );
+        let notice = stop_notice(&db, item).expect("a later autostart-off is visible after a finished run");
+        assert!(notice.autostart_disabled && !notice.execution_abandoned);
+    }
+
+    let first = stop_notice(&db, &acked.id).unwrap();
+    assert!(acknowledge(&db, &acked.id, first.audit_id).auto_stop_notice.is_none());
+
+    let replacement = ready_execution(&db, &started.id);
+    db.start_execution_run(&replacement.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    assert_eq!(stop_notice(&db, &started.id), None);
+}
+
+#[test]
+fn a_previous_run_does_not_hide_an_unreplaced_abandonment() {
+    let db = WorkDb::open(temp_db_path("auto-stop-after-run-abandon")).unwrap();
+    let product = create_test_product_named(&db, "Auto stop after run abandon");
+    let acked = create_test_chore(&db, &product.id, "Acked");
+    let started = create_test_chore(&db, &product.id, "Started");
+    finish_a_run_then_backdate(&db, &acked.id);
+    finish_a_run_then_backdate(&db, &started.id);
+
+    raw_abandon(&db, &ready_execution(&db, &acked.id).id);
+    raw_abandon(&db, &ready_execution(&db, &started.id).id);
+    let first = stop_notice(&db, &acked.id).expect("an unreplaced later attempt is visible after a finished run");
+    assert!(first.execution_abandoned);
+    assert!(stop_notice(&db, &started.id).is_some());
+
+    assert!(acknowledge(&db, &acked.id, first.audit_id).auto_stop_notice.is_none());
+    let replacement = ready_execution(&db, &started.id);
+    db.start_execution_run(&replacement.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    assert_eq!(stop_notice(&db, &started.id), None);
 }
 
 #[test]

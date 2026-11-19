@@ -395,6 +395,44 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNil(AutoStopNotice.parse(["reason_code": "x"] as [String: Any]))
     }
 
+    func testAcknowledgeAutoStopNoticeSendsTheAuditIdPatch() {
+        let notice = AutoStopNotice(
+            auditId: 41, reasonCode: "ghost_active_demoted", detail: nil, changedAt: "1799990000",
+            autostartDisabled: true, executionAbandoned: false
+        )
+        let patch = notice.acknowledgePatch
+        XCTAssertEqual(patch.count, 1)
+        XCTAssertEqual((patch["acknowledge_auto_stop_through"] as? NSNumber)?.int64Value, 41)
+
+        var task = Self.makeTask(id: "task_stop")
+        task.autoStopNotice = notice
+        let model = ChatViewModel(socketPath: "/tmp/boss-test-\(UUID().uuidString).sock")
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.outboundRecorder = { sent.append($0) }
+        model.acknowledgeAutoStopNotice(for: task)
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?["type"] as? String, "update_work_item")
+        XCTAssertEqual(sent.first?["id"] as? String, "task_stop")
+        let sentPatch = sent.first?["patch"] as? [String: Any]
+        XCTAssertEqual((sentPatch?["acknowledge_auto_stop_through"] as? NSNumber)?.int64Value, 41)
+    }
+
+    func testAutoStopBannerIsHiddenWhileDispatchFailedReasonIsSet() {
+        var task = Self.makeTask(id: "task_stop")
+        task.autoStopNotice = AutoStopNotice(
+            auditId: 1, reasonCode: "x", detail: nil, changedAt: "",
+            autostartDisabled: true, executionAbandoned: false
+        )
+        XCTAssertNotNil(AutoStopNotice.visibleNotice(on: task))
+        task.dispatchFailedReason = "cube_workspace_lease_failed"
+        XCTAssertNil(AutoStopNotice.visibleNotice(on: task))
+        task.autoStopNotice = nil
+        task.dispatchFailedReason = nil
+        XCTAssertNil(AutoStopNotice.visibleNotice(on: task))
+    }
+
     // MARK: - Equatable: every rendered field flips equality
 
     /// Table-driven: for each rendered `WorkTask` field, a base task and a

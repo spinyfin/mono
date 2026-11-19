@@ -991,12 +991,14 @@ pub struct Task {
     #[builder(default)]
     pub conflict_resolution_deferred: bool,
 
-    /// The engine stopped this never-started item on its own (turned off
-    /// autostart, or abandoned its queued execution without replacing it) and
-    /// no human has acknowledged it. A derived projection from the
-    /// `task_status_audit` ledger, not a stored column: it clears when the
-    /// item starts a run or when [`WorkItemPatch::acknowledge_auto_stop_through`]
-    /// covers it, and survives status changes in between.
+    /// The engine stopped this item on its own (turned off autostart, or
+    /// abandoned a never-started execution without replacing it) and no
+    /// human has acknowledged it. A previous finished run does not hide a
+    /// later stop. A derived projection from the `task_status_audit` ledger,
+    /// not a stored column: it clears when a later run starts, when an
+    /// execution is queued again, or when
+    /// [`WorkItemPatch::acknowledge_auto_stop_through`] covers it, and
+    /// survives status changes in between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_stop_notice: Option<AutoStopNotice>,
 
@@ -1453,8 +1455,8 @@ pub struct TaskFieldAuditRow {
     pub item_ever_ran: Option<bool>,
 }
 
-/// An unacknowledged engine-initiated stop of a never-started work item, shown
-/// on its card. Built from the ledger rows behind `boss task show --json`.
+/// An unacknowledged engine-initiated stop of a work item, shown on its
+/// card. Built from the ledger rows behind `boss task show --json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct AutoStopNotice {
