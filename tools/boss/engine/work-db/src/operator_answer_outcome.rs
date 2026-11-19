@@ -19,18 +19,16 @@ pub struct OperatorAnswerOutcome {
     pub touched_work_item_ids: Vec<String>,
     /// The task whose ready execution the answer wants dispatched immediately,
     /// like `bossctl agents launch`: through the global dispatch pause and
-    /// focus mode. Set only where the answer *creates* the work (an
-    /// architectural-mismatch answer), never for an ordinary resume.
+    /// focus mode. Set when the answer creates work (an architectural-mismatch
+    /// answer) and when it resumes a run that was admitted by an operator
+    /// force launch. An ordinary resume of a normally dispatched run leaves
+    /// this unset so the scheduler applies the pause.
     pub dispatch_work_item_id: Option<String>,
     /// The task the owner chose to archive when the engine asked what to do
     /// with an item progression could not unstick. The archive is the ordinary
     /// update path (it cascades to dependents and the project), so the caller
     /// runs it once the answer has committed.
     pub archive_work_item_id: Option<String>,
-    /// The minted resume execution, when the run that asked the question was
-    /// admitted by an operator force launch. The RPC layer may bypass an
-    /// operator-originated dispatch pause for this resume.
-    pub force_resume_execution_id: Option<String>,
 }
 
 impl OperatorAnswerOutcome {

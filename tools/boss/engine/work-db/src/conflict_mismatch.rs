@@ -247,7 +247,7 @@ pub(super) fn conflict_revision_awaits_mismatch_answer(conn: &Connection, revisi
     )?)
 }
 
-fn mark_operator_forced_admission_in_tx(tx: &Transaction<'_>, work_item_id: &str) -> Result<()> {
+pub(crate) fn mark_operator_forced_admission_in_tx(tx: &Transaction<'_>, work_item_id: &str) -> Result<()> {
     let id: Option<String> = tx
         .query_row(
             &format!(
