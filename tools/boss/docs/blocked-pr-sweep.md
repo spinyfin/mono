@@ -9,7 +9,7 @@ Code:
 - `tools/boss/engine/merge-poller/src/ci_transient_retry.rs` — the transient-CI job retry, run inside `ci_watch::on_ci_failure_detected_with` where the failing checks are known.
 - `tools/boss/engine/ci-log-reader/src/transient.rs` — the transient-vs-deterministic classifier for a failed Buildkite job.
 - `tools/boss/engine/work-db/src/blocked_pr.rs` — storage: `pr_blocked_diagnoses` (the card's reason) and `pr_blocked_remediations` (the ledger every budget is counted from).
-- `Task::review_blocked_reason` / `review_blocked_category` on the wire; `WorkBoardCardTitleRow` renders the reason under the title as `Blocked: …`.
+- `Task::review_blocked_reason` / `review_blocked_category` on the wire; `WorkBoardCardTitleRow` renders the reason verbatim under the title (the engine already phrased it, including `Needs you:` / `CI retrying:`).
 
 ## Inventory: what blocks or stalls a Review-lane PR
 

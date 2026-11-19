@@ -533,6 +533,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dead_active_revision_grace_counts_from_when_the_run_ended() {
+        let (_dir, db) = open_db();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let c = in_review_chore(&db, "dead-active");
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(c.work_item_id.clone())
+                    .description("Address review findings")
+                    .created_via("review:test")
+                    .build(),
+                &FakePrStateChecker::always(PrOpenState::Open),
+            )
+            .unwrap();
+        // A run that started an hour ago and ended `ended_secs_ago` ago.
+        let end_run = |ended_secs_ago: i64| {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'orphaned',
+                        created_at = CAST(CAST(strftime('%s','now') AS INTEGER) - 3600 AS TEXT),
+                        finished_at = CAST(CAST(strftime('%s','now') AS INTEGER) - ?2 AS TEXT)
+                 WHERE work_item_id = ?1",
+                rusqlite::params![&revision.id, ended_secs_ago],
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status = 'active' WHERE id = ?1", [&revision.id])
+                .unwrap();
+        };
+        end_run(60);
+        let outcome = run_one_pass(&db, publisher.as_ref(), true).await;
+        assert_eq!(outcome.redispatched, 0, "{outcome:?}");
+        let reason = task(&db, &c.work_item_id).review_blocked_reason.unwrap_or_default();
+        assert!(reason.contains("waiting for orphan recovery"), "{reason}");
+
+        end_run(3600);
+        run_one_pass(&db, publisher.as_ref(), true).await;
+        let reason = task(&db, &c.work_item_id).review_blocked_reason.unwrap_or_default();
+        assert!(reason.contains("orphan recovery did not re-dispatch"), "{reason}");
+    }
+
+    #[tokio::test]
     async fn redispatch_budget_counts_per_head_across_revisions_and_resets_on_a_new_head() {
         let (_dir, db) = open_db();
         let c = in_review_chore(&db, "head-budget");
