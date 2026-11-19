@@ -533,6 +533,22 @@ Alternatives considered and set aside: a standalone service first (no users for 
 
 Phases 0 to 2 are small, independent of the queue choice, and worth doing whatever is decided about the rest. Phase 3 is the last one that is clearly justified by today's data.
 
+### Sizing
+
+[opinion] Rough footprints per pull request against the 30-file limit on a change, taken from what a change of each shape costs in this repository: a new column and migration are four fixed files plus one per writer, a new crate is five fixed files plus two or three per consumer, and a new RPC verb is twelve to fifteen files. They are estimates to be replaced by each phase's own design doc, not commitments.
+
+| Phase | Expected pull requests                                                                              | Rough files in each                                  | Likely to need splitting                                                              |
+| ----- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| 0     | The ledger columns and writers; one per flaky-test fix; the `lint/rust` limit                       | 8 to 12 for the ledger; 1 to 3 for a fix             | No                                                                                    |
+| 1     | Classifier and re-enqueue; flake ledger storage and counters                                        | 10 to 15; 6 to 10                                    | Only if the ledger is built in the first PR, or if a new RPC verb is added to show it |
+| 2     | The conflict check before the merge; the tier 1 reliability fixes                                   | 6 to 12 each                                         | Not known until the conflict diagnosis says how many fixes there are                  |
+| 3     | The seam crate; the GitHub implementation; the Trunk implementation; the intent rule; tier 2 shadow | 11 to 14 for the crate; 8 to 12 for each of the rest | **Yes, the likeliest.** As one change it is well over 30 files.                       |
+| 4     | The core crate and its state machine; the engine adapters                                           | 10 to 15 each                                        | Yes, the crate and its adapters should land separately                                |
+| 5     | bazel-diff in CI; lanes with the post-merge check and revert                                        | 5 to 8; 15 to 25                                     | Lanes, depending on what the shadow measurement shows                                 |
+| 6     | Not sized: a new binary with GitHub App adapters is several pull requests                           |                                                      | Yes                                                                                   |
+
+The landing-backend seam is the item most likely to exceed the limit if built as one change. It replaces the hard-coded merge `match` in `review.rs`, touches both pollers and both intent stores, and normalises ejection causes across two systems, on top of the new crate's own cost. Split it along capability boundaries: the crate and normalised types with GitHub as the only implementation and no behaviour change; Trunk as the second implementation; the single intent rule; tier 2 in shadow mode as its own task. The next likeliest is phase 1: the Tier 0 re-enqueue should land before, and separately from, the flake ledger storage.
+
 ## Risks
 
 - **Retry hides a real intermittent failure.** A PR that makes a test flaky lands on the second attempt. Mitigation: the flake ledger flags a test that first flakes in a PR that touches it; one retry only.
@@ -560,7 +576,7 @@ Phases 0 to 2 are small, independent of the queue choice, and worth doing whatev
 
 ## Follow-up code changes
 
-For separate PRs. None was made here.
+For separate PRs. None was made here. Rough sizes are in [Sizing](#sizing); the landing-backend trait below is the one most likely to need splitting.
 
 - Record a cause class, the queue commit, and the eventual re-land outcome on every `merge_queue_rebounce` remediation row, and add counters for each.
 - On a queue ejection classified as infrastructure, or as a first test failure, re-enqueue the same head from the engine with `enqueuePullRequest` and no revision; charge no CI budget. Give `CiLogReader::retrigger` its first production caller for the Trunk and PR-branch cases.
