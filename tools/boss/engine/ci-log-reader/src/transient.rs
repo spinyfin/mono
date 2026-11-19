@@ -167,14 +167,19 @@ const CHECKLEFT_INPUT_UNAVAILABLE_LINES: &[&str] = &[
 const DETERMINISTIC_MARKERS: &[(&str, &str)] = &[
     ("FAIL: //", "test target failed"),
     ("TIMEOUT: //", "test target timed out"),
-    // Covers both the execution-phase `FAILED:` and the loading/analysis-phase
-    // `ERROR:` terminators.
-    ("Build did NOT complete successfully", "build failed"),
+    ("FAILED: Build did NOT complete", "build failed"),
     ("ERROR: Analysis of target", "build analysis failed"),
     ("error[E", "compiler error"),
     ("** TEST FAILED **", "test failed"),
     ("** BUILD FAILED **", "build failed"),
 ];
+
+/// The loading-phase terminator. It proves the build failed, but a Bazel
+/// repository fetch that dies on a retryable download also ends with it, so
+/// it vetoes a transient verdict only when the log carries no retryable
+/// download failure. Change-caused loading failures are still caught by
+/// their own lines (`ERROR: Analysis of target`, permanent downloads).
+const LOADING_TERMINATOR: &str = "ERROR: Build did NOT complete successfully";
 
 /// Upstream-unavailable log signatures: `(needle, summary)`. Matched
 /// case-sensitively against each log line; the summary is the card label.
@@ -353,8 +358,12 @@ fn first_line_containing(log: &str, needles: &[&str]) -> Option<String> {
 /// refusal, which is the tool declining to report, not a finding about the
 /// change.
 fn first_deterministic_marker(log: &str) -> Option<(String, &'static str)> {
+    let retryable_download = log.lines().any(|l| download_failure_summary(l).is_some());
     for line in log.lines() {
         let trimmed = line.trim();
+        if !retryable_download && trimmed.contains(LOADING_TERMINATOR) {
+            return Some((truncate(trimmed, 300), "build failed"));
+        }
         if let Some((_, summary)) = DETERMINISTIC_MARKERS.iter().find(|(m, _)| trimmed.contains(m)) {
             return Some((truncate(trimmed, 300), summary));
         }
@@ -505,6 +514,25 @@ summary: 1 error(s), 1 warning(s), 0 info finding(s)
                 "{retryable:?} should be transient: {verdict:?}"
             );
         }
+    }
+
+    #[test]
+    fn retryable_download_followed_by_loading_terminator_is_still_transient() {
+        let log = format!(
+            "{}\nERROR: Build did NOT complete successfully\n",
+            download_line("Read timed out")
+        );
+        let verdict = classify_job(&failed(1, &log));
+        assert!(
+            matches!(
+                verdict,
+                Verdict::Transient {
+                    signal: TransientSignal::UpstreamUnavailable,
+                    ..
+                }
+            ),
+            "{verdict:?}"
+        );
     }
 
     #[test]

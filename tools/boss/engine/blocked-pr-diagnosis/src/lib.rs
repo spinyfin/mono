@@ -15,6 +15,15 @@
 //! Blocked section but have silently stopped progressing (a revision whose
 //! worker died, an automated review that was reaped at its generation cap),
 //! so "blocked" here means "will not reach merge without something happening".
+//!
+//! Statuses stay wire strings (`status: String`) because the facts are
+//! gathered straight from database rows and the sweep must keep running on a
+//! value this build does not know yet. They are parsed with the
+//! `boss-protocol` `FromStr` impls and every decision goes through those
+//! enums' predicates (or the parsed helpers below), never a raw literal. An
+//! unknown value is neither terminal nor live. A parity test walks every
+//! `ExecutionStatus` and `TaskStatus` wire string and checks the helpers
+//! agree with the protocol predicates.
 
 use boss_protocol::{ExecutionStatus, TaskStatus};
 
@@ -127,7 +136,10 @@ impl ExecutionFacts {
     /// The run ended because the worker died or failed, not because anyone
     /// stopped it: the only terminal states the sweep may re-dispatch from.
     fn died(&self) -> bool {
-        matches!(self.status.as_str(), "failed" | "orphaned")
+        matches!(
+            self.parsed_status(),
+            Some(ExecutionStatus::Failed | ExecutionStatus::Orphaned)
+        )
     }
 
     /// How long the worker has been gone. Prefers [`ended_age_secs`] so a
@@ -162,12 +174,24 @@ pub struct RevisionFacts {
 
 impl RevisionFacts {
     fn is_open(&self) -> bool {
-        self.status.parse::<TaskStatus>().is_ok_and(|s| s.can_still_change_pr())
+        self.parsed_status().is_some_and(|s| s.can_still_change_pr())
+    }
+
+    fn parsed_status(&self) -> Option<TaskStatus> {
+        self.status.parse().ok()
+    }
+
+    fn is_blocked(&self) -> bool {
+        self.parsed_status() == Some(TaskStatus::Blocked)
+    }
+
+    fn is_active(&self) -> bool {
+        self.parsed_status() == Some(TaskStatus::Active)
     }
 
     /// `todo` or `active`: the states a revision can be dispatched from.
     fn is_dispatchable(&self) -> bool {
-        matches!(self.status.parse(), Ok(TaskStatus::Todo | TaskStatus::Active))
+        matches!(self.parsed_status(), Some(TaskStatus::Todo | TaskStatus::Active))
     }
 
     /// Open, nothing non-terminal, and the newest run ended by failing or
@@ -343,8 +367,9 @@ pub enum Category {
 }
 
 impl Category {
-    /// Every variant. `_exhaustive` has no wildcard arm, so adding a variant
-    /// without listing it here fails to compile.
+    /// Every variant. `_index` has no wildcard arm, so a new variant must be
+    /// given an index there, and `all_lists_every_category_at_its_index`
+    /// fails until `ALL` holds it at that index.
     pub const ALL: [Category; 23] = [
         Self::ReviewFeedback,
         Self::MergeConflictResolving,
@@ -372,31 +397,31 @@ impl Category {
     ];
 
     #[cfg(test)]
-    fn _exhaustive(c: Category) {
+    fn _index(c: Category) -> usize {
         match c {
-            Category::ReviewFeedback
-            | Category::MergeConflictResolving
-            | Category::MergeConflictRevisionDead
-            | Category::MergeConflictNoRemediation
-            | Category::CiTransientRetrying
-            | Category::CiTransientExhausted
-            | Category::CiFixExhausted
-            | Category::CiFixRevisionLive
-            | Category::CiFixRevisionDead
-            | Category::CiFixRevisionBlocked
-            | Category::CiFailingNoRemediation
-            | Category::RevisionBlocked
-            | Category::RevisionDead
-            | Category::DispatchStalled
-            | Category::RevisionHalted
-            | Category::ReviewUnreviewedAfterReap
-            | Category::ReviewReadmissionPending
-            | Category::ReviewAwaitingApproval
-            | Category::ReviewFindingsUnaddressed
-            | Category::ReviewGaveUp
-            | Category::ReviewNotAdmitted
-            | Category::ReviewerStalled
-            | Category::BlockedOther => {}
+            Category::ReviewFeedback => 0,
+            Category::MergeConflictResolving => 1,
+            Category::MergeConflictRevisionDead => 2,
+            Category::MergeConflictNoRemediation => 3,
+            Category::CiTransientRetrying => 4,
+            Category::CiTransientExhausted => 5,
+            Category::CiFixExhausted => 6,
+            Category::CiFixRevisionLive => 7,
+            Category::CiFixRevisionDead => 8,
+            Category::CiFixRevisionBlocked => 9,
+            Category::CiFailingNoRemediation => 10,
+            Category::RevisionBlocked => 11,
+            Category::RevisionDead => 12,
+            Category::DispatchStalled => 13,
+            Category::RevisionHalted => 14,
+            Category::ReviewUnreviewedAfterReap => 15,
+            Category::ReviewReadmissionPending => 16,
+            Category::ReviewAwaitingApproval => 17,
+            Category::ReviewFindingsUnaddressed => 18,
+            Category::ReviewGaveUp => 19,
+            Category::ReviewNotAdmitted => 20,
+            Category::ReviewerStalled => 21,
+            Category::BlockedOther => 22,
         }
     }
 
@@ -479,11 +504,17 @@ impl Diagnosis {
     }
 }
 
+impl BlockedFacts {
+    fn is_blocked(&self) -> bool {
+        self.status.parse::<TaskStatus>().ok() == Some(TaskStatus::Blocked)
+    }
+}
+
 /// The engine's Review-column Blocked rule (`classify_review_section`).
 pub fn is_review_blocked(f: &BlockedFacts) -> bool {
     let open: Vec<&RevisionFacts> = f.revisions.iter().filter(|r| r.is_open()).collect();
-    let in_revision_blocked_only = !open.is_empty() && open.iter().all(|r| r.status == "blocked");
-    f.status == "blocked"
+    let in_revision_blocked_only = !open.is_empty() && open.iter().all(|r| r.is_blocked());
+    f.is_blocked()
         || f.blocked_reason.is_some()
         || f.ci_required_state.as_deref() == Some("fail")
         || f.pr_mergeable_state.as_deref() == Some("conflicting")
@@ -492,7 +523,7 @@ pub fn is_review_blocked(f: &BlockedFacts) -> bool {
 
 /// Diagnose the card. `None` means nothing is blocking or stalling it.
 pub fn diagnose(f: &BlockedFacts) -> Option<Diagnosis> {
-    if f.status == "blocked" && f.blocked_reason.as_deref() == Some("review_feedback") {
+    if f.is_blocked() && f.blocked_reason.as_deref() == Some("review_feedback") {
         return Some(Diagnosis::human(
             Category::ReviewFeedback,
             "a reviewer requested changes; address the review and push",
@@ -509,14 +540,14 @@ pub fn diagnose(f: &BlockedFacts) -> Option<Diagnosis> {
         return Some(diagnose_ci(f));
     }
     let open: Vec<&RevisionFacts> = f.revisions.iter().filter(|r| r.is_open()).collect();
-    if !open.is_empty() && open.iter().all(|r| r.status == "blocked") {
+    if !open.is_empty() && open.iter().all(|r| r.is_blocked()) {
         let r = open[0];
         return Some(Diagnosis::human(
             Category::RevisionBlocked,
             format!("{} \"{}\" is blocked ({})", r.origin.label(), r.name, blocked_label(r)),
         ));
     }
-    if f.status == "blocked" {
+    if f.is_blocked() {
         let reason = f.blocked_reason.as_deref().unwrap_or("no reason recorded");
         let detail = f
             .blocked_detail
@@ -555,7 +586,7 @@ fn diagnose_conflict(f: &BlockedFacts) -> Diagnosis {
             .as_deref()
             .and_then(|id| f.revisions.iter().find(|r| r.id == id))
         {
-            if rev.status == "blocked" {
+            if rev.is_blocked() {
                 return Diagnosis::human(
                     Category::MergeConflictRevisionDead,
                     format!(
@@ -621,7 +652,7 @@ fn diagnose_ci(f: &BlockedFacts) -> Diagnosis {
                     .find(|r| r.origin == RevisionOrigin::CiFix && r.is_open())
             });
     if let Some(rev) = fix {
-        if rev.status == "blocked" {
+        if rev.is_blocked() {
             return Diagnosis::human(
                 Category::CiFixRevisionBlocked,
                 format!(
@@ -890,7 +921,7 @@ fn dead_revision(r: &RevisionFacts, head_used: u32, category: Category) -> Diagn
         .as_ref()
         .map(|e| (e.status.clone(), e.downtime_secs()))
         .unwrap_or_else(|| ("unknown".to_owned(), 0));
-    if r.status == "active" {
+    if r.is_active() {
         // The orphan sweep owns dead `active` work items.
         return if age < ORPHAN_RECOVERY_GRACE_SECS {
             Diagnosis::waiting(
@@ -1531,7 +1562,20 @@ mod tests {
             Some(exec("completed", 600)),
         )];
         let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::CiFailingNoRemediation, "{}", d.reason);
+        assert_eq!(d.action, Action::None, "{}", d.reason);
         assert!(!d.reason.contains("queued"), "{}", d.reason);
+
+        f.ci.last_transient_retry = Some(TransientRetryFacts {
+            check_name: "checks".into(),
+            summary: "HTTP 504".into(),
+            outcome: "retried".into(),
+            age_secs: 5,
+            attempt: 1,
+            budget: 2,
+        });
+        let d = diagnose(&f).unwrap();
+        assert_eq!(d.category, Category::CiTransientRetrying, "{}", d.reason);
     }
 
     #[test]
@@ -1625,5 +1669,67 @@ mod tests {
             keys.iter()
                 .all(|k| k.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
         );
+    }
+
+    #[test]
+    fn all_lists_every_category_at_its_index() {
+        for (i, c) in Category::ALL.iter().enumerate() {
+            assert_eq!(Category::_index(*c), i, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn status_helpers_agree_with_protocol_predicates() {
+        // No wildcard: a new `ExecutionStatus` variant must be added here.
+        fn _covered(s: &ExecutionStatus) {
+            match s {
+                ExecutionStatus::Queued
+                | ExecutionStatus::Ready
+                | ExecutionStatus::WaitingDependency
+                | ExecutionStatus::Claimed
+                | ExecutionStatus::Running
+                | ExecutionStatus::WaitingHuman
+                | ExecutionStatus::WaitingReview
+                | ExecutionStatus::WaitingMerge
+                | ExecutionStatus::Completed
+                | ExecutionStatus::Failed
+                | ExecutionStatus::Abandoned
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::Orphaned => {}
+            }
+        }
+        let wire = [
+            "queued",
+            "ready",
+            "waiting_dependency",
+            "claimed",
+            "running",
+            "waiting_human",
+            "waiting_review",
+            "waiting_merge",
+            "completed",
+            "failed",
+            "abandoned",
+            "cancelled",
+            "orphaned",
+        ];
+        for w in wire {
+            let status: ExecutionStatus = w.parse().unwrap();
+            _covered(&status);
+            assert_eq!(status.as_str(), w);
+            let e = exec(w, 0);
+            assert_eq!(e.is_terminal(), status.is_terminal(), "{status:?}");
+            assert_eq!(e.is_running(), status.is_live(), "{status:?}");
+            let died = matches!(status, ExecutionStatus::Failed | ExecutionStatus::Orphaned);
+            assert_eq!(e.died(), died, "{status:?}");
+        }
+        for status in TaskStatus::ALL {
+            let r = revision(status.as_str(), RevisionOrigin::Review, None);
+            assert_eq!(r.is_open(), status.can_still_change_pr(), "{status:?}");
+            assert_eq!(r.is_blocked(), *status == TaskStatus::Blocked, "{status:?}");
+            assert_eq!(r.is_active(), *status == TaskStatus::Active, "{status:?}");
+        }
+        let unknown = exec("not_a_status", 0);
+        assert!(!unknown.is_terminal() && !unknown.is_running() && !unknown.died());
     }
 }
