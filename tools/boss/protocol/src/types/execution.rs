@@ -152,10 +152,6 @@ impl std::str::FromStr for ExecutionKind {
     }
 }
 
-/// Discriminator for the `work_executions.status` column. Exhaustive
-/// match enforces that every callsite handles new variants explicitly —
-/// adding a new status here produces a compile error at every status-keyed
-/// branch that must reason about it.
 /// Declares [`ExecutionStatus`] and its `ALL` list from one variant list, so
 /// a new variant cannot be left out of `ALL`.
 macro_rules! execution_status_enum {
@@ -171,6 +167,10 @@ macro_rules! execution_status_enum {
 }
 
 execution_status_enum! {
+    /// Discriminator for the `work_executions.status` column. Exhaustive
+    /// match enforces that every callsite handles new variants explicitly —
+    /// adding a new status here produces a compile error at every status-keyed
+    /// branch that must reason about it.
     #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum ExecutionStatus {

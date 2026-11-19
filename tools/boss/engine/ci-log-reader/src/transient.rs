@@ -178,11 +178,13 @@ const DETERMINISTIC_MARKERS: &[(&str, &str)] = &[
 /// repository fetch that dies on a retryable download also ends with it, so
 /// it vetoes a transient verdict only when the log carries no retryable
 /// download failure. Change-caused loading failures are still caught by
-/// their own lines (`ERROR: Analysis of target`, permanent downloads).
+/// their own lines (`ERROR: Analysis of target`, permanent downloads, and
+/// the in-repo loading defects recognised by [`is_loading_change_defect`]).
 const LOADING_TERMINATOR: &str = "ERROR: Build did NOT complete successfully";
 
 /// A loading-phase defect in the change's own packages: a missing in-repo
-/// target or package, or a visibility violation. These stay deterministic
+/// target or package, a visibility violation, or a diagnostic in an in-repo
+/// `BUILD` / `BUILD.bazel` / `.bzl` file. These stay deterministic
 /// even when the log also carries a retryable download failure, which would
 /// otherwise exempt the bare [`LOADING_TERMINATOR`]. External-repo labels
 /// (`@repo//...`) are excluded because a failed fetch surfaces as
@@ -195,6 +197,28 @@ fn is_loading_change_defect(line: &str) -> bool {
     missing_in_repo("no such target ")
         || missing_in_repo("no such package ")
         || line.contains(" is not visible from target ")
+        || is_in_repo_build_file_error(line)
+}
+
+/// `ERROR: <abs path>/BUILD[.bazel]:<line>:<col>: ...` or the same for a
+/// `.bzl` file: Bazel reporting a defect in a file the change can edit.
+/// Repository-fetch and download diagnostics are excluded; those name the
+/// file Bazel was fetching into, not an edit by the change.
+fn is_in_repo_build_file_error(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("ERROR: ") else {
+        return false;
+    };
+    if rest.starts_with("An error occurred during the fetch of repository") || rest.contains(DOWNLOAD_FAILURE_NEEDLE) {
+        return false;
+    }
+    let Some(path) = rest.split(':').next() else {
+        return false;
+    };
+    if !path.starts_with('/') || path.contains("/external/") {
+        return false;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file == "BUILD" || file == "BUILD.bazel" || file.ends_with(".bzl")
 }
 
 /// Upstream-unavailable log signatures: `(needle, summary)`. Matched
@@ -571,6 +595,53 @@ summary: 1 error(s), 1 warning(s), 0 info finding(s)
                 "{defect:?}: {verdict:?}"
             );
         }
+    }
+
+    #[test]
+    fn in_repo_build_file_error_alongside_retryable_download_is_deterministic() {
+        for defect in [
+            "ERROR: /w/pkg/BUILD.bazel:3:1: syntax error at 'foo': expected value",
+            "ERROR: /w/pkg/BUILD:7:5: name 'x' is not defined",
+            "ERROR: /w/tools/defs.bzl:12:3: Traceback (most recent call last)",
+        ] {
+            let log = format!(
+                "{}\n{defect}\nERROR: Build did NOT complete successfully\n",
+                download_line("Read timed out")
+            );
+            let verdict = classify_job(&failed(1, &log));
+            assert!(
+                matches!(verdict, Verdict::Deterministic { .. }),
+                "{defect}: {verdict:?}"
+            );
+        }
+    }
+
+    /// Reconstructed from Bazel's fetch-failure output shape (a failed
+    /// repository fetch ending in a missing-package error and the bare
+    /// loading terminator, with a "FAILED: Build did NOT complete" summary
+    /// line). Paths and URLs are sanitized.
+    const FETCH_FAILURE_LOG: &str = "\
+Loading: 0 packages loaded
+ERROR: An error occurred during the fetch of repository 'rules_foo+':
+   Traceback (most recent call last):
+\tFile \"/home/agent/.cache/bazel/external/bazel_tools/tools/build_defs/repo/http.bzl\", line 132, column 45, in _http_archive_impl
+\t\tdownload_info = ctx.download_and_extract(
+Error in download_and_extract: java.io.IOException: Error downloading [https://github.com/example/rules_foo/archive/v1.tar.gz] to /home/agent/.cache/bazel/external/rules_foo+/temp/v1.tar.gz: Read timed out
+ERROR: no such package '@@rules_foo+//foo': java.io.IOException: Error downloading [https://github.com/example/rules_foo/archive/v1.tar.gz]: Read timed out
+ERROR: Build did NOT complete successfully
+";
+
+    #[test]
+    fn whole_fetch_failure_log_is_transient() {
+        let verdict = classify_job(&failed(1, FETCH_FAILURE_LOG));
+        assert!(matches!(verdict, Verdict::Transient { .. }), "{verdict:?}");
+        let with_prefix = format!("{FETCH_FAILURE_LOG}FAILED: Build did NOT complete successfully\n");
+        // The FAILED-prefixed summary is still a deterministic marker; Bazel
+        // prints it after the loading terminator on analysis/build failures.
+        assert!(matches!(
+            classify_job(&failed(1, &with_prefix)),
+            Verdict::Deterministic { .. }
+        ));
     }
 
     #[test]
