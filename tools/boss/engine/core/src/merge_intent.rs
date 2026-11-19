@@ -46,10 +46,12 @@ pub(crate) const FIX_OWED_GIVE_UP_AFTER_SECS: i64 = 10 * 60;
 /// probed, and the fixes it started in between.
 fn decide(intent: &MergeIntent, current_head: Option<&str>, remediation: MergeIntentRemediation) -> Outcome {
     if remediation.fix_owed {
-        let stale = remediation.ci_fixes == 0
-            && remediation
-                .fix_owed_age_secs
-                .is_some_and(|age| age >= FIX_OWED_GIVE_UP_AFTER_SECS);
+        // Age of the unfulfilled obligation alone: an earlier, unrelated CI
+        // attempt does not satisfy it, and one for this obligation would have
+        // cleared `fix_owed`.
+        let stale = remediation
+            .fix_owed_age_secs
+            .is_some_and(|age| age >= FIX_OWED_GIVE_UP_AFTER_SECS);
         if stale {
             return Outcome::Return(MergeIntentEnd {
                 status: MERGE_INTENT_NEEDS_REVIEW,
@@ -247,16 +249,16 @@ mod tests {
         assert_eq!(end.status, MERGE_INTENT_NEEDS_REVIEW);
         assert_eq!(end.reason, MERGE_INTENT_REASON_NO_DECISION);
         assert!(end.detail.unwrap().contains("no CI fix was started"));
-        let attempt_exists = MergeIntentRemediation {
+        let earlier_attempt = MergeIntentRemediation {
             fix_owed: true,
             fix_owed_age_secs: Some(FIX_OWED_GIVE_UP_AFTER_SECS),
             ci_fixes: 1,
             conflict_resolutions: 0,
         };
+        let end = returned(decide(&intent(Some(APPROVED)), Some(APPROVED), earlier_attempt));
         assert_eq!(
-            decide(&intent(Some(APPROVED)), Some(APPROVED), attempt_exists),
-            Outcome::Wait,
-            "a minted attempt is still in flight"
+            end.status, MERGE_INTENT_NEEDS_REVIEW,
+            "an earlier attempt does not satisfy the obligation"
         );
     }
 
@@ -506,6 +508,49 @@ mod tests {
         f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
         f.settle().await;
         assert!(f.standing().is_none(), "nothing will mint a CI fix");
+        assert_eq!(f.on_card().unwrap().status, MERGE_INTENT_NEEDS_REVIEW);
+    }
+
+    #[tokio::test]
+    async fn a_stale_owed_fix_ends_even_after_an_earlier_ci_attempt_finished() {
+        let f = fixture(APPROVED);
+        let id = &f.candidate.work_item_id;
+        f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
+        // A PR-branch CI fix that ran and finished after the request.
+        let earlier =
+            f.db.insert_ci_remediation(
+                CiRemediationInsertInput::builder()
+                    .product_id(&f.candidate.product_id)
+                    .work_item_id(id)
+                    .pr_url(PR)
+                    .pr_number(42)
+                    .head_branch("feature")
+                    .head_sha_at_trigger("earlier-head")
+                    .attempt_kind("fix")
+                    .consumes_budget(1)
+                    .failed_checks("[]")
+                    .failure_kind("pr_branch_ci")
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        f.db.mark_ci_remediation_abandoned(&earlier.id, "done").unwrap();
+        f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
+        let conn = f.db.connect().unwrap();
+        conn.execute(
+            "UPDATE ci_remediations SET created_at = CAST(CAST(strftime('%s','now') AS INTEGER) - 1500 AS TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE merge_intents
+             SET fix_owed_since = CAST(CAST(strftime('%s','now') AS INTEGER) - 700 AS TEXT)
+             WHERE work_item_id = ?1 AND status = 'active'",
+            [id],
+        )
+        .unwrap();
+        f.settle().await;
+        assert!(f.standing().is_none());
         assert_eq!(f.on_card().unwrap().status, MERGE_INTENT_NEEDS_REVIEW);
     }
 }

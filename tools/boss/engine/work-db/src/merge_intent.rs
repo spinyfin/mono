@@ -410,6 +410,15 @@ pub enum MergeQueueDeparture {
     Ended,
 }
 
+/// SQL predicate: does `table`'s row belong to the merge-queue episode of the
+/// PR head named by the SQL expression `head`? Both the dequeue-time
+/// prediction and the owed-fix check build their match from here.
+fn episode_head_match_sql(table: &str, head: &str) -> String {
+    format!(
+        "({table}.head_sha_at_trigger = 'mq:' || {head} OR {table}.head_sha_at_trigger = {head} OR {table}.before_commit_sha = {head})"
+    )
+}
+
 /// Same identity as [`WorkDb::ci_remediation_exists_for_merge_queue_episode`]
 /// when only the PR head is known: `mq:<head>`, the raw head, or that head
 /// stored as the synthetic queue commit.
@@ -418,16 +427,14 @@ fn merge_queue_episode_exists(conn: &Connection, work_item_id: &str, head_sha: &
         return Ok(false);
     }
     Ok(conn.query_row(
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
              SELECT 1 FROM ci_remediations
               WHERE work_item_id = ?1
                 AND failure_kind = 'merge_queue_rebounce'
-                AND (
-                     head_sha_at_trigger = 'mq:' || ?2
-                  OR head_sha_at_trigger = ?2
-                  OR before_commit_sha = ?2
-                )
-         )",
+                AND {})",
+            episode_head_match_sql("ci_remediations", "?2")
+        ),
         params![work_item_id, head_sha],
         |row| row.get(0),
     )?)
@@ -511,16 +518,68 @@ fn failed_checks_fix_will_not_run(
     Ok(None)
 }
 
+/// Whether the failed-checks fix this intent is owed is still unfulfilled,
+/// and how long the obligation has stood. Owed means the intent was stamped
+/// at a failed-checks dequeue and no CI attempt has been minted for it: none
+/// created at or after the stamp, and none already keyed to the PR head's
+/// merge-queue episode.
+fn fix_owed_on(conn: &Connection, intent: &MergeIntent) -> Result<(bool, Option<i64>)> {
+    let approved_match = episode_head_match_sql("cr", "mi.approved_head_sha");
+    let pr_head_match = episode_head_match_sql("cr", "t.pr_head_sha");
+    let (owed, age): (bool, Option<i64>) = conn.query_row(
+        &format!(
+            "SELECT
+                mi.fix_owed_since IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ci_remediations cr
+                    WHERE cr.work_item_id = mi.work_item_id
+                      AND (
+                        CAST(cr.created_at AS INTEGER) >= CAST(mi.fix_owed_since AS INTEGER)
+                        OR (
+                          cr.failure_kind = 'merge_queue_rebounce'
+                          AND (
+                            (NULLIF(mi.approved_head_sha, '') IS NOT NULL AND {approved_match})
+                            OR EXISTS (
+                                SELECT 1 FROM tasks t
+                                 WHERE t.id = mi.work_item_id
+                                   AND NULLIF(t.pr_head_sha, '') IS NOT NULL
+                                   AND {pr_head_match}))))),
+                CASE WHEN mi.fix_owed_since IS NOT NULL
+                     THEN CAST(strftime('%s', 'now') AS INTEGER) - CAST(mi.fix_owed_since AS INTEGER)
+                     ELSE NULL END
+             FROM merge_intents mi WHERE mi.id = ?1"
+        ),
+        [&intent.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((owed, if owed { age } else { None }))
+}
+
+/// End a request that is still owed a CI fix the rebounce path declined to
+/// mint. A request whose fix was already minted (this sweep or an earlier
+/// one) is left alone, which is why a repeated decline on the same episode
+/// is harmless.
 fn end_owed_ci_fix(conn: &Connection, work_item_id: &str, pr_url: &str, why: MergeIntentCiFixDecline) -> Result<bool> {
     let Some(intent) = query_active(conn, work_item_id, pr_url)? else {
         return Ok(false);
     };
+    // Ownership is by creation time: an attempt minted since the stamp is
+    // this request's own fix. An older attempt on the same head is the very
+    // reason the decline fired, so it must not keep the request standing.
+    let own_fix_minted: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM ci_remediations cr, merge_intents mi
+              WHERE mi.id = ?1 AND cr.work_item_id = mi.work_item_id
+                AND CAST(cr.created_at AS INTEGER) >= CAST(mi.fix_owed_since AS INTEGER))",
+        [&intent.id],
+        |row| row.get(0),
+    )?;
     let stamped: bool = conn.query_row(
         "SELECT fix_owed_since IS NOT NULL FROM merge_intents WHERE id = ?1",
         [&intent.id],
         |row| row.get(0),
     )?;
-    if !stamped {
+    if !stamped || own_fix_minted {
         return Ok(false);
     }
     let head = intent.approved_head_sha.clone();
@@ -664,39 +723,10 @@ impl WorkDb {
              WHERE work_item_id = ?1 AND status NOT IN ('deferred', 'predicted')
                AND CAST(created_at AS INTEGER) >= CAST(?2 AS INTEGER)",
         )?;
-        let (fix_owed, fix_owed_age_secs): (bool, Option<i64>) = conn.query_row(
-            "SELECT
-                mi.fix_owed_since IS NOT NULL
-                  AND NOT EXISTS (
-                    SELECT 1 FROM ci_remediations cr
-                    WHERE cr.work_item_id = mi.work_item_id
-                      AND (
-                        CAST(cr.created_at AS INTEGER) >= CAST(mi.fix_owed_since AS INTEGER)
-                        OR (
-                          cr.failure_kind = 'merge_queue_rebounce'
-                          AND (
-                            (NULLIF(mi.approved_head_sha, '') IS NOT NULL AND (
-                                cr.head_sha_at_trigger = 'mq:' || mi.approved_head_sha
-                             OR cr.head_sha_at_trigger = mi.approved_head_sha
-                             OR cr.before_commit_sha = mi.approved_head_sha))
-                            OR EXISTS (
-                                SELECT 1 FROM tasks t
-                                 WHERE t.id = mi.work_item_id
-                                   AND NULLIF(t.pr_head_sha, '') IS NOT NULL
-                                   AND (
-                                       cr.head_sha_at_trigger = 'mq:' || t.pr_head_sha
-                                    OR cr.head_sha_at_trigger = t.pr_head_sha
-                                    OR cr.before_commit_sha = t.pr_head_sha)))))),
-                CASE WHEN mi.fix_owed_since IS NOT NULL
-                     THEN CAST(strftime('%s', 'now') AS INTEGER) - CAST(mi.fix_owed_since AS INTEGER)
-                     ELSE NULL END
-             FROM merge_intents mi WHERE mi.id = ?1",
-            [&intent.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (fix_owed, fix_owed_age_secs) = fix_owed_on(&conn, intent)?;
         Ok(MergeIntentRemediation {
             fix_owed,
-            fix_owed_age_secs: if fix_owed { fix_owed_age_secs } else { None },
+            fix_owed_age_secs,
             ci_fixes,
             conflict_resolutions,
         })
@@ -973,6 +1003,39 @@ mod tests {
         assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
         assert!(ended.detail.unwrap().contains("already had a CI fix"));
         assert!(f.db.active_merge_intent(&f.task, PR).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_repeated_decline_after_the_fix_was_minted_leaves_the_request_standing() {
+        let f = fixture();
+        let intent = f.request();
+        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap();
+        // Rebounce mints the attempt for this dequeue.
+        f.db.insert_ci_remediation(
+            CiRemediationInsertInput::builder()
+                .product_id(&f.product)
+                .work_item_id(&f.task)
+                .pr_url(PR)
+                .pr_number(42)
+                .head_branch("feature")
+                .head_sha_at_trigger("mq:head-1")
+                .attempt_kind("fix")
+                .consumes_budget(1)
+                .failed_checks("[]")
+                .failure_kind("merge_queue_rebounce")
+                .before_commit_sha("queue-commit")
+                .build(),
+        )
+        .unwrap()
+        .unwrap();
+        // The next sweep sees the same episode, finds it handled, and says so.
+        assert!(
+            !f.db
+                .decline_owed_merge_intent_ci_fix(&f.task, PR, MergeIntentCiFixDecline::EpisodeAlreadyHandled)
+                .unwrap()
+        );
+        assert!(f.db.active_merge_intent(&f.task, PR).unwrap().is_some());
+        assert!(!f.db.merge_intent_remediation(&intent).unwrap().fix_owed);
     }
 
     #[test]
