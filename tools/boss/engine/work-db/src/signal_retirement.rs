@@ -180,6 +180,7 @@ pub(crate) fn clear_resolved_signal_in_tx(
             });
         }
     }
+    let mut label_cleared = false;
     let task_transitioned = if ci {
         crate::blocking::clear_blocked_ci_failure_in_tx(conn, item, pr, false, actor)?.is_some()
     } else {
@@ -191,7 +192,7 @@ pub(crate) fn clear_resolved_signal_in_tx(
         let transitioned = crate::blocking::clear_blocked_merge_conflict_in_tx(conn, item, pr, actor)?.is_some();
         // The conflict is gone, so the "Merge paused" explanation for it is too,
         // whether the parent was blocked or already back in review.
-        crate::merge_conflict_merging::clear_stopped_on_conflict_lift(conn, item)?;
+        label_cleared = crate::merge_conflict_merging::clear_stopped_on_conflict_lift(conn, item)?;
         transitioned
     };
     let retire_conflict = conflict
@@ -232,14 +233,14 @@ pub(crate) fn clear_resolved_signal_in_tx(
     if ci {
         conn.execute("DELETE FROM ci_inflight_observations WHERE work_item_id = ?1", [item])?;
     }
-    if !task_transitioned && !retire && !signal_cleared {
+    if !task_transitioned && !retire && !signal_cleared && !label_cleared {
         tracing::info!(
             work_item_id = item,
             pr_url = pr,
             ci,
             active_attempt_id = ids.first().map(String::as_str),
             "signal retirement declined: nothing to clear (task not blocked on this signal for this PR, \
-             and no running or revision-backed attempt to retire)",
+             no stale paused label, and no running or revision-backed attempt to retire)",
         );
         return Ok(ClearResolvedSignal::Nothing);
     }
@@ -490,6 +491,47 @@ mod tests {
         })
         .unwrap()
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stale_paused_label_alone_is_cleared_and_published() {
+        use boss_event_bus::{EventKind, TopicFilter};
+        let db = db();
+        let product = create_test_product(&db).id;
+        let (item, pr) = blocked_on_conflict(&db, &product, "Label only");
+        let attempt = conflict_attempt(&db, &product, &item, &pr, "h1");
+        // Already back in review with the attempt finished, but a paused label lingers.
+        db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, None, 3)
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'in_review', blocked_reason = NULL,
+                   merge_queue_detail = '{\"source\":\"conflict_resolution\",\"paused_label\":\"Merge paused: x\"}'
+                 WHERE id = ?1",
+                [&item],
+            )
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE task_blocked_signals SET cleared_at = '2020-01-01' WHERE work_item_id = ?1",
+                [&item],
+            )
+            .unwrap();
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::WorkItemChanged));
+
+        let outcome = db.clear_resolved_pr_signal(&item, &pr, false).unwrap();
+        assert!(matches!(outcome, ClearResolvedSignal::Applied(_)), "{outcome:?}");
+        assert_eq!(
+            query_task(&db.connect().unwrap(), &item)
+                .unwrap()
+                .unwrap()
+                .merge_queue_detail,
+            None
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv()).await;
+        assert!(event.is_ok(), "clearing the label must notify the board");
     }
 
     #[test]

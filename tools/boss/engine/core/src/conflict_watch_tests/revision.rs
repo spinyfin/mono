@@ -255,3 +255,45 @@ async fn detection_mints_runnable_revision_when_in_review_siblings_exist() {
         "conflict revision must not gate on an in_review sibling"
     );
 }
+
+#[tokio::test]
+async fn a_requested_merge_keeps_its_paused_label_through_the_revision_handoff_until_the_conflict_lifts() {
+    // The user asked for a merge, then the conflict is handed to a revision
+    // (maybe_spawn_conflict_revision + unblock_for_revision). The parent is back
+    // in review but the card must keep saying why the merge stopped; the label
+    // goes only when the conflict is really retired through `on_resolved`.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/32";
+    let (product, chore) = make_in_review(&db, "C-rev-label", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    db.record_github_merge_intent(
+        boss_work_db::GithubMergeIntentInsertInput::builder()
+            .work_item_id(&chore)
+            .pr_url(pr)
+            .head_sha("old-head")
+            .build(),
+        "{}",
+    )
+    .unwrap();
+    let detail = |db: &WorkDb| task(db, &chore).merge_queue_detail;
+
+    assert!(
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            None,
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await
+    );
+    let (status, _) = chore_status(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview);
+    let handed_off = detail(&db).expect("the paused label must survive the handoff");
+    assert!(handed_off.contains("Merge paused"), "{handed_off}");
+
+    assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await);
+    assert_eq!(detail(&db), None, "retiring the signal must clear the paused label");
+}
