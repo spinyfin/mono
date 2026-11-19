@@ -806,14 +806,23 @@ impl ExecutionCoordinator {
         *self.dispatch_focus.lock().unwrap() = focus;
     }
 
-    /// Ready executions the current focus set holds back right now.
+    /// Ready executions the current focus set holds back right now: those
+    /// outside the focus set whose recorded wait reason is `focus_mode`. A
+    /// row a pause holds, or one with no recorded verdict yet, is not counted.
     pub fn focus_held_count(&self) -> Result<usize> {
         let focus = self.dispatch_focus();
         if !focus.is_active() {
             return Ok(0);
         }
         let ready = self.work_db.list_ready_executions()?;
-        Ok(self.work_db.executions_outside_dispatch_focus(&ready, &focus)?.len())
+        let outside = self.work_db.executions_outside_dispatch_focus(&ready, &focus)?;
+        Ok(ready
+            .iter()
+            .filter(|execution| {
+                outside.contains(&execution.id)
+                    && execution.dispatch_wait_reason.as_deref() == Some(boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE)
+            })
+            .count())
     }
 
     /// `true` when dispatch is globally paused.

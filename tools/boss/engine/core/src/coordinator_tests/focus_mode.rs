@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 use super::helpers::*;
 
+use crate::coordinator::DISPATCH_WAIT_REASON_DISPATCH_PAUSED;
 use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe};
 use crate::work::{ReviewBatchCreateInput, ReviewBatchDispatch};
@@ -571,15 +572,49 @@ async fn held_count_reports_only_rows_focus_is_holding() {
     let h = harness();
     let focused = h.project("Focused");
     let other = h.project("Other");
-    let _ = h.ready_project_task(&focused, "In scope");
+    let (_, in_scope_exec) = h.ready_project_task(&focused, "In scope");
     let _ = h.ready_project_task(&other, "Other one");
     let _ = h.ready_loose_chore("Loose chore");
 
     assert_eq!(h.coordinator.focus_held_count().unwrap(), 0, "no focus, nothing held");
     h.focus_on(&[&focused]);
+    assert_eq!(
+        h.coordinator.focus_held_count().unwrap(),
+        0,
+        "no recorded verdict yet, so focus is not yet known to hold anything"
+    );
+    h.drain_and_wait_for(&[&in_scope_exec]).await;
     assert_eq!(h.coordinator.focus_held_count().unwrap(), 2);
     h.clear_focus();
     assert_eq!(h.coordinator.focus_held_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn held_count_excludes_rows_a_pause_is_holding() {
+    let h = harness();
+    let focused = h.project("Focused");
+    let other = h.project("Other");
+    let _ = h.ready_project_task(&focused, "In scope");
+    let (_, other_exec) = h.ready_project_task(&other, "Other one");
+    h.focus_on(&[&focused]);
+    h.coordinator.pause_dispatch_scoped(
+        1_786_385_816,
+        DispatchPauseOrigin::Operator,
+        DispatchPauseScope::NewWork,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
+    h.coordinator.drain_ready_queue_for_test().await;
+
+    assert_eq!(
+        h.execution(&other_exec).dispatch_wait_reason.as_deref(),
+        Some(DISPATCH_WAIT_REASON_DISPATCH_PAUSED),
+        "the pause is what holds the row"
+    );
+    assert_eq!(
+        h.coordinator.focus_held_count().unwrap(),
+        0,
+        "pause-held rows are not held by focus"
+    );
 }
 
 /// The breaker's half-open recovery probe is an automatic `force_dispatch`

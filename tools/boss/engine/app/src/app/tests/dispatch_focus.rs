@@ -105,11 +105,12 @@ async fn focus_starts_off_and_set_add_remove_clear_edit_the_set() {
 }
 
 #[tokio::test]
-async fn held_count_reflects_ready_rows_outside_the_set() {
-    let (state, _dir) = test_server_state();
+async fn held_count_counts_out_of_scope_rows_once_focus_mode_is_recorded() {
+    let (state, _dir) = test_server_state_with_fakes();
     let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
     let focused = project(&state, &product.id, "Focused");
     let other = project(&state, &product.id, "Other");
+    let mut outside_exec = None;
     for (project, name) in [(&focused, "In scope"), (&other, "Outside")] {
         let task = state
             .work_db
@@ -122,7 +123,7 @@ async fn held_count_reflects_ready_rows_outside_the_set() {
                     .build(),
             )
             .unwrap();
-        state
+        let execution = state
             .work_db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
@@ -132,11 +133,29 @@ async fn held_count_reflects_ready_rows_outside_the_set() {
                     .build(),
             )
             .unwrap();
+        if name == "Outside" {
+            outside_exec = Some(execution.id);
+        }
     }
+    let outside_exec = outside_exec.expect("outside execution");
 
-    let focus = focus_of(update(&state, DispatchFocusAction::Set, &[&focused.id]).await);
+    let before_drain = focus_of(update(&state, DispatchFocusAction::Set, &[&focused.id]).await);
+    assert_eq!(
+        before_drain.held_count, 0,
+        "held_count ignores out-of-scope rows until drain records focus_mode"
+    );
 
-    assert_eq!(focus.held_count, 1);
+    state.execution_coordinator.drain_ready_queue_for_test().await;
+    assert_eq!(
+        state
+            .work_db
+            .get_execution(&outside_exec)
+            .unwrap()
+            .dispatch_wait_reason
+            .as_deref(),
+        Some(boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE),
+    );
+    assert_eq!(show(&state).await.held_count, 1);
 }
 
 #[tokio::test]
@@ -241,6 +260,60 @@ async fn focus_survives_an_engine_restart() {
     // And clearing persists too: the next restart comes up unfocused.
     update(&restarted, DispatchFocusAction::Clear, &[]).await;
     assert!(!state.work_db.load_dispatch_focus().unwrap().is_active());
+}
+
+/// The board's stored queue order is seeded after the focus set is restored,
+/// so an out-of-scope ready row has no queue position after a restart.
+#[tokio::test]
+async fn restart_with_focus_seeds_queue_order_without_out_of_scope_rows() {
+    let (state, dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let focused = project(&state, &product.id, "Focused");
+    let other = project(&state, &product.id, "Other");
+    let mut ready = Vec::new();
+    for (project, name) in [(&focused, "In scope"), (&other, "Outside")] {
+        let task = state
+            .work_db
+            .create_task(
+                boss_protocol::CreateTaskInput::builder()
+                    .product_id(product.id.clone())
+                    .project_id(project.id.clone())
+                    .name(name)
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        state
+            .work_db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(task.id.clone())
+                    .kind(ExecutionKind::TaskImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        ready.push(task.id);
+    }
+    update(&state, DispatchFocusAction::Set, &[&focused.id]).await;
+
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        boss_engine_runtime::config::WorkConfig::builder()
+            .cwd(dir.path().to_path_buf())
+            .db_path(dir.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let restarted =
+        ServerState::new_arc_with_app_pid_and_merge_probe(cfg, None, None, ServerStateOverrides::default()).unwrap();
+
+    let order = restarted.published_queued_dispatch.lock().unwrap().clone();
+    assert_eq!(order[&ready[0]].position, Some(0), "in-scope row is ranked: {order:?}");
+    assert_eq!(
+        order[&ready[1]].position, None,
+        "out-of-scope row has no position: {order:?}"
+    );
+    assert!(!order[&ready[1]].next_up);
 }
 
 /// An unreadable persisted value starts dispatch unrestricted, but the focus

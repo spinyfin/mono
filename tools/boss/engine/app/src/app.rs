@@ -2071,6 +2071,12 @@ impl ServerState {
         });
         let _ = server_state.queued_dispatch_changed.set(queue_changed.clone());
         publisher_impl.set_queue_changed(move || queue_changed());
+        // Restore the dispatch focus set before the first scheduler kick, so
+        // a restart never lets out-of-scope rows through while focus is on.
+        // It also precedes the queue-order seed below: the stored order is
+        // classified under the focus set, and nothing republishes it when the
+        // set is restored later.
+        dispatch_focus::restore_persisted_dispatch_focus(&server_state);
         // Seed the stored order once; from here it changes only through
         // `refresh_queued_dispatch`.
         server_state.refresh_queued_dispatch();
@@ -2138,9 +2144,6 @@ impl ServerState {
                 ),
             }
         }
-        // Restore the dispatch focus set before the first scheduler kick, so
-        // a restart never lets out-of-scope rows through while focus is on.
-        dispatch_focus::restore_persisted_dispatch_focus(&server_state);
         timeline.mark("coordinator_and_subsystems");
         timeline.finish();
 

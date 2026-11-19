@@ -108,15 +108,34 @@ pub(crate) fn focus_json(focus: &DispatchFocusState) -> serde_json::Value {
     serde_json::to_value(focus).unwrap_or(serde_json::Value::Null)
 }
 
+/// One ready execution as `diagnose` sees it against the focus set.
+pub(crate) struct ReadyRow {
+    pub(crate) execution_id: String,
+    pub(crate) work_item_id: String,
+    /// Outside the focus set, by the scope rule alone.
+    pub(crate) outside_focus: bool,
+    /// The wait reason the engine recorded on the row, if any. Focus is only
+    /// what holds the row when this is `focus_mode`: a global pause, for one,
+    /// takes precedence and records its own reason.
+    pub(crate) recorded_reason: Option<String>,
+    /// The CLI command that launches it, or `None` when no command does.
+    pub(crate) launch_target: Option<String>,
+}
+
+impl ReadyRow {
+    /// Whether the engine's recorded verdict is that focus mode holds this row.
+    fn held_by_focus(&self) -> bool {
+        self.outside_focus && self.recorded_reason.as_deref() == Some(boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE)
+    }
+}
+
 /// What `bossctl dispatch diagnose` reports about focus mode for the
 /// executions it is looking at. Read straight from `state.db`, so it works
 /// with the engine down, like the rest of `diagnose`.
 pub(crate) struct FocusDiagnosis {
     pub(crate) focus: boss_protocol::DispatchFocus,
     pub(crate) targets: Vec<boss_protocol::DispatchFocusTarget>,
-    /// `(execution id, work item id, held by focus, launch target)` for each
-    /// ready execution. `None` when no CLI command launches it.
-    pub(crate) ready: Vec<(String, String, bool, Option<String>)>,
+    pub(crate) ready: Vec<ReadyRow>,
 }
 
 impl FocusDiagnosis {
@@ -132,11 +151,16 @@ impl FocusDiagnosis {
                 executions.push(execution);
             }
         }
-        let held = db.executions_outside_dispatch_focus(&executions, &focus)?;
+        let outside = db.executions_outside_dispatch_focus(&executions, &focus)?;
         for execution in executions {
-            let is_held = held.contains(&execution.id);
             let launch_target = db.launch_command_for(&execution.work_item_id)?;
-            ready.push((execution.id, execution.work_item_id, is_held, launch_target));
+            ready.push(ReadyRow {
+                outside_focus: outside.contains(&execution.id),
+                recorded_reason: execution.dispatch_wait_reason,
+                launch_target,
+                execution_id: execution.id,
+                work_item_id: execution.work_item_id,
+            });
         }
         Ok(Self { focus, targets, ready })
     }
@@ -145,11 +169,13 @@ impl FocusDiagnosis {
         serde_json::json!({
             "active": self.focus.is_active(),
             "targets": self.targets,
-            "ready_executions": self.ready.iter().map(|(execution_id, work_item_id, held, _)| serde_json::json!({
-                "execution_id": execution_id,
-                "work_item_id": work_item_id,
-                "held_by_focus": held,
-                "hold_reason": held.then_some(boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE),
+            "ready_executions": self.ready.iter().map(|row| serde_json::json!({
+                "execution_id": row.execution_id,
+                "work_item_id": row.work_item_id,
+                "outside_focus_set": row.outside_focus,
+                "held_by_focus": row.held_by_focus(),
+                "recorded_wait_reason": row.recorded_reason,
+                "hold_reason": row.held_by_focus().then_some(boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE),
             })).collect::<Vec<_>>(),
         })
     }
@@ -158,25 +184,38 @@ impl FocusDiagnosis {
         let state = DispatchFocusState {
             active: self.focus.is_active(),
             targets: self.targets.clone(),
-            held_count: self.ready.iter().filter(|(_, _, held, _)| *held).count(),
+            held_count: self.ready.iter().filter(|row| row.held_by_focus()).count(),
             restore_error: None,
         };
         let mut lines = focus_lines(&state);
-        // The held count above is scoped to the executions diagnosed, not
-        // the whole queue; say so rather than let it read as fleet-wide.
+        // The held count in the last line is scoped to the executions
+        // diagnosed, not the whole queue, so it would read as fleet-wide.
+        // Drop it; the per-execution lines below carry the verdicts.
         if state.active {
             lines.pop();
         }
-        for (execution_id, work_item_id, held, launch_target) in &self.ready {
-            if *held {
-                let bypass = launch_target
-                    .as_ref()
-                    .map(|command| format!(" (`{command}` bypasses focus)"))
-                    .unwrap_or_default();
+        for row in &self.ready {
+            let (execution_id, work_item_id) = (&row.execution_id, &row.work_item_id);
+            let bypass = row
+                .launch_target
+                .as_ref()
+                .map(|command| format!(" (`{command}` bypasses focus)"))
+                .unwrap_or_default();
+            if row.held_by_focus() {
                 lines.push(format!(
                     "  HELD by focus mode: {execution_id} ({work_item_id}) is outside the focus set — \
                      wait reason `{}`; it dispatches once focus is cleared or its project/product is added{bypass}",
                     boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE,
+                ));
+            } else if row.outside_focus {
+                let held_by = row
+                    .recorded_reason
+                    .as_deref()
+                    .map(|reason| format!("currently held by `{reason}`"))
+                    .unwrap_or_else(|| "no wait reason recorded yet".to_owned());
+                lines.push(format!(
+                    "  outside the focus set: {execution_id} ({work_item_id}) ({held_by}); \
+                     focus mode will hold it once nothing earlier does{bypass}"
                 ));
             } else if state.active {
                 lines.push(format!(
@@ -379,11 +418,28 @@ mod tests {
 
         // Focus off: nothing is held and nothing is printed about it.
         let off = FocusDiagnosis::load(&db, &ids).unwrap();
-        assert!(off.ready.iter().all(|(_, _, held, _)| !held));
+        assert!(off.ready.iter().all(|row| !row.outside_focus));
 
         let mut focus = DispatchFocus::default();
         focus.insert(DispatchFocusTargetKind::Project, focused.id.clone());
         db.save_dispatch_focus(&focus).unwrap();
+        // Before the engine records a verdict, the row is outside the set but
+        // diagnose must not claim focus is what holds it.
+        let pending = FocusDiagnosis::load(&db, &ids).unwrap().lines().join("\n");
+        assert!(!pending.contains("HELD by focus mode"), "{pending}");
+        assert!(
+            pending.contains(&format!("outside the focus set: {outside_exec}")),
+            "{pending}"
+        );
+
+        // A global pause records its own reason, which diagnose names.
+        db.set_dispatch_wait_reason(&outside_exec, "dispatch_paused").unwrap();
+        let paused = FocusDiagnosis::load(&db, &ids).unwrap().lines().join("\n");
+        assert!(!paused.contains("HELD by focus mode"), "{paused}");
+        assert!(paused.contains("currently held by `dispatch_paused`"), "{paused}");
+
+        db.set_dispatch_wait_reason(&outside_exec, boss_protocol::DISPATCH_WAIT_REASON_FOCUS_MODE)
+            .unwrap();
         let on = FocusDiagnosis::load(&db, &ids).unwrap();
         let text = on.lines().join("\n");
         assert!(text.contains("focus: on"), "{text}");
