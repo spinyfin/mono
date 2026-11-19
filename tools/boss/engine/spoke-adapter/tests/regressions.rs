@@ -147,6 +147,14 @@ async fn same_workspace_basename_does_not_cross_stores() {
 #[tokio::test]
 async fn lost_release_reply_resolves_on_reconnect_without_releasing_again() {
     for kind in [Kind::Release, Kind::ReleaseWithReset, Kind::ForceRelease] {
+        // Lease is answered; Release is left unanswered so `command_deadline`
+        // must fire before the reconnect path runs. Lease and Release share
+        // that field, so they cannot be split the way spawn vs Stop can.
+        // The coordinator lease-miss `workspace_slack` documents (a 300ms
+        // lease recorded as `dispatch_not_before` before spawn) does not
+        // apply: this test is not on the dispatch path, and a slow lease
+        // fails the setup unwrap rather than being swallowed as a pre-start
+        // failure.
         let fx = Fixture::with(short(300)).await;
         fx.ready(HOST);
         let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -626,7 +634,13 @@ async fn an_adopt_that_finds_no_session_does_not_end_the_doubt_of_an_unanswered_
 
 #[tokio::test]
 async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt_again() {
-    let fx = Fixture::with(short(300)).await;
+    // Spawn is answered via `standard`; only Stop is left unanswered. Split
+    // the deadlines so a loaded CI worker's Spawn reply cannot miss a 300ms
+    // spawn_deadline (unsettled SpawnOutcomeUncertain) before the Stop-retry
+    // path runs, while the unanswered Stop still parks quickly enough for
+    // the <450ms retry assertion. workspace_slack(10_000) would raise Stop
+    // to 5s and fail that assertion.
+    let fx = Fixture::with(answered_spawn_short_stop(300)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();

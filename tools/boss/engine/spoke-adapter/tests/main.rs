@@ -69,6 +69,19 @@ pub(crate) fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
         .build()
 }
 
+/// Spawn is answered; a later control command (Stop) is left unanswered so
+/// `command_deadline` must fire. `spawn_deadline` is load-tolerant so a slow
+/// Spawn reply under CI contention is not an unsettled timeout before Stop is
+/// even sent. `workspace_slack` would raise the Stop deadline to 5s and break
+/// tests that assert the unanswered Stop parks in a few hundred milliseconds.
+pub(crate) fn answered_spawn_short_stop(command_deadline_ms: u64) -> SpokeAdapterConfig {
+    SpokeAdapterConfig::builder()
+        .command_deadline(Duration::from_millis(command_deadline_ms))
+        .spawn_deadline(Duration::from_millis(10_000))
+        .prompt_timeout(Duration::from_millis(command_deadline_ms))
+        .build()
+}
+
 pub(crate) async fn lease(adapter: &Arc<dyn HostAdapter>) {
     let lease = adapter.lease_workspace("repo", "task", None, false, &[]).await.unwrap();
     assert_eq!(lease.lease_id, "lease-1");
