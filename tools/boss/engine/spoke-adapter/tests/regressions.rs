@@ -147,7 +147,12 @@ async fn same_workspace_basename_does_not_cross_stores() {
 #[tokio::test]
 async fn lost_release_reply_resolves_on_reconnect_without_releasing_again() {
     for kind in [Kind::Release, Kind::ReleaseWithReset, Kind::ForceRelease] {
-        let fx = Fixture::with(short(300)).await;
+        // Lease is answered; Release is left unanswered so `command_deadline`
+        // must fire before the reconnect path runs. Lease and Release share
+        // that field, so the deadline is load-tolerant (5s) rather than short:
+        // a slow Lease reply must not panic the setup before the unanswered
+        // Release is exercised. The cost is one 5s wait per release kind.
+        let fx = Fixture::with(workspace_slack(5_000)).await;
         fx.ready(HOST);
         let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
         let first = fx
@@ -289,7 +294,7 @@ async fn answered_sweeps_keep_probe_history_and_lookup_work_bounded() {
 
 #[tokio::test]
 async fn full_outbox_refuses_stop_and_does_not_pin_an_unsent_lease() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     fx.ready("other");
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -398,7 +403,7 @@ fn no_stop(_: &Command) -> Option<CommandResult> {
 
 #[tokio::test]
 async fn an_interrupted_spawn_the_host_then_reports_absent_no_longer_blocks_release() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let _peer = fx
@@ -424,7 +429,7 @@ async fn an_interrupted_spawn_the_host_then_reports_absent_no_longer_blocks_rele
 
 #[tokio::test]
 async fn an_adopted_alive_worker_keeps_the_lease_until_its_session_is_gone() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let exited = Arc::new(AtomicBool::new(false));
@@ -478,7 +483,7 @@ async fn an_adopted_alive_worker_keeps_the_lease_until_its_session_is_gone() {
 
 #[tokio::test]
 async fn a_settled_uncertain_spawn_adopted_alive_is_stopped_then_released() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let gone = Arc::new(AtomicBool::new(false));
@@ -534,9 +539,10 @@ async fn a_settled_uncertain_spawn_adopted_alive_is_stopped_then_released() {
 
 #[tokio::test]
 async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_reported_running() {
-    // Only Spawn is intentionally unanswered; Stop must have time to confirm
-    // its reply while the integration tests share a loaded CI worker.
-    let fx = Fixture::with(workspace_slack(300)).await;
+    // Every command is answered (the spawn with an uncertain refusal), so no
+    // deadline is meant to fire here: keep them all far above what a loaded
+    // CI worker shared with dozens of sibling tests can take to deliver a reply.
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -563,7 +569,7 @@ async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_re
 
 #[tokio::test]
 async fn a_launched_worker_whose_stop_is_not_confirmed_is_settled_uncertain() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -625,7 +631,13 @@ async fn an_adopt_that_finds_no_session_does_not_end_the_doubt_of_an_unanswered_
 
 #[tokio::test]
 async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt_again() {
-    let fx = Fixture::with(short(300)).await;
+    // Spawn is answered via `standard`; only Stop is left unanswered. Split
+    // the deadlines so a loaded CI worker's Spawn reply cannot miss a 300ms
+    // spawn_deadline (unsettled SpawnOutcomeUncertain) before the Stop-retry
+    // path runs, while the unanswered Stop still parks quickly enough for
+    // the <450ms retry assertion. workspace_slack(10_000) would raise Stop
+    // to 5s and fail that assertion.
+    let fx = Fixture::with(answered_spawn_short_stop(300)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
