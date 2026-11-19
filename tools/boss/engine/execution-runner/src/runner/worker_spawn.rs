@@ -14,12 +14,12 @@ use anyhow::Context as _;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 
-use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
+use crate::effort::{PoolModelTier, SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem, pin_is_honourable};
 use boss_execution_contracts::{REVIEW_GUIDE_DRIVER, pool_dispatch_policy_for_worker_id};
 use boss_protocol::{
-    EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReviewBatchMember, ReviewBatchMemberRole,
+    EffortLevel, ExecutionKind, ProposalKind, ProposalState, ReasoningMode, ReviewBatchMember, ReviewBatchMemberRole,
     ReviewBatchMemberStatus, ReviewBatchPhase, ReviewBatchStatus, ReviewReportProposalPayload, TaskKind,
 };
 
@@ -258,6 +258,48 @@ async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
             e
         })
         .ok()
+}
+
+/// The row-derived inputs that decide a worker's *model* (not its driver or
+/// effort), after execution-kind policy has been applied.
+///
+/// Most kinds model off the work item they run for: its pin, its
+/// reasoning mode, its kind. A progression run is the exception. It is short
+/// triage that acts through restricted verbs on whatever item is stuck, so
+/// it asks for the driver's cheap standard tier and ignores the item's
+/// model pin, reasoning mode and kind. Otherwise an `investigation` item
+/// would hand its progression run the design/investigation tier (Fable on
+/// Claude).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelSelectionInputs<'a> {
+    model_override: Option<&'a str>,
+    pool_model_tier: Option<PoolModelTier>,
+    kind: Option<&'a TaskKind>,
+    reasoning: Option<ReasoningMode>,
+}
+
+fn model_selection_inputs<'a>(
+    execution_kind: &ExecutionKind,
+    pool_model_tier: Option<PoolModelTier>,
+    row_model_override: Option<&'a str>,
+    work_item_kind: Option<&'a TaskKind>,
+    row_reasoning: Option<ReasoningMode>,
+) -> ModelSelectionInputs<'a> {
+    if *execution_kind == ExecutionKind::Progression {
+        ModelSelectionInputs {
+            model_override: None,
+            pool_model_tier: Some(PoolModelTier::Standard),
+            kind: None,
+            reasoning: None,
+        }
+    } else {
+        ModelSelectionInputs {
+            model_override: row_model_override,
+            pool_model_tier,
+            kind: work_item_kind,
+            reasoning: row_reasoning,
+        }
+    }
 }
 
 /// Drop a live task/product driver pin that cannot clear the capability gate
@@ -1223,6 +1265,13 @@ pub async fn compose_worker_spawn(
         .is_none()
         .then(|| pool_dispatch_policy_for_worker_id(worker_id))
         .flatten();
+    let model_inputs = model_selection_inputs(
+        &execution.kind,
+        pool_policy.map(|p| p.model_tier),
+        row_model_override.as_deref(),
+        work_item_kind,
+        row_reasoning,
+    );
     // Main-pool only: a live pin that the capability gate will refuse for
     // this execution kind yields to allocation / the engine default rather
     // than hard-failing `compose_worker_spawn`. Pool workers already ignore
@@ -1236,7 +1285,7 @@ pub async fn compose_worker_spawn(
             work_item_kind,
             row_driver.as_deref(),
             product_default_driver.as_deref(),
-            boss_engine_effort::is_design_or_investigation_tier(work_item_kind, row_reasoning),
+            boss_engine_effort::is_design_or_investigation_tier(model_inputs.kind, model_inputs.reasoning),
         )
     };
     let spawn_config = if execution.kind == ExecutionKind::PrReviewGuide {
@@ -1273,15 +1322,15 @@ pub async fn compose_worker_spawn(
                     // diffs are low risk: the rubric applies the same correctness bar at
                     // every level.
                     .maybe_effort_level(row_effort)
-                    .maybe_model_override(row_model_override.as_deref())
-                    .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
+                    .maybe_model_override(model_inputs.model_override)
+                    .maybe_pool_model_override(model_inputs.pool_model_tier)
                     .maybe_product_default_model(product_default_model.as_deref())
                     .maybe_task_driver(effective_task_driver)
                     .maybe_product_default_driver(effective_product_default_driver)
                     .maybe_pool_policy_driver(pool_policy.map(|policy| policy.driver))
                     .maybe_allocated_driver(allocated_driver.as_deref())
-                    .maybe_kind(work_item_kind)
-                    .maybe_reasoning(row_reasoning)
+                    .maybe_kind(model_inputs.kind)
+                    .maybe_reasoning(model_inputs.reasoning)
                     .design_reasoning_effort_xhigh(row_design_reasoning_effort_xhigh)
                     .build();
                 resolve_spawn_config_in(&registry, &spawn_input)

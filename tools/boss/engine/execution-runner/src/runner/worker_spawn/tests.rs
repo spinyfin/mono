@@ -2095,3 +2095,106 @@ mod repo_guidance_prompt_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod progression_model_policy_tests {
+    //! A progression run picks its model from its own policy (the driver's
+    //! cheap standard tier), never from the stuck item's reasoning, kind,
+    //! pin or effort.
+    use super::super::{PoolModelTier, model_selection_inputs};
+    use crate::effort::{ModelResolutionSource, SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
+    use boss_protocol::{EffortLevel, ExecutionKind, ReasoningMode, TaskKind};
+
+    fn resolve(
+        execution_kind: &ExecutionKind,
+        driver: &str,
+        kind: &TaskKind,
+        reasoning: ReasoningMode,
+        model_override: Option<&str>,
+    ) -> SpawnConfig {
+        let registry = crate::driver::DriverRegistry::default();
+        let inputs = model_selection_inputs(execution_kind, None, model_override, Some(kind), Some(reasoning));
+        let input = SpawnResolutionInput::builder()
+            .effort_level(EffortLevel::Large)
+            .task_driver(driver)
+            .maybe_model_override(inputs.model_override)
+            .maybe_pool_model_override(inputs.pool_model_tier)
+            .maybe_kind(inputs.kind)
+            .maybe_reasoning(inputs.reasoning)
+            .build();
+        resolve_spawn_config_in(&registry, &input).unwrap()
+    }
+
+    #[test]
+    fn progression_on_an_investigation_item_resolves_to_the_cheap_tier_on_each_driver() {
+        let registry = crate::driver::DriverRegistry::default();
+        for slug in registry.slugs() {
+            let menu = registry.get(slug).unwrap().descriptor().model_menu;
+            let cheap = (menu.model_for_reasoning)(ReasoningMode::Standard);
+            for kind in [TaskKind::Chore, TaskKind::Investigation, TaskKind::Design] {
+                let cfg = resolve(
+                    &ExecutionKind::Progression,
+                    slug,
+                    &kind,
+                    ReasoningMode::Investigation,
+                    None,
+                );
+                // Some drivers (agy) fold the effort level into the model slug as a
+                // suffix of the same model; the tier is what must match.
+                assert!(cfg.model.starts_with(cheap), "{slug} {kind:?}: {}", cfg.model);
+                assert_eq!(cfg.model_source, ModelResolutionSource::PoolStandardTier);
+                assert!(!boss_engine_effort::model_is_fable(&cfg.model));
+            }
+        }
+        let claude = resolve(
+            &ExecutionKind::Progression,
+            "claude",
+            &TaskKind::Chore,
+            ReasoningMode::Investigation,
+            None,
+        );
+        assert_eq!(claude.model, "sonnet");
+    }
+
+    #[test]
+    fn progression_ignores_the_target_items_model_pin() {
+        let cfg = resolve(
+            &ExecutionKind::Progression,
+            "claude",
+            &TaskKind::Chore,
+            ReasoningMode::Investigation,
+            Some("fable"),
+        );
+        assert_eq!(cfg.model, "sonnet");
+    }
+
+    #[test]
+    fn other_kinds_on_an_investigation_item_keep_their_model_policy() {
+        for kind in [
+            ExecutionKind::ChoreImplementation,
+            ExecutionKind::RevisionImplementation,
+        ] {
+            let cfg = resolve(&kind, "claude", &TaskKind::Chore, ReasoningMode::Investigation, None);
+            assert_eq!(cfg.model, "fable", "{kind:?}");
+            let pinned = resolve(
+                &kind,
+                "claude",
+                &TaskKind::Chore,
+                ReasoningMode::Investigation,
+                Some("opus"),
+            );
+            assert_eq!(pinned.model, "opus", "{kind:?}");
+        }
+        assert_eq!(
+            model_selection_inputs(
+                &ExecutionKind::ChoreImplementation,
+                Some(PoolModelTier::Strong),
+                None,
+                None,
+                None
+            )
+            .pool_model_tier,
+            Some(PoolModelTier::Strong)
+        );
+    }
+}
