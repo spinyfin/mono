@@ -15,16 +15,19 @@
 //! checks therefore walk the DAG: concurrent merges are safe only when every
 //! branch reaches the checked head, without reaching abandoned history.
 //!
-//! Collection also never touches the live `.jj/repo/index`. That is
+//! Collection also never rebuilds the live `.jj/repo/index`. That is
 //! deliberate and costs nothing: neither jj 0.26 nor 0.32's `util gc` prunes the
 //! default index store (tested against repos with abandoned operations:
 //! all index file paths and contents, including operation links and segments,
 //! are identical before and after;
-//! see `store_gc_default_index_retention_for_both_client_versions`),
-//! so running it against the private scratch index leaves the live index
-//! exactly as growth-prone as it already was. A rewrite itself orphans the
-//! old operation links; reclaiming them is a `jj debug reindex` of the live
-//! store, which is a manual step, not part of this pass.
+//! see `store_gc_default_index_retention_for_both_client_versions`).
+//! Verification still uses a private scratch index so a damaged live cache
+//! cannot hide missing objects. `util gc` itself runs against the live store:
+//! the private index is a snapshot of the collection checkpoint, and a lease
+//! that publishes a head after that checkpoint would otherwise look
+//! unreachable. A rewrite itself orphans the old operation links; reclaiming
+//! them is a `jj debug reindex` of the live store, which is a manual step, not
+//! part of this pass.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,6 +38,29 @@ use crate::command_runner::{CommandRunner, JJ_GATE_HELD_ENV, RealCommandRunner};
 /// The oldest jj (major, minor) that shares the stores cube maintains. The
 /// collector must not be newer: see the module doc.
 pub(super) const OLDEST_SHARED_CLIENT_JJ: (u64, u64) = (0, 26);
+
+/// Newest collector whose pruning and lease behavior is tested.
+pub(super) const NEWEST_COLLECTOR_JJ: (u64, u64) = (0, 46);
+
+pub(super) fn require_supported_collector(version: (u64, u64)) -> Result<()> {
+    if version > NEWEST_COLLECTOR_JJ {
+        return Err(CubeError::InvalidArgument(format!(
+            "jj {}.{} collection is not supported yet; the newest tested collector is {}.{}",
+            version.0, version.1, NEWEST_COLLECTOR_JJ.0, NEWEST_COLLECTOR_JJ.1
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `version` rewrites the operation log through the prepared, staged
+/// path. The in-place abandon holds every reader out for the whole rewrite,
+/// which newer jj makes too slow to bound; and only the staged path refreshes
+/// the primary working copy afterwards, which newer jj requires before a new
+/// workspace can be added. Every collector newer than the oldest shared client
+/// (0.26) therefore stages, not just the newest tested one.
+pub(super) fn uses_staged_rewrite(version: (u64, u64)) -> bool {
+    version > OLDEST_SHARED_CLIENT_JJ
+}
 
 #[cfg(test)]
 thread_local! {
@@ -110,6 +136,9 @@ pub(super) fn collector_version(
         .split_whitespace()
         .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))
         .and_then(parse_major_minor);
+    if let Some(found) = found {
+        require_supported_collector(found)?;
+    }
     match found {
         Some(found) if found <= oldest => Ok(version),
         _ => Err(CubeError::InvalidArgument(format!(
@@ -164,14 +193,28 @@ impl GcIndex {
         Ok(result)
     }
 
-    /// Run `args` against the private index. `util gc` accepts no
-    /// `--at-operation`, so only its caller's head check can bound it.
-    pub(super) fn run(&self, runner: &dyn CommandRunner, args: &[&str], timeout: Duration) -> Result<()> {
-        self.run_at(runner, None, args, timeout)
+    /// Collect unreferenced files from the live store. `util gc` accepts no
+    /// `--at-operation`, so only its caller's head check can bound it, and it
+    /// must see the operation heads that exist when it runs: the private index
+    /// is a snapshot of the collection checkpoint and would treat commits a
+    /// concurrent lease published after that checkpoint as garbage.
+    pub(super) fn collect(&self, runner: &dyn CommandRunner, args: &[&str], timeout: Duration) -> Result<()> {
+        self.run_repo(runner, &self.source, None, args, timeout)
     }
 
     fn run_at(&self, runner: &dyn CommandRunner, head: Option<&str>, args: &[&str], timeout: Duration) -> Result<()> {
-        let path = self.scratch.to_string_lossy();
+        self.run_repo(runner, &self.scratch, head, args, timeout)
+    }
+
+    fn run_repo(
+        &self,
+        runner: &dyn CommandRunner,
+        repo: &Path,
+        head: Option<&str>,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<()> {
+        let path = repo.to_string_lossy();
         let mut command = vec!["--ignore-working-copy", "--repository", &path];
         if let Some(head) = head {
             command.extend(["--at-operation", head]);
@@ -207,6 +250,43 @@ impl Drop for GcIndex {
     }
 }
 
+/// Turn off git's automatic maintenance in the store behind `source`, so that
+/// nothing packs refs while `util gc --expire now` runs. Idempotent, and a
+/// no-op when the store has no git repository.
+///
+/// `util gc` spares a commit written after it started by the modification
+/// time of that commit's `refs/jj/keep` file, and only a loose ref has one. jj
+/// newer than 0.26 fetches through a `git` subprocess, and git 2.54 ends a
+/// fetch with maintenance that packs every loose ref. A lease's fetch during
+/// collection therefore stripped that protection from every commit written
+/// since the collector loaded the store: `util gc` deleted their keep refs,
+/// and git pruned those written in the collector's first second, which left
+/// the operation log naming a commit that no longer exists.
+///
+/// The setting is left in place. The store's packing is this pass's own
+/// `git gc`, and a pass that cannot run reports that as needing attention.
+pub(super) fn disable_git_auto_maintenance(runner: &dyn CommandRunner, source: &Path) -> Result<()> {
+    let Some(config) = [source.join(".git/config"), source.join(".jj/repo/store/git/config")]
+        .into_iter()
+        .find(|config| config.is_file())
+    else {
+        return Ok(());
+    };
+    let config = config.to_string_lossy();
+    let git = |args: &[&str]| {
+        let mut command = vec!["config", "--file", &config];
+        command.extend_from_slice(args);
+        runner.run(&RealCommandRunner::invocation(source, "git", &command))
+    };
+    // `--get` fails when the key is unset, which reads as "not off".
+    if git(&["--get", "maintenance.auto"]).is_ok_and(|value| value.trim() == "false") {
+        return Ok(());
+    }
+    // jj rewrites this file for every remote change; share its critical section.
+    let _remotes = runner.lock_git_remotes(source)?;
+    git(&["maintenance.auto", "false"]).map(drop)
+}
+
 /// Most operations the ancestry walk visits before giving up. A head built on
 /// a store's pre-abandon history (tens of thousands of operations on mono)
 /// ends here rather than at the root operation.
@@ -218,12 +298,66 @@ const ANCESTRY_WALK_BUDGET: Duration = Duration::from_secs(60);
 /// Require every parent branch to reach the checked head, accepting benign
 /// concurrent merges but refusing abandoned ancestry. Bound both work and time;
 /// unknown debug output fails closed, so it cannot authorize collection.
+/// Runs its `jj` reads under the shared maintenance gate, so the caller must
+/// not hold it exclusively: see [`require_safe_progress_gate_held`].
 pub(super) fn require_safe_progress(
     runner: &dyn CommandRunner,
     source: &Path,
     ancestor: &str,
     head: &str,
 ) -> Result<()> {
+    require_ancestry(runner, source, ancestor, head, false)
+}
+
+/// [`require_safe_progress`] for a caller that already holds the maintenance
+/// gate exclusively. The walk's `jj` reads are marked as made under that hold:
+/// taking the gate shared through a second file handle would wait on the
+/// caller's own exclusive lock until it timed out.
+pub(super) fn require_safe_progress_gate_held(
+    runner: &dyn CommandRunner,
+    source: &Path,
+    ancestor: &str,
+    head: &str,
+) -> Result<()> {
+    require_ancestry(runner, source, ancestor, head, true)
+}
+
+/// Whether `head` descends from `ancestor`, under the same bounds and
+/// fail-closed rules as [`require_safe_progress_gate_held`]. A walk that
+/// cannot reach `ancestor` is `Ok(false)`; only a failed `jj` read is an error.
+pub(super) fn descends_from_gate_held(
+    runner: &dyn CommandRunner,
+    source: &Path,
+    ancestor: &str,
+    head: &str,
+) -> Result<bool> {
+    Ok(walk_ancestry(runner, source, ancestor, head, true)?.is_none())
+}
+
+fn require_ancestry(
+    runner: &dyn CommandRunner,
+    source: &Path,
+    ancestor: &str,
+    head: &str,
+    gate_held: bool,
+) -> Result<()> {
+    let Some(failure) = walk_ancestry(runner, source, ancestor, head, gate_held)? else {
+        return Ok(());
+    };
+    Err(CubeError::InvalidArgument(format!(
+        "unsafe operation heads in {}: {head} does not descend safely from {ancestor}: {failure}",
+        source.display()
+    )))
+}
+
+/// `None` when every branch from `head` reaches `ancestor`, else why not.
+fn walk_ancestry(
+    runner: &dyn CommandRunner,
+    source: &Path,
+    ancestor: &str,
+    head: &str,
+    gate_held: bool,
+) -> Result<Option<String>> {
     let mut pending = vec![head.to_owned()];
     let mut seen = std::collections::HashSet::new();
     let deadline = std::time::Instant::now() + ANCESTRY_WALK_BUDGET;
@@ -240,21 +374,25 @@ pub(super) fn require_safe_progress(
             ));
             break;
         }
+        let mut invocation = RealCommandRunner::invocation(
+            source,
+            "jj",
+            &[
+                "--ignore-working-copy",
+                "--at-operation",
+                &current,
+                "debug",
+                "operation",
+                "--display",
+                "operation",
+                &current,
+            ],
+        );
+        if gate_held {
+            invocation.env.push((JJ_GATE_HELD_ENV.to_owned(), "1".to_owned()));
+        }
         let output = runner.run_with_timeout(
-            &RealCommandRunner::invocation(
-                source,
-                "jj",
-                &[
-                    "--ignore-working-copy",
-                    "--at-operation",
-                    &current,
-                    "debug",
-                    "operation",
-                    "--display",
-                    "operation",
-                    &current,
-                ],
-            ),
+            &invocation,
             deadline.saturating_duration_since(std::time::Instant::now()),
         )?;
         let parents = output
@@ -276,11 +414,5 @@ pub(super) fn require_safe_progress(
         }
         pending.extend(ids.into_iter().map(str::to_owned));
     }
-    let Some(failure) = failure else {
-        return Ok(());
-    };
-    Err(CubeError::InvalidArgument(format!(
-        "unsafe operation heads in {}: {head} does not descend safely from {ancestor}: {failure}",
-        source.display()
-    )))
+    Ok(failure)
 }

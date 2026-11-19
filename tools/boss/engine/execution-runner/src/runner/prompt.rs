@@ -1829,7 +1829,7 @@ fn compose_revision_directive(
     out.push_str("   jj bookmark set <parent-branch-name> -r @\n");
     out.push_str("   ```\n");
     out.push_str(&format!(
-        "4. `{cube} pr update --branch <parent-branch-name>`   # pushes to the existing PR; no GIT_DIR or --allow-new needed.\n",
+        "4. `{cube} pr update --branch <parent-branch-name>`   # pushes to the existing PR; no GIT_DIR or push flags needed.\n",
     ));
     out.push_str("5. **Update the PR title AND description** — this is a required step, not optional:\n");
     out.push_str(&format!(
@@ -2313,8 +2313,9 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution, bazel_work
          jj materializes each conflict as annotated regions directly in the file. \
          Resolve by **editing those regions in place**:\n\n\
          - Open the conflicted file and find the `<<<<<<<` / `>>>>>>>` marker blocks.\n\
-         - Each block contains the conflict base and the two sides (`Contents of side #1`, \
-         `Contents of side #2`). Decide which content to keep (or merge both), then replace \
+         - Each block contains the conflict base and the two sides. Older jj labels them \
+         `Contents of side #1` and `Contents of side #2`; newer jj labels each side with the \
+         commit it comes from. Decide which content to keep (or merge both), then replace \
          the entire marker block with the resolved content.\n\
          - Alternatively, run `jj resolve <file>` to open a 3-way merge tool (e.g. vimdiff) \
          that handles the structured regions for you.\n\n\
@@ -2443,13 +2444,16 @@ fn compose_conflict_ground_truth_fragment(attempt: &ConflictResolution) -> Strin
          both, keep working.\n\n\
          **4. Divergent change ids make local revsets lie.** Cube workspaces share one `jj` \
          object store, so the same change id can name several commits. If any `jj` output \
-         shows a `??` suffix (e.g. `qtltpmoy??`), or `jj bookmark list` reports the \
+         marks a change id as divergent (a `??` suffix such as `qtltpmoy??` before jj 0.37; \
+         a `/0` or `/1` suffix such as `qtltpmoy/1` and the label `(divergent)` from 0.37), \
+         or `jj bookmark list` reports the \
          branch \"ahead by N commits, behind by M commits\" against `@git`, that change is \
          **DIVERGENT**: change-id revsets resolve to an arbitrary copy, so every \
          `conflicts=` and `descendants()` answer you get is unsound, and two revsets in the \
          same session can silently answer about two different commits. Re-run every check \
          using **full commit ids**, never change ids; `jj edit <change-id>` will also \
-         hard-fail with \"resolved to more than one revision\". Do not `jj abandon` a commit \
+         hard-fail with \"resolved to more than one revision\" (\"is divergent\" on newer jj). \
+         Do not `jj abandon` a commit \
          you did not create in this run — every `mono-agent-*` workspace shares one `jj` \
          object store, so a duplicate you did not make may be another worker's live \
          in-progress commit.\n\n\

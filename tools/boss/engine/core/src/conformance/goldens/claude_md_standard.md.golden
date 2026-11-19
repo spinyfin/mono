@@ -184,9 +184,11 @@ no `jj file track .claude/...`).
 
 Always pass `-m "…"` to `git commit`, `git rebase`, `jj commit`,
 `jj describe`, and amend/squash flows (`git commit --amend`,
-`jj squash`, `jj split`). The worker environment has no usable
+`jj squash`). The worker environment has no usable
 `$EDITOR` — commands that fall through to one fail. Fix by
-re-running with `-m`.
+re-running with `-m`. For splitting on jj 0.26 through 0.46, use
+`jj split --config 'ui.editor="true"' <paths>`, then
+`jj describe -r <revision> -m "message"` on each half.
 
 ## Creating a PR from a jj workspace
 

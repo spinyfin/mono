@@ -546,7 +546,8 @@ async fn conflicted_preservation_requires_current_work_to_be_retained() {
     for title in ["First variant", "Second variant"] {
         JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &saved.commit_id, "-m", title]);
     }
-    let name = preserved_name(&record.execution_id);
+    // A conflicted bookmark: every target, on any jj.
+    let name = revision(&preserved_name(&record.execution_id));
     let variants = JjRepo::run(
         &repo.repo,
         &["log", "--no-graph", "-r", &name, "-T", "commit_id ++ \"\\n\""],
@@ -654,7 +655,7 @@ async fn restoring_a_conflicted_bookmark_resolves_it_so_later_work_is_preserved(
     for title in ["First variant", "Second variant"] {
         JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &saved.commit_id, "-m", title]);
     }
-    let name = preserved_name(&record.execution_id);
+    let name = revision(&preserved_name(&record.execution_id));
     assert_eq!(
         JjRepo::run(
             &repo.repo,

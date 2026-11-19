@@ -7,7 +7,19 @@ use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::CubeError;
 use crate::app::store_gc::Collection;
 use crate::cli::Cli;
+use crate::command_runner::JjGate;
 use clap::Parser;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+fn marker_path(database: &Path) -> PathBuf {
+    JjGate::quarantine_path(&JjGate::path(database.parent().unwrap()))
+}
+
+fn write_marker(database: &Path, owner: &Path) {
+    std::fs::create_dir_all(marker_path(database).parent().unwrap()).unwrap();
+    std::fs::write(marker_path(database), owner.display().to_string()).unwrap();
+}
 
 fn operation_command(source: &std::path::Path, head: &str, output: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
@@ -111,7 +123,8 @@ fn assert_retryable_skip(tempdir: &tempfile::TempDir, database: &std::path::Path
     assert_eq!(row["collection"], "concurrent", "{row}");
     assert!(!rows.iter().any(|row| row["outcome"] == "failed"));
     assert!(!row.to_string().contains("Repair"), "{row}");
-    // The persisted outcome is a skip that leaves the failure streak alone.
+    // The persisted outcome is a skip, and it counts toward the attention the
+    // listing raises: a store that is busy every time must not go unreported.
     let store = crate::store::Store::open_at(database).unwrap();
     assert_eq!(
         store
@@ -124,7 +137,7 @@ fn assert_retryable_skip(tempdir: &tempfile::TempDir, database: &std::path::Path
             .get_pool_metadata_i(&crate::app::store_gc::store_gc_failures_key("mono"))
             .unwrap()
             .unwrap_or(0),
-        0
+        1
     );
     // No quarantine marker was left behind.
     let gate = crate::command_runner::JjGate::path(database.parent().unwrap());
@@ -264,6 +277,25 @@ fn the_oldest_client_declaration_is_stored_per_repo() {
 
     // A malformed declaration is rejected and changes nothing.
     let fake = FakeRunner::default();
+    for version in ["0.47", "1.0"] {
+        let error = run_with_dependencies(
+            Cli::parse_from(["cube", "repo", "declare-oldest-jj", "mono", version]),
+            Some(&database),
+            &fake,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not supported yet"), "{error}");
+        let probe = FakeRunner::new(vec![ExpectedCommand::ok(
+            source.clone(),
+            "jj",
+            &["--version"],
+            &format!("jj {version}.0"),
+        )]);
+        let error = crate::app::store_gc_integrity::collector_version(&probe, &source, "mono", (9, 0)).unwrap_err();
+        assert!(error.to_string().contains("not supported yet"), "{error}");
+        assert!(!error.to_string().contains("declare-oldest-jj"), "{error}");
+        probe.assert_exhausted();
+    }
     for bad in [
         "0",
         "0.34.1",
@@ -304,4 +336,75 @@ fn the_oldest_client_declaration_is_stored_per_repo() {
             .iter()
             .any(|row| row["outcome"] == "failed" && row["collector_jj_version"] == "jj 0.34.0")
     );
+}
+
+#[test]
+fn every_collector_newer_than_the_oldest_client_stages_its_rewrite() {
+    use crate::app::store_gc_integrity::uses_staged_rewrite;
+    // The in-place abandon is only measured and bounded on 0.26; any newer
+    // jj, tested or not, takes the staged path that also refreshes the
+    // primary working copy.
+    assert!(!uses_staged_rewrite((0, 26)));
+    for minor in [27, 32, 36, 40, 45, 46] {
+        assert!(uses_staged_rewrite((0, minor)), "0.{minor}");
+    }
+}
+
+#[test]
+fn a_refresh_is_refused_while_a_second_head_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let heads = dir.path().join(".jj/repo/op_heads/heads");
+    std::fs::create_dir_all(&heads).unwrap();
+    std::fs::write(heads.join("rewritten"), b"").unwrap();
+    std::fs::write(heads.join("sibling"), b"").unwrap();
+    // No jj command is expected: update-stale would merge the heads.
+    let runner = FakeRunner::new(vec![]);
+    let error =
+        crate::app::store_gc::recover_refresh(&runner, dir.path(), "original", "rewritten", Duration::from_secs(1))
+            .unwrap_err();
+    assert!(error.to_string().contains("2 operation heads"), "{error}");
+    runner.assert_exhausted();
+}
+
+#[test]
+fn a_pending_refresh_is_redone_and_verified_before_readers_are_admitted() {
+    let (tempdir, database) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database);
+    let source = seed_store_files(&source_of(&database));
+    write_marker(&database, &source);
+    let refresh = marker_path(&database).with_extension("refresh");
+    // The seeded store's one head is the published rewrite.
+    std::fs::write(&refresh, "original\nhead").unwrap();
+    let update_stale = || ExpectedCommand::ok(source.clone(), "jj", &["workspace", "update-stale"], "");
+    let mut failing = update_stale();
+    failing.result = Err(CubeError::InvalidArgument("working copy refresh failed".into()));
+
+    let fake = FakeRunner::new(vec![ps_command(&source, ""), failing]);
+    let error = JjGate::shared_for_database_with_runner(Some(&database), &fake)
+        .err()
+        .expect("recovery fails closed");
+    assert!(matches!(error, CubeError::MaintenanceQuarantined(_)), "{error}");
+    fake.assert_exhausted();
+    assert!(marker_path(&database).exists() && refresh.exists());
+
+    let fake = FakeRunner::new(vec![ps_command(&source, ""), update_stale()]);
+    JjGate::shared_for_database_with_runner(Some(&database), &fake).unwrap();
+    fake.assert_exhausted();
+    assert!(!marker_path(&database).exists() && !refresh.exists());
+}
+
+#[test]
+fn a_refresh_record_for_a_rewrite_that_never_became_the_head_is_dropped() {
+    let (tempdir, database) = with_database_path();
+    seed_mono_repo(&tempdir.path().join("workspaces"), &database);
+    let source = seed_store_files(&source_of(&database));
+    write_marker(&database, &source);
+    let refresh = marker_path(&database).with_extension("refresh");
+    // The seeded store's one head is the original: publication never happened.
+    std::fs::write(&refresh, "head\nnever-published").unwrap();
+    // No jj command is expected: there is nothing to refresh.
+    let fake = FakeRunner::new(vec![ps_command(&source, "")]);
+    JjGate::shared_for_database_with_runner(Some(&database), &fake).unwrap();
+    fake.assert_exhausted();
+    assert!(!marker_path(&database).exists() && !refresh.exists());
 }

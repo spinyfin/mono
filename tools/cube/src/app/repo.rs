@@ -114,6 +114,7 @@ pub(super) fn run_repo(
             let not_a_version =
                 || CubeError::InvalidArgument(format!("`{version}` is not a `major.minor` jj version (e.g. 0.34)"));
             let oldest = parse_declared_version(version.trim()).ok_or_else(not_a_version)?;
+            crate::app::store_gc_integrity::require_supported_collector(oldest)?;
             let encoded = encode_major_minor(oldest).ok_or_else(not_a_version)?;
             let previous = store
                 .get_pool_metadata_i(&oldest_client_key(&record.repo))?
@@ -180,10 +181,15 @@ pub(super) fn run_repo(
             }
             let report = result?;
             if !dry_run {
-                store.set_pool_metadata_i(
-                    &crate::app::store_gc::store_gc_last_at_key(&repo),
-                    crate::app::util::current_epoch_s()?,
-                )?;
+                use crate::app::store_gc::{CONCURRENT_RETRY_SECS, Collection, STORE_GC_INTERVAL_SECS};
+                let now = crate::app::util::current_epoch_s()?;
+                // A busy store is retried within the hour, not in a day.
+                let stamp = if report.collection == Collection::Concurrent {
+                    now - STORE_GC_INTERVAL_SECS + CONCURRENT_RETRY_SECS
+                } else {
+                    now
+                };
+                store.set_pool_metadata_i(&crate::app::store_gc::store_gc_last_at_key(&repo), stamp)?;
             }
             RunResult::new(report.summary(), json!({ "store_gc": report }))
         }

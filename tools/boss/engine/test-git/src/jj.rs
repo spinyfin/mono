@@ -172,11 +172,19 @@ impl JjRepo {
         let layout = Self::layout(root);
         let repo = &layout.repo;
         let mut init = Command::new(Self::binary());
-        init.args(["git", "init"]);
-        if colocated {
-            init.arg("--colocate");
-        }
-        let output = init.arg(repo).output().expect("Bazel must provide jj");
+        // jj 0.34 colocates by default; say which layout this fixture is.
+        init.args(if colocated {
+            ["git", "init", "--colocate"].as_slice()
+        } else {
+            ["--config", "git.colocate=false", "git", "init"].as_slice()
+        });
+        // jj 0.38 reads, and migrates, the configuration of the repository
+        // around its working directory. Under Bazel that is the checkout.
+        let output = init
+            .arg(repo)
+            .current_dir(root)
+            .output()
+            .expect("Bazel must provide jj");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         Self::run(repo, &["config", "set", "--repo", "user.name", "Recovery test"]);
         Self::run(
@@ -197,15 +205,25 @@ impl JjRepo {
         layout
     }
 
+    /// The declared jj, as an absolute path: commands run inside their
+    /// repository, where a runfiles-relative path would not resolve.
     pub fn binary() -> std::ffi::OsString {
-        std::env::var_os("BOSS_JJ_BIN").expect("Bazel must declare BOSS_JJ_BIN")
+        std::fs::canonicalize(std::env::var_os("BOSS_JJ_BIN").expect("Bazel must declare BOSS_JJ_BIN"))
+            .expect("the declared jj binary must exist")
+            .into_os_string()
     }
 
+    /// Run jj in `repo`. `args` are written for jj 0.26, as in production,
+    /// and respelled for the declared jj the same way production does it.
     pub fn run(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new(Self::binary())
+        let binary = Self::binary();
+        let version = git_utils::jj_compat::detected_version(&binary).expect("the declared jj must be supported");
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let output = Command::new(binary)
             .args(["--no-pager", "-R"])
             .arg(repo)
-            .args(args)
+            .current_dir(repo)
+            .args(git_utils::jj_compat::arguments(version, &args))
             .output()
             .expect("Bazel must provide jj");
         assert!(

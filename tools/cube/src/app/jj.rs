@@ -150,6 +150,35 @@ pub(super) fn is_retryable_network_error(err: &CubeError) -> bool {
     }
 }
 
+/// Git-backend lock contention: concurrent `jj` writers on a shared
+/// colocated store (a lease attaching a workspace while store GC rewrites
+/// keep-refs, or two attaches overlapping a collector) can fail after the
+/// working copy exists. A bounded retry after forgetting the partial
+/// attach is safe; a logic or auth failure is not.
+const TRANSIENT_BACKEND_LOCK_SIGNATURES: &[&str] = &[
+    "obtaining the lock",
+    "failed to lock",
+    "cannot lock ref",
+    "unable to create",
+];
+
+/// True when `err` is a git/jj backend lock that a short retry can clear.
+pub(super) fn is_retryable_backend_lock_error(err: &CubeError) -> bool {
+    match err {
+        CubeError::CommandFailed { stderr, .. } => {
+            let lowered = stderr.to_ascii_lowercase();
+            if !TRANSIENT_BACKEND_LOCK_SIGNATURES
+                .iter()
+                .any(|sig| lowered.contains(sig))
+            {
+                return false;
+            }
+            lowered.contains("lock")
+        }
+        _ => false,
+    }
+}
+
 /// The smallest remaining budget worth handing to a freshly spawned
 /// subprocess. Below this, the process has no realistic chance to finish
 /// before the deadline kills it — `jj` startup alone (loading the repo,

@@ -65,7 +65,14 @@ fn git(workspace: &Path, args: &[&str]) -> Result<Vec<u8>> {
 pub(crate) fn verify(workspace: &Path, packet: &SourcePacket) -> Result<PathBuf> {
     require_sha(&packet.head_sha)?;
     require_sha(&packet.merge_base_sha)?;
-    let output = Command::new(std::env::var_os("BOSS_JJ_BIN").unwrap_or_else(|| "jj".into()))
+    let binary = std::env::var_os("BOSS_JJ_BIN").unwrap_or_else(|| "jj".into());
+    let binary = if Path::new(&binary).components().count() > 1 {
+        std::fs::canonicalize(binary)?.into_os_string()
+    } else {
+        binary
+    };
+    let output = Command::new(binary)
+        .current_dir(workspace)
         .args([
             "--repository",
             &workspace.display().to_string(),

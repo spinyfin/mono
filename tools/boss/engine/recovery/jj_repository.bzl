@@ -1,7 +1,9 @@
 """Pinned jj executables for real, sandboxed tests.
 
 One parameterized repository rule serves every pinned jj version. MODULE.bazel
-instantiates it as `jj_test_tools` (the default version) and as
+instantiates it as `jj_test_tools` (the default version, which is the oldest
+jj cube and Boss support), as `jj_upgrade_test_tools` (the newest supported
+jj, which the `*_jj_046_test` targets run the same suites against), and as
 `cube_jj_newer`, a newer jj that cube's GC tests use to reproduce predecessor
 retention across index versions. Each instance declares its own visibility.
 """
@@ -24,6 +26,12 @@ _JJ_RELEASES = {
         "x86_64-apple-darwin": "d7c1a4800ad877219ccb6e0bb7925194f18242bffe4048d6bd834afe7d765773",
         "aarch64-unknown-linux-musl": "1a68cfdbb71e97ed3b417e153701c135d680f07a6f2b6cb6e086008356c650a1",
         "x86_64-unknown-linux-musl": "64470d36bed3f5d04dc7c5d05e47b2052f61cc253977ae3c0b9729937c55a0a3",
+    },
+    "0.46.0": {
+        "aarch64-apple-darwin": "43daa37ce0f9716cdf6fb65a29cbcae74a3160aef048cf3cb3d166d41cb4ab58",
+        "x86_64-apple-darwin": "10d941de276c7c5074ef5d395312813b4575f4ce92cb9c0b05738efb90bd3b60",
+        "aarch64-unknown-linux-musl": "80e28f7501c11e50e0ca06cd6a1fa1d982cff9cc59bfe4411a9d36aa501d867e",
+        "x86_64-unknown-linux-musl": "fce0271158e665ceb82dc66c5eb95b1728649094e9133074f3b5baece345fc08",
     },
 }
 

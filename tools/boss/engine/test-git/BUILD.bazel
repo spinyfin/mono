@@ -19,7 +19,7 @@ rust_library(
         "//tools/boss/engine/recovery:__pkg__",
         "//tools/cube:__pkg__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = ["//lib/rust/git_utils"] + all_crate_deps(normal = True),
 )
 
 rust_test(

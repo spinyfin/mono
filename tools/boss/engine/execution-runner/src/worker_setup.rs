@@ -362,9 +362,11 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
          \n\
          Always pass `-m \"…\"` to `git commit`, `git rebase`, `jj commit`,\n\
          `jj describe`, and amend/squash flows (`git commit --amend`,\n\
-         `jj squash`, `jj split`). The worker environment has no usable\n\
+         `jj squash`). The worker environment has no usable\n\
          `$EDITOR` — commands that fall through to one fail. Fix by\n\
-         re-running with `-m`.\n\
+         re-running with `-m`. For splitting on jj 0.26 through 0.46, use\n\
+         `jj split --config 'ui.editor=\"true\"' <paths>`, then\n\
+         `jj describe -r <revision> -m \"message\"` on each half.\n\
          \n\
          ## Creating a PR from a jj workspace\n\
          \n\

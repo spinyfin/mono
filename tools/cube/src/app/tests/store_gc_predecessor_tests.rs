@@ -20,7 +20,10 @@ impl CommandRunner for QuietRunner<'_> {
 }
 
 fn fixture() -> Fixture {
-    let f = Fixture::new();
+    // These tests are about a store shared by a jj 0.26 client, which reads
+    // predecessors from commits, and a newer one that no longer writes them.
+    // Both are pinned, so the tests mean the same whichever jj is under test.
+    let f = Fixture::with_jj("CUBE_OLDEST_JJ_BIN", "ws");
     // jj 0.26 passes --expire now to its own collector but runs plain git gc.
     // Expire Git objects and reflogs now too, modeling old objects without a
     // two-week sleep. This configuration belongs only to the temporary repo.

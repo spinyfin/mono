@@ -75,7 +75,14 @@ async fn ancestor_selection_discloses_unrelated_variant_across_retries() {
     );
     let identities = JjRepo::run(
         &repo.repo,
-        &["log", "--no-graph", "-r", &pointer, "-T", "change_id ++ \"\\n\""],
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &revision(&pointer),
+            "-T",
+            "change_id ++ \"\\n\"",
+        ],
     );
     assert_eq!(identities.lines().collect::<std::collections::HashSet<_>>().len(), 2);
     JjRepo::run(&repo.replacement, &["new", "main"]);
@@ -120,7 +127,7 @@ async fn retry_reports_real_archive_name_after_shared_ancestor_rebase() {
             "log",
             "--no-graph",
             "-r",
-            &pointer,
+            &revision(&pointer),
             "-T",
             "commit_id ++ \" \" ++ description.first_line() ++ \"\\n\"",
         ],
@@ -136,7 +143,14 @@ async fn retry_reports_real_archive_name_after_shared_ancestor_rebase() {
     assert_ne!(selected, old);
     let identities = JjRepo::run(
         &repo.repo,
-        &["log", "--no-graph", "-r", &pointer, "-T", "change_id ++ \"\\n\""],
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &revision(&pointer),
+            "-T",
+            "change_id ++ \"\\n\"",
+        ],
     );
     assert_eq!(identities.lines().collect::<std::collections::HashSet<_>>().len(), 1);
     let archive = variant_archive_name(&record.execution_id, old.trim());

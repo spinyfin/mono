@@ -188,7 +188,7 @@ async fn probe_command(
 /// fixture), `<workspace_path>/.jj/repo` is itself that directory.
 ///
 /// In a cube **secondary** workspace, `<workspace_path>/.jj/repo` is
-/// instead a *file* containing the absolute path to the primary
+/// instead a *file* containing an absolute path, or a path relative to `.jj`, to the primary
 /// workspace's `.jj/repo` directory — secondary workspaces share one
 /// object store with their siblings rather than owning their own.
 /// This function follows that indirection so callers always end up
@@ -198,7 +198,7 @@ fn resolve_jj_repo_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
 
     if repo_path.is_file() {
         let raw = std::fs::read_to_string(&repo_path)?;
-        Ok(PathBuf::from(raw.trim()))
+        Ok(workspace_path.join(".jj").join(raw.trim()))
     } else {
         Ok(repo_path)
     }
@@ -549,6 +549,23 @@ fn parse_legacy_output(base_sha: &str, head_sha: &str, stdout: &str) -> Conflict
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_absolute_and_relative_secondary_store_pointers() {
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("primary/.jj/repo");
+        let secondary = root.path().join("secondary");
+        std::fs::create_dir_all(primary.join("store/git")).unwrap();
+        std::fs::write(primary.join("store/git_target"), "git").unwrap();
+        std::fs::create_dir_all(secondary.join(".jj")).unwrap();
+        for pointer in [primary.to_str().unwrap(), "../../primary/.jj/repo"] {
+            std::fs::write(secondary.join(".jj/repo"), pointer).unwrap();
+            assert_eq!(
+                resolve_git_dir(&secondary).unwrap(),
+                primary.join("store/git").canonicalize().unwrap()
+            );
+        }
+    }
 
     // --- parse_git_version ---------------------------------------------------
 

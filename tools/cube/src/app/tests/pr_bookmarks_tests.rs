@@ -56,6 +56,13 @@ impl Fixture {
 
     /// As [`Fixture::new`], with the secondary workspace at `<tmp>/<ws_path>`.
     fn with_ws_path(ws_path: &str) -> Self {
+        Self::with_jj("BOSS_JJ_BIN", ws_path)
+    }
+
+    /// A fixture built and driven by the jj that Bazel declared in `jj_env`.
+    /// `BOSS_JJ_BIN` is the jj under test; a test about a particular release
+    /// names the variable that pins it.
+    fn with_jj(jj_env: &str, ws_path: &str) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("jj-config.toml");
         std::fs::write(
@@ -68,7 +75,7 @@ impl Fixture {
         std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
         // Bazel hands over a runfiles-relative path; the fixture runs jj from
         // other directories, so pin it to an absolute one up front.
-        let binary = std::fs::canonicalize(std::env::var("BOSS_JJ_BIN").expect("Bazel must declare BOSS_JJ_BIN"))
+        let binary = std::fs::canonicalize(std::env::var(jj_env).expect("Bazel must declare the jj binary"))
             .expect("declared jj binary exists");
         let runner = DeclaredJj { binary, config };
         let fixture = Self {
@@ -814,6 +821,123 @@ fn pull_ref_ignores_a_github_remote_with_a_similar_repo_name() {
     let info = serde_json::json!({"head": {"ref": "gone", "sha": head, "repo": null}});
     let resolved = crate::app::pr_head::resolve_pr_head(&runner, None, &f.ws, "example/repo", 1, &info, None).unwrap();
     assert_eq!(resolved.sha, head);
+}
+
+/// The spellings jj changed between 0.26 and 0.46, as cube writes them, run
+/// against the jj under test through the production runner.
+#[test]
+fn commands_jj_respelled_keep_their_meaning_on_the_jj_under_test() {
+    let f = Fixture::new();
+    let attempt = |args: &[&str]| f.runner.run(&RealCommandRunner::invocation(&f.ws, "jj", args));
+    let remote = f._dir.path().join("remote");
+    f.jj(f._dir.path(), &["git", "init", remote.to_str().unwrap()]);
+    assert!(
+        !remote.join(".git").exists(),
+        "a plain repository must not be colocated"
+    );
+    assert!(!f.ws.join(".git").exists(), "a cube workspace has no Git worktree");
+    let remote_git = remote.join(".jj/repo/store/git");
+    f.jj(&f.ws, &["git", "remote", "add", "origin", remote_git.to_str().unwrap()]);
+
+    // A name that matches nothing is an error, as cube's callers expect.
+    let missing = attempt(&["bookmark", "track", "nosuch@origin"]).unwrap_err();
+    assert!(missing.to_string().contains("No such remote bookmark"), "{missing}");
+    fn push<'a>(tail: &[&'a str]) -> Vec<&'a str> {
+        let head: &[&str] = &["git", "push", "--remote", "origin", "--ignore-working-copy", "-b"];
+        [head, tail].concat()
+    }
+    assert!(attempt(&push(&["nosuch"])).is_err());
+
+    // Publishing a bookmark that is new on the remote, twice.
+    for _ in 0..2 {
+        f.jj(&f.ws, &push(&["feat", "--allow-new"]));
+    }
+    assert_eq!(f.commit("feat"), f.commit("feat@origin"));
+
+    // First publication to a second remote must work even while the local
+    // bookmark already tracks origin (the local mirror in production).
+    let second = f._dir.path().join("second-remote");
+    f.jj(f._dir.path(), &["git", "init", second.to_str().unwrap()]);
+    f.jj(
+        &f.ws,
+        &[
+            "git",
+            "remote",
+            "add",
+            "github",
+            second.join(".jj/repo/store/git").to_str().unwrap(),
+        ],
+    );
+    f.jj(
+        &f.ws,
+        &["git", "push", "-b", "feat", "--remote", "github", "--allow-new"],
+    );
+    assert_eq!(f.commit("feat"), f.commit("feat@github"));
+
+    // Reverting one named operation.
+    f.jj(&f.ws, &["bookmark", "create", "probe", "-r", "feat"]);
+    let operation = f.jj(&f.ws, &["op", "log", "-n", "1", "--no-graph", "-T", "id"]);
+    f.jj(&f.ws, &["op", "undo", &operation]);
+    assert!(f.commit("bookmarks(exact:probe)").is_empty());
+
+    // A change ID names every visible commit of a divergent change.
+    f.jj(&f.ws, &["new", "feat", "-m", "one"]);
+    let change = f.jj(&f.ws, &["log", "--no-graph", "-r", "@", "-T", "change_id"]);
+    f.jj(&f.ws, &["describe", "-m", "left"]);
+    f.jj(&f.ws, &["--at-op", "@-", "describe", "-m", "right"]);
+    let variants = f.jj(
+        &f.ws,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("present({change}) & ~root()"),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert_eq!(variants.lines().count(), 2, "{variants}");
+    let evolution = f.jj(
+        &f.ws,
+        &[
+            "--ignore-working-copy",
+            "evolog",
+            "--no-graph",
+            "-r",
+            variants.lines().next().unwrap(),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    );
+    assert!(
+        evolution
+            .lines()
+            .any(|id| variants.lines().any(|variant| variant == id))
+    );
+
+    // Forgetting a bookmark drops every record of it.
+    f.jj(&f.ws, &["--ignore-working-copy", "bookmark", "forget", "feat"]);
+    let listed = f.jj(
+        &f.ws,
+        &[
+            "bookmark",
+            "list",
+            "--all-remotes",
+            "-T",
+            "name ++ \"\\n\"",
+            "exact:feat",
+        ],
+    );
+    assert_eq!(listed, "");
+
+    // Splitting without an editor, and reading a path with glob characters.
+    f.jj(&f.ws, &["new", "main", "-m", "split fixture"]);
+    std::fs::write(f.ws.join("part[1]"), "first\n").unwrap();
+    std::fs::write(f.ws.join("part2"), "second\n").unwrap();
+    f.jj(&f.ws, &["split", "--config", "ui.editor=\"true\"", "cwd:\"part[1]\""]);
+    assert_eq!(f.jj(&f.ws, &["diff", "-r", "@-", "--name-only"]), "part[1]");
+    assert_eq!(f.jj(&f.ws, &["diff", "-r", "@", "--name-only"]), "part2");
+    assert_eq!(f.jj(&f.ws, &["file", "show", "-r", "@-", "part[1]"]), "first");
 }
 
 #[test]

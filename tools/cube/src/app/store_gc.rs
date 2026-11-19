@@ -40,15 +40,30 @@
 //!    keeps. If the post-abandon polling never finds a quiet instant, the
 //!    pass falls back to the two-week default. Either way it collects only
 //!    when the head re-check found a single head.
-//!    Collection uses a private, freshly rebuilt index over the shared store.
-//!    Inherited indexes are not trusted: newer jj versions can omit legacy
-//!    predecessors that jj 0.26 still needs when rebuilding. Fresh validation
-//!    also runs before abandon (preserving the live cache on failure), and
-//!    again after collection. Any validation failure fails the upkeep and
-//!    records a failed audit event; a successful cached read is insufficient.
+//!    Collection validates against a private, freshly rebuilt index over the
+//!    shared store, then runs `util gc` against the live store. Inherited
+//!    indexes are not trusted: newer jj versions can omit legacy predecessors
+//!    that jj 0.26 still needs when rebuilding. Fresh validation also runs
+//!    before abandon (preserving the live cache on failure), and again after
+//!    collection. `util gc` uses the live heads so a lease that started after
+//!    the collection checkpoint stays reachable. Any validation failure fails
+//!    the upkeep and records a failed audit event; a successful cached read is
+//!    insufficient.
 //!
-//! The abandon holds the exclusive host-wide [`JjGate`] from before the
-//! abandon through the head check. Every
+//! Collectors newer than jj 0.26 prepare the slow rewrite against private
+//! heads under a shared gate. The exclusive step snapshots the primary working
+//! copy, verifies the original head is unchanged, publishes the prepared head
+//! and refreshes the primary working copy, verifying the head set before and
+//! after (the refresh cannot be pinned to an operation, and jj merges
+//! multiple heads on load). If live operations advanced the head, which on a
+//! busy host they usually do during a minutes-long preparation, the rewrite
+//! is prepared again, a bounded number of times, before the pass reports a
+//! concurrent skip; that outcome counts toward the attention surfaced by
+//! `cube workspace list` and the next attempt is due within the hour. The
+//! quarantine is lifted only after the refresh is verified; a failed or
+//! interrupted refresh is recorded durably and completed by the recovery that
+//! readers attempt. jj 0.26 runs the abandon itself under the exclusive
+//! host-wide [`JjGate`] through the head check. Every
 //! `jj` command cube starts
 //! (lease, goto, push, fetch; see `command_runner`) holds the gate shared for
 //! its run, so none of those can load the pre-rewrite head; cube commands
@@ -104,6 +119,18 @@ use crate::store::Store;
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::run_jj;
 use crate::app::store_gc_integrity::{GcIndex, collector_version, oldest_shared_client};
+
+#[path = "store_gc_rewrite.rs"]
+mod rewrite;
+pub(crate) use rewrite::recover_refresh;
+
+/// How many times a staged rewrite is prepared again because live operations
+/// advanced while it was being prepared. Each preparation takes minutes on a
+/// large log, and ordinary worker activity makes one such advance likely.
+const MAX_REPREPARES: usize = 3;
+/// After a pass that found the store busy, the next upkeep is due again in
+/// this long instead of a day, so one busy window does not skip a day.
+pub(super) const CONCURRENT_RETRY_SECS: i64 = 60 * 60;
 
 /// Operations newer than this are never abandoned. Three days of history
 /// keeps `jj op undo` useful while the log stays bounded.
@@ -200,10 +227,11 @@ impl StoreGcOutcome {
 /// count.
 pub(super) fn record_store_gc_outcome(store: &Store, repo: &str, outcome: StoreGcOutcome) -> Result<()> {
     store.set_pool_metadata_i(&store_gc_outcome_key(repo), outcome.code())?;
+    // A pass that found the store busy is not maintained either: a store that
+    // is busy every time (collection retried within the hour, see
+    // `CONCURRENT_RETRY_SECS`) must be reported, not quietly left to grow.
     let failures = if outcome == StoreGcOutcome::Maintained {
         0
-    } else if outcome == StoreGcOutcome::Concurrent {
-        store.get_pool_metadata_i(&store_gc_failures_key(repo))?.unwrap_or(0)
     } else {
         store
             .get_pool_metadata_i(&store_gc_failures_key(repo))?
@@ -734,6 +762,32 @@ pub(super) fn gc_repo_store_with_deadline(
             index
         };
         let mut rewritten_head = None;
+        // New jj rewrites large retained histories slowly. Prepare with
+        // private heads while holding only a shared gate; publish only if no
+        // live operation has advanced since preparation. Preparation takes
+        // minutes, so live operations often advance meanwhile; the pass then
+        // prepares again from the new head, a bounded number of times.
+        let staged_cut = abandoned_through.clone().filter(|_| {
+            collector_jj
+                .and_then(|v| v.strip_prefix("jj "))
+                .and_then(super::store_gc_integrity::parse_major_minor)
+                .is_some_and(super::store_gc_integrity::uses_staged_rewrite)
+        });
+        let prepare = |cut: &str| -> Result<Option<rewrite::PreparedRewrite>> {
+            let _reader = JjGate::shared_for_database(database_path)?;
+            rewrite::PreparedRewrite::prepare(runner, &source, cut)
+        };
+        let mut staged = match staged_cut.as_deref() {
+            Some(cut) => Some(prepare(cut)?),
+            None => None,
+        };
+        let staged_is_stale = |staged: &Option<Option<rewrite::PreparedRewrite>>| -> Result<bool> {
+            Ok(match staged {
+                Some(Some(prepared)) => !prepared.is_current(&source)?,
+                Some(None) => true,
+                None => false,
+            })
+        };
         // Held through the rewrite and head check:
         // cube-started jj commands wait on it, so
         // none of them can load the pre-rewrite head in between.
@@ -745,7 +799,8 @@ pub(super) fn gc_repo_store_with_deadline(
             // the re-probe under the gate are retried within one budget,
             // releasing the gate between attempts, so lease churn or a
             // single racing jj does not skip the pass for a day.
-            let budget = Instant::now();
+            let mut budget = Instant::now();
+            let mut reprepares = 0;
             let mut host_quiet = true;
             while gate.is_none() && host_quiet && budget.elapsed() < quiescence.max(Duration::from_millis(1)) {
                 let remaining = quiescence.saturating_sub(budget.elapsed());
@@ -758,12 +813,29 @@ pub(super) fn gc_repo_store_with_deadline(
                     continue;
                 };
                 reconcile_quarantine(runner, &candidate, record, &source)?;
+                if staged.is_some() {
+                    // Edits the primary working copy gained since the
+                    // preparation become an operation here, which the
+                    // staleness check below then sees. This can take seconds
+                    // on a large store, so it precedes the quiet-host probe:
+                    // no jj process may start unobserved between that probe
+                    // and publication.
+                    rewrite::snapshot_primary(runner, &source, exclusive_timeout)?;
+                }
                 if wait_for_jj_quiescence(runner, &source, Duration::ZERO, QUIESCENCE_POLL)? {
+                    if staged.is_some() && staged_is_stale(&staged)? && reprepares < MAX_REPREPARES {
+                        drop(candidate);
+                        reprepares += 1;
+                        staged = Some(prepare(&cut)?);
+                        budget = Instant::now();
+                        continue;
+                    }
                     exclusive_started = Some(Instant::now());
                     gate = Some(candidate);
                 }
             }
-            if gate.is_some() && op_heads(&source)?.len() != 1 {
+            let mut raced = false;
+            if gate.is_some() && (op_heads(&source)?.len() != 1 || staged_is_stale(&staged)?) {
                 // A concurrent head that predates the abandon: the abandon
                 // would rewrite every head and the after-abandon check
                 // would mistake it for a race. Rewrite nothing instead.
@@ -772,19 +844,51 @@ pub(super) fn gc_repo_store_with_deadline(
                 abandoned_through = None;
                 collection = Collection::Concurrent;
             } else if let Some(active_gate) = gate.as_ref() {
-                let range = format!("..{cut}");
                 active_gate.quarantine(&source)?;
-                let abandon = runner.run_with_timeout(
-                    &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
-                    exclusive_timeout,
-                );
-                rewritten_head = Some(require_single_op_head(record, &source, "after the abandon")?);
-                active_gate.clear_quarantine(&source)?;
-                abandon?;
+                if let Some(Some(prepared)) = &staged {
+                    // The refresh is recorded before publication: a crash
+                    // anywhere after it leaves the quarantine, and its
+                    // recovery finishes and verifies the refresh, or sees
+                    // from the head that nothing was published.
+                    active_gate.require_refresh(prepared.original(), prepared.rewritten())?;
+                    let published = prepared.publish(&source);
+                    if published.is_err() && !op_heads(&source)?.iter().any(|head| head == prepared.rewritten()) {
+                        // The rewrite is not a head, so nothing was published:
+                        // a command outside cube's gate advanced the store
+                        // first. The store is as it was.
+                        active_gate.clear_refresh()?;
+                        active_gate.clear_quarantine(&source)?;
+                        raced = true;
+                    } else {
+                        // On failure both markers stay, and the pass fails.
+                        published?;
+                        rewrite::complete_refresh(runner, &source, prepared.rewritten(), exclusive_timeout)?;
+                        // The prepared head, not whatever a refresh left,
+                        // anchors every later ancestry check.
+                        rewritten_head = Some(prepared.rewritten().to_owned());
+                        active_gate.clear_refresh()?;
+                        active_gate.clear_quarantine(&source)?;
+                    }
+                } else {
+                    let range = format!("..{cut}");
+                    let abandon = runner.run_with_timeout(
+                        &gated_jj_invocation(&source, &["--ignore-working-copy", "op", "abandon", &range]),
+                        exclusive_timeout,
+                    );
+                    rewritten_head = Some(require_single_op_head(record, &source, "after the abandon")?);
+                    active_gate.clear_quarantine(&source)?;
+                    abandon?;
+                }
             } else {
                 gate = None;
                 abandoned_through = None;
                 collection = Collection::Skipped;
+            }
+            if raced {
+                drop(gate.take());
+                exclusive_started = None;
+                abandoned_through = None;
+                collection = Collection::Concurrent;
             }
         }
         'collect: {
@@ -840,6 +944,30 @@ pub(super) fn gc_repo_store_with_deadline(
                         record.repo
                     );
                 }
+                if staged_cut.is_some() {
+                    // The staged rewrite left every working copy on an
+                    // operation the new head does not descend from. Refresh
+                    // the free ones now, so a lease does not have to.
+                    let refresh_started = Instant::now();
+                    let refresh =
+                        rewrite::refresh_free_workspaces(runner, database_path, &record.repo, exclusive_timeout);
+                    audit!(
+                        database_path,
+                        "repo.store_gc.workspace_refresh",
+                        repo = record.repo,
+                        outcome = if refresh.is_ok() { "succeeded" } else { "failed" },
+                        refreshed = refresh.as_ref().ok().map(|counts| counts.0),
+                        not_refreshed = refresh.as_ref().ok().map(|counts| counts.1),
+                        duration_ms = refresh_started.elapsed().as_millis() as u64,
+                        error = refresh.as_ref().err().map(ToString::to_string),
+                    );
+                    if let Err(error) = refresh {
+                        eprintln!(
+                            "cube: store gc: {}: free workspaces were not refreshed after the rewrite: {error}",
+                            record.repo
+                        );
+                    }
+                }
             }
             // The fresh-index rebuild can take minutes, so it runs first and
             // pinned to the checked head: a head published meanwhile cannot
@@ -861,6 +989,16 @@ pub(super) fn gc_repo_store_with_deadline(
                 super::store_gc_integrity::require_safe_progress(runner, &source, rewritten, &head)?;
             }
             index.verify(runner, MAINTENANCE_CMD_TIMEOUT, "before collection", &head)?;
+            // Before the quiet observation, so maintenance that a fetch has
+            // already started gets that wait to finish in.
+            let refs_stay_loose = super::store_gc_integrity::disable_git_auto_maintenance(runner, &source);
+            if let Err(error) = &refs_stay_loose {
+                eprintln!(
+                    "cube: store gc: {}: could not turn off git's automatic maintenance, so collection keeps \
+                     the default expiry: {error}",
+                    record.repo
+                );
+            }
             let quiet = wait_for_jj_quiescence(runner, &source, quiescence, QUIESCENCE_POLL)?;
             // A command that started during the abandon or the rebuild
             // loaded an older head and may have committed on it since; that
@@ -872,15 +1010,16 @@ pub(super) fn gc_repo_store_with_deadline(
                 break 'collect;
             };
             super::store_gc_integrity::require_safe_progress(runner, &source, &head, &current)?;
-            if quiet {
+            if quiet && refs_stay_loose.is_ok() {
                 gc_args.extend(["--expire", "now"]);
                 collection = Collection::Immediate;
             } else {
                 collection = Collection::Deferred;
             }
             // Collection is a reader: leases proceed, but another rewrite
-            // cannot invalidate the head this collector loaded.
-            index.run(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
+            // cannot invalidate the head this collector loaded. `util gc`
+            // runs against the live store so those leases stay reachable.
+            index.collect(runner, &gc_args, MAINTENANCE_CMD_TIMEOUT)?;
             // Collection has already run, so every head that exists now is
             // checked rather than refused: a concurrent worker operation is
             // benign when it descends from the head collected against, and

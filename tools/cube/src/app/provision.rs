@@ -3,6 +3,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use crate::command_runner::{CommandInvocation, CommandRunner};
 use crate::metadata::{RepoRecord, WorkspaceRecord};
@@ -12,9 +14,45 @@ use crate::{audit, setup};
 
 use crate::app::disk::DiskSpace;
 use crate::app::errors::{CubeError, Result};
-use crate::app::jj::{network_cmd_timeout, workspace_path_exists};
+use crate::app::jj::{is_retryable_backend_lock_error, network_cmd_timeout, workspace_path_exists};
 use crate::app::reclaim::assert_mint_headroom;
 use crate::app::util::current_epoch_s;
+
+/// Extra `jj workspace add` attempts after a git-backend lock. The
+/// working copy can exist before the keep-ref write, so each retry forgets
+/// the partial attach first.
+const WORKSPACE_ADD_LOCK_RETRIES: u32 = 3;
+const WORKSPACE_ADD_LOCK_RETRY_WAIT: Duration = Duration::from_millis(50);
+
+fn forget_staging_workspace(
+    runner: &dyn CommandRunner,
+    canonical: &Path,
+    repo_record: &RepoRecord,
+    workspace_id: &str,
+    staging_path: &Path,
+) -> Result<()> {
+    if !staging_path.exists() {
+        return Ok(());
+    }
+    // Best-effort: tolerate "no such workspace" when there is nothing to forget.
+    let _ = runner.run(&CommandInvocation {
+        cwd: repo_record.workspace_root.clone(),
+        program: "jj".to_string(),
+        args: vec![
+            "-R".to_string(),
+            canonical.display().to_string(),
+            "workspace".to_string(),
+            "forget".to_string(),
+            workspace_id.to_string(),
+        ],
+        env: vec![],
+    });
+    fs::remove_dir_all(staging_path).map_err(|source| CubeError::WorkspaceDirRemove {
+        path: staging_path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
 
 pub(super) fn next_workspace_id(prefix: &str, existing: &[String]) -> String {
     let mut max_n: u32 = 0;
@@ -103,30 +141,6 @@ pub(super) fn auto_create_workspace(
     // moving the directory after the attach is transparent. The repo lock is held
     // across the whole lease, so the staging name can't race a concurrent create.
     let staging_path = repo_record.workspace_root.join(format!(".incoming-{workspace_id}"));
-    if staging_path.exists() {
-        // A leftover staging dir means a prior create was interrupted after
-        // `jj workspace add` registered this workspace in the SHARED canonical
-        // store but before the publish rename. Unlike an independent clone, the
-        // attach mutated that shared store, so the dangling registration must be
-        // forgotten or the re-add below collides with "workspace already exists".
-        // Best-effort: tolerate "no such workspace" when there is nothing to forget.
-        let _ = runner.run(&CommandInvocation {
-            cwd: repo_record.workspace_root.clone(),
-            program: "jj".to_string(),
-            args: vec![
-                "-R".to_string(),
-                canonical.display().to_string(),
-                "workspace".to_string(),
-                "forget".to_string(),
-                workspace_id.clone(),
-            ],
-            env: vec![],
-        });
-        fs::remove_dir_all(&staging_path).map_err(|source| CubeError::WorkspaceDirRemove {
-            path: staging_path.clone(),
-            source,
-        })?;
-    }
 
     // `jj workspace add` attaches a new working copy that SHARES the canonical
     // store: the new `.jj/repo` is a file POINTER to `<canonical>/.jj/repo`, not a
@@ -134,23 +148,41 @@ pub(super) fn auto_create_workspace(
     // tens of GB each). `--name <workspace_id>` pins the store-side workspace name
     // to the pool id regardless of the staging basename, so the publish rename
     // needs no fix-up. This is a local operation; the timeout is only a backstop.
-    runner.run_with_timeout(
-        &CommandInvocation {
-            cwd: repo_record.workspace_root.clone(),
-            program: "jj".to_string(),
-            args: vec![
-                "-R".to_string(),
-                canonical.display().to_string(),
-                "workspace".to_string(),
-                "add".to_string(),
-                "--name".to_string(),
-                workspace_id.clone(),
-                staging_path.display().to_string(),
-            ],
-            env: vec![],
-        },
-        network_cmd_timeout(),
-    )?;
+    //
+    // A leftover staging dir (prior create interrupted after the store
+    // registration, or a lock retry after jj created the working copy then
+    // failed on a keep-ref) must be forgotten before re-adding, or jj
+    // collides with "workspace already exists".
+    let add = CommandInvocation {
+        cwd: repo_record.workspace_root.clone(),
+        program: "jj".to_string(),
+        args: vec![
+            "-R".to_string(),
+            canonical.display().to_string(),
+            "workspace".to_string(),
+            "add".to_string(),
+            "--name".to_string(),
+            workspace_id.clone(),
+            staging_path.display().to_string(),
+        ],
+        env: vec![],
+    };
+    let mut attempt: u32 = 0;
+    loop {
+        forget_staging_workspace(runner, canonical, repo_record, &workspace_id, &staging_path)?;
+        match runner.run_with_timeout(&add, network_cmd_timeout()) {
+            Ok(_) => break,
+            Err(err) if attempt < WORKSPACE_ADD_LOCK_RETRIES && is_retryable_backend_lock_error(&err) => {
+                attempt += 1;
+                eprintln!(
+                    "cube: `jj workspace add --name {workspace_id}` hit a git lock \
+                     (attempt {attempt}/{WORKSPACE_ADD_LOCK_RETRIES}); retrying: {err}"
+                );
+                thread::sleep(WORKSPACE_ADD_LOCK_RETRY_WAIT);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
     // No per-workspace remote/bookmark setup is needed: the shared store already
     // carries `origin` = the real GitHub upstream and a local `main` bookmark, both

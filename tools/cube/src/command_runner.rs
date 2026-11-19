@@ -146,6 +146,10 @@ pub struct RealCommandRunner;
 /// itself, which already holds the appropriate [`JjGate`] reservation.
 pub const JJ_GATE_HELD_ENV: &str = "CUBE_JJ_GATE_HELD";
 
+/// Bound on the working-copy refresh a reader performs while recovering a
+/// quarantined store; the store is closed to every reader until it ends.
+const REFRESH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Host-wide gate between cube's own `jj` commands and shared-store
 /// maintenance. Every `jj` command cube starts holds the gate shared for its
 /// run; the op-log abandon holds it exclusive from before the abandon until
@@ -188,6 +192,59 @@ impl JjGate {
                 source.display()
             ))),
             None => Ok(()),
+        }
+    }
+
+    /// Where the pending-refresh record for this gate lives.
+    fn refresh_path(&self) -> PathBuf {
+        self.quarantine.with_extension("refresh")
+    }
+
+    /// Record, durably and before the new head is published, that the store's
+    /// primary working copy must be refreshed onto `rewritten`, which replaces
+    /// the head `original`. While the record exists the quarantine cannot be
+    /// lifted: a rewrite whose refresh did not finish leaves the working copy
+    /// on an operation that no longer exists, and workspace creation fails
+    /// until it is refreshed. Both operations are recorded because the record
+    /// is written before publication: recovery must tell a rewrite that was
+    /// published from one that never was.
+    pub fn require_refresh(&self, original: &str, rewritten: &str) -> Result<(), CubeError> {
+        let parent = self.quarantine.parent().expect("gate has a parent");
+        let mut record = tempfile::NamedTempFile::new_in(parent).map_err(CubeError::Io)?;
+        record
+            .write_all(format!("{original}\n{rewritten}").as_bytes())
+            .map_err(CubeError::Io)?;
+        record.as_file().sync_all().map_err(CubeError::Io)?;
+        record
+            .persist(self.refresh_path())
+            .map_err(|e| CubeError::Io(e.error))?;
+        File::open(parent).and_then(|dir| dir.sync_all()).map_err(CubeError::Io)
+    }
+
+    /// The `(original, rewritten)` operations of a rewrite whose refresh is
+    /// still owed, if any.
+    pub fn pending_refresh(&self) -> Result<Option<(String, String)>, CubeError> {
+        match fs::read_to_string(self.refresh_path()) {
+            Ok(record) => match record.split_once('\n') {
+                Some((original, rewritten)) if !original.is_empty() && !rewritten.is_empty() => {
+                    Ok(Some((original.to_owned(), rewritten.to_owned())))
+                }
+                _ => Err(CubeError::MaintenanceQuarantined(
+                    "unknown owner (malformed refresh record)".into(),
+                )),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(CubeError::MaintenanceQuarantined(
+                "unknown owner (unreadable refresh record)".into(),
+            )),
+        }
+    }
+
+    /// Drop the refresh record once the refresh was verified.
+    pub fn clear_refresh(&self) -> Result<(), CubeError> {
+        match fs::remove_file(self.refresh_path()) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(CubeError::Io(err)),
+            _ => Ok(()),
         }
     }
 
@@ -278,6 +335,19 @@ impl JjGate {
             return Err(CubeError::InvalidArgument(format!(
                 "store {owner} holds {heads} operation heads; repair the store before running `cube repo gc <repo>`"
             )));
+        }
+        // A rewrite published but not yet refreshed (a failed or interrupted
+        // `workspace update-stale`) is finished here, and verified, before
+        // readers are admitted again.
+        // The record is written before publication, so the rewrite may never
+        // have been published; the store's one head says which.
+        if let Some((original, rewritten)) = self.pending_refresh()? {
+            crate::app::store_gc::recover_refresh(runner, source, &original, &rewritten, REFRESH_RECOVERY_TIMEOUT)
+                .map_err(|error| {
+                    eprintln!("cube: store gc: refreshing the working copy of {owner} failed: {error}");
+                    CubeError::MaintenanceQuarantined(owner.clone())
+                })?;
+            self.clear_refresh()?;
         }
         self.clear_quarantine(source)
     }
@@ -441,14 +511,19 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn run_raw(&self, invocation: &CommandInvocation) -> Result<Vec<u8>, CubeError> {
+        // `run` has no deadline of its own; the preparation gets a generous one.
+        self.prepare(invocation, Duration::from_secs(300))?;
         let _gate = jj_gate(invocation, JJ_GATE_WAIT)?;
         let mut cmd = Command::new(&invocation.program);
-        cmd.args(&invocation.args).current_dir(&invocation.cwd);
+        cmd.args(compatible_args(invocation)?).current_dir(&invocation.cwd);
         Self::configure_env(&mut cmd);
         for (k, v) in &invocation.env {
             cmd.env(k, v);
         }
         let output = cmd.output().map_err(CubeError::Io)?;
+        if let Some(failure) = unmatched_name_failure(invocation, &output)? {
+            return Err(failure);
+        }
         if output.status.success() {
             Ok(output.stdout)
         } else {
@@ -563,7 +638,7 @@ impl CommandRunner for RealCommandRunner {
     /// short-lived `cube workspace lease` the way a maintenance pass has to.
     fn spawn_detached(&self, invocation: &CommandInvocation) -> Result<u32, CubeError> {
         let mut cmd = Command::new(&invocation.program);
-        cmd.args(&invocation.args)
+        cmd.args(compatible_args(invocation)?)
             .current_dir(&invocation.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -580,6 +655,21 @@ impl CommandRunner for RealCommandRunner {
 }
 
 impl RealCommandRunner {
+    /// Run the command `git_utils::jj_compat::preparatory_arguments` names for
+    /// `invocation` on its jj, if there is one, with the caller's `timeout`
+    /// and environment. A failure stops the command it prepares for.
+    fn prepare(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<(), CubeError> {
+        let Some(version) = jj_version(invocation)? else {
+            return Ok(());
+        };
+        let Some(args) = git_utils::jj_compat::preparatory_arguments(version, &invocation.args) else {
+            return Ok(());
+        };
+        let mut preparation = invocation.clone();
+        preparation.args = args;
+        self.run_with_timeout(&preparation, timeout).map(drop)
+    }
+
     /// Run a command with a wall-clock timeout, returning the raw
     /// [`std::process::Output`] regardless of exit status (`Ok(Some(_))`),
     /// or `Ok(None)` if the timeout elapsed (the child is killed and reaped
@@ -634,8 +724,9 @@ impl RealCommandRunner {
         own_process_group: bool,
         mut on_heartbeat: impl FnMut(Duration, Duration),
     ) -> Result<Option<std::process::Output>, CubeError> {
+        self.prepare(invocation, timeout)?;
         let mut cmd = Command::new(&invocation.program);
-        cmd.args(&invocation.args)
+        cmd.args(compatible_args(invocation)?)
             .current_dir(&invocation.cwd)
             .stdin(Stdio::null());
         Self::configure_env(&mut cmd);
@@ -689,6 +780,9 @@ impl RealCommandRunner {
                 timeout_secs: timeout.as_secs(),
             }),
             Some(output) => {
+                if let Some(failure) = unmatched_name_failure(invocation, &output)? {
+                    return Err(failure);
+                }
                 if output.status.success() {
                     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
                 } else {
@@ -702,6 +796,53 @@ impl RealCommandRunner {
             }
         }
     }
+}
+
+/// The supported version of the jj `invocation` runs, or `None` for another
+/// program. An unsupported jj fails here, before the command is spawned.
+fn jj_version(invocation: &CommandInvocation) -> Result<Option<git_utils::jj_compat::Version>, CubeError> {
+    if Path::new(&invocation.program).file_name() != Some(std::ffi::OsStr::new("jj")) {
+        return Ok(None);
+    }
+    git_utils::jj_compat::detected_version(std::ffi::OsStr::new(&invocation.program))
+        .map(Some)
+        .map_err(CubeError::InvalidArgument)
+}
+
+/// Respell arguments written for jj 0.26 for the jj `invocation` runs. This
+/// only rewrites arguments; any command the respelling needs first (tracking
+/// the destination of a push that used `--allow-new`) is
+/// [`RealCommandRunner::prepare`].
+fn compatible_args(invocation: &CommandInvocation) -> Result<Vec<String>, CubeError> {
+    Ok(match jj_version(invocation)? {
+        Some(version) => git_utils::jj_compat::arguments(version, &invocation.args),
+        None => invocation.args.clone(),
+    })
+}
+
+/// The failure a zero-exit jj command stands for, when newer jj only warned
+/// about a name that matched nothing.
+fn unmatched_name_failure(
+    invocation: &CommandInvocation,
+    output: &std::process::Output,
+) -> Result<Option<CubeError>, CubeError> {
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let Some(version) = jj_version(invocation)? else {
+        return Ok(None);
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(
+        git_utils::jj_compat::unmatched_name_error(version, &invocation.args, &stderr).map(|stderr| {
+            CubeError::CommandFailed {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                status: output.status.code(),
+                stderr,
+            }
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -881,6 +1022,84 @@ mod tests {
         assert!(JjGate::exclusive(&path, wait).is_err());
         drop(first);
         assert!(JjGate::exclusive(&path, wait).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unsupported_jj_fails_before_running_the_requested_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("jj");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'jj 0.47.0'; else touch mutated; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = RealCommandRunner::invocation(dir.path(), binary.to_str().unwrap(), &["new"]);
+        for result in [
+            RealCommandRunner.run(&invocation),
+            RealCommandRunner.run_with_timeout(&invocation, Duration::from_secs(5)),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("0.26.x through 0.46.x"), "{error}");
+            assert!(!dir.path().join("mutated").exists());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn newer_jj_gets_respelled_arguments_and_unmatched_names_still_fail() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("jj");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'jj 0.46.0'; exit 0; fi\necho \"$*\" >> calls\n\
+             if [ \"$3\" = master@origin ]; then echo \"Warning: No matching remote bookmarks for names: $3\" >&2; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let jj = |args: &[&str]| RealCommandRunner::invocation(dir.path(), binary.to_str().unwrap(), args);
+
+        RealCommandRunner
+            .run_with_timeout(
+                &jj(&["git", "push", "-b", "feature", "--remote", "origin", "--allow-new"]),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        for result in [
+            RealCommandRunner.run(&jj(&["bookmark", "track", "master@origin"])),
+            RealCommandRunner.run_with_timeout(&jj(&["bookmark", "track", "master@origin"]), Duration::from_secs(5)),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, CubeError::CommandFailed { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("No such remote bookmark: master@origin"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "bookmark track feature@origin --ignore-working-copy\ngit push -b feature --remote origin\nbookmark track master@origin\nbookmark track master@origin\n"
+        );
+        let error = RealCommandRunner
+            .run(&jj(&[
+                "git",
+                "push",
+                "-b",
+                "master",
+                "--remote",
+                "origin",
+                "--allow-new",
+            ]))
+            .unwrap_err();
+        assert!(error.to_string().contains("No such remote bookmark"), "{error}");
+        assert!(
+            !std::fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .contains("git push -b master")
+        );
     }
 
     #[test]

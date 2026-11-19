@@ -140,6 +140,7 @@ pub fn preserve_test_workspace(db: &WorkDb, execution_id: &str) {
             workspace.canonicalize().unwrap()
         } else {
             boss_engine_recovery::execution_bookmark::shared_repo_from_pointer(
+                &workspace.canonicalize().unwrap(),
                 &std::fs::read_to_string(workspace.join(".jj/repo")).unwrap(),
             )
             .unwrap()

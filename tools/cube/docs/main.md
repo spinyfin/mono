@@ -766,9 +766,11 @@ checkout and not aware of anything above jj:
    proceed throughout it. Reports and audit events include `exclusive_ms`
    and `collection_ms` to distinguish rewrite contention from collection cost.
    Cube reconstructs a private commit index before abandoning operations and
-   again before collection, uses that index for GC, and verifies a fresh rebuild
-   afterward. This protects predecessor commits required by the active jj
-   version even when an inherited index omits them. A verification failure
+   again before collection, verifies a fresh rebuild afterward, and runs
+   `util gc` against the live store. The private index protects predecessor
+   commits required by the active jj version even when an inherited index
+   omits them; collecting against the live heads keeps objects a concurrent
+   lease published after the collection checkpoint. A verification failure
    returns an error and writes a failed `repo.store_gc` audit row; preflight
    preserves the live cached index on an already-damaged store. See
    [missing-predecessor recovery](store-gc-recovery.md) for the tested recovery
@@ -823,7 +825,11 @@ updated at, and the abandon rewrites that operation under a new id. Verified
 on jj 0.26.0 with a second workspace: after its recorded operation was
 abandoned and deleted by `--expire now`, and its `@` was rewritten from the
 first workspace, its next `jj status` ran normally and landed on the
-rewritten `@` without `jj workspace update-stale`.
+rewritten `@` without `jj workspace update-stale`. jj 0.46 instead refuses
+every command in such a workspace until `jj workspace update-stale` has run,
+and takes longer than a lease's probe deadline to say so on a large log, so
+the collector refreshes the free workspaces itself after a rewrite (see
+[jj compatibility](jj-compatibility.md)).
 
 The periodic pool-GC pass starts this once a day per repo as a detached
 `cube repo gc` child, because the collection deletes one file per abandoned
