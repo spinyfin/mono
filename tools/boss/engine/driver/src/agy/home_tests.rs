@@ -142,8 +142,32 @@ fn provision_creates_private_tree_and_keychain_bridge() {
     let settings = fs::read_to_string(gemini.join("antigravity-cli/settings.json")).unwrap();
     assert!(!settings.contains("enableTelemetry"));
     assert!(settings.contains("trustedWorkspaces"));
+    let private: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    assert_eq!(private["queuedMessages"], "queue");
+    let session: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&runtime.session_settings_path).unwrap()).unwrap();
+    assert_eq!(session["queuedMessages"], "queue");
 
     assert_agy_posture(&runtime.process_home, &workspace).unwrap();
+}
+
+#[test]
+fn posture_refuses_unpinned_or_immediate_input() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = env_for_provision(tmp.path());
+    let runtime = provision_agy_home(tmp.path(), "prompt", "run-queue-mode").unwrap();
+    let path = runtime.process_home.join(".gemini/antigravity-cli/settings.json");
+    let original: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for mode in [None, Some("send-immediately")] {
+        let mut settings = original.clone();
+        settings.as_object_mut().unwrap().remove("queuedMessages");
+        if let Some(mode) = mode {
+            settings["queuedMessages"] = mode.into();
+        }
+        fs::write(&path, settings.to_string()).unwrap();
+        let error = assert_agy_posture(&runtime.process_home, tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("queuedMessages"), "{error:#}");
+    }
 }
 
 #[test]

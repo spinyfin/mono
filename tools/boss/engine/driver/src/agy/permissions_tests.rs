@@ -60,12 +60,19 @@ fn every_kind_renders_the_pinned_posture_and_nothing_else() {
         let keys: BTreeSet<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            BTreeSet::from(["agentMode", "permissions", "toolPermission", "trustedWorkspaces"]),
+            BTreeSet::from([
+                "agentMode",
+                "permissions",
+                "queuedMessages",
+                "toolPermission",
+                "trustedWorkspaces"
+            ]),
             "{kind:?}"
         );
         // Pinned explicitly: an absent agentMode starts in Auto on 1.5.7+.
         assert_eq!(json["agentMode"], "", "{kind:?}");
         assert_eq!(json["toolPermission"], "request-review", "{kind:?}");
+        assert_eq!(json["queuedMessages"], "queue", "{kind:?}");
         assert_eq!(json["trustedWorkspaces"], serde_json::json!([WORKSPACE]), "{kind:?}");
 
         let permission_keys: BTreeSet<&str> = json["permissions"]
@@ -440,7 +447,11 @@ fn parse_rendered_rejects_loosened_or_misspelled_settings() {
     let good = rendered(WorkerKind::Triage).to_json().unwrap();
     assert!(parse_rendered(&good).is_ok());
     type Edit = fn(&mut Value);
-    let edits: [(&str, Edit); 8] = [
+    let edits: [(&str, Edit); 10] = [
+        ("immediate input", |v| v["queuedMessages"] = "send-immediately".into()),
+        ("missing queue mode", |v| {
+            v.as_object_mut().unwrap().remove("queuedMessages");
+        }),
         ("unknown key", |v| {
             v["toolPermissions"] = "request-review".into();
         }),

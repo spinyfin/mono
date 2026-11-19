@@ -113,3 +113,69 @@ async fn local_shim_bounds_large_hook_and_heals_poisoned_buffer_before_stop() {
     let record: serde_json::Value = serde_json::from_str(rejected.trim()).unwrap();
     assert_eq!(record["rejected_reason"], "hook exceeds ingress size limit");
 }
+
+fn incoming_stop(run_id: &str, transcript_path: Option<&str>) -> IncomingHookEvent {
+    IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "s".to_owned(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        transcript_path.map(str::to_owned),
+    )
+}
+
+fn write_transcript(dir: &TempDir, name: &str, lines: &[&str]) -> String {
+    use std::io::Write;
+    let path = dir.path().join(name);
+    let mut f = std::fs::File::create(&path).unwrap();
+    for line in lines {
+        writeln!(f, "{line}").unwrap();
+    }
+    path.to_string_lossy().into_owned()
+}
+
+const CODEX_API_ERROR_PROSE: &str = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"API Error handling is now fixed"}]}}"#;
+const GROK_API_ERROR_PROSE: &str = r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"API Error handling is now fixed"}}}}"#;
+const AGY_QUOTA_ROW: &str = r#"{"step_index":7,"source":"MODEL","type":"ERROR_MESSAGE","status":"ERROR","error":"You have exhausted your quota on this model."}"#;
+const AGY_TOOL_CALL_ROW: &str = r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"echo recovered"}}]}"#;
+const AGY_TOOL_RESULT_ROW: &str = r#"{"step_index":9,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Command exited with code 0.\n\nCommand output:\nrecovered"}"#;
+
+async fn assert_stop_publishes_no_idle(db: &WorkDb, run_id: &str, transcript: &str) {
+    let bus = EventBus::new();
+    let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+    publish_hook_derived_events(&bus, db, &incoming_stop(run_id, Some(transcript))).await;
+    bus.publish(Event::DispatchReady);
+    let event = sub.recv().await.expect("sentinel event");
+    assert_eq!(
+        event,
+        Event::DispatchReady,
+        "no TransientErrorIdle should have been published"
+    );
+}
+
+#[tokio::test]
+async fn native_codex_api_error_prose_does_not_publish_idle_error() {
+    let (dir, db, run_id) = db_with_started_execution(Some("codex"));
+    let transcript = write_transcript(&dir, "t.jsonl", &[CODEX_API_ERROR_PROSE]);
+    assert_stop_publishes_no_idle(&db, &run_id, &transcript).await;
+}
+
+#[tokio::test]
+async fn native_grok_api_error_prose_does_not_publish_idle_error() {
+    let (dir, db, run_id) = db_with_started_execution(Some("grok"));
+    let transcript = write_transcript(&dir, "t.jsonl", &[GROK_API_ERROR_PROSE]);
+    assert_stop_publishes_no_idle(&db, &run_id, &transcript).await;
+}
+
+#[tokio::test]
+async fn raw_agy_quota_then_tool_progress_does_not_publish_idle_error() {
+    let (dir, db, run_id) = db_with_started_execution(Some("agy"));
+    let transcript = write_transcript(
+        &dir,
+        "t.jsonl",
+        &[AGY_QUOTA_ROW, AGY_TOOL_CALL_ROW, AGY_TOOL_RESULT_ROW],
+    );
+    assert_stop_publishes_no_idle(&db, &run_id, &transcript).await;
+}

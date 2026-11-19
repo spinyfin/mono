@@ -796,20 +796,20 @@ fn interrupt_plan_defaults_to_none_and_agrees_with_the_transport() {
     assert_eq!(stub.interrupt(), InterruptDelivery::Unsupported);
 }
 
-/// Every launch-ready driver must declare an interrupt plan that its own
-/// transport declaration agrees with, and the plan must be able to run at all
-/// (at least one press, at least one attempt).
+/// Every interruptible driver, including one restricted to explicit pins,
+/// must declare a runnable plan agreeing with its transport. Launch-ready
+/// drivers must also support interruption.
 ///
 /// Asserted over `DriverRegistry::slugs()` rather than a hand-listed set, so a
 /// driver added tomorrow is covered the day it is registered rather than the
 /// day someone remembers to extend this list.
 #[test]
-fn launch_ready_drivers_have_plans_and_skeletons_declare_unsupported() {
+fn supported_interrupts_have_valid_plans_including_pinned_drivers() {
     let registry = registry::DriverRegistry::default();
     for slug in registry.slugs() {
         let driver = registry.require(slug).expect("slug came from the registry");
-        if !driver.launch_ready() {
-            assert_eq!(driver.interrupt(), InterruptDelivery::Unsupported, "{slug}");
+        if driver.interrupt() == InterruptDelivery::Unsupported {
+            assert!(!driver.launch_ready(), "launch-ready driver {slug} cannot interrupt");
             assert!(driver.interrupt_plan().is_none(), "{slug}");
             continue;
         }

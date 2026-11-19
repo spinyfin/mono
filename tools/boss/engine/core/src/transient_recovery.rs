@@ -31,12 +31,15 @@
 //! execution is old enough ([`RECOVERY_GRACE_SECS`]):
 //!
 //!   1. Read the worker's transcript tail — the authoritative signal.
-//!      [`crate::transient_error::extract_worker_error`] returns the
-//!      halting API-error text **only if it is the last meaningful
-//!      entry** (if the worker did any work after the error it
-//!      recovered on its own and we leave it alone). We never trust the
-//!      `Idle` hook alone — it can't distinguish "finished cleanly" from
-//!      "wedged on an error."
+//!      The execution's driver normalises the native dialect and
+//!      [`crate::driver::AgentDriver::extract_error_from_transcript`]
+//!      returns the halting API-error text **only if it is the last
+//!      meaningful entry** (if the worker did any work after the error it
+//!      recovered on its own and we leave it alone). Drivers that do not
+//!      recognise a halting error (Codex, Grok) return `None` even when
+//!      normalised assistant prose would match the shared extractor.
+//!      We never trust the `Idle` hook alone — it can't distinguish
+//!      "finished cleanly" from "wedged on an error."
 //!   2. Classify the error through the resolved driver's
 //!      [`crate::driver::AgentDriver::classify_error`] and apply
 //!      the bounded-retry policy
@@ -490,7 +493,8 @@ async fn process_state(
         outcome.no_error_skipped += 1;
         return;
     };
-    let lines = read_transcript_tail(&transcript_path, TRANSCRIPT_TAIL_MAX_BYTES).await;
+    let inspection = inspect_normalized_transcript_tail(work_db, &execution_id, &transcript_path).await;
+    let lines = inspection.lines;
     let prior_attempts = execution.transient_failure_count.max(0) as u32;
 
     // Two shapes of "this worker is stalled" are worth acting on:
@@ -511,7 +515,7 @@ async fn process_state(
     //     the common short delay, but a resume chain deserves this
     //     extra check even past grace because leaving it silently
     //     parked is exactly the bug this closes.
-    let (error_text, class, stall_reason) = match extract_worker_error(&lines) {
+    let (error_text, class, stall_reason) = match inspection.trailing_error {
         Some(text) => {
             // Route through the resolved driver's ControlVerbs
             // classifier — never call a provider-specific helper
@@ -836,10 +840,57 @@ fn classify_error_for_execution(work_db: &WorkDb, execution_id: &str, text: &str
     }
 }
 
+/// Bounded transcript tail after the execution's driver has reshaped it,
+/// plus the trailing error that driver reports (if any).
+pub(crate) struct NormalizedTranscriptInspection {
+    pub lines: Vec<Value>,
+    pub trailing_error: Option<String>,
+}
+
+/// Read the bounded transcript tail, reshape it through the execution's
+/// driver (`transcript_session()` when the driver correlates rows across a
+/// tail, else the per-row `normalize_transcript_entry`), and obtain any
+/// trailing error through [`AgentDriver::extract_error_from_transcript`].
+/// A driver whose native rows differ from Claude's (agy's `ERROR_MESSAGE`)
+/// is otherwise invisible to the shared extractors. Codex and Grok
+/// explicitly return `None` from the extractor, so ordinary normalised
+/// prose beginning "API Error" does not become a recovery signal. An
+/// unresolvable driver leaves the rows as read and falls back to
+/// [`extract_worker_error`].
+pub(crate) async fn inspect_normalized_transcript_tail(
+    work_db: &WorkDb,
+    execution_id: &str,
+    path: &str,
+) -> NormalizedTranscriptInspection {
+    let lines = read_transcript_tail(path, TRANSCRIPT_TAIL_MAX_BYTES).await;
+    let driver = match work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => DriverRegistry::default().get(&slug).cloned(),
+        _ => None,
+    };
+    let Some(driver) = driver else {
+        return NormalizedTranscriptInspection {
+            trailing_error: extract_worker_error(&lines),
+            lines,
+        };
+    };
+    let lines: Vec<Value> = match driver.transcript_session() {
+        Some(mut session) => lines
+            .into_iter()
+            .map(|raw| session.normalize_transcript_entry(raw))
+            .collect(),
+        None => lines
+            .into_iter()
+            .map(|raw| driver.normalize_transcript_entry(raw))
+            .collect(),
+    };
+    let trailing_error = driver.extract_error_from_transcript(&lines);
+    NormalizedTranscriptInspection { lines, trailing_error }
+}
+
 fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {
     match class {
-        WorkerErrorClass::Transient => ErrorClass::Transient,
-        WorkerErrorClass::Permanent => ErrorClass::Permanent,
+        WorkerErrorClass::Transient | WorkerErrorClass::EligibilityServiceFailure => ErrorClass::Transient,
+        WorkerErrorClass::Permanent | WorkerErrorClass::QuotaExhausted => ErrorClass::Permanent,
         WorkerErrorClass::Indeterminate => ErrorClass::Indeterminate,
     }
 }
@@ -1101,6 +1152,10 @@ fn clip(s: &str, max_bytes: usize) -> String {
     let one_line = s.trim().replace('\n', " ");
     boss_engine_utils::string_clip::clip_to_bytes(&one_line, max_bytes)
 }
+
+#[cfg(test)]
+#[path = "transient_recovery_agy_tests.rs"]
+mod agy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2601,4 +2656,10 @@ mod tests {
              instead of re-polling it — proof the arm cannot busy-spin",
         );
     }
+
+    #[path = "transient_recovery_agy_sweep_tests.rs"]
+    mod agy_sweep_tests;
+
+    #[path = "transient_recovery_driver_extract_tests.rs"]
+    mod driver_extract_tests;
 }

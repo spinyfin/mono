@@ -952,10 +952,10 @@ fn resolve_connection_driver(
 /// — the eventual subscriber's own check no-ops on a false positive.
 ///
 /// - [`Event::TransientErrorIdle`]: published on the driver's turn
-///   boundary when the transcript's last meaningful entry is a trailing
-///   API error — the same ground truth [`crate::transient_recovery`]'s
-///   sweep already trusts, just checked immediately instead of waiting
-///   for the next 60s pass.
+///   boundary when that driver's extractor reports a trailing API error
+///   on the normalised transcript — the same ground truth
+///   [`crate::transient_recovery`]'s sweep already trusts, just checked
+///   immediately instead of waiting for the next 60s pass.
 /// - [`Event::AnswerAgentDied`]: published on `SessionEnd`, the only
 ///   hook that fires when a worker's session terminates. This does not
 ///   cover a hard pane kill (no hook fires at all in that case) — that
@@ -963,7 +963,7 @@ fn resolve_connection_driver(
 ///   `stranded_answering_sweep`'s DB-driven backstop, unchanged.
 ///   `SessionEnd` is a process boundary, not a turn boundary, so it stays
 ///   an event-shape match.
-pub async fn publish_hook_derived_events(bus: &EventBus, incoming: &IncomingHookEvent) {
+pub async fn publish_hook_derived_events(bus: &EventBus, work_db: &WorkDb, incoming: &IncomingHookEvent) {
     let Some(execution_id) = incoming.run_id.clone() else {
         return;
     };
@@ -971,12 +971,10 @@ pub async fn publish_hook_derived_events(bus: &EventBus, incoming: &IncomingHook
         let Some(transcript_path) = incoming.transcript_path.as_deref() else {
             return;
         };
-        let lines = crate::transient_recovery::read_transcript_tail(
-            transcript_path,
-            crate::transient_recovery::TRANSCRIPT_TAIL_MAX_BYTES,
-        )
-        .await;
-        if crate::transient_error::extract_worker_error(&lines).is_some() {
+        let inspection =
+            crate::transient_recovery::inspect_normalized_transcript_tail(work_db, &execution_id, transcript_path)
+                .await;
+        if inspection.trailing_error.is_some() {
             bus.publish(Event::TransientErrorIdle { execution_id });
         }
         return;
@@ -2623,7 +2621,12 @@ mod tests {
         let bus = EventBus::new();
         let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
 
-        publish_hook_derived_events(&bus, &incoming_stop("exec-1", Some(&transcript))).await;
+        publish_hook_derived_events(
+            &bus,
+            &crate::test_support::open_db().1,
+            &incoming_stop("exec-1", Some(&transcript)),
+        )
+        .await;
 
         let event = sub.recv().await.expect("event published");
         assert_eq!(
@@ -2641,7 +2644,12 @@ mod tests {
         let bus = EventBus::new();
         let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
 
-        publish_hook_derived_events(&bus, &incoming_stop("exec-1", Some(&transcript))).await;
+        publish_hook_derived_events(
+            &bus,
+            &crate::test_support::open_db().1,
+            &incoming_stop("exec-1", Some(&transcript)),
+        )
+        .await;
 
         // Publish an unrelated event so the assertion below can distinguish
         // "nothing published" from "recv would hang forever".
@@ -2659,7 +2667,7 @@ mod tests {
         let bus = EventBus::new();
         let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
 
-        publish_hook_derived_events(&bus, &incoming_stop("exec-1", None)).await;
+        publish_hook_derived_events(&bus, &crate::test_support::open_db().1, &incoming_stop("exec-1", None)).await;
 
         bus.publish(Event::DispatchReady);
         let event = sub.recv().await.expect("the sentinel event should still arrive");
@@ -2679,7 +2687,7 @@ mod tests {
             None,
         );
 
-        publish_hook_derived_events(&bus, &incoming).await;
+        publish_hook_derived_events(&bus, &crate::test_support::open_db().1, &incoming).await;
 
         let event = sub.recv().await.expect("event published");
         assert_eq!(
@@ -2703,7 +2711,7 @@ mod tests {
             None,
         );
 
-        publish_hook_derived_events(&bus, &incoming).await;
+        publish_hook_derived_events(&bus, &crate::test_support::open_db().1, &incoming).await;
 
         bus.publish(Event::DispatchReady);
         let event = sub.recv().await.expect("the sentinel event should still arrive");
@@ -2766,7 +2774,7 @@ mod tests {
         );
         assert!(!incoming.is_turn_boundary());
 
-        publish_hook_derived_events(&bus, &incoming).await;
+        publish_hook_derived_events(&bus, &crate::test_support::open_db().1, &incoming).await;
 
         bus.publish(Event::DispatchReady);
         let event = sub.recv().await.expect("the sentinel event should still arrive");

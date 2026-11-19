@@ -10,9 +10,9 @@
 //! pane command (`pane_command`) with its `PaneMonitorSpec`. The pane runs
 //! the shared initial-brief launcher, which withholds the brief until the
 //! CLI's startup log shows the rendered posture and the guard hooks loaded.
-//! `launch_ready` stays false until the control verbs (interrupt, probe,
-//! reap) land; the pane command itself is live for explicit pins. Retention
-//! preserves transcript evidence in the per-run HOME.
+//! Measured pane controls are live for explicit pins; `launch_ready` stays
+//! false during the pinned-only rollout. Retention preserves transcript
+//! evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
 //! were not measured on 1.5.5 (permission / shared-HOME studies,
@@ -35,6 +35,7 @@ use super::{
     ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass,
 };
 
+mod classify_error;
 mod environment;
 mod home;
 mod hooks;
@@ -118,9 +119,9 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// Registered under the `"agy"` slug. Declares the v1 capability set from
 /// the Antigravity driver design. Per-run `HOME` provisioning, permission
 /// rendering, PreToolUse authorization, hook progress observation, transcript
-/// access, and the interactive pane command are live. `launch_ready` stays
-/// false until the control verbs land, so unpinned traffic never reaches this
-/// driver. Retention preserves per-run transcript evidence.
+/// access, pane controls, and the interactive pane command are live.
+/// `launch_ready` stays false for the pinned-only rollout, so unpinned traffic
+/// never reaches this driver. Retention preserves per-run transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -625,22 +626,43 @@ impl AgentDriver for AgyDriver {
         boss_engine_transient_error::extract_worker_error(lines)
     }
 
-    fn classify_error(&self, _raw_output: &str) -> WorkerErrorClass {
-        WorkerErrorClass::Indeterminate
+    fn classify_error(&self, raw_output: &str) -> WorkerErrorClass {
+        classify_error::classify_agy_error(raw_output)
     }
 
+    // All typed delivery uses the engine's blocking-dialog guard and Enter
+    // submit key; a probe must never answer an approval or trust dialog.
     fn probe(&self) -> super::ProbeDelivery {
         super::ProbeDelivery::PaneText
     }
 
     fn interrupt(&self) -> InterruptDelivery {
-        InterruptDelivery::Unsupported
+        InterruptDelivery::PaneEsc
     }
 
-    // Recovery is implemented below, but control verbs stay unsupported
-    // until the startup contract makes this driver launch-ready.
+    // Pane study Q5: one Escape cancels in 0.3–0.9 s, without a Stop hook.
+    // Wait for the private log observer (including its settle fallback),
+    // never infer completion merely from having sent the key.
     fn interrupt_plan(&self) -> Option<InterruptPlan> {
-        None
+        Some(InterruptPlan {
+            gesture: super::InterruptGesture {
+                key: "Escape",
+                presses: 1,
+                press_interval: std::time::Duration::ZERO,
+            },
+            confirm_window: turn_end_recovery::SETTLE_WINDOW,
+            max_attempts: 2,
+            turn_end_evidence: super::TurnEndEvidence::RecoveryObserver,
+        })
+    }
+
+    fn stop(&self) -> super::StopDelivery {
+        // Pane study Q8: /quit exits with status 0.
+        super::StopDelivery::PaneCommand { command: "/quit" }
+    }
+
+    fn reap(&self) -> super::ReapDelivery {
+        super::ReapDelivery::ProcessGroup
     }
 
     fn prepare_interrupt_recovery(
@@ -664,8 +686,8 @@ impl AgentDriver for AgyDriver {
     }
 
     fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
-        // Pane viability study Q5: mid-turn stdin is buffered as the next
-        // prompt. Override the safe Rejects default with that measurement.
+        // Pane viability study Q6: queued input runs at the next Stop, even
+        // fullyIdle=false. Provisioning pins queuedMessages to queue.
         MidTurnPaneInput::Buffers
     }
 
@@ -1090,10 +1112,21 @@ mod tests {
     }
 
     #[test]
-    fn interrupts_remain_unsupported_until_launch_is_ready() {
+    fn measured_controls_are_available_to_pinned_workers() {
         let driver = AgyDriver::default();
-        assert_eq!(driver.interrupt(), InterruptDelivery::Unsupported);
-        assert!(driver.interrupt_plan().is_none());
+        assert_eq!(driver.probe(), super::super::ProbeDelivery::PaneText);
+        assert_eq!(driver.interrupt(), InterruptDelivery::PaneEsc);
+        let plan = driver.interrupt_plan().unwrap();
+        assert_eq!(plan.gesture.key, "Escape");
+        assert_eq!(plan.gesture.presses, 1);
+        assert_eq!(plan.max_attempts, 2);
+        assert_eq!(plan.confirm_window, turn_end_recovery::SETTLE_WINDOW);
+        assert_eq!(plan.turn_end_evidence, super::super::TurnEndEvidence::RecoveryObserver);
+        assert_eq!(
+            driver.stop(),
+            super::super::StopDelivery::PaneCommand { command: "/quit" }
+        );
+        assert_eq!(driver.reap(), super::super::ReapDelivery::ProcessGroup);
         assert!(!driver.launch_ready());
     }
 

@@ -827,7 +827,13 @@ pub enum WorkerErrorClass {
     Transient,
     /// Non-retryable — retrying would reproduce the failure.
     Permanent,
-    /// Recognised as an error but not confidently bucketed; treat as Permanent.
+    /// Account/model quota is exhausted. Escalate without automatic retry;
+    /// another worker on the same entitlement would hit the same limit.
+    QuotaExhausted,
+    /// Vendor eligibility lookup failed at the service (rather than denying
+    /// entitlement). Uses bounded transient recovery, distinct from auth.
+    EligibilityServiceFailure,
+    /// Recognised as an error but not confidently bucketed; use bounded recovery.
     Indeterminate,
 }
 
