@@ -171,7 +171,7 @@ impl WorkDb {
     pub fn mark_operator_forced_admission(&self, work_item_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        mark_operator_forced_admission_in_tx(&tx, work_item_id)?;
+        let _ = mark_operator_forced_admission_in_tx(&tx, work_item_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -247,7 +247,9 @@ pub(super) fn conflict_revision_awaits_mismatch_answer(conn: &Connection, revisi
     )?)
 }
 
-pub(crate) fn mark_operator_forced_admission_in_tx(tx: &Transaction<'_>, work_item_id: &str) -> Result<()> {
+/// Flag the newest non-terminal execution of `work_item_id` as
+/// operator-forced. Returns whether a row was marked.
+pub(crate) fn mark_operator_forced_admission_in_tx(tx: &Transaction<'_>, work_item_id: &str) -> Result<bool> {
     let id: Option<String> = tx
         .query_row(
             &format!(
@@ -260,13 +262,14 @@ pub(crate) fn mark_operator_forced_admission_in_tx(tx: &Transaction<'_>, work_it
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(id) = id {
-        tx.execute(
-            "UPDATE work_executions SET operator_forced_admission = 1 WHERE id = ?1",
-            [&id],
-        )?;
-    }
-    Ok(())
+    let Some(id) = id else {
+        return Ok(false);
+    };
+    tx.execute(
+        "UPDATE work_executions SET operator_forced_admission = 1 WHERE id = ?1",
+        [&id],
+    )?;
+    Ok(true)
 }
 
 /// The question to ask for the attempt this execution's conflict revision
@@ -416,7 +419,7 @@ pub(super) fn answer_in_tx(
                 super::pr_flow::restart_after_answer_from(pending, tx, asker, question, &block, restart, attribution)?
                     .minted;
             if !suppress_start {
-                mark_operator_forced_admission_in_tx(tx, &asker.id)?;
+                let _ = mark_operator_forced_admission_in_tx(tx, &asker.id)?;
             }
             Ok(AnswerEffect {
                 touched: vec![asker.id.clone()],
@@ -465,7 +468,7 @@ pub(super) fn answer_in_tx(
                 params![attempt_id, port.id],
             )?;
             if !suppress_start {
-                mark_operator_forced_admission_in_tx(tx, &port.id)?;
+                let _ = mark_operator_forced_admission_in_tx(tx, &port.id)?;
             }
             Ok(AnswerEffect {
                 touched: vec![asker.id.clone(), port.id.clone()],

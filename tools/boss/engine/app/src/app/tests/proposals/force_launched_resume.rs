@@ -267,7 +267,7 @@ async fn answering_a_normally_dispatched_runs_question_still_waits_behind_the_pa
 }
 
 #[tokio::test]
-async fn unpaused_answer_uses_normal_dispatch() {
+async fn unpaused_force_launched_answer_takes_operator_forced_admission() {
     let (state, _dir, asking, task_id, runner) = force_launched_question().await;
     state
         .execution_coordinator
@@ -570,4 +570,33 @@ async fn declining_a_normally_dispatched_runs_question_still_waits_behind_the_pa
     }
     assert!(held, "the pause must hold the resume after a No answer");
     assert!(!state.work_db.execution_force_launched(&resume_id).unwrap());
+}
+
+#[tokio::test]
+async fn suppressed_start_keeps_lineage_without_operator_forced_admission() {
+    let (state, _dir, asking, task_id, _runner) = force_launched_question().await;
+    let outcome = state
+        .work_db
+        .answer_operator_question_from(
+            &task_id,
+            boss_protocol::OperatorAnswer::YesNo { value: true },
+            &boss_work_db::GhPrStateChecker,
+            boss_protocol::LAST_STATUS_ACTOR_HUMAN,
+            None,
+            true,
+        )
+        .unwrap();
+    let resume = resume_execution(&state, &task_id, &asking);
+    assert!(
+        state.work_db.execution_force_launched(&resume.id).unwrap(),
+        "the queued continuation inherits force-launch lineage"
+    );
+    assert!(
+        !state
+            .work_db
+            .execution_has_operator_forced_admission(&resume.id)
+            .unwrap(),
+        "a suppressed start must not bypass the pause"
+    );
+    assert!(outcome.dispatch_work_item_id.is_none());
 }

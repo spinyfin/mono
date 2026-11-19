@@ -450,7 +450,14 @@ pub(crate) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result
 /// Copy force-launch lineage onto the latest continuation of `task_id`.
 /// When start is not suppressed, persist operator-forced admission so the
 /// drain can admit it through an operator pause, and report the task for
-/// `launch_answered_work`.
+/// `launch_answered_work`; returns `None` when no continuation exists to mark.
+///
+/// This is deliberately lineage-driven, not hold-driven: a run admitted by an
+/// operator force launch keeps operator-forced standing through every
+/// answered-question resume, the same as `bossctl agents launch`, whether or
+/// not a pause is active when the answer arrives. That way the resume cannot
+/// be stranded by a pause or focus change between answer and drain. The
+/// hard pool cap and the writer/preflight/predecessor-lease holds still apply.
 pub(super) fn inherit_force_launch_continuation(
     tx: &rusqlite::Transaction<'_>,
     task_id: &str,
@@ -468,7 +475,9 @@ pub(super) fn inherit_force_launch_continuation(
     if suppress_start {
         return Ok(None);
     }
-    super::conflict_mismatch::mark_operator_forced_admission_in_tx(tx, task_id)?;
+    if !super::conflict_mismatch::mark_operator_forced_admission_in_tx(tx, task_id)? {
+        return Ok(None);
+    }
     Ok(Some(task_id.to_string()))
 }
 
