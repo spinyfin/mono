@@ -289,7 +289,7 @@ async fn answered_sweeps_keep_probe_history_and_lookup_work_bounded() {
 
 #[tokio::test]
 async fn full_outbox_refuses_stop_and_does_not_pin_an_unsent_lease() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     fx.ready("other");
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -398,7 +398,7 @@ fn no_stop(_: &Command) -> Option<CommandResult> {
 
 #[tokio::test]
 async fn an_interrupted_spawn_the_host_then_reports_absent_no_longer_blocks_release() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let _peer = fx
@@ -424,7 +424,7 @@ async fn an_interrupted_spawn_the_host_then_reports_absent_no_longer_blocks_rele
 
 #[tokio::test]
 async fn an_adopted_alive_worker_keeps_the_lease_until_its_session_is_gone() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let exited = Arc::new(AtomicBool::new(false));
@@ -564,7 +564,7 @@ async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_re
 
 #[tokio::test]
 async fn a_launched_worker_whose_stop_is_not_confirmed_is_settled_uncertain() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
