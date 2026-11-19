@@ -304,6 +304,18 @@ pub(super) fn all() -> Vec<Migration> {
             apply: progression_candidates::migrate_execution_provenance,
         },
         Migration {
+            id: "20261118_1200_execution_force_launched".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "force_launched")? {
+                    conn.execute_batch(
+                        "ALTER TABLE work_executions ADD COLUMN force_launched INTEGER NOT NULL DEFAULT 0",
+                    )?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261118_0258_execution_launch_failed".into(),
             legacy_version: None,
             apply: |conn| {
@@ -538,4 +550,86 @@ pub(super) fn all() -> Vec<Migration> {
         },
     ]);
     migrations
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn force_launch_migration_preserves_existing_admissions() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_executions (id TEXT PRIMARY KEY); INSERT INTO work_executions VALUES ('existing')",
+        )
+        .unwrap();
+        let migration = super::all()
+            .into_iter()
+            .find(|migration| migration.id == "20261118_1200_execution_force_launched")
+            .unwrap();
+        assert_eq!(migration.legacy_version, None);
+        (migration.apply)(&conn).unwrap();
+        let flag = || {
+            conn.query_row(
+                "SELECT force_launched FROM work_executions WHERE id = 'existing'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(flag(), 0, "existing admissions must remain ordinary");
+        conn.execute(
+            "UPDATE work_executions SET force_launched = 1 WHERE id = 'existing'",
+            [],
+        )
+        .unwrap();
+        (migration.apply)(&conn).unwrap();
+        assert_eq!(flag(), 1, "a restored stamp must survive migration replay");
+        conn.execute("INSERT INTO work_executions (id) VALUES ('new')", [])
+            .unwrap();
+        let new_flag: i64 = conn
+            .query_row(
+                "SELECT force_launched FROM work_executions WHERE id = 'new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_flag, 0, "new admissions default to ordinary dispatch");
+    }
+
+    #[test]
+    fn force_launch_migration_upgrades_a_current_database_without_the_column() {
+        let (dir, db) = crate::test_support::open_db();
+        let path = db.path().to_path_buf();
+        {
+            let conn = db.connect().unwrap();
+            assert!(
+                super::super::table_has_column(&conn, "work_executions", "force_launched").unwrap(),
+                "the current fixture already includes force_launched"
+            );
+            conn.execute_batch(
+                "ALTER TABLE work_executions DROP COLUMN force_launched;
+                 DELETE FROM schema_migrations WHERE id = '20261118_1200_execution_force_launched';",
+            )
+            .unwrap();
+            assert!(
+                !super::super::table_has_column(&conn, "work_executions", "force_launched").unwrap(),
+                "the upgrade fixture must start from main's schema without force_launched"
+            );
+        }
+        drop(db);
+        let upgraded = crate::WorkDb::open(path).unwrap();
+        let conn = upgraded.connect().unwrap();
+        assert!(
+            super::super::table_has_column(&conn, "work_executions", "force_launched").unwrap(),
+            "opening a current database that never received force_launched must add the column"
+        );
+        let applied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE id = '20261118_1200_execution_force_launched'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1, "the upgrade must record the named migration");
+        drop(dir);
+    }
 }

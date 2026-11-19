@@ -749,3 +749,33 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
         "the refusal banner must survive the sweep while allocation is still refused"
     );
 }
+
+/// An operator force launch (`bossctl agents launch`) is recorded durably on
+/// the execution; a pause-only override is a different intent and is not.
+#[tokio::test]
+async fn operator_force_launch_is_recorded_on_the_execution() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Force launched");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    assert!(!db.execution_force_launched(&execution.id).unwrap());
+
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        Arc::new(FakeCubeClient::default()),
+        Arc::new(FakeExecutionRunner::default()),
+    ));
+    coordinator.pause_dispatch(
+        1_700_000_000,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("test: investigating worker failures").unwrap(),
+    );
+    coordinator
+        .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
+        .await
+        .expect("an operator force launch bypasses the pause");
+    assert!(db.execution_force_launched(&execution.id).unwrap());
+}

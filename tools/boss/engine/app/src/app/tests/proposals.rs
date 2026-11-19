@@ -235,6 +235,7 @@ The repo owner recorded this answer. It is explicit, human-granted approval for 
 
 mod chore_questions;
 mod dismissal;
+mod force_launched_resume;
 mod multiple_choice;
 mod prerequisites;
 
