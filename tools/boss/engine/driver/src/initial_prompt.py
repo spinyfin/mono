@@ -296,21 +296,25 @@ def _is_later_composer(line):
     return bool(row) and (PROMPT_MARK in row or row.startswith(b">"))
 
 
-# Every row of Antigravity's two footer-less startup menus: the folder-trust
-# dialog and the `Settings Error` screen. The cursor can rest on any of them
-# (a human arrow key), so the guard must hold for each selection.
+# Every row of Antigravity's footer-less startup menus: the folder-trust
+# dialog, the `Settings Error` screen, and the sign-in menu (numbered, no
+# `esc to cancel`; Return on the default row starts Google OAuth). The
+# cursor can rest on any of them (a human arrow key), so the guard must
+# hold for each selection.
 SELECTION_MENUS = (
     (b"Yes, I trust this folder", b"No, exit"),
     (b"Exit and fix manually", b"Continue with defaults this session",
      b"Overwrite the file with defaults"),
+    (b"1. Google OAuth", b"2. Use a Google Cloud project"),
 )
 
 
 def _selection_menu_marker(lines, markers):
-    # Antigravity's trust dialog and `Settings Error` screen have no
-    # `esc to cancel` footer and no numbered choices: the answer is the
-    # `>`-marked row among unnumbered ones, last on screen. A transcript copy
-    # is followed by the real composer, so the last marker row is not a choice.
+    # Antigravity's trust dialog, `Settings Error` screen, and sign-in menu
+    # have no `esc to cancel` footer. Trust and Settings Error also have no
+    # numbered choices; the sign-in menu is numbered. The answer is the
+    # `>`-marked row, last on screen. A transcript copy is followed by the
+    # real composer, so the last marker row is not a choice.
     lines = list(lines)
     while lines and not lines[-1].strip():
         lines.pop()

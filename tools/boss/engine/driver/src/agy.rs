@@ -223,8 +223,8 @@ impl AgentDriver for AgyDriver {
             // answers it: a pasted message plus Return approved a pending
             // command, and typed text starting with `3` saved a global
             // always-allow rule (permission study, section 8). The first four
-            // are the approval dialogs, the last two are blocking startup
-            // screens.
+            // are the approval dialogs; the rest are blocking startup screens,
+            // including the sign-in menu whose default choice is Google OAuth.
             blocking_dialog_markers: vec![
                 "Run this command?".into(),
                 "Allow creation of this file?".into(),
@@ -232,6 +232,7 @@ impl AgentDriver for AgyDriver {
                 "Allow access to this file?".into(),
                 "Do you trust the contents of this project?".into(),
                 "Settings Error".into(),
+                "Select login method:".into(),
             ],
         })
     }
@@ -323,6 +324,11 @@ impl AgentDriver for AgyDriver {
         if !process_home.exists() {
             return refuse_agy_plan(env, "agy spawn refused: per-run HOME is not provisioned");
         }
+        // Last check of the private settings, and it runs before the pane CLI
+        // starts. A start drops default-valued keys; a retry re-provisions
+        // first, so this is never a second plan against a home the CLI has
+        // already started in. After launch the session mode comes from
+        // `--settings`, which the CLI never writes back.
         if let Err(error) =
             home::assert_agy_posture(&process_home, workspace_stamp.as_deref().unwrap_or(Path::new(".")))
         {
@@ -1314,6 +1320,9 @@ mod tests {
 
         // The pin itself is not relaxed: a start after provisioning (the pane
         // launch is one) leaves a file that the same checks still refuse.
+        // spawn_invocation is the last of those checks and runs before the
+        // pane CLI starts; a second plan against that rewritten home, without
+        // re-provisioning, is refused the same way.
         let mut started: serde_json::Value = private.clone();
         started.as_object_mut().unwrap().remove("queuedMessages");
         fs::write(&settings, serde_json::to_string_pretty(&started).unwrap()).unwrap();
@@ -1322,6 +1331,10 @@ mod tests {
             format!("{error:#}").contains("must pin queuedMessages to queue (found no queuedMessages key"),
             "{error:#}"
         );
+        let refused = driver.spawn_invocation(spawn_request("gemini-4-carbon-high", None, Some(run_id)));
+        assert!(refused.command.starts_with("printf"), "{}", refused.command);
+        assert!(refused.command.contains("private HOME posture"), "{}", refused.command);
+        assert!(!refused.command.contains("initial-prompt.py"), "{}", refused.command);
     }
 
     #[tokio::test]
@@ -1782,6 +1795,7 @@ mod tests {
             "Allow access to this file?",
             "Do you trust the contents of this project?",
             "Settings Error",
+            "Select login method:",
         ] {
             assert!(spec.blocking_dialog_markers.iter().any(|m| m == dialog), "{dialog}");
         }

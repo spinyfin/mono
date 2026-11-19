@@ -520,6 +520,12 @@ fn write_private_cli_settings(process_home: &Path, workspace: &Path) -> anyhow::
 /// Put the private CLI settings back after an `agy` start in this home, and
 /// check the posture of the home as the pane launch will find it.
 ///
+/// Provisioning ends here so the returned home holds the settings Boss
+/// rendered rather than what the CLI wrote back during the probe. The posture
+/// is asserted on that final state. The private tree is validated first so
+/// nothing the CLI created is written through. Changed keys are logged by
+/// name.
+///
 /// An `agy` start rewrites `settings.json` while it loads its settings: it
 /// parses the file, serialises it again in its own sparse form, and writes the
 /// result back when the bytes differ. The sparse form leaves out every key
@@ -532,17 +538,11 @@ fn write_private_cli_settings(process_home: &Path, workspace: &Path) -> anyhow::
 /// bytes on disk and calls `WriteCliSettings`; `models` is dispatched after
 /// `NewManager` returns.
 ///
-/// Provisioning used to assert the posture before the probe only. The home it
-/// returned was then the one the CLI had rewritten, and the next posture check
-/// (startup verification in `write_permission_config`) refused every
-/// provisioned run. The file is rendered again here so the launch reads what
-/// Boss rendered, whatever the CLI left, and the posture is asserted on that
-/// final state. The private tree is validated first, so nothing the CLI
-/// created is written through. What the CLI changed is logged by key name.
-///
 /// The pane launch is a start too, so the pin is gone again once the worker is
-/// running. Nothing checks this file after the launch; the mode a session runs
-/// in comes from `--settings`, which the CLI never writes back.
+/// running. [`super::AgyDriver::spawn_invocation`] is the last posture check
+/// of this file, and it runs before the CLI starts in the pane. A retry
+/// re-provisions first. After that start, the mode a session runs in comes
+/// from `--settings`, which the CLI never writes back.
 fn restore_private_cli_settings_after_cli_start(process_home: &Path, workspace: &Path) -> anyhow::Result<()> {
     validate_private_layout(process_home)?;
     let path = private_cli_settings_path(process_home);

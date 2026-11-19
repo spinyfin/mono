@@ -96,7 +96,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": "Do you trust the contents of this project?"
@@ -107,7 +108,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": "Settings Error"
@@ -118,7 +120,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": null
@@ -129,7 +132,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": null
@@ -140,7 +144,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": "Do you trust the contents of this project?"
@@ -151,7 +156,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": "Settings Error"
@@ -162,7 +168,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": "Settings Error"
@@ -173,7 +180,8 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": null
@@ -184,7 +192,68 @@
     "markers": [
       "Run this command?",
       "Do you trust the contents of this project?",
-      "Settings Error"
+      "Settings Error",
+      "Select login method:"
+    ],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "agy sign-in menu",
+    "screen": "Welcome to the Antigravity CLI. You are currently not signed in.\nSelect login method:\n> 1. Google OAuth\n  2. Use a Google Cloud project\n  ↑/↓ Navigate · enter Select",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error",
+      "Select login method:"
+    ],
+    "payload": "",
+    "expected_marker": "Select login method:"
+  },
+  {
+    "name": "agy sign-in menu with Google Cloud project selected",
+    "screen": "Welcome to the Antigravity CLI. You are currently not signed in.\nSelect login method:\n  1. Google OAuth\n> 2. Use a Google Cloud project\n  ↑/↓ Navigate · enter Select",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error",
+      "Select login method:"
+    ],
+    "payload": "",
+    "expected_marker": "Select login method:"
+  },
+  {
+    "name": "agy sign-in menu 1.1.12",
+    "screen": "Welcome to the Antigravity CLI. You are currently not signed in.\nSelect login method:\n> 1. Google OAuth\n  2. Use a Google Cloud project\n[Use arrow keys to navigate, Enter to select]",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error",
+      "Select login method:"
+    ],
+    "payload": "",
+    "expected_marker": "Select login method:"
+  },
+  {
+    "name": "agy sign-in menu quoted in transcript",
+    "screen": "Welcome to the Antigravity CLI. You are currently not signed in.\nSelect login method:\n> 1. Google OAuth\n  2. Use a Google Cloud project\n  ↑/↓ Navigate · enter Select\n\n> \n  ? for shortcuts",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error",
+      "Select login method:"
+    ],
+    "payload": "",
+    "expected_marker": null
+  },
+  {
+    "name": "agy sign-in menu with Google Cloud project selected quoted in transcript",
+    "screen": "Welcome to the Antigravity CLI. You are currently not signed in.\nSelect login method:\n  1. Google OAuth\n> 2. Use a Google Cloud project\n  ↑/↓ Navigate · enter Select\n\n> \n  ? for shortcuts",
+    "markers": [
+      "Run this command?",
+      "Do you trust the contents of this project?",
+      "Settings Error",
+      "Select login method:"
     ],
     "payload": "",
     "expected_marker": null

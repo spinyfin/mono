@@ -99,16 +99,19 @@ fn dialog_contains(visible: &str, marker: &str) -> bool {
 
 /// The selected row of Antigravity's startup menus. Its trust dialog and its
 /// `Settings Error` screen carry no `esc to cancel` footer and no numbered
-/// choices; the answer is the `>`-marked row among unnumbered ones.
-/// The cursor can rest on any row (a human arrow key), so every row of each
-/// menu's full option set is a blocking selection.
-const SELECTION_MENUS: [&[&str]; 2] = [
+/// choices; the answer is the `>`-marked row among unnumbered ones. The
+/// sign-in menu is numbered and also has no `esc to cancel` footer; Return
+/// on its default row starts Google OAuth. The cursor can rest on any row
+/// (a human arrow key), so every row of each menu's full option set is a
+/// blocking selection.
+const SELECTION_MENUS: [&[&str]; 3] = [
     &["Yes, I trust this folder", "No, exit"],
     &[
         "Exit and fix manually",
         "Continue with defaults this session",
         "Overwrite the file with defaults",
     ],
+    &["1. Google OAuth", "2. Use a Google Cloud project"],
 ];
 
 fn selection_menu_contains(visible: &str, marker: &str) -> bool {

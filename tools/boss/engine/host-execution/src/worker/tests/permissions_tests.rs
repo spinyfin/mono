@@ -120,3 +120,39 @@ async fn wait_for_brief_fails_closed_on_a_mismatched_settings_line() {
     );
     assert!(fake.sent.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn agy_sign_in_menu_rejects_text_and_return_without_sending() {
+    const SCREEN: &str = "Welcome to the Antigravity CLI. You are currently not signed in.\n\
+Select login method:\n\
+> 1. Google OAuth\n\
+  2. Use a Google Cloud project\n\
+  ↑/↓ Navigate · enter Select";
+    for kind in [DeliveryKind::Nudge, DeliveryKind::Interrupt] {
+        let root = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::default());
+        *fake.visible.lock().unwrap() = SCREEN.into();
+        live(&fake);
+        let supervisor = supervisor(root.path(), fake.clone()).await;
+        seed(&supervisor.store, Phase::Alive);
+        let (state, matching) = agy_state(root.path());
+        std::fs::write(&state.log_file, matching).unwrap();
+        update(&supervisor.store, |record| {
+            record.driver_id = "agy".into();
+            record.runtime_state = Some(state.to_driver_runtime_state());
+        });
+        let result = supervisor
+            .execute(&deliver_command("sign-in", kind, "injected"), false, 1)
+            .await;
+        assert_eq!(result.code, ResultCode::Rejected as i32, "{kind:?}: {}", result.reason);
+        assert_eq!(
+            result.reason,
+            boss_tmux::BlockingDialogOnScreen::delivery_attempt_reason(&boss_tmux::BlockingDialogOnScreen {
+                marker: "Select login method:".into(),
+            }),
+            "{kind:?}: {}",
+            result.reason
+        );
+        assert!(fake.sent.lock().unwrap().is_empty(), "{kind:?}");
+    }
+}

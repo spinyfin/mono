@@ -414,7 +414,10 @@ assert os.read(0, 1) == b'\r'
 
 /// A CLI that finds no credential in the run's home stops on its sign-in menu,
 /// where Return selects `Google OAuth` and opens a browser. The relay must
-/// write nothing to that screen and must fail the delivery naming it.
+/// write nothing to that screen and must fail the delivery naming it. Closed
+/// stdin still exercises the same write-time blocking-dialog check that
+/// forwards later pane input; text and Return against this layout are the
+/// shared fixture corpus (`launcher_refuses_every_selected_startup_menu_row`).
 #[test]
 fn relay_sends_nothing_to_the_sign_in_menu() {
     let root = tempfile::tempdir().unwrap();
@@ -477,11 +480,9 @@ for mode in ("menu", "composer"):
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let read = |name: &str| fs::read(root.path().join(name)).unwrap();
 
-    assert_eq!(
-        String::from_utf8(read("outcome-menu")).unwrap(),
-        "TimeoutError: driver did not become ready for initial brief within 2s; it was still showing \
-         'You are currently not signed in'"
-    );
+    let outcome = String::from_utf8(read("outcome-menu")).unwrap();
+    assert!(outcome.starts_with("BlockingDialogOnScreen:"), "{outcome}");
+    assert!(outcome.contains("Select login method:"), "{outcome}");
     assert_eq!(read("received-menu"), b"", "nothing may be typed into the sign-in menu");
     // The same stub without the menu is given the brief and Return, so the
     // menu is what held delivery back.
