@@ -287,7 +287,8 @@ pub fn write_restricted_claude_settings(
 }
 
 /// Assemble the full `extra_args` the spawn flow must append: `--sandbox`,
-/// one `--deny` per structural rule, then `--permission-mode` if forced.
+/// one `--deny` per structural rule, then `--allow` / `--deny` pairs for a
+/// deny-by-default kind, then `--permission-mode` if forced.
 /// Order matches [`crate::apply_permission_extra_args`]'s flag/value pairing
 /// (every entry immediately followed by its value).
 ///
@@ -312,34 +313,59 @@ pub fn extra_args(
         args.push("--deny".to_owned());
         args.push(rule);
     }
-    if worker_kind == WorkerKind::ReviewGuide {
-        for rule in crate::codex::review_guide_allow_rules() {
-            args.extend(["--allow".into(), rule]);
-        }
-    }
-    // The progression agent gets the same capability table Claude renders into
-    // its settings: deny-by-default, the allowlist is the whole set of
-    // actions it can take, and the deny belt (every write, `jj`/`git`,
-    // `cube`, mutating `gh`) sits on top. This is what confines it on local
-    // macOS, where Grok runs with `--sandbox off` like every other local kind.
-    // Of the two spellings each `boss` rule comes in, only the bare `boss`
-    // one ever matches under Grok; the `"$BOSS_BIN"` form is inert here and
-    // `hooks::VARIABLE_BOSS_PROGRAM_GUARD_COMMAND` redirects a worker off it.
-    if worker_kind == WorkerKind::Progression {
-        for rule in crate::capability_rules::progression_deny_rules() {
-            if !args.windows(2).any(|pair| pair[0] == "--deny" && pair[1] == rule) {
-                args.extend(["--deny".into(), rule]);
-            }
-        }
-        for rule in crate::capability_rules::progression_allow_rules() {
-            args.extend(["--allow".into(), rule]);
-        }
-    }
+    // Every kind the engine forces to `dontAsk` must carry its submit verb as
+    // a Grok-admissible `--allow` (bare `boss`, never `"$BOSS_BIN"`). Grok
+    // ignores `SpawnRequest.settings_path`, so the Claude settings allowlist
+    // never reaches it. Of the two spellings each shared `boss` rule comes
+    // in, only the bare one ever matches; `hooks::VARIABLE_BOSS_PROGRAM_GUARD_COMMAND`
+    // is a belt that redirects a worker off the inert form.
+    push_restricted_kind_rules(&mut args, worker_kind);
     if let Some(mode) = permission_mode_for_worker_kind(worker_kind) {
         args.push("--permission-mode".to_owned());
         args.push(mode.to_owned());
     }
+    debug_assert!(
+        grok_admissible_submit_allow_rule(worker_kind)
+            .is_none_or(|rule| args.windows(2).any(|pair| pair == ["--allow", rule])),
+        "a deny-by-default Grok launch must --allow the kind's bare-boss submit verb"
+    );
     args
+}
+
+/// Extra `--deny` / `--allow` pairs for a deny-by-default kind. Empty for
+/// kinds that run under always-approve.
+fn push_restricted_kind_rules(args: &mut Vec<String>, worker_kind: WorkerKind) {
+    let (denies, allows): (Vec<String>, Vec<String>) = match worker_kind {
+        WorkerKind::AnswerAgent => (
+            crate::capability_rules::answer_agent_deny_rules(),
+            crate::capability_rules::answer_agent_allow_rules(),
+        ),
+        WorkerKind::ReviewGuide => (Vec::new(), crate::codex::review_guide_allow_rules()),
+        WorkerKind::Progression => (
+            crate::capability_rules::progression_deny_rules(),
+            crate::capability_rules::progression_allow_rules(),
+        ),
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => return,
+    };
+    for rule in denies {
+        if !args.windows(2).any(|pair| pair[0] == "--deny" && pair[1] == rule) {
+            args.extend(["--deny".into(), rule]);
+        }
+    }
+    for rule in allows {
+        args.extend(["--allow".into(), rule]);
+    }
+}
+
+/// The `--allow` rule that admits this kind's submit verb in the bare `boss`
+/// spelling Grok can match. `None` for kinds that are not deny-by-default.
+pub fn grok_admissible_submit_allow_rule(worker_kind: WorkerKind) -> Option<&'static str> {
+    match worker_kind {
+        WorkerKind::AnswerAgent => Some("Bash(boss comment reply:*)"),
+        WorkerKind::ReviewGuide => Some("Bash(boss propose review-guide:*)"),
+        WorkerKind::Progression => Some("Bash(boss propose:*)"),
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
+    }
 }
 
 #[cfg(test)]
@@ -609,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn extra_args_orders_sandbox_then_deny_pairs_then_permission_mode() {
+    fn extra_args_orders_sandbox_then_deny_pairs_then_allow_pairs_then_permission_mode() {
         let dir = PathBuf::from("/boss-data");
         let workspace = PathBuf::from("/ws");
         let args = extra_args(WorkerKind::AnswerAgent, Some(&dir), &workspace, false);
@@ -622,13 +648,52 @@ mod tests {
                 "boss-workspace"
             }
         );
-        // Every --deny is immediately followed by its rule value.
+        // Every --deny / --allow is immediately followed by its rule value.
         let mut i = 2;
         while args[i] == "--deny" {
             assert!(i + 1 < args.len());
             i += 2;
         }
+        while args[i] == "--allow" {
+            assert!(i + 1 < args.len());
+            i += 2;
+        }
         assert_eq!(&args[i..], ["--permission-mode", "dontAsk"]);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--allow", "Bash(boss comment reply:*)"]),
+            "answer agent submit verb must be Grok-admissible: {args:?}"
+        );
+        for rule in crate::capability_rules::answer_agent_deny_rules() {
+            assert!(
+                args.windows(2).any(|pair| pair == ["--deny", &rule]),
+                "answer agent deny belt missing {rule}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_deny_by_default_kind_admits_its_submit_verb_as_bare_boss() {
+        for kind in [
+            WorkerKind::AnswerAgent,
+            WorkerKind::ReviewGuide,
+            WorkerKind::Progression,
+        ] {
+            assert_eq!(permission_mode_for_worker_kind(kind), Some("dontAsk"));
+            let settings = render_restricted_claude_settings(kind).expect("dontAsk settings");
+            assert!(settings.contains("dontAsk"), "{kind:?}: {settings}");
+            let args = extra_args(kind, None, Path::new("/ws"), false);
+            let submit = grok_admissible_submit_allow_rule(kind).expect("a restricted kind has a submit verb");
+            assert!(
+                args.windows(2).any(|pair| pair == ["--allow", submit]),
+                "{kind:?}: merged Grok launch must --allow {submit}: {args:?}"
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+        }
+        for kind in [WorkerKind::Standard, WorkerKind::Reviewer, WorkerKind::Triage] {
+            assert_eq!(grok_admissible_submit_allow_rule(kind), None);
+            assert_eq!(permission_mode_for_worker_kind(kind), None);
+        }
     }
 
     #[test]

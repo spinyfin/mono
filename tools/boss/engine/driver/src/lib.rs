@@ -2721,6 +2721,15 @@ pub mod capability_rules {
         ]
     }
 
+    /// Defense-in-depth deny belt for [`crate::WorkerKind::AnswerAgent`].
+    ///
+    /// The primary enforcement is the `dontAsk` allowlist
+    /// ([`answer_agent_allow_rules`]); deny always wins over allow. Same body
+    /// as other read-only workers: no file writes, no publish verbs, no `cube`.
+    pub fn answer_agent_deny_rules() -> Vec<String> {
+        read_only_worker_deny_rules()
+    }
+
     /// The `permissions.allow` allowlist for `WorkerKind::Progression`.
     ///
     /// Under the forced `dontAsk` mode this is the ENTIRE set of non-read-only

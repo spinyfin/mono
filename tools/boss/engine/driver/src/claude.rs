@@ -1409,7 +1409,7 @@ mod review_guide_recognizer_tests {
                 "\"$BOSS_BIN\" propose review-guide --body '# Guide\nswift run\n$(literal)\n'",
                 true,
             ),
-            ("boss propose review-guide --body 'guide'", false),
+            ("boss propose review-guide --body 'guide'", true),
             (r#"$BOSS_BIN propose review-guide --body 'guide'"#, false),
             (r#""$BOSS_BIN" propose review-guide --body "$(cat secret)""#, false),
             (r#""$BOSS_BIN" propose review-guide --body 'x'; touch /tmp/x"#, false),

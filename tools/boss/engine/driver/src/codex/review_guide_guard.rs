@@ -27,6 +27,10 @@ pub fn review_guide_allow_rules() -> Vec<String> {
         "Bash(sed -n:*)".to_owned(),
         r#"Bash("$BOSS_BIN" propose review-guide:*)"#.to_owned(),
         r#"Bash("${BOSS_BIN}" propose review-guide:*)"#.to_owned(),
+        // Grok cannot match a rule whose program is a shell variable, so the
+        // deny-by-default launch also admits the bare PATH spelling the
+        // variable-program guard redirects to.
+        "Bash(boss propose review-guide:*)".to_owned(),
     ]
 }
 
@@ -103,7 +107,7 @@ macro_rules! render_review_guide_guard {
     if not match:
         return None
     prefix=match.group(1)
-    prefixes=(dq+dl+'BOSS_BIN'+dq+' propose review-guide',dq+dl+'{BOSS_BIN}'+dq+' propose review-guide')
+    prefixes=(dq+dl+'BOSS_BIN'+dq+' propose review-guide',dq+dl+'{BOSS_BIN}'+dq+' propose review-guide','boss propose review-guide')
     if prefix not in prefixes:
         return None
     return prefix+' --body '+q+'literal'+q
@@ -176,12 +180,12 @@ mod tests {
             "\"$BOSS_BIN\" propose review-guide --body '# Guide\n## Problem\nA `code` example: $(literal).\nswift run\nboss engine start\nbazel run //tools/boss/engine/core:engine\n'",
             "\"$BOSS_BIN\" propose review-guide --body 'author'\"'\"'s guide'",
             "\"$BOSS_BIN\" propose review-guide --body 'author'\\''s guide'",
+            "boss propose review-guide --body 'guide'",
         ] {
             let payload = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}});
             assert_eq!(decide(payload).0, "approve", "{command}");
         }
         for command in [
-            "boss propose review-guide --body 'guide'",
             "\"$BOSS_BIN\" propose review-guide --body \"$(cat secret)\"",
             "\"$BOSS_BIN\" propose review-guide --body 'x'; touch /tmp/x",
             "\"$BOSS_BIN\" propose review-guide --body 'x' > /tmp/x",

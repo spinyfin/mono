@@ -90,8 +90,19 @@ In a session without always-approve the notification means the dialog is on the 
 ## What changed
 
 - **Launch.** The restricted kinds (answer agent, review guide, progression) are launched without `--always-approve`, with `permissions.defaultMode = "dontAsk"` written to `.claude/settings.json` under the run's scoped process `HOME`, and with `--permission-mode dontAsk` kept on the command line for the reason in point 3. The scoped `HOME` is engine-owned and per run; provisioning clears its `.claude` directory and the posture check already exempts it from the "operator settings leaked" refusal.
-- **Spelling.** A `PreToolUse` guard is armed for those kinds that refuses a `$BOSS_BIN` command with the bare spelling to use. It refuses only what the permission rules were about to refuse.
-- **Detection.** A restricted worker whose driver reports an approval prompt, followed by no event at all for two minutes, is failed with the reason and its pane and slot are released. This is the state the wedge was, and the one a future Grok change to any of the above would bring back. It applies only to kinds launched without always-approve, because of the previous section. Two minutes is the margin against acting on a prompt that was answered: the only automatic answer measured takes 0.02 s, and a restricted session has none.
+- **Spelling.** Restricted Grok kinds are taught the bare `boss` spelling. Their `--allow` table admits that kind's submit verb as `Bash(boss …:*)`. The launch guard that would refuse a PATH `boss` is dropped for those kinds. A `PreToolUse` belt still refuses a command that contains `$BOSS_BIN` or `${BOSS_BIN}` anywhere and names the bare spelling to use.
+- **Detection.** A restricted worker whose driver reports an approval prompt that is still outstanding two minutes later is failed with the reason and its pane and slot are released, even if recording the failure write itself fails. An unrelated later event (Grok's `task_complete` Notification) does not clear the watch. This is the state the wedge was, and the one a future Grok change to any of the above would bring back. It applies only to kinds launched without always-approve, because of the previous section. Two minutes is the margin against acting on a prompt that was answered: the only automatic answer measured takes 0.02 s, and a restricted session has none.
+
+## Why `progression.run_timeout` did not reap the 80-minute runs
+
+The in-memory unanswered-prompt watch is lost on an engine restart. The documented fallback was `progression.run_timeout` (30 minutes). Those four runs were still holding slots at 1h22m, so that fallback did not fire.
+
+Two independent skip conditions in the stale-worker sweep explain it:
+
+1. **Spawning skip.** After a restart, adopted panes start as `Spawning`. Grok does not declare `AwaitingInputSignal`, so a restricted run left on an approval prompt never leaves `Spawning`. The sweep skipped every `Spawning` slot _before_ it reached the progression-timeout branch.
+2. **`started_at` missing.** `reap_timed_out_progression` returned without acting when `execution.started_epoch()` was `None`. A re-adopted row can be in that state; `created_at` is then the only wall-clock the timeout can use.
+
+The sweep now evaluates the progression timeout regardless of activity, and uses `created_at` when `started_at` is unset. The two-minute watch remains the live-process path; the timeout is the restart bound.
 
 `grok inspect --json` does not report the effective mode (`permissions.sources` is empty for a settings file that carries only `defaultMode`), so there is nothing to assert before the pane starts. The detection above is the check.
 

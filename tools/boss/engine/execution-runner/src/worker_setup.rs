@@ -122,8 +122,39 @@ pub struct WorkerSetupInput {
 /// AnswerAgent, and ReviewGuide workers cannot file `--question` /
 /// `--explanation` flags, and the generic composer's pointer to this
 /// section is gated on the same predicate.
+///
+/// The CLI spelling this driver and kind are taught. Restricted Grok kinds
+/// name `boss`; every other combination names `"$BOSS_BIN"`.
+pub fn worker_boss_invocation(driver_name: &str, worker_kind: &WorkerKind) -> &'static str {
+    if driver_name == "grok" && worker_kind.forced_permission_mode().is_some() {
+        "boss"
+    } else {
+        boss_engine_worker_bin::WORKER_BOSS_INVOCATION
+    }
+}
+
+/// Render the worker-facing agent-rules file. Restricted Grok kinds should
+/// call [`render_claude_md_with_invocation`] with [`worker_boss_invocation`]
+/// so they are taught the bare `boss` spelling Grok can allowlist.
 pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
-    let mut rules = render_worker_rules_body(input, preamble, config_dir);
+    render_claude_md_with_invocation(
+        input,
+        preamble,
+        config_dir,
+        boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
+    )
+}
+
+/// Same as [`render_claude_md`], with an explicit Boss CLI spelling.
+/// Restricted Grok kinds pass `boss`; every other spawn passes
+/// [`boss_engine_worker_bin::WORKER_BOSS_INVOCATION`].
+pub fn render_claude_md_with_invocation(
+    input: &WorkerSetupInput,
+    preamble: &str,
+    config_dir: &str,
+    boss: &str,
+) -> String {
+    let mut rules = render_worker_rules_body(input, preamble, config_dir, boss);
     if input.worker_kind == WorkerKind::Standard {
         rules.push_str(ci_failure::GUIDANCE);
     }
@@ -134,7 +165,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
     rules
 }
 
-fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir: &str) -> String {
+fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir: &str, boss: &str) -> String {
     if input.worker_kind == WorkerKind::Reviewer && input.is_review_supervisor {
         return crate::pr_review::render_supervisor_claude_md(
             &input.lease_id,
@@ -175,12 +206,11 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
     if input.worker_kind == WorkerKind::Progression {
         return crate::progression_agent::render_progression_claude_md(
             &input.workspace_path.display().to_string(),
-            boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
+            boss,
         );
     }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
-    let boss = boss_engine_worker_bin::WORKER_BOSS_INVOCATION;
     let cube = boss_engine_worker_bin::WORKER_CUBE_INVOCATION;
     let draft_directive = if input.draft_pr_mode {
         format!(

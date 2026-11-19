@@ -48,6 +48,19 @@ fn approval_prompt(run: &str, ingress_seq: u64) -> IncomingHookEvent {
     IncomingHookEvent::resolve(grok.as_ref(), event, Some(run.to_owned()), None, None).with_ingress_seq(ingress_seq)
 }
 
+fn task_complete(run: &str, ingress_seq: u64) -> IncomingHookEvent {
+    let grok = driver("grok");
+    let event = grok
+        .normalize_progress_event(&serde_json::json!({
+            "hookEventName": "notification",
+            "sessionId": SESSION,
+            "notificationType": "task_complete",
+            "message": "Background task completed: abc",
+        }))
+        .unwrap();
+    IncomingHookEvent::resolve(grok.as_ref(), event, Some(run.to_owned()), None, None).with_ingress_seq(ingress_seq)
+}
+
 fn tool_finished(run: &str, ingress_seq: u64) -> IncomingHookEvent {
     IncomingHookEvent::resolve(
         driver("grok").as_ref(),
@@ -134,16 +147,18 @@ async fn a_progression_run_left_on_an_approval_prompt_is_failed_with_the_reason_
     );
 }
 
-/// Any event after the prompt means it was answered: the run is left alone.
+/// A dialog-closing event (PostToolUse) means the prompt was answered.
 #[tokio::test]
-async fn a_prompt_followed_by_any_worker_event_is_not_a_failure() {
+async fn a_prompt_followed_by_a_dialog_closing_event_is_not_a_failure() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
 
     let prompt = approval_prompt(&run, 7);
     dispatch_live_worker_state(&state, &prompt).await;
     let (_, mark) = state.approval_prompt_to_watch(&prompt).unwrap();
-    dispatch_live_worker_state(&state, &tool_finished(&run, 8)).await;
+    let finished = tool_finished(&run, 8);
+    dispatch_live_worker_state(&state, &finished).await;
+    state.watch_approval_prompt(&finished);
 
     assert!(
         !state
@@ -152,6 +167,77 @@ async fn a_prompt_followed_by_any_worker_event_is_not_a_failure() {
     );
     assert!(!state.work_db.get_execution(&run).unwrap().status.is_terminal());
     assert_eq!(state.worker_registry.slot_for_run(&run), Some(SLOT));
+}
+
+/// A failed failure-write still releases the pane and slot. A transient DB
+/// error at the grace deadline must not recreate the silent hold.
+#[tokio::test]
+async fn a_failed_failure_write_still_releases_the_pane_and_slot() {
+    let (state, _dir) = test_server_state();
+    // No tmux identity: `release_worker_pane` cannot reap a session, so the
+    // in-memory slot drop after a failed failure-write is what this covers.
+    let run = register_working_worker_with_driver(&state, SLOT, Some("grok"));
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute("UPDATE work_executions SET kind = 'progression' WHERE id = ?1", [&run])
+        .unwrap();
+
+    let prompt = approval_prompt(&run, 7);
+    dispatch_live_worker_state(&state, &prompt).await;
+    let (_, mark) = state.approval_prompt_to_watch(&prompt).unwrap();
+
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("PRAGMA query_only = ON;")
+        .unwrap();
+
+    assert!(
+        state
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .await,
+        "the watch still acts when the failure write itself fails"
+    );
+    assert!(
+        !state.work_db.get_execution(&run).unwrap().status.is_terminal(),
+        "query_only blocked the durable failure write"
+    );
+    assert!(
+        state.worker_registry.slot_for_run(&run).is_none(),
+        "the slot is released even when the failure write fails"
+    );
+}
+
+/// Grok's background `task_complete` is an ordinary Notification. It must
+/// not disarm the watch: the dialog is still on the pane.
+#[tokio::test]
+async fn a_prompt_followed_by_task_complete_still_fails_after_the_grace() {
+    let (state, _dir) = test_server_state();
+    let run = working_run(&state, "grok", true);
+
+    let prompt = approval_prompt(&run, 7);
+    dispatch_live_worker_state(&state, &prompt).await;
+    let (_, mark) = state.approval_prompt_to_watch(&prompt).unwrap();
+    let complete = task_complete(&run, 8);
+    dispatch_live_worker_state(&state, &complete).await;
+    state.watch_approval_prompt(&complete);
+
+    assert!(
+        state
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .await
+    );
+    assert_eq!(
+        state.work_db.get_execution(&run).unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert!(
+        state.worker_registry.slot_for_run(&run).is_none(),
+        "the slot is released"
+    );
 }
 
 /// A prompt whose answer was applied before the prompt itself reached the

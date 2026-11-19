@@ -800,6 +800,9 @@ struct ServerState {
     /// abandoned at their time budget; cleared by the next pass that finishes.
     #[builder(default = boss_engine_merge_poller::detection_stall_signal())]
     merge_detection_stall: Arc<boss_engine_merge_poller::DetectionStallSignal>,
+    /// Deny-by-default runs whose last approval prompt has not closed.
+    #[builder(default)]
+    outstanding_approval_prompts: StdMutex<HashMap<String, approval_prompt::OutstandingApprovalPrompt>>,
     /// What the startup pass that retries pre-start-failed review guides
     /// did. Set once, before the engine serves requests; empty until then.
     #[builder(default)]
