@@ -85,6 +85,20 @@ pub(super) fn approve_in_tx(
         answered_at,
         now,
     } = approval;
+    if let Some(owner) = prerequisite_link::explicit_owner(conn, task, &question.answer_type)? {
+        return approve_existing_in_tx(
+            pending,
+            conn,
+            task,
+            ExistingApproval {
+                question,
+                existing_id: &owner.id,
+                answered_at,
+                now,
+            },
+            attribution,
+        );
+    }
     let (prerequisite, created) = match find_equivalent_open_task(conn, task, name)? {
         Some(existing) => (existing, false),
         None => {
@@ -172,6 +186,12 @@ pub(super) fn approve_existing_in_tx(
     }
     if matches!(prerequisite.status, TaskStatus::Done | TaskStatus::Archived) {
         bail!("the named task is already finished");
+    }
+    if let Some(owner) = prerequisite_link::explicit_owner(conn, task, &question.answer_type)? {
+        anyhow::ensure!(
+            owner.id == existing_id,
+            "the pull request owner changed since the question was asked"
+        );
     }
     if prerequisite.id == task.id {
         bail!("a task cannot wait on itself");

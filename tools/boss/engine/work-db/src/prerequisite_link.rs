@@ -25,9 +25,13 @@ pub(crate) fn resolve_stored_question(
 ) -> Result<ResolvedQuestion> {
     let Some(asking) = asking else {
         return Ok(match &question.answer_type {
-            OperatorAnswerType::LinkPrerequisiteTask { .. } => {
-                ResolvedQuestion::Rejected("a link question can only be asked from a task".into())
+            OperatorAnswerType::LinkPrerequisiteTask { .. }
+            | OperatorAnswerType::CreatePrerequisiteTask {
+                existing_pr: Some(_), ..
             }
+            | OperatorAnswerType::CreatePrerequisiteTask {
+                existing_id: Some(_), ..
+            } => ResolvedQuestion::Rejected("a link question can only be asked from a task".into()),
             _ => ResolvedQuestion::Ready(question.clone()),
         });
     };
@@ -62,9 +66,16 @@ pub(crate) fn resolve_stored_question(
                 None
             };
             let pr = existing_pr.as_deref().or(scanned.as_deref());
-            match resolve_existing(conn, asking, existing_id.as_deref(), pr, false)? {
+            let required = existing_id.is_some() || existing_pr.is_some();
+            match resolve_existing(conn, asking, existing_id.as_deref(), pr, required)? {
                 Ok(existing) => Ok(ResolvedQuestion::Ready(link_question(question, &existing))),
-                Err(ExistingError::Missing(_)) => Ok(ResolvedQuestion::Ready(question.clone())),
+                Err(ExistingError::Missing(reason)) => {
+                    if required {
+                        Ok(ResolvedQuestion::Rejected(reason))
+                    } else {
+                        Ok(ResolvedQuestion::Ready(question.clone()))
+                    }
+                }
                 Err(ExistingError::Invalid(reason)) => {
                     let reason = match scanned.as_deref() {
                         Some(url) => format!(
@@ -78,6 +89,23 @@ pub(crate) fn resolve_stored_question(
             }
         }
         _ => Ok(ResolvedQuestion::Ready(question.clone())),
+    }
+}
+
+/// Recheck explicit references in the answer transaction without falling back
+/// to name-based creation when an owner disappears.
+pub(super) fn explicit_owner(
+    conn: &Connection,
+    asking: &Task,
+    answer_type: &OperatorAnswerType,
+) -> Result<Option<Task>> {
+    let (id, pr) = answer_type.existing_prerequisite_refs();
+    if id.is_none() && pr.is_none() {
+        return Ok(None);
+    }
+    match resolve_existing(conn, asking, id, pr, true)? {
+        Ok(owner) => Ok(Some(owner)),
+        Err(err) => bail!(err.reason()),
     }
 }
 
