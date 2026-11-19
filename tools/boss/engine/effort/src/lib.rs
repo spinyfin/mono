@@ -199,6 +199,8 @@ pub enum ModelResolutionSource {
     TaskOverride,
     DesignInvestigationTier,
     PoolStrongTier,
+    /// The cheap standard tier requested by [`PoolModelTier::Standard`].
+    PoolStandardTier,
     Reasoning,
     LegacyKindFloor,
     LegacyEffortTable,
@@ -214,6 +216,7 @@ impl ModelResolutionSource {
             Self::TaskOverride => "task_override",
             Self::DesignInvestigationTier => "design_investigation_tier",
             Self::PoolStrongTier => "pool_strong_tier",
+            Self::PoolStandardTier => "pool_standard_tier",
             Self::Reasoning => "reasoning",
             Self::LegacyKindFloor => "legacy_kind_floor",
             Self::LegacyEffortTable => "legacy_effort_table",
@@ -470,7 +473,10 @@ pub fn is_design_or_investigation_tier(kind: Option<&TaskKind>, reasoning: Optio
 ///    reviewer still lands on Opus and a Codex reviewer lands on Codex's own
 ///    strong-tier model, never on a literal `"opus"` a non-Claude CLI
 ///    rejects. Reviewer/automation agents get the strong tier regardless of
-///    the row's effort level. Pass `None` for main-pool executions.
+///    the row's effort level. [`PoolModelTier::Standard`] is the cheap
+///    counterpart (progression runs): `model_for_reasoning(Standard)` on the
+///    selected driver, never the design/investigation tier. Pass `None` for
+///    main-pool executions.
 /// 3. `tasks.reasoning` — the capability signal, from the selected driver's
 ///    [`boss_engine_driver::ModelMenu::model_for_reasoning`]. **This is the
 ///    lever that decides the model for every classified row**, and it does not
@@ -528,6 +534,12 @@ pub enum PoolModelTier {
     /// Both the automation pool and the review pool request this tier
     /// unconditionally.
     Strong,
+    /// The cheap standard tier for the resolved driver, reached via
+    /// [`boss_engine_driver::ModelMenu::model_for_reasoning`]`(`[`ReasoningMode::Standard`]`)`
+    /// (Sonnet on Claude). Progression runs request this unconditionally:
+    /// they are short triage that acts through restricted verbs, so their
+    /// model never follows the target row's reasoning, effort or pin.
+    Standard,
 }
 
 /// Inputs to [`resolve_spawn_config_in`], grouped into one type per the
@@ -599,6 +611,11 @@ pub fn resolve_spawn_config_in(
         (
             (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned(),
             ModelResolutionSource::PoolStrongTier,
+        )
+    } else if let Some(PoolModelTier::Standard) = input.pool_model_override {
+        (
+            (menu.model_for_reasoning)(ReasoningMode::Standard).to_owned(),
+            ModelResolutionSource::PoolStandardTier,
         )
     } else if tier_applies {
         let model = menu
@@ -1929,6 +1946,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn standard_pool_tier_is_the_cheap_tier_on_every_driver_whatever_the_row_says() {
+        // Progression asks for the standard tier. An investigation row at
+        // `large` effort, and a design row, would otherwise reach each
+        // driver's design/investigation tier (Fable on Claude).
+        let registry = DriverRegistry::default();
+        for slug in registry.slugs() {
+            let menu = registry.get(slug).unwrap().descriptor().model_menu;
+            let cheap = (menu.model_for_reasoning)(ReasoningMode::Standard);
+            for (kind, reasoning) in [
+                (TaskKind::Chore, ReasoningMode::Investigation),
+                (TaskKind::Design, ReasoningMode::Standard),
+                (TaskKind::Investigation, ReasoningMode::Investigation),
+            ] {
+                let cfg = resolve_spawn_config(
+                    &SpawnResolutionInput::builder()
+                        .task_driver(slug)
+                        .kind(&kind)
+                        .reasoning(reasoning)
+                        .effort_level(EffortLevel::Large)
+                        .pool_model_override(PoolModelTier::Standard)
+                        .build(),
+                )
+                .unwrap();
+                assert_eq!(cfg.driver, slug);
+                // Some drivers (agy) fold the effort level into the model slug as a
+                // suffix of the same model; the tier is what must match.
+                assert!(
+                    cfg.model.starts_with(cheap),
+                    "{slug} {kind:?} {reasoning:?}: {}",
+                    cfg.model
+                );
+                assert_eq!(cfg.model_source, ModelResolutionSource::PoolStandardTier);
+                assert!(!model_is_fable(&cfg.model));
+            }
+        }
+        let claude = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .task_driver("claude")
+                .reasoning(ReasoningMode::Investigation)
+                .effort_level(EffortLevel::Large)
+                .pool_model_override(PoolModelTier::Standard)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(claude.model, "sonnet");
     }
 
     #[test]

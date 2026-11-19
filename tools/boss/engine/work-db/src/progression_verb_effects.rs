@@ -82,6 +82,11 @@ pub(super) fn revise(
         .description(payload.brief.clone())
         .name(format!("Unstick: {}", truncated(&ctx.item.name)))
         .created_via(ctx.created_via.clone())
+        // Classified by its own shape, like the other engine-minted revisions:
+        // an unstick revision is a bounded fix, not investigation work, so it
+        // must not inherit `investigation` (and the Fable tier) from the
+        // chain root.
+        .reasoning(ReasoningMode::Standard)
         // The one-open-revision rule and the budget above are the duplicate guard.
         .force_duplicate(true)
         .build();

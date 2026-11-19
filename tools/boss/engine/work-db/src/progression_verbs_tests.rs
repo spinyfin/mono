@@ -241,6 +241,34 @@ fn revise_creates_a_progression_revision_on_the_items_open_pr() {
 }
 
 #[test]
+fn revise_on_an_investigation_chain_is_classified_standard_and_stays_off_fable() {
+    let fx = fx();
+    let item = fx.pr_item("Red investigation PR", "fail");
+    fx.sql(&format!(
+        "UPDATE tasks SET reasoning = 'investigation' WHERE id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, "S6_ci_failure");
+
+    let revision = fx.applied(&run, ProposalKind::Revise, json!({"brief": "Fix the failing check."}));
+
+    // The chain root keeps its own classification; only the revision is pinned.
+    assert_eq!(fx.task(&item).reasoning, Some(ReasoningMode::Investigation));
+    let task = fx.task(&revision);
+    assert_eq!(task.reasoning, Some(ReasoningMode::Standard));
+    let config = boss_engine_effort::resolve_spawn_config(
+        &boss_engine_effort::SpawnResolutionInput::builder()
+            .maybe_effort_level(task.effort_level)
+            .maybe_reasoning(task.reasoning)
+            .kind(&task.kind)
+            .task_driver("claude")
+            .build(),
+    )
+    .unwrap();
+    assert!(!boss_engine_effort::model_is_fable(&config.model), "{}", config.model);
+    assert_eq!(config.model, "sonnet");
+}
+
+#[test]
 fn revise_refuses_a_closed_pr_and_stores_nothing() {
     let mut fx = fx();
     let item = fx.pr_item("Closed PR", "fail");
