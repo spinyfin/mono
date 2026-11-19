@@ -97,7 +97,8 @@ pub(crate) use crate::driver::claude::{
 pub(crate) use crate::driver::ProgressObservationWiring;
 
 pub use boss_execution_runner::worker_setup::{
-    WorkerKind, WorkerSetupInput, render_claude_md, worker_kind_for_execution,
+    WorkerKind, WorkerSetupInput, render_claude_md, render_claude_md_with_invocation, worker_boss_invocation,
+    worker_kind_for_execution,
 };
 
 /// Whether the worker settings should install the engine-data-dir
@@ -1831,7 +1832,12 @@ pub fn write_workspace_files(
     let preamble = driver.agent_rules_preamble();
     std::fs::write(
         &agent_rules_path,
-        render_claude_md(input, preamble, descriptor.config_dir),
+        render_claude_md_with_invocation(
+            input,
+            preamble,
+            descriptor.config_dir,
+            worker_boss_invocation(descriptor.name, &input.worker_kind),
+        ),
     )?;
     std::fs::write(&gitignore_path, driver.config_dir_gitignore())?;
 

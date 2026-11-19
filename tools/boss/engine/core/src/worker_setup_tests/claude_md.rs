@@ -525,6 +525,51 @@ fn static_question_contract_lives_in_generated_rules() {
 }
 
 #[test]
+fn grok_restricted_kinds_are_taught_the_bare_boss_spelling() {
+    use super::super::worker_boss_invocation;
+    for kind in [
+        WorkerKind::AnswerAgent,
+        WorkerKind::ReviewGuide,
+        WorkerKind::Progression,
+    ] {
+        let mut input = sample_input();
+        input.worker_kind = kind.clone();
+        let rendered = render_claude_md_with_invocation(
+            &input,
+            ClaudeDriver.agent_rules_preamble(),
+            ClaudeDriver.descriptor().config_dir,
+            worker_boss_invocation("grok", &kind),
+        );
+        match kind {
+            WorkerKind::AnswerAgent => {
+                assert!(
+                    rendered.contains("boss comment reply"),
+                    "answer agent submit verb is already the bare spelling: {rendered}"
+                );
+            }
+            WorkerKind::ReviewGuide => {
+                assert!(
+                    rendered.contains("`boss "),
+                    "review guide must be taught bare boss: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("$BOSS_BIN"),
+                    "Grok review guide must not be taught $BOSS_BIN: {rendered}"
+                );
+            }
+            WorkerKind::Progression => {
+                assert!(rendered.contains("`boss propose`"), "{rendered}");
+                assert!(
+                    !rendered.contains("$BOSS_BIN"),
+                    "Grok progression must not be taught $BOSS_BIN: {rendered}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn question_contract_requires_standard_worker_and_enabled_channel() {
     for kind in [
         WorkerKind::Standard,

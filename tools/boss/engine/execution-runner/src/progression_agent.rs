@@ -159,4 +159,28 @@ mod tests {
         // The agent cannot write files, so briefs go inline.
         assert!(md.contains("pass text inline in single quotes"));
     }
+
+    #[test]
+    fn grok_restricted_kinds_are_taught_the_bare_boss_spelling() {
+        use crate::worker_setup::{WorkerKind, worker_boss_invocation};
+        for kind in [
+            WorkerKind::AnswerAgent,
+            WorkerKind::ReviewGuide,
+            WorkerKind::Progression,
+        ] {
+            assert_eq!(worker_boss_invocation("grok", &kind), "boss", "{kind:?}");
+            assert_eq!(
+                worker_boss_invocation("claude", &kind),
+                boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            worker_boss_invocation("grok", &WorkerKind::Standard),
+            boss_engine_worker_bin::WORKER_BOSS_INVOCATION
+        );
+        let md = render_progression_claude_md("/scratch/x", worker_boss_invocation("grok", &WorkerKind::Progression));
+        assert!(md.contains("`boss propose`"), "{md}");
+        assert!(!md.contains("$BOSS_BIN"), "{md}");
+    }
 }
