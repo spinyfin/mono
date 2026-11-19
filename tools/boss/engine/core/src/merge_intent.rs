@@ -500,12 +500,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_checks_dequeue_with_no_budget_ends_rather_than_waiting() {
+    async fn a_declined_ci_fix_ends_rather_than_waiting() {
         let f = fixture(APPROVED);
         let id = &f.candidate.work_item_id;
         f.db.set_ci_attempt_budget(id, Some(0)).unwrap();
         f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
         f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
+        f.db.decline_owed_merge_intent_ci_fix(id, PR, crate::work::MergeIntentCiFixDecline::BudgetExhausted)
+            .unwrap();
         f.settle().await;
         assert!(f.standing().is_none(), "nothing will mint a CI fix");
         assert_eq!(f.on_card().unwrap().status, MERGE_INTENT_NEEDS_REVIEW);
@@ -516,7 +518,8 @@ mod tests {
         let f = fixture(APPROVED);
         let id = &f.candidate.work_item_id;
         f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
-        // A PR-branch CI fix that ran and finished after the request.
+        // A PR-branch CI fix that ran and finished after the request, before the
+        // failed-checks dequeue that owes a second one.
         let earlier =
             f.db.insert_ci_remediation(
                 CiRemediationInsertInput::builder()
@@ -536,7 +539,15 @@ mod tests {
             .unwrap();
         f.db.mark_ci_remediation_abandoned(&earlier.id, "done").unwrap();
         f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
+        // Order: request < earlier attempt < fix owed since < now - 600.
         let conn = f.db.connect().unwrap();
+        conn.execute(
+            "UPDATE merge_intents
+             SET created_at = CAST(CAST(strftime('%s','now') AS INTEGER) - 2000 AS TEXT)
+             WHERE work_item_id = ?1 AND status = 'active'",
+            [id],
+        )
+        .unwrap();
         conn.execute(
             "UPDATE ci_remediations SET created_at = CAST(CAST(strftime('%s','now') AS INTEGER) - 1500 AS TEXT)",
             [],
@@ -549,6 +560,11 @@ mod tests {
             [id],
         )
         .unwrap();
+        drop(conn);
+        let standing = f.standing().unwrap();
+        let remediation = f.db.merge_intent_remediation(&standing).unwrap();
+        assert_eq!(remediation.ci_fixes, 1, "the earlier attempt postdates the request");
+        assert!(remediation.fix_owed, "no attempt was minted for the dequeue");
         f.settle().await;
         assert!(f.standing().is_none());
         assert_eq!(f.on_card().unwrap().status, MERGE_INTENT_NEEDS_REVIEW);

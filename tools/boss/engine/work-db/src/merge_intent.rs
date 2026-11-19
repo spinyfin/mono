@@ -419,105 +419,6 @@ fn episode_head_match_sql(table: &str, head: &str) -> String {
     )
 }
 
-/// Same identity as [`WorkDb::ci_remediation_exists_for_merge_queue_episode`]
-/// when only the PR head is known: `mq:<head>`, the raw head, or that head
-/// stored as the synthetic queue commit.
-fn merge_queue_episode_exists(conn: &Connection, work_item_id: &str, head_sha: &str) -> Result<bool> {
-    if head_sha.is_empty() {
-        return Ok(false);
-    }
-    Ok(conn.query_row(
-        &format!(
-            "SELECT EXISTS(
-             SELECT 1 FROM ci_remediations
-              WHERE work_item_id = ?1
-                AND failure_kind = 'merge_queue_rebounce'
-                AND {})",
-            episode_head_match_sql("ci_remediations", "?2")
-        ),
-        params![work_item_id, head_sha],
-        |row| row.get(0),
-    )?)
-}
-
-fn ci_failure_suppressed_for_head(conn: &Connection, work_item_id: &str, head_sha: &str) -> Result<bool> {
-    if head_sha.is_empty() {
-        return Ok(false);
-    }
-    Ok(conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM ci_failure_suppressions
-              WHERE work_item_id = ?1 AND head_sha = ?2
-         )",
-        params![work_item_id, head_sha],
-        |row| row.get(0),
-    )?)
-}
-
-fn effective_ci_budget_on(conn: &Connection, work_item_id: &str) -> Result<i64> {
-    let raw: Option<(Option<i64>, i64)> = conn
-        .query_row(
-            "SELECT t.ci_attempt_budget, COALESCE(p.ci_attempt_budget, 3)
-             FROM tasks t JOIN products p ON p.id = t.product_id
-             WHERE t.id = ?1",
-            [work_item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    Ok(raw
-        .map(|(per_pr, product)| per_pr.unwrap_or(product).clamp(0, 10))
-        .unwrap_or(3))
-}
-
-/// Whether a failed-checks dequeue will mint a CI fix, and the head to name
-/// if it will not.
-fn failed_checks_fix_will_not_run(
-    conn: &Connection,
-    work_item_id: &str,
-    intent: &MergeIntent,
-) -> Result<Option<(MergeIntentCiFixDecline, Option<String>)>> {
-    let (product_id, pr_head, used): (String, Option<String>, i64) = conn.query_row(
-        "SELECT product_id, NULLIF(pr_head_sha, ''), COALESCE(ci_attempts_used, 0)
-         FROM tasks WHERE id = ?1",
-        [work_item_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    let head = intent
-        .approved_head_sha
-        .as_deref()
-        .or(pr_head.as_deref())
-        .map(str::to_owned);
-    let maintenance_on: bool = conn
-        .query_row(
-            "SELECT COALESCE(auto_pr_maintenance_enabled, 1) != 0 FROM products WHERE id = ?1",
-            [&product_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(true);
-    if !maintenance_on {
-        return Ok(Some((MergeIntentCiFixDecline::MaintenanceDisabled, head)));
-    }
-    if used >= effective_ci_budget_on(conn, work_item_id)? {
-        return Ok(Some((MergeIntentCiFixDecline::BudgetExhausted, head)));
-    }
-    for candidate in [intent.approved_head_sha.as_deref(), pr_head.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        if ci_failure_suppressed_for_head(conn, work_item_id, candidate)? {
-            return Ok(Some((MergeIntentCiFixDecline::Suppressed, Some(candidate.to_owned()))));
-        }
-        if merge_queue_episode_exists(conn, work_item_id, candidate)? {
-            return Ok(Some((
-                MergeIntentCiFixDecline::EpisodeAlreadyHandled,
-                Some(candidate.to_owned()),
-            )));
-        }
-    }
-    Ok(None)
-}
-
 /// Whether the failed-checks fix this intent is owed is still unfulfilled,
 /// and how long the obligation has stood. Owed means the intent was stamped
 /// at a failed-checks dequeue and no CI attempt has been minted for it: none
@@ -660,16 +561,15 @@ impl WorkDb {
             return Ok(MergeQueueDeparture::NoIntent);
         };
         let departure = if queue_reason.eq_ignore_ascii_case("failed_checks") {
-            if let Some((why, head)) = failed_checks_fix_will_not_run(&tx, work_item_id, &intent)? {
-                end_by_id(&tx, &intent.id, &why.end(head))?;
-                MergeQueueDeparture::Ended
-            } else {
-                tx.execute(
-                    "UPDATE merge_intents SET fix_owed_since = ?2 WHERE id = ?1",
-                    params![intent.id, now_string()],
-                )?;
-                MergeQueueDeparture::Standing
-            }
+            // The rebounce producer decides whether a fix is minted, through
+            // the real maintenance, budget, suppression and episode gates, and
+            // ends the request when it declines. Here the engine only records
+            // that a fix is owed.
+            tx.execute(
+                "UPDATE merge_intents SET fix_owed_since = ?2 WHERE id = ?1",
+                params![intent.id, now_string()],
+            )?;
+            MergeQueueDeparture::Standing
         } else if queue_reason.eq_ignore_ascii_case("merge_conflict") {
             MergeQueueDeparture::Standing
         } else {
@@ -932,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_checks_dequeue_ends_when_automatic_maintenance_is_off() {
+    fn a_declined_fix_ends_the_request_when_automatic_maintenance_is_off() {
         let f = fixture();
         f.db.connect()
             .unwrap()
@@ -944,7 +844,11 @@ mod tests {
         let intent = f.request();
         assert_eq!(
             f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
-            MergeQueueDeparture::Ended
+            MergeQueueDeparture::Standing
+        );
+        assert!(
+            f.db.decline_owed_merge_intent_ci_fix(&f.task, PR, MergeIntentCiFixDecline::MaintenanceDisabled)
+                .unwrap()
         );
         let ended = f.stored(&intent.id);
         assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
@@ -957,13 +861,17 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_checks_dequeue_ends_when_the_ci_fix_budget_is_zero() {
+    fn a_declined_fix_ends_the_request_when_the_ci_fix_budget_is_spent() {
         let f = fixture();
         f.db.set_ci_attempt_budget(&f.task, Some(0)).unwrap();
         let intent = f.request();
         assert_eq!(
             f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
-            MergeQueueDeparture::Ended
+            MergeQueueDeparture::Standing
+        );
+        assert!(
+            f.db.decline_owed_merge_intent_ci_fix(&f.task, PR, MergeIntentCiFixDecline::BudgetExhausted)
+                .unwrap()
         );
         let ended = f.stored(&intent.id);
         assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
@@ -972,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_checks_dequeue_ends_when_the_same_head_already_had_a_ci_fix() {
+    fn a_declined_fix_ends_the_request_when_the_same_head_already_had_a_ci_fix() {
         let f = fixture();
         f.request();
         f.db.insert_ci_remediation(
@@ -992,12 +900,20 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute("UPDATE ci_remediations SET created_at = '1'", [])
+            .unwrap();
         // A new merge request of the same head, then the queue rejects it
         // again. Rebounce will not mint a second attempt for this episode.
         let second = f.db.record_merge_intent(&f.task, PR, Some("head-1")).unwrap();
         assert_eq!(
             f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
-            MergeQueueDeparture::Ended
+            MergeQueueDeparture::Standing
+        );
+        assert!(
+            f.db.decline_owed_merge_intent_ci_fix(&f.task, PR, MergeIntentCiFixDecline::EpisodeAlreadyHandled)
+                .unwrap()
         );
         let ended = f.stored(&second.id);
         assert_eq!(ended.status, MERGE_INTENT_NEEDS_REVIEW);
