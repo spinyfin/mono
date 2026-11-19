@@ -247,9 +247,14 @@ bazel() {
   shift
 
   local tmplog
-  tmplog=$(mktemp)
+  tmplog=$(mktemp "${TMPDIR:-/tmp}/bazel-log.XXXXXX")
 
-  if _ci_run_bazel "$tmplog" "$subcommand" "$@"; then
+  # bazel's exit status is captured explicitly: under the step scripts'
+  # `set -e -o pipefail` a bare failing call would end this function before the
+  # recovery below could run.
+  local rc=0
+  _ci_run_bazel "$tmplog" "$subcommand" "$@" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
     rm -f "$tmplog" "$tmplog.watchdog"
     return 0
   fi
@@ -264,10 +269,11 @@ bazel() {
   fi
 
   # "Lost inputs no longer available remotely" after Bazel's own restarts: the
-  # disk cache's action cache names blobs that exist nowhere, so every restart
-  # hits the same dangling entry. Remove those entries (only those) and run
-  # the command once more; the producing actions re-run and re-upload. See
-  # lost-inputs-repair.sh. Repeat only while a repair changed something.
+  # disk cache's action cache names blobs the remote cache no longer has, so
+  # every restart hits the same entry. Remove the entries naming lost blobs
+  # (only those) and run the command once more; the producing actions re-run
+  # and re-upload. See lost-inputs-repair.sh. Repeat only while a repair
+  # removed something; otherwise the original exit status is returned.
   if ci_repair_lost_inputs "$tmplog" "$CI_DISK_CACHE_DIR"; then
     echo "--- Lost inputs: pruned dangling disk-cache entries; retrying bazel $subcommand"
     rm -f "$tmplog" "$tmplog.watchdog"
@@ -289,7 +295,7 @@ bazel() {
 
   _ci_note_remote_failure "$tmplog"
   rm -f "$tmplog" "$tmplog.watchdog"
-  return 1
+  return "$rc"
 }
 
 # bazel_verify_only <build|test> <args...>

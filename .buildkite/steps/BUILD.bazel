@@ -2,6 +2,7 @@
 # themselves are run by Buildkite straight from the checkout, not by bazel.
 exports_files(
     [
+        "ci-env.sh",
         "disk-cache-gc-cap.sh",
         "lost-inputs-repair.sh",
         "remote-execution.sh",
