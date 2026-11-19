@@ -81,8 +81,9 @@ impl PassClock {
         timeout_at.saturating_duration_since(tokio::time::Instant::now()) <= self.budget / divisor
     }
 
-    /// Stop starting more work. `leave_open_walk_reserve` is true for the
-    /// open walk while later groups have not run this pass.
+    /// Stop starting more work. `leave_open_walk_reserve` is true for a
+    /// rotated group while a later group has still to run this pass; the
+    /// last group is bounded by the yield margin alone.
     fn should_yield(&self, leave_open_walk_reserve: bool) -> bool {
         (leave_open_walk_reserve && self.past_reserve(OPEN_WALK_RESERVE_DIVISOR)) || self.remaining().is_zero()
     }
@@ -98,6 +99,34 @@ enum LatePhase {
 /// Groups after the terminal walk. Terminal merge observation always runs
 /// first; these three rotate so a slow open walk or slow upkeep cannot
 /// starve recovery forever.
+/// The local upkeep subphases, in the order a pass with turn 0 runs them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum UpkeepPhase {
+    StrandedCi,
+    StrandedBlocked,
+    QueueRebounce,
+    StalledReviewer,
+    ReviewAdmission,
+    ReviewBatchUpkeep,
+}
+
+/// The upkeep subphases in the order the pass with `turn` runs them: the
+/// starting subphase advances every pass, so a slow early subphase cannot
+/// keep the later ones from running on every pass.
+pub(crate) fn upkeep_order(turn: u64) -> [UpkeepPhase; 6] {
+    let mut subphases = [
+        UpkeepPhase::StrandedCi,
+        UpkeepPhase::StrandedBlocked,
+        UpkeepPhase::QueueRebounce,
+        UpkeepPhase::StalledReviewer,
+        UpkeepPhase::ReviewAdmission,
+        UpkeepPhase::ReviewBatchUpkeep,
+    ];
+    let len = subphases.len() as u64;
+    subphases.rotate_left((turn % len) as usize);
+    subphases
+}
+
 #[derive(Clone, Copy)]
 enum PostTerminalGroup {
     OpenWalk,
@@ -176,7 +205,9 @@ impl ProbeSnapshot {
             "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
              before writing further state",
         );
-        self.results = probe.probe_batch(&urls).await;
+        // Merge rather than replace: entries for candidates already walked
+        // stay readable for the pass's adaptive-poll observations.
+        self.results.extend(probe.probe_batch(&urls).await);
         self.taken_at = tokio::time::Instant::now();
         self.refreshed_last_call = true;
         true
@@ -519,6 +550,14 @@ pub async fn run_one_pass_tracked(
         let mut rotations = state.rotations();
         rotations.walk.retain(&seen);
         rotations
+            .upkeep
+            .stranded_ci
+            .retain(&stranded_ci_attempts.iter().map(|a| a.work_item_id.as_str()).collect());
+        rotations
+            .upkeep
+            .stranded_blocked
+            .retain(&stranded_blocked.iter().map(|c| c.work_item_id.as_str()).collect());
+        rotations
             .recheck
             .retain(&pending_pr_recheck.iter().map(String::as_str).collect());
         rotations
@@ -649,15 +688,26 @@ pub async fn run_one_pass_tracked(
         .map(|handler| handler.review_batch_fanout_enabled())
         .unwrap_or(false);
 
-    for group in groups {
+    // Groups that still read the probe snapshot and have not started: a
+    // re-probe must cover them, or it would replace results they are about
+    // to use.
+    let mut open_walk_started = false;
+    let mut stranded_blocked_started = false;
+
+    for (position, group) in groups.into_iter().enumerate() {
+        // The reserve for later groups only matters while one follows.
+        let reserve = position + 1 < groups.len();
         match group {
             PostTerminalGroup::OpenWalk => {
+                open_walk_started = true;
                 trace.enter(PassPhase::OpenWalk, open_walk.len());
                 for idx in 0..open_walk.len() {
-                    // Always leave the reserve: an item started with less
-                    // than a quarter of the budget left is dropped by the
-                    // outer timeout and would be stamped, starving the tail.
-                    if clock.should_yield(true) {
+                    // Leave the reserve while a later group still has to run:
+                    // an item started with less than a quarter of the budget
+                    // left is dropped by the outer timeout and would be
+                    // stamped, starving the tail. The last group is bounded
+                    // by the yield margin alone.
+                    if clock.should_yield(reserve) {
                         tracing::warn!(
                             deferred = open_walk.len() - idx,
                             walked = idx,
@@ -669,17 +719,33 @@ pub async fn run_one_pass_tracked(
                     }
                     let candidate = open_walk[idx];
                     trace.start_item(&candidate.work_item_id);
+                    let pending_stranded: &[PendingMergeCheck] = if stranded_blocked_started {
+                        &[]
+                    } else {
+                        &stranded_blocked
+                    };
                     if !ensure_fresh_refreshing_parked(
                         &mut snapshot,
                         probe,
                         work_db,
                         &mut parked_ids,
                         &parked_scope,
-                        open_walk[idx..].iter().copied().chain(stranded_blocked.iter()),
+                        open_walk[idx..].iter().copied().chain(pending_stranded.iter()),
                     )
                     .await
                     {
                         break;
+                    }
+                    // No probe result means nothing was observed: leave the
+                    // candidate unstamped and unfinished so the pass reports
+                    // an incomplete walk and it is first next pass.
+                    if !snapshot.results.contains_key(&candidate.pr_url) {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            "merge poller: open walk found no probe result for this PR; will retry next pass",
+                        );
+                        continue;
                     }
                     state.rotations().walk.stamp(&candidate.work_item_id);
                     sweep_one(
@@ -701,151 +767,212 @@ pub async fn run_one_pass_tracked(
                 }
             }
             PostTerminalGroup::Upkeep => {
-                // Rescue stranded ci_remediations attempts: `pending` rows with no live
-                // execution. These arise when two dequeue events land in the same sweep —
-                // the first flips the task (consuming the WHERE guard on
-                // `mark_chore_blocked_ci_failure`) and the second inserts a ci_remediations
-                // row but cannot create an execution.
-                trace.enter(PassPhase::StrandedCi, stranded_ci_attempts.len());
-                for attempt in &stranded_ci_attempts {
-                    if clock.should_yield(false) {
-                        break;
-                    }
-                    trace.start_item(&attempt.work_item_id);
-                    if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
-                        outcome.ci_remediation_redispatched += 1;
-                    }
-                    trace.finish_item();
+                if clock.should_yield(false) {
+                    continue;
                 }
-                // Reconcile stranded `blocked` parents (NULL scalar reason, empty
-                // active-signal set, remediation-owned, bound PR).
-                trace.enter(PassPhase::StrandedBlocked, stranded_blocked.len());
-                for idx in 0..stranded_blocked.len() {
-                    if clock.should_yield(false) {
-                        break;
-                    }
-                    trace.start_item(&stranded_blocked[idx].work_item_id);
-                    if !ensure_fresh_refreshing_parked(
-                        &mut snapshot,
-                        probe,
-                        work_db,
-                        &mut parked_ids,
-                        &parked_scope,
-                        stranded_blocked[idx..].iter(),
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                    sweep_stranded_blocked_remediation(
-                        work_db,
-                        &snapshot.results,
-                        publisher,
-                        host,
-                        &stranded_blocked[idx],
-                        &mut outcome,
-                    )
-                    .await;
-                    trace.finish_item();
-                }
-                // Merge-queue rebounce: one batched GraphQL round trip, then
-                // per-candidate checks. Refresh parked rows first so a row
-                // parked during the open walk is not bounced.
-                trace.enter(PassPhase::QueueRebounce, 0);
-                if !clock.should_yield(false) {
-                    parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
-                    run_merge_queue_rebounce_pass(
-                        work_db,
-                        publisher,
-                        &in_review,
-                        &blocked_ci,
-                        Some(&parked_ids),
-                        &mut outcome,
-                    )
-                    .await;
-                }
-                // Reviewer-fallback: tasks held in `active` (PendingReview)
-                // while waiting for an AI reviewer pass that has since finished
-                // or timed out. Timeout: 10 minutes.
-                trace.enter(PassPhase::StalledReviewer, 0);
-                let reviewer_stale_secs: u64 = 10 * 60;
-                let stalled_candidates = match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
-                    Ok(items) => items,
-                    Err(err) => {
-                        tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks");
-                        Vec::new()
-                    }
-                };
-                trace.set_items_total(stalled_candidates.len());
-                for (task_id, product_id, pr_url, review_result_written) in &stalled_candidates {
-                    if clock.should_yield(false) {
-                        break;
-                    }
-                    trace.start_item(task_id);
-                    sweep_stalled_reviewer(
-                        work_db,
-                        publisher,
-                        StalledReview {
-                            task_id,
-                            product_id,
-                            pr_url,
-                            review_result_written: *review_result_written,
-                            skip_unbatched_review_holds,
-                        },
-                        &GhPrStateChecker,
-                        &mut outcome,
-                    )
-                    .await;
-                    trace.finish_item();
-                }
-
-                trace.enter(PassPhase::ReviewAdmission, 0);
-                if !clock.should_yield(false)
-                    && skip_unbatched_review_holds
-                    && let Some(handler) = completion_handler
-                {
-                    let pool_size = handler.review_pool_size();
-                    sweep_deferred_review_admission_with(
-                        work_db,
-                        publisher,
-                        handler.review_batch_enqueuer(),
-                        None,
-                        pool_size,
-                        &mut outcome,
-                    )
-                    .await;
-                }
-                trace.enter(PassPhase::ReviewBatchUpkeep, 0);
-                if !clock.should_yield(false) {
-                    if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
-                        tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
-                    }
-                    match work_db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
-                        Ok(reaped) => {
-                            outcome.review_batches_reaped = reaped.len();
-                            if !reaped.is_empty() {
-                                tracing::info!(
-                                    reaped = reaped.len(),
-                                    "merge poller: reaped inert review batches to release pool reservations"
-                                );
+                // The subphases rotate their starting point, advanced before
+                // any awaited work, so a slow early subphase cannot keep the
+                // later ones from ever running.
+                let upkeep_turn = state.next_upkeep_turn();
+                let subphases = upkeep_order(upkeep_turn);
+                for subphase in subphases {
+                    match subphase {
+                        // Rescue stranded ci_remediations attempts: `pending` rows with no live
+                        // execution. These arise when two dequeue events land in the same sweep —
+                        // the first flips the task (consuming the WHERE guard on
+                        // `mark_chore_blocked_ci_failure`) and the second inserts a ci_remediations
+                        // row but cannot create an execution.
+                        UpkeepPhase::StrandedCi => {
+                            trace.enter(PassPhase::StrandedCi, stranded_ci_attempts.len());
+                            let attempts = state
+                                .rotations()
+                                .upkeep
+                                .stranded_ci
+                                .order(stranded_ci_attempts.iter().collect(), |attempt| {
+                                    attempt.work_item_id.as_str()
+                                });
+                            for attempt in attempts {
+                                if clock.should_yield(false) {
+                                    break;
+                                }
+                                trace.start_item(&attempt.work_item_id);
+                                state.rotations().upkeep.stranded_ci.stamp(&attempt.work_item_id);
+                                if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
+                                    outcome.ci_remediation_redispatched += 1;
+                                }
+                                trace.finish_item();
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!(?err, "merge poller: failed to reap inert review batches");
+                        // Reconcile stranded `blocked` parents (NULL scalar reason, empty
+                        // active-signal set, remediation-owned, bound PR).
+                        UpkeepPhase::StrandedBlocked => {
+                            stranded_blocked_started = true;
+                            trace.enter(PassPhase::StrandedBlocked, stranded_blocked.len());
+                            let stranded_walk = state
+                                .rotations()
+                                .upkeep
+                                .stranded_blocked
+                                .order(stranded_blocked.iter().collect(), |candidate| {
+                                    candidate.work_item_id.as_str()
+                                });
+                            for idx in 0..stranded_walk.len() {
+                                if clock.should_yield(false) {
+                                    break;
+                                }
+                                let candidate = stranded_walk[idx];
+                                trace.start_item(&candidate.work_item_id);
+                                state.rotations().upkeep.stranded_blocked.stamp(&candidate.work_item_id);
+                                let pending_open: &[&PendingMergeCheck] =
+                                    if open_walk_started { &[] } else { &open_walk };
+                                if !ensure_fresh_refreshing_parked(
+                                    &mut snapshot,
+                                    probe,
+                                    work_db,
+                                    &mut parked_ids,
+                                    &parked_scope,
+                                    stranded_walk[idx..].iter().copied().chain(pending_open.iter().copied()),
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                sweep_stranded_blocked_remediation(
+                                    work_db,
+                                    &snapshot.results,
+                                    publisher,
+                                    host,
+                                    candidate,
+                                    &mut outcome,
+                                )
+                                .await;
+                                trace.finish_item();
+                            }
+                        }
+                        // Merge-queue rebounce: one batched GraphQL round trip, then
+                        // per-candidate checks. Refresh parked rows first so a row
+                        // parked during the open walk is not bounced.
+                        UpkeepPhase::QueueRebounce => {
+                            trace.enter(PassPhase::QueueRebounce, 0);
+                            if !clock.should_yield(false) {
+                                parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
+                                run_merge_queue_rebounce_pass(
+                                    work_db,
+                                    publisher,
+                                    &in_review,
+                                    &blocked_ci,
+                                    Some(&parked_ids),
+                                    &mut outcome,
+                                )
+                                .await;
+                            }
+                        }
+                        // Reviewer-fallback: tasks held in `active` (PendingReview)
+                        // while waiting for an AI reviewer pass that has since finished
+                        // or timed out. Timeout: 10 minutes.
+                        UpkeepPhase::StalledReviewer => {
+                            trace.enter(PassPhase::StalledReviewer, 0);
+                            let reviewer_stale_secs: u64 = 10 * 60;
+                            let stalled_candidates = match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs)
+                            {
+                                Ok(items) => items,
+                                Err(err) => {
+                                    tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks");
+                                    Vec::new()
+                                }
+                            };
+                            let stalled_candidates = {
+                                let mut rotations = state.rotations();
+                                rotations
+                                    .upkeep
+                                    .stalled_reviewer
+                                    .retain(&stalled_candidates.iter().map(|item| item.0.as_str()).collect());
+                                rotations
+                                    .upkeep
+                                    .stalled_reviewer
+                                    .order(stalled_candidates.iter().collect(), |item| item.0.as_str())
+                            };
+                            trace.set_items_total(stalled_candidates.len());
+                            for (task_id, product_id, pr_url, review_result_written) in stalled_candidates {
+                                if clock.should_yield(false) {
+                                    break;
+                                }
+                                trace.start_item(task_id);
+                                state.rotations().upkeep.stalled_reviewer.stamp(task_id);
+                                sweep_stalled_reviewer(
+                                    work_db,
+                                    publisher,
+                                    StalledReview {
+                                        task_id,
+                                        product_id,
+                                        pr_url,
+                                        review_result_written: *review_result_written,
+                                        skip_unbatched_review_holds,
+                                    },
+                                    &GhPrStateChecker,
+                                    &mut outcome,
+                                )
+                                .await;
+                                trace.finish_item();
+                            }
+                        }
+                        UpkeepPhase::ReviewAdmission => {
+                            trace.enter(PassPhase::ReviewAdmission, 0);
+                            if !clock.should_yield(false)
+                                && skip_unbatched_review_holds
+                                && let Some(handler) = completion_handler
+                            {
+                                let pool_size = handler.review_pool_size();
+                                sweep_deferred_review_admission_with(
+                                    work_db,
+                                    publisher,
+                                    handler.review_batch_enqueuer(),
+                                    None,
+                                    pool_size,
+                                    &mut outcome,
+                                )
+                                .await;
+                            }
+                        }
+                        UpkeepPhase::ReviewBatchUpkeep => {
+                            trace.enter(PassPhase::ReviewBatchUpkeep, 0);
+                            if !clock.should_yield(false) {
+                                if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
+                                    tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
+                                }
+                                match work_db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
+                                    Ok(reaped) => {
+                                        outcome.review_batches_reaped = reaped.len();
+                                        if !reaped.is_empty() {
+                                            tracing::info!(
+                                                reaped = reaped.len(),
+                                                "merge poller: reaped inert review batches to release pool reservations"
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(?err, "merge poller: failed to reap inert review batches");
+                                    }
+                                }
+                                sample_review_pool_gauges(work_db, &mut outcome);
+                            }
                         }
                     }
-                    sample_review_pool_gauges(work_db, &mut outcome);
                 }
             }
             PostTerminalGroup::LateFamilies => {
                 if let Some(handler) = completion_handler {
-                    if clock.should_yield(true) {
+                    if clock.should_yield(reserve) {
                         continue;
                     }
-                    // Only a pass that actually has time for this group
+                    // Only a pass with comfortable time for this group
                     // advances family rotation, so a family is not charged
-                    // for a pass that already spent its budget on the walk.
-                    let family_turn = state.next_late_family_turn();
+                    // for a pass that reached it with the reserve already
+                    // spent. Items are still stamped before they run.
+                    let family_turn = if clock.should_yield(true) {
+                        state.late_family_turn()
+                    } else {
+                        state.next_late_family_turn()
+                    };
                     let rechecks = state
                         .rotations()
                         .recheck
@@ -867,14 +994,14 @@ pub async fn run_one_pass_tracked(
                     let mut late_phases = [LatePhase::PrRecheck, LatePhase::BackgroundNudges, LatePhase::LatePr];
                     late_phases.rotate_left((family_turn % 3) as usize);
                     for phase in late_phases {
-                        if clock.should_yield(true) {
+                        if clock.should_yield(reserve) {
                             break;
                         }
                         match phase {
                             LatePhase::PrRecheck => {
                                 trace.enter(PassPhase::PrRecheck, rechecks.len());
                                 for execution_id in &rechecks {
-                                    if clock.should_yield(true) {
+                                    if clock.should_yield(reserve) {
                                         break;
                                     }
                                     trace.start_item(execution_id);
@@ -886,7 +1013,7 @@ pub async fn run_one_pass_tracked(
                             LatePhase::BackgroundNudges => {
                                 trace.enter(PassPhase::BackgroundNudges, nudges.len());
                                 for execution_id in &nudges {
-                                    if clock.should_yield(true) {
+                                    if clock.should_yield(reserve) {
                                         break;
                                     }
                                     trace.start_item(execution_id);
@@ -905,7 +1032,7 @@ pub async fn run_one_pass_tracked(
                             LatePhase::LatePr => {
                                 trace.enter(PassPhase::LatePr, late.len());
                                 for candidate in &late {
-                                    if clock.should_yield(true) {
+                                    if clock.should_yield(reserve) {
                                         break;
                                     }
                                     trace.start_item(&candidate.execution_id);

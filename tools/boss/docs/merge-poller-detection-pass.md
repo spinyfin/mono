@@ -43,7 +43,12 @@ Two properties follow from that order:
   outer timeout so a group can yield instead of being dropped.
   The three per-execution families (PR recheck, background nudges, late PR)
   rotate which one starts, and each family's candidates are ordered
-  least-recently-attended first.
+  least-recently-attended first. The six local upkeep subphases (stranded
+  CI rescue, stranded-blocked reconcile, queue rebounce, stalled reviewer,
+  review admission, review batch upkeep) also rotate which one starts, and
+  the stranded and stalled-reviewer item lists are ordered
+  least-recently-attended first, so a slow early subphase or a long list
+  cannot keep the later work from running on every pass.
 
 ## When a pass runs out of time
 
@@ -51,7 +56,10 @@ The loop drops a pass that exceeds its budget. Four things keep that from
 turning into PRs that are never observed:
 
 - **Open-walk reserve.** The walk of still-open PRs, and the per-execution
-  families, stop starting new items while a quarter of the budget remains.
+  families, stop starting new items while a quarter of the budget remains
+  and a later group has still to run this pass. Whichever of them runs last
+  has nothing to leave time for and is bounded by the yield margin alone,
+  so a load that fits the budget walks every open PR and clears the stall.
   Unstarted candidates are not stamped. A candidate that is already in
   flight can still overrun the reserve; the next pass then starts with a
   later group so recovery still makes progress.
@@ -62,7 +70,10 @@ turning into PRs that are never observed:
   handling is what exhausts the budget goes to the back of the next pass
   instead of cutting every pass off in the same place. Open walk, local
   upkeep and the per-execution families rotate their starting order at the
-  start of that work, so a pass dropped in the open walk still rotates.
+  start of that work, so a pass dropped in the open walk still rotates. A
+  mid-pass re-probe covers every candidate whose group has not started and
+  merges into the snapshot, so rotation never leaves a later group without
+  probe results.
 - **The adaptive schedule is left alone.** An abandoned pass has no
   observations. It is not treated as a pass that saw no candidates, which
   would retire every per-PR adaptive slot; hot PRs keep being reconciled

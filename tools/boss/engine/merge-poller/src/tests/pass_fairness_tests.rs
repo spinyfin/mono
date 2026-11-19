@@ -27,13 +27,31 @@ const CADENCE: Duration = Duration::from_secs(60);
 /// invalidation (the poll-state write `sweep_one` publishes for an open PR
 /// whose state changed) records its work item and then takes [`UPKEEP`].
 /// Merges publish through `publish_work_item_changed` and stay fast.
-#[derive(Default)]
 struct SlowUpkeepPublisher {
     inner: RecordingPublisher,
     upkept: std::sync::Mutex<Vec<String>>,
+    /// Delay of each open-PR poll-state publish.
+    runtime_delay: Duration,
+    /// Delay of each work-item-changed publish (merges).
+    changed_delay: Duration,
+}
+
+impl Default for SlowUpkeepPublisher {
+    fn default() -> Self {
+        Self::timed(UPKEEP, Duration::ZERO)
+    }
 }
 
 impl SlowUpkeepPublisher {
+    fn timed(runtime_delay: Duration, changed_delay: Duration) -> Self {
+        Self {
+            inner: RecordingPublisher::default(),
+            upkept: std::sync::Mutex::new(Vec::new()),
+            runtime_delay,
+            changed_delay,
+        }
+    }
+
     /// Work items whose upkeep has started since the last call, in order.
     fn take_upkept(&self) -> Vec<String> {
         std::mem::take(&mut *self.upkept.lock().unwrap())
@@ -50,6 +68,7 @@ impl ExecutionPublisher for SlowUpkeepPublisher {
         self.inner
             .publish_work_item_changed(product_id, work_item_id, reason)
             .await;
+        tokio::time::sleep(self.changed_delay).await;
     }
 
     async fn publish_work_item_runtime_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
@@ -57,7 +76,7 @@ impl ExecutionPublisher for SlowUpkeepPublisher {
         self.inner
             .publish_work_item_runtime_changed(product_id, work_item_id, reason)
             .await;
-        tokio::time::sleep(UPKEEP).await;
+        tokio::time::sleep(self.runtime_delay).await;
     }
 
     async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
@@ -471,22 +490,41 @@ impl ReviewBatchEnqueuer for NoopEnqueuer {
 /// Completion handler whose PR recheck, late-PR, and background-nudge
 /// paths each take [`UPKEEP`], so those families contend for the budget.
 struct SlowRecheckHandler {
+    calls: HandlerCalls,
+    pending_nudges: Vec<String>,
+    enqueuer: NoopEnqueuer,
+    /// Whether review-batch fanout is on, which turns the deferred review
+    /// admission subphase on; it reads the pool size each time it runs.
+    fanout: bool,
+}
+
+/// What [`SlowRecheckHandler`] finished, recorded after its delay.
+#[derive(Default)]
+struct HandlerCalls {
     rechecked: std::sync::Mutex<Vec<String>>,
     late: std::sync::Mutex<Vec<String>>,
     nudges: std::sync::Mutex<Vec<String>>,
-    pending_nudges: Vec<String>,
-    enqueuer: NoopEnqueuer,
+    pool_size_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl SlowRecheckHandler {
     fn new(pending_nudges: Vec<String>) -> Self {
         Self {
-            rechecked: std::sync::Mutex::new(Vec::new()),
-            late: std::sync::Mutex::new(Vec::new()),
-            nudges: std::sync::Mutex::new(Vec::new()),
+            calls: HandlerCalls::default(),
             pending_nudges,
             enqueuer: NoopEnqueuer,
+            fanout: false,
         }
+    }
+
+    fn with_review_fanout(mut self) -> Self {
+        self.fanout = true;
+        self
+    }
+
+    /// How many times the review admission subphase actually ran.
+    fn admission_runs(&self) -> usize {
+        self.calls.pool_size_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -500,13 +538,16 @@ impl CompletionRequests for SlowRecheckHandler {
     }
     async fn recheck_background_nudge(&self, execution_id: &str) -> Option<StopOutcome> {
         tokio::time::sleep(UPKEEP).await;
-        self.nudges.lock().unwrap().push(execution_id.to_owned());
+        self.calls.nudges.lock().unwrap().push(execution_id.to_owned());
         None
     }
     fn review_batch_fanout_enabled(&self) -> bool {
-        false
+        self.fanout
     }
     fn review_pool_size(&self) -> usize {
+        self.calls
+            .pool_size_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         0
     }
     async fn force_release(&self, _execution_id: &str) {}
@@ -520,12 +561,12 @@ impl CompletionRequests for SlowRecheckHandler {
     async fn force_stop_execution(&self, _execution_id: &str) {}
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {
         tokio::time::sleep(UPKEEP).await;
-        self.rechecked.lock().unwrap().push(execution_id.to_owned());
+        self.calls.rechecked.lock().unwrap().push(execution_id.to_owned());
         StopOutcome::AwaitingInput
     }
     async fn recheck_for_pr_late(&self, candidate: &LatePrCandidate) -> StopOutcome {
         tokio::time::sleep(UPKEEP).await;
-        self.late.lock().unwrap().push(candidate.execution_id.clone());
+        self.calls.late.lock().unwrap().push(candidate.execution_id.clone());
         StopOutcome::AwaitingInput
     }
     fn reconcile_review_guide_source_from_probe(
@@ -601,7 +642,7 @@ async fn slow_open_walk_still_reaches_recheck_late_pr_and_upkeep() {
     }
     let stub = StubProbe::new();
     let publisher = SlowUpkeepPublisher::default();
-    let handler = SlowRecheckHandler::new(Vec::new());
+    let handler = SlowRecheckHandler::new(Vec::new()).with_review_fanout();
     let state = PassState::default();
     let mut upkeep_ran = false;
 
@@ -624,11 +665,15 @@ async fn slow_open_walk_still_reaches_recheck_late_pr_and_upkeep() {
         state.trace().timings().breakdown(),
     );
     assert!(
-        !handler.rechecked.lock().unwrap().is_empty(),
+        handler.admission_runs() > 0,
+        "deferred review admission must actually run, not just be entered, within six rotated passes",
+    );
+    assert!(
+        !handler.calls.rechecked.lock().unwrap().is_empty(),
         "pending rechecks must complete within six rotated passes",
     );
     assert!(
-        !handler.late.lock().unwrap().is_empty(),
+        !handler.calls.late.lock().unwrap().is_empty(),
         "late-PR recovery must complete within six rotated passes",
     );
 }
@@ -659,10 +704,10 @@ async fn slow_rechecks_still_service_late_pr() {
     }
 
     assert!(
-        !handler.late.lock().unwrap().is_empty(),
+        !handler.calls.late.lock().unwrap().is_empty(),
         "late-PR recovery must complete even when rechecks are slow: rechecked={:?} late={:?}",
-        handler.rechecked.lock().unwrap(),
-        handler.late.lock().unwrap(),
+        handler.calls.rechecked.lock().unwrap(),
+        handler.calls.late.lock().unwrap(),
     );
 }
 
@@ -807,11 +852,133 @@ async fn slow_background_nudges_service_every_id_across_passes() {
         let _ = budgeted_pass_with(&db, &stub, &publisher, Some(&handler), &metrics, &state).await;
     }
 
-    let mut seen = handler.nudges.lock().unwrap().clone();
+    let mut seen = handler.calls.nudges.lock().unwrap().clone();
     seen.sort();
     seen.dedup();
     assert_eq!(
         seen, nudge_ids,
         "every background-nudge id must complete across rotated passes, got {seen:?}"
     );
+}
+
+/// Every upkeep subphase leads on some pass, so a persistently slow early
+/// subphase cannot hold the later ones off indefinitely.
+#[test]
+fn every_upkeep_subphase_leads_within_one_rotation() {
+    use crate::pass::{UpkeepPhase, upkeep_order};
+    let leaders: std::collections::HashSet<_> = (0..6).map(|turn| upkeep_order(turn)[0]).collect();
+    assert_eq!(leaders.len(), 6, "{leaders:?}");
+    for turn in 0..12 {
+        let order = upkeep_order(turn);
+        let all: std::collections::HashSet<_> = order.iter().copied().collect();
+        assert_eq!(all.len(), 6, "turn {turn} must run every subphase exactly once");
+    }
+    assert!(upkeep_order(5)[0] == UpkeepPhase::ReviewBatchUpkeep);
+}
+
+/// The last group in a pass has no later group to leave time for, so only
+/// the yield margin bounds it. Eight 20s open PRs cost 160s, between 0.75x
+/// and 1x of the 180s budget: the pass where the open walk runs last must
+/// walk them all and report no truncation.
+#[tokio::test(start_paused = true)]
+async fn an_open_walk_that_fits_the_budget_is_not_truncated_when_it_runs_last() {
+    let (_dir, db) = open_db();
+    let metrics = Registry::new();
+    crate::init(&metrics);
+    let listed = tracked_prs(&db, 8);
+    let stub = StubProbe::new();
+    let publisher = SlowUpkeepPublisher::timed(Duration::from_secs(20), Duration::ZERO);
+    let state = PassState::default();
+
+    // Pass 0 runs the open walk first, with later groups still to run.
+    set_all_open(&stub, &listed, OpenPrCiStatus::Clean);
+    let _ = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
+    assert!(state.trace().timings().open_walk_truncated());
+
+    // Pass 1 runs it last.
+    set_all_open(&stub, &listed, OpenPrCiStatus::InFlight);
+    let completed = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
+    assert!(completed.is_some());
+    let timings = state.trace().timings();
+    assert!(
+        !timings.open_walk_truncated(),
+        "nothing follows the walk, so it must use the whole budget: {}",
+        timings.breakdown(),
+    );
+    let signal = detection_stall_signal();
+    record_pass_result(&signal, true, &timings, BUDGET, 1_000);
+    assert!(signal.borrow().is_none(), "a full walk must not raise the stall");
+}
+
+/// Upkeep runs before the open walk and its stranded-blocked refresh happens
+/// after the snapshot has gone stale: the later open walk must still find
+/// its own probe results, observe every PR and keep its adaptive tiers.
+#[tokio::test(start_paused = true)]
+async fn a_stranded_blocked_reprobe_does_not_discard_the_open_walks_results() {
+    let (_dir, db) = open_db();
+    let metrics = Registry::new();
+    crate::init(&metrics);
+    let listed = tracked_prs(&db, 3);
+    let product_id = listed[0].product_id.clone();
+    let stub = StubProbe::new();
+    // The merge takes longer than the snapshot's max age to record.
+    let publisher = SlowUpkeepPublisher::timed(Duration::ZERO, Duration::from_secs(61));
+    let state = PassState::default();
+
+    // Pass 0 (open walk first) only advances the rotation.
+    set_all_open(&stub, &listed, OpenPrCiStatus::Clean);
+    let _ = budgeted_pass(&db, &stub, &publisher, &metrics, &state).await;
+
+    let merged_pr = "https://github.com/foo/bar/pull/100";
+    chore_in_review_for_product(&db, &product_id, "Merged", merged_pr);
+    stub.set(merged_pr, PrLifecycleState::Merged);
+    let stranded_pr = "https://github.com/foo/bar/pull/101";
+    let stranded = chore_in_review_for_product(&db, &product_id, "Stranded", stranded_pr);
+    db.update_work_item(
+        &stranded,
+        WorkItemPatch {
+            status: Some("blocked".into()),
+            blocked_reason: Some(String::new()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    {
+        let conn = rusqlite::Connection::open(_dir.path().join("state.db")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO conflict_resolutions
+                 (id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch, status,
+                  revision_task_id, created_at)
+             VALUES ('cr-1', ?1, ?2, ?3, 101, 'feature', 'main', 'pending', ?2, '0')",
+            rusqlite::params![&product_id, &stranded, stranded_pr],
+        )
+        .unwrap();
+    }
+    assert_eq!(db.list_chores_stranded_blocked_remediation().unwrap().len(), 1);
+    set_all_open(&stub, &listed, OpenPrCiStatus::InFlight);
+    stub.set(stranded_pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+
+    // Pass 1 runs upkeep first, after the slow terminal merge.
+    let (_outcome, observations) = budgeted_pass(&db, &stub, &publisher, &metrics, &state)
+        .await
+        .expect("pass completes");
+
+    let timings = state.trace().timings();
+    assert!(
+        !timings.open_walk_truncated(),
+        "the open walk must observe every open PR: {}",
+        timings.breakdown(),
+    );
+    for candidate in &listed {
+        let tier = observations
+            .iter()
+            .find(|(url, _)| url == &candidate.pr_url)
+            .map(|(_, tier)| *tier);
+        assert!(
+            matches!(tier, Some(Some(_))),
+            "{} must keep its adaptive tier: {observations:?}",
+            candidate.pr_url,
+        );
+    }
 }

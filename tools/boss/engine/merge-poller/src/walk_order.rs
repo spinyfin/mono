@@ -58,11 +58,24 @@ impl Rotation {
     }
 }
 
+/// Rotations for the upkeep subphases that walk a list.
+#[derive(Debug, Default)]
+pub(crate) struct UpkeepRotations {
+    /// Stranded ci-remediation rescue, keyed by work item id.
+    pub(crate) stranded_ci: Rotation,
+    /// Stranded-blocked reconcile, keyed by work item id.
+    pub(crate) stranded_blocked: Rotation,
+    /// Reviewer-fallback for stalled reviews, keyed by task id.
+    pub(crate) stalled_reviewer: Rotation,
+}
+
 /// The rotations one poller loop keeps, one per candidate family.
 #[derive(Debug, Default)]
 pub(crate) struct PassRotations {
     /// The PR candidate walk, keyed by work item id.
     pub(crate) walk: Rotation,
+    /// The local upkeep subphases' item lists.
+    pub(crate) upkeep: UpkeepRotations,
     /// The live-worker PR-detection recheck, keyed by execution id.
     pub(crate) recheck: Rotation,
     /// Background-nudge rechecks, keyed by execution id.
@@ -88,6 +101,9 @@ pub struct PassState {
     /// only when that group actually has time, so a family is not charged
     /// for a pass that yielded before it started.
     late_family_turn: AtomicU64,
+    /// Starting offset among the six local upkeep subphases. Advanced when
+    /// the upkeep group starts, before any of its awaited work.
+    upkeep_turn: AtomicU64,
 }
 
 impl PassState {
@@ -102,11 +118,24 @@ impl PassState {
         self.rotations.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Take the next starting offset among post-terminal groups and
-    /// per-execution families. Call once per pass, after the terminal
-    /// walk and before any rotated group runs.
+    /// Take the next starting offset among post-terminal groups. Call once
+    /// per pass, after the terminal walk and before any rotated group runs.
     pub(crate) fn next_phase_turn(&self) -> u64 {
         self.phase_turn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The current starting offset among the per-execution families,
+    /// without advancing it.
+    pub(crate) fn late_family_turn(&self) -> u64 {
+        self.late_family_turn.load(Ordering::Relaxed)
+    }
+
+    /// Take the next starting offset among PR recheck, background nudges
+    /// and late PR. Call when the per-execution group has time to run.
+    /// Take the next starting offset among the upkeep subphases. Call when
+    /// the upkeep group has time to run, before its first awaited work.
+    pub(crate) fn next_upkeep_turn(&self) -> u64 {
+        self.upkeep_turn.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Take the next starting offset among PR recheck, background nudges
