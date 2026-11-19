@@ -829,6 +829,7 @@ mod attention_filing;
 mod attention_reconcile;
 mod attentions;
 mod audit_misc;
+mod auto_stop_notice;
 mod automations;
 mod blocked_workspace;
 mod blocking;

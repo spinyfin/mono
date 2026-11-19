@@ -351,6 +351,11 @@ struct WorkBoardCardItem: View {
                 WorkDispatchFailureBanner(reason: dispatchFailedReason, errorText: task.dispatchFailedError)
             }
 
+            // A dispatch failure already explains why autostart is off.
+            if task.dispatchFailedReason == nil, let notice = task.autoStopNotice {
+                WorkAutoStopBanner(notice: notice) { model.acknowledgeAutoStopNotice(for: task) }
+            }
+
             if let dragRefusal {
                 WorkDragRefusalBanner(
                     message: dragRefusal.message,

@@ -384,6 +384,14 @@ extension ChatViewModel {
         engine.sendUpdateWorkItem(id: task.id, patch: ["priority": priority.rawValue])
     }
 
+    /// Acknowledge a card's engine-stop notice up to the audit row it showed.
+    /// The engine only covers rows up to that id, so a stop recorded after the
+    /// card was drawn stays visible.
+    func acknowledgeAutoStopNotice(for task: WorkTask) {
+        guard let notice = task.autoStopNotice else { return }
+        engine.sendUpdateWorkItem(id: task.id, patch: ["acknowledge_auto_stop_through": notice.auditId])
+    }
+
     func navigatorBriefDraft(for taskID: String) -> NavigatorBriefDraft? {
         navigator.briefDrafts[taskID]
     }

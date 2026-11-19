@@ -318,6 +318,8 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         pr_mergeable_state: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
         // Derived from the conflict ledger during board assembly.
         conflict_resolution_deferred: false,
+        // Derived from the audit ledger during board assembly.
+        auto_stop_notice: None,
         // Base task mapping leaves external_ref unset; map_task_with_external_ref
         // populates it from columns 36-40.
         external_ref: None,

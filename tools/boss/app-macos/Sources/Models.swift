@@ -140,6 +140,10 @@ struct WorkTask: Identifiable, Hashable {
     /// Mirrors `Task.pr_mergeable_state` on the wire.
     var prMergeableState: String? = nil
     var conflictResolutionDeferred: Bool = false
+    /// Unacknowledged engine-initiated stop of this never-started item (autostart
+    /// turned off, or its queued execution abandoned with no replacement).
+    /// `nil` when there is none. Mirrors `Task.auto_stop_notice` on the wire.
+    var autoStopNotice: AutoStopNotice? = nil
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil

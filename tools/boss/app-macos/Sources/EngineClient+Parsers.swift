@@ -244,6 +244,7 @@ extension EngineClient {
             mergeIntent: WorkMergeIntent.parse(payload["merge_intent"]),
             prMergeableState: payload["pr_mergeable_state"] as? String,
             conflictResolutionDeferred: payload["conflict_resolution_deferred"] as? Bool ?? false,
+            autoStopNotice: AutoStopNotice.parse(payload["auto_stop_notice"]),
             externalRef: parseExternalRef(payload["external_ref"]),
             parentTaskId: payload["parent_task_id"] as? String,
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,

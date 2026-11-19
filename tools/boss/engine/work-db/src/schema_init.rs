@@ -1072,6 +1072,10 @@ mod floor_tests {
                 }),
             ),
             (
+                super::super::auto_stop_notice::MIGRATION_ID,
+                Box::new(|c| super::super::auto_stop_notice::migrate(c).unwrap()),
+            ),
+            (
                 "20261118_0918_board_runtime_epoch_run_finished",
                 Box::new(|c| super::super::queued_display::migrate(c).unwrap()),
             ),
