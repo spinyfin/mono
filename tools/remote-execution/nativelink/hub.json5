@@ -183,8 +183,8 @@
             // path (the laptop reaches this hub through a tunnel) sees traffic,
             // and the hub does not find out that a client has gone until the
             // action ends. It logs "Execute stream dropped before the operation
-            // finished" when a write fails. 30 s is half of Bazel's own
-            // keepalive interval.
+            // finished" when a write fails. 30 s matches the client's
+            // --grpc_keepalive_time (dev-remote / ci-remote).
             //
             // It does not make a Bazel 9.1 client time out, and neither does
             // its absence: see ../README.md, "What bounds a stuck action".
@@ -203,7 +203,9 @@
         // /status on the port clients use. A CI step asks it before it sends
         // its build here (.buildkite/steps/remote-execution.sh): a hub whose
         // process has stopped answering still accepts a TCP connection, and a
-        // Bazel 9.1 client that starts a build against one waits for ever.
+        // Bazel 9.1 client that starts a build against one waits on its first
+        // call (about six minutes of --remote_timeout retries) unless the
+        // probe already sent the step to the agent.
         // It answers 503 when a store has failed or stalled.
         health: {},
       },

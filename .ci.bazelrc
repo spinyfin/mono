@@ -89,11 +89,15 @@ build:ci-remote --jobs=64
 # with an error that names the reason; ci-env.sh then says on the build page
 # that the executor failed and not the change. An executor that stops
 # answering after the step has started is different. Bazel 9.1 puts no
-# deadline on an execution call, and no flag in this version adds one, so
-# nothing written here can bound it: that step's bound is timeout_in_minutes
-# in .buildkite/pipeline.yml. Do not add --remote_timeout for it; that flag
-# applies to cache calls only. See tools/remote-execution/README.md, "What
-# bounds a stuck action".
+# deadline on an execution call. --grpc_keepalive_time defaults to 60s in
+# 9.1; these two lines set 30s / 20s so the values live in this file. That
+# drops the transport only if HTTP/2 PINGs go unanswered (measured with the
+# 60s default: still waiting 17 minutes later). The remaining bound is
+# timeout_in_minutes on every remote-enabled CI step. Do not add
+# --remote_timeout for it; that flag applies to cache calls only. See
+# tools/remote-execution/README.md, "What bounds a stuck action".
+build:ci-remote --grpc_keepalive_time=30s
+build:ci-remote --grpc_keepalive_timeout=20s
 build:ci-remote --noremote_local_fallback
 # Tests execute on the workers too; see `test:remote-tests` in .bazelrc.
 test:ci-remote --config=remote-tests
@@ -116,8 +120,10 @@ build:ci-remote --remote_cache_compression
 # The disk cache from build:ci-linux stays on, for the reason given under
 # ci-remote.
 build:ci-remote-linux --jobs=64
-# As under ci-remote, including what bounds a step whose executor stops
-# answering.
+# As under ci-remote, including the keepalive lines and what bounds a step
+# whose executor stops answering.
+build:ci-remote-linux --grpc_keepalive_time=30s
+build:ci-remote-linux --grpc_keepalive_timeout=20s
 build:ci-remote-linux --noremote_local_fallback
 build:ci-remote-linux --remote_cache_compression
 # The tag that routes the build: every action asks for a worker whose

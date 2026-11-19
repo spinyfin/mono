@@ -85,6 +85,8 @@ platform_line="$(line_number 'common --enable_platform_specific_config')"
 # back the entries it exists to keep out.
 [[ "$(count_active 'bazelcache-remote')" == "1" ]] ||
   fail "only dev-remote may use the remote-mode disk cache directory"
+line_number 'build:dev-remote --grpc_keepalive_time=30s' > /dev/null
+line_number 'build:dev-remote --grpc_keepalive_timeout=20s' > /dev/null
 line_number 'build:dev-remote --remote_local_fallback' > /dev/null
 # Without this a result a developer's Mac produced after a fallback is uploaded
 # under the key CI's remote steps use, and a CI step can be satisfied by it.

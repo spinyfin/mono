@@ -55,6 +55,28 @@ printf '%s\n' \
   'cat "${HUB_FIXTURES}/${name}.body" > "$output" 2> /dev/null || true' \
   > "${tmp}/bin/curl"
 chmod +x "${tmp}/bin/curl"
+# journalctl: --quiet must be passed, or the empty-window banner would make
+# an idle hub look like a non-JSON log. With --quiet, no entries is silence.
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/bin/bash' \
+  'echo "$*" >> "${HUB_FIXTURES}/journalctl-args"' \
+  'quiet=0' \
+  'while [[ $# -gt 0 ]]; do' \
+  '  case "$1" in' \
+  '    --quiet) quiet=1; shift ;;' \
+  '    *) shift ;;' \
+  '  esac' \
+  'done' \
+  'if [[ "$quiet" -ne 1 ]]; then' \
+  '  echo "-- No entries --"' \
+  '  exit 0' \
+  'fi' \
+  'if [[ -f "${HUB_FIXTURES}/journal.log" ]]; then' \
+  '  cat "${HUB_FIXTURES}/journal.log"' \
+  'fi' \
+  > "${tmp}/bin/journalctl"
+chmod +x "${tmp}/bin/journalctl"
 export HUB_FIXTURES="${hub}"
 export PATH="${tmp}/bin:${PATH}"
 
@@ -115,7 +137,7 @@ unreported() { event "$1" WARN "Worker no longer reports an operation it acknowl
 # with one ordinary line in it.
 reset_hub() {
   now="$(date +%s)"
-  rm -f "${hub}"/*.code "${hub}/requests" "${tmp}/health.state" "${tmp}/alerts"
+  rm -f "${hub}"/*.code "${hub}/requests" "${hub}/journalctl-args" "${hub}/journal.log" "${tmp}/health.state" "${tmp}/alerts"
   printf '%s' "$status_ok" > "${hub}/status.body"
   set_workers \
     "$(worker anaplian 3 10 false false)" "$(worker arbitrary 0 12 false false)" \
@@ -137,6 +159,16 @@ check() {
   status=0
   line="$(env NL_HUB_ADMIN_LISTEN=127.0.0.1:50071 NL_HEALTH_EXPECTED_WORKERS=6 \
     NL_HEALTH_STATE_FILE="${tmp}/health.state" "$@" "$health" --log-file "$log" 2>&1)" || status=$?
+}
+
+# check_journal [NAME=value]...: the same, reading the log from the stub
+# journalctl instead of a file.
+check_journal() {
+  status=0
+  : > "${hub}/journalctl-args"
+  line="$(env NL_HUB_ADMIN_LISTEN=127.0.0.1:50071 NL_HEALTH_EXPECTED_WORKERS=6 \
+    NL_HEALTH_STATE_FILE="${tmp}/health.state" "$@" "$health" \
+    --journal-unit nativelink-macos-hub.service 2>&1)" || status=$?
 }
 
 # expect <description> <exit status> <substring of the line>...
@@ -290,10 +322,36 @@ check
 expect "log in another format" 2 "the hub's log has no JSON events"
 
 reset_hub
+printf '%s\n' '-- No entries --' > "$log"
+check
+expect "empty-window banner in a log file" 0 "healthy: 6/6 workers"
+
+reset_hub
+check_journal
+expect "idle journal" 0 "healthy: 6/6 workers"
+if ! grep -q -- '--quiet' "${hub}/journalctl-args"; then
+  fail "idle journal: journalctl was not passed --quiet: $(cat "${hub}/journalctl-args")"
+fi
+cp "$log" "${hub}/journal.log"
+check_journal
+expect "journal with JSON" 0 "healthy: 6/6 workers" "1 log lines"
+
+reset_hub
 status=0
 line="$(env NL_HUB_ADMIN_LISTEN=127.0.0.1:50071 NL_HEALTH_STATE_FILE="${tmp}/health.state" \
   "$health" --log-file "${tmp}/no-such-log" 2>&1)" || status=$?
 expect "missing log" 2 "could not read the hub's log"
+
+reset_hub
+: > "${tmp}/alerts"
+alert="printf '%s|%s\n' \"\$NL_HEALTH_STATE\" \"\$NL_HEALTH_LINE\" >> '${tmp}/alerts'"
+status=0
+line="$(env NL_HUB_ADMIN_LISTEN=127.0.0.1:50071 NL_HEALTH_STATE_FILE="${tmp}/health.state" \
+  NL_HEALTH_ALERT_CMD="$alert" "$health" --log-file "${tmp}/no-such-log" 2>&1)" || status=$?
+expect "missing log alerts" 2 "could not read the hub's log"
+if ! grep -q '^error|hub-health: error: could not read the hub' "${tmp}/alerts"; then
+  fail "missing log: expected an error alert, got: $(cat "${tmp}/alerts" 2>/dev/null)"
+fi
 
 status=0
 line="$(env -u NL_HUB_ADMIN_LISTEN "$health" --log-file "$log" 2>&1)" || status=$?

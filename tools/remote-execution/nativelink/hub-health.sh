@@ -16,6 +16,8 @@
 # restarts or stops anything: ../README.md, "Recovery", is for a person.
 #
 #   hub-health.sh --journal-unit <unit>   read the hub's log from the journal
+#                                         (--quiet, so an empty window is
+#                                         silence and not "-- No entries --")
 #   hub-health.sh --log-file <path>       read it from a file
 #
 # The log has to be NativeLink's JSON format (NL_LOG=json, set by
@@ -58,6 +60,21 @@ REQUEST_TIMEOUT_S=10
 
 die() {
   echo "hub-health: error: $*" >&2
+  # A check that could not run is as much a signal as an unhealthy hub.
+  # Usage errors fire before state_file is set and skip the hook.
+  if [[ -n "${NL_HEALTH_ALERT_CMD:-}" ]]; then
+    previous=healthy
+    if [[ -n "${state_file:-}" ]]; then
+      previous="$(cat "$state_file" 2> /dev/null || echo healthy)"
+    fi
+    if [[ "$previous" != "error" ]]; then
+      if [[ -n "${state_file:-}" ]]; then
+        echo error > "$state_file" 2> /dev/null || true
+      fi
+      NL_HEALTH_LINE="hub-health: error: $*" NL_HEALTH_STATE="error" sh -c "$NL_HEALTH_ALERT_CMD" ||
+        echo "hub-health: warning: NL_HEALTH_ALERT_CMD failed" >&2
+    fi
+  fi
   exit 2
 }
 
@@ -169,7 +186,7 @@ fi
 
 read_log() {
   case "$source_kind" in
-    --journal-unit) journalctl --user --unit "$source_arg" --since "-${window_s}s" --output cat --no-pager ;;
+    --journal-unit) journalctl --user --quiet --unit "$source_arg" --since "-${window_s}s" --output cat --no-pager ;;
     --log-file) cat "$source_arg" ;;
   esac
 }
@@ -187,6 +204,9 @@ since="$(date -u -d "@${since_s}" '+%Y-%m-%dT%H:%M:%S' 2> /dev/null || date -u -
 read -r raw_lines log_events log_lines forced_evictions operation_timeouts lost_results < <(
   read_log 2> "$scratch/log-error" | awk -v since="$since" '
     # {"timestamp":"2026-11-18T22:27:36.123456Z","level":"WARN","fields":{"message":"..."
+    # journalctl without --quiet prints "-- No entries --" for an empty
+    # window; skip that banner so an idle hub is not reported as "no JSON".
+    /^-- / { next }
     {
       lines++
       if (!match($0, /"timestamp":"[0-9T:.-]+Z"/)) next

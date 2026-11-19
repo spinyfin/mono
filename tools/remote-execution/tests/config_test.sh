@@ -150,6 +150,8 @@ grep -q -x 'Environment=NL_LOG=json' "$hub_unit" ||
 # The journal of the unit the hub runs as.
 grep -q -x 'ExecStart=%h/nativelink-macos-hub/hub-health.sh --journal-unit nativelink-macos-hub.service' "$health_unit" ||
   fail "the health check must read the journal of nativelink-macos-hub.service"
+grep -q 'journalctl --user --quiet --unit' "$health" ||
+  fail "hub-health.sh must pass --quiet to journalctl so an empty window is not '-- No entries --'"
 grep -q -x 'OnUnitActiveSec=1min' "$health_timer" ||
   fail "the health check must run every minute"
 # The scheduler by the name the admin API knows it under.

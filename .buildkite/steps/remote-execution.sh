@@ -40,7 +40,7 @@
 #      The second half is there because a connection proves little. The
 #      kernel accepts one for a process that has stopped answering, and a
 #      Bazel 9.1 client that sends its build to such a process waits without a
-#      limit: it puts no deadline on an execution call (measured: still
+#      per-RPC deadline (measured with the 60s keepalive default: still
 #      waiting 17 minutes after the executor froze). A step that would have
 #      hung at its first bazel command builds on its agent instead. See
 #      tools/remote-execution/README.md, "What bounds a stuck action".
@@ -117,14 +117,15 @@ ci_remote_endpoint_reachable() {
 # ci_remote_endpoint_status <endpoint> <host> <port>
 #
 # Asks the endpoint for its status page over HTTP, on the port Bazel uses,
-# and prints the HTTP status: 200 for an executor that is answering and whose
-# stores work, 503 for one that reports a failed or stalled store, and 000
-# for one that sent no answer within CI_REMOTE_STATUS_TIMEOUT_SECS. Any other
-# status means the endpoint answers but serves no status page on this port,
-# which is all that can be learned from it. An agent without curl prints
-# "unknown". Nothing is echoed: the endpoint is host configuration.
+# and prints one token: 200 for an executor that is answering and whose
+# stores work, 503 for one that reports a failed or stalled store, `timeout`
+# for one that sent no answer within CI_REMOTE_STATUS_TIMEOUT_SECS (curl
+# exit 28), `curl:<n>` for any other curl failure, and any other HTTP status
+# for an endpoint that answers but serves no status page on this port. An
+# agent without curl prints "unknown". Nothing else is echoed: the endpoint
+# is host configuration.
 ci_remote_endpoint_status() {
-  local scheme="http" host="$2" code
+  local scheme="http" host="$2" code curl_exit=0
   if [[ "$1" == grpcs://* ]]; then
     scheme="https"
   fi
@@ -137,7 +138,15 @@ ci_remote_endpoint_status() {
     return 0
   fi
   code="$(curl --silent --output /dev/null --max-time "$CI_REMOTE_STATUS_TIMEOUT_SECS" \
-    --write-out '%{http_code}' "${scheme}://${host}:$3/status" 2> /dev/null)" || true
+    --write-out '%{http_code}' "${scheme}://${host}:$3/status" 2> /dev/null)" || curl_exit=$?
+  if ((curl_exit == 28)); then
+    echo timeout
+    return 0
+  fi
+  if ((curl_exit != 0)); then
+    echo "curl:${curl_exit}"
+    return 0
+  fi
   echo "${code:-000}"
 }
 
@@ -231,7 +240,7 @@ ci_remote_execution_decide() {
   fi
   http_status="$(ci_remote_endpoint_status "$endpoint" "${host_port% *}" "${host_port##* }")"
   case "$http_status" in
-    000)
+    timeout)
       CI_REMOTE_EXECUTION_FELL_BACK=1
       CI_REMOTE_EXECUTION_REASON="the remote executor accepted a connection but did not answer a status request within ${CI_REMOTE_STATUS_TIMEOUT_SECS}s, so this step builds on the agent"
       return 0
@@ -240,6 +249,13 @@ ci_remote_execution_decide() {
       CI_REMOTE_EXECUTION_FELL_BACK=1
       CI_REMOTE_EXECUTION_REASON="the remote executor reports a failed or stalled store (its status page answers 503), so this step builds on the agent"
       return 0
+      ;;
+    curl:*)
+      # Connection reset, empty reply, TLS failure, HTTP/2-only listener, …
+      # Today's 1.6.6 hubs have no status page on the client port; only a
+      # timeout means the process accepted a connection and then said
+      # nothing. Any other probe failure is treated as "no status page".
+      scope="$scope (status probe failed: curl exit ${http_status#curl:}; treating the endpoint as having no status page)"
       ;;
   esac
 

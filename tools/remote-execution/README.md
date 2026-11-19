@@ -92,27 +92,27 @@ The worker's three limits are NativeLink's defaults, kept because nothing has me
 
 A remote action that cannot make progress ends in one of the ways below. The times and the CI column are measured, with Bazel 9.1.0 against a 1.8.6 hub and two workers running these configs on one machine, unless a time is marked as derived from the settings. The developer column is measured for every worker freezing and for a hub that stops answering, before and during a build; the other rows follow from the rule Bazel applies, which is to run an action on the Mac when its remote execution failed for any reason but the action's own timeout.
 
-| What happens                                                 | What ends it                                                            | How long                                    | CI step (`ci-remote`)                                                                                                               | Developer's Mac (`dev-remote`)    |
-| ------------------------------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| The worker running an action freezes or dies                 | `worker_timeout_s`; the action runs on another worker                   | Evicted after 30 s                          | Succeeds                                                                                                                            | Succeeds                          |
-| Every worker freezes or is gone                              | `worker_timeout_s`, then `no_worker_action_timeout_s`                   | Failed 151 s after the freeze               | Fails: `Action cannot be scheduled, no worker is connected to the scheduler.`                                                       | The action runs on the Mac        |
-| Workers are evicted again and again (the loop of 2026-11-18) | `max_worker_loss_retries`                                               | 3 to 6 min (derived: six losses of 30–60 s) | Fails: `The worker running this action was lost 7 times`                                                                            | The action runs on the Mac        |
-| A command hangs on a worker                                  | The test's own timeout, or `max_action_timeout_s`; then one more worker | At most 2 × 20 min (derived)                | Fails with the timeout                                                                                                              | Fails with the timeout            |
-| A worker reports an action as running and never finishes it  | `max_action_executing_timeout_s`                                        | 45 min per attempt (derived)                | Fails after the retries                                                                                                             | The action runs on the Mac        |
-| The hub's process dies                                       | The connection breaks                                                   | 4 s                                         | Fails: `(Exit 34): UNAVAILABLE: io exception`                                                                                       | The action runs on the Mac        |
-| The hub stops answering **before** a build starts            | CI: the status probe. Bazel: its first call, six tries of 60 s each     | CI probe: 10 s. Bazel: 366 s and 369 s      | The step builds on its agent, with a warning. Without the probe: `Failed to query remote execution capabilities: DEADLINE_EXCEEDED` | The build runs on the Mac         |
-| The hub stops answering **during** a build                   | Nothing in Bazel 9.1. CI: `timeout_in_minutes`                          | CI: 60 min (30 for `checks`)                | The step is timed out                                                                                                               | Waits until the hub answers again |
+| What happens                                                 | What ends it                                                            | How long                                                      | CI step (`ci-remote`)                                                                                                               | Developer's Mac (`dev-remote`)                                                |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| The worker running an action freezes or dies                 | `worker_timeout_s`; the action runs on another worker                   | Evicted after 30 s                                            | Succeeds                                                                                                                            | Succeeds                                                                      |
+| Every worker freezes or is gone                              | `worker_timeout_s`, then `no_worker_action_timeout_s`                   | Failed 151 s after the freeze                                 | Fails: `Action cannot be scheduled, no worker is connected to the scheduler.`                                                       | The action runs on the Mac                                                    |
+| Workers are evicted again and again (the loop of 2026-11-18) | `max_worker_loss_retries`                                               | 3 to 6 min (derived: six losses of 30–60 s)                   | Fails: `The worker running this action was lost 7 times`                                                                            | The action runs on the Mac                                                    |
+| A command hangs on a worker                                  | The test's own timeout, or `max_action_timeout_s`; then one more worker | At most 2 × 20 min (derived)                                  | Fails with the timeout                                                                                                              | Fails with the timeout                                                        |
+| A worker reports an action as running and never finishes it  | `max_action_executing_timeout_s`                                        | 45 min per attempt (derived)                                  | Fails after the retries                                                                                                             | The action runs on the Mac                                                    |
+| The hub's process dies                                       | The connection breaks                                                   | 4 s                                                           | Fails: `(Exit 34): UNAVAILABLE: io exception`                                                                                       | The action runs on the Mac                                                    |
+| The hub stops answering **before** a build starts            | CI: the status probe. Bazel: its first call, six tries of 60 s each     | CI probe: 10 s. Bazel: 366 s and 369 s                        | The step builds on its agent, with a warning. Without the probe: `Failed to query remote execution capabilities: DEADLINE_EXCEEDED` | The build runs on the Mac                                                     |
+| The hub stops answering **during** a build                   | gRPC keepalive, then CI: `timeout_in_minutes`                           | Keepalive: 30 s + 20 s, if PINGs go unanswered. CI: 60–90 min | Keepalive: `UNAVAILABLE`. Else the step is timed out                                                                                | Keepalive: the action runs on the Mac. Else waits until the hub answers again |
 
-The last row is the gap, and it is in the client. Bazel 9.1 puts no deadline on an execution call: `--remote_timeout` covers cache calls only, the flag that used to cover execution (`--experimental_remote_execution_keepalive`) is a no-op since 9.0, and the gRPC keepalive, on by default, did not end the wait either. Measured: with the hub's process stopped in the middle of an action, the build was still waiting, with no error, 17 minutes later. When the hub was allowed to run again the build carried on and finished by itself, which is also what a restart of the hub does to builds that are waiting on it.
+The last row is only partly bounded, and the remaining gap is in the client. Bazel 9.1 puts no deadline on an execution call: `--remote_timeout` covers cache calls only, and the flag that used to cover execution (`--experimental_remote_execution_keepalive`) is a no-op since 9.0. `--grpc_keepalive_time` **is** on by default in 9.1, at 60 s (pings after that much quiet, while a call is pending; 0 disables them). `dev-remote`, `ci-remote` and `ci-remote-linux` set `--grpc_keepalive_time=30s --grpc_keepalive_timeout=20s` so those values live in the rc files. A hub that does not ACK HTTP/2 PINGs then drops the transport; Bazel retries and then fails (CI) or falls back (developer). Measured with the 60 s default: with the hub's process stopped in the middle of an action, the build was still waiting, with no error, 17 minutes later. When the hub was allowed to run again the build carried on and finished by itself, which is also what a restart of the hub does to builds that are waiting on it. A hub whose HTTP/2 stack still ACKs PINGs is therefore not bounded by keepalive.
 
 So, for a hub that stops answering:
 
-- **A CI step that starts** asks the hub for its status page first (`.buildkite/steps/remote-execution.sh`) and builds on its agent if there is no answer or the answer is 503. A TCP connection is not enough: the kernel accepts one for a process that has stopped.
-- **A CI step that is running** is bounded by `timeout_in_minutes` in `.buildkite/pipeline.yml`, about four times the slowest passing run of each step.
-- **A developer's build that is running** waits. Interrupt it and add `--config=dev-local` to finish on the Mac.
+- **A CI step that starts** asks the hub for its status page first (`.buildkite/steps/remote-execution.sh`) and builds on its agent if there is no answer within 10 s (curl exit 28) or the answer is 503. A TCP connection is not enough: the kernel accepts one for a process that has stopped. Any other probe failure (reset, TLS, no route) is treated as "no status page" and the step still executes remotely.
+- **A CI step that is running** is bounded by keepalive if PINGs go unanswered, and otherwise by `timeout_in_minutes` on every remote-enabled step (`pipeline.yml` and the integrity pipeline), about four times the slowest passing run of each verification step.
+- **A developer's build that is running** falls back if keepalive PINGs go unanswered, and otherwise waits. Interrupt it and add `--config=dev-local` to finish on the Mac.
 - The hub's health check reports it within a minute (next section), and restarting the hub releases every waiting build.
 
-A deadline in the client needs Bazel 9.3 or later, where `--remote_grpc_service_config` can put a timeout on the execution service. It is not a small change: the timeout counts an action's whole time on the hub, queued and running, and Bazel gives up after `--remote_retries` of them, so the value also caps the longest action the pool can run.
+A per-RPC deadline in the client needs Bazel 9.3 or later, where `--remote_grpc_service_config` can put a timeout on the execution service. It is not a small change: the timeout counts an action's whole time on the hub, queued and running, and Bazel gives up after `--remote_retries` of them, so the value also caps the longest action the pool can run.
 
 ## Health check
 
@@ -178,9 +178,12 @@ If it is one Mac, the fault is on it (memory pressure, a disk, a hung action): r
 **`the hub did not answer a status request`, `reports a failed or stalled store`, `actions are queued … while N slots are free`.** The hub itself. First keep what happened, then restart it:
 
 ```sh
+set -a
+. ~/nativelink-macos-hub/hub.env
+set +a
 journalctl --user --unit nativelink-macos-hub.service --since -1h --output cat > ~/hub-$(date +%Y%m%dT%H%M).log
-curl -s http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/workers
-curl -s http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/demand
+curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/workers || true
+curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/demand || true
 systemctl --user restart nativelink-macos-hub.service
 ```
 
@@ -232,7 +235,7 @@ loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 systemctl --user enable --now nativelink-macos-hub.service
 journalctl --user --unit nativelink-macos-hub.service --output cat | head     # "Ready, listening on …" three times
-curl -s -o /dev/null -w '%{http_code}\n' http://<address>:50051/status         # 200
+curl -s --connect-timeout 10 --max-time 10 -o /dev/null -w '%{http_code}\n' http://<address>:50051/status         # 200
 ```
 
 A variable missing from `hub.env` fails the start with an error that names it.
@@ -267,7 +270,10 @@ macOS ties "Developer Tools" and "Local Network" (Privacy & Security) to the bin
 **5. Check the pool, then point the clients at it.** On the hub:
 
 ```sh
-curl -s http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/workers | grep -o '"id":"[a-z]*' | sort
+set -a
+. ~/nativelink-macos-hub/hub.env
+set +a
+curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/workers | grep -o '"id":"[a-z]*' | sort
 systemctl --user enable --now nativelink-macos-hub-health.timer
 ~/nativelink-macos-hub/hub-health.sh --journal-unit nativelink-macos-hub.service      # healthy: 6/6 workers …
 ```
@@ -290,4 +296,4 @@ A checkout that built against the old hub may log `Lost inputs no longer availab
 ## Not covered here
 
 - **The Linux workers' hub** (`.buildkite/linux-agents-runbook.md`, "Remote execution workers") still runs NativeLink 1.6.6 with no timeouts set, so it has the scheduler this change replaces for the Macs. Its hub and workers need the same upgrade and the same scheduler block. The CI probe and the step timeouts already apply to Linux steps; the probe needs a status page on that hub's client port to see more than a connection.
-- **A deadline in the Bazel client**, as described under "What bounds a stuck action".
+- **A per-RPC deadline in the Bazel client** (`--remote_grpc_service_config` in Bazel 9.3 or later), as described under "What bounds a stuck action". Keepalive and `timeout_in_minutes` are what 9.1 can do.

@@ -89,13 +89,21 @@ nc() {
 }
 
 # The status request. curl_http is the HTTP status the endpoint answers with;
-# 000 is what curl prints, with a failing exit status, when nothing answered.
+# 000 is what curl prints when nothing answered. A timeout is curl exit 28;
+# curl_fail_exit overrides that for other failures (reset, TLS, …).
 curl_calls="${TEST_TMPDIR:?}/curl-calls"
 curl_http=200
+curl_fail_exit=""
 curl() {
   printf '%s\n' "$*" >> "$curl_calls"
   printf '%s' "$curl_http"
-  [[ "$curl_http" != "000" ]]
+  if [[ -n "$curl_fail_exit" ]]; then
+    return "$curl_fail_exit"
+  fi
+  if [[ "$curl_http" == "000" ]]; then
+    return 28
+  fi
+  return 0
 }
 
 # decide <os_type> <allowed> <endpoint> <nc_status> [<arch>]: runs the decision
@@ -193,9 +201,9 @@ decide darwin 1 "$endpoint" 1 || fail "unreachable: decide failed"
 expect_local "unreachable" 1
 expect_equal "" "$(cat "$curl_calls")" "unreachable: status requested"
 
-# The endpoint accepts a connection and then says nothing. That is a process
-# that has stopped answering, and a bazel command sent to it would wait without
-# a limit, so the step builds on the agent.
+# The endpoint accepts a connection and then says nothing (curl exit 28).
+# That is a process that has stopped answering, and a bazel command sent to
+# it would wait without a per-RPC deadline, so the step builds on the agent.
 curl_http=000
 decide darwin 1 "$endpoint" 0 || fail "silent: decide failed"
 expect_local "silent" 1
@@ -221,6 +229,25 @@ decide darwin 1 "$endpoint" 0 || fail "no status page: decide failed"
 expect_equal "on" "$CI_REMOTE_EXECUTION" "no status page: CI_REMOTE_EXECUTION"
 expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "no status page: CI_REMOTE_EXECUTION_FELL_BACK"
 
+# A probe that fails for any reason other than a timeout (reset, empty reply,
+# TLS, HTTP/2-only listener) is treated the same way. Today's 1.6.6 hubs have
+# no status page on the client port; only curl exit 28 means the process
+# accepted a connection and then said nothing.
+curl_http=000
+curl_fail_exit=52
+decide darwin 1 "$endpoint" 0 || fail "curl 52: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "curl 52: CI_REMOTE_EXECUTION"
+expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "curl 52: CI_REMOTE_EXECUTION_FELL_BACK"
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"curl exit 52"* ]]; then
+  fail "curl 52: the reason does not name the curl exit: ${CI_REMOTE_EXECUTION_REASON}"
+fi
+curl_fail_exit=35
+decide darwin 1 "$endpoint" 0 || fail "curl 35: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "curl 35: CI_REMOTE_EXECUTION"
+expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "curl 35: CI_REMOTE_EXECUTION_FELL_BACK"
+curl_fail_exit=""
+curl_http=200
+
 # So is any endpoint on an agent that has no curl: the connection is then all
 # there is to go on, as it was before the status request existed.
 command() {
@@ -244,6 +271,12 @@ expect_equal "200" "$(ci_remote_endpoint_status "grpc://[::1]:50051" "::1" 50051
 expect_equal \
   "https://executor.test:443/status http://[::1]:50051/status" \
   "$(awk '{ print $NF }' "$curl_calls" | tr '\n' ' ' | sed 's/ $//')" "status request URLs"
+curl_http=000
+expect_equal "timeout" "$(ci_remote_endpoint_status "$endpoint" "executor.test" 50051)" "status timeout"
+curl_fail_exit=56
+expect_equal "curl:56" "$(ci_remote_endpoint_status "$endpoint" "executor.test" 50051)" "status curl 56"
+curl_fail_exit=""
+curl_http=200
 
 # A Linux x86-64 agent: the Linux config, and the probe uses the connect
 # timeout flag of the Linux nc. Everything else is the same decision.
@@ -326,6 +359,8 @@ fi
 
 real_rc="${workspace}/.ci.bazelrc"
 for line in \
+  "build:ci-remote --grpc_keepalive_time=30s" \
+  "build:ci-remote --grpc_keepalive_timeout=20s" \
   "build:ci-remote --noremote_local_fallback" \
   "build:ci-remote --remote_cache_compression" \
   "test:ci-remote --config=remote-tests"; do
@@ -334,6 +369,8 @@ for line in \
   fi
 done
 for line in \
+  "build:ci-remote-linux --grpc_keepalive_time=30s" \
+  "build:ci-remote-linux --grpc_keepalive_timeout=20s" \
   "build:ci-remote-linux --noremote_local_fallback" \
   "build:ci-remote-linux --remote_cache_compression" \
   "build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux" \
