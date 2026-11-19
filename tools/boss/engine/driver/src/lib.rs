@@ -837,6 +837,19 @@ pub enum WorkerErrorClass {
     Indeterminate,
 }
 
+impl WorkerErrorClass {
+    /// Stable label for attention bodies, dispatch events, and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkerErrorClass::Transient => "transient",
+            WorkerErrorClass::Permanent => "permanent",
+            WorkerErrorClass::QuotaExhausted => "quota_exhausted",
+            WorkerErrorClass::EligibilityServiceFailure => "eligibility_service_failure",
+            WorkerErrorClass::Indeterminate => "indeterminate",
+        }
+    }
+}
+
 /// What a driver's foreground process does with pty bytes that arrive while
 /// it is **mid-turn** (`WorkerActivity::Working`) — the property that decides
 /// whether `probe --urgent` can honour its documented "inject at the next

@@ -60,8 +60,10 @@ pub const AGENT_MODE: &str = "";
 /// `toolPermission` rendered for every kind.
 pub const TOOL_PERMISSION: &str = "request-review";
 
-/// Pin the pane study's buffered input mode. Accepted by agy 1.5.9's
-/// strict --settings parser; "send-immediately" changes mid-turn semantics.
+/// Pin the pane study's buffered input mode. The JSON key and `queue` value
+/// were accepted by agy 1.5.10's strict `--settings` parser (invalid values
+/// and the typo `queuedMessage` exit 1); "send-immediately" changes mid-turn
+/// semantics. See the permission-study queued-messages artifacts.
 pub const QUEUED_MESSAGES: &str = "queue";
 
 /// The one per-run CLI flag the posture needs.

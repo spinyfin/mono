@@ -20,7 +20,8 @@ use crate::conformance::fixtures::{
     project_command,
 };
 use crate::driver::agy::permissions::{
-    AGENT_MODE, RuleList, SettingsPlan, TOOL_PERMISSION, parse_rendered, render_settings, validate_rule,
+    AGENT_MODE, QUEUED_MESSAGES, RuleList, SettingsPlan, TOOL_PERMISSION, parse_rendered, render_settings,
+    validate_rule,
 };
 use crate::driver::agy::{MIN_QUALIFIED_AGY_VERSION, REFUSED_TOOL_PREFIX};
 use crate::driver::{AgentDriver, AgyDriver, ProgressSessionConfig, WorkerKind};
@@ -176,6 +177,32 @@ fn agent_mode_is_pinned_empty_so_auto_cannot_be_the_omitted_default() {
     assert!(
         message.contains("agentMode") || message.contains("missing field"),
         "expected a missing-agentMode parse error, got {message}"
+    );
+}
+
+#[test]
+fn golden_session_settings_pin_queued_messages_to_queue() {
+    // Permission study §1 / queued-messages artifacts: the JSON key is
+    // `queuedMessages` and the buffered-input value is `queue`. A CLI
+    // that renames the key fails the live `--settings` probe; this
+    // hermetic half pins what Boss renders.
+    let json: Value = serde_json::from_str(GOLDEN_SETTINGS_STANDARD).unwrap();
+    assert_eq!(json["queuedMessages"], QUEUED_MESSAGES);
+    assert_eq!(QUEUED_MESSAGES, "queue");
+    let err = parse_rendered(
+        r#"{
+            "agentMode": "",
+            "toolPermission": "request-review",
+            "queuedMessages": "not-a-real-mode",
+            "trustedWorkspaces": ["/boss-test-absent/ws"],
+            "permissions": { "deny": ["read_file(/boss-test-absent/data)"] }
+        }"#,
+    )
+    .expect_err("invalid queuedMessages value must fail closed");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("queuedMessages"),
+        "expected a queuedMessages validation error, got {message}"
     );
 }
 

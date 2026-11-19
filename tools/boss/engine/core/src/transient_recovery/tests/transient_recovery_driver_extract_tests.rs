@@ -7,6 +7,7 @@ use super::*;
 
 const CODEX_API_ERROR_PROSE: &str = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"API Error handling is now fixed"}]}}"#;
 const GROK_API_ERROR_PROSE: &str = r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"API Error handling is now fixed"}}}}"#;
+const AGY_API_ERROR_PROSE: &str = r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"API Error handling is now fixed"}"#;
 
 async fn driver_sweep(driver: &str, lines: &[&str], prior_attempts: i64) -> TransientRecoveryOutcome {
     let (dir, db) = open_db();
@@ -90,4 +91,39 @@ async fn native_grok_api_error_prose_is_not_a_halting_error() {
     assert_eq!(outcome.resumed, 0);
     assert_eq!(outcome.escalated, 0);
     assert_eq!(outcome.no_error_skipped, 1);
+}
+
+#[tokio::test]
+async fn native_agy_api_error_prose_is_not_a_halting_error() {
+    let outcome = driver_sweep("agy", &[AGY_API_ERROR_PROSE], 0).await;
+    assert_eq!(outcome.nudged, 0, "{outcome:?}");
+    assert_eq!(outcome.resumed, 0);
+    assert_eq!(outcome.escalated, 0);
+    assert_eq!(outcome.no_error_skipped, 1);
+}
+
+#[tokio::test]
+async fn inspect_uses_agy_flagged_extractor_instead_of_shared_api_error_prefix() {
+    let (dir, db) = open_db();
+    let product_id = create_product(&db);
+    db.update_work_item(
+        &product_id,
+        crate::work::WorkItemPatch {
+            default_driver: Some("agy".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let work_item_id = create_active_chore(&db, &product_id, "test chore");
+    let transcript = write_transcript(&dir, "t.jsonl", &[AGY_API_ERROR_PROSE]);
+    let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+    let inspection = inspect_normalized_transcript_tail(&db, &exec_id, &transcript).await;
+    assert!(
+        extract_worker_error(&inspection.lines).is_some(),
+        "the shared prefix heuristic still matches normalised agy assistant prose"
+    );
+    assert_eq!(
+        inspection.trailing_error, None,
+        "AgyDriver::extract_error_from_transcript must honour only flagged ERROR_MESSAGE rows"
+    );
 }

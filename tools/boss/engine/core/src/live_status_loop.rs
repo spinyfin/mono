@@ -879,8 +879,11 @@ impl LiveStatusManager {
 /// they reach the redaction/summarizer pipeline. Pulled out of
 /// `run_slot_loop` so the wiring itself — not just
 /// `AgentDriver::normalize_transcript_entry` in isolation — has test
-/// coverage.
-fn normalize_lines(
+/// coverage. The recovery sweep uses this same two-tier selection
+/// (`transcript_session()` when the driver correlates rows, else the
+/// per-row `normalize_transcript_entry`) so a pin change cannot fork
+/// the dialect used to read a running worker's native transcript.
+pub(crate) fn normalize_lines(
     driver: &dyn AgentDriver,
     session: &mut Option<Box<dyn TranscriptSessionNormalizer>>,
     lines: Vec<Value>,

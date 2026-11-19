@@ -619,11 +619,13 @@ impl AgentDriver for AgyDriver {
 
     fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String> {
         // The dialect work is in the normaliser, which flags a halting
-        // `ERROR_MESSAGE` step the way the shared "last meaningful entry"
-        // extractor reads it. A refused or failed *tool* step is a
-        // `tool_result` there, so a worker that was denied a command and then
-        // stopped is not mistaken for one wedged on an API error.
-        boss_engine_transient_error::extract_worker_error(lines)
+        // `ERROR_MESSAGE` step with `isApiErrorMessage: true`. Honour only
+        // that flag: the shared prose fallback treats any assistant text
+        // beginning "API Error" as a halt, and PLANNER_RESPONSE prose is
+        // reshaped into exactly that shape. A refused or failed *tool* step
+        // is a `tool_result` there, so a worker that was denied a command
+        // and then stopped is not mistaken for one wedged on an API error.
+        boss_engine_transient_error::extract_flagged_worker_error(lines)
     }
 
     fn classify_error(&self, raw_output: &str) -> WorkerErrorClass {
@@ -1417,6 +1419,24 @@ mod tests {
         assert_eq!(
             driver.extract_error_from_transcript(&normalized_lines(&driver, TOOL_CALLS_CAPTURE)),
             None
+        );
+    }
+
+    #[test]
+    fn planner_response_api_error_prose_is_not_a_halting_error() {
+        let driver = AgyDriver::default();
+        let row = r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"API Error handling is now fixed"}"#;
+        let lines = normalized_lines(&driver, &format!("{row}\n"));
+        assert_eq!(lines[0]["type"], "assistant");
+        assert_eq!(
+            boss_engine_transient_error::extract_worker_error(&lines).as_deref(),
+            Some("API Error handling is now fixed"),
+            "shared Claude-shaped fallback still matches the normalised prose"
+        );
+        assert_eq!(
+            driver.extract_error_from_transcript(&lines),
+            None,
+            "agy must honour only flagged ERROR_MESSAGE rows"
         );
     }
 

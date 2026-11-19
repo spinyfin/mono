@@ -227,10 +227,25 @@ pub fn classify_claude_error(text: &str) -> ErrorClass {
 /// result) after the most recent API error. `lines` is a slice of
 /// parsed transcript JSONL values, oldest-first.
 pub fn extract_worker_error(lines: &[Value]) -> Option<String> {
+    extract_trailing_error(lines, /*flag_only=*/ false)
+}
+
+/// Extract a trailing API-error using only `isApiErrorMessage: true`.
+///
+/// Same last-meaningful-entry rule as [`extract_worker_error`], without the
+/// Claude-only `starts_with("api error")` prose fallback. Drivers whose
+/// normaliser always flags a real error (agy's `ERROR_MESSAGE` →
+/// `isApiErrorMessage: true`) must use this so ordinary assistant prose
+/// that happens to begin "API Error" is not treated as a halt.
+pub fn extract_flagged_worker_error(lines: &[Value]) -> Option<String> {
+    extract_trailing_error(lines, /*flag_only=*/ true)
+}
+
+fn extract_trailing_error(lines: &[Value], flag_only: bool) -> Option<String> {
     let mut last_error: Option<(usize, String)> = None;
     let mut last_progress: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
-        if let Some(text) = entry_api_error_text(line) {
+        if let Some(text) = entry_api_error_text(line, flag_only) {
             last_error = Some((i, text));
         } else if is_progress_entry(line) {
             last_progress = Some(i);
@@ -246,10 +261,12 @@ pub fn extract_worker_error(lines: &[Value]) -> Option<String> {
 ///
 /// Claude Code records a fatal API error as an assistant entry flagged
 /// `isApiErrorMessage: true` whose text content reads `API Error: …`.
-/// We also accept any assistant/system entry whose extracted text
-/// begins with `api error` (case-insensitive) as a belt-and-braces
-/// fallback in case the flag is absent on a given client version.
-fn entry_api_error_text(line: &Value) -> Option<String> {
+/// When `flag_only` is false we also accept any assistant/system entry
+/// whose extracted text begins with `api error` (case-insensitive) as a
+/// belt-and-braces fallback in case the flag is absent on a given Claude
+/// client version. That fallback is Claude-shaped: other drivers must pass
+/// `flag_only` so ordinary prose is not a halt.
+fn entry_api_error_text(line: &Value, flag_only: bool) -> Option<String> {
     let entry_type = line.get("type").and_then(Value::as_str).unwrap_or("");
     if entry_type != "assistant" && entry_type != "system" {
         return None;
@@ -257,7 +274,7 @@ fn entry_api_error_text(line: &Value) -> Option<String> {
     let flagged = line.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false);
     let text = entry_text(line);
     let looks_like_error = text.trim_start().to_lowercase().starts_with("api error");
-    if flagged || looks_like_error {
+    if flagged || (!flag_only && looks_like_error) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             // Flagged but no text we could pull — still a real error.
@@ -287,7 +304,7 @@ fn entry_api_error_text(line: &Value) -> Option<String> {
 pub fn transcript_shows_no_activity(lines: &[Value]) -> bool {
     lines
         .iter()
-        .all(|line| entry_api_error_text(line).is_none() && !is_progress_entry(line))
+        .all(|line| entry_api_error_text(line, /*flag_only=*/ false).is_none() && !is_progress_entry(line))
 }
 
 /// True when `line` represents the worker doing real work — used to
@@ -635,6 +652,38 @@ mod tests {
     #[test]
     fn empty_transcript_yields_none() {
         assert_eq!(extract_worker_error(&[]), None);
+    }
+
+    #[test]
+    fn flagged_extractor_ignores_api_error_prose_without_the_flag() {
+        let lines = vec![assistant_text("API Error handling is now fixed")];
+        assert_eq!(
+            extract_worker_error(&lines).as_deref(),
+            Some("API Error handling is now fixed"),
+            "Claude-shaped fallback still matches unflagged prose"
+        );
+        assert_eq!(
+            extract_flagged_worker_error(&lines),
+            None,
+            "flag-only extractor must not halt on unflagged assistant prose"
+        );
+    }
+
+    #[test]
+    fn flagged_extractor_keeps_last_meaningful_flagged_entry() {
+        let lines = vec![
+            assistant_text("working on it"),
+            api_error_entry("You have exhausted your quota on this model."),
+        ];
+        assert_eq!(
+            extract_flagged_worker_error(&lines).as_deref(),
+            Some("You have exhausted your quota on this model."),
+        );
+        let recovered = vec![
+            api_error_entry("You have exhausted your quota on this model."),
+            assistant_text("retrying"),
+        ];
+        assert_eq!(extract_flagged_worker_error(&recovered), None);
     }
 
     // ─── transcript_shows_no_activity ──────────────────────────────────

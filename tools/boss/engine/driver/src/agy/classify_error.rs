@@ -20,12 +20,11 @@ pub(super) fn classify_agy_error(text: &str) -> WorkerErrorClass {
     };
     let has = |markers: &[&str]| markers.iter().any(|marker| lower.contains(marker));
 
-    // Quota takes precedence over retryable wrappers (including 429/500).
-    // RESOURCE_EXHAUSTED is also Google's per-minute rate-limit status, so
-    // it is quota only when the text also names quota or a used-up limit.
-    // A bare RESOURCE_EXHAUSTED / HTTP 429 RESOURCE_EXHAUSTED stays on the
-    // bounded-retry path instead of escalating as exhausted quota.
-    if has(&[
+    // Google's per-minute / per-second throttle uses quota wording
+    // (`Quota exceeded for quota metric '… per minute'`). That is a
+    // short-window rate limit, not an exhausted daily/account quota, so
+    // it stays on bounded retry. Check it before the exhaustion branch.
+    let has_quota_wording = has(&[
         "quota_exhausted",
         "quota exhausted",
         "quota_exceeded",
@@ -33,8 +32,30 @@ pub(super) fn classify_agy_error(text: &str) -> WorkerErrorClass {
         "quota has been exceeded",
         "quota has been exhausted",
         "exhausted your quota",
+    ]);
+    if has_quota_wording
+        && has(&[
+            "per minute",
+            "perminute",
+            "per_minute",
+            "per second",
+            "retrydelay",
+            "retry in",
+        ])
+    {
+        return WorkerErrorClass::Transient;
+    }
+    // Exhaustion (account/model/day) escalates without retry. Generic
+    // "quota exceeded" without a window or exhaustion phrasing is not
+    // enough: Google uses that prefix for the per-minute throttle too.
+    if has(&[
+        "quota_exhausted",
+        "quota exhausted",
+        "quota has been exhausted",
+        "exhausted your quota",
         "subscription limit for this account is used up",
-    ]) {
+    ]) || (has_quota_wording && has(&["per day", "perday", "per_day"]))
+    {
         return WorkerErrorClass::QuotaExhausted;
     }
     if has(&["eligibility check failed"]) && has_status("500") {
@@ -91,8 +112,7 @@ mod tests {
             "Quota exhausted",
             "The subscription limit for this account is used up; it resets in 5h",
             "QUOTA_EXHAUSTED: retry after reset",
-            "rpc error: code = ResourceExhausted desc = Quota exceeded",
-            "Your image generation quota has been exceeded. Please try again later.",
+            "Quota exceeded for quota metric 'Generate Content API requests per day'",
             "Eligibility check failed: 500 Internal Server Error: QUOTA_EXHAUSTED",
         ] {
             assert_eq!(
@@ -104,10 +124,37 @@ mod tests {
     }
 
     #[test]
-    fn resource_exhausted_is_quota_only_with_quota_language() {
+    fn short_window_quota_wording_is_transient_rate_limit() {
+        let driver = AgyDriver::default();
+        for error in [
+            "Quota exceeded for quota metric 'Generate Content API requests per minute' and limit '… per minute …'",
+            "rpc error: code = ResourceExhausted desc = Quota exceeded for quota metric 'Generate Content API requests per minute'",
+            "RESOURCE_EXHAUSTED: Quota exceeded RetryDelay: 8s",
+            "quota exceeded, retry in 20s",
+            "Quota exceeded for quota metric GenerateContentRequestsPerMinutePerProject",
+        ] {
+            assert_eq!(driver.classify_error(error), WorkerErrorClass::Transient, "{error}");
+        }
+    }
+
+    #[test]
+    fn generic_quota_exceeded_without_exhaustion_or_window_is_not_quota() {
         let driver = AgyDriver::default();
         assert_eq!(
             driver.classify_error("rpc error: code = ResourceExhausted desc = Quota exceeded"),
+            WorkerErrorClass::Indeterminate
+        );
+        assert_eq!(
+            driver.classify_error("Your image generation quota has been exceeded. Please try again later."),
+            WorkerErrorClass::Indeterminate
+        );
+    }
+
+    #[test]
+    fn resource_exhausted_is_quota_only_with_exhaustion_language() {
+        let driver = AgyDriver::default();
+        assert_eq!(
+            driver.classify_error("rpc error: code = ResourceExhausted desc = You have exhausted your quota"),
             WorkerErrorClass::QuotaExhausted
         );
         assert_eq!(
