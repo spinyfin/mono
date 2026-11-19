@@ -478,7 +478,7 @@ async fn an_adopted_alive_worker_keeps_the_lease_until_its_session_is_gone() {
 
 #[tokio::test]
 async fn a_settled_uncertain_spawn_adopted_alive_is_stopped_then_released() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let gone = Arc::new(AtomicBool::new(false));
@@ -534,9 +534,10 @@ async fn a_settled_uncertain_spawn_adopted_alive_is_stopped_then_released() {
 
 #[tokio::test]
 async fn an_adopted_alive_worker_that_never_accepted_its_brief_is_stopped_not_reported_running() {
-    // Only Spawn is intentionally unanswered; Stop must have time to confirm
-    // its reply while the integration tests share a loaded CI worker.
-    let fx = Fixture::with(workspace_slack(300)).await;
+    // Every command is answered (the spawn with an uncertain refusal), so no
+    // deadline is meant to fire here: keep them all far above what a loaded
+    // CI worker shared with dozens of sibling tests can take to deliver a reply.
+    let fx = Fixture::with(workspace_slack(10_000)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
