@@ -106,7 +106,10 @@ fn work_resumed_evidence() -> String {
     // completed spawn run, not merely another attempt (active or failed).
     // Other WorkResumed signals retain their run-start clearing contract,
     // including the generic self-exclusion: a later run of the *same*
-    // execution does not clear those kinds.
+    // execution does not clear those kinds. The retired
+    // `question_resume_dispatch_failed` kind (no producer remains; rows from
+    // earlier builds may persist) was filed against the resume that could
+    // not start, so that execution's own later start is its clearing evidence.
     format!(
         "EXISTS (
              SELECT 1
@@ -117,7 +120,10 @@ fn work_resumed_evidence() -> String {
                AND {REAL_RUN_START}
                AND (work_attention_items.kind != 'pane_spawn_failed' OR r.status = 'completed')
                AND CAST(r.started_at AS INTEGER) >= CAST({ATTENTION_RAISED_AT} AS INTEGER)
-               AND r.execution_id IS NOT work_attention_items.execution_id
+               AND (
+                    work_attention_items.kind = 'question_resume_dispatch_failed'
+                    OR r.execution_id IS NOT work_attention_items.execution_id
+               )
          )"
     )
 }
