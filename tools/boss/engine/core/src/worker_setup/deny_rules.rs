@@ -142,7 +142,7 @@ pub fn answer_agent_allow_rules() -> Vec<String> {
 ///   checkout; it must not lease, release, or otherwise mutate cube state
 ///   itself (design capability table: "Release/mutate cube lease state … No").
 pub fn answer_agent_deny_rules() -> Vec<String> {
-    read_only_worker_deny_rules()
+    crate::driver::capability_rules::answer_agent_deny_rules()
 }
 
 /// The `permissions.allow` allowlist for [`WorkerKind::Progression`]. The

@@ -113,7 +113,7 @@ repository, created before the spawn and removed when the run is torn down.
 The spawn machinery needs a directory to write the agent-rules file, the settings
 pointer and the initial-input script, and nothing else lives there.
 
-What it can run is an allowlist under `--permission-mode dontAsk`, which the
+What it can run is a deny-by-default allowlist (`dontAsk`), which the
 dispatcher forces so it cannot be downgraded: `Read`, `Grep` and `Glob`;
 `boss propose`, read-only `boss task show|list` and `boss pr status` (in both
 the bare `boss` and `"$BOSS_BIN"` spellings); and `gh pr view|checks`. Everything
@@ -134,9 +134,57 @@ the Standard posture:
   chaining, redirection or substitution, and rejects mutating `gh`, `jj`, `git`,
   `cube` and every file write.
 - **Grok** receives the same allow and deny rules as `--allow` / `--deny`
-  arguments under `--permission-mode dontAsk`. On local macOS it runs with
-  `--sandbox off` like every other local kind, so those rules are the only
-  confinement there; elsewhere it also gets the read-only sandbox profile.
+  arguments. On local macOS it runs with `--sandbox off` like every other
+  local kind, so those rules are the only confinement there; elsewhere it also
+  gets the read-only sandbox profile. Deny-by-default takes three things in
+  Grok's interactive TUI, where `--permission-mode dontAsk` on its own gives an
+  _ask_ session that opens an approval dialog for anything outside the list:
+  the pane is launched without `--always-approve` (which would run everything
+  no deny rule names), `permissions.defaultMode = "dontAsk"` is written to
+  `.claude/settings.json` under the run's scoped process `HOME`, and the flag
+  stays on the command line because it switches off a stray
+  `--always-approve`. The same launch applies to the answer agent and the
+  review guide. Grok never allowlists a command whose program is a shell
+  variable, so the `"$BOSS_BIN"` rules are inert there and only bare `boss`
+  runs. Restricted Grok kinds are taught the bare `boss` spelling in their
+  agent rules, their `--allow` table includes that kind's submit verb as
+  `Bash(boss …:*)`, and the launch guard that would refuse a PATH `boss` is
+  dropped for those kinds. A `PreToolUse` belt still refuses a command that
+  contains `$BOSS_BIN` or `${BOSS_BIN}` anywhere and names the bare spelling
+  to use instead. Measurements:
+  [`grok-restricted-permission-mode-in-the-tui-2026-11-18.md`](investigations/grok-restricted-permission-mode-in-the-tui-2026-11-18.md).
+
+### A restricted worker left on an approval prompt
+
+A kind launched deny-by-default has nobody to answer an approval prompt, so a
+prompt that opens anyway would hold the run's pool slot until its pane was
+torn down for some other reason. The engine does not wait for that. When such
+a worker's driver reports an approval prompt
+(`AgentDriver::approval_prompt_reported`; Grok's `permission_prompt`
+notification is the one measured mapping) and that prompt is still outstanding
+two minutes later, the execution is recorded failed with an
+`UnansweredApprovalPrompt` reason naming the driver and the wait, its pane and
+slot are released, and a `stale_worker_reconcile` dispatch event carries
+`unanswered_approval_prompt`. The pane is released even if recording the
+failure write itself fails. A progression run is failed on its own row only:
+the stuck item it was inspecting is not blocked or annotated, and the failure
+counts toward that item's infrastructure-failure cap like any other.
+
+The two minutes are a margin against acting on a prompt that was answered, not
+a wait for something expected: the only automatic answer measured takes 0.02
+seconds, and a session without always-approve has none. Kinds launched under
+always-approve are not watched, because there Grok raises the same
+notification for a command it cannot check against its deny rules and answers
+it itself, after which the tool runs for as long as it runs. An unrelated later
+event does not clear the watch: Grok's background `task_complete` is an
+ordinary Notification, and the watch stays armed until a new PreToolUse, a
+PostToolUse, a Stop, or a SessionEnd shows the dialog closed. The watch is an
+in-memory timer started by the prompt's event; an engine restart inside the
+two minutes loses it. A progression run is then bounded by
+`progression.run_timeout`. That timeout is evaluated even while the slot is
+still `Spawning` (an adopted pane starts there, and Grok never reports
+`AwaitingInput`, so a restricted run left on a prompt stays Spawning). If
+`started_at` was never recorded, the sweep uses `created_at`.
 
 The PATH and launcher environment described above applies unchanged: the boss
 and cube launchers are materialized in the worker tool directory and the sealed

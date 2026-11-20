@@ -153,6 +153,10 @@ struct DriverHookResolution {
     /// boundary that could be hand-set at a construction site is a boundary
     /// the driver seam does not actually own.
     turn_boundary: Option<TurnEnd>,
+    /// The driver's answer to "does this event report an approval prompt on
+    /// the pane", resolved at the same seam as the turn boundary so it too
+    /// cannot be hand-set at a construction site.
+    approval_prompt: bool,
     /// Driver-owned root the transcript path must remain beneath, resolved at
     /// the same seam as the turn boundary. `Err` is retained rather than
     /// degraded to unrestricted access: a broken containment root must make
@@ -182,6 +186,7 @@ impl IncomingHookEvent {
         let driver_resolution = DriverHookResolution {
             preceding_events: Vec::new(),
             turn_boundary: driver.turn_boundary(&event),
+            approval_prompt: driver.approval_prompt_reported(&event),
             transcript_containment_root: match run_id.as_deref() {
                 Some(run_id) => driver
                     .transcript_containment_root(run_id)
@@ -215,6 +220,7 @@ impl IncomingHookEvent {
             // Internal evidence does not consume the native hook's activity sequence.
             incoming.connection.ingress_seq = None;
             incoming.driver_resolution.turn_boundary = None;
+            incoming.driver_resolution.approval_prompt = false;
             events.push(incoming);
         }
         events.push(self);
@@ -277,6 +283,14 @@ impl IncomingHookEvent {
     /// on-turn-boundary dispatcher opens with.
     pub fn is_turn_boundary(&self) -> bool {
         self.driver_resolution.turn_boundary.is_some()
+    }
+
+    /// Whether the run's driver says this event reports an interactive
+    /// approval prompt on the worker's pane. See
+    /// [`AgentDriver::approval_prompt_reported`] for what that does and does
+    /// not establish.
+    pub fn reports_approval_prompt(&self) -> bool {
+        self.driver_resolution.approval_prompt
     }
 
     pub fn transcript_containment_root(&self) -> Result<Option<&Path>, &str> {

@@ -873,12 +873,6 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         }
 
-        // A spawn may have persisted its session identity before creating it.
-        if state.activity == WorkerActivity::Spawning {
-            outcome.not_working_skipped += 1;
-            continue;
-        }
-
         // Look the execution up before the inspector so a terminal row
         // resolves its stale_worker attention even when the production
         // inspector returns `None` (`tmux_run_for_execution` excludes
@@ -897,12 +891,15 @@ pub async fn run_one_pass_with_terminal_and_grace(
             continue;
         }
 
+        // Evaluated before the Spawning skip below: an adopted pane starts as
+        // Spawning and Grok never reports AwaitingInput, so a restricted run
+        // left on an approval prompt must still be bounded by the timeout.
         // A `progression` run is bounded by its own wall-clock timeout, not by
         // the semantic-staleness ladder: that ladder raises `stale_worker`
         // attention and appends audit text on the *work item*, and a progression
         // run's item is the stuck item it is inspecting, which this sweep must
         // not touch. Reaped past the timeout through the ordinary reaper; until
-        // then left alone.
+        // then left alone. Activity is ignored here on purpose.
         if execution.kind == boss_protocol::ExecutionKind::Progression {
             if reap_timed_out_progression(
                 ProgressionReapContext {
@@ -920,6 +917,12 @@ pub async fn run_one_pass_with_terminal_and_grace(
             {
                 outcome.reaped += 1;
             }
+            continue;
+        }
+
+        // A spawn may have persisted its session identity before creating it.
+        if state.activity == WorkerActivity::Spawning {
+            outcome.not_working_skipped += 1;
             continue;
         }
 
@@ -1212,17 +1215,20 @@ async fn reap_timed_out_progression(
         dispatch_events,
         reaper,
     } = ctx;
-    let Some(started_epoch) = execution.started_epoch() else {
+    // `started_at` is unset until the first run row is recorded. After an
+    // engine restart a live pane can be re-adopted with no start stamp; the
+    // row's `created_at` is then the only wall-clock the timeout can use.
+    let Some(anchor_epoch) = execution.started_epoch().or_else(|| execution.created_epoch()) else {
         return false;
     };
     let timeout_secs = progression_run_timeout_secs(work_db);
-    if now_epoch_secs.saturating_sub(started_epoch) <= timeout_secs {
+    if now_epoch_secs.saturating_sub(anchor_epoch) <= timeout_secs {
         return false;
     }
     let execution_id = &state.run_id;
     let reason = format!(
         "progression-run-timeout: the run was still going {}s after it started (limit {timeout_secs}s); reaped",
-        now_epoch_secs.saturating_sub(started_epoch)
+        now_epoch_secs.saturating_sub(anchor_epoch)
     );
     tracing::warn!(
         execution_id,

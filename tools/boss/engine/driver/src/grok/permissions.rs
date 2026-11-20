@@ -22,8 +22,35 @@
 //! These policies complement the `PreToolUse` guards ([`super::hooks`]).
 //! Local macOS workers intentionally rely on the repository's test sandbox
 //! rather than a Boss-owned OS-level profile.
+//!
+//! ## Deny-by-default for the restricted kinds
+//!
+//! The kinds the engine forces to `dontAsk` (answer agent, review guide,
+//! progression) must run their allowlist and get a refusal for everything
+//! else, with nothing ever waiting on a keypress. In Grok's interactive TUI
+//! the `--permission-mode dontAsk` flag does not do that. Measured on grok
+//! 1.0.70
+//! (`tools/boss/docs/investigations/grok-restricted-permission-mode-in-the-tui-2026-11-18.md`):
+//!
+//! - The flag puts the session in `default` (ask) mode, with or without
+//!   `--always-approve` beside it. A command outside the allowlist then opens
+//!   an approval dialog, and an unattended pane sits on it indefinitely.
+//! - The posture the flag's name promises is reached through the
+//!   Claude-compatible setting `permissions.defaultMode = "dontAsk"`: a call
+//!   outside the allowlist is refused at once and the model is told so.
+//! - `--always-approve` takes precedence over that setting and runs
+//!   everything no `--deny` rule names, unless the flag is also present, in
+//!   which case the session is back in ask mode and the setting decides.
+//!
+//! So a restricted kind is launched without `--always-approve`
+//! ([`super::build_grok_pane_command`]), with the setting written into its
+//! scoped process `HOME` ([`write_restricted_claude_settings`]), and with the
+//! flag kept as the belt that stops a stray `--always-approve` from turning
+//! the session into allow-everything.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
 
 use crate::WorkerKind;
 
@@ -203,14 +230,73 @@ pub fn structural_deny_rules(
 /// Delegates to the shared mirror: AnswerAgent, ReviewGuide and Progression
 /// force `Some("dontAsk")`. Other kinds return `None` because the pane
 /// already carries `--always-approve`.
+///
+/// `Some` marks a deny-by-default kind, which the flag alone does not
+/// deliver: see the module documentation and
+/// [`write_restricted_claude_settings`].
 pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'static str> {
     crate::capability_rules::forced_permission_mode(worker_kind)
 }
 
+/// Where Grok reads the Claude-compatible user settings for a worker whose
+/// process `HOME` is `process_home`.
+pub fn restricted_claude_settings_path(process_home: &Path) -> PathBuf {
+    process_home.join(".claude").join("settings.json")
+}
+
+/// The Claude-compatible settings document that makes a restricted kind's
+/// session deny-by-default, or `None` for a kind that runs under
+/// always-approve.
+///
+/// It carries the mode and nothing else. The allow and deny rules stay on the
+/// command line, where [`extra_args`] renders them from the shared tables.
+pub fn render_restricted_claude_settings(worker_kind: WorkerKind) -> Option<String> {
+    let mode = permission_mode_for_worker_kind(worker_kind)?;
+    let document = serde_json::json!({ "permissions": { "defaultMode": mode } });
+    Some(format!("{document:#}\n"))
+}
+
+/// Write the deny-by-default settings for `worker_kind` under the worker's
+/// scoped process `HOME`, returning the path written. For a kind that needs
+/// none, remove a file a previous run of this home may have left and return
+/// `None`.
+///
+/// The scoped `HOME` is engine-owned and per run, so this is the only
+/// `~/.claude/settings.json` the session can load: provisioning clears the
+/// directory and the posture check refuses a launch that still sees the
+/// machine owner's copy.
+pub fn write_restricted_claude_settings(
+    process_home: &Path,
+    worker_kind: WorkerKind,
+) -> anyhow::Result<Option<PathBuf>> {
+    let path = restricted_claude_settings_path(process_home);
+    let Some(settings) = render_restricted_claude_settings(worker_kind) else {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing stale {}", path.display()));
+            }
+        }
+        return Ok(None);
+    };
+    let dir = path.parent().unwrap_or(process_home);
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(&path, settings).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(path))
+}
+
 /// Assemble the full `extra_args` the spawn flow must append: `--sandbox`,
-/// one `--deny` per structural rule, then `--permission-mode` if forced.
+/// one `--deny` per structural rule, then `--allow` / `--deny` pairs for a
+/// deny-by-default kind, then `--permission-mode` if forced.
 /// Order matches [`crate::apply_permission_extra_args`]'s flag/value pairing
 /// (every entry immediately followed by its value).
+///
+/// The forced `--permission-mode` does not by itself make the session
+/// deny-by-default (see the module documentation). It stays on the command
+/// line because it overrides `--always-approve`: with it present, a pane
+/// command that carried always-approve by mistake is still governed by
+/// [`write_restricted_claude_settings`] instead of running everything.
 pub fn extra_args(
     worker_kind: WorkerKind,
     boss_data_dir: Option<&Path>,
@@ -227,31 +313,59 @@ pub fn extra_args(
         args.push("--deny".to_owned());
         args.push(rule);
     }
-    if worker_kind == WorkerKind::ReviewGuide {
-        for rule in crate::codex::review_guide_allow_rules() {
-            args.extend(["--allow".into(), rule]);
-        }
-    }
-    // The progression agent gets the same capability table Claude renders into
-    // its settings: under the forced `dontAsk` mode the allowlist is the whole
-    // set of actions it can take, and the deny belt (every write, `jj`/`git`,
-    // `cube`, mutating `gh`) sits on top. This is what confines it on local
-    // macOS, where Grok runs with `--sandbox off` like every other local kind.
-    if worker_kind == WorkerKind::Progression {
-        for rule in crate::capability_rules::progression_deny_rules() {
-            if !args.windows(2).any(|pair| pair[0] == "--deny" && pair[1] == rule) {
-                args.extend(["--deny".into(), rule]);
-            }
-        }
-        for rule in crate::capability_rules::progression_allow_rules() {
-            args.extend(["--allow".into(), rule]);
-        }
-    }
+    // Every kind the engine forces to `dontAsk` must carry its submit verb as
+    // a Grok-admissible `--allow` (bare `boss`, never `"$BOSS_BIN"`). Grok
+    // ignores `SpawnRequest.settings_path`, so the Claude settings allowlist
+    // never reaches it. Of the two spellings each shared `boss` rule comes
+    // in, only the bare one ever matches; `hooks::VARIABLE_BOSS_PROGRAM_GUARD_COMMAND`
+    // is a belt that redirects a worker off the inert form.
+    push_restricted_kind_rules(&mut args, worker_kind);
     if let Some(mode) = permission_mode_for_worker_kind(worker_kind) {
         args.push("--permission-mode".to_owned());
         args.push(mode.to_owned());
     }
+    debug_assert!(
+        grok_admissible_submit_allow_rule(worker_kind)
+            .is_none_or(|rule| args.windows(2).any(|pair| pair == ["--allow", rule])),
+        "a deny-by-default Grok launch must --allow the kind's bare-boss submit verb"
+    );
     args
+}
+
+/// Extra `--deny` / `--allow` pairs for a deny-by-default kind. Empty for
+/// kinds that run under always-approve.
+fn push_restricted_kind_rules(args: &mut Vec<String>, worker_kind: WorkerKind) {
+    let (denies, allows): (Vec<String>, Vec<String>) = match worker_kind {
+        WorkerKind::AnswerAgent => (
+            crate::capability_rules::answer_agent_deny_rules(),
+            crate::capability_rules::answer_agent_allow_rules(),
+        ),
+        WorkerKind::ReviewGuide => (Vec::new(), crate::codex::review_guide_allow_rules()),
+        WorkerKind::Progression => (
+            crate::capability_rules::progression_deny_rules(),
+            crate::capability_rules::progression_allow_rules(),
+        ),
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => return,
+    };
+    for rule in denies {
+        if !args.windows(2).any(|pair| pair[0] == "--deny" && pair[1] == rule) {
+            args.extend(["--deny".into(), rule]);
+        }
+    }
+    for rule in allows {
+        args.extend(["--allow".into(), rule]);
+    }
+}
+
+/// The `--allow` rule that admits this kind's submit verb in the bare `boss`
+/// spelling Grok can match. `None` for kinds that are not deny-by-default.
+pub fn grok_admissible_submit_allow_rule(worker_kind: WorkerKind) -> Option<&'static str> {
+    match worker_kind {
+        WorkerKind::AnswerAgent => Some("Bash(boss comment reply:*)"),
+        WorkerKind::ReviewGuide => Some("Bash(boss propose review-guide:*)"),
+        WorkerKind::Progression => Some("Bash(boss propose:*)"),
+        WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => None,
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +457,51 @@ mod tests {
                 assert_eq!(sandbox, "boss-read-only");
             }
         }
+    }
+
+    #[test]
+    fn restricted_kinds_render_the_deny_by_default_setting_and_others_render_none() {
+        for kind in [
+            WorkerKind::Progression,
+            WorkerKind::AnswerAgent,
+            WorkerKind::ReviewGuide,
+        ] {
+            let settings = render_restricted_claude_settings(kind).expect("a restricted kind renders settings");
+            let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+            assert_eq!(
+                parsed,
+                serde_json::json!({"permissions": {"defaultMode": "dontAsk"}}),
+                "{kind:?}: the mode and nothing else"
+            );
+        }
+        for kind in [WorkerKind::Standard, WorkerKind::Reviewer, WorkerKind::Triage] {
+            assert_eq!(render_restricted_claude_settings(kind), None, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn restricted_settings_are_written_under_the_scoped_home_and_removed_for_other_kinds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let process_home = tmp.path().join("process-home");
+        std::fs::create_dir_all(&process_home).unwrap();
+        let expected = process_home.join(".claude").join("settings.json");
+
+        let written = write_restricted_claude_settings(&process_home, WorkerKind::Progression).unwrap();
+        assert_eq!(written.as_deref(), Some(expected.as_path()));
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&expected).unwrap()).unwrap();
+        assert_eq!(parsed["permissions"]["defaultMode"], "dontAsk");
+
+        // The same home provisioned for an always-approve kind must not keep it.
+        assert_eq!(
+            write_restricted_claude_settings(&process_home, WorkerKind::Standard).unwrap(),
+            None
+        );
+        assert!(!expected.exists(), "a stale deny-by-default file must be removed");
+        // And removing what is not there is not an error.
+        assert_eq!(
+            write_restricted_claude_settings(&process_home, WorkerKind::Standard).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -476,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn extra_args_orders_sandbox_then_deny_pairs_then_permission_mode() {
+    fn extra_args_orders_sandbox_then_deny_pairs_then_allow_pairs_then_permission_mode() {
         let dir = PathBuf::from("/boss-data");
         let workspace = PathBuf::from("/ws");
         let args = extra_args(WorkerKind::AnswerAgent, Some(&dir), &workspace, false);
@@ -489,13 +648,52 @@ mod tests {
                 "boss-workspace"
             }
         );
-        // Every --deny is immediately followed by its rule value.
+        // Every --deny / --allow is immediately followed by its rule value.
         let mut i = 2;
         while args[i] == "--deny" {
             assert!(i + 1 < args.len());
             i += 2;
         }
+        while args[i] == "--allow" {
+            assert!(i + 1 < args.len());
+            i += 2;
+        }
         assert_eq!(&args[i..], ["--permission-mode", "dontAsk"]);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--allow", "Bash(boss comment reply:*)"]),
+            "answer agent submit verb must be Grok-admissible: {args:?}"
+        );
+        for rule in crate::capability_rules::answer_agent_deny_rules() {
+            assert!(
+                args.windows(2).any(|pair| pair == ["--deny", &rule]),
+                "answer agent deny belt missing {rule}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_deny_by_default_kind_admits_its_submit_verb_as_bare_boss() {
+        for kind in [
+            WorkerKind::AnswerAgent,
+            WorkerKind::ReviewGuide,
+            WorkerKind::Progression,
+        ] {
+            assert_eq!(permission_mode_for_worker_kind(kind), Some("dontAsk"));
+            let settings = render_restricted_claude_settings(kind).expect("dontAsk settings");
+            assert!(settings.contains("dontAsk"), "{kind:?}: {settings}");
+            let args = extra_args(kind, None, Path::new("/ws"), false);
+            let submit = grok_admissible_submit_allow_rule(kind).expect("a restricted kind has a submit verb");
+            assert!(
+                args.windows(2).any(|pair| pair == ["--allow", submit]),
+                "{kind:?}: merged Grok launch must --allow {submit}: {args:?}"
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--permission-mode", "dontAsk"]));
+        }
+        for kind in [WorkerKind::Standard, WorkerKind::Reviewer, WorkerKind::Triage] {
+            assert_eq!(grok_admissible_submit_allow_rule(kind), None);
+            assert_eq!(permission_mode_for_worker_kind(kind), None);
+        }
     }
 
     #[test]

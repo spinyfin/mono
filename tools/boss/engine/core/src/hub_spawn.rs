@@ -25,7 +25,9 @@ use boss_execution_runner::WorkerSpawnOpts;
 use crate::driver::{DriverRegistry, EnvDirective};
 use crate::runner::compose_worker_spawn;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
-use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json, worker_kind_for_execution};
+use crate::worker_setup::{
+    WorkerSetupInput, render_remote_settings_json, worker_boss_invocation, worker_kind_for_execution,
+};
 
 /// Shim binary name resolved on the remote PATH by both the SSH and spoke
 /// transports. Cube's standard install puts `boss-event` on the worker's PATH,
@@ -209,10 +211,11 @@ pub async fn compose_remote_spawn(request: ComposeRemoteSpawn<'_>) -> Result<Spa
         structured_output_kind,
         pr_url_output,
         permission_mode: settings_input.worker_kind.forced_permission_mode().map(str::to_owned),
-        agent_rules: Some(crate::worker_setup::render_claude_md(
+        agent_rules: Some(crate::worker_setup::render_claude_md_with_invocation(
             &settings_input,
             driver.agent_rules_preamble(),
             driver.descriptor().config_dir,
+            worker_boss_invocation(driver.descriptor().name, &settings_input.worker_kind),
         )),
         ..Default::default()
     };

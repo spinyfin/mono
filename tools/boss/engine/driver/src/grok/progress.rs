@@ -106,6 +106,26 @@ fn mapped<'a>(table: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
     table.iter().find(|(from, _)| *from == key).map(|(_, to)| *to)
 }
 
+/// `notificationType` of the `Notification` Grok raises when it opens a tool
+/// approval dialog. Measured on grok 0.2.114 and again on 1.0.70.
+const APPROVAL_PROMPT_NOTIFICATION_TYPE: &str = "permission_prompt";
+
+/// Message a decoded approval-prompt [`WorkerEvent::Notification`] carries.
+/// It is Grok's own wording, and the normaliser writes it for every
+/// `permission_prompt` notification whatever Grok sent.
+pub(super) const APPROVAL_PROMPT_MESSAGE: &str = "Tool permission requested";
+
+/// Whether a decoded event is Grok's approval-prompt notification. Backs
+/// [`crate::AgentDriver::approval_prompt_reported`].
+///
+/// In a session without always-approve this means a dialog is on the pane
+/// and stays there until a key is pressed. In an always-approve session Grok
+/// raises it for a command it cannot check against the `--deny` rules and
+/// answers it itself about 20ms later, so there it means nothing is stuck.
+pub(super) fn is_approval_prompt(event: &WorkerEvent) -> bool {
+    matches!(event, WorkerEvent::Notification { message, .. } if message == APPROVAL_PROMPT_MESSAGE)
+}
+
 /// Rewrite one raw Grok hook payload into the canonical snake_case shape
 /// [`normalize_hook_event`] expects.
 ///
@@ -157,7 +177,17 @@ fn canonicalize(raw: &Value) -> Result<Value, NormalizeError> {
 /// (malformed JSON, missing session identity, …) — those errors propagate
 /// too, so a genuine defect is visible rather than swallowed.
 fn normalize_grok_hook_event(raw: &Value) -> Result<WorkerEvent, NormalizeError> {
-    let canonical = canonicalize(raw)?;
+    let mut canonical = canonicalize(raw)?;
+    // The approval prompt is identified by its `notificationType`, which the
+    // decoded event does not carry. Pin the message to the one string
+    // `is_approval_prompt` recognises so the decision follows the type and
+    // not Grok's wording of the day.
+    if canonical.get("hook_event_name").and_then(Value::as_str) == Some("Notification")
+        && canonical.get("notification_type").and_then(Value::as_str) == Some(APPROVAL_PROMPT_NOTIFICATION_TYPE)
+        && let Some(object) = canonical.as_object_mut()
+    {
+        object.insert("message".to_owned(), Value::String(APPROVAL_PROMPT_MESSAGE.to_owned()));
+    }
     normalize_hook_event(&canonical).inspect_err(|err| {
         if let NormalizeError::UnknownEvent(name) = err {
             tracing::debug!(
@@ -462,14 +492,13 @@ mod tests {
         );
     }
 
-    /// The one `notificationType` that genuinely means "blocked awaiting a
-    /// human" — measured against grok 0.2.114 by removing `--always-approve`
-    /// and sitting on the resulting permission prompt. It is pinned here so
-    /// the shape is captured in code, but it deliberately normalises to a
-    /// plain [`WorkerEvent::Notification`] like any other: Boss spawns Grok
-    /// with `--always-approve`, which suppresses the prompt that raises it,
-    /// so `GrokDriver` does **not** declare `Capability::AwaitingInputSignal`
-    /// and nothing downstream may promote this into `WaitingForInput`.
+    /// The `notificationType` Grok raises when it opens an approval dialog,
+    /// measured against grok 0.2.114 by removing `--always-approve` and
+    /// sitting on the resulting prompt. It normalises to a plain
+    /// [`WorkerEvent::Notification`] like any other: `GrokDriver` does **not**
+    /// declare `Capability::AwaitingInputSignal` and nothing downstream may
+    /// promote this into `WaitingForInput`. It is recognised separately, as
+    /// an approval prompt, by [`is_approval_prompt`].
     /// See `grok-notification-vocabulary-and-leader-process-2026-07-29.md`.
     #[test]
     fn permission_prompt_notification_stays_an_ordinary_notification() {
@@ -487,11 +516,57 @@ mod tests {
                 message: "Tool permission requested".into(),
             }
         );
-        // `notificationType` is canonicalised for shape consistency but is
-        // not consumed — there is no awaiting-input branch to route it to.
+        // `notificationType` is canonicalised; there is no awaiting-input
+        // branch to route it to.
         let canonical = canonicalize(&raw).unwrap();
         assert_eq!(canonical["notification_type"], "permission_prompt");
         assert!(canonical.get("notificationType").is_none());
+    }
+
+    /// The approval prompt is recognised by its `notificationType`, so a
+    /// reworded or missing message still counts and another notification
+    /// that happens to share the wording does not have to.
+    #[test]
+    fn approval_prompt_is_recognised_by_notification_type_not_wording() {
+        let prompt = |message: serde_json::Value| {
+            let mut raw = json!({
+                "hookEventName": "notification",
+                "sessionId": "76744658-0402-42f7-a644-68dd52f6dad4",
+                "notificationType": "permission_prompt",
+                "permissionMode": "default",
+            });
+            if !message.is_null() {
+                raw["message"] = message;
+            }
+            session().normalize_progress_event(&raw).unwrap()
+        };
+        for message in [
+            json!("Tool permission requested"),
+            json!("Approval needed"),
+            json!(null),
+        ] {
+            let event = prompt(message.clone());
+            assert!(is_approval_prompt(&event), "{message}: {event:?}");
+        }
+
+        let background = session()
+            .normalize_progress_event(&json!({
+                "hookEventName": "notification",
+                "sessionId": "76744658-0402-42f7-a644-68dd52f6dad4",
+                "notificationType": "task_complete",
+                "message": "Background task completed: 019fa637",
+            }))
+            .unwrap();
+        assert!(!is_approval_prompt(&background));
+        let tool = session()
+            .normalize_progress_event(&json!({
+                "hookEventName": "pre_tool_use",
+                "sessionId": "76744658-0402-42f7-a644-68dd52f6dad4",
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": "uname -a"},
+            }))
+            .unwrap();
+        assert!(!is_approval_prompt(&tool));
     }
 
     #[test]
