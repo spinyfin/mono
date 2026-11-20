@@ -341,9 +341,18 @@ def strip_prefixes(group, prefix_env, shell_vars):
             prefix_env["__APPENDS_ARGS"] = "1"
         if base in WRAPPERS or base in ("builtin", "parallel"):
             index += 1
-            continue
-        if base == "timeout" and index + 1 < len(group):
-            index += 2
+            value_options = WRAPPER_VALUE_OPTIONS.get(base, set())
+            positional = WRAPPER_POSITIONAL.get(base, 0)
+            while index < len(group) and group[index].startswith("-"):
+                option = group[index]
+                index += 1
+                if option == "--":
+                    break
+                if option in value_options and index < len(group):
+                    index += 1
+                if base == "taskset" and (option == "-c" or option.startswith("--cpu-list")):
+                    positional = 0
+            index += positional
             continue
         break
     return [token for token in group[index:] if token != "}"]

@@ -169,6 +169,18 @@ pub(crate) fn denied() -> Vec<String> {
         "coproc NAME { pkill foo; }",
         "$'pkill' foo",
         "pk$(echo ill) foo",
+        "K=$(command -v pkill); bash -c 'echo $(date); $K -f foo'",
+        "ps aux | grep 'cube.*pr update' | awk '{print \"kill \" $2}' | sh",
+        "(echo 'pkill -f foo'; echo done) | sh",
+        "{ echo 'pkill -f foo'; echo done; } | sh",
+        "trap 'kill 0' EXIT",
+        "trap 'pkill -f foo' EXIT",
+        "trap 'kill -9 -1' EXIT",
+        "cat > /tmp/k.sh <<'EOF'\npkill -f foo\nEOF\nbash /tmp/k.sh",
+        "=pkill -f foo",
+        "noglob pkill -f foo",
+        "nocorrect killall foo",
+        "- pkill foo",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -271,6 +283,12 @@ pub(crate) const ALLOWED: &[&str] = &[
     "find . -maxdepth 1 -exec ls {} \\;",
     "su -c 'ls'",
     "\"$TOOL\" pr create --title 'Block pkill and killall'",
+    "eval \"$(brew shellenv)\"",
+    "bash -c \"$(cat run.sh)\"",
+    "ROOT=$(jj root); bash -c \"$ROOT/scripts/x.sh\"",
+    "trap -l",
+    "trap -p EXIT",
+    "cat > /tmp/k.sh <<'EOF'\necho hi\nEOF\nbash /tmp/k.sh",
 ];
 
 fn claude_launch_guard_script() -> tempfile::NamedTempFile {
@@ -380,4 +398,17 @@ fn claude_signal_guard_allows_safe_commands() {
 fn signal_fragment_is_safe_inside_the_inline_shell_command() {
     let fragment = include_str!("signal_guard.py");
     assert!(!fragment.contains(['"', '$', '`', '\\']));
+}
+
+#[test]
+fn launch_guard_strips_the_same_wrappers_as_the_signal_guard() {
+    let script = claude_launch_guard_script();
+    let commands: Vec<String> = ["flock /tmp/l bossctl status", "sudo -D /tmp bossctl status"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let decisions = claude_guard_decisions(script.path(), &commands);
+    for (command, decision) in commands.iter().zip(decisions) {
+        assert_eq!(decision["decision"], "block", "{command}: {decision}");
+    }
 }
