@@ -42,6 +42,7 @@ mod selected_product;
 mod stream_integrity;
 mod stuck_report;
 mod traffic_split;
+mod work_wait;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
@@ -809,6 +810,13 @@ enum AgentsAction {
         /// unavailable; never falls back to another host.
         #[arg(long)]
         host: Option<String>,
+        /// When the worker pool is at its hard cap, wait for a free slot
+        /// instead of failing. Never bypasses the cap.
+        #[arg(long)]
+        wait_for_slot: bool,
+        /// With --wait-for-slot, give up after this many seconds.
+        #[arg(long, requires = "wait_for_slot")]
+        timeout: Option<u64>,
     },
     /// Stop a worker session and release its lease.
     Stop {
@@ -976,6 +984,23 @@ enum WorkAction {
         /// `docs/designs/operator-forced-dispatch-while-dispatch-is-paused.md`.
         #[arg(long)]
         force: bool,
+    },
+    /// Block until an execution leaves its pre-run states, then print the
+    /// final status with its wait reason or last error.
+    ///
+    /// Takes an execution id or a work item id (the item's newest
+    /// execution is followed). Exit status: 0 started, 1 failed, 3 timed
+    /// out, 4 lookup/connection/argument error, 5 left the selected states
+    /// without starting. All pre-run states are waited on by default.
+    Wait {
+        /// Execution id (`exec_…`) or work item id.
+        reference: String,
+        /// Keep waiting while the execution is in any of these statuses.
+        #[arg(long, value_delimiter = ',', default_values_t = work_wait::DEFAULT_UNTIL_NOT.iter().map(|s| s.to_string()))]
+        until_not: Vec<String>,
+        /// Give up after this many seconds (exit status 3). Default: wait forever.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Cancel a queued or running execution (any non-terminal status).
     ///
@@ -1301,8 +1326,28 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     work_item_id,
                     preferred_workspace_id,
                     host,
+                    wait_for_slot,
+                    timeout,
                 },
-        } => agents::agents_launch(&cli.socket_path, cli.json, work_item_id, preferred_workspace_id, host).await,
+        } => {
+            agents::agents_launch(
+                &cli.socket_path,
+                cli.json,
+                work_item_id,
+                preferred_workspace_id,
+                host,
+                wait_for_slot.then(|| timeout.map(std::time::Duration::from_secs)),
+            )
+            .await
+        }
+        Command::Work {
+            action:
+                WorkAction::Wait {
+                    reference,
+                    until_not,
+                    timeout,
+                },
+        } => work_wait::work_wait(&cli.socket_path, cli.json, reference, until_not, timeout).await,
         Command::Work {
             action:
                 WorkAction::Start {

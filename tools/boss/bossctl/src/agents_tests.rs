@@ -1048,3 +1048,102 @@ fn parse_transcript_tail_events_errors_when_driver_slug_is_unknown() {
         .expect_err("an unresolvable driver slug must not swallow the schema error");
     assert!(err.to_string().contains("rendering transcript"));
 }
+
+#[tokio::test]
+async fn launch_retries_only_cap_refusals() {
+    use std::cell::Cell;
+    use std::time::Duration;
+    for (wait, message, expected) in [
+        (true, "main pool at hard cap", 2),
+        (false, "main pool at hard cap", 1),
+        (true, "unmet dependency", 1),
+    ] {
+        let calls = Cell::new(0);
+        let response = launch_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                let message = if calls.get() == 1 { message } else { "different error" };
+                async move {
+                    Ok(FrontendEvent::WorkError {
+                        message: message.into(),
+                    })
+                }
+            },
+            wait,
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), expected);
+        assert!(
+            matches!(response, FrontendEvent::WorkError { message: m } if m == if expected == 2 { "different error" } else { message })
+        );
+    }
+}
+
+#[tokio::test]
+async fn launch_does_not_retry_transport_errors() {
+    let calls = std::cell::Cell::new(0);
+    let error = launch_with_retry(
+        || {
+            calls.set(calls.get() + 1);
+            async { bail!("connection lost") }
+        },
+        true,
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(calls.get(), 1);
+    assert!(error.to_string().contains("connection lost"));
+}
+
+#[tokio::test]
+async fn launch_short_deadline_returns_cap_refusal_without_another_request() {
+    use std::time::Duration;
+    let calls = std::cell::Cell::new(0);
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        launch_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                async {
+                    Ok(FrontendEvent::WorkError {
+                        message: "pool at hard cap".into(),
+                    })
+                }
+            },
+            true,
+            Some(tokio::time::Instant::now() + Duration::from_millis(10)),
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(response, FrontendEvent::WorkError { message } if message == "pool at hard cap"));
+}
+
+#[tokio::test]
+async fn launch_expired_deadline_never_sends() {
+    let calls = std::cell::Cell::new(0);
+    let result = launch_with_retry(
+        || {
+            calls.set(calls.get() + 1);
+            async {
+                Ok(FrontendEvent::WorkError {
+                    message: "unexpected".into(),
+                })
+            }
+        },
+        true,
+        Some(tokio::time::Instant::now()),
+        std::time::Duration::ZERO,
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(calls.get(), 0);
+}

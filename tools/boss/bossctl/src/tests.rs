@@ -1015,3 +1015,67 @@ fn all_spawns_mutation_requires_explicit_operator_acknowledgment() {
     };
     assert!(pause::validate_dispatch_pause_reply(reply, true).is_ok());
 }
+
+#[test]
+fn work_wait_parses_default_and_custom_status_lists() {
+    for (args, expected) in [
+        (
+            vec!["bossctl", "work", "wait", "exec_example"],
+            vec!["queued", "ready", "waiting_dependency", "claimed"],
+        ),
+        (
+            vec![
+                "bossctl",
+                "work",
+                "wait",
+                "exec_example",
+                "--until-not",
+                "ready,claimed",
+                "--timeout",
+                "1",
+            ],
+            vec!["ready", "claimed"],
+        ),
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Work {
+            action:
+                WorkAction::Wait {
+                    reference,
+                    until_not,
+                    timeout,
+                },
+        } = cli.command
+        else {
+            panic!("expected work wait");
+        };
+        assert_eq!(reference, "exec_example");
+        assert_eq!(until_not, expected);
+        assert_eq!(timeout, (expected.len() == 2).then_some(1));
+    }
+}
+
+#[test]
+fn launch_timeout_requires_wait_for_slot() {
+    assert!(Cli::try_parse_from(["bossctl", "agents", "launch", "task_example", "--timeout", "1"]).is_err());
+    let cli = Cli::try_parse_from([
+        "bossctl",
+        "agents",
+        "launch",
+        "task_example",
+        "--wait-for-slot",
+        "--timeout",
+        "1",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::Agents {
+            action: AgentsAction::Launch {
+                wait_for_slot: true,
+                timeout: Some(1),
+                ..
+            }
+        }
+    ));
+}
