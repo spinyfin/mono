@@ -151,6 +151,18 @@ impl InflightDispatches {
             .any(|e| e.work_item_id == work_item_id)
     }
 
+    /// Whether this exact execution holds a reservation: its dispatch has been
+    /// handed off and has not yet returned. Unlike
+    /// [`Self::is_work_item_dispatching`] this answers for one row, so a
+    /// caller asking "is anything still starting this execution?" is not
+    /// told yes because of a sibling row on the same work item.
+    pub fn is_execution_dispatching(&self, execution_id: &str) -> bool {
+        self.table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(execution_id)
+    }
+
     /// In-flight dispatches on work items in `member_ids`, excluding
     /// `exclude_execution_id` (the caller itself) and excluding
     /// `exclude_work_item_id`.
@@ -317,6 +329,28 @@ mod tests {
         );
         assert!(inflight.is_work_item_dispatching("T1"));
         assert!(!inflight.is_work_item_dispatching("T2"));
+    }
+
+    /// The per-execution answer names only the row that holds the
+    /// reservation, and stops naming it once the dispatch returns.
+    #[test]
+    fn only_the_reserved_execution_reads_as_dispatching() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let inflight = InflightDispatches::new();
+
+        let reservation = inflight
+            .try_reserve(&execution("exec_a", "T1"), &db)
+            .expect("first reservation");
+
+        assert!(inflight.is_execution_dispatching("exec_a"));
+        assert!(
+            !inflight.is_execution_dispatching("exec_b"),
+            "a sibling row on the same work item is not itself being dispatched",
+        );
+
+        drop(reservation);
+        assert!(!inflight.is_execution_dispatching("exec_a"));
     }
 
     /// `try_reserve` is the atomic claim. A `contains`-then-`reserve` pair

@@ -158,9 +158,20 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                     // If the request landed on an existing
                     // non-terminal execution (idempotent path
                     // when a live worker already runs the
-                    // item), just refresh the row and skip
-                    // force-dispatch — there's no second
-                    // worker to spawn.
+                    // item, or the engine is still starting
+                    // one for it), just refresh the row and
+                    // skip force-dispatch — there's no second
+                    // worker to spawn. The response below
+                    // reports that existing run.
+                    if execution.status != ExecutionStatus::Ready {
+                        tracing::info!(
+                            execution_id = %execution.id,
+                            work_item_id = %execution.work_item_id,
+                            execution_status = %execution.status,
+                            "RequestExecution (force): the work item already has an execution with a worker, \
+                             or one being started; reporting it without launching another",
+                        );
+                    }
                     if execution.status == ExecutionStatus::Ready {
                         let coordinator = server_state.execution_coordinator.clone();
                         let execution_id = execution.id.clone();

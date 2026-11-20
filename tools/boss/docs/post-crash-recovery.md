@@ -97,6 +97,21 @@ preservation failure does not hold the lease: the release goes ahead and a
 error and the lease id, so a successor that then starts without that work does
 so with the loss on record.
 
+**Who performs the first release.** A run's first release belongs to the path
+that ended it, which preserves and releases as part of its own teardown. A
+successor's dispatch only repeats a release that an earlier attempt kept for
+occupancy, so it never starts a second release beside the owner's. A run that
+an explicit start (`bossctl work start`, `bossctl agents launch`, a drag to
+Doing) abandons as stale is the case with no such path: abandoning is a
+database write and tears nothing down. The request that abandoned the run
+therefore starts its release itself, through the same gates as any inferred
+death: a recorded local worker shell that is confirmed dead, absence from the
+live registry, an empty workspace, and preservation before the release.
+`bossctl agents launch` waits for it inside the same call and then dispatches;
+the drain holds the successor while it runs and is woken when it completes.
+Without that proof nothing is released, the successor stays held, and the
+sweeps and the wait bound described above apply.
+
 Transient recovery confirms pane teardown, preserves the stalled run's work,
 and releases its lease through the same inferred-death release the dead-pid,
 stale-worker and spawn-ack sweeps use (for a remote run, through the owning

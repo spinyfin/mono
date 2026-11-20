@@ -25,8 +25,8 @@ mod lifecycle;
 pub mod test_doubles;
 pub use lifecycle::{
     DriverSignals, ExecutionCubes, LifecycleServices, LiveWorkerLiveness, NeverStartedReap, NoopWorkerPaneReleaser,
-    PaneReleaseOutcome, PidStatus, ReattachSummary, RemoteLeaseReconcileOutcome, ResolvedExecutionCube, TeardownReason,
-    UnsubmittedReap, WorkerPaneReleaser,
+    PaneReleaseOutcome, PidStatus, PredecessorRelease, ReattachSummary, RemoteLeaseReconcileOutcome,
+    ResolvedExecutionCube, TeardownReason, UnsubmittedReap, WorkerPaneReleaser,
 };
 
 use std::path::Path;

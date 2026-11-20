@@ -203,6 +203,23 @@ pub struct RemoteLeaseReconcileOutcome {
     pub skipped: usize,
 }
 
+/// Which release of a terminal predecessor's lease the caller may perform.
+///
+/// Whichever path ends a run owns that run's first release: it preserves the
+/// work and returns the lease as part of its own teardown. A second releaser
+/// that started on its own could preserve a workspace the first has already
+/// returned to cube, so everyone else only repeats a release that is known
+/// to have finished without returning the lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredecessorRelease {
+    /// Repeat a release that an earlier attempt kept for occupancy.
+    RetryKept,
+    /// The caller ended this run itself and no other path is tearing it
+    /// down, so this is the run's first release. It is still gated on proof
+    /// that the worker is gone.
+    Own,
+}
+
 /// Narrow live-worker surface the coordinator (and the pane-death /
 /// orphan-sweep corroboration paths that read the coordinator's registry)
 /// need, without naming the engine-core registry type.
@@ -263,6 +280,7 @@ pub trait LifecycleServices: Send + Sync {
         provider: &dyn HostAdapterProvider,
         local: Arc<dyn HostAdapter>,
         at_bound: bool,
+        release: PredecessorRelease,
     );
 
     async fn teardown_driver_workspace(
