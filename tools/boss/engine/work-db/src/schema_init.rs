@@ -17,6 +17,8 @@ const SCHEMA_COMPATIBILITY_FLOOR: (&str, u32) = ("1.0.707", 32);
 #[path = "schema_legacy_sql.rs"]
 mod legacy_sql;
 use legacy_sql::*;
+#[path = "schema_cancel_provenance.rs"]
+mod cancel_provenance;
 #[path = "schema_migrations.rs"]
 mod migrations;
 #[path = "schema_migration_registry.rs"]
@@ -846,6 +848,17 @@ mod floor_tests {
             (
                 "00000000_0000_v060_bookmark_prune",
                 Box::new(|c| c.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap()),
+            ),
+            (
+                cancel_provenance::MIGRATION_ID,
+                Box::new(|c| {
+                    c.execute_batch(
+                        "ALTER TABLE work_executions ADD COLUMN cancel_source TEXT;
+                         ALTER TABLE work_executions ADD COLUMN cancel_actor TEXT;
+                         ALTER TABLE work_executions ADD COLUMN cancel_reason TEXT;",
+                    )
+                    .unwrap();
+                }),
             ),
             (
                 super::super::conflict_mismatch::MIGRATION_ID,
