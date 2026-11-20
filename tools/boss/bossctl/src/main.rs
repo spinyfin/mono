@@ -28,6 +28,7 @@ mod comments;
 mod dispatch_concurrency;
 mod dispatch_stats;
 mod doctor;
+mod doctor_spawn;
 mod enrollment;
 mod focus;
 mod homes;
