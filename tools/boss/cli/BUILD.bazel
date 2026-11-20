@@ -258,6 +258,32 @@ rust_test(
     ),
 )
 
+rust_test(
+    name = "dependency_cycles_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/dependency_cycles.rs",
+    ],
+    crate_root = "tests/dependency_cycles.rs",
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":common",
+        ":harness",
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # End-to-end coverage for the effort-level / model-override CLI
 # surface (PR #370 schema task). Same shape as `infer_product_test`
 # — drives the `boss` binary against an in-process engine to confirm

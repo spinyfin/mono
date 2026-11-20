@@ -31,6 +31,35 @@ pub struct AddDependencyInput {
     pub relation: Option<String>,
 }
 
+/// A closed cycle. Each step identifies the source of an outgoing edge;
+/// the last step points back to the first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyCycleError {
+    pub path: Vec<DependencyCycleStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyCycleStep {
+    pub id: String,
+    pub name: String,
+    pub relation: String,
+}
+
+impl std::fmt::Display for DependencyCycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dependency cycle: ")?;
+        for step in &self.path {
+            write!(f, "{} ({}) -[{}]-> ", step.id, step.name, step.relation)?;
+        }
+        if let Some(first) = self.path.first() {
+            write!(f, "{} ({})", first.id, first.name)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DependencyCycleError {}
+
 /// Direction of a dependency listing — incoming (prereqs of the
 /// named row), outgoing (dependents), or both.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

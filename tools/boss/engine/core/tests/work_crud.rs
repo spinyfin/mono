@@ -950,7 +950,7 @@ async fn list_dependencies_detailed(
 
 /// Round-trip the new dependency RPCs through the wire layer:
 /// add → list → remove. Cycles and self-loops surface as
-/// `WorkError`. Existing CRUD verbs keep working alongside.
+/// `DependencyCycleRejected`. Existing CRUD verbs keep working alongside.
 #[tokio::test]
 async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     let engine = TestEngine::spawn().await?;
@@ -1006,7 +1006,7 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
     .await?;
     assert_eq!(edge2, edge);
 
-    // Cycle add returns a WorkError.
+    // Cycle add returns a structured, complete path.
     let cycle = client
         .send_request(&FrontendRequest::AddDependency {
             input: AddDependencyInput {
@@ -1017,8 +1017,13 @@ async fn dependency_rpcs_round_trip_through_engine() -> Result<()> {
         })
         .await?;
     match cycle {
-        FrontendEvent::WorkError { message } => {
-            assert!(message.contains("cycle"), "expected cycle error: {message}");
+        FrontendEvent::DependencyCycleRejected { error } => {
+            assert_eq!(error.path.len(), 2);
+            assert_eq!(error.path[0].id, b.id);
+            assert_eq!(error.path[0].name, "B");
+            assert_eq!(error.path[1].id, a.id);
+            assert_eq!(error.path[1].name, "A");
+            assert!(error.path.iter().all(|step| step.relation == "blocks"));
         }
         other => return Err(unexpected_event("cycle add", other)),
     }

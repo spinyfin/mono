@@ -10,7 +10,9 @@
 //! callers can compose them inside an in-flight transaction (cycle
 //! check + insert, edge cleanup on prereq delete, etc.).
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+mod cycle;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use boss_protocol::WorkItemDependency;
@@ -41,17 +43,9 @@ pub enum EdgeInsertOutcome {
     AlreadyExists,
 }
 
-/// Add a `(dependent_id, prerequisite_id, relation)` edge if it does
-/// not already exist. Caller is responsible for:
-///
-/// - validating both ids resolve to live work items in the same
-///   product (see `validate_edge_endpoints`),
-/// - validating the new edge would not close a cycle (see
-///   `would_create_cycle`).
-///
-/// This function only writes the row. It runs against any
-/// `Connection` (engine-owned db, in-flight transaction, fresh
-/// connection in a test) so the caller picks the isolation.
+/// Add an edge, refusing self-edges and cycles in the dispatch-gating graph.
+/// A savepoint keeps validation and insertion in one snapshot, including for
+/// autocommit callers. Callers validate endpoint existence and product scope.
 pub fn insert_edge(
     conn: &Connection,
     dependent_id: &str,
@@ -59,9 +53,29 @@ pub fn insert_edge(
     relation: &str,
     now_epoch: &str,
 ) -> Result<(WorkItemDependency, EdgeInsertOutcome)> {
-    if dependent_id == prerequisite_id {
-        bail!("dependency edge cannot point at itself: {dependent_id}");
+    conn.execute_batch("SAVEPOINT dependency_edge_insert")?;
+    let result = (|| {
+        // Re-adding an existing edge stays idempotent, including legacy graphs.
+        if let Some(edge) = query_edge(conn, dependent_id, prerequisite_id, relation)? {
+            return Ok((edge, EdgeInsertOutcome::AlreadyExists));
+        }
+        cycle::validate(conn, dependent_id, prerequisite_id, relation)?;
+        insert_validated_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)
+    })();
+    if result.is_err() {
+        conn.execute_batch("ROLLBACK TO dependency_edge_insert")?;
     }
+    conn.execute_batch("RELEASE dependency_edge_insert")?;
+    result
+}
+
+fn insert_validated_edge(
+    conn: &Connection,
+    dependent_id: &str,
+    prerequisite_id: &str,
+    relation: &str,
+    now_epoch: &str,
+) -> Result<(WorkItemDependency, EdgeInsertOutcome)> {
     let rows = conn.execute(
         "INSERT OR IGNORE INTO work_item_dependencies
             (dependent_id, prerequisite_id, relation, created_at)

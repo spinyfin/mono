@@ -831,6 +831,19 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "work_item_restored",
         },
         TagCase {
+            label: "DependencyCycleRejected",
+            event: FrontendEvent::DependencyCycleRejected {
+                error: crate::DependencyCycleError {
+                    path: vec![crate::DependencyCycleStep {
+                        id: "task_a".into(),
+                        name: "Schema".into(),
+                        relation: "blocks".into(),
+                    }],
+                },
+            },
+            expected_tag: "dependency_cycle_rejected",
+        },
+        TagCase {
             label: "WorkError",
             event: FrontendEvent::WorkError { message: "boom".into() },
             expected_tag: "work_error",
@@ -2358,6 +2371,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemDeleted { .. }
         | FrontendEvent::WorkItemRestored { .. }
         | FrontendEvent::WorkError { .. }
+        | FrontendEvent::DependencyCycleRejected { .. }
         | FrontendEvent::WorkItemRefused { .. }
         | FrontendEvent::WorkItemDuplicateBlocked { .. }
         | FrontendEvent::Error { .. }
