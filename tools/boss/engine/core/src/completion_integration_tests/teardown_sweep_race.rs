@@ -11,8 +11,6 @@
 //! a worker that was still running.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use tempfile::tempdir;
@@ -47,22 +45,28 @@ fn steps(log: &TeardownLog) -> Vec<String> {
     log.lock().expect("teardown log mutex poisoned").clone()
 }
 
-/// A gate a stub can park on until the test opens it, plus a flag the test
-/// polls to know the stub has actually reached it.
+/// A gate a stub can park on until the test opens it, plus a signal the
+/// stub raises on arrival so the test can wait for exactly that event.
+///
+/// Both halves are `Notify` permits: `notify_one` stores a permit when
+/// nobody is waiting yet, so neither side can miss the other's signal
+/// whichever of them runs first.
 #[derive(Default)]
 struct Gate {
-    entered: AtomicBool,
+    entered: tokio::sync::Notify,
     open: tokio::sync::Notify,
 }
 
 impl Gate {
     async fn wait(&self) {
-        self.entered.store(true, Ordering::SeqCst);
+        self.entered.notify_one();
         self.open.notified().await;
     }
 
-    fn reached(&self) -> bool {
-        self.entered.load(Ordering::SeqCst)
+    /// Resolves once a stub has parked on this gate. Single consumer: each
+    /// arrival yields one permit.
+    async fn entered(&self) {
+        self.entered.notified().await;
     }
 
     fn release(&self) {
@@ -199,18 +203,22 @@ fn register_live_worker(live_states: &LiveWorkerStateRegistry, slot_id: u8, exec
     );
 }
 
-/// Yield until `predicate` holds, or panic after a bounded number of
-/// polls. Used to observe the spawned completion task reaching a gate
-/// without sleeping for a fixed duration.
-async fn await_condition(label: &str, predicate: impl Fn() -> bool) {
-    for _ in 0..2_000 {
-        if predicate() {
-            return;
-        }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
+/// Wait for the spawned completion task to park on `gate`.
+///
+/// This waits on the gate's own arrival signal, with no deadline: how long
+/// the completion path takes to get there depends on how loaded the machine
+/// is, and that must not decide the test. The only other way out is the
+/// completion task ending first, which means it can never reach the gate —
+/// that fails immediately instead of hanging.
+async fn await_gate_entered<T>(label: &str, gate: &Gate, completion: &mut tokio::task::JoinHandle<T>) {
+    tokio::select! {
+        biased;
+        () = gate.entered() => {}
+        result = completion => match result {
+            Ok(_) => panic!("completion finished without reaching: {label}"),
+            Err(error) => panic!("completion failed before reaching: {label}: {error}"),
+        },
     }
-    panic!("timed out waiting for: {label}");
 }
 
 /// Run a full two-pass-plus sweep cycle and assert it reaped nothing.
@@ -305,7 +313,7 @@ async fn sweep_does_not_reap_a_worker_whose_pane_teardown_is_in_flight() {
     // Drive the Stop-hook PR-completion path. `Done` (merged) is used so
     // the reviewer-enqueue branch — which would reach for `gh` — is not
     // taken; the teardown sequence under test is identical on both arms.
-    let completion = tokio::spawn({
+    let mut completion = tokio::spawn({
         let handler = handler.clone();
         let execution_id = execution_id.clone();
         async move {
@@ -322,8 +330,7 @@ async fn sweep_does_not_reap_a_worker_whose_pane_teardown_is_in_flight() {
 
     // Wait until the completion path is parked mid-teardown with its pane
     // still live — the exact state the incident trace captured.
-    let gate = pane_gate.clone();
-    await_condition("pane teardown entered", || gate.reached()).await;
+    await_gate_entered("pane teardown entered", &pane_gate, &mut completion).await;
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
         boss_protocol::ExecutionStatus::Completed,
@@ -410,7 +417,7 @@ async fn sweep_does_not_reap_a_worker_behind_a_slow_cube_release() {
         .with_teardown_registry(teardown_registry.clone()),
     );
 
-    let completion = tokio::spawn({
+    let mut completion = tokio::spawn({
         let handler = handler.clone();
         let execution_id = execution_id.clone();
         async move {
@@ -425,8 +432,7 @@ async fn sweep_does_not_reap_a_worker_behind_a_slow_cube_release() {
         }
     });
 
-    let gate = cube_gate.clone();
-    await_condition("cube release entered", || gate.reached()).await;
+    await_gate_entered("cube release entered", &cube_gate, &mut completion).await;
 
     let reaper = RecordingSweepReaper::new(log.clone(), live_states.clone());
     let sink = Arc::new(RecordingDispatchEventSink::new());
