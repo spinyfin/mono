@@ -1326,7 +1326,7 @@
           "FILE:@@//tools/boss/protocol-spoke/Cargo.toml 0d9a3a185757a9a86e7bb0ac7fab9d375c3131daf88f55616c557a35b0b48758",
           "FILE:@@//tools/boss/tmux/Cargo.toml ac762f0d82703fed877bd2e11228eae99f562657783bb009315d87ccd84d52ca",
           "FILE:@@//tools/boss/engine/recovery-fixtures/Cargo.toml c09563bd4c449aa3eacf6a5bd11901c60f3e624c852e3fc15f2016afb209771e",
-          "FILE:@@//tools/boss/engine/work-db/Cargo.toml e84a6a0bf973f708d94f6fac207a84308864dfb916ffddca6f54d935e090f300",
+          "FILE:@@//tools/boss/engine/work-db/Cargo.toml 626a62090360fbd0a8f4f333ce30dc0b89ef549afa9e773f7e790b145fe7a968",
           "FILE:@@//tools/boss/engine/board-projection/Cargo.toml 9773f5735c9d720c1cee634f3579fb72bd879081c27ffc9fd61bab2f064c2224",
           "FILE:@@//tools/boss/engine/conflict-diagnosis/Cargo.toml 5ad8adb361f6c6c5a02588775e37e5cf23afa1c013e3b0c222ed37ab3ab0063b",
           "FILE:@@//tools/boss/engine/automation-dedup/Cargo.toml 80f24d29781bd9958bcb2c8e8d5a0d5b191c1e7123be6a3a3afb38d2641499d9",

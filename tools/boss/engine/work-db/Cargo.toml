@@ -8,7 +8,6 @@ workspace = "../../../.."
 test-support = ["dep:libc", "dep:tempfile", "dep:tracing-subscriber", "rusqlite/backup"]
 
 [dependencies]
-libc = { version = "0.2", optional = true }
 boss-write-batch = { path = "../write-batch" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -42,6 +41,7 @@ chrono = { workspace = true }
 fastrand = { workspace = true }
 fs4 = { workspace = true }
 git-utils = { path = "../../../../lib/rust/git_utils" }
+libc = { workspace = true, optional = true }
 regex = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -57,7 +57,7 @@ unicode-segmentation = { workspace = true }
 [dev-dependencies]
 boss-metrics = { path = "../metrics", features = ["test-support"] }
 boss-prose-vocabulary = { path = "../prose-vocabulary" }
-libc = "0.2"
+libc = { workspace = true }
 rusqlite = { workspace = true, features = ["backup"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
