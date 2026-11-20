@@ -2537,6 +2537,8 @@ async fn serve_scoped(
         automation_scheduler_timer_wheel,
     );
 
+    let _boothby_scheduler_handle = boothby::spawn_scheduler(&server_state);
+
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
     // by a dropped wakeup (the `status_transition` → `request_recorded`
     // stall class — see `exec_18af3ba5259d32a8_12`, 2026-05-13) is
