@@ -96,11 +96,14 @@ mod classify;
 mod deferred_review_admission;
 mod disarm_drain;
 mod merge_queue;
+mod pass;
+mod pass_trace;
 mod poll_metrics;
 mod post_merge_review;
 mod probe;
 mod schedule;
 mod sweep;
+mod walk_order;
 
 pub mod blocking_signal;
 pub mod ci_watch;
@@ -116,12 +119,17 @@ pub use boss_observation_contracts::MergeQueueDequeueEvent;
 pub use classify::*;
 pub use merge_queue::QUEUED_NO_POSITION_SECTION_ORDER;
 pub(crate) use merge_queue::*;
+pub use pass::*;
+pub use pass_trace::*;
 pub use poll_metrics::*;
 #[cfg(test)]
 pub(crate) use post_merge_review::maybe_trigger_post_merge_review;
 pub use probe::*;
 pub use schedule::*;
 pub use sweep::*;
+pub use walk_order::PassState;
+#[cfg(test)]
+pub(crate) use walk_order::Rotation;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

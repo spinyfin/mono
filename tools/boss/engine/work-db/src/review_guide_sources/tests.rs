@@ -302,6 +302,32 @@ fn source_observation_sequence_is_monotonic_before_collection() {
     assert_eq!(db.allocate_pr_review_guide_source_observation_sequence().unwrap(), 2);
 }
 
+/// A block is the same values single allocations would have returned back
+/// to back, and later allocations of either kind continue after it.
+#[test]
+fn a_block_of_source_observation_sequences_is_contiguous_and_advances_the_counter() {
+    let (_dir, db) = open_db();
+    assert_eq!(db.allocate_pr_review_guide_source_observation_sequence().unwrap(), 1);
+    assert_eq!(
+        db.allocate_pr_review_guide_source_observation_sequences(3).unwrap(),
+        vec![2, 3, 4],
+    );
+    assert!(
+        db.allocate_pr_review_guide_source_observation_sequences(0)
+            .unwrap()
+            .is_empty(),
+        "an empty block allocates nothing",
+    );
+    assert_eq!(db.allocate_pr_review_guide_source_observation_sequence().unwrap(), 5);
+
+    // The first allocation on a fresh database seeds the counter too.
+    let (_dir, fresh) = open_db();
+    assert_eq!(
+        fresh.allocate_pr_review_guide_source_observation_sequences(2).unwrap(),
+        vec![1, 2],
+    );
+}
+
 #[test]
 fn revision_execution_resolves_to_the_canonical_pr_root() {
     let (_dir, db) = open_db();

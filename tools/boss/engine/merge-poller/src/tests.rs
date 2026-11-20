@@ -568,6 +568,8 @@ mod merge_queue_tests;
 #[cfg(test)]
 mod metrics_tests;
 #[cfg(test)]
+mod pass_fairness_tests;
+#[cfg(test)]
 mod poll_stability_tests;
 #[cfg(test)]
 mod post_merge_review_trigger_tests;

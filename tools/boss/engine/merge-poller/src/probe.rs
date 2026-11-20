@@ -228,15 +228,17 @@ impl CommandMergeProbe {
             // A non-zero exit here isn't necessarily a transport failure: `gh
             // api graphql` also exits non-zero whenever the response carries a
             // top-level `errors` array, which GitHub returns (alongside HTTP
-            // 200 and `data.<repo_alias> = null`) whenever a `repository(...)`
-            // alias can't be resolved (repo deleted/renamed/access revoked).
-            // Failing every URL in the pass for that case would let one
-            // tracked PR whose repo has gone away stall reconciliation for
-            // every other PR indefinitely, since `run_one_pass` rebuilds the
-            // same probe set every pass. Fall back to per-PR probing instead,
-            // so the graceful 404 -> `ClosedUnmerged` handling in `probe`
-            // isolates the unresolvable repo from its siblings, exactly like
-            // the pre-batching code did.
+            // 200 and a null node) whenever a `repository(...)` or
+            // `pullRequest(...)` alias can't be resolved (repo deleted/renamed/
+            // access revoked, PR deleted or transferred). Failing every URL in
+            // the pass for that case would let one tracked PR that has gone
+            // away stall reconciliation for every other PR indefinitely, since
+            // `run_one_pass` rebuilds the same probe set every pass.
+            //
+            // `gh` still prints the response body in that case, and the body
+            // still carries every node GitHub *could* resolve. It is parsed
+            // below like a successful response, and only the PRs an error
+            // names are re-probed individually — see [`batch_error_scope`].
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 if is_rate_limit_error(&stderr) {
@@ -274,12 +276,24 @@ impl CommandMergeProbe {
                     }
                     return out;
                 }
-                tracing::debug!(
-                    stderr = %stderr.trim(),
-                    "merge poller: batched probe graphql call failed — falling back to per-PR probing for this pass",
-                );
-                out.extend(probe_each_individually(&order).await);
-                return out;
+                match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    Ok(v) if v.get("data").is_some_and(|data| data.is_object()) => v,
+                    _ => {
+                        // No usable body at all: nothing says which PRs the
+                        // failure covers, so every one is probed on its own.
+                        // That is two or three `gh` calls per PR, one after
+                        // another — loud, because at a few dozen PRs it is
+                        // most of a pass's time budget.
+                        tracing::warn!(
+                            stderr = %stderr.trim(),
+                            pr_count = order.len(),
+                            "merge poller: batched probe graphql call failed with no usable response — \
+                             probing every PR individually for this pass",
+                        );
+                        out.extend(probe_each_individually(&order).await);
+                        return out;
+                    }
+                }
             }
             Err(err) => {
                 let msg = format!("failed to spawn batched probe `gh api graphql`: {err}");
@@ -292,25 +306,40 @@ impl CommandMergeProbe {
 
         record_rate_limit(&body);
 
-        // A 200 response can still carry a top-level `errors` array alongside
-        // partial `data` (e.g. one repo alias resolves, another doesn't). Treat
-        // that the same as the non-zero-exit case above: fall back to per-PR
-        // probing rather than failing every URL in the pass over one bad repo
-        // alias.
-        if body
-            .get("errors")
-            .and_then(|e| e.as_array())
-            .is_some_and(|errors| !errors.is_empty())
-        {
-            tracing::debug!(
-                errors = %body["errors"],
-                "merge poller: batched probe graphql response carried errors — falling back to per-PR probing for this pass",
-            );
-            out.extend(probe_each_individually(&order).await);
-            return out;
-        }
+        // A response can carry a top-level `errors` array alongside partial
+        // `data` (one PR or repo alias doesn't resolve, the rest do). Only the
+        // PRs an error names are untrusted; the others are read from this
+        // response as usual. Re-probing every PR individually would cost two
+        // or three serial `gh` calls per tracked PR, so only the named PRs
+        // are re-probed.
+        let untrusted: std::collections::HashSet<String> = match batch_error_scope(&body, &alias_map) {
+            BatchErrorScope::Clean => Default::default(),
+            BatchErrorScope::Urls(urls) => {
+                tracing::info!(
+                    errors = %body["errors"],
+                    affected = urls.len(),
+                    pr_count = order.len(),
+                    "merge poller: batched probe graphql response carried errors for some PRs — \
+                     probing only those individually",
+                );
+                urls
+            }
+            BatchErrorScope::Whole => {
+                tracing::warn!(
+                    errors = %body["errors"],
+                    pr_count = order.len(),
+                    "merge poller: batched probe graphql response carried an error that names no PR — \
+                     probing every PR individually for this pass",
+                );
+                out.extend(probe_each_individually(&order).await);
+                return out;
+            }
+        };
 
         for (url, pr_node) in walk_batch_response(&body, &alias_map) {
+            if untrusted.contains(&url) {
+                continue;
+            }
             let Some(pr_node) = pr_node else {
                 // No PullRequest for this number any more (force-deleted,
                 // transferred) — same "can't decide it's merged just because
@@ -331,8 +360,76 @@ impl CommandMergeProbe {
             let result = parse_probe_json(&url, &flat, combined_state.as_deref()).map_err(|err| err.to_string());
             out.insert(url.clone(), result);
         }
+        if !untrusted.is_empty() {
+            // `probe`'s own 404 handling maps a PR or repo that is really
+            // gone to `ClosedUnmerged`, exactly as before.
+            let affected: Vec<String> = order.iter().filter(|url| untrusted.contains(*url)).cloned().collect();
+            out.extend(probe_each_individually(&affected).await);
+        }
         out
     }
+}
+
+/// Which PRs of a batched probe response its `errors` array leaves
+/// untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BatchErrorScope {
+    /// No errors: every node is read from the response.
+    Clean,
+    /// Every error names a repo or PR alias of this batch. Only these URLs
+    /// need probing individually; the rest of the response stands.
+    Urls(std::collections::HashSet<String>),
+    /// An error names nothing in this batch (no `path`, or one that matches
+    /// no alias — a query-level failure such as a server-side timeout), so
+    /// no node in the response can be trusted.
+    Whole,
+}
+
+/// Scope a batched response's GraphQL `errors` to the PRs they name.
+///
+/// GitHub gives each error a `path` into the response: `["repo0"]` for a
+/// repository that did not resolve, `["repo0", "pr3"]` for a pull request
+/// that did not, and a longer path for a field inside one PR. Anything at or
+/// below a PR alias taints that PR only — including a nested field error,
+/// where the node is present but partly null and a null CI rollup would
+/// otherwise read as green. A repo-level error taints every PR in that
+/// repo. An error with no usable path taints the whole response.
+///
+/// Pure, so the scoping is unit-tested against synthetic responses.
+pub(crate) fn batch_error_scope(body: &serde_json::Value, alias_map: &BatchAliasMap) -> BatchErrorScope {
+    let Some(errors) = body
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .filter(|errors| !errors.is_empty())
+    else {
+        return BatchErrorScope::Clean;
+    };
+    let mut urls = std::collections::HashSet::new();
+    for error in errors {
+        let path: Vec<&str> = error
+            .get("path")
+            .and_then(|p| p.as_array())
+            .map(|segments| segments.iter().filter_map(|segment| segment.as_str()).collect())
+            .unwrap_or_default();
+        let Some((_, pr_aliases)) = path
+            .first()
+            .and_then(|repo| alias_map.iter().find(|(repo_alias, _)| repo_alias == repo))
+        else {
+            return BatchErrorScope::Whole;
+        };
+        match path
+            .get(1)
+            .and_then(|pr| pr_aliases.iter().find(|(pr_alias, _)| pr_alias == pr))
+        {
+            Some((_, url)) => {
+                urls.insert(url.clone());
+            }
+            // The repo itself, or something under it this batch did not ask
+            // for by PR alias: every PR in the repo is untrusted.
+            None => urls.extend(pr_aliases.iter().map(|(_, url)| url.clone())),
+        }
+    }
+    BatchErrorScope::Urls(urls)
 }
 
 /// repo_alias -> [(pr_alias, url)] — the aliases [`build_batch_query`] used

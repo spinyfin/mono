@@ -244,6 +244,7 @@ async fn a_pass_within_budget_returns_its_outcome_unchanged() {
         Duration::from_secs(30),
         Duration::from_secs(30),
         &metrics,
+        &PassTrace::default(),
         async move { expected },
     )
     .await;
@@ -261,6 +262,7 @@ async fn an_overrunning_pass_is_abandoned_and_counted() {
         Duration::from_secs(180),
         Duration::from_secs(60),
         &metrics,
+        &PassTrace::default(),
         async {
             // The 32-minute inline-remediation pass, in miniature.
             tokio::time::sleep(Duration::from_secs(32 * 60)).await;
@@ -290,6 +292,7 @@ async fn a_pass_slower_than_its_cadence_is_counted_even_when_it_completes() {
         Duration::from_secs(180),
         Duration::from_secs(60),
         &metrics,
+        &PassTrace::default(),
         async {
             tokio::time::sleep(Duration::from_secs(90)).await;
             SweepOutcome::default()

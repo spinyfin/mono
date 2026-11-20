@@ -89,6 +89,10 @@ root-cause rule as the section below.
   intervals for the two singleton sweeps, and what each one's cost scales
   with):
   [`tools/boss/docs/background-sweep-telemetry.md`](tools/boss/docs/background-sweep-telemetry.md)
+- Merge poller detection pass (the order a pass works in, what an abandoned
+  pass does and does not lose, the `merge_detection_stalled` health issue,
+  and the per-phase timing to read when a pass is slow):
+  [`tools/boss/docs/merge-poller-detection-pass.md`](tools/boss/docs/merge-poller-detection-pass.md)
 - Dispatch focus mode (`bossctl dispatch focus`: restrict automatic
   dispatch to chosen projects/products; scope rules, precedence against the
   pause and force-launch, the `focus_mode` hold reason):

@@ -86,6 +86,53 @@ async fn progression_launch_backoff_is_on_the_health_report_until_the_sweep_clea
     assert!(reported(&state).is_none());
 }
 
+/// An abandoned merge-detection pass must reach the health report, and
+/// leave it once a pass finishes. Without the entry a card whose PR has
+/// merged sits in the Merging lane and nothing on screen says why.
+#[tokio::test]
+async fn abandoned_merge_detection_pass_is_on_the_health_report_until_a_pass_finishes() {
+    use boss_engine_merge_poller::{DETECTION_STALL_ISSUE_KIND, DetectionStall, PassPhase, PassTimings, PhaseTiming};
+
+    let (state, _dir) = test_server_state();
+    let reported = |state: &Arc<ServerState>| {
+        build_engine_health_report(state)
+            .issues
+            .into_iter()
+            .find(|issue| issue.kind == DETECTION_STALL_ISSUE_KIND)
+    };
+    assert!(reported(&state).is_none());
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    state.merge_detection_stall.send_replace(Some(DetectionStall {
+        consecutive_abandoned: 3,
+        first_abandoned_epoch_s: now - 12 * 60,
+        latest_abandoned_epoch_s: now,
+        budget: Duration::from_secs(180),
+        timings: PassTimings {
+            total: Duration::from_secs(180),
+            phases: Vec::new(),
+            in_flight: Some(PhaseTiming {
+                phase: PassPhase::OpenWalk,
+                elapsed: Duration::from_secs(179),
+                items_total: 46,
+                items_done: 12,
+                item: Some("chore_x".to_owned()),
+            }),
+        },
+    }));
+    let issue = reported(&state).expect("the stall reaches the health report");
+    assert_eq!(issue.severity, "error");
+    assert!(issue.title.contains("last 3 detection passes"), "{}", issue.title);
+    assert!(
+        issue.body.contains("12 minutes ago") && issue.body.contains("`open_walk`") && issue.body.contains("12 of 46"),
+        "{}",
+        issue.body
+    );
+
+    state.merge_detection_stall.send_replace(None);
+    assert!(reported(&state).is_none());
+}
+
 /// The engine-health helper must surface a
 /// `missing_anthropic_api_key` issue when the agent config
 /// resolved with no key — that's exactly the case the macOS app

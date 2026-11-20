@@ -13,554 +13,9 @@ pub struct SweepHandlers<'a> {
     pub completion_handler: Option<&'a dyn CompletionRequests>,
     /// Conflict handling, design-doc maintenance, population and the loop passes.
     pub host: Option<&'a dyn SweepHost>,
-}
-
-/// How long a batched probe snapshot may be used to write lifecycle
-/// transitions before it must be re-taken.
-///
-/// A pass takes ONE batched probe up front and then walks every candidate
-/// against it. That is fine when the pass takes a second; it is a
-/// correctness problem when it doesn't. In the incident this constant
-/// exists for, PR #2346 merged ten seconds after a pass took its snapshot,
-/// and the pass — stuck behind 32 minutes of inline conflict remediation —
-/// went on writing state from that half-hour-old snapshot. Sized to the
-/// nominal full-sweep interval: a snapshot older than one whole sweep
-/// cadence is by definition something the next sweep should have replaced.
-pub(crate) const PROBE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
-
-/// Re-probes allowed within a single pass before the pass gives up on its
-/// remaining candidates. Bounded so a pathologically slow pass can't turn
-/// into an unbounded GitHub-quota amplifier; abandoning the remainder is
-/// safe because every candidate list is rebuilt from the DB next pass.
-pub(crate) const MAX_PROBE_REFRESHES_PER_PASS: u8 = 2;
-
-/// The batched probe result for one pass, plus the age bookkeeping that
-/// keeps a long pass from transitioning work items off a stale view of
-/// GitHub. See [`PROBE_SNAPSHOT_MAX_AGE`].
-pub(crate) struct ProbeSnapshot {
-    pub(crate) results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
-    /// `tokio::time::Instant`, not `std::time::Instant`, so the ageing logic
-    /// is drivable from tests under a paused clock (`tokio::time::advance`)
-    /// instead of only by a real 60-second wall-clock stall. Identical to the
-    /// std clock outside a paused runtime.
-    taken_at: tokio::time::Instant,
-    refreshes_left: u8,
-}
-
-impl ProbeSnapshot {
-    pub(crate) fn new(results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>) -> Self {
-        Self {
-            results,
-            taken_at: tokio::time::Instant::now(),
-            refreshes_left: MAX_PROBE_REFRESHES_PER_PASS,
-        }
-    }
-
-    /// Returns `true` when it is safe to write state from `self.results`.
-    ///
-    /// Fresh snapshot → `true` immediately (the overwhelmingly common case,
-    /// and free — no clock-driven GitHub traffic). Stale snapshot → re-probe
-    /// and return `true`. Stale snapshot with the per-pass refresh budget
-    /// already spent → `false`, and the caller must stop: writing off a
-    /// snapshot that old is worse than deferring to the next pass.
-    ///
-    /// `remaining_urls` is called **only** on the re-probe path and must
-    /// yield just the candidates the pass has not walked yet. Re-probing the
-    /// pass's whole original URL set would re-fetch every candidate already
-    /// transitioned earlier in the pass, multiplying GitHub batch cost on
-    /// precisely the path that is already slow enough to have gone stale.
-    /// Nothing is lost by dropping the processed prefix: those entries are
-    /// never read again, and every candidate list is rebuilt from the DB next
-    /// pass. It is a closure rather than a slice so the common (fresh) case
-    /// allocates nothing.
-    pub(crate) async fn ensure_fresh(
-        &mut self,
-        probe: &dyn MergeProbe,
-        remaining_urls: impl FnOnce() -> Vec<String>,
-    ) -> bool {
-        let age = self.taken_at.elapsed();
-        if age <= PROBE_SNAPSHOT_MAX_AGE {
-            return true;
-        }
-        if self.refreshes_left == 0 {
-            tracing::warn!(
-                snapshot_age_ms = age.as_millis(),
-                max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
-                "merge poller: probe snapshot stale and the per-pass re-probe budget is spent; \
-                 abandoning the rest of this pass rather than transitioning off a stale snapshot",
-            );
-            return false;
-        }
-        self.refreshes_left -= 1;
-        let urls = remaining_urls();
-        tracing::warn!(
-            snapshot_age_ms = age.as_millis(),
-            max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
-            pr_count = urls.len(),
-            "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
-             before writing further state",
-        );
-        self.results = probe.probe_batch(&urls).await;
-        self.taken_at = tokio::time::Instant::now();
-        true
-    }
-}
-
-/// The still-unprocessed candidates' PR urls, de-duplicated and in walk
-/// order — what [`ProbeSnapshot::ensure_fresh`] re-probes when it must.
-fn remaining_probe_urls<'a>(remaining: impl IntoIterator<Item = &'a PendingMergeCheck>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    remaining
-        .into_iter()
-        .map(|c| c.pr_url.clone())
-        .filter(|url| seen.insert(url.clone()))
-        .collect()
-}
-
-/// Allocate source-capture observation sequences before a batched GitHub
-/// probe starts. A slower, older response can therefore never outrank a
-/// newer probe merely because it arrived later. The disabled rollout pays
-/// no write cost and leaves the existing poller behavior unchanged.
-///
-/// Sequence allocation is deliberately adjacent to the actual GitHub
-/// request rather than the later candidate walk: response timing must not
-/// determine which comparison becomes the desired one.
-fn allocate_source_observation_sequences(
-    work_db: &WorkDb,
-    completion_handler: Option<&dyn CompletionRequests>,
-    probe_urls: &[String],
-) -> HashMap<String, i64> {
-    completion_handler
-        .filter(|handler| handler.review_guide_source_capture_enabled())
-        .map(|_| {
-            probe_urls
-                .iter()
-                .filter_map(
-                    |url| match work_db.allocate_pr_review_guide_source_observation_sequence() {
-                        Ok(sequence) => Some((url.clone(), sequence)),
-                        Err(error) => {
-                            tracing::warn!(
-                                pr_url = %url,
-                                ?error,
-                                "merge poller: could not allocate review-guide source observation sequence",
-                            );
-                            None
-                        }
-                    },
-                )
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Run one full lifecycle sweep over every chore and project_task
-/// the poller cares about (in_review with a PR, plus rows currently
-/// blocked on merge_conflict so we can detect resolution, plus
-/// `waiting_human` executions whose chore is still missing a
-/// `pr_url`). Returns per-bucket counters so callers can log a
-/// one-line summary.
-///
-/// `cube_client` is threaded into the conflict-watch retire path so
-/// `on_resolved` can release the cube workspace lease the resolution
-/// worker held (design Q5). Pass `None` for sweeps that don't need to
-/// drive lease release — pre-Phase-3 wiring, tests, etc.
-///
-/// `completion_handler` is threaded in so the pending-PR-detection
-/// recheck can reuse the on-Stop transition path
-/// (`record_worker_pr_completion` + cube release + pane teardown + event
-/// publish). Pass `None` for pre-`completion_handler` wiring and tests that
-/// exercise only the in-review and conflict paths.
-///
-/// `host` is the engine-host seam ([`SweepHost`]) that carries out conflict
-/// handling, design-doc pointer maintenance and project population. The host
-/// owns the bounded background runner conflict remediation is handed to — it is
-/// what keeps this function a *detection* pass: observing a conflict records
-/// the attempt, publishes, and enqueues; it never awaits the escalation
-/// ladder's cube lease + rebase + push. Pass `None` to run the sweep with none
-/// of those engine services wired (a pass that only observes and promotes).
-pub async fn run_one_pass(
-    work_db: &WorkDb,
-    probe: &dyn MergeProbe,
-    publisher: &dyn ExecutionPublisher,
-    cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&dyn CompletionRequests>,
-    host: Option<&dyn SweepHost>,
-) -> SweepOutcome {
-    run_one_pass_observed(work_db, probe, publisher, cube_client, completion_handler, host)
-        .await
-        .0
-}
-
-/// [`run_one_pass`], plus the per-PR [`PollTier`] its probe implies for
-/// every candidate the pass considered.
-///
-/// The tiers are free: the pass already probed every one of these PRs, and
-/// throwing the classification away is what forced the adaptive layer to
-/// spend a probe of its own just to *discover* that a PR is cold. Handing
-/// them to [`PrPollSchedule::apply_sweep_observations`] lets the schedule be
-/// derived from the sweep rather than guessed and corrected.
-///
-/// The observation list covers every URL the pass *listed*, not only the
-/// ones it walked: the batched probe is taken up front for the whole set, so
-/// a pass abandoned mid-walk still classified them all. An entry the
-/// snapshot no longer holds (a mid-pass re-probe replaces the results map
-/// with just the unprocessed remainder) is reported as `None` — no adaptive
-/// slot, and the next sweep re-observes it.
-pub async fn run_one_pass_observed(
-    work_db: &WorkDb,
-    probe: &dyn MergeProbe,
-    publisher: &dyn ExecutionPublisher,
-    cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&dyn CompletionRequests>,
-    host: Option<&dyn SweepHost>,
-) -> (SweepOutcome, Vec<PollObservation>) {
-    let in_review = match work_db.list_chores_pending_merge_check() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to list pending merge checks");
-            Vec::new()
-        }
-    };
-    let blocked_conflict = match work_db.list_chores_blocked_on_merge_conflict() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to list chores blocked on merge_conflict",);
-            Vec::new()
-        }
-    };
-    let blocked_ci = match work_db.list_chores_blocked_on_ci_failure() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to list chores blocked on ci_failure",);
-            Vec::new()
-        }
-    };
-    let blocked_other = match work_db.list_chores_blocked_other_with_pr() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "merge poller: failed to list chores blocked with a PR for another reason",
-            );
-            Vec::new()
-        }
-    };
-    let pending_pr_recheck = match work_db.list_executions_pending_pr_detection() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to list executions pending PR detection",);
-            Vec::new()
-        }
-    };
-    // Stop-boundary nudges held for delegated background work must be
-    // revisited by a recurring path: the worker may never emit another Stop.
-    // The handler snapshots the exact suppressed intents so this also covers
-    // revision executions with an already-bound PR, not just the no-PR query
-    // above.
-    let pending_background_nudges = completion_handler
-        .map(|handler| handler.pending_background_nudge_execution_ids())
-        .unwrap_or_default();
-    let stranded_ci_attempts = match work_db.list_stranded_ci_remediation_attempts() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to list stranded ci remediation attempts",);
-            Vec::new()
-        }
-    };
-    let stranded_blocked = match work_db.list_chores_stranded_blocked_remediation() {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                "merge poller: failed to list stranded blocked remediation parents",
-            );
-            Vec::new()
-        }
-    };
-    // Late-PR candidates (Bug B recovery): terminal executions within
-    // the last 60 min whose task is still `active` with no `pr_url`.
-    // These arise from the double-spawn race where the orphan sweep
-    // abandons exec_A while its pane is still running. The normal
-    // `pending_pr_recheck` sweep (which only watches `waiting_human`)
-    // cannot recover them; this sweep fills the gap.
-    let late_pr_candidates: Vec<LatePrCandidate> = if completion_handler.is_some() {
-        match work_db.list_recently_terminal_executions_pending_pr_detection(3600) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(?err, "merge poller: failed to list late PR candidates",);
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    if let Some(host) = host {
-        super::disarm_drain::drain_pending_merge_disarms(work_db, probe, publisher, host).await;
-    }
-    let total = in_review.len()
-        + blocked_conflict.len()
-        + blocked_ci.len()
-        + blocked_other.len()
-        + pending_pr_recheck.len()
-        + pending_background_nudges.len()
-        + stranded_ci_attempts.len()
-        + stranded_blocked.len()
-        + late_pr_candidates.len();
-    if total == 0 && !super::deferred_review_admission::has_pending_review_admission(work_db, completion_handler) {
-        // No candidates at all: an empty observation set, which retires every
-        // remaining adaptive slot rather than leaving orphans behind.
-        return (SweepOutcome::default(), Vec::new());
-    }
-    tracing::debug!(
-        in_review = in_review.len(),
-        blocked_conflict = blocked_conflict.len(),
-        blocked_ci = blocked_ci.len(),
-        blocked_other = blocked_other.len(),
-        pending_pr_recheck = pending_pr_recheck.len(),
-        pending_background_nudges = pending_background_nudges.len(),
-        stranded_ci_attempts = stranded_ci_attempts.len(),
-        stranded_blocked = stranded_blocked.len(),
-        late_pr_candidates = late_pr_candidates.len(),
-        "merge poller: sweep started",
-    );
-    let mut outcome = SweepOutcome::default();
-    // Batch every PR this pass will probe into one round trip
-    // (`MergeProbe::probe_batch`) instead of one `gh pr view` per PR —
-    // covers both the `sweep_one` candidates below and `stranded_blocked`,
-    // since both loops probe the same way.
-    let mut probe_url_seen = std::collections::HashSet::new();
-    let probe_urls: Vec<String> = in_review
-        .iter()
-        .chain(blocked_conflict.iter())
-        .chain(blocked_ci.iter())
-        .chain(blocked_other.iter())
-        .chain(stranded_blocked.iter())
-        .map(|candidate| candidate.pr_url.clone())
-        .filter(|url| probe_url_seen.insert(url.clone()))
-        .collect();
-    let source_observation_sequences = allocate_source_observation_sequences(work_db, completion_handler, &probe_urls);
-    let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
-    // The pass's candidate walk, materialised so a mid-pass re-probe can be
-    // scoped to the part of it that has not happened yet — see
-    // [`ProbeSnapshot::ensure_fresh`].
-    let sweep_walk: Vec<&PendingMergeCheck> = in_review
-        .iter()
-        .chain(blocked_conflict.iter())
-        .chain(blocked_ci.iter())
-        .chain(blocked_other.iter())
-        .collect();
-    // De-duplicate by work_item_id: a chore that's both pending and
-    // blocked-on-CI (shouldn't happen but defensive) only gets one
-    // probe per sweep.
-    let mut seen = std::collections::HashSet::new();
-    for idx in 0..sweep_walk.len() {
-        let candidate = sweep_walk[idx];
-        if !seen.insert(candidate.work_item_id.clone()) {
-            continue;
-        }
-        // Never transition off a snapshot that has gone stale under a
-        // long-running pass — see [`ProbeSnapshot`].
-        if !snapshot
-            .ensure_fresh(probe, || {
-                remaining_probe_urls(sweep_walk[idx..].iter().copied().chain(stranded_blocked.iter()))
-            })
-            .await
-        {
-            break;
-        }
-        sweep_one(
-            work_db,
-            &snapshot.results,
-            &source_observation_sequences,
-            (publisher, "full_sweep"),
-            SweepHandlers {
-                cube_client,
-                completion_handler,
-                host,
-            },
-            candidate,
-            &mut outcome,
-        )
-        .await;
-    }
-    if let Some(handler) = completion_handler {
-        for execution_id in &pending_pr_recheck {
-            sweep_pending_pr(handler, execution_id, &mut outcome).await;
-        }
-        for execution_id in &pending_background_nudges {
-            if let Some(recheck_outcome) = handler.recheck_background_nudge(execution_id).await {
-                tracing::info!(
-                    execution_id,
-                    outcome = ?recheck_outcome,
-                    "merge poller: recurring background-child nudge recheck completed",
-                );
-            }
-        }
-    } else if !pending_pr_recheck.is_empty() {
-        tracing::debug!(
-            count = pending_pr_recheck.len(),
-            "merge poller: pending PR-detection candidates skipped (no completion_handler wired)",
-        );
-    }
-    // Rescue stranded ci_remediations attempts: `pending` rows with no live
-    // execution. These arise when two dequeue events land in the same sweep —
-    // the first flips the task (consuming the WHERE guard on
-    // `mark_chore_blocked_ci_failure`) and the second inserts a ci_remediations
-    // row but cannot create an execution. Re-emit a fresh execution so a worker
-    // is dispatched without waiting for the task to return to `in_review`.
-    for attempt in &stranded_ci_attempts {
-        if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
-            outcome.ci_remediation_redispatched += 1;
-        }
-    }
-    // Reconcile stranded `blocked` parents (NULL scalar reason, empty
-    // active-signal set, remediation-owned, bound PR). These fell out of
-    // every scalar-reason-keyed candidate list above, so a still-dirty PR
-    // would otherwise never be re-probed and no remediation revision would
-    // ever (re)spawn — the invariant violation where a parent rests
-    // `blocked` with no signal while its PR conflicts/fails. Re-probe each,
-    // re-canonicalise a still-dirty row back into the standard
-    // merge_conflict / ci_failure loop, and let the normal detection path
-    // spawn a fresh revision.
-    for idx in 0..stranded_blocked.len() {
-        if !snapshot
-            .ensure_fresh(probe, || remaining_probe_urls(stranded_blocked[idx..].iter()))
-            .await
-        {
-            break;
-        }
-        sweep_stranded_blocked_remediation(
-            work_db,
-            &snapshot.results,
-            publisher,
-            host,
-            &stranded_blocked[idx],
-            &mut outcome,
-        )
-        .await;
-    }
-    // Late-PR sweep (Bug B): recover terminal executions whose pane
-    // pushed a PR after the execution was marked abandoned.
-    if let Some(handler) = completion_handler {
-        for candidate in &late_pr_candidates {
-            sweep_late_pr(handler, candidate, &mut outcome).await;
-        }
-    }
-    // Merge-queue rebounce pass: for every `in_review` PR and every
-    // `blocked: ci_failure` PR, poll the GitHub timeline for
-    // `RemovedFromMergeQueueEvent` rows with `reason=FAILED_CHECKS`.
-    // This is a separate pass from the probe loop above — the probe
-    // covers per-PR CI and merge-conflict signals, while this pass
-    // specifically looks for queue dequeues. Including `blocked_ci`
-    // candidates ensures that a second dequeue (on a PR already blocked
-    // by a prior dequeue) inserts a ci_remediations row so the stranded
-    // rescue above can dispatch an execution for it.
-    // The `INSERT OR IGNORE` idempotency on `ci_remediations` ensures
-    // that events already processed on a prior sweep are no-ops.
-    //
-    // Every candidate's dequeue events are fetched in one batched GraphQL
-    // round trip (`fetch_merge_queue_dequeue_events_batch`) instead of one
-    // `gh api graphql` call per candidate — this was the dominant
-    // per-pass request volume behind the hourly GitHub quota exhaustion
-    // (O(open rows) unbatched requests, every 60s, on top of everything
-    // else sharing the token).
-    // A `trunk_queue`-mechanism product's dequeue/eviction signal is owned
-    // by the Trunk queue poller, not GitHub's merge-queue timeline — its
-    // PRs never actually sit in GitHub's native queue (see
-    // `is_trunk_queue_product`), so a `RemovedFromMergeQueueEvent` lookup
-    // here would either find nothing or, worse, race the Trunk-owned
-    // coordination state with a GitHub-side signal that was never armed
-    // for this product.
-    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
-
-    // reviewer-fallback sweep: tasks held in `active` (PendingReview)
-    // while waiting for an AI reviewer pass that has since finished or timed
-    // out. A pass that recorded a ReviewResult may advance to Review; a pass
-    // that produced no result is re-fired and stays in Doing. Timeout: 10
-    // minutes — long enough for the reviewer to complete normally, short
-    // enough to surface and recover a wedged pass promptly.
-    let reviewer_stale_secs: u64 = 10 * 60;
-    let stalled_candidates = match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks");
-            Vec::new()
-        }
-    };
-    let skip_unbatched_review_holds = completion_handler
-        .map(|handler| handler.review_batch_fanout_enabled())
-        .unwrap_or(false);
-    for (task_id, product_id, pr_url, review_result_written) in &stalled_candidates {
-        sweep_stalled_reviewer(
-            work_db,
-            publisher,
-            StalledReview {
-                task_id,
-                product_id,
-                pr_url,
-                review_result_written: *review_result_written,
-                skip_unbatched_review_holds,
-            },
-            &GhPrStateChecker,
-            &mut outcome,
-        )
-        .await;
-    }
-
-    if skip_unbatched_review_holds && let Some(handler) = completion_handler {
-        let pool_size = handler.review_pool_size();
-        sweep_deferred_review_admission_with(
-            work_db,
-            publisher,
-            handler.review_batch_enqueuer(),
-            None,
-            pool_size,
-            &mut outcome,
-        )
-        .await;
-    }
-    if let Err(err) = work_db.sweep_reported_live_review_batch_members() {
-        tracing::warn!(?err, "merge poller: failed to sweep reported live batch members");
-    }
-    match work_db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
-        Ok(reaped) => {
-            outcome.review_batches_reaped = reaped.len();
-            if !reaped.is_empty() {
-                tracing::info!(
-                    reaped = reaped.len(),
-                    "merge poller: reaped inert review batches to release pool reservations"
-                );
-            }
-        }
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: failed to reap inert review batches");
-        }
-    }
-    sample_review_pool_gauges(work_db, &mut outcome);
-
-    let observations = poll_observations(&probe_urls, &snapshot.results);
-    (outcome, observations)
-}
-
-/// Classify each probed URL into the tier that should drive its adaptive
-/// polling. Shared by the full sweep and the batched adaptive reconcile so
-/// both feed [`PrPollSchedule`] through identical rules: a URL whose probe
-/// failed, or which the snapshot no longer holds, yields `None` (no adaptive
-/// slot — the full sweep re-probes it).
-pub(crate) fn poll_observations(
-    pr_urls: &[String],
-    results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
-) -> Vec<PollObservation> {
-    pr_urls
-        .iter()
-        .map(|url| {
-            let tier = results
-                .get(url)
-                .and_then(|r| r.as_ref().ok())
-                .and_then(poll_tier_for_probe);
-            (url.clone(), tier)
-        })
-        .collect()
+    /// Parked work-item ids preloaded for this pass. `None` looks up each
+    /// candidate on its own.
+    pub parked_ids: Option<&'a std::collections::HashSet<String>>,
 }
 
 /// Reconcile exactly one PR instead of sweeping every candidate (doc
@@ -696,6 +151,7 @@ pub async fn reconcile_batch(
                 cube_client,
                 completion_handler,
                 host,
+                parked_ids: None,
             },
             candidate,
             &mut outcome,
@@ -709,7 +165,7 @@ pub async fn reconcile_batch(
     // dequeue/eviction signal is owned by the Trunk queue poller, not
     // GitHub's merge-queue timeline. One batched dequeue query for the whole
     // due set, exactly like the full sweep's.
-    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
+    run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, None, &mut outcome).await;
 
     let reviewer_stale_secs: u64 = 10 * 60;
     let skip_unbatched_review_holds = completion_handler
@@ -1232,6 +688,7 @@ pub(crate) async fn sweep_one(
         cube_client,
         completion_handler,
         host,
+        parked_ids,
     } = handlers;
     let probe_result = match probe_results.get(&candidate.pr_url) {
         Some(Ok(state)) => state.clone(),
@@ -1260,8 +717,14 @@ pub(crate) async fn sweep_one(
     // when none remains).
     let mut known_active_queue_failure: Option<Option<CiRemediation>> = None;
     // Read before any transition: a merge moves the row to `done`, after which
-    // it no longer reads as parked.
-    let parked = work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep");
+    // it no longer reads as parked. The batched set is a fast skip for rows
+    // already parked at load; a row parked since then is confirmed on the
+    // mint/resume paths below.
+    let parked = match parked_ids {
+        Some(ids) => ids.contains(&candidate.work_item_id),
+        None => work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep"),
+    };
+    let parked_for_action = || parked || work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge poller sweep");
     match &probe_result.state {
         PrLifecycleState::Merged => {
             match work_db.retire_github_merge_intent(&candidate.work_item_id, &candidate.pr_url, "merged") {
@@ -1377,7 +840,13 @@ pub(crate) async fn sweep_one(
                     let ladder_enabled = completion_handler
                         .map(|h| h.mechanical_rebase_enabled())
                         .unwrap_or(false);
-                    if let Some(host) = host
+                    if parked_for_action() {
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            "merge poller: row is parked; skipping conflict remediation",
+                        );
+                    } else if let Some(host) = host
                         && host
                             .on_conflict_detected(
                                 work_db,
@@ -1417,6 +886,7 @@ pub(crate) async fn sweep_one(
                             cube_client,
                             completion_handler,
                             host,
+                            parked_ids,
                         },
                         candidate,
                         &probe_result,
@@ -1446,6 +916,7 @@ pub(crate) async fn sweep_one(
                             cube_client,
                             completion_handler,
                             host,
+                            parked_ids,
                         },
                         candidate,
                         &probe_result,
@@ -1535,7 +1006,7 @@ pub(crate) async fn sweep_one(
             caller,
         )
         .await;
-        if !parked
+        if !parked_for_action()
             && open.mergeability == OpenPrMergeability::Clean
             && let Some(host) = host
         {
@@ -2023,6 +1494,7 @@ pub async fn maybe_clear_blocked(
         cube_client,
         completion_handler,
         host,
+        parked_ids: _,
     } = handlers;
     let labels = &probe_result.labels;
     let raw_mergeable = probe_result.raw_mergeable.as_str();
@@ -2940,7 +2412,7 @@ fn has_nonterminal_pr_review(work_db: &WorkDb, task_id: &str, cycle_root_id: &st
     is_live_review(task_id) || (cycle_root_id != task_id && is_live_review(cycle_root_id))
 }
 
-fn sample_review_pool_gauges(work_db: &WorkDb, outcome: &mut SweepOutcome) {
+pub(crate) fn sample_review_pool_gauges(work_db: &WorkDb, outcome: &mut SweepOutcome) {
     match work_db.review_pool_reserved_units() {
         Ok((pre, post)) => outcome.reserved_review_units = pre + post,
         Err(err) => tracing::warn!(?err, "merge poller: failed to sample review-pool reservations"),

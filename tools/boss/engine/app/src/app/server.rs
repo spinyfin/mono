@@ -1751,11 +1751,15 @@ async fn serve_scoped(
             // population are carried out by the services that own them; the
             // poller reaches them through this host.
             host: server_state.sweep_host.clone(),
+            detection_stall: server_state.merge_detection_stall.clone(),
         },
         Duration::from_secs(60),
         server_state.metrics.clone(),
         (server_state.pr_reconciler_kick.clone(), pr_reconcile_requests),
     );
+    // An abandoned detection pass reaches the app's health banner as it
+    // happens, not on the next poll.
+    let _merge_detection_stall_health_handle = server_state.spawn_merge_detection_stall_health_broadcaster();
 
     // Periodic dead-PID reconciler: detects worker slots whose backing
     // OS process has died (kill-9, crash, OOM) and reaps them so the

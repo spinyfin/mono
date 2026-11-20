@@ -392,6 +392,119 @@ fn walk_batch_response_finds_nodes_by_alias_and_flags_null_nodes() {
     );
 }
 
+/// Two repos, three PRs — the alias map the scoping tests below read errors
+/// against.
+fn two_repo_alias_map() -> BatchAliasMap {
+    vec![
+        (
+            "repo0".to_owned(),
+            vec![
+                ("pr0".to_owned(), "https://github.com/acme/widgets/pull/1".to_owned()),
+                ("pr1".to_owned(), "https://github.com/acme/widgets/pull/2".to_owned()),
+            ],
+        ),
+        (
+            "repo1".to_owned(),
+            vec![("pr0".to_owned(), "https://github.com/acme/gadgets/pull/7".to_owned())],
+        ),
+    ]
+}
+
+fn url_set(urls: &[&str]) -> std::collections::HashSet<String> {
+    urls.iter().map(|url| (*url).to_owned()).collect()
+}
+
+/// One PR that no longer resolves must cost one extra probe, not one per
+/// tracked PR. This is the response GitHub actually returns for a deleted
+/// PR number: the sibling nodes are all present, and the error's `path`
+/// names the one alias that is not.
+#[test]
+fn a_pr_level_error_scopes_the_fallback_to_that_pr_alone() {
+    let body = serde_json::json!({
+        "data": { "repo0": { "pr0": { "state": "MERGED" }, "pr1": null }, "repo1": { "pr0": { "state": "OPEN" } } },
+        "errors": [{
+            "type": "NOT_FOUND",
+            "path": ["repo0", "pr1"],
+            "message": "Could not resolve to a PullRequest with the number of 2.",
+        }],
+    });
+
+    assert_eq!(
+        batch_error_scope(&body, &two_repo_alias_map()),
+        BatchErrorScope::Urls(url_set(&["https://github.com/acme/widgets/pull/2"])),
+    );
+}
+
+/// An error on a field *inside* a PR node leaves that node present but
+/// partly null. It must not be read from the batch: a null CI rollup would
+/// classify as green.
+#[test]
+fn a_nested_field_error_makes_its_own_pr_untrusted() {
+    let body = serde_json::json!({
+        "data": { "repo0": { "pr0": { "state": "OPEN", "commits": null }, "pr1": { "state": "OPEN" } } },
+        "errors": [{ "path": ["repo0", "pr0", "commits", "nodes", 0], "message": "Something went wrong." }],
+    });
+
+    assert_eq!(
+        batch_error_scope(&body, &two_repo_alias_map()),
+        BatchErrorScope::Urls(url_set(&["https://github.com/acme/widgets/pull/1"])),
+    );
+}
+
+/// A repository that no longer resolves takes its own PRs with it and
+/// leaves every other repo's PRs readable from the batch.
+#[test]
+fn a_repo_level_error_scopes_the_fallback_to_that_repo() {
+    let body = serde_json::json!({
+        "data": { "repo0": null, "repo1": { "pr0": { "state": "OPEN" } } },
+        "errors": [{ "type": "NOT_FOUND", "path": ["repo0"], "message": "Could not resolve to a Repository." }],
+    });
+
+    assert_eq!(
+        batch_error_scope(&body, &two_repo_alias_map()),
+        BatchErrorScope::Urls(url_set(&[
+            "https://github.com/acme/widgets/pull/1",
+            "https://github.com/acme/widgets/pull/2",
+        ])),
+    );
+}
+
+/// An error that names nothing in the batch says nothing about which nodes
+/// are sound, so none of them is trusted.
+#[test]
+fn an_error_naming_no_alias_distrusts_the_whole_response() {
+    let pathless = serde_json::json!({
+        "data": { "repo0": { "pr0": { "state": "OPEN" } } },
+        "errors": [{ "message": "Something went wrong while executing your query." }],
+    });
+    assert_eq!(
+        batch_error_scope(&pathless, &two_repo_alias_map()),
+        BatchErrorScope::Whole
+    );
+
+    let unknown_alias = serde_json::json!({
+        "data": {},
+        "errors": [
+            { "path": ["repo0", "pr0"], "message": "scoped" },
+            { "path": ["rateLimit"], "message": "not an alias of this batch" },
+        ],
+    });
+    assert_eq!(
+        batch_error_scope(&unknown_alias, &two_repo_alias_map()),
+        BatchErrorScope::Whole,
+        "one unscoped error is enough, whatever the others name",
+    );
+}
+
+#[test]
+fn a_response_without_errors_is_read_whole() {
+    let alias_map = two_repo_alias_map();
+    let no_field = serde_json::json!({ "data": { "repo0": { "pr0": { "state": "OPEN" } } } });
+    assert_eq!(batch_error_scope(&no_field, &alias_map), BatchErrorScope::Clean);
+    let empty = serde_json::json!({ "data": {}, "errors": [] });
+    assert_eq!(batch_error_scope(&empty, &alias_map), BatchErrorScope::Clean);
+}
+
 /// `(state × mergeability × ci-leaf-set × combined-state)` matrix for
 /// the CI predicate. Exercises the latest-leaf-per-name collapse, the
 /// required/not-required filter, the closed conclusion set from design
