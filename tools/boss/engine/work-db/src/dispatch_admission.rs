@@ -52,7 +52,7 @@ pub struct DispatchAdmissionFacts {
     /// see `task_accepts_execution`'s doc comment.
     #[builder(default)]
     pub autostart_disabled: bool,
-    /// `true` when this row's latest execution ended in a *deliberate*
+    /// `true` when this row's latest declaration-capable execution ended in a *deliberate*
     /// park rather than a lost pane: the worker declared
     /// `run_done --outcome blocked`, or an open park attention item
     /// (`run_done_declared_blocked` / `nudge_breaker_tripped`) is still
@@ -62,7 +62,8 @@ pub struct DispatchAdmissionFacts {
     ///
     /// Blocking on every **automatic** mint path (`orphan_sweep`,
     /// `rescan_active_dispatch`, `reconcile_active_dispatch`,
-    /// `reconcile_work_item_execution`, `reconcile_revision_execution`).
+    /// `reconcile_work_item_execution`, `reconcile_revision_execution`,
+    /// `dispatch_failure_recovery_sweep`).
     /// Informational on this evaluator
     /// for the same reason as `churn_guard_parked`: an explicit
     /// `bossctl work start` / kanban drag-to-Doing is the un-park
@@ -132,9 +133,11 @@ fn has_open_execution_attention_of_kind_on(conn: &Connection, execution_id: &str
 /// the latest execution so that a fresh replacement execution — minted by
 /// an explicit `bossctl work start` — is never kept parked by a park item
 /// belonging to the row it replaced. Explicit dispatch also resolves park
-/// attention synchronously. Latest-execution scoping assumes automatic mint
-/// paths honor the park before inserting a replacement; PR-review mint paths
-/// instead require `in_review`, while a nudge-breaker park leaves work `active`.
+/// attention synchronously. "Latest" counts only executions that can carry a
+/// run-done declaration: automatic review, triage and answer runs may be minted
+/// while the row is parked (the stalled-reviewer sweep only needs `active`) and
+/// must not erase the implementation run's signal. Automatic implementation
+/// mint paths honor the park before inserting a replacement.
 /// Takes `&Connection` so transactional callers need not re-lock the DB.
 pub fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -> Result<bool> {
     // Compatibility only: new terminal failures move the task out of active
@@ -158,12 +161,21 @@ pub fn work_item_is_deliberately_parked(conn: &Connection, work_item_id: &str) -
     })
 }
 
+impl WorkDb {
+    /// Read the deliberate park without evaluating the other admission gates.
+    pub fn is_deliberately_parked(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        work_item_is_deliberately_parked(&conn, work_item_id)
+    }
+}
+
 /// SQL scalar: the id of `item`'s latest execution, the row
 /// [`work_item_is_deliberately_parked`] keys on.
 fn latest_execution_id_sql(item: &str) -> String {
     format!(
         "(SELECT latest.id FROM work_executions latest
           WHERE latest.work_item_id = {item}
+            AND latest.kind NOT IN ('pr_review', 'automation_triage', 'answer_agent')
           ORDER BY latest.created_at DESC, latest.id DESC
           LIMIT 1)"
     )

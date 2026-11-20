@@ -590,7 +590,9 @@ impl WorkDb {
         }
         ensure_dispatch_repo_resolvable(&mut conn, &input.work_item_id)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if !Self::reenable_autostart_after_dispatch_failure_in_tx(&tx, work_item_id)? {
+        if work_item_is_deliberately_parked(&tx, work_item_id)?
+            || !Self::reenable_autostart_after_dispatch_failure_in_tx(&tx, work_item_id)?
+        {
             tx.commit()?;
             return Ok(None);
         }
