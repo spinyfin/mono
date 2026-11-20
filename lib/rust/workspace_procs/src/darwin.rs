@@ -133,12 +133,7 @@ pub fn proc_cwd(pid: libc::pid_t) -> std::io::Result<std::path::PathBuf> {
         )
     };
     if n <= 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(if error.raw_os_error() == Some(libc::ESRCH) {
-            std::io::Error::new(std::io::ErrorKind::NotFound, error)
-        } else {
-            error
-        });
+        return Err(std::io::Error::last_os_error());
     }
     if n != info_size {
         return Err(std::io::Error::other(format!(
@@ -161,24 +156,14 @@ fn list_pids_of(kind: u32, info: u32) -> std::io::Result<Vec<libc::pid_t>> {
     // SAFETY: null buffer is the documented size-query form of `proc_listpids`.
     let bytes = unsafe { libc::proc_listpids(kind, info, std::ptr::null_mut(), 0) };
     if bytes <= 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(if error.raw_os_error() == Some(libc::ESRCH) {
-            std::io::Error::new(std::io::ErrorKind::NotFound, error)
-        } else {
-            error
-        });
+        return Err(std::io::Error::last_os_error());
     }
     let mut buf = vec![0i32; (bytes as usize / std::mem::size_of::<i32>()) + 32];
     let capacity = (buf.len() * std::mem::size_of::<i32>()) as libc::c_int;
     // SAFETY: `buf` is a valid integer buffer of `capacity` bytes.
     let written = unsafe { libc::proc_listpids(kind, info, buf.as_mut_ptr() as *mut c_void, capacity) };
     if written <= 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(if error.raw_os_error() == Some(libc::ESRCH) {
-            std::io::Error::new(std::io::ErrorKind::NotFound, error)
-        } else {
-            error
-        });
+        return Err(std::io::Error::last_os_error());
     }
     let count = (written as usize) / std::mem::size_of::<i32>();
     Ok(buf
@@ -197,12 +182,7 @@ pub fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
     // SAFETY: `info` is a valid buffer of exactly `info_size` bytes.
     let n = unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut c_void, info_size) };
     if n <= 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(if error.raw_os_error() == Some(libc::ESRCH) {
-            std::io::Error::new(std::io::ErrorKind::NotFound, error)
-        } else {
-            error
-        });
+        return Err(std::io::Error::last_os_error());
     }
     if n != info_size {
         return Err(std::io::Error::other(format!(
@@ -212,10 +192,7 @@ pub fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
     // Darwin sys/proc.h: SZOMB = 5, awaiting collection by the parent.
     // A zombie no longer has a cwd and is not a live workspace occupant.
     if info.header.status == 5 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("pid {pid} has exited"),
-        ));
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
     }
     Ok(ProcBsdInfo {
         ppid: info.header.ppid as libc::pid_t,
@@ -246,6 +223,15 @@ mod tests {
         assert_eq!(c_name(b"zsh\0garbage").as_deref(), Some("zsh"));
         assert_eq!(c_name(b"abc").as_deref(), Some("abc"));
         assert_eq!(c_name(b"\0").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn exited_pid_preserves_raw_esrch() {
+        let mut child = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        assert!(child.wait().unwrap().success());
+        assert_eq!(proc_cwd(pid).unwrap_err().raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(proc_bsd_info(pid).unwrap_err().raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]

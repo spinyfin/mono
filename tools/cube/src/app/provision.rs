@@ -234,14 +234,15 @@ pub(super) fn auto_create_workspace(
 /// (no commits, no working copy), so remove the directory and forget its
 /// registry row, freeing the slot for a fresh clone. Called from the lease
 /// path so a degraded pool self-repairs instead of blocking a lease
-/// (issue #845 part 2b). Returns true only when the directory and row were removed.
+/// (issue #845 part 2b).
 ///
-/// Anything
-/// still running inside the husk is reaped first; when that cannot be verified
+/// Returns true only when the directory and row were removed.
+///
+/// Anything still running inside the husk is reaped first; when that cannot be verified
 /// the directory is kept (a husk is never worth killing the wrong process or
 /// deleting a tree something still uses) and the lease provisions a fresh
 /// workspace instead of failing.
-pub(super) fn gc_broken_empty_workspace_with(
+pub(super) fn gc_broken_empty_workspace(
     table: &dyn WorkspaceProcessTable,
     store: &mut Store,
     database_path: Option<&Path>,
@@ -569,7 +570,7 @@ mod broken_empty_removal_tests {
         let tempdir = tempfile::tempdir().unwrap();
         let (mut store, path) = seeded(&tempdir);
         let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(path.to_str().unwrap()))], 900);
-        gc_broken_empty_workspace_with(&table, &mut store, None, "mono", "mono-agent-001", &path).unwrap();
+        gc_broken_empty_workspace(&table, &mut store, None, "mono", "mono-agent-001", &path).unwrap();
         assert!(!path.exists());
         assert!(!table.is_alive(40));
         assert!(store.list_workspaces("mono").unwrap().is_empty());
@@ -581,7 +582,7 @@ mod broken_empty_removal_tests {
         let (mut store, path) = seeded(&tempdir);
         let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(path.to_str().unwrap()))], 900);
         table.immortal(40);
-        gc_broken_empty_workspace_with(&table, &mut store, None, "mono", "mono-agent-001", &path)
+        gc_broken_empty_workspace(&table, &mut store, None, "mono", "mono-agent-001", &path)
             .expect("verification failure must not fail provisioning");
         assert!(path.join("leftover").exists(), "directory is retained");
         assert!(table.is_alive(40));
@@ -592,7 +593,7 @@ mod broken_empty_removal_tests {
     fn husk_is_retained_when_the_process_table_cannot_be_read() {
         let tempdir = tempfile::tempdir().unwrap();
         let (mut store, path) = seeded(&tempdir);
-        gc_broken_empty_workspace_with(&UnreadableTable, &mut store, None, "mono", "mono-agent-001", &path).unwrap();
+        gc_broken_empty_workspace(&UnreadableTable, &mut store, None, "mono", "mono-agent-001", &path).unwrap();
         assert!(path.join("leftover").exists());
         assert_eq!(store.list_workspaces("mono").unwrap().len(), 1);
     }

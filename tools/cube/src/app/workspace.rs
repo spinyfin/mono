@@ -41,7 +41,7 @@ use crate::app::process_guard::{
 };
 use crate::app::provision::{
     auto_create_workspace, discover_workspaces, find_workspace_record, format_lease_message, format_setup_message,
-    gc_broken_empty_workspace_with, run_setup_for_lease, run_setup_for_workspace,
+    gc_broken_empty_workspace, run_setup_for_lease, run_setup_for_workspace,
 };
 use crate::app::reclaim::relieve_disk_pressure;
 use crate::app::reconcile::{
@@ -1130,8 +1130,7 @@ pub(super) fn run_workspace_with_process_table(
                 // surfacing it to the caller. A husk must never be a reason to
                 // deny a lease for a reachable repo (issue #845 part 2b).
                 for (ws_id, ws_path) in &broken_empty {
-                    if gc_broken_empty_workspace_with(process_table, &mut store, database_path, &repo, ws_id, ws_path)?
-                    {
+                    if gc_broken_empty_workspace(process_table, &mut store, database_path, &repo, ws_id, ws_path)? {
                         candidates.retain(|c| &c.workspace_id != ws_id);
                     }
                 }

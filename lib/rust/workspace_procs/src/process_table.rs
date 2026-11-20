@@ -80,7 +80,7 @@ pub trait WorkspaceProcessTable: Send + Sync {
     /// Every process the caller may inspect.
     fn list(&self) -> io::Result<Vec<LiveProcess>>;
 
-    /// One process, fresh. `Err` with `NotFound` once it has exited.
+    /// One process, fresh. `Err` with `NotFound` or raw `ESRCH` once it has exited.
     fn snapshot(&self, pid: i32) -> io::Result<LiveProcess>;
 
     /// Deliver `signal` to exactly `pid` (never a group).
@@ -432,11 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_pid_is_not_found() {
+    fn missing_pid_reports_process_exit() {
         // Far past any plausible pid on either platform.
         let err = SystemWorkspaceProcessTable.snapshot(99_999_999 - 1).unwrap_err();
         assert!(
-            matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidInput),
+            matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidInput)
+                || err.raw_os_error() == Some(libc::ESRCH),
             "{err:?}"
         );
     }
