@@ -2301,14 +2301,28 @@ pub(crate) struct TaskCreateArgs {
 }
 
 /// Args for `boss task list`. Returns every leaf work-item kind for the
-/// product (project tasks, design, investigation, design_postmortem,
-/// followup, chore, revision). Narrow with `--project` (excludes
+/// selected products (project tasks, design, investigation, design_postmortem,
+/// followup, chore, revision). Use --all-products to search across products.
+/// With --match or --ids, omitting both --product and --project searches across
+/// products. Narrow with `--project` (excludes
 /// project-less chores) or use `boss chore list` / `boss task list-revisions`
 /// for single-kind views.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskListArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
+
+    /// Search every product. Implicit with --match or --ids without a product or project scope.
+    #[arg(long, conflicts_with_all = ["product", "project"])]
+    pub(crate) all_products: bool,
+
+    /// Filter by work-item kind. Repeat or use a comma-separated list.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) kind: Vec<boss_protocol::TaskKind>,
+
+    /// Created at or after an RFC3339 timestamp or a relative age (24h, 7d, 2w).
+    #[arg(long)]
+    pub(crate) created_since: Option<String>,
 
     #[arg(long, value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) project: Option<String>,
@@ -2338,7 +2352,9 @@ pub(crate) struct TaskListArgs {
     /// Accepts the same forms as `boss task show`: friendly short ids
     /// (`T42`, `42`, `#42`), primary ids (`task_…`), and the
     /// cross-product form (`boss/42`). An id that names no row in the
-    /// product errors rather than being silently dropped. Composes with
+    /// selected scope errors rather than being silently dropped. Without
+    /// --product, ids may span products; bare numbers must be unambiguous.
+    /// An explicit --product restricts every id to that product. Composes with
     /// the other filters below as an AND — a row excluded by e.g.
     /// `--status` is not an error, only an id that doesn't exist at
     /// all is. `--id` is accepted as a legacy alias for existing

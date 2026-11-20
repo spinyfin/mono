@@ -813,74 +813,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                 print_task_details("Created task", &task, None, false);
             })
         }
-        TaskCommand::List(args) => {
-            let product = resolve_product_inferable(&mut client, args.product, args.project.as_deref(), ctx).await?;
-            let project = match args.project {
-                Some(selector) => Some(resolve_project(&mut client, &product.id, Some(selector), ctx).await?),
-                None => None,
-            };
-            let dep_filter = args.dep.into_filter();
-            let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
-            // Resolve --parent to a primary id, then canonicalize to the
-            // revision chain root so a mid-chain revision id matches the
-            // same rows `boss task list-revisions --parent` would return.
-            // Unknown selectors error loudly rather than returning an empty
-            // child set (which would look like "this parent has no
-            // children").
-            let parent_task_id = if let Some(selector) = args.parent.as_deref() {
-                let resolved = resolve_create_revision_parent(&mut client, selector).await?;
-                Some(resolve_chain_root_id(&mut client, &resolved).await)
-            } else {
-                None
-            };
-            let tasks = list_tasks(
-                &mut client,
-                &product.id,
-                project.as_ref().map(|project| project.id.as_str()),
-                dep_filter.clone(),
-                args.include_deleted,
-            )
-            .await?;
-            let resolved_ids = if args.ids.is_empty() {
-                Vec::new()
-            } else if dep_filter.is_none() && project.is_none() && parent_task_id.is_none() && args.include_deleted {
-                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &tasks, |t| {
-                    (t.id.as_str(), t.short_id)
-                })
-                .await?
-            } else {
-                // Existence must be independent of every server-side
-                // narrowing filter, including --include-deleted: a
-                // tombstoned row still exists, so it must narrow to
-                // an empty result rather than error as unknown.
-                let unfiltered = list_tasks(&mut client, &product.id, None, None, true).await?;
-                resolve_ids_for_listing(&mut client, ctx, &args.ids, &product.id, &unfiltered, |t| {
-                    (t.id.as_str(), t.short_id)
-                })
-                .await?
-            };
-            let tasks = apply_task_list_filters(
-                tasks,
-                TaskListCriteria::builder()
-                    .statuses(&args.status)
-                    .priorities(&args.priority)
-                    .maybe_match_term(args.match_term.as_deref())
-                    .ids(&resolved_ids)
-                    .maybe_limit(args.limit)
-                    .include_archived(args.include_archived)
-                    .parked(args.parked.filter())
-                    .maybe_parent_task_id(parent_task_id.as_deref())
-                    .build(),
-                repo_selector.as_ref(),
-                product.repo_remote_url.as_deref(),
-            );
-            // Status filtering above runs against the stored vocabulary;
-            // remap to the board names only for output.
-            let tasks: Vec<Task> = tasks.into_iter().map(with_display_status).collect();
-            print_entity(ctx, &serde_json::json!({ "tasks": tasks }), || {
-                print_tasks_table(&tasks, args.with_primary_id)
-            })
-        }
+        TaskCommand::List(args) => task_list::run(&mut client, ctx, args).await,
         TaskCommand::ByPr(args) => run_by_pr(&mut client, ctx, args).await,
         TaskCommand::ByExec(args) => run_by_exec(&mut client, ctx, args).await,
         TaskCommand::Executions(args) => run_task_executions(&mut client, ctx, args).await,
