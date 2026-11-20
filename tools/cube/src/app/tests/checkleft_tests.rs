@@ -273,7 +273,9 @@ fn checkleft_gate_exports_pr_description_to_checkleft_subprocess() {
     // that env var at its highest precedence.
     let dir = TempDir::new().unwrap();
     write_fake_checkleft_env_echo(dir.path());
-    let checkleft = Some(vec![dir.path().join("bin").join("checkleft")]);
+    // Read the fixture through the shell: a parallel fork can briefly inherit
+    // its write descriptor and make direct script execution fail with ETXTBSY.
+    let checkleft = Some(vec!["/bin/sh".into(), dir.path().join("bin").join("checkleft")]);
     let err = run_checkleft_gate_impl(dir.path(), checkleft, Some("PR body mentioning T1234"))
         .expect_err("fake checkleft always exits 1");
     let CubeError::InvalidArgument(msg) = err else {
@@ -304,7 +306,9 @@ fn checkleft_gate_leaves_pr_description_unset_when_none() {
 
     let dir = TempDir::new().unwrap();
     write_fake_checkleft_env_echo(dir.path());
-    let checkleft = Some(vec![dir.path().join("bin").join("checkleft")]);
+    // Read the fixture through the shell: a parallel fork can briefly inherit
+    // its write descriptor and make direct script execution fail with ETXTBSY.
+    let checkleft = Some(vec!["/bin/sh".into(), dir.path().join("bin").join("checkleft")]);
     let result = run_checkleft_gate_impl(dir.path(), checkleft, None);
 
     // SAFETY: see above.
