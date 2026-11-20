@@ -207,6 +207,64 @@ fn execution_host_ids_for_item_batches_per_execution_lookup() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Every execution read path maps the diagnostic columns the CLI shows: the
+/// wait reason, its blocker, launch outcome flags, provenance, progression
+/// disposition and the host. A select list that drifts from `map_execution`
+/// fails here rather than as a missing field in `boss task executions`.
+#[test]
+fn execution_reads_map_wait_launch_and_provenance_columns() {
+    let path = temp_db_path("execution-diagnostic-columns");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Held and failed");
+    let held = create_ready_chore_execution(&db, chore.id.clone());
+    let plain = create_ready_chore_execution(&db, chore.id.clone());
+
+    db.set_dispatch_wait_with_blocker(&held.id, "awaiting_predecessor_preservation", Some("exec_blocker"))
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions
+             SET created_via = 'progression_sweep', launch_failed = 1, force_launched = 1,
+                 operator_forced_admission = 1, progression_disposition = 'no_action',
+                 host_id = 'zakalwe', last_error = 'workspace lease failed'
+             WHERE id = ?1",
+            [&held.id],
+        )
+        .unwrap();
+
+    let check = |execs: Vec<WorkExecution>| {
+        let held = execs.iter().find(|e| e.id == held.id).expect("held execution listed");
+        assert_eq!(
+            held.dispatch_wait_reason.as_deref(),
+            Some("awaiting_predecessor_preservation")
+        );
+        assert!(held.dispatch_wait_since.is_some());
+        assert_eq!(held.dispatch_wait_blocker_id.as_deref(), Some("exec_blocker"));
+        assert_eq!(held.created_via.as_deref(), Some("progression_sweep"));
+        assert!(held.launch_failed && held.force_launched && held.operator_forced_admission);
+        assert_eq!(held.progression_disposition.as_deref(), Some("no_action"));
+        assert_eq!(held.host_id.as_deref(), Some("zakalwe"));
+        assert_eq!(held.last_error.as_deref(), Some("workspace lease failed"));
+
+        let plain = execs.iter().find(|e| e.id == plain.id).expect("plain execution listed");
+        assert_eq!(plain.dispatch_wait_blocker_id, None);
+        assert_eq!(plain.created_via, None);
+        assert!(!plain.launch_failed && !plain.force_launched && !plain.operator_forced_admission);
+        assert_eq!(plain.progression_disposition, None);
+        assert_eq!(plain.host_id, None);
+    };
+    check(db.list_executions(Some(&chore.id)).unwrap());
+    check(db.list_executions_for_chain(&chore.id).unwrap());
+    check(vec![
+        db.get_execution(&held.id).unwrap(),
+        db.get_execution(&plain.id).unwrap(),
+    ]);
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// End-to-end coverage for the engine-startup reconcile path with
 /// a mix of live, dead, and unknown persisted runs — the explicit
 /// acceptance test from the work-item brief. We exercise this at

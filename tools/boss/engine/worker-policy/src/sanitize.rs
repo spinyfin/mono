@@ -18,14 +18,16 @@
 //! ## The forbidden-key test is the real guard
 //!
 //! The four fields the design names are `transcript_path`, `host_id`,
-//! `remote_pid`, and `shell_pid`. `transcript_path` and `artifacts_path` are
-//! on the wire today: the other two are `work_executions` / `work_runs`
-//! **columns that `mappers.rs` never maps into [`WorkExecution`] or
-//! [`WorkRun`]**. Stripping a field that does not exist is not something the
-//! type system can express, so [`SANITIZED_EXECUTION_FIELDS`] is asserted
-//! against the *serialized JSON* in tests instead. If someone later adds
-//! `host_id` to `WorkExecution`, that test fails and this module has to grow
-//! a line — which is the outcome we want, rather than a silent leak.
+//! `remote_pid`, and `shell_pid`. `transcript_path`, `artifacts_path` and
+//! `host_id` are on the wire today (`host_id` on [`WorkExecution`], so the
+//! operator CLI can show where a run was placed); `remote_pid` and
+//! `shell_pid` are `work_executions` / `work_runs` **columns that
+//! `mappers.rs` never maps into [`WorkExecution`] or [`WorkRun`]**.
+//! Stripping a field that does not exist is not something the type system
+//! can express, so [`SANITIZED_EXECUTION_FIELDS`] is asserted against the
+//! *serialized JSON* in tests instead. If someone later adds one of the
+//! remaining fields to `WorkExecution`, that test fails and this module has
+//! to grow a line — which is the outcome we want, rather than a silent leak.
 
 use boss_protocol::{
     Attention, AttentionGroup, FrontendEvent, FrontendEventWorkerVisitor, Idea, PlannerRunSummary, Product, Project,
@@ -45,11 +47,11 @@ pub const SANITIZED_EXECUTION_FIELDS: &[&str] = &[
 
 /// Strip the runtime-half fields from one execution row.
 ///
-/// A no-op today — [`WorkExecution`] carries none of
-/// [`SANITIZED_EXECUTION_FIELDS`] on the wire — but it exists so the
-/// sanitizing pass has an obvious place to grow when it does, and so the
-/// wiring is already correct at every call site.
-fn sanitize_execution(execution: WorkExecution) -> WorkExecution {
+/// `host_id` names the machine a run was placed on, which is part of the
+/// runtime half that stays closed to workers. The other fields in
+/// [`SANITIZED_EXECUTION_FIELDS`] are not carried by [`WorkExecution`].
+fn sanitize_execution(mut execution: WorkExecution) -> WorkExecution {
+    execution.host_id = None;
     execution
 }
 

@@ -1596,7 +1596,7 @@ pub(crate) async fn run_show_leaf(
         },
     )
     .await?;
-    let executions = list_executions_for_item(client, &item.id).await?;
+    let (executions, executions_total) = list_executions_for_item(client, &item.id).await?;
     let execution_runs = list_execution_runs(client, &executions).await?;
     let runtime = get_task_runtime(client, &item.id).await?;
     let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
@@ -1631,6 +1631,9 @@ pub(crate) async fn run_show_leaf(
             "executions".to_owned(),
             serde_json::to_value(&execution_runs).map_err(CliError::internal)?,
         );
+        // `executions` holds only the newest few; the total tells a reader
+        // whether anything was cut (`boss task executions` lists them all).
+        map.insert("executions_total".to_owned(), serde_json::json!(executions_total));
         map.insert(
             "attention_items".to_owned(),
             serde_json::to_value(&attention_items).map_err(CliError::internal)?,
@@ -1660,7 +1663,7 @@ pub(crate) async fn run_show_leaf(
         print_attention_groups_section(&attention_groups);
         print_runtime_section(&runtime);
         print_dependency_section(&detail);
-        print_executions_section(&execution_runs);
+        print_executions_section(&execution_runs, executions_total, &item.id);
         print_field_audit_section(&field_audit);
     })
 }

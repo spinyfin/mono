@@ -165,6 +165,7 @@ mod data;
 mod decision_commands;
 mod dependency_filter_args;
 mod engine_cmds;
+mod execution_lines;
 mod guidance;
 mod handoff;
 mod idea_args;

@@ -2237,6 +2237,32 @@ fn print_execution_history_row(exec: &WorkExecution, host: &str) {
     if let Some(pr_url) = &exec.pr_url {
         println!("  pr_url: {pr_url}");
     }
+    // Timestamps stay as stored epoch seconds here: this verb reads
+    // `state.db` directly and has no local-time rendering. The same fields
+    // are in `--json`, and `boss task executions` prints them as ISO times.
+    if let Some(reason) = exec
+        .dispatch_wait_reason
+        .as_deref()
+        .filter(|_| !exec.status.is_terminal())
+    {
+        let blocker = exec
+            .dispatch_wait_blocker_id
+            .as_deref()
+            .map(|id| format!(" (blocked by {id})"))
+            .unwrap_or_default();
+        let since = exec
+            .dispatch_wait_since
+            .as_deref()
+            .map(|epoch| format!(" since {epoch}"))
+            .unwrap_or_default();
+        println!("  waiting: {reason}{blocker}{since}");
+    }
+    if let Some(error) = exec.last_error.as_deref().filter(|text| !text.trim().is_empty()) {
+        let flat = error.split_whitespace().collect::<Vec<_>>().join(" ");
+        let shown: String = flat.chars().take(200).collect();
+        let ellipsis = if flat.chars().count() > 200 { "…" } else { "" };
+        println!("  error: {shown}{ellipsis}");
+    }
 }
 
 /// Format a millisecond timestamp as a human-friendly relative age

@@ -665,6 +665,13 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
             .transpose()?,
         pr_head_after: row.get(29)?,
         last_error: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
+        host_id: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
+        dispatch_wait_blocker_id: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
+        created_via: row.get::<_, Option<String>>(33)?.filter(|s| !s.is_empty()),
+        launch_failed: row.get::<_, i64>(34)? != 0,
+        force_launched: row.get::<_, i64>(35)? != 0,
+        operator_forced_admission: row.get::<_, i64>(36)? != 0,
+        progression_disposition: row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty()),
     })
 }
 

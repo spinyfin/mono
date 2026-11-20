@@ -3,6 +3,8 @@
 use crate::*;
 use boss_protocol::{WorkRun, WorkerTierDenial};
 
+use crate::execution_lines::{display_time, execution_detail_lines, truncate_one_line};
+
 // Re-export the shared selector grammar from boss_protocol so every
 // CLI surface uses the same choke-point types as bossctl / engine RPC.
 // Must live above any `#[cfg(test)]` modules in this file (clippy
@@ -1694,17 +1696,24 @@ pub(crate) async fn list_dependencies_detailed(
     )
 }
 
+/// How many executions `boss task show` prints before pointing at
+/// `boss task executions` for the rest.
+pub(crate) const SHOW_EXECUTIONS_LIMIT: usize = 20;
+
+/// The newest [`SHOW_EXECUTIONS_LIMIT`] executions of a work item, newest
+/// first, plus the total the engine holds so a caller can say what it cut.
 pub(crate) async fn list_executions_for_item(
     client: &mut BossClient,
     work_item_id: &str,
-) -> Result<Vec<WorkExecution>, CliError> {
+) -> Result<(Vec<WorkExecution>, usize), CliError> {
     list_executions_for_item_impl(client, work_item_id, false).await
 }
 
 /// `boss task executions <id>` — untruncated execution history for a work
 /// item (engine-RPC half of `bossctl work executions`). Unlike the
-/// `Executions` section on `boss task show`, this does not truncate to 20
-/// and sorts oldest-first so the full ledger reads chronologically.
+/// `Executions` section on `boss task show`, this does not truncate to
+/// [`SHOW_EXECUTIONS_LIMIT`] and sorts oldest-first so the full ledger reads
+/// chronologically.
 pub(crate) async fn run_task_executions(
     client: &mut BossClient,
     ctx: &RunContext,
@@ -1762,14 +1771,23 @@ pub(crate) async fn run_task_executions(
 fn print_execution_history_row(detail: &ExecutionRuns) {
     let exec = &detail.execution;
     let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
-    let started = exec.started_at.as_deref().unwrap_or("-");
-    let finished = exec.finished_at.as_deref().unwrap_or("-");
+    let host = exec.host_id.as_deref().unwrap_or("-");
     println!(
-        "{}  [{}]  kind={}  workspace={}  created={}  started={}  finished={}",
-        exec.id, exec.status, exec.kind, workspace, exec.created_at, started, finished,
+        "{}  [{}]  kind={}  host={}  workspace={}  created={}  started={}  finished={}",
+        exec.id,
+        exec.status,
+        exec.kind,
+        host,
+        workspace,
+        display_time(Some(&exec.created_at)),
+        display_time(exec.started_at.as_deref()),
+        display_time(exec.finished_at.as_deref()),
     );
     if let Some(pr_url) = &exec.pr_url {
         println!("  pr_url: {pr_url}");
+    }
+    for line in execution_detail_lines(exec, &detail.runs) {
+        println!("  {line}");
     }
     print_run_history(&detail.runs, detail.runs_unavailable.as_ref(), "  ");
 }
@@ -1781,14 +1799,14 @@ pub(crate) async fn list_executions_for_chain(
     client: &mut BossClient,
     chain_root_id: &str,
 ) -> Result<Vec<WorkExecution>, CliError> {
-    list_executions_for_item_impl(client, chain_root_id, true).await
+    Ok(list_executions_for_item_impl(client, chain_root_id, true).await?.0)
 }
 
 async fn list_executions_for_item_impl(
     client: &mut BossClient,
     work_item_id: &str,
     include_revision_chain: bool,
-) -> Result<Vec<WorkExecution>, CliError> {
+) -> Result<(Vec<WorkExecution>, usize), CliError> {
     match client
         .send_request(&FrontendRequest::ListExecutions {
             work_item_id: Some(work_item_id.to_owned()),
@@ -1799,8 +1817,9 @@ async fn list_executions_for_item_impl(
     {
         FrontendEvent::ExecutionsList { mut executions, .. } => {
             executions.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-            executions.truncate(20);
-            Ok(executions)
+            let total = executions.len();
+            executions.truncate(SHOW_EXECUTIONS_LIMIT);
+            Ok((executions, total))
         }
         FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
             Err(CliError::application(message))
@@ -1957,24 +1976,41 @@ fn listed_runs_from_event(event: FrontendEvent) -> Result<ListedRuns, CliError> 
     }
 }
 
-pub(crate) fn print_executions_section(executions: &[ExecutionRuns]) {
+/// Print the `Executions` section of `boss task show`. `total` is how many
+/// executions the engine holds for the item; when it exceeds what is shown the
+/// heading says so and names the verb that lists them all.
+pub(crate) fn print_executions_section(executions: &[ExecutionRuns], total: usize, work_item_id: &str) {
     if executions.is_empty() {
         return;
     }
     println!();
-    println!("Executions ({}):", executions.len());
+    if total > executions.len() {
+        println!(
+            "Executions (newest {} of {total}; `boss task executions {work_item_id}` lists all):",
+            executions.len()
+        );
+    } else {
+        println!("Executions ({}):", executions.len());
+    }
     for detail in executions {
         let exec = &detail.execution;
-        let started = exec.started_at.as_deref().unwrap_or("-");
-        let finished = exec.finished_at.as_deref().unwrap_or("-");
         print!(
             "  {} [{}] started={} finished={}",
-            exec.id, exec.status, started, finished
+            exec.id,
+            exec.status,
+            display_time(exec.started_at.as_deref()),
+            display_time(exec.finished_at.as_deref()),
         );
+        if let Some(host) = &exec.host_id {
+            print!(" host={host}");
+        }
         if let Some(pr) = &exec.pr_url {
             print!(" pr={pr}");
         }
         println!();
+        for line in execution_detail_lines(exec, &detail.runs) {
+            println!("    {line}");
+        }
         print_run_history(&detail.runs, detail.runs_unavailable.as_ref(), "    ");
     }
 }
@@ -1986,6 +2022,9 @@ fn print_run_history(runs: &[WorkRun], unavailable: Option<&WorkerTierDenial>, i
     }
     for run in runs {
         println!("{indent}run {} [{}]", run.id, run.status);
+        if let Some(error) = run.error_text.as_deref().filter(|text| !text.trim().is_empty()) {
+            println!("{indent}  error: {}", truncate_one_line(error));
+        }
         if let Some(summary) = &run.result_summary {
             let continuation_indent = format!("{indent}  ");
             println!(

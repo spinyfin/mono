@@ -238,7 +238,7 @@ fn sweep_cost_baseline_full_projection_vs_narrow_reads() {
                     created_at, started_at, finished_at, pre_start_failure_count, dispatch_not_before,
                     pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count,
                     allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since,
-                    driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                    driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, host_id, dispatch_wait_blocker_id, created_via, launch_failed, force_launched, operator_forced_admission, progression_disposition
              FROM work_executions
              WHERE status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND EXISTS (

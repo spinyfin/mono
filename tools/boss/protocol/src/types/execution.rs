@@ -936,6 +936,55 @@ pub struct WorkExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 
+    /// The host this execution was bound to when a run started on it.
+    /// `None` for an execution that has never been placed (still waiting
+    /// for a worker) and for rows that ran on the engine's own machine
+    /// before host binding was recorded. This is a runtime-half field: the
+    /// worker-tier sanitizer strips it from every row sent to a worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+
+    /// Id of the work item or execution the current dispatch wait is held
+    /// behind (for example the predecessor an `awaiting_predecessor_*`
+    /// reason names). `None` whenever [`Self::dispatch_wait_reason`] is
+    /// `None` or the reason has no single blocker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_wait_blocker_id: Option<String>,
+
+    /// Which producer minted this execution (`progression_sweep` for a
+    /// progression pass). `None` for an execution created by the ordinary
+    /// reconcile and request paths, and for rows that predate the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_via: Option<String>,
+
+    /// `true` when this execution failed before a worker process became
+    /// live (workspace lease, spawn-config, or pane-spawn failure) and the
+    /// failure persisted through teardown. Distinguishes "the launch never
+    /// started" from "a worker started and then failed".
+    #[serde(default)]
+    #[builder(default)]
+    pub launch_failed: bool,
+
+    /// `true` when an operator force-launched this execution past the pool
+    /// and pause gates.
+    #[serde(default)]
+    #[builder(default)]
+    pub force_launched: bool,
+
+    /// `true` when an operator explicitly admitted this execution over a
+    /// conflicting-state refusal, so ordinary admission checks did not
+    /// apply to it.
+    #[serde(default)]
+    #[builder(default)]
+    pub operator_forced_admission: bool,
+
+    /// The progression-pass disposition recorded when a progression run
+    /// declared done (`progressed`, `no_action`, `asked`, `withdrawn`).
+    /// `None` for every execution that is not a progression run, or whose
+    /// run has not declared yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progression_disposition: Option<String>,
+
     /// When `true`, the cube workspace preference (`preferred_workspace_id`)
     /// is treated as a warmth hint only: if the preferred workspace is
     /// unavailable or busy, the coordinator falls back silently to any free
