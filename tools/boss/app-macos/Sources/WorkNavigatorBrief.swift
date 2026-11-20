@@ -13,6 +13,7 @@ struct WorkNavigatorBrief: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if hasMultipleDocuments {
             HStack(spacing: 8) {
                 Picker("Document", selection: Binding(
                     get: { model.navigatorDocument(for: root.id) },
@@ -26,12 +27,14 @@ struct WorkNavigatorBrief: View {
                         Text("Historical ask").tag(NavigatorBriefDocument.historical)
                     }
                 }
+                .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(maxWidth: ask != nil && ask?.id != root.id ? 280 : 160)
+                .frame(maxWidth: 280)
                 .accessibilityIdentifier("navigator-brief-document")
                 if document.id != root.id {
                     askLabel(document)
                 }
+            }
             }
             WorkItemBriefEditor(
                 title: documentTitle,
@@ -41,6 +44,7 @@ struct WorkNavigatorBrief: View {
                 remoteChanged: model.navigatorBriefChangedRemotely(document),
                 readOnly: context.isReadOnly || !model.navigatorBriefCanEdit(document),
                 showsAgentNotice: root.navigator?.root?.knownSection == .working,
+                showsTitleRow: !hasMultipleDocuments,
                 onEdit: { model.beginNavigatorBriefEdit(document) },
                 onCancel: { model.cancelNavigatorBriefEdit(document) },
                 onSave: { _ = model.saveNavigatorBrief(document) },
@@ -48,6 +52,12 @@ struct WorkNavigatorBrief: View {
             )
             .id(document.id)
         }
+    }
+
+    /// The document picker only exists when there is something to pick: a
+    /// distinct current ask, or a historical ask that is being viewed.
+    var hasMultipleDocuments: Bool {
+        (ask != nil && ask?.id != root.id) || model.navigatorDocument(for: root.id) == .historical
     }
 
     private var draftBinding: Binding<String> {

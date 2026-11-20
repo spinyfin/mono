@@ -102,6 +102,8 @@ enum MarkdownDocumentMeasure {
 private enum MarkdownDocumentLayout {
     static let horizontalPadding: CGFloat = 40
     static let verticalPadding: CGFloat = 32
+    static let compactHorizontalPadding: CGFloat = 4
+    static let compactVerticalPadding: CGFloat = 8
 }
 
 /// The single reconciled chrome every in-app markdown document viewer renders
@@ -184,6 +186,10 @@ struct MarkdownDocumentChrome: View {
     /// `RevisionBriefCollapsibleHeadings.collapsedByDefault(in:)`) passes a
     /// non-empty set to fold those headings behind a disclosure.
     var collapsedByDefaultHeadings: Set<String> = []
+    /// Embedded use: the caller already shows the document title, so the
+    /// header and its rule are dropped and the side padding is tightened to
+    /// match the surrounding pane.
+    var compact: Bool = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -210,7 +216,8 @@ struct MarkdownDocumentChrome: View {
             initialFragment: initialFragment,
             projectShortID: projectShortID,
             clickStartTime: clickStartTime,
-            collapsedByDefaultHeadings: collapsedByDefaultHeadings
+            collapsedByDefaultHeadings: collapsedByDefaultHeadings,
+            compact: compact
         )
     }
 
@@ -281,6 +288,7 @@ private struct MarkdownDocumentColumn: View {
     let projectShortID: String
     let clickStartTime: Date?
     let collapsedByDefaultHeadings: Set<String>
+    var compact: Bool = false
 
     @Environment(\.commentedAnchors) private var commentedAnchors
     @Environment(\.commentFlashAnchor) private var commentFlashAnchor
@@ -348,17 +356,19 @@ private struct MarkdownDocumentColumn: View {
                     // `MarkdownChunkTopSpacing` owns the whole inter-chunk
                     // gap; the 12pt that used to live on the stack is
                     // explicit padding on these two chrome rows.
-                    header
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.bottom, 12)
-                    Divider()
-                        .overlay(BossMarkdownPalette.hairline)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.bottom, 12)
+                    if !compact {
+                        header
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.bottom, 12)
+                        Divider()
+                            .overlay(BossMarkdownPalette.hairline)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxWidth: MarkdownDocumentMeasure.proseContent)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.bottom, 12)
+                    }
                     if let loadError {
                         loadErrorView(loadError)
                     }
@@ -384,8 +394,8 @@ private struct MarkdownDocumentColumn: View {
                     }
                 }
                 .scrollTargetLayout()
-                .padding(.horizontal, MarkdownDocumentLayout.horizontalPadding)
-                .padding(.vertical, MarkdownDocumentLayout.verticalPadding)
+                .padding(.horizontal, compact ? MarkdownDocumentLayout.compactHorizontalPadding : MarkdownDocumentLayout.horizontalPadding)
+                .padding(.vertical, compact ? MarkdownDocumentLayout.compactVerticalPadding : MarkdownDocumentLayout.verticalPadding)
                 .frame(maxWidth: cachedDocumentMeasure ?? MarkdownDocumentMeasure.forSource(source))
                 .frame(maxWidth: .infinity)
                 .background(MarkdownScrollViewCapture(controller: scrollController))

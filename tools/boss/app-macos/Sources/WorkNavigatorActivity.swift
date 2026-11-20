@@ -66,17 +66,19 @@ struct WorkNavigatorActivity: View {
     @ViewBuilder
     private func activityPicker(_ selected: NavigatorActivity) -> some View {
         HStack(spacing: 8) {
-            Picker("Current activity", selection: Binding(
-                get: { selected.executionId },
-                set: { model.setNavigatorActivity(executionID: $0, rootID: root.id) }
-            )) {
-                ForEach(pickerActivities, id: \.executionId) { activity in
-                    Text(activityLabel(activity)).tag(activity.executionId)
+            if pickerActivities.count > 1 {
+                Picker("Current activity", selection: Binding(
+                    get: { selected.executionId },
+                    set: { model.setNavigatorActivity(executionID: $0, rootID: root.id) }
+                )) {
+                    ForEach(pickerActivities, id: \.executionId) { activity in
+                        Text(activityLabel(activity)).tag(activity.executionId)
+                    }
                 }
+                .labelsHidden()
+                .frame(maxWidth: 360)
+                .accessibilityIdentifier("navigator-activity-picker")
             }
-            .labelsHidden()
-            .frame(maxWidth: 360)
-            .accessibilityIdentifier("navigator-activity-picker")
             if let notice = endedNotice {
                 Text(notice)
                     .font(.caption)
@@ -171,12 +173,28 @@ struct WorkNavigatorActivity: View {
         return taskName
     }
 
+    /// A pane can attach only for a selected run with a local workspace or a
+    /// remote host; otherwise the agent area collapses to one slim row.
+    var hasAgentPane: Bool {
+        guard let selected else { return false }
+        return remoteHost(for: selected) != nil || workspace != nil
+    }
+
+    @ViewBuilder
     private var workingBody: some View {
-        VSplitView {
-            WorkNavigatorBrief(context: context)
-                .frame(minHeight: 120)
-            terminalRegion
-                .frame(minHeight: 140)
+        if hasAgentPane {
+            VSplitView {
+                WorkNavigatorBrief(context: context)
+                    .frame(minHeight: 120)
+                terminalRegion
+                    .frame(minHeight: 140)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                WorkNavigatorBrief(context: context)
+                    .frame(maxHeight: .infinity)
+                NavigatorAgentStatusRow(text: "Agent not started")
+            }
         }
     }
 
@@ -187,9 +205,7 @@ struct WorkNavigatorActivity: View {
                 reasonBanner
                 if variant == .failed { failureBody }
                 if variant == .starting {
-                    Label("Agent pane not available yet.", systemImage: "hourglass")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    NavigatorAgentStatusRow(text: "Agent not started")
                 }
                 if variant == .landed {
                     landedBody
@@ -303,8 +319,23 @@ struct WorkNavigatorActivity: View {
                 workspace: workspace
             )
         } else {
-            NavigatorPaneNotice(text: "Agent pane not available yet.", systemImage: "terminal")
+            NavigatorAgentStatusRow(text: "Agent not started")
         }
+    }
+}
+
+/// One slim line standing in for an agent pane that does not exist.
+struct NavigatorAgentStatusRow: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: "terminal")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
+            .accessibilityIdentifier("navigator-terminal-unavailable")
     }
 }
 
@@ -403,7 +434,7 @@ struct WorkNavigatorTerminalSlot: View {
             } else if case .attachFailure(let reason) = presentation {
                 NavigatorPaneNotice(text: "Agent pane could not attach: \(reason)", systemImage: "exclamationmark.triangle")
             } else {
-                NavigatorPaneNotice(text: "Agent pane not available yet.", systemImage: "terminal")
+                NavigatorPaneNotice(text: "Agent starting…", systemImage: "terminal")
             }
         }
         .onAppear { updateAttachRequest(owner: attachOwner) }

@@ -31,10 +31,25 @@ struct WorkNavigatorDetail: View {
 
     var body: some View {
         if let root = model.navigatorSelectedTask {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(root.name).font(.title2).textSelection(.enabled)
-                Text([model.projectName(for: root.projectID), root.navigator?.root?.reasonLabel]
-                    .compactMap { $0 }.joined(separator: " · ")).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(root.name).font(.title3.weight(.semibold)).lineLimit(2)
+                        .textSelection(.enabled)
+                    if let status = root.navigator?.root?.reasonLabel {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                            .fixedSize()
+                            .accessibilityIdentifier("navigator-status-pill")
+                    }
+                }
+                if let project = model.projectName(for: root.projectID), !project.isEmpty {
+                    Text(project).font(.caption).foregroundStyle(.secondary)
+                }
                 if let pr = root.prURL, let url = URL(string: pr) {
                     Link("Open pull request", destination: url)
                 }
@@ -68,6 +83,7 @@ struct WorkNavigatorDetail: View {
                         Text(slot.title(actionCount: actionCount)).tag(slot)
                     }
                 }
+                .labelsHidden()
                 .pickerStyle(.segmented)
                 // Keep every registered body mounted while switching tabs.
                 ZStack(alignment: .topLeading) {
@@ -81,7 +97,7 @@ struct WorkNavigatorDetail: View {
                 }
                 .id(root.id)
             }
-            .padding(16)
+            .padding(12)
         } else {
             ContentUnavailableView("Select a task", systemImage: "sidebar.left",
                                    description: Text("See its brief, activity and review here."))
