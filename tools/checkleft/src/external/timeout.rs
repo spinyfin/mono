@@ -39,7 +39,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 ///
 /// A descendant may keep a pipe open after the child exits, so this cannot be
 /// unbounded. It deliberately does not consume the subprocess execution budget:
-/// on overrun, return the output captured so far with the child’s real status.
+/// on overrun, return the output captured so far with the child's real status.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Named timeout cause so optional diagnostics can preserve ordinary probe
