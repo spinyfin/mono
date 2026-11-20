@@ -6,6 +6,7 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "driver-quota",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["src/agy_usage_fixture.json"],
     crate_name = "boss_engine_driver_quota",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -27,6 +28,7 @@ rust_library(
 rust_test(
     name = "driver-quota_test",
     size = "small",
+    compile_data = ["src/agy_usage_fixture.json"],
     crate = ":driver-quota",
     edition = "2024",
     proc_macro_deps = all_crate_deps(

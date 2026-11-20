@@ -125,6 +125,10 @@ enum BossRevealCapture {
             BossNavigatorReviewCapture.start(path: path, state: state, updateModel: updateModel)
             return
         }
+        if state == "driver-quota" {
+            BossDriverQuotaCapture.start(path: path)
+            return
+        }
         if state == "markdown-list-rhythm" {
             BossMarkdownListCapture.start(path: path)
             return

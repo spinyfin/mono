@@ -425,6 +425,25 @@ fn render_provision_hooks_json() -> String {
 // ---------------------------------------------------------------------------
 
 pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<AgyRuntimeState> {
+    provision_home(workspace, prompt_text, run_id, true)
+}
+
+/// The quota command itself exercises authentication; avoid a redundant models request.
+pub(super) fn provision_quota_home(workspace: &Path) -> anyhow::Result<AgyRuntimeState> {
+    provision_home(
+        workspace,
+        "unused",
+        &format!("quota-probe-{}", std::process::id()),
+        false,
+    )
+}
+
+fn provision_home(
+    workspace: &Path,
+    prompt_text: &str,
+    run_id: &str,
+    probe_models: bool,
+) -> anyhow::Result<AgyRuntimeState> {
     let container = agy_run_container_for_run(run_id)?;
     let process_home = container.join(PROCESS_HOME_LEAF);
     let control_dir = container.join(CONTROL_LEAF);
@@ -493,7 +512,7 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
 
     assert_agy_posture(&process_home, workspace)?;
 
-    if !skip_posture_assert() {
+    if probe_models && !skip_posture_assert() {
         probe_agy_models(&environment).context("live agy models posture probe")?;
         // The probe is a CLI start in this home, and a start does not leave
         // the private settings as they were written above.

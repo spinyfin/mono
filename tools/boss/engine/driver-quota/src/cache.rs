@@ -439,6 +439,7 @@ mod tests {
     #[tokio::test]
     async fn entries_are_ordered_for_display_not_by_completion() {
         let cache = QuotaCache::new(vec![
+            CountingProbe::new("agy", 4.0),
             CountingProbe::new("grok", 1.0),
             CountingProbe::new("claude", 2.0),
             CountingProbe::new("codex", 3.0),

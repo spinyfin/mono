@@ -1,18 +1,22 @@
 //! Per-driver provider quota probes and their cache.
 //!
-//! Boss drives three coding-agent CLIs, and each one's provider meters the
-//! maintainer's subscription independently. Getting all three figures used to
+//! Boss drives four coding-agent CLIs, and each one's provider meters the
+//! maintainer's subscription independently. Getting the original three figures used to
 //! mean starting each driver interactively and typing its slash command. This
 //! crate obtains the same figures out of band and caches them, so the engine
 //! can serve one comparable snapshot over RPC.
 //!
-//! # Mechanism per driver — three CLIs, three different answers
+//! # Mechanism per driver
 //!
 //! | driver | mechanism | why |
 //! |--------|-----------|-----|
 //! | `claude` | `claude -p "/usage" --output-format json` | `/usage` is a **local** slash command: in print mode Claude Code executes it without a model turn (`num_turns: 0`, `total_cost_usd: 0`) and prints the provider's report in the JSON envelope's `result`. No credential ever passes through Boss — the CLI reads its own keychain entry. |
 //! | `codex` | `codex app-server` stdio JSON-RPC → `account/rateLimits/read` (via the shared client in `boss-engine-codex-hook-trust`) | Codex exposes no `usage`/`status` subcommand, but its app-server protocol has a first-class, machine-readable method for exactly this. One handshake, no thread started, no model turn. Again no credential passes through Boss: the child reads `$CODEX_HOME/auth.json` itself. |
 //! | `grok` | HTTPS GET of the CLI's own billing/credits endpoint | Grok's `/usage` is an in-TUI extension with no CLI equivalent, and headless `grok -p "/usage"` treats the text as a *prompt to the model* — it would burn tokens and answer with prose. The endpoint the extension itself calls is the only non-interactive route, so this is the one driver where Boss handles a bearer token. It is read from the same `auth.json` the driver reads, held in memory for one request, and never logged, echoed, or persisted. The CLI stores a short-lived access token (observed: six hours) beside a refresh token and renews it lazily, so when the stored token has expired the probe asks the CLI to refresh it through its own non-interactive path (`grok models`, via a [`GrokCredentialRefresher`]) and re-reads the file the CLI rewrote — Boss never writes the credential, and never opens a login flow. |
+//!
+//! Antigravity uses its local `agy --print /usage --output-format json` command
+//! through the driver crate's isolated-home runner. See [`agy`] and the quota
+//! source documentation for the Gemini weekly bucket and captured fixture.
 //!
 //! # What this must never become
 //!
@@ -32,6 +36,7 @@
 //! lazy: no probe runs until something asks for a snapshot, so engine startup
 //! is untouched.
 
+pub mod agy;
 pub mod cache;
 pub mod parse {
     //! Pure parsers turning each driver's raw probe output into a
@@ -710,7 +715,7 @@ use async_trait::async_trait;
 use boss_protocol::DriverQuotaOutcome;
 
 /// Per-driver deadline. Generous enough for a cold CLI start on a loaded
-/// laptop, short enough that three probes in parallel cannot make the
+/// laptop, short enough that concurrent probes in parallel cannot make the
 /// Preferences pane feel hung. A probe that exceeds it is reported as
 /// [`boss_protocol::DriverQuotaFailureKind::Timeout`], never left pending.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
@@ -740,6 +745,7 @@ pub(crate) fn now_epoch_s() -> i64 {
 }
 
 /// Build the production probe set: one probe per implemented driver.
+/// The composition root supplies agy's scoped CLI runner as `agy_probe`.
 ///
 /// `grok_auth_path` must come from the driver's own resolution
 /// (`boss_engine_driver::grok::resolve_grok_auth_source`) so the probe reads
@@ -749,10 +755,12 @@ pub(crate) fn now_epoch_s() -> i64 {
 /// the Grok CLI's own credential-refresh path, likewise supplied by the
 /// composition root so this crate holds no knowledge of how to run `grok`.
 pub fn default_probes(
+    agy_probe: std::sync::Arc<dyn DriverQuotaProbe>,
     grok_auth_path: std::path::PathBuf,
     grok_refresher: std::sync::Arc<dyn GrokCredentialRefresher>,
 ) -> QuotaProbeSet {
     vec![
+        agy_probe,
         std::sync::Arc::new(probes::claude::ClaudeQuotaProbe::default()),
         std::sync::Arc::new(probes::codex::CodexQuotaProbe::default()),
         std::sync::Arc::new(probes::grok::GrokQuotaProbe::new(grok_auth_path, grok_refresher)),
@@ -767,6 +775,19 @@ mod tests {
     struct NoRefresh;
 
     #[async_trait]
+    impl DriverQuotaProbe for NoRefresh {
+        fn driver(&self) -> &'static str {
+            "agy"
+        }
+        async fn probe(&self) -> DriverQuotaOutcome {
+            parse::unavailable(
+                boss_protocol::DriverQuotaFailureKind::NotReported,
+                "Quota not reported by agy",
+            )
+        }
+    }
+
+    #[async_trait]
     impl GrokCredentialRefresher for NoRefresh {
         async fn refresh(&self) -> GrokRefreshOutcome {
             GrokRefreshOutcome::Failed {
@@ -778,6 +799,7 @@ mod tests {
     #[test]
     fn production_probe_set_covers_every_driver_the_snapshot_promises() {
         let probes = default_probes(
+            std::sync::Arc::new(NoRefresh),
             std::path::PathBuf::from("/tmp/auth.json"),
             std::sync::Arc::new(NoRefresh),
         );
