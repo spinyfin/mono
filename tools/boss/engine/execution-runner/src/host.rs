@@ -266,6 +266,20 @@ pub struct StartedWorker {
     pub slot_id: u8,
     pub shell_pid: i32,
     pub written_files: WrittenFiles,
+    pub timings: StartWorkerTimings,
+}
+
+/// Where `start_worker` spent its time, for the `pane spawned for execution` log line.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StartWorkerTimings {
+    /// Writing CLAUDE.md/AGENTS.md and each driver's settings and hooks. For Claude this is
+    /// its whole permission and hook config.
+    pub workspace_files: std::time::Duration,
+    /// Building the worker environment and starting the detached tmux session.
+    pub tmux_start: std::time::Duration,
+    /// The app's `AttachWorkerPane` round trip, serialized across concurrent spawns and
+    /// bounded by the spawn timeout per attempt.
+    pub viewer_attach: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]

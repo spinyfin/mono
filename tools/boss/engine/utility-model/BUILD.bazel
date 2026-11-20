@@ -16,6 +16,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/pane-summary:__pkg__",
+        "//tools/boss/engine/spawn-setup-probe:__pkg__",
     ],
     deps = [
         "//tools/boss/claude_client",

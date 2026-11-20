@@ -48,6 +48,7 @@ members = [
   "tools/boss/engine/spoke-worker-api",
   "tools/boss/engine/host-execution",
   "tools/boss/engine/core",
+  "tools/boss/engine/spawn-setup-probe",
   "tools/boss/engine/core/runtime",
   "tools/boss/engine/app",
   "tools/boss/engine/execution-runner",

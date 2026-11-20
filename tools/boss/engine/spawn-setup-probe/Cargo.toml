@@ -1,0 +1,18 @@
+[package]
+name = "boss-spawn-setup-probe"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "spawn_setup_probe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+boss-engine = { path = "../core" }
+boss-engine-utility-model = { path = "../utility-model" }
+boss-execution-runner = { path = "../execution-runner" }
+boss-pane-summary = { path = "../pane-summary" }
+boss-protocol = { path = "../../protocol" }
+boss-work-db = { path = "../work-db" }
+tokio = { workspace = true, features = ["full"] }

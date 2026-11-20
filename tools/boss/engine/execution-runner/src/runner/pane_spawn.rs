@@ -1414,6 +1414,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             .with_context(|| format!("spawning worker pane for run {}", execution.id))?;
         pre_pane.pane_start = pane_start_began.elapsed();
 
+        let start_timings = started.timings;
         let spawned_at = std::time::Instant::now();
         tracing::info!(
             worker_id,
@@ -1432,6 +1433,9 @@ impl ExecutionRunner for PaneSpawnRunner {
             permission_config_ms = pre_pane.permission_config.as_millis() as u64,
             title_ms = pre_pane.title.as_millis() as u64,
             pane_start_ms = pre_pane.pane_start.as_millis() as u64,
+            workspace_files_ms = start_timings.workspace_files.as_millis() as u64,
+            tmux_start_ms = start_timings.tmux_start.as_millis() as u64,
+            viewer_attach_ms = start_timings.viewer_attach.as_millis() as u64,
             pre_pane_ms = spawn_began.elapsed().as_millis() as u64,
             "pane spawned for execution",
         );
@@ -1778,7 +1782,8 @@ struct PrePaneTimings {
     permission_config: StdDuration,
     /// The pane title, which can ask the utility model for a summary.
     title: StdDuration,
-    /// Creating the tmux worker pane.
+    /// The whole `start_worker` call: workspace file and settings writes, tmux start and the
+    /// app viewer attach. The three parts are in `start_worker`'s `StartWorkerTimings`.
     pane_start: StdDuration,
 }
 

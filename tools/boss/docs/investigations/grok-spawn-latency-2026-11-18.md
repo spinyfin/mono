@@ -40,7 +40,7 @@ The comparable costs for the other drivers are a `python3` import check that is 
 
 ## Measured
 
-Host: 12-core macOS laptop running other workers' builds, whose load swung widely during the day. Where recorded, batches below give the 1-minute load average read just before and after them; load was not recorded for the final setup fixtures. Grok CLI 1.0.70, Claude Code 2.1.327, Codex CLI 0.169.0. The `preflight` figures are direct `subprocess.run` durations of the seven commands in the engine's order and environment. They do not exercise the engine's own preflight, so they exclude its wait for a live refresh lock and its reprobe after a credential refresh (see "What can still stretch a Grok spawn"). Each run used a fresh `GROK_HOME` and process `HOME` with the engine's environment and delegates, the shared `GROK_AUTH_PATH`, and a leased checkout of this repository as the working directory. `grok_spawn_latency_probe.py` beside this file is the harness. The first batch of each kind was run before it was consolidated into that one script, and the rest with it as committed.
+Host: 12-core macOS laptop running other workers' builds, whose load swung widely during the day. Where recorded, batches below give the 1-minute load average read just before and after them; load was not recorded for the final setup fixtures. Grok CLI 1.0.70, Claude Code 2.1.327, Codex CLI 0.169.0. The `preflight` figures are direct `subprocess.run` durations of the seven commands in the engine's order and environment. They do not exercise the engine's own preflight, so they exclude its wait for a live refresh lock and its reprobe after a credential refresh (see "What can still stretch a Grok spawn"). Each run used a fresh `GROK_HOME` and process `HOME` with the engine's environment and delegates, the shared `GROK_AUTH_PATH`, and a leased checkout of this repository as the working directory. `grok_spawn_latency_probe.py` beside this file is the harness that produced them, kept as a dated record (see "Reproducing"). The first batch of each kind was run before it was consolidated into that one script, and the rest with it as committed.
 
 ### Grok's seven subprocesses
 
@@ -145,7 +145,7 @@ The `//tools/boss/engine/core:spawn_setup_probe` harness also calls the real Rus
 
 This is local attribution, not a full engine dispatch. Each fixture uses a private database, workspace, process home and per-run driver homes. It calls `compose_worker_spawn`, `write_workspace_files` (including Claude's actual settings and hooks), each driver's `write_permission_config`, `spawn_invocation`, and `title_for_spawn`. Codex permission config includes the real installed CLI's hook-trust attestation; Grok includes `hooks::write_hooks` and permission artifacts, not the Python canary stand-in. Claude's driver permission method is empty; its work is in the workspace-settings row. The first Claude settings call was the 255 ms maximum, including initial guard-script materialization; subsequent fixtures reuse those content-addressed scripts, as an engine does.
 
-Provisioning is excluded from these Rust timings: fresh empty driver homes are created before measurement, without copying credentials or running preflight. The separate Grok subprocess measurements and home stand-in remain separate observations. Pane creation is the detached tmux measurement above; Grok driver start is the 84-run accepted-prompt sample. Title rows cover the real cached and missing-credential branches, without a utility-model inference request. An uncached credentialed title can make a network request with up to two 5 s attempts and a 250 ms backoff; these local title figures do not bound that branch. The fixture does not include database scheduling, refresh-lock waits, credential reprobes, a production repo-guidance fetch or hook ingest. These differences prevent treating the rows as an end-to-end distribution or assuming identical setup costs across drivers.
+Provisioning is excluded from these Rust timings: fresh empty driver homes are created before measurement, without copying credentials or running preflight. The separate Grok subprocess measurements and home stand-in remain separate observations. Pane creation is the detached tmux measurement above (not the engine's `pane_start_ms`, which also covers workspace file writes and the serialized app viewer attach; see `workspace_files_ms`, `tmux_start_ms` and `viewer_attach_ms` on the same log line); Grok driver start is the 84-run accepted-prompt sample. Title rows cover the real cached and missing-credential branches, without a utility-model inference request. An uncached credentialed title can make a network request with up to two 5 s attempts and a 250 ms backoff; these local title figures do not bound that branch. The fixture does not include database scheduling, refresh-lock waits, credential reprobes, a production repo-guidance fetch or hook ingest. These differences prevent treating the rows as an end-to-end distribution or assuming identical setup costs across drivers.
 
 ### Older Grok CLIs
 
@@ -228,16 +228,8 @@ The engine log now carries enough to attribute a slow spawn without an export. F
 - The repobin shim itself was not run, because the worker launch guard refuses it. The 11.3 s figure is the Bazel build that shim performs, run directly.
 - All timings are from one host and one day.
 
-## Running the probe
-
-```sh
-python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py preflight <workspace> <scratch-dir> 30
-python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py preflight <workspace> <scratch-dir> 30 --parallel 3
-python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py tui <workspace> <scratch-dir> 15
-python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py setup <workspace> <scratch-dir> 30
-python3 tools/boss/docs/investigations/grok_spawn_latency_probe.py tui <workspace> <scratch-dir> 4 --hold SessionStart:3
-```
+## Reproducing
 
 To reproduce the real-code setup attribution, build `//tools/boss/engine/core:spawn_setup_probe` with `bazel build --remote_download_outputs=toplevel`, then invoke the resulting `bazel-bin/tools/boss/engine/core/spawn_setup_probe` binary with one absolute, nonexistent scratch-directory argument. It emits tab-separated driver, run, step and seconds columns, 30 runs per driver. It is a measurement binary, not a test or an engine; it starts neither worker panes nor an engine, isolates every writable runtime home, and needs an installed `codex` for hook-trust attestation. Keep its scratch directory and output for analysis.
 
-The Python harness needs a logged-in `grok`, `gh`, `jj`, `tmux` and the bundled `cube` (or `PROBE_CUBE` naming another build). It does not contact a Boss engine. The `tui` mode submits a brief asking for a one-word reply and stops the pane when the prompt is accepted.
+`grok_spawn_latency_probe.py` is a dated record of how the subprocess, `tui` and `setup` figures above were taken, not a supported tool. It hand-copies Grok's provisioning, environment and pane command as of Grok CLI 1.0.70 and nothing ties it to the engine, so a rerun would measure that snapshot rather than the current engine. For a current measurement, use the Boss log lines (`Grok spawn preparation step finished`, `pane spawned for execution`) from a real spawn.

@@ -25,8 +25,8 @@ fn main() -> anyhow::Result<()> {
         for (key, leaf) in [
             ("HOME", "home"),
             ("TMPDIR", "tmp"),
-            ("BOSS_GROK_HOMES_DIR", "grok"),
-            ("BOSS_CODEX_HOMES_DIR", "codex"),
+            (boss_engine::driver::grok::GROK_HOMES_ROOT_ENV, "grok"),
+            (boss_engine::driver::codex::CODEX_HOMES_ROOT_ENV, "codex"),
         ] {
             let path = root.join(leaf);
             fs::create_dir_all(&path)?;

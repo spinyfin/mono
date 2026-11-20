@@ -429,7 +429,7 @@ async fn start_tmux_worker(
     Ok(pane_pid)
 }
 
-pub use boss_execution_runner::host::{StartWorkerInput, StartedWorker};
+pub use boss_execution_runner::host::{StartWorkerInput, StartWorkerTimings, StartedWorker};
 
 #[derive(Debug, Error)]
 pub enum StartWorkerError {
@@ -686,7 +686,9 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         .is_post_merge_reviewer(input.is_post_merge_reviewer)
         .checkout_positioned_on_pr_head(input.checkout_positioned_on_pr_head)
         .build();
+    let workspace_files_began = std::time::Instant::now();
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
+    let workspace_files = workspace_files_began.elapsed();
     spawner
         .prepare_progress_ingress(&input.run_id, input.driver.clone(), progress_ingress)
         .map_err(StartWorkerError::ProgressIngress)?;
@@ -830,6 +832,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         })?
         .display()
         .to_string();
+    let tmux_start_began = std::time::Instant::now();
     let shell_pid = match start_tmux_worker(
         tmux_host,
         &pane_launch,
@@ -847,6 +850,7 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
             return Err(err);
         }
     };
+    let tmux_start = tmux_start_began.elapsed();
     // The detached tmux session owns the worker, so a missing app session
     // only means it runs without a viewer until the app reconnects. A
     // SlotBusy rejection is different: reconciliation has already tried to
@@ -854,7 +858,8 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
     // worker is reaped. Other failures are stamped onto the live state so
     // the card says "Couldn't attach the terminal: <reason>" instead of
     // reading as still connecting. A successful attach clears the error.
-    let viewer_attach_error: Option<String> = match spawner
+    let viewer_attach_began = std::time::Instant::now();
+    let attach_response = spawner
         .send_to_app_request(
             EngineToAppRequest::AttachWorkerPane(AttachWorkerPaneInput {
                 run_id: input.run_id.clone(),
@@ -866,8 +871,9 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
             }),
             spawn_timeout,
         )
-        .await
-    {
+        .await;
+    let viewer_attach = viewer_attach_began.elapsed();
+    let viewer_attach_error: Option<String> = match attach_response {
         Ok(EngineToAppResponse::AttachWorkerPane { result: Ok(_) }) => {
             tracing::info!(
                 run_id = %input.run_id,
@@ -970,6 +976,11 @@ async fn start_worker_armed<S: WorkerSpawner + ?Sized>(
         slot_id,
         shell_pid,
         written_files: written,
+        timings: StartWorkerTimings {
+            workspace_files,
+            tmux_start,
+            viewer_attach,
+        },
     })
 }
 
