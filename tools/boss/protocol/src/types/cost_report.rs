@@ -16,9 +16,10 @@
 //! NULL token columns — the cost is unknown, not zero. A run that
 //! failed before ever reaching a model legitimately has zero tokens
 //! recorded. [`CostMeasurement`] keeps these distinct:
-//! `runs_unmeasured` counts NULL rows (excluded from every token
-//! sum); `runs_zero` counts rows with a real, recorded zero. Token
-//! sums are never computed by coalescing NULL to zero.
+//! `runs_unmeasured` counts rows with no recorded token category
+//! (excluded from every token sum); `runs_zero` counts rows with a
+//! real, recorded zero. Token sums are never computed by coalescing
+//! NULL to zero.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,27 +30,42 @@ use serde::{Deserialize, Serialize};
 /// `runs_total == runs_measured + runs_unmeasured`. `runs_zero` is a
 /// subset of `runs_measured` (a measured run whose recorded tokens
 /// happen to be exactly zero, e.g. a run that failed before calling
-/// a model). Every token field sums only `runs_measured` rows.
+/// a model). A run is measured when any token category is present.
+/// Unmeasured runs are excluded from category sums and do not make a
+/// measured category unknown. A category is NULL when no run was
+/// measured, or when any measured run lacks that category.
+/// `total_tokens` sums available categories on measured runs; when
+/// `tokens_partial` is true it is a lower bound, not a complete total.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostMeasurement {
+    /// Reasons recorded on runs without complete provider usage.
+    #[serde(default)]
+    #[builder(default)]
+    pub usage_unavailable: Vec<String>,
+    /// Totals are a lower bound when a measured run lacks a category.
+    /// Unmeasured runs are counted in `runs_unmeasured` and
+    /// `usage_unavailable` instead; they do not set this flag.
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_partial: bool,
     pub agent_active_ms: i64,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
     /// `true` when at least one run folded into this measurement used
-    /// a model absent from the pricing table, meaning `estimated_usd`
+    /// a model with unverified rates or incomplete categories, meaning `estimated_usd`
     /// (when present) understates the true total. `false` when either
     /// every priced-eligible run had a known price, or no USD
     /// estimate was requested at all.
     pub estimated_usd_partial: bool,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    /// Runs with recorded token columns — includes `runs_zero`, whose
-    /// recorded tokens are all exactly zero.
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    /// Runs with at least one recorded token category — includes
+    /// `runs_zero`, whose recorded tokens are all exactly zero.
     pub runs_measured: u32,
     pub runs_total: u32,
-    /// Runs with NULL token columns — cost unknown, excluded from
-    /// every sum in this measurement. Never conflated with a
+    /// Runs with no recorded token category — cost unknown, excluded
+    /// from every sum in this measurement. Never conflated with a
     /// recorded-zero run.
     pub runs_unmeasured: u32,
     /// Runs whose tokens were recorded and are all exactly zero (a
@@ -114,6 +130,9 @@ pub struct TaskCostReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WindowCostReport {
+    #[serde(default)]
+    #[builder(default)]
+    pub by_driver: Vec<CostBucket>,
     pub by_effort_level: Vec<CostBucket>,
     pub by_kind: Vec<CostBucket>,
     pub by_model: Vec<CostBucket>,
@@ -137,16 +156,19 @@ pub struct WindowCostReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostTopRow {
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_partial: bool,
     pub execution_id: String,
     pub run_id: String,
     pub work_item_id: String,
     pub short_id: Option<i64>,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub input_tokens: i64,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub input_tokens: Option<i64>,
     pub kind: String,
     pub name: String,
-    pub output_tokens: i64,
+    pub output_tokens: Option<i64>,
     pub status: String,
     pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

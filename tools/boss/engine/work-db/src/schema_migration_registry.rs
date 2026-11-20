@@ -496,6 +496,17 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: "20261120_1630_run_usage_unavailable".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_runs", "usage_unavailable")? {
+                conn.execute_batch("ALTER TABLE work_runs ADD COLUMN usage_unavailable TEXT DEFAULT 'No provider token usage observed';
+                    UPDATE work_runs SET usage_unavailable = NULL WHERE input_tokens IS NOT NULL")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261030_0900_sol_default_full_share".into(),
             legacy_version: None,
             apply: driver_allocation::sol_selection::migrate_default_full_share,

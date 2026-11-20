@@ -57,6 +57,8 @@ pub struct ProjectPropertyAuditEntry {
 #[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostRunRecord {
+    pub driver: Option<String>,
+    pub usage_unavailable: Option<String>,
     pub run_id: String,
     pub execution_id: String,
     pub work_item_id: String,
@@ -80,6 +82,8 @@ pub struct CostRunRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct RunCostSnapshot {
+    /// A provider observation was missing or incomplete; never a zero measurement.
+    pub usage_unavailable: Option<String>,
     /// Assign every persisted cost field verbatim, including NULL. Set when a
     /// transcript generation is replaced so values absent from the replay do
     /// not survive from the obsolete generation.

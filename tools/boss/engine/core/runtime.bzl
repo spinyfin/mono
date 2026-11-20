@@ -68,7 +68,7 @@ def runtime_libraries():
                 "src/facade.rs",
             ],
         ),
-        compile_data = [
+        compile_data = native.glob(["src/run_cost/testdata/*.jsonl"]) + [
             "//tools/boss/event-shim:src/main.rs",
             "//tools/boss/engine/driver:agy_blocked_marker_capture",
             "remote/boss-remote-run.sh",

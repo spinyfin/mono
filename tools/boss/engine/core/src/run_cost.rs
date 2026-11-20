@@ -19,6 +19,8 @@ use crate::transcript_tail::TranscriptTail;
 
 pub(crate) use boss_engine_storage_values::RunCostSnapshot;
 
+mod native;
+
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[builder(on(String, into))]
 struct MessageUsage {
@@ -34,6 +36,7 @@ struct MessageUsage {
 #[derive(Debug, Default, bon::Builder)]
 #[builder(on(String, into))]
 struct CostAccumulator {
+    native: native::NativeUsage,
     provider_usage: std::collections::BTreeMap<String, Value>,
     model: Option<String>,
     messages: HashMap<String, Option<MessageUsage>>,
@@ -46,6 +49,7 @@ struct CostAccumulator {
 
 impl CostAccumulator {
     fn ingest(&mut self, transcript_path: &Path, value: &Value, capture_provider_usage: bool) {
+        self.native.ingest(transcript_path, value);
         // Raw provider objects are only consumed by pr_review_guide_attempts.
         // Ordinary executions still fold token totals below; skip the clone
         // and per-run cache of unused JSON.
@@ -192,6 +196,9 @@ impl CostAccumulator {
     }
 
     fn snapshot(&self) -> Option<RunCostSnapshot> {
+        if let Some(snapshot) = self.native.snapshot() {
+            return Some(snapshot);
+        }
         if self.messages.is_empty()
             && self.codex_rounds.is_empty()
             && self.codex_usage_by_transcript.is_empty()
@@ -223,6 +230,7 @@ impl CostAccumulator {
             provider_usage_json: (!self.provider_usage.is_empty())
                 .then(|| serde_json::to_string(&self.provider_usage).expect("usage objects serialize")),
             full_replacement: false,
+            usage_unavailable: None,
             model: self.model.clone(),
             output_tokens: saw_usage.then(|| sum(|usage| usage.output_tokens)),
             input_tokens: saw_usage.then(|| sum(|usage| usage.input_tokens)),
@@ -240,6 +248,7 @@ impl CostAccumulator {
     }
 
     fn merge_from(&mut self, other: &Self) {
+        self.native.merge_from(&other.native);
         self.provider_usage.extend(other.provider_usage.clone());
         if let Some(model) = other.model.as_ref() {
             self.model = Some(model.clone());
@@ -410,7 +419,7 @@ impl RunCostCapture {
             None if full_replacement => RunCostSnapshot::default(),
             None => return Ok(false),
         };
-        snapshot.full_replacement = full_replacement;
+        snapshot.full_replacement |= full_replacement;
         // Keep the per-execution lock through the DB assignment so two hooks
         // cannot persist cumulative snapshots out of order.
         work_db
@@ -633,3 +642,7 @@ mod tests {
         assert_eq!(tail.snapshot().unwrap().input_tokens, Some(1));
     }
 }
+
+#[cfg(test)]
+#[path = "run_cost/native_tests.rs"]
+mod native_tests;
