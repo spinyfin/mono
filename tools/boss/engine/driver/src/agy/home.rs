@@ -677,7 +677,10 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
 
 /// Remove run state at teardown.
 ///
-/// A home provisioned with the durable store keeps nothing: `brain/` is a link
+/// Keep the control directory (CLI log, launcher diagnostics and settings)
+/// until the bounded agy home-retention sweep expires it. Teardown also runs
+/// on failed spawns, before a conversation or transcript need exist.
+/// A home provisioned with the durable store keeps no process state: `brain/` is a link
 /// whose target — the `transcript_full.jsonl` the Stop payload's
 /// `transcriptPath` names — lives under the per-execution store, and removing
 /// the link leaves that target untouched. A legacy home (a real `brain/`
@@ -687,11 +690,12 @@ pub fn reclaim_agy_run(process_home: &Path) -> anyhow::Result<()> {
     let container = process_home.parent().context("agy run container")?;
     assert_agy_home_safe_to_delete(container)?;
     validate_private_layout(process_home)?;
-    let keep: Vec<Vec<&str>> = if brain_link_is_symlink(process_home) {
+    let mut keep: Vec<Vec<&str>> = if brain_link_is_symlink(process_home) {
         Vec::new()
     } else {
         AGY_TRANSCRIPT_PATHS.iter().map(|path| path.to_vec()).collect()
     };
+    keep.push(vec![CONTROL_LEAF]);
     retain_paths(container, &keep)
 }
 

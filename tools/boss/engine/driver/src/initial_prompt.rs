@@ -108,6 +108,43 @@ pub fn read_delivery_log(home: &Path) -> Vec<DeliveryStep> {
         .unwrap_or_default()
 }
 
+/// Failure evidence to include in the dispatch error before teardown. The
+/// relay's exit 64 means undelivered, not necessarily a CLI usage error: only
+/// `driver_exited` records the child's status. Output is the bounded PTY tail,
+/// where the interactive CLI writes both stdout and stderr.
+pub fn startup_failure_diagnostics(home: &Path) -> Option<String> {
+    let steps = read_delivery_log(home);
+    let failure = steps
+        .iter()
+        .rev()
+        .find(|step| step.step == "startup_failed" || step.step == "failed")?;
+    let reason = failure
+        .fields
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown launcher failure");
+    let code = steps
+        .iter()
+        .rev()
+        .find(|step| step.step == "driver_exited")
+        .and_then(|step| step.fields.get("exit_code"))
+        .and_then(|value| value.as_i64());
+    let tail = steps
+        .iter()
+        .rev()
+        .find_map(|step| step.fields.get("output_tail").and_then(|value| value.as_str()));
+    let status = code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unavailable (no observed child exit)".into());
+    let bounded = |text: &str| text.chars().take(4096).collect::<String>();
+    Some(format!(
+        "launcher failure: {}; CLI exit status: {status}; CLI stdout/stderr tail: {:?}; control directory: {}",
+        bounded(reason),
+        bounded(tail.unwrap_or("<no output captured>")),
+        home.display()
+    ))
+}
+
 /// Line the relay prints to stderr when it fails; the specific reasons
 /// ("before receiving the initial brief", "did not become ready ...") follow it.
 const RELAY_FAILURE_PREFIX: &str = "boss initial brief delivery failed";

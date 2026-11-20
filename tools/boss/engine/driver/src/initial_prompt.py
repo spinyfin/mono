@@ -37,6 +37,8 @@ REPLIES = {
 # actual cursor position, not the synthesized 1;1 used when outer_tty is false.
 REPLY = re.compile(
     rb"\x1b\[(?:\??\d+;\d+R|\??[\d;]*c|>[\d;]*c|\?\d+u|\?\d+;\d+\$y)"
+    rb"|\x1b\](?:10|11|12);rgb:[\da-fA-F]{1,4}/[\da-fA-F]{1,4}/[\da-fA-F]{1,4}(?:\x07|\x1b\\)"
+    rb"|\x1bP>\|[\x20-\x7e]{1,128}\x1b\\"
 )
 REPLY_BODY = {
     b"?": frozenset(b"0123456789;$"),
@@ -411,8 +413,8 @@ def has_user_bytes(pending):
 def take_terminal_replies(data, buffer):
     """Split stdin into recognised terminal replies vs other input.
 
-    Returns (forwarded, remaining_buffer, refused). Incomplete CSI that could
-    still become a reply stays in remaining_buffer.
+    Returns (forwarded, remaining_buffer, refused). An incomplete recognised
+    reply stays in remaining_buffer, including a split OSC terminator.
     """
     buffer += data
     forwarded = bytearray()
@@ -431,6 +433,26 @@ def take_terminal_replies(data, buffer):
 def _reply_prefix(buffer):
     if buffer in (b"", b"\x1b", b"\x1b["):
         return True
+    # Bubble Tea asks for foreground/background/cursor colors during agy
+    # startup, before settings admission. These are terminal replies, not
+    # keyboard input. Keep the grammar narrow: never admit arbitrary OSC
+    # payloads (clipboard, hyperlinks, or a pasted command).
+    for prefix in (b"\x1b]10;rgb:", b"\x1b]11;rgb:", b"\x1b]12;rgb:"):
+        if prefix.startswith(buffer):
+            return True
+        if buffer.startswith(prefix):
+            body = buffer[len(prefix):].removesuffix(b"\x1b")
+            parts = body.split(b"/")
+            return (len(parts) <= 3
+                    and all(re.fullmatch(rb"[\da-fA-F]{1,4}", part) for part in parts[:-1])
+                    and re.fullmatch(rb"[\da-fA-F]{0,4}", parts[-1]) is not None)
+    # XTVERSION (CSI > q) is another agy startup query. Its DCS reply holds
+    # printable terminal identity only; reject embedded controls and bound it.
+    version_prefix = b"\x1bP>|"
+    if version_prefix.startswith(buffer):
+        return True
+    if buffer.startswith(version_prefix):
+        return re.fullmatch(rb"[\x20-\x7e]{0,128}", buffer[len(version_prefix):].removesuffix(b"\x1b")) is not None
     if not buffer.startswith(b"\x1b[") or len(buffer) >= 32:
         return False
     rest = buffer[2:]
@@ -749,9 +771,18 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
         if exit_status is None:
             _, exit_status = os.waitpid(pid, 0)
         status = exit_status
+        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
         if not delivered:
-            raise RuntimeError("driver exited before receiving the initial brief")
-        return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
+            log("driver_exited", exit_code=code)
+            raise RuntimeError(f"driver exited before receiving the initial brief (exit status {code})")
+        return code
+    except Exception as error:
+        # stdout and stderr share the child's PTY. Preserve its last visible
+        # lines before cleanup, even when the CLI exits before creating a log.
+        # Never capture a delivered brief or subsequent worker output here.
+        if not delivered:
+            log("startup_failed", reason=str(error), output_tail=view.tail().decode("utf-8", "replace")[-4096:])
+        raise
     finally:
         try:
             os.killpg(pid, signal.SIGKILL)

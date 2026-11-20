@@ -1694,6 +1694,7 @@ async fn confirm_prompt_after_late_start(
     )
     .await;
     log_delivery_steps(run_id, driver.descriptor().name, &home);
+    let result = with_launcher_diagnostics(result, &home);
     if result.is_err() {
         tracing::warn!(run_id, last_pane_text = %last_capture.lock().expect("capture mutex poisoned"),
             "spawn confirmation evidence at failure");
@@ -1805,6 +1806,8 @@ fn log_delivery_steps(run_id: &str, driver_name: &str, home: &Path) {
             ),
             "submit_sent" => ("prompt delivery: submit sent", false),
             "failed" => ("prompt delivery: launcher failed", true),
+            "startup_failed" => ("prompt delivery: CLI startup diagnostics", true),
+            "driver_exited" => ("prompt delivery: CLI exited", false),
             "post_submit_failure" => ("prompt delivery: launcher reported a post-submit failure", true),
             _ => ("prompt delivery: unrecognised launcher step", false),
         };
@@ -1878,6 +1881,7 @@ pub(crate) async fn confirm_local_spawn(
     }
     // Whichever wait ended confirmation, say how far the launcher got.
     log_delivery_steps(run_id, driver_name, &home);
+    let result = with_launcher_diagnostics(result, &home);
     if result.is_err() {
         tracing::warn!(run_id, %started_at, elapsed_ms = started.elapsed().as_millis() as u64,
             first_hook_event = ?live_states.and_then(|registry| registry.first_hook_event_for_run(run_id)),
@@ -1885,6 +1889,15 @@ pub(crate) async fn confirm_local_spawn(
             "spawn confirmation evidence at failure");
     }
     result
+}
+
+fn with_launcher_diagnostics(result: Result<()>, home: &Path) -> Result<()> {
+    result.map_err(
+        |error| match crate::driver::initial_prompt::startup_failure_diagnostics(home) {
+            Some(detail) => error.context(detail),
+            None => error,
+        },
+    )
 }
 
 /// Keep the last `4096` characters of `text` as the failure-diagnostics
