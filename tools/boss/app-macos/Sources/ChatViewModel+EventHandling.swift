@@ -239,6 +239,9 @@ extension ChatViewModel {
             // A refused Move Up/Down reorder carries its own request id:
             // show the reason on the card that was moved.
             if settleReorderWorkError(message: message, requestId: requestId) { return }
+            // A refused comment reclassification carries its request id too:
+            // the picker that sent it reverts and shows the reason inline.
+            if commentBridge.settleIntentRefusal(message: message, requestId: requestId) { return }
             abandonBackgroundWorkRequest(requestId: requestId)
             // Legacy list_executions/list_attachments guards do not retain
             // request IDs, so they cannot match the error's envelope ID.
@@ -776,8 +779,8 @@ extension ChatViewModel {
             commentBridge.handleCommentsList(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
         case .commentsResolved(let artifactKind, let artifactId, let comments):
             commentBridge.handleCommentsResolved(artifactKind: artifactKind, artifactId: artifactId, comments: comments)
-        case .commentResult(let comment):
-            commentBridge.handleCommentResult(comment)
+        case .commentResult(let comment, let requestId):
+            commentBridge.handleCommentResult(comment, requestId: requestId)
         case .commentsBannerState(let artifactKind, let artifactId, let state):
             commentBridge.handleCommentsBannerState(artifactKind: artifactKind, artifactId: artifactId, state: state)
         case .commentsReviseDocResult(let outcome):

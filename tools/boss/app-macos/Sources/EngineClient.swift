@@ -292,11 +292,11 @@ final class EngineClient: @unchecked Sendable {
     // Not `private`: called from the `EngineClient+PaneResponses.swift`
     // extension, which needs file-scoped-`private` loosened to `internal`
     // to reach it.
-    /// Returns the envelope id for a socket write or queued read. Only
-    /// self-retrying background polls may opt out of disconnected reports;
-    /// user actions must either queue or report a visible failure.
+    /// Returns the envelope id for a socket write or queued read.
+    /// Retained mutations also return their id when `returnRetainedRequestId` is enabled.
+    /// Only self-retrying background polls may opt out of disconnected reports; user actions must either queue or report a visible failure.
     @discardableResult
-    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString) -> String? {
+    func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString, returnRetainedRequestId: Bool = false) -> String? {
         outboundRecorder?(payload)
         if payload["type"] as? String == "merge_when_ready" {
             Self.log.info("merge RPC scheduled: request=\(envelopeRequestId, privacy: .public)")
@@ -318,9 +318,10 @@ final class EngineClient: @unchecked Sendable {
 
         if simulateConnectedForTesting { return envelopeRequestId }
         guard reachableState.withLock({ $0 }) else {
-            return handleDisconnectedSend(
+            let result = handleDisconnectedSend(
                 payload, envelopeRequestId: envelopeRequestId,
                 queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+            return result.requestId(includingRetained: returnRetainedRequestId)
         }
         guard let encoded = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
             emit(.error(message: "failed to encode outbound request"))
@@ -349,6 +350,18 @@ final class EngineClient: @unchecked Sendable {
         return envelopeRequestId
     }
 
+    private enum DisconnectedSendOutcome {
+        case sent(String), retained(String), rejected
+
+        func requestId(includingRetained: Bool = false) -> String? {
+            switch self {
+            case .sent(let id): return id
+            case .retained(let id): return includingRetained ? id : nil
+            case .rejected: return nil
+            }
+        }
+    }
+
     /// A send while the socket is down is a transport condition, not an
     /// engine-reported error. Idempotent reads are held and delivered on
     /// reconnect when the caller opts in with `queueIfDisconnected`;
@@ -357,7 +370,7 @@ final class EngineClient: @unchecked Sendable {
     private func handleDisconnectedSend(
         _ payload: [String: Any], envelopeRequestId: String,
         queueIfDisconnected: Bool, reportIfDisconnected: Bool
-    ) -> String? {
+    ) -> DisconnectedSendOutcome {
         let kind = (payload["type"] as? String) ?? "unknown"
         if queueIfDisconnected {
             Self.log.info("queued \(kind, privacy: .public) while disconnected; will send on reconnect")
@@ -379,20 +392,25 @@ final class EngineClient: @unchecked Sendable {
                 }
             } else {
                 emit(.notConnected(requestKind: kind))
-                return nil
+                return .rejected
             }
-            return envelopeRequestId
+            return .sent(envelopeRequestId)
         }
         if !reportIfDisconnected {
             Self.log.info("skipped \(kind, privacy: .public) while disconnected; caller retries on reconnect")
-            return nil
+            return .rejected
         }
-        if retainUnsent(payload, envelopeRequestId: envelopeRequestId) == .full {
+        let retention = retainUnsent(payload, envelopeRequestId: envelopeRequestId)
+        if retention == .full {
             emit(.actionNotSaved(requestKind: kind))
-            return nil
+            return .rejected
         }
         emit(.notConnected(requestKind: kind))
-        return nil
+        return retention == .retained ? .retained(envelopeRequestId) : .rejected
+    }
+
+    func isAwaitingRetry(_ requestId: String) -> Bool {
+        ledger.withLock { $0.unsent.contains { $0.id == requestId } }
     }
 
     private enum RetentionOutcome { case retained, ineligible, full }
@@ -445,8 +463,10 @@ final class EngineClient: @unchecked Sendable {
         return true
     }
 
-    func discardUnsentActions() {
+    @discardableResult
+    func discardUnsentActions() -> [String] {
         ledger.withLock { state in
+            let discardedIds = state.unsent.map(\.id)
             for action in state.unsent {
                 if let payload = (try? JSONSerialization.jsonObject(with: action.data)) as? [String: Any],
                    payload["type"] as? String == "move_work_item_on_board",
@@ -455,6 +475,7 @@ final class EngineClient: @unchecked Sendable {
                 }
             }
             state.unsent.removeAll()
+            return discardedIds
         }
     }
 
@@ -572,7 +593,7 @@ final class EngineClient: @unchecked Sendable {
             }
             return handleDisconnectedSend(
                 payload, envelopeRequestId: envelopeRequestId,
-                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected)
+                queueIfDisconnected: queueIfDisconnected, reportIfDisconnected: reportIfDisconnected).requestId()
         }
         do {
             let envelope: [String: Any] = [
@@ -1753,7 +1774,7 @@ final class EngineClient: @unchecked Sendable {
                 emit(.error(message: "received invalid comment_result payload"))
                 break
             }
-            emit(.commentResult(comment: comment))
+            emit(.commentResult(comment: comment, requestId: envelopeRequestId))
         case "comments_list":
             let artifactKind = payload["artifact_kind"] as? String ?? ""
             let artifactId = payload["artifact_id"] as? String ?? ""
