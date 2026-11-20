@@ -52,7 +52,7 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
         // Only the unanswered `late_ok` spawn and the unconfirmed stop still
         // owe a deadline; advance virtual time just for those.
         timing::guarded(timing::advancing(|| attention_open(&fx, &execution.id))).await;
-        let (next, pool) = restarted_with_pool(&fx, &env.coordinator, 1).await;
+        let (next, pool) = timing::guarded(restarted_with_pool(&fx, &env.coordinator, 1)).await;
         if shape == "late_ok" {
             timing::guarded(timing::condition(|| {
                 peer.commands()
@@ -65,15 +65,37 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
                 .into_iter()
                 .find(|c| matches!(c.body, Some(command::Body::Spawn(_))))
                 .unwrap();
-            peer.answer_late(&spawn, answer(&spawn).unwrap()).await;
+            timing::guarded(peer.answer_late(&spawn, answer(&spawn).unwrap())).await;
             timing::guarded(timing::condition(|| {
                 fx.db.host_command_result(HOST, &spawn.command_id).unwrap().is_some()
             }))
             .await;
         }
         assert!(fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap());
-        let reconcile = async {
-            next.reconcile_ended_in_doubt_spokes().await;
+        let prompt_checks = fx.signals.1.load(Ordering::SeqCst);
+        let stops = fx.stop_submissions.load(Ordering::SeqCst);
+        // Complete adapter construction and driver installation without burning
+        // the sweep-item timeout while blocking database work is pending.
+        timing::guarded(next.reconcile_ended_in_doubt_spokes()).await;
+        if shape == "unconfirmed_stop" {
+            timing::guarded(async {
+                timing::condition(|| fx.signals.1.load(Ordering::SeqCst) > prompt_checks).await;
+                assert_eq!(pool.busy_count().await, 1, "the resumed driver owns a slot");
+                // The resumed driver has reached prompt confirmation. Expire
+                // that missing evidence, then observe its unanswered Stop retry
+                // before expiring the Stop deadline. The sweep is already over.
+                // Cross each 300 ms deadline by a timer tick (50 ms), rather
+                // than stopping exactly on Tokio's rounded timer boundary.
+                tokio::time::advance(Duration::from_millis(350)).await;
+                timing::condition(|| fx.stop_submissions.load(Ordering::SeqCst) > stops).await;
+                tokio::time::advance(Duration::from_millis(350)).await;
+                while pool.busy_count().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        }
+        timing::guarded(async {
             if shape == "late_ok" {
                 timing::condition(|| {
                     fx.db.active_run_ids_for_execution(&execution.id).unwrap().is_empty()
@@ -90,15 +112,8 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
                 assert!(attention_open(&fx, &execution.id), "{shape}");
                 assert!(fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap(), "{shape}");
             }
-        };
-        if shape == "unconfirmed_stop" {
-            // Prompt evidence and the Stop reply are deliberately absent, so the
-            // restarted driver's deadlines must be allowed to expire. No
-            // command in this shape needs an in-time reply.
-            timing::guarded(timing::advancing_during(reconcile)).await;
-        } else {
-            timing::guarded(reconcile).await;
-        }
+        })
+        .await;
         assert_never_failed(&fx, &execution.id);
         next.abort_driving_runs();
     }
