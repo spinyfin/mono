@@ -320,6 +320,12 @@ impl AgentDriver for AgyDriver {
             workspace = %workspace_stamp.as_deref().unwrap_or(Path::new(".")).display(),
             "agy spawn environment resolved"
         );
+        let Some(workspace) = workspace_stamp else {
+            return refuse_agy_plan(
+                env,
+                "agy spawn refused: missing workspace path stamp; cannot verify folder trust before launch",
+            );
+        };
 
         if !process_home.exists() {
             return refuse_agy_plan(env, "agy spawn refused: per-run HOME is not provisioned");
@@ -329,9 +335,7 @@ impl AgentDriver for AgyDriver {
         // first, so this is never a second plan against a home the CLI has
         // already started in. After launch the session mode comes from
         // `--settings`, which the CLI never writes back.
-        if let Err(error) =
-            home::assert_agy_posture(&process_home, workspace_stamp.as_deref().unwrap_or(Path::new(".")))
-        {
+        if let Err(error) = home::assert_agy_posture(&process_home, &workspace) {
             return refuse_agy_plan(env, &format!("agy spawn refused: private HOME posture: {error:#}"));
         }
         if !skip_binary_assert()

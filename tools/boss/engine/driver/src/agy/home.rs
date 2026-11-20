@@ -313,9 +313,10 @@ pub fn hooks_dir_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
     Ok(process_home_for_run(run_id)?.join(HOOKS_DIR_RELATIVE))
 }
 
-/// The private CLI `settings.json` (trusted workspaces; the CLI also saves
-/// its own always-allow grants here) for the HOME whose hook directory is
-/// `hooks_dir` (`<process-home>/.gemini/config`).
+/// The private CLI `settings.json` (trusted workspaces — every spelling of
+/// the working directory; the CLI also saves its own always-allow grants
+/// here) for the HOME whose hook directory is `hooks_dir`
+/// (`<process-home>/.gemini/config`).
 pub fn cli_settings_path_for_hooks_dir(hooks_dir: &Path) -> PathBuf {
     let gemini = hooks_dir.parent().unwrap_or(hooks_dir);
     gemini.join("antigravity-cli").join("settings.json")
@@ -628,17 +629,26 @@ pub fn assert_agy_posture(process_home: &Path, workspace: &Path) -> anyhow::Resu
             ),
         }
     }
-    let trusted = settings_json
-        .get("trustedWorkspaces")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let variants = trust_path_variants(workspace);
-    if !variants.iter().any(|p| trusted.iter().any(|v| v.as_str() == Some(p))) {
-        bail!(
-            "trustedWorkspaces does not include the workspace path {}; got {trusted:?}",
-            workspace.display()
-        );
+    let trusted = trusted_workspace_list(&settings_json);
+    assert_working_directory_pre_trusted("private CLI settings.json", &trusted, workspace)?;
+
+    // `--settings` overrides the private file at pane launch, so a home whose
+    // private file is complete but whose session document lists only the
+    // canonical spelling still opens the folder-trust dialog.
+    if let Some(session_path) = process_home
+        .parent()
+        .map(|container| container.join(CONTROL_LEAF).join("session-settings.json"))
+        .filter(|path| path.is_file())
+    {
+        let session = fs::read_to_string(&session_path)
+            .with_context(|| format!("reading session settings {}", session_path.display()))?;
+        let session_json: serde_json::Value =
+            serde_json::from_str(&session).context("parsing session --settings JSON")?;
+        assert_working_directory_pre_trusted(
+            "session --settings file",
+            &trusted_workspace_list(&session_json),
+            workspace,
+        )?;
     }
 
     // `.gemini/settings.json` is not read by agy and must not be created.
@@ -649,6 +659,45 @@ pub fn assert_agy_posture(process_home: &Path, workspace: &Path) -> anyhow::Resu
         bail!("must not write trustedFolders.json; agy does not read it");
     }
 
+    Ok(())
+}
+
+fn trusted_workspace_list(settings: &serde_json::Value) -> Vec<String> {
+    settings
+        .get("trustedWorkspaces")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `agy` matches `trustedWorkspaces` by exact string. A missing `/var` or
+/// `/tmp` spelling of the cwd is the folder-trust dialog, not a later prompt.
+fn assert_working_directory_pre_trusted(source: &str, trusted: &[String], workspace: &Path) -> anyhow::Result<()> {
+    if !workspace.is_absolute() {
+        bail!(
+            "{source} cannot pre-trust relative working directory {}; \
+             the launch would show the folder-trust dialog",
+            workspace.display()
+        );
+    }
+    let required = trust_path_variants(workspace);
+    let missing: Vec<&String> = required
+        .iter()
+        .filter(|path| !trusted.iter().any(|got| got == *path))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "{source} does not pre-trust every spelling of the working directory {}; \
+             missing {missing:?} (need {required:?}, got {trusted:?}); \
+             the launch would show the folder-trust dialog",
+            workspace.display()
+        );
+    }
     Ok(())
 }
 

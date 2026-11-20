@@ -1,5 +1,6 @@
 use super::*;
 use crate::AgentDriver;
+use crate::scoped_home::trust_path_variants;
 use crate::test_support::home_override;
 use tempfile::TempDir;
 
@@ -529,4 +530,95 @@ fn the_durable_directory_is_filed_under_the_sanitized_run_id() {
     );
     assert_agy_posture(&runtime.process_home, tmp.path()).unwrap();
     assert!(transcript_containment_root("run/odd id").unwrap().is_some());
+}
+
+fn trusted_paths(json: &serde_json::Value) -> Vec<String> {
+    json["trustedWorkspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn assert_home_pre_trusts(runtime: &AgyRuntimeState, workspace: &Path) {
+    let required = trust_path_variants(workspace);
+    assert!(
+        !required.is_empty(),
+        "working directory {} has no trust spellings",
+        workspace.display()
+    );
+    for path in [
+        runtime.process_home.join(".gemini/antigravity-cli/settings.json"),
+        runtime.session_settings_path.clone(),
+    ] {
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let trusted = trusted_paths(&json);
+        for spelling in &required {
+            assert!(
+                trusted.contains(spelling),
+                "{} missing {spelling:?} in {trusted:?}",
+                path.display()
+            );
+        }
+    }
+    assert_agy_posture(&runtime.process_home, workspace).unwrap();
+    for spelling in &required {
+        assert_agy_posture(&runtime.process_home, Path::new(spelling)).unwrap();
+    }
+}
+
+#[test]
+fn rendered_home_pre_trusts_a_cube_workspace_and_a_progression_scratch_dir() {
+    let tmp = TempDir::new().unwrap();
+    let homes = tmp.path().join("homes");
+    let _guard = env_for_provision(&homes);
+
+    let cube = tmp.path().join("workspaces/impl-ws");
+    fs::create_dir_all(&cube).unwrap();
+    let scratch = tmp.path().join("boss-progression-scratch/exec_folder_trust_1");
+    fs::create_dir_all(&scratch).unwrap();
+
+    let cube_home = provision_agy_home(&cube, "prompt", "run-cube").unwrap();
+    assert_home_pre_trusts(&cube_home, &cube);
+
+    let scratch_home = provision_agy_home(&scratch, "prompt", "run-progression").unwrap();
+    assert_home_pre_trusts(&scratch_home, &scratch);
+}
+
+#[test]
+fn posture_refuses_a_working_directory_that_is_not_fully_pre_trusted() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = env_for_provision(tmp.path());
+    let workspace = tmp.path().join("boss-progression-scratch/exec_untrusted");
+    fs::create_dir_all(&workspace).unwrap();
+    let runtime = provision_agy_home(&workspace, "prompt", "run-partial-trust").unwrap();
+    let required = trust_path_variants(&workspace);
+    let private = runtime.process_home.join(".gemini/antigravity-cli/settings.json");
+
+    let mut empty: serde_json::Value = serde_json::from_str(&fs::read_to_string(&private).unwrap()).unwrap();
+    empty["trustedWorkspaces"] = serde_json::json!([]);
+    fs::write(&private, empty.to_string()).unwrap();
+    let error = assert_agy_posture(&runtime.process_home, &workspace)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("folder-trust dialog"), "{error}");
+    assert!(error.contains("private CLI settings.json"), "{error}");
+
+    // Restore the private file, then drop spellings only from `--settings`,
+    // which is the document the pane CLI actually reads.
+    super::write_private_cli_settings(&runtime.process_home, &workspace).unwrap();
+    let mut session: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&runtime.session_settings_path).unwrap()).unwrap();
+    session["trustedWorkspaces"] = if required.len() > 1 {
+        serde_json::json!([fs::canonicalize(&workspace).unwrap().display().to_string()])
+    } else {
+        serde_json::json!([])
+    };
+    fs::write(&runtime.session_settings_path, session.to_string()).unwrap();
+    let error = assert_agy_posture(&runtime.process_home, &workspace)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("folder-trust dialog"), "{error}");
+    assert!(error.contains("session --settings file"), "{error}");
 }
