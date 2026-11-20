@@ -82,6 +82,7 @@ unset \
   BOSS_SHAKE_PRIVATE_KEY_PEM
 
 child_pid=""
+watchdog_pid=""
 
 process_group_is_alive() {
   [[ -n "${child_pid}" ]] && kill -0 -- "-${child_pid}" 2>/dev/null
@@ -114,6 +115,17 @@ terminate_child_group() {
   return 1
 }
 
+# Tells the watchdog this shell did its own cleanup, and reaps it. Called
+# last, so that a SIGKILL part-way through cleanup still leaves the watchdog
+# to finish the job.
+release_watchdog() {
+  if [[ -n "${watchdog_pid}" ]]; then
+    printf 'done\n' >&8 2>/dev/null || true
+    wait "${watchdog_pid}" 2>/dev/null || true
+    watchdog_pid=""
+  fi
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
@@ -123,6 +135,7 @@ cleanup() {
   if [[ "${owns_test_tmpdir}" == "1" ]]; then
     "${runtime_bin}/rm" -rf "${test_tmpdir}"
   fi
+  release_watchdog
   exit "${status}"
 }
 
@@ -377,13 +390,50 @@ else:
   fi
 } >"${profile}"
 
+# The traps above cover every signal this shell can see. They do not cover
+# SIGKILL, which is how a test action is abandoned rather than timed out:
+# Bazel's process-wrapper kills test-setup.sh's group when a build is
+# interrupted, and test-setup.sh's own helper then kills this shell's group.
+# An executor that kills an action outright has the same effect. The test's
+# process group below is in neither of those groups. With nothing else
+# watching, it would outlive this shell with no parent: a hung test stays for
+# good, a healthy one keeps running against a build that is over, and the
+# private root is never removed.
+#
+# So a watchdog holds the read end of a FIFO whose only write end is this
+# shell's descriptor 8. The kernel closes that descriptor however this shell
+# dies. A line on the FIFO says cleanup already happened; end-of-file says the
+# shell is gone, and the watchdog does the cleanup in its place. The FIFO is
+# unlinked once both ends are open, so nothing else can open it.
+lifeline="${TEST_TMPDIR}/wrapper-lifeline"
+"${runtime_bin}/mkfifo" "${lifeline}"
+exec 8<>"${lifeline}" 9<"${lifeline}"
+"${runtime_bin}/rm" -f "${lifeline}"
+
 # Monitor mode gives sandbox-exec and all descendants a dedicated process
 # group, allowing timeout/interrupt traps to forward the original signal to
-# the complete test tree before removing the private root.
+# the complete test tree before removing the private root. The watchdog gets
+# a group of its own for the same reason the test does: a kill aimed at this
+# shell's group must not take it too. Neither end of the FIFO reaches the
+# test, where a surviving descendant would hold the write end open.
 set -m
-/usr/bin/sandbox-exec -f "${profile}" "$@" &
+/usr/bin/sandbox-exec -f "${profile}" "$@" 8<&- 9<&- &
 child_pid=$!
+(
+  set +m
+  trap - EXIT INT TERM HUP
+  exec 8<&- </dev/null >/dev/null 2>&1
+  if IFS= read -r _ <&9; then
+    exit 0
+  fi
+  terminate_child_group || true
+  if [[ "${owns_test_tmpdir}" == "1" ]]; then
+    "${runtime_bin}/rm" -rf "${test_tmpdir}"
+  fi
+) &
+watchdog_pid=$!
 set +m
+exec 9<&-
 
 set +e
 wait "${child_pid}"
