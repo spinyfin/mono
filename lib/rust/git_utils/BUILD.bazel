@@ -7,6 +7,7 @@ rust_library(
     name = "git_utils",
     srcs = [
         "src/gh_cli.rs",
+        "src/jj_compat.rs",
         "src/jj_provenance.rs",
         "src/lib.rs",
         "src/pr_bookmark.rs",
@@ -23,6 +24,8 @@ rust_library(
         "//tools/boss/engine/design-docs:__pkg__",
         "//tools/boss/engine/execution-runner:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",
+        "//tools/boss/engine/recovery:__pkg__",
+        "//tools/boss/engine/test-git:__pkg__",
         "//tools/boss/engine/work-db:__pkg__",
         "//tools/boss/github:__pkg__",
         "//tools/cube:__pkg__",

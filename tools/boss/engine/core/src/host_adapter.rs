@@ -137,8 +137,21 @@ impl Jj for SshHostAdapter {
 
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
         let path = repo.to_str().context("shared repo path is not UTF-8")?;
+        let version = *self
+            .jj_version
+            .get_or_try_init(|| async {
+                let probe = self
+                    .transport
+                    .run_within(&["jj", "--version"], Duration::from_secs(60))
+                    .await?;
+                anyhow::ensure!(probe.success(), "remote jj --version failed: {}", probe.stderr);
+                git_utils::jj_compat::Version::parse(probe.stdout.trim()).map_err(anyhow::Error::msg)
+            })
+            .await?;
+        let compatible =
+            git_utils::jj_compat::arguments(version, &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
         let mut command = vec!["jj", "--no-pager", "-R", path];
-        command.extend_from_slice(args);
+        command.extend(compatible.iter().map(String::as_str));
         let output = self.transport.run_within(&command, Duration::from_secs(60)).await?;
         anyhow::ensure!(
             output.success(),
@@ -146,7 +159,11 @@ impl Jj for SshHostAdapter {
             self.transport.host_id,
             output.stderr
         );
-        Ok(output.stdout)
+        Ok(if args.contains(&"interdiff") && args.contains(&"--git") {
+            git_utils::jj_compat::interdiff_files(version, &output.stdout).to_owned()
+        } else {
+            output.stdout
+        })
     }
 
     async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
@@ -159,7 +176,7 @@ impl Jj for SshHostAdapter {
             self.transport.host_id,
             output.stderr
         );
-        execution_bookmark::shared_repo_from_pointer(&output.stdout)
+        execution_bookmark::shared_repo_from_pointer(workspace, &output.stdout)
     }
 }
 
@@ -413,6 +430,8 @@ impl HostAdapter for LocalHostAdapter {
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct SshHostAdapter {
+    #[builder(skip)]
+    jj_version: tokio::sync::OnceCell<git_utils::jj_compat::Version>,
     transport: SshTransport,
     push_locks: WrapperPushLocks,
     /// Backing store for the shared prompt-composition path
@@ -457,6 +476,7 @@ impl SshHostAdapter {
         Self {
             transport,
             push_locks: WrapperPushLocks::new(),
+            jj_version: tokio::sync::OnceCell::new(),
             work_db,
             cfg,
             non_opus_auto_mode,

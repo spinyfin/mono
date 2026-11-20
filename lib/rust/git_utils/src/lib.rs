@@ -23,3 +23,5 @@ pub mod gh_cli;
 pub mod jj_provenance;
 pub mod pr_bookmark;
 pub mod repo_slug;
+
+pub mod jj_compat;

@@ -124,6 +124,19 @@ jj_test_repository(
     ],
 )
 
+# The newest jj cube and Boss support. The `*_jj_046_test` targets run the
+# default-version suites against it; to run any other jj-dependent test against
+# it, see "Tests" in tools/cube/docs/jj-compatibility.md.
+jj_test_repository(
+    name = "jj_upgrade_test_tools",
+    version = "0.46.0",
+    visible_to = [
+        "@@//tools/boss/engine/recovery:__pkg__",
+        "@@//tools/boss/engine/core:__pkg__",
+        "@@//tools/cube:__pkg__",
+    ],
+)
+
 # A newer jj, used only by cube's GC tests.
 jj_test_repository(
     name = "cube_jj_newer",

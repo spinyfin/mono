@@ -162,7 +162,8 @@ async fn conflicted_preserved_bookmark_releases_clean_workspace_without_moving_v
     for title in ["First variant", "Second variant"] {
         JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &tip.commit_id, "-m", title]);
     }
-    let name = recovery::preserved_name(&execution.id);
+    // A conflicted bookmark: every target, on any jj.
+    let name = format!("bookmarks(exact:{:?})", recovery::preserved_name(&execution.id));
     let variants = JjRepo::run(
         &repo.repo,
         &["log", "--no-graph", "-r", &name, "-T", "commit_id ++ \"\\n\""],
@@ -301,7 +302,7 @@ async fn conflicted_preserved_bookmark_is_resolved_so_later_work_can_be_preserve
     for title in ["First variant", "Second variant"] {
         JjRepo::run(&repo.repo, &["--at-op", &op, "describe", &tip.commit_id, "-m", title]);
     }
-    let name = recovery::preserved_name(&execution.id);
+    let name = format!("bookmarks(exact:{:?})", recovery::preserved_name(&execution.id));
     assert_eq!(
         JjRepo::run(
             &repo.repo,

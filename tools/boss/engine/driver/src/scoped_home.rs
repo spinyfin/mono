@@ -28,6 +28,8 @@ const GH_DEFAULT_CONFIG_LEAF: &str = ".config/gh";
 const CUBE_DEFAULT_DATA_LEAF: &str = ".local/share/cube";
 const CUBE_DEFAULT_CONFIG_LEAF: &str = ".config/cube";
 const BAZEL_DISK_CACHE_LEAF: &str = ".cache/bazelcache";
+const JJ_XDG_CONFIG_LEAF: &str = ".config/jj";
+const JJ_MACOS_LEGACY_CONFIG_LEAF: &str = "Library/Application Support/jj/config.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
@@ -113,12 +115,36 @@ impl HostToolPaths {
             require_delegate(source, &process_home.join(LOGIN_KEYCHAIN_LEAF), "macOS login keychain")?;
         }
         if let Some(source) = &self.vcs.jj_config {
-            let destination = if cfg!(target_os = "macos") {
-                process_home.join("Library/Application Support/jj/config.toml")
-            } else {
-                process_home.join(".config/jj/config.toml")
-            };
-            require_delegate(source, &destination, "jj user configuration")?;
+            // jj 0.36 and newer read the XDG location on every platform; older
+            // jj on macOS reads only the platform one. Grok strips `JJ_CONFIG`
+            // from tool shells, so whichever jj runs must find it through HOME.
+            require_delegate(
+                source,
+                &process_home.join(JJ_XDG_CONFIG_LEAF).join("config.toml"),
+                "jj user configuration",
+            )?;
+            if cfg!(target_os = "macos") {
+                require_delegate(
+                    source,
+                    &process_home.join(JJ_MACOS_LEGACY_CONFIG_LEAF),
+                    "jj user configuration",
+                )?;
+            }
+        }
+        // From 0.38 jj keeps every repository's configuration beside the user
+        // configuration it finds through HOME, whatever `JJ_CONFIG` says, and
+        // moves a repository's configuration there on first contact. Without
+        // this delegate a scoped HOME reads an empty repository configuration,
+        // and the first jj to touch a store would move its configuration into
+        // a per-run home that is later deleted. Older jj ignores the directory.
+        if let Some(source) = resolve_jj_repo_config_dir() {
+            fs::create_dir_all(&source)
+                .with_context(|| format!("creating jj repository configuration directory {}", source.display()))?;
+            require_delegate(
+                &source,
+                &process_home.join(JJ_XDG_CONFIG_LEAF).join("repos"),
+                "jj repository configuration",
+            )?;
         }
         if let Some(source) = &self.vcs.git_config_global {
             require_delegate(source, &process_home.join(".gitconfig"), "git user configuration")?;
@@ -287,14 +313,27 @@ fn resolve_jj_config() -> Option<PathBuf> {
     if legacy.is_file() {
         return Some(legacy);
     }
-    let platform = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/jj/config.toml")
-    } else if let Some(xdg) = nonempty_env("XDG_CONFIG_HOME") {
-        xdg.join("jj/config.toml")
-    } else {
-        home.join(".config/jj/config.toml")
-    };
-    platform.is_file().then_some(platform)
+    // Every jj from 0.29 reads the XDG location, and from 0.36 it is the only
+    // platform location jj reads on macOS, so it wins once it exists. Before
+    // that, jj on macOS reads only `~/Library/Application Support/jj`.
+    let xdg = jj_xdg_config_dir(&home).join("config.toml");
+    if xdg.is_file() {
+        return Some(xdg);
+    }
+    let macos = home.join(JJ_MACOS_LEGACY_CONFIG_LEAF);
+    (cfg!(target_os = "macos") && macos.is_file()).then_some(macos)
+}
+
+fn jj_xdg_config_dir(home: &Path) -> PathBuf {
+    nonempty_env("XDG_CONFIG_HOME")
+        .map(|xdg| xdg.join("jj"))
+        .unwrap_or_else(|| home.join(JJ_XDG_CONFIG_LEAF))
+}
+
+/// Where jj 0.38 and newer keep per-repository configuration on this host.
+/// Read at provisioning time: it follows the same HOME as the paths above.
+fn resolve_jj_repo_config_dir() -> Option<PathBuf> {
+    nonempty_env("HOME").map(|home| jj_xdg_config_dir(&home).join("repos"))
 }
 
 fn resolve_git_config_global() -> Option<PathBuf> {
@@ -480,6 +519,41 @@ mod tests {
         let err = replace_with_symlink(&source, &dest, "probe").unwrap_err().to_string();
         assert!(err.contains("refusing to replace non-symlink"), "{err}");
         assert_eq!(fs::read(&dest).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn jj_configuration_resolves_for_old_and_new_jj() {
+        let tmp = TempDir::new().unwrap();
+        let host_home = tmp.path().join("host-home");
+        let process_home = tmp.path().join("process-home");
+        let xdg = host_home.join(".config/jj/config.toml");
+        let macos = host_home.join(JJ_MACOS_LEGACY_CONFIG_LEAF);
+        for path in [&xdg, &macos] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let _guard = EnvGuard::set_and_clear(&[("HOME", &host_home)], &host_clear());
+
+        // Before the host configuration is moved, only old jj on macOS has one.
+        fs::write(&macos, "[user]\n").unwrap();
+        assert_eq!(resolve_jj_config(), cfg!(target_os = "macos").then(|| macos.clone()));
+        // Once the XDG file exists it is the one every newer jj reads.
+        fs::write(&xdg, "[user]\n").unwrap();
+        assert_eq!(resolve_jj_config(), Some(xdg.clone()));
+
+        HostToolPaths::resolve().unwrap().provision_into(&process_home).unwrap();
+        assert_eq!(fs::read_link(process_home.join(".config/jj/config.toml")).unwrap(), xdg);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                fs::read_link(process_home.join(JJ_MACOS_LEGACY_CONFIG_LEAF)).unwrap(),
+                xdg
+            );
+        }
+        // Repository configuration written through the scoped home lands in
+        // the host directory, which is created if no jj has made it yet.
+        let repos = host_home.join(".config/jj/repos");
+        assert_eq!(fs::read_link(process_home.join(".config/jj/repos")).unwrap(), repos);
+        fs::create_dir_all(process_home.join(".config/jj/repos/0123")).unwrap();
+        assert!(repos.join("0123").is_dir());
     }
 
     #[test]

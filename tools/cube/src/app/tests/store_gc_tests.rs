@@ -1251,9 +1251,16 @@ fn cube_jj_commands_still_running_skip_the_abandon() {
 }
 
 /// Commands run against an independent index over the shared store.
+/// `util gc` is the exception: cube runs it against the live store so a
+/// lease published after the collection checkpoint stays reachable.
 pub(super) fn gc_index_command(source: &std::path::Path, args: &[&str]) -> ExpectedCommand {
-    let path = source.join(".jj/cube-gc-index");
-    let mut command = vec!["--ignore-working-copy", "--repository", path.to_str().unwrap()];
+    let scratch = source.join(".jj/cube-gc-index");
+    let repo = if args.contains(&"gc") {
+        source
+    } else {
+        scratch.as_path()
+    };
+    let mut command = vec!["--ignore-working-copy", "--repository", repo.to_str().unwrap()];
     command.extend_from_slice(args);
     ExpectedCommand::ok(source.to_path_buf(), "jj", &command, "")
 }

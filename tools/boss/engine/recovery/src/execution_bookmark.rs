@@ -212,13 +212,28 @@ pub fn jj_binary() -> std::ffi::OsString {
 #[async_trait]
 impl Jj for LocalJj {
     async fn run(&self, repo: &Path, args: &[&str]) -> Result<String> {
+        let binary = jj_binary();
+        let version = git_utils::jj_compat::detected_version(&binary).map_err(anyhow::Error::msg)?;
+        let compatible =
+            git_utils::jj_compat::arguments(version, &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        let mut command = tokio::process::Command::new(&binary);
+        // From 0.38 jj also loads, and on first contact migrates, the
+        // configuration of the repository around its working directory, even
+        // with `-R`. Run it in the repository it was asked about. A missing
+        // repository keeps the inherited directory so jj reports it itself.
+        if repo.is_dir() {
+            if Path::new(&binary).components().count() > 1 {
+                command = tokio::process::Command::new(std::fs::canonicalize(&binary)?);
+            }
+            command.current_dir(repo);
+        }
         let output = tokio::time::timeout(
             Duration::from_secs(60),
-            tokio::process::Command::new(jj_binary())
+            command
                 .arg("--no-pager")
                 .arg("-R")
                 .arg(repo)
-                .args(args)
+                .args(&compatible)
                 .kill_on_drop(true)
                 .output(),
         )
@@ -231,10 +246,16 @@ impl Jj for LocalJj {
             repo.display(),
             String::from_utf8_lossy(&output.stderr)
         );
-        String::from_utf8(output.stdout).context("jj output was not UTF-8")
+        let text = String::from_utf8(output.stdout).context("jj output was not UTF-8")?;
+        Ok(if args.contains(&"interdiff") && args.contains(&"--git") {
+            git_utils::jj_compat::interdiff_files(version, &text).to_owned()
+        } else {
+            text
+        })
     }
 
     async fn shared_repo(&self, workspace: &Path) -> Result<PathBuf> {
+        let workspace = workspace.canonicalize().context("cannot resolve jj workspace")?;
         let pointer = workspace.join(".jj/repo");
         if pointer.is_dir() {
             return workspace
@@ -242,14 +263,27 @@ impl Jj for LocalJj {
                 .context("cannot resolve shared repository root");
         }
         shared_repo_from_pointer(
+            &workspace,
             &std::fs::read_to_string(&pointer)
                 .with_context(|| format!("cannot read shared jj store pointer {}", pointer.display()))?,
-        )
+        )?
+        .canonicalize()
+        .context("cannot resolve shared repository root")
     }
 }
 
-pub fn shared_repo_from_pointer(pointer: &str) -> Result<PathBuf> {
-    let path = Path::new(pointer.trim());
+pub fn shared_repo_from_pointer(workspace: &Path, pointer: &str) -> Result<PathBuf> {
+    let joined = workspace.join(".jj").join(pointer.trim());
+    let mut path = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                path.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => path.push(part),
+        }
+    }
     ensure!(
         path.is_absolute() && path.ends_with(".jj/repo"),
         "unexpected shared jj store pointer: {pointer:?}"

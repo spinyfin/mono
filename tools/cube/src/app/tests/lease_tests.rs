@@ -401,6 +401,83 @@ fn workspace_lease_auto_create_recovers_from_interrupted_staging() {
     runner.assert_exhausted();
 }
 
+/// `jj workspace add` can create the working copy and then fail on a git
+/// keep-ref lock while store GC (or another writer) holds it. The next
+/// attempt must forget that partial attach and succeed, the same way a
+/// leftover `.incoming-*` dir is recovered.
+#[test]
+fn workspace_lease_auto_create_retries_git_lock_during_workspace_add() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    seed_mono_repo(&workspace_root, &database_path);
+    let source = mono_source_path(&workspace_root);
+
+    let new_path = workspace_root.join("mono-agent-001");
+    let staging = workspace_root.join(".incoming-mono-agent-001");
+    let add_args = [
+        "-R",
+        source.to_str().unwrap(),
+        "workspace",
+        "add",
+        "--name",
+        "mono-agent-001",
+        staging.to_str().unwrap(),
+    ];
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::failing(
+            workspace_root.clone(),
+            "jj",
+            &add_args,
+            "Created workspace in \".incoming-mono-agent-001\"\n\
+             Internal error: Unexpected error from backend\n\
+             Caused by:\n\
+             1: Could not prepare reference edit, \"reference\"=\"refs/jj/keep/abc\"\n\
+             2: Another IO error occurred while obtaining the lock",
+        )
+        .creating_dir(staging.clone()),
+        ExpectedCommand::ok(
+            workspace_root.clone(),
+            "jj",
+            &[
+                "-R",
+                &source.display().to_string(),
+                "workspace",
+                "forget",
+                "mono-agent-001",
+            ],
+            "",
+        ),
+        ExpectedCommand::workspace_add(workspace_root.clone(), &source, "mono-agent-001", &staging),
+        ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+            "cafef00d",
+        ),
+    ]);
+
+    let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "retry lock"]);
+    let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
+    assert_eq!(result.payload["workspace"]["state"], "leased");
+    runner.assert_exhausted();
+}
+
 /// In the shared-store model the canonical repo already carries the local
 /// `main`/`master` bookmarks, so auto-create must NOT re-track any bookmark
 /// per workspace — it only attaches and resets. The FakeRunner's strict

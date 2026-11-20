@@ -5,7 +5,9 @@ use super::support::{ExpectedCommand, FakeRunner};
 use crate::command_runner::RealCommandRunner;
 
 use crate::app::errors::CubeError;
-use crate::app::jj::{is_bookkeeping_bookmark, is_retryable_network_error, run_jj_push};
+use crate::app::jj::{
+    is_bookkeeping_bookmark, is_retryable_backend_lock_error, is_retryable_network_error, run_jj_push,
+};
 
 #[test]
 fn is_bookkeeping_bookmark_covers_legacy_pr_aliases_and_engine_pointers() {
@@ -38,6 +40,36 @@ fn is_retryable_network_error_classifies_transient_failures() {
         args: vec![],
         status: Some(1),
         stderr: "fatal: permission denied (publickey)".to_string(),
+    }));
+}
+
+#[test]
+fn is_retryable_backend_lock_error_classifies_git_lock_contention() {
+    assert!(is_retryable_backend_lock_error(&CubeError::CommandFailed {
+        program: "jj".to_string(),
+        args: vec![],
+        status: Some(255),
+        stderr: "Created workspace in \"/tmp/ws\"\nInternal error: Unexpected error from backend\n\
+                 Caused by:\n1: Could not prepare reference edit, \"reference\"=\"refs/jj/keep/abc\"\n\
+                 2: Another IO error occurred while obtaining the lock"
+            .to_string(),
+    }));
+    assert!(is_retryable_backend_lock_error(&CubeError::CommandFailed {
+        program: "jj".to_string(),
+        args: vec![],
+        status: Some(1),
+        stderr: "Unable to create '/tmp/repo/.git/refs/jj/keep/abc.lock': File exists".to_string(),
+    }));
+    assert!(!is_retryable_backend_lock_error(&CubeError::CommandFailed {
+        program: "jj".to_string(),
+        args: vec![],
+        status: Some(1),
+        stderr: "Error: Workspace mono-agent-001 already exists".to_string(),
+    }));
+    assert!(!is_retryable_backend_lock_error(&CubeError::CommandTimedOut {
+        program: "jj".to_string(),
+        args: vec!["workspace".to_string(), "add".to_string()],
+        timeout_secs: 120,
     }));
 }
 
