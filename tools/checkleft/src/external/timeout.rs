@@ -39,7 +39,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 ///
 /// A descendant may keep a pipe open after the child exits, so this cannot be
 /// unbounded. It deliberately does not consume the subprocess execution budget:
-/// the child has already completed successfully at this point.
+/// on overrun, return the output captured so far with the child’s real status.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Named timeout cause so optional diagnostics can preserve ordinary probe
@@ -232,11 +232,14 @@ impl PipeReader {
             Ok(result) => result
                 .with_context(|| format!("failed to read {stream} for check `{check_id}` subprocess `{subprocess}`"))?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!(
-                    "warning: check `{check_id}` subprocess `{subprocess}` exited ({status}) after {child_elapsed_ms} ms \
-                     but {stream} did not reach EOF within {} ms; a descendant process is holding the pipe open. \
-                     Using the output captured so far",
-                    DRAIN_GRACE.as_millis()
+                tracing::warn!(
+                    check_id,
+                    subprocess,
+                    stream,
+                    status = %status,
+                    child_elapsed_ms,
+                    drain_grace_ms = DRAIN_GRACE.as_millis() as u64,
+                    "descendant held the output pipe open after child exit; using output captured so far"
                 );
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -263,13 +266,13 @@ mod tests {
     fn exited_child_with_pipe_held_open_is_not_a_timeout() {
         let started = Instant::now();
         let out = output_with_timeout(
-            &mut sh("echo partial; echo err >&2; (sleep 30 &) ; exit 3"),
+            &mut sh("echo partial; echo err >&2; (sleep 6 &) ; exit 3"),
             "t/c",
             "tool",
             60_000,
         )
         .expect("drain overrun must not be an error");
-        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(started.elapsed() < Duration::from_millis(3_500));
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(out.stdout, b"partial\n");
         assert_eq!(out.stderr, b"err\n");
@@ -277,14 +280,32 @@ mod tests {
 
     #[test]
     fn exited_zero_with_pipe_held_open_succeeds() {
-        let out = output_with_timeout(&mut sh("echo ok; (sleep 30 &)"), "t/c", "tool", 60_000).unwrap();
+        let started = Instant::now();
+        let out = output_with_timeout(&mut sh("echo ok; (sleep 6 &)"), "t/c", "tool", 60_000).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(3_500));
         assert!(out.status.success());
         assert_eq!(out.stdout, b"ok\n");
     }
 
     #[test]
+    fn only_stdout_held_open_preserves_both_streams() {
+        let started = Instant::now();
+        let out = output_with_timeout(
+            &mut sh("echo ok; echo err >&2; (sleep 6 2>/dev/null &)"),
+            "t/c",
+            "tool",
+            60_000,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"ok\n");
+        assert_eq!(out.stderr, b"err\n");
+    }
+
+    #[test]
     fn genuinely_slow_child_still_times_out() {
-        let err = output_with_timeout(&mut sh("sleep 30"), "t/c", "tool", 200).unwrap_err();
+        let err = output_with_timeout(&mut sh("exec sleep 6"), "t/c", "tool", 200).unwrap_err();
         assert!(err.downcast_ref::<SubprocessTimeout>().is_some());
     }
 }
