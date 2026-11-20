@@ -35,7 +35,8 @@ echo "--- [bazel-test] testing"
 # Use a fresh directory so an agent checkout cannot report a previous job's BEP.
 report_dir=$(mktemp -d "${TMPDIR:-/tmp}/bazel-flaky.XXXXXX")
 test_status=0
-bazel_verify_only test --build_event_json_file="${report_dir}/events.json" --nobuild_event_json_file_path_conversion --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/... || test_status=$?
+# Preserve retry evidence even with minimal remote output downloads.
+bazel_verify_only test --flaky_test_attempts=2 --remote_download_regex='.*testlogs/.*\.(log|xml)$' --build_event_json_file="${report_dir}/events.json" --nobuild_event_json_file_path_conversion --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/... || test_status=$?
 
 report_status=0
 python3 "$(dirname "${BASH_SOURCE[0]}")/report-flaky-tests.py" "${report_dir}/events.json" "${report_dir}" || report_status=$?

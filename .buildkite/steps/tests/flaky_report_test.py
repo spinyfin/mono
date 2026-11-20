@@ -101,10 +101,68 @@ class ReportTest(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 reporter.collect(bep, root)
 
+    def test_missing_optional_remote_outputs_are_recorded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log = root / 'test.log'
+            log.write_text('recovered')
+            outputs = [dict(name='test.log', uri=log.as_uri()),
+                       dict(name='test.outputs__outputs.zip', uri=(root / 'outputs.zip').as_uri())]
+            result = dict(id=dict(testResult=dict(label='//pkg:remote')),
+                          testResult=dict(status='PASSED', testActionOutput=outputs))
+            summary = dict(id=dict(testSummary=dict(label='//pkg:remote')),
+                           testSummary=dict(overallStatus='FLAKY'))
+            bep = root / 'events.json'
+            bep.write_text('\n'.join(map(json.dumps, [result, summary])))
+            report = reporter.collect(bep, root)
+            attempt = report['tests'][0]['attempts'][0]
+            self.assertFalse(report['tests'][0]['replayed'])
+            self.assertEqual(attempt['missing_outputs'], [outputs[1]['uri']])
+            self.assertEqual((root / attempt['log_paths'][0]).read_text(), 'recovered')
+            with patch.object(reporter.subprocess, 'run'):
+                reporter.publish(report, root)
+            outputs.append(dict(name='test.xml', uri=(root / 'test.xml').as_uri()))
+            bep.write_text('\n'.join(map(json.dumps, [result, summary])))
+            with self.assertRaises(FileNotFoundError):
+                reporter.collect(bep, root)
+
+    def test_cached_replay_and_missing_optional_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            passed, failed = root / 'test.log', root / 'failed.log'
+            passed.write_text('passed on retry')
+            failed.write_text('original failure')
+            events = [dict(id=dict(testResult=dict(label='//pkg:cached')),
+                           testResult=dict(status='FLAKY', cachedLocally=True, testActionOutput=[
+                               dict(name='test.log', uri=passed.as_uri()),
+                               dict(name='outputs.zip', uri=(root / 'absent.zip').as_uri())])),
+                      dict(id=dict(testSummary=dict(label='//pkg:cached')),
+                           testSummary=dict(overallStatus='FLAKY', totalRunCount=2,
+                                            failed=[dict(uri=failed.as_uri())],
+                                            passed=[dict(uri=passed.as_uri())]))]
+            bep = root / 'events.json'
+            bep.write_text('\n'.join(map(json.dumps, events)))
+            report = reporter.collect(bep, root)
+            test = report['tests'][0]
+            self.assertTrue(test['replayed'])
+            self.assertEqual(test['attempts'][0]['provenance'], 'local-cache')
+            self.assertEqual(test['attempts'][0]['missing_outputs'], [(root / 'absent.zip').as_uri()])
+            self.assertEqual(len(test['summary_logs']), 1)
+            path = test['summary_logs'][0]['log_paths'][0]
+            self.assertEqual((root / path).read_text(), 'original failure')
+            with patch.object(reporter.subprocess, 'run') as run:
+                reporter.publish(report, root)
+            annotation = run.call_args.args[0][-1]
+            self.assertIn('local cache replay: aggregate FLAKY', annotation)
+            self.assertNotIn('attempt 1: FLAKY', annotation)
+            self.assertIn('artifact://' + path, annotation)
+
     def test_step_status_and_ci_retry_config(self):
         root = Path(os.environ['TEST_SRCDIR']) / os.environ['TEST_WORKSPACE']
-        self.assertIn('test:ci --flaky_test_attempts=2', (root / '.ci.bazelrc').read_text())
+        self.assertNotIn('--flaky_test_attempts', (root / '.ci.bazelrc').read_text())
         original = (root / '.buildkite/steps/bazel-build-test.sh').read_text()
+        self.assertIn('test --flaky_test_attempts=2', original)
+        self.assertIn("--remote_download_regex='.*testlogs/.*\\.(log|xml)$'", original)
         # Execute the real control flow with stand-ins for Bazel and the agent.
         # This covers the report running after a failed test and failing closed.
         with tempfile.TemporaryDirectory() as temp:

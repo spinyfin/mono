@@ -28,7 +28,7 @@ The resulting context names are `buildkite/mono/<step-key>` — e.g. `buildkite/
 
 ## Test retries and flaky reports
 
-CI test commands inherit `test:ci --flaky_test_attempts=2` from `.ci.bazelrc`:
+`bazel-build-test` passes `--flaky_test_attempts=2` on its test command:
 each failed test gets one retry in PR, merge-queue and `main` builds. Developer
 defaults in `.bazelrc` are unchanged. A test that passes on retry is `FLAKY`
 and does not fail the required check; a test that fails both attempts still
@@ -40,10 +40,17 @@ failed test-case names when the test's XML supplies them, and links to each
 attempt's uploaded logs. The job uploads `flaky-tests.json` even when there
 are no flaky targets. It records commit, branch, build number, and a `tests`
 array with target, configuration, attempt count, test cases and individual
-attempts (run, shard, attempt, status and log paths). Paths refer to the job's
+attempts (run, shard, attempt, status, cache provenance and log paths).
+Locally cached results are marked as replays rather than new flaky occurrences;
+summary failure and passing logs are uploaded when not already captured by attempts.
+Missing optional outputs are recorded in `missing_outputs`; test logs and listed
+XML files remain required evidence. Paths refer to the job's
 `flaky-logs/` artifacts. Reporting failures fail the step too, so lost reports
-cannot silently turn into a successful check. Other CI steps inherit retries
-but only `bazel-build-test` publishes this report.
+cannot silently turn into a successful check. Other CI steps retain their existing
+retry defaults and do not inherit this retry policy.
+
+The reporting step explicitly downloads test-log and XML outputs, including
+earlier retry attempts, while retaining minimal downloads for other remote outputs.
 
 ## Rollout: rename complete (`bazel-build` + `bazel-test` → `bazel-build-test`)
 
