@@ -8,14 +8,15 @@
 //! (`app/cost.rs`) stays a thin fetch-then-build shim.
 //!
 //! See `boss_protocol::CostMeasurement`'s doc comment for the NULL-vs-zero
-//! contract every builder here upholds: a run with no recorded tokens
-//! (`input_tokens: None`) is *unmeasured*, never folded into a sum as
-//! zero.
+//! contract every builder here upholds: a run with no recorded token
+//! category is *unmeasured*, never folded into a sum as zero. A run with
+//! some categories present is measured even when others are unknown.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use boss_protocol::{
-    CostBucket, CostMeasurement, CostTopRow, ExecutionCostRow, TaskCostReport, TopCostReport, WindowCostReport,
+    CostBucket, CostMeasurement, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow, TaskCostReport,
+    TopCostReport, WindowCostReport,
 };
 
 use crate::cost_pricing;
@@ -241,39 +242,38 @@ impl Accumulator {
         if let Some(reason) = &record.usage_unavailable {
             self.unavailable.insert(reason.clone());
         }
-        for (name, value) in [
-            ("input", record.input_tokens),
-            ("output", record.output_tokens),
-            ("cache_creation", record.cache_creation_tokens),
-            ("cache_read", record.cache_read_tokens),
-        ] {
-            if value.is_none() {
-                self.unknown_categories.insert(name);
-            }
-        }
-        let Some(input_tokens) = record.input_tokens else {
+        if !run_is_measured(record) {
             self.counts.unmeasured += 1;
             return;
-        };
+        }
         self.counts.measured += 1;
-        let output_tokens = record.output_tokens.unwrap_or(0);
-        let cache_creation_tokens = record.cache_creation_tokens.unwrap_or(0);
-        let cache_read_tokens = record.cache_read_tokens.unwrap_or(0);
-        if [
-            record.input_tokens,
-            record.output_tokens,
-            record.cache_creation_tokens,
-            record.cache_read_tokens,
-        ]
-        .iter()
-        .all(|n| *n == Some(0))
-        {
+        if token_fields(record).iter().all(|(_, value)| *value == Some(0)) {
             self.counts.zero += 1;
         }
-        self.tokens.input += input_tokens;
-        self.tokens.output += output_tokens;
-        self.tokens.cache_creation += cache_creation_tokens;
-        self.tokens.cache_read += cache_read_tokens;
+        fold_category(
+            &mut self.unknown_categories,
+            &mut self.tokens.input,
+            "input",
+            record.input_tokens,
+        );
+        fold_category(
+            &mut self.unknown_categories,
+            &mut self.tokens.output,
+            "output",
+            record.output_tokens,
+        );
+        fold_category(
+            &mut self.unknown_categories,
+            &mut self.tokens.cache_creation,
+            "cache_creation",
+            record.cache_creation_tokens,
+        );
+        fold_category(
+            &mut self.unknown_categories,
+            &mut self.tokens.cache_read,
+            "cache_read",
+            record.cache_read_tokens,
+        );
         self.agent_active_ms += record.agent_active_ms.unwrap_or(0);
         if want_usd {
             match price_for_record(record) {
@@ -281,10 +281,10 @@ impl Accumulator {
                     self.priced_runs += 1;
                     self.priced_usd += cost_pricing::estimate_usd(
                         price,
-                        input_tokens,
-                        output_tokens,
-                        cache_creation_tokens,
-                        cache_read_tokens,
+                        record.input_tokens.unwrap_or(0),
+                        record.output_tokens.unwrap_or(0),
+                        record.cache_creation_tokens.unwrap_or(0),
+                        record.cache_read_tokens.unwrap_or(0),
                     );
                 }
                 None => {
@@ -295,18 +295,18 @@ impl Accumulator {
         }
     }
 
+    fn category(&self, name: &str, value: i64) -> Option<i64> {
+        (self.counts.measured > 0 && !self.unknown_categories.contains(name)).then_some(value)
+    }
+
     fn finish(&self, want_usd: bool) -> CostMeasurement {
         CostMeasurement::builder()
             .agent_active_ms(self.agent_active_ms)
-            .maybe_cache_creation_tokens(
-                (!self.unknown_categories.contains("cache_creation")).then_some(self.tokens.cache_creation),
-            )
-            .maybe_cache_read_tokens(
-                (!self.unknown_categories.contains("cache_read")).then_some(self.tokens.cache_read),
-            )
+            .maybe_cache_creation_tokens(self.category("cache_creation", self.tokens.cache_creation))
+            .maybe_cache_read_tokens(self.category("cache_read", self.tokens.cache_read))
             .estimated_usd_partial(want_usd && self.partial)
-            .maybe_input_tokens((!self.unknown_categories.contains("input")).then_some(self.tokens.input))
-            .maybe_output_tokens((!self.unknown_categories.contains("output")).then_some(self.tokens.output))
+            .maybe_input_tokens(self.category("input", self.tokens.input))
+            .maybe_output_tokens(self.category("output", self.tokens.output))
             .tokens_partial(!self.unknown_categories.is_empty())
             .usage_unavailable(self.unavailable.iter().cloned().collect())
             .runs_measured(self.counts.measured)
@@ -322,7 +322,7 @@ impl Accumulator {
 // Subscription-backed Grok/Antigravity model names are not verified API rates.
 // Incomplete categories also cannot support a complete dollar estimate.
 fn price_for_record(record: &CostRunRecord) -> Option<cost_pricing::ModelPriceUsdPerMillion> {
-    if matches!(record.driver.as_deref(), Some("grok" | "agy")) {
+    if matches!(record.driver.as_deref(), Some(DRIVER_SLUG_GROK | DRIVER_SLUG_AGY)) {
         return None;
     }
     if [
@@ -337,6 +337,32 @@ fn price_for_record(record: &CostRunRecord) -> Option<cost_pricing::ModelPriceUs
         return None;
     }
     record.model.as_deref().and_then(cost_pricing::price_for_model)
+}
+
+fn token_fields(record: &CostRunRecord) -> [(&'static str, Option<i64>); 4] {
+    [
+        ("input", record.input_tokens),
+        ("output", record.output_tokens),
+        ("cache_creation", record.cache_creation_tokens),
+        ("cache_read", record.cache_read_tokens),
+    ]
+}
+
+fn run_is_measured(record: &CostRunRecord) -> bool {
+    token_fields(record).iter().any(|(_, value)| value.is_some())
+}
+
+fn known_tokens(record: &CostRunRecord) -> i64 {
+    token_fields(record).iter().filter_map(|(_, value)| *value).sum()
+}
+
+fn fold_category(unknown: &mut BTreeSet<&'static str>, dest: &mut i64, name: &'static str, value: Option<i64>) {
+    match value {
+        Some(n) => *dest += n,
+        None => {
+            unknown.insert(name);
+        }
+    }
 }
 
 fn label_or_none(value: Option<&str>) -> String {
@@ -489,9 +515,11 @@ pub fn build_window_cost_report(
 }
 
 /// Build the `boss cost top` report: the `limit` highest-`total_tokens`
-/// runs in `records`, descending. A record with no recorded tokens
-/// cannot be ranked and is excluded from `rows` — counted in
+/// runs in `records`, descending. A record with no recorded token
+/// category cannot be ranked and is excluded from `rows` — counted in
 /// `excluded_unmeasured_count` instead of being sorted in as a zero.
+/// Known tokens on a partially measured run still rank; missing
+/// categories make `tokens_partial` true and keep USD absent.
 pub fn build_top_cost_report(
     since_epoch_s: i64,
     until_epoch_s: i64,
@@ -505,22 +533,19 @@ pub fn build_top_cost_report(
     let mut rows: Vec<CostTopRow> = Vec::new();
 
     for record in records {
-        let Some(input_tokens) = record.input_tokens else {
+        if !run_is_measured(record) {
             excluded_unmeasured_count += 1;
             continue;
-        };
-        let output_tokens = record.output_tokens.unwrap_or(0);
-        let cache_creation_tokens = record.cache_creation_tokens.unwrap_or(0);
-        let cache_read_tokens = record.cache_read_tokens.unwrap_or(0);
-        let total_tokens = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens;
+        }
+        let total_tokens = known_tokens(record);
 
         let estimated_usd = want_usd.then(|| price_for_record(record)).flatten().map(|price| {
             cost_pricing::estimate_usd(
                 price,
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
+                record.input_tokens.unwrap_or(0),
+                record.output_tokens.unwrap_or(0),
+                record.cache_creation_tokens.unwrap_or(0),
+                record.cache_read_tokens.unwrap_or(0),
             )
         });
         if want_usd && estimated_usd.is_none() {
@@ -619,6 +644,101 @@ mod tests {
         // Sum comes only from the measured run — the unmeasured run's
         // absence must not silently read as an extra zero.
         assert_eq!(report.overall.total_tokens, 150);
+        assert_eq!(report.overall.input_tokens, Some(100));
+        assert_eq!(report.overall.output_tokens, Some(50));
+        assert_eq!(report.overall.cache_creation_tokens, Some(0));
+        assert_eq!(report.overall.cache_read_tokens, Some(0));
+        assert!(!report.overall.tokens_partial);
+    }
+
+    #[test]
+    fn complete_run_plus_unmeasured_run_keeps_known_categories() {
+        let records = vec![
+            measured(record("run_1", "exec_1"), 100, 50, 10, 5),
+            record("run_2", "exec_1"),
+        ];
+        let report = build_task_cost_report("task_1", None, "t", &records, false, 0);
+        assert_eq!(report.overall.runs_measured, 1);
+        assert_eq!(report.overall.runs_unmeasured, 1);
+        assert_eq!(report.overall.input_tokens, Some(100));
+        assert_eq!(report.overall.output_tokens, Some(50));
+        assert_eq!(report.overall.cache_creation_tokens, Some(10));
+        assert_eq!(report.overall.cache_read_tokens, Some(5));
+        assert!(!report.overall.tokens_partial);
+        assert_eq!(report.overall.total_tokens, 165);
+    }
+
+    #[test]
+    fn all_unmeasured_bucket_reports_unknown_categories_not_zero() {
+        let records = vec![record("run_1", "exec_1")];
+        let report = build_task_cost_report("task_1", None, "t", &records, false, 0);
+        assert_eq!(report.overall.runs_measured, 0);
+        assert_eq!(report.overall.runs_unmeasured, 1);
+        assert_eq!(report.overall.input_tokens, None);
+        assert_eq!(report.overall.output_tokens, None);
+        assert_eq!(report.overall.cache_creation_tokens, None);
+        assert_eq!(report.overall.cache_read_tokens, None);
+        assert!(!report.overall.tokens_partial);
+        assert_eq!(report.overall.total_tokens, 0);
+    }
+
+    fn output_and_cache_read_only(mut r: CostRunRecord, output: i64, cache_read: i64) -> CostRunRecord {
+        r.output_tokens = Some(output);
+        r.cache_read_tokens = Some(cache_read);
+        r
+    }
+
+    #[test]
+    fn partial_native_run_accumulates_known_categories_independently() {
+        let records = vec![output_and_cache_read_only(record("run_1", "exec_1"), 50, 20)];
+        let report = build_task_cost_report("task_1", None, "t", &records, false, 0);
+        assert_eq!(report.overall.runs_measured, 1);
+        assert_eq!(report.overall.runs_unmeasured, 0);
+        assert_eq!(report.overall.input_tokens, None);
+        assert_eq!(report.overall.output_tokens, Some(50));
+        assert_eq!(report.overall.cache_creation_tokens, None);
+        assert_eq!(report.overall.cache_read_tokens, Some(20));
+        assert!(report.overall.tokens_partial);
+        assert_eq!(report.overall.total_tokens, 70);
+        let usd = build_task_cost_report("task_1", None, "t", &records, true, 0);
+        assert!(usd.overall.estimated_usd.is_none());
+        assert!(usd.overall.estimated_usd_partial);
+    }
+
+    #[test]
+    fn partial_native_run_mixed_with_complete_run_keeps_known_as_partial_sums() {
+        let records = vec![
+            measured(record("run_full", "exec_1"), 100, 40, 10, 5),
+            output_and_cache_read_only(record("run_partial", "exec_1"), 50, 20),
+        ];
+        let report = build_task_cost_report("task_1", None, "t", &records, false, 0);
+        assert_eq!(report.overall.runs_measured, 2);
+        assert_eq!(report.overall.runs_unmeasured, 0);
+        assert_eq!(report.overall.input_tokens, None);
+        assert_eq!(report.overall.output_tokens, Some(90));
+        assert_eq!(report.overall.cache_creation_tokens, None);
+        assert_eq!(report.overall.cache_read_tokens, Some(25));
+        assert!(report.overall.tokens_partial);
+        assert_eq!(report.overall.total_tokens, 225);
+    }
+
+    #[test]
+    fn top_report_ranks_partial_runs_by_known_tokens() {
+        let records = vec![
+            output_and_cache_read_only(record("run_partial", "exec_1"), 50, 20),
+            measured(record("run_full", "exec_1"), 10, 0, 0, 0),
+            record("run_unmeasured", "exec_1"),
+        ];
+        let report = build_top_cost_report(0, i64::MAX, 10, &records, false, 0);
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].run_id, "run_partial");
+        assert_eq!(report.rows[0].total_tokens, 70);
+        assert!(report.rows[0].tokens_partial);
+        assert_eq!(report.rows[0].input_tokens, None);
+        assert_eq!(report.rows[0].output_tokens, Some(50));
+        assert_eq!(report.rows[1].run_id, "run_full");
+        assert!(!report.rows[1].tokens_partial);
+        assert_eq!(report.excluded_unmeasured_count, 1);
     }
 
     #[test]
@@ -745,5 +865,17 @@ mod tests {
         assert!(report.overall.estimated_usd.is_none());
         assert!(report.overall.estimated_usd_partial);
         assert_eq!(report.pricing_gaps, vec!["gpt-5-codex".to_owned()]);
+    }
+
+    #[test]
+    fn grok_and_agy_drivers_are_unpriced_even_with_complete_tokens() {
+        for driver in [DRIVER_SLUG_GROK, DRIVER_SLUG_AGY] {
+            let mut r = measured(record("run_1", "exec_1"), 1_000_000, 0, 0, 0);
+            r.driver = Some(driver.to_owned());
+            r.model = Some("claude-sonnet-5".to_owned());
+            let report = build_task_cost_report("task_1", None, "t", &[r], true, 0);
+            assert!(report.overall.estimated_usd.is_none());
+            assert!(report.overall.estimated_usd_partial);
+        }
     }
 }

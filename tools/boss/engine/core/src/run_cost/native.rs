@@ -119,7 +119,13 @@ fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {
             // reasoningTokens is already included in outputTokens.
             output_tokens: count(usage, "outputTokens"),
             rounds: count(usage, "modelCalls"),
-            agent_active_ms: count(usage, "apiDurationMs"),
+            // `apiDurationMs` is model API latency, not turn wall time.
+            // Claude/Codex `agent_active_ms` includes tool execution;
+            // ACP turn_completed has no equivalent, and events.jsonl
+            // turn_started/turn_ended is a different file the cost
+            // tailer does not read. Leave unknown rather than
+            // understate activity as API-only milliseconds.
+            agent_active_ms: None,
             ..Default::default()
         },
     ))

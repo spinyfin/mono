@@ -1,4 +1,5 @@
 use super::*;
+use crate::cost_report::{self, CostRunRecord};
 use crate::test_support::{create_product, create_ready_chore_execution, create_test_chore, open_db};
 use serde_json::json;
 
@@ -26,7 +27,7 @@ fn captured_grok_turns_include_cancelled_usage_without_double_counting() {
     assert_eq!(snapshot.cache_creation_tokens, None);
     assert_eq!(snapshot.cache_creation_5m_tokens, None);
     assert_eq!(snapshot.cache_creation_1h_tokens, None);
-    assert_eq!(snapshot.agent_active_ms, Some(3032));
+    assert_eq!(snapshot.agent_active_ms, None);
     assert_eq!(snapshot.rounds, Some(2));
     assert_eq!(snapshot.model.as_deref(), Some("grok-4.5-build"));
     assert_eq!(snapshot.usage_unavailable, None);
@@ -92,6 +93,96 @@ fn step_revisions_replace_usage_and_separate_transcripts_do_not_collide() {
     assert_eq!(snapshot.cache_read_tokens, Some(0));
     assert_eq!(snapshot.model, None);
     assert_eq!(snapshot.rounds, Some(2));
+}
+
+fn grok_turn(prompt_id: &str, usage: serde_json::Value) -> String {
+    json!({"method":"_x.ai/session/update","params":{"update":{
+        "sessionUpdate":"turn_completed","prompt_id":prompt_id,
+        "usage":usage}}})
+    .to_string()
+}
+
+fn record_from_snapshot(run_id: &str, snapshot: RunCostSnapshot) -> CostRunRecord {
+    CostRunRecord::builder()
+        .run_id(run_id)
+        .execution_id("exec_1")
+        .work_item_id("task_1")
+        .work_item_name("t")
+        .execution_kind("chore_implementation")
+        .execution_status("completed")
+        .run_status("completed")
+        .created_at_epoch_s(1)
+        .maybe_input_tokens(snapshot.input_tokens)
+        .maybe_output_tokens(snapshot.output_tokens)
+        .maybe_cache_creation_tokens(snapshot.cache_creation_tokens)
+        .maybe_cache_read_tokens(snapshot.cache_read_tokens)
+        .maybe_usage_unavailable(snapshot.usage_unavailable)
+        .build()
+}
+
+fn fully_measured_claude_run() -> CostRunRecord {
+    CostRunRecord::builder()
+        .run_id("run_claude")
+        .execution_id("exec_1")
+        .work_item_id("task_1")
+        .work_item_name("t")
+        .execution_kind("chore_implementation")
+        .execution_status("completed")
+        .run_status("completed")
+        .created_at_epoch_s(1)
+        .input_tokens(100)
+        .output_tokens(40)
+        .cache_creation_tokens(10)
+        .cache_read_tokens(5)
+        .build()
+}
+
+#[test]
+fn grok_turn_without_input_still_reports_known_output_and_cache_read() {
+    let snapshot = parse(&grok_turn("partial", json!({"outputTokens":50,"cachedReadTokens":20})));
+    assert_eq!(snapshot.input_tokens, None);
+    assert_eq!(snapshot.output_tokens, Some(50));
+    assert_eq!(snapshot.cache_read_tokens, Some(20));
+    assert_eq!(snapshot.cache_creation_tokens, None);
+    assert_eq!(snapshot.agent_active_ms, None);
+    let records = [record_from_snapshot("run_partial", snapshot)];
+    let report = cost_report::build_window_cost_report(0, i64::MAX, &records, false, 0);
+    assert_eq!(report.overall.runs_measured, 1);
+    assert_eq!(report.overall.runs_unmeasured, 0);
+    assert_eq!(report.overall.input_tokens, None);
+    assert_eq!(report.overall.output_tokens, Some(50));
+    assert_eq!(report.overall.cache_creation_tokens, None);
+    assert_eq!(report.overall.cache_read_tokens, Some(20));
+    assert!(report.overall.tokens_partial);
+    assert_eq!(report.overall.total_tokens, 70);
+    let top = cost_report::build_top_cost_report(0, i64::MAX, 10, &records, false, 0);
+    assert_eq!(top.rows.len(), 1);
+    assert_eq!(top.rows[0].total_tokens, 70);
+    assert!(top.rows[0].tokens_partial);
+    assert_eq!(top.excluded_unmeasured_count, 0);
+}
+
+#[test]
+fn grok_partial_turn_mixed_with_complete_run_keeps_known_as_partial_sums() {
+    let partial = record_from_snapshot(
+        "run_partial",
+        parse(&grok_turn("partial", json!({"outputTokens":50,"cachedReadTokens":20}))),
+    );
+    let records = vec![fully_measured_claude_run(), partial];
+    let report = cost_report::build_window_cost_report(0, i64::MAX, &records, false, 0);
+    assert_eq!(report.overall.runs_measured, 2);
+    assert_eq!(report.overall.input_tokens, None);
+    assert_eq!(report.overall.output_tokens, Some(90));
+    assert_eq!(report.overall.cache_creation_tokens, None);
+    assert_eq!(report.overall.cache_read_tokens, Some(25));
+    assert!(report.overall.tokens_partial);
+    assert_eq!(report.overall.total_tokens, 225);
+    let top = cost_report::build_top_cost_report(0, i64::MAX, 10, &records, false, 0);
+    assert_eq!(top.rows.len(), 2);
+    assert_eq!(top.rows[0].run_id, "run_claude");
+    assert_eq!(top.rows[0].total_tokens, 155);
+    assert_eq!(top.rows[1].run_id, "run_partial");
+    assert_eq!(top.rows[1].total_tokens, 70);
 }
 
 #[tokio::test]

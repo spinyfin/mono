@@ -16,9 +16,10 @@
 //! NULL token columns — the cost is unknown, not zero. A run that
 //! failed before ever reaching a model legitimately has zero tokens
 //! recorded. [`CostMeasurement`] keeps these distinct:
-//! `runs_unmeasured` counts NULL rows (excluded from every token
-//! sum); `runs_zero` counts rows with a real, recorded zero. Token
-//! sums are never computed by coalescing NULL to zero.
+//! `runs_unmeasured` counts rows with no recorded token category
+//! (excluded from every token sum); `runs_zero` counts rows with a
+//! real, recorded zero. Token sums are never computed by coalescing
+//! NULL to zero.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +30,10 @@ use serde::{Deserialize, Serialize};
 /// `runs_total == runs_measured + runs_unmeasured`. `runs_zero` is a
 /// subset of `runs_measured` (a measured run whose recorded tokens
 /// happen to be exactly zero, e.g. a run that failed before calling
-/// a model). A category is NULL if any run lacks that measurement.
+/// a model). A run is measured when any token category is present.
+/// Unmeasured runs are excluded from category sums and do not make a
+/// measured category unknown. A category is NULL when no run was
+/// measured, or when any measured run lacks that category.
 /// `total_tokens` sums available categories on measured runs; when
 /// `tokens_partial` is true it is a lower bound, not a complete total.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
@@ -39,7 +43,9 @@ pub struct CostMeasurement {
     #[serde(default)]
     #[builder(default)]
     pub usage_unavailable: Vec<String>,
-    /// Totals are a lower bound when any measured category is unknown.
+    /// Totals are a lower bound when a measured run lacks a category.
+    /// Unmeasured runs are counted in `runs_unmeasured` and
+    /// `usage_unavailable` instead; they do not set this flag.
     #[serde(default)]
     #[builder(default)]
     pub tokens_partial: bool,
@@ -54,12 +60,12 @@ pub struct CostMeasurement {
     pub estimated_usd_partial: bool,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
-    /// Runs with recorded token columns — includes `runs_zero`, whose
-    /// recorded tokens are all exactly zero.
+    /// Runs with at least one recorded token category — includes
+    /// `runs_zero`, whose recorded tokens are all exactly zero.
     pub runs_measured: u32,
     pub runs_total: u32,
-    /// Runs with NULL token columns — cost unknown, excluded from
-    /// every sum in this measurement. Never conflated with a
+    /// Runs with no recorded token category — cost unknown, excluded
+    /// from every sum in this measurement. Never conflated with a
     /// recorded-zero run.
     pub runs_unmeasured: u32,
     /// Runs whose tokens were recorded and are all exactly zero (a
