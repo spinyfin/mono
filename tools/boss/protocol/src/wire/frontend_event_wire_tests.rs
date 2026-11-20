@@ -627,6 +627,13 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "project_tasks_reordered",
         },
+        TagCase {
+            label: "ExecutionQueryResult",
+            event: FrontendEvent::ExecutionQueryResult {
+                result: crate::ExecutionQueryResult::default(),
+            },
+            expected_tag: "execution_query_result",
+        },
         // --- Executions & runs ---
         TagCase {
             label: "ExecutionsList",
@@ -2333,6 +2340,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemUpdated { .. }
         | FrontendEvent::ProjectTasksReordered { .. }
         | FrontendEvent::ExecutionsList { .. }
+        | FrontendEvent::ExecutionQueryResult { .. }
         | FrontendEvent::TaskRuntimeResult { .. }
         | FrontendEvent::ExecutionResult { .. }
         | FrontendEvent::ExecutionCreated { .. }

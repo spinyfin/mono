@@ -252,6 +252,20 @@ pub(super) async fn handle_evaluate_dispatch_admission(ctx: Dispatch, req: Front
     }
 }
 
+pub(super) async fn handle_query_executions(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::QueryExecutions { query } = req else {
+        unreachable!()
+    };
+    match ctx.work_db.query_executions(&query) {
+        Ok(result) => send_response(
+            &ctx.sink,
+            &ctx.request_id,
+            FrontendEvent::ExecutionQueryResult { result },
+        ),
+        Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+    }
+}
+
 pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

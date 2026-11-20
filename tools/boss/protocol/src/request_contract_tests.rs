@@ -13,6 +13,25 @@ fn worker_progression(request: &FrontendRequest) -> (WorkerAccess, ProgressionAc
     (contract.worker, contract.progression)
 }
 
+#[test]
+fn cross_item_execution_diagnostics_are_replayable_coordinator_reads() {
+    let request = FrontendRequest::QueryExecutions {
+        query: crate::ExecutionQuery::default(),
+    };
+    assert_eq!(
+        replay_admission(&request),
+        (ReplayContract::Always, AdmissionLane::Bulk)
+    );
+    assert_eq!(
+        worker_progression(&request),
+        (WorkerAccess::Coordinator, ProgressionAccess::Deny)
+    );
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(wire["type"], "query_executions");
+    let restored: FrontendRequest = serde_json::from_value(wire).unwrap();
+    assert!(matches!(restored, FrontendRequest::QueryExecutions { .. }));
+}
+
 fn task(force: bool) -> FrontendRequest {
     FrontendRequest::CreateTask {
         input: CreateTaskInput::builder()

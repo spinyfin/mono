@@ -2026,6 +2026,11 @@ pub enum FrontendRequest {
         probe_id: String,
     },
 
+    /// Read-only cross-item execution filtering and count cross-tabs.
+    QueryExecutions {
+        query: crate::ExecutionQuery,
+    },
+
     /// Boss-only RPC: mark the execution backing `run_id` as the
     /// terminal `orphaned` status and preserve its cube workspace
     /// lease so a fresh execution can resume against the same branch.
