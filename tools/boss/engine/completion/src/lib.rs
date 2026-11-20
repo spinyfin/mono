@@ -74,6 +74,7 @@ use crate::work::{
 };
 use crate::worker_escalation::{WorkerSignal, WorkerSignalKind};
 use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
+use boss_engine_utils::heap_future::on_heap;
 use boss_execution_contracts::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::pr_url::pr_number_from_url;

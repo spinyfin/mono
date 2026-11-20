@@ -392,3 +392,133 @@ async fn codex_applied_no_op_with_changed_description_releases_the_live_slot() {
     };
     assert_eq!(task.status, boss_protocol::TaskStatus::Done);
 }
+
+/// Stack the Stop dispatch path may have in use when it calls out to GitHub:
+/// an eighth of the 2 MiB a test thread or a tokio worker gets by default.
+///
+/// The route below measured 118 KiB deep at that call when this budget was
+/// set, in an unoptimised arm64 build. Before the fan-out and the Stop handler
+/// stopped building their callees' futures in their own stack frames, the same
+/// route used 1.9 MiB of the thread's 2 MiB, and the first test in this file
+/// overflowed its thread on Linux CI.
+const STOP_DISPATCH_STACK_BUDGET: usize = 256 * 1024;
+
+/// Size the dispatch future itself may have. It holds two references and a
+/// pointer to the staged fan-out; any callee awaited in place would add its
+/// whole state machine to this.
+const STOP_DISPATCH_FUTURE_BUDGET: usize = 256;
+
+/// How deep the dispatching thread's stack is each time the dispatch path
+/// asks GitHub about a PR.
+struct StackAtGithubCalls {
+    dispatch_thread: std::thread::ThreadId,
+    deepest: std::sync::atomic::AtomicUsize,
+}
+
+impl StackAtGithubCalls {
+    fn on_this_thread() -> Self {
+        Self {
+            dispatch_thread: std::thread::current().id(),
+            deepest: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    /// Only a call made on the dispatching thread says anything about that
+    /// thread's stack.
+    fn record(&self) {
+        if std::thread::current().id() == self.dispatch_thread {
+            self.deepest.fetch_min(
+                boss_engine_utils::heap_future::stack_position(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Bytes of stack between `start` and the deepest recorded call, or
+    /// `None` when no call was recorded.
+    fn deepest_below(&self, start: usize) -> Option<usize> {
+        let deepest = self.deepest.load(std::sync::atomic::Ordering::Relaxed);
+        (deepest != usize::MAX).then(|| start.saturating_sub(deepest))
+    }
+}
+
+/// Fails every mergeability probe, like [`UnreachableBranchVerifier`], and
+/// records how deep the stack was when asked.
+struct UnreachableMergeProbe(Arc<StackAtGithubCalls>);
+
+#[async_trait]
+impl boss_engine_merge_poller::MergeProbe for UnreachableMergeProbe {
+    async fn probe(&self, _pr_url: &str) -> Result<boss_engine_merge_poller::PrLifecycleProbe> {
+        self.0.record();
+        Err(anyhow::anyhow!("error connecting to api.github.com"))
+    }
+}
+
+/// The guard for the overflow this file's first test hit on Linux CI.
+///
+/// A stack overflow aborts the test process, which takes every other test in
+/// the shard down with it and names none of the code responsible. This test
+/// takes the same route through the real dispatch path and fails with a
+/// number long before that: the declared no-op reaches the mergeability probe
+/// under the fan-out, the Stop handler, the revision no-op check and the
+/// conflict-delivery gate, so a future that goes back to being built in any
+/// of those frames shows up in the depth recorded there.
+#[tokio::test]
+async fn stop_dispatch_reaches_github_within_its_stack_budget() {
+    let github_calls = Arc::new(StackAtGithubCalls::on_this_thread());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Arc::new(RuntimeConfig::from_parts(
+        boss_engine_runtime::config::WorkConfig::builder()
+            .cwd(dir.path().to_path_buf())
+            .db_path(dir.path().join("state.db"))
+            .build(),
+        None,
+    ));
+    let server_state = ServerState::new_arc_with_app_pid_and_merge_probe(
+        cfg,
+        None,
+        None,
+        ServerStateOverrides {
+            cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+            execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+            branch_verifier: Some(Arc::new(UnreachableBranchVerifier)),
+            merge_probe: Some(Arc::new(UnreachableMergeProbe(github_calls.clone()))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let slot_id = 7;
+    let (execution_id, _workspace) =
+        seed_parked_revision(&server_state, "https://github.com/spinyfin/mono/pull/1613", slot_id);
+    super::tmux_stub::install_teardown(&server_state, &execution_id, 4_194_306);
+    declare_no_changes_needed(&server_state.work_db, &execution_id);
+    let stop = stop_hook_through_the_events_socket(&server_state, &execution_id).await;
+
+    let dispatch = dispatch_worker_event_fanout(&server_state, &stop);
+    let dispatch_future_size = std::mem::size_of_val(&dispatch);
+    let start = boss_engine_utils::heap_future::stack_position();
+    dispatch.await;
+
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Failed,
+        "the run must have taken the fail-closed route this guard measures",
+    );
+    let depth = github_calls
+        .deepest_below(start)
+        .expect("the fail-closed route asks GitHub whether the PR is mergeable");
+    assert!(
+        depth <= STOP_DISPATCH_STACK_BUDGET,
+        "the Stop dispatch path was {depth} bytes of stack deep when it probed GitHub; the budget is \
+         {STOP_DISPATCH_STACK_BUDGET}. A function between `dispatch_worker_event_fanout` and the \
+         mergeability probe is building the futures it awaits in its own stack frame again. Await \
+         them through `boss_engine_utils::heap_future::on_heap`; `Box::pin(..).await` does not \
+         keep them out of the frame.",
+    );
+    assert!(
+        dispatch_future_size <= STOP_DISPATCH_FUTURE_BUDGET,
+        "the Stop dispatch future is {dispatch_future_size} bytes; the budget is \
+         {STOP_DISPATCH_FUTURE_BUDGET}. Something it awaits is stored inline in it. Await it through \
+         `boss_engine_utils::heap_future::on_heap`.",
+    );
+}

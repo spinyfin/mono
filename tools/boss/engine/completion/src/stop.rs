@@ -85,13 +85,14 @@ impl WorkerCompletionHandler {
         let lock = self.boundary_lock(execution_id);
         let _boundary = lock.lock().await;
         // Keep the completion decision's large future out of each caller's
-        // state machine, including hook fanout paths with many awaits.
-        let outcome = Box::pin(self.on_stop_inner(execution_id, turn_end, defer_finalization)).await;
+        // state machine and stack frame, including hook fanout paths with
+        // many awaits.
+        let outcome = on_heap(|| self.on_stop_inner(execution_id, turn_end, defer_finalization)).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
             if execution.kind == ExecutionKind::CiRemediation {
-                self.finalize_ci_remediation_attempt(&execution, &outcome).await;
+                on_heap(|| self.finalize_ci_remediation_attempt(&execution, &outcome)).await;
             }
             // Conflict resolution now dispatches through
             // `revision_implementation` (the legacy `conflict_resolution`
@@ -105,7 +106,7 @@ impl WorkerCompletionHandler {
                 execution.kind,
                 ExecutionKind::RevisionImplementation | ExecutionKind::ConflictResolution
             ) {
-                self.finalize_conflict_resolution_attempt(&execution, &outcome).await;
+                on_heap(|| self.finalize_conflict_resolution_attempt(&execution, &outcome)).await;
             }
         }
         outcome
@@ -504,6 +505,15 @@ impl WorkerCompletionHandler {
         }
     }
 
+    /// Decide what one turn boundary means for `execution_id`.
+    ///
+    /// Every future awaited here is built by [`on_heap`]. This function has
+    /// about sixty await points and a call takes one route through them, but
+    /// an unoptimised build reserves stack for all of them at once: each
+    /// future awaited in place gets its own slots in this function's frame.
+    /// That made the frame 1.3 MB on every Stop, most of a 2 MiB thread stack
+    /// before any callee ran. `Box::pin(..).await` only halves it; see
+    /// [`boss_engine_utils::heap_future`]. Await new callees the same way.
     pub(super) async fn on_stop_inner(
         &self,
         execution_id: &str,
@@ -590,7 +600,7 @@ impl WorkerCompletionHandler {
         if execution.kind == ExecutionKind::Progression {
             let driver_error = if turn_end.map(|end| end.reason) == Some(boss_protocol::StopReason::Other) {
                 Some(
-                    self.read_final_triage_message(execution_id)
+                    on_heap(|| self.read_final_triage_message(execution_id))
                         .await
                         .into_message()
                         .unwrap_or_else(|| "the driver reported a fatal error".to_owned()),
@@ -598,7 +608,7 @@ impl WorkerCompletionHandler {
             } else {
                 None
             };
-            return self.finalize_progression(&execution, driver_error.as_deref()).await;
+            return on_heap(|| self.finalize_progression(&execution, driver_error.as_deref())).await;
         }
 
         // Driver-reported fatal error (StopReason::Other): the run's driver
@@ -615,8 +625,7 @@ impl WorkerCompletionHandler {
         // clean turn boundary as a normal idle worker, and nudged (and kept
         // renudging) an already-exited process while its cube lease leaked.
         if turn_end.map(|end| end.reason) == Some(boss_protocol::StopReason::Other) {
-            let detail = self
-                .read_final_triage_message(execution_id)
+            let detail = on_heap(|| self.read_final_triage_message(execution_id))
                 .await
                 .into_message()
                 .unwrap_or_else(|| {
@@ -645,7 +654,7 @@ impl WorkerCompletionHandler {
             {
                 tracing::warn!(execution_id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to record the driver-terminal-error failure");
             }
-            return self.finalize_driver_terminal_error(&execution, &detail).await;
+            return on_heap(|| self.finalize_driver_terminal_error(&execution, &detail)).await;
         }
 
         // No-op submission waits for this boundary so the driver's abandoned
@@ -660,14 +669,12 @@ impl WorkerCompletionHandler {
             && self.feature_flags.is_enabled("run_done_proposals_seam")
             && self.worker_signalled_no_op(execution_id)
         {
-            self.detect_and_file_unobserved_command_signal(&execution).await;
+            on_heap(|| self.detect_and_file_unobserved_command_signal(&execution)).await;
             if self.refuse_no_op_declaration(&execution) {
-                return self.nudge_refused_no_op(&execution).await;
+                return on_heap(|| self.nudge_refused_no_op(&execution)).await;
             }
             let (contribution, attention) = self.declared_run_done_no_op_inputs(&execution);
-            return self
-                .finalize_no_op_completion_retaining(&execution, contribution, attention)
-                .await;
+            return on_heap(|| self.finalize_no_op_completion_retaining(&execution, contribution, attention)).await;
         }
 
         // Maint task 6: an `automation_triage` execution never opens a PR.
@@ -675,7 +682,7 @@ impl WorkerCompletionHandler {
         // (`automation: task <id>` / `automation: skip — …`), not by PR
         // detection or the nudge path below. Branch out before any of that.
         if execution.kind == ExecutionKind::AutomationTriage {
-            return self.finalize_automation_triage(&execution).await;
+            return on_heap(|| self.finalize_automation_triage(&execution)).await;
         }
 
         // P3b: an `answer_agent` execution never opens a PR either. Its
@@ -687,7 +694,7 @@ impl WorkerCompletionHandler {
         // stranded `running` run so the comment doesn't sit in `answering`
         // forever.
         if execution.kind == ExecutionKind::AnswerAgent {
-            return self.finalize_answer_agent(&execution).await;
+            return on_heap(|| self.finalize_answer_agent(&execution)).await;
         }
 
         // A `pr_review_guide` execution never opens a PR either. The
@@ -695,7 +702,7 @@ impl WorkerCompletionHandler {
         // this execution's attempt, or fails the attempt if the run ended
         // without a submission.
         if execution.kind == ExecutionKind::PrReviewGuide {
-            return self.finalize_review_guide(&execution).await;
+            return on_heap(|| self.finalize_review_guide(&execution)).await;
         }
 
         // A `pr_review` reviewer execution never opens a PR. It reads
@@ -704,7 +711,7 @@ impl WorkerCompletionHandler {
         // the reviewer execution (which also parses the ReviewResult and
         // enqueues revisions when warranted).
         if execution.kind == ExecutionKind::PrReview {
-            return self.finalize_pr_review_pass(&execution).await;
+            return on_heap(|| self.finalize_pr_review_pass(&execution)).await;
         }
 
         // Concrete unfinished work must not wait through the generic silence
@@ -714,16 +721,17 @@ impl WorkerCompletionHandler {
             && self.staged_unobserved_commands.has_unobserved_proposal(execution_id)
             && matches!(self.work_db.execution_run_done_outcome(execution_id), Ok(None))
         {
-            self.detect_and_file_unobserved_command_signal(&execution).await;
-            return self
-                .nudge_or_park(
+            on_heap(|| self.detect_and_file_unobserved_command_signal(&execution)).await;
+            return on_heap(|| {
+                self.nudge_or_park(
                     &execution,
                     "Your turn ended with an unobserved boss propose command. Poll its existing session or cell until it exits and inspect the printed result. If it failed or the session is gone, check the proposal status and retry the submission if needed. Do not infer acceptance from your final summary. Run boss propose commands to completion, including pr-created, wait, and done; if your work is finished, submit the appropriate done outcome as your last action.",
                     crate::nudge::PROPOSAL_OBSERVATION_FINGERPRINT,
                     None,
                     StopOutcome::AwaitingInput,
                 )
-                .await;
+            })
+            .await;
         }
 
         // Flaky/infra retrigger park (issue #1205): a `ci_remediation`
@@ -783,9 +791,10 @@ impl WorkerCompletionHandler {
 
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable off-host.
-        let _ = self
-            .collect_remote_structured_output(&execution, crate::structured_output::StructuredOutputKind::PrUrl)
-            .await;
+        let _ = on_heap(|| {
+            self.collect_remote_structured_output(&execution, crate::structured_output::StructuredOutputKind::PrUrl)
+        })
+        .await;
         // Primary channel: the structured-output PR-URL artifact the worker
         // wrote (file contract — no transcript or hook-stream knowledge
         // needed, so every driver can satisfy it). It fills the same staging
@@ -814,9 +823,8 @@ impl WorkerCompletionHandler {
             .get_entry(execution_id)
             .is_none_or(|entry| entry.finalization_armed);
         if staged_armed
-            && let Some(staged_url) = self
-                .verified_staged_pr_url(execution_id, &execution, "stop event")
-                .await
+            && let Some(staged_url) =
+                on_heap(|| self.verified_staged_pr_url(execution_id, &execution, "stop event")).await
         {
             tracing::info!(
                 execution_id,
@@ -837,21 +845,24 @@ impl WorkerCompletionHandler {
             // expires it needs the stamped head to recover promptly rather
             // than finalizing against stale evidence.
             if execution.kind == ExecutionKind::RevisionImplementation {
-                self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &staged_url)
-                    .await;
+                on_heap(|| {
+                    self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &staged_url)
+                })
+                .await;
                 // incident-004 AI-3: staged URL + publish arm is not enough.
                 // If the contribution gate refuses (sha_unchanged, no
                 // metadata, no explicit no-op), fall through to the SHA-delta
                 // / no-op / nudge path rather than returning a quiet
                 // AwaitingInput that strands the worker without a probe.
-                let staged_outcome = self
-                    .finalize_pr_transition(
+                let staged_outcome = on_heap(|| {
+                    self.finalize_pr_transition(
                         execution_id,
                         staged_url.clone(),
                         WorkerPrCompletionTarget::InReview,
                         "stop_staged",
                     )
-                    .await;
+                })
+                .await;
                 if !matches!(staged_outcome, StopOutcome::AwaitingInput) {
                     return staged_outcome;
                 }
@@ -875,16 +886,17 @@ impl WorkerCompletionHandler {
                          declaration yet; declaration remains required — deferring staged \
                          finalization",
                     );
-                    return self.await_run_done_declaration(&execution, &staged_url).await;
+                    return on_heap(|| self.await_run_done_declaration(&execution, &staged_url)).await;
                 }
-                return self
-                    .finalize_pr_transition(
+                return on_heap(|| {
+                    self.finalize_pr_transition(
                         execution_id,
                         staged_url,
                         WorkerPrCompletionTarget::InReview,
                         "stop_staged",
                     )
-                    .await;
+                })
+                .await;
             }
         }
 
@@ -910,7 +922,7 @@ impl WorkerCompletionHandler {
         // isn't silently missed. Marker detection itself never touches
         // PR state, so running it ahead of the gate carries none of the
         // race the gate below guards against.
-        self.detect_and_file_worker_signals(&execution).await;
+        on_heap(|| self.detect_and_file_worker_signals(&execution)).await;
 
         // Deferred-scope detection: a worker that deliberately narrowed
         // its task's scope and declared it via a `[deferred-scope]`
@@ -930,7 +942,7 @@ impl WorkerCompletionHandler {
         // lifetime of a `pr_review` reviewer pane) is still captured
         // instead of being silently dropped — and unlike `[blocked]`,
         // a deferred-scope marker is never re-emitted on a later Stop.
-        self.detect_and_record_deferred_scope(&execution).await;
+        on_heap(|| self.detect_and_record_deferred_scope(&execution)).await;
 
         // proposal_channel_error: a `boss propose` submission failed during
         // this execution's Stop-boundary window. File an attention and
@@ -941,14 +953,14 @@ impl WorkerCompletionHandler {
         // passes above for the same reason: read-only against staged
         // in-memory state, never touches PR state, so it is safe ahead of
         // the running-status gate below.
-        self.detect_and_file_proposal_channel_error(&execution).await;
+        on_heap(|| self.detect_and_file_proposal_channel_error(&execution)).await;
 
         // Codex unobserved-command detection: a `command_execution` that
         // started with no observed completion before this turn boundary
         // (probe 6, exit-code investigation). Read-only against staged
         // in-memory state, never touches PR state, so — like the three
         // passes above — it is safe ahead of the running-status gate below.
-        self.detect_and_file_unobserved_command_signal(&execution).await;
+        on_heap(|| self.detect_and_file_unobserved_command_signal(&execution)).await;
 
         // A probe minted on an earlier Stop can still be sitting undelivered in
         // the run's pending-probe queue (e.g. a `PROBE_NO_PR` nudge whose
@@ -1010,24 +1022,24 @@ impl WorkerCompletionHandler {
         // ahead of the cold-path `detect_pr` reconstruction (jj revset + a
         // GitHub API walk) because it is strictly cheaper and reads evidence
         // the worker itself produced.
-        if self.stage_pr_url_from_driver_prose(&execution).await
-            && let Some(recovered_url) = self
-                .verified_staged_pr_url(execution_id, &execution, "stop event (driver fallback)")
-                .await
+        if on_heap(|| self.stage_pr_url_from_driver_prose(&execution)).await
+            && let Some(recovered_url) =
+                on_heap(|| self.verified_staged_pr_url(execution_id, &execution, "stop event (driver fallback)")).await
         {
             tracing::info!(
                 execution_id,
                 pr_url = %recovered_url,
                 "stop event: using PR URL recovered by the driver's final-message producer; skipping detector",
             );
-            return self
-                .finalize_pr_transition(
+            return on_heap(|| {
+                self.finalize_pr_transition(
                     execution_id,
                     recovered_url,
                     WorkerPrCompletionTarget::InReview,
                     "stop_driver_fallback",
                 )
-                .await;
+            })
+            .await;
         }
 
         // Resume-bounce SHA-delta gate: when the chore already has a
@@ -1042,7 +1054,7 @@ impl WorkerCompletionHandler {
         // is attributed to the concurrently-active parent worker and we
         // absorb the new baseline without finalizing so the revision can
         // push on its next turn.
-        match self.evaluate_sha_delta_gate(execution_id, &execution).await {
+        match on_heap(|| self.evaluate_sha_delta_gate(execution_id, &execution)).await {
             ShaDeltaGateOutcome::Contributed { pr_url, head_now } => {
                 if execution.kind == ExecutionKind::RevisionImplementation {
                     let push_staged = self.staged_revision_pushes.take(execution_id);
@@ -1064,14 +1076,15 @@ impl WorkerCompletionHandler {
                                  recheck_for_pr transient-failure recovery may not fire",
                             );
                         }
-                        return self
-                            .finalize_pr_transition(
+                        return on_heap(|| {
+                            self.finalize_pr_transition(
                                 execution_id,
                                 pr_url,
                                 WorkerPrCompletionTarget::InReview,
                                 "stop_sha_delta",
                             )
-                            .await;
+                        })
+                        .await;
                     }
                     // already_stop_seen=true with no push evidence: parent pushed.
                     // Absorb the head into the baseline and fall through to the
@@ -1112,33 +1125,46 @@ impl WorkerCompletionHandler {
                     let _pr_url_for_nudge = pr_url;
                     // Restructure: fall through by using a shared helper.
                     // Inline the NoContribution nudge path here.
-                    let conflict_prefetch = match self
-                        .try_retire_cleared_blocking_signal(execution_id, &execution, &_pr_url_for_nudge)
-                        .await
+                    let conflict_prefetch = match on_heap(|| {
+                        self.try_retire_cleared_blocking_signal(execution_id, &execution, &_pr_url_for_nudge)
+                    })
+                    .await
                     {
                         BlockingSignalOutcome::Retired(outcome) => return outcome,
                         BlockingSignalOutcome::NotRetired(prefetch) => prefetch,
                     };
-                    if let Some(outcome) = self
-                        .try_finalize_metadata_only_fix_on_stop(execution_id, &execution, &_pr_url_for_nudge)
-                        .await
+                    if let Some(outcome) = on_heap(|| {
+                        self.try_finalize_metadata_only_fix_on_stop(execution_id, &execution, &_pr_url_for_nudge)
+                    })
+                    .await
                     {
                         return outcome;
                     }
                     // The parent's push is not this revision's conflict
                     // resolution — verify against GitHub before the generic
                     // nudge invites a "nothing left to do" reply.
-                    let (probe_text, fingerprint) = match self
-                        .conflict_revision_stop_refusal(execution_id, &execution, &_pr_url_for_nudge, conflict_prefetch)
-                        .await
+                    let (probe_text, fingerprint) = match on_heap(|| {
+                        self.conflict_revision_stop_refusal(
+                            execution_id,
+                            &execution,
+                            &_pr_url_for_nudge,
+                            conflict_prefetch,
+                        )
+                    })
+                    .await
                     {
                         Some(refusal) => refusal,
                         None => {
                             // An absorbed parent head cannot prove this
                             // revision made no contribution.
-                            if let Some(outcome) = self
-                                .try_revision_no_op(&execution, &_pr_url_for_nudge, ContributionEvidence::Indeterminate)
-                                .await
+                            if let Some(outcome) = on_heap(|| {
+                                self.try_revision_no_op(
+                                    &execution,
+                                    &_pr_url_for_nudge,
+                                    ContributionEvidence::Indeterminate,
+                                )
+                            })
+                            .await
                             {
                                 return outcome;
                             }
@@ -1153,33 +1179,36 @@ impl WorkerCompletionHandler {
                         bound_pr_url = %_pr_url_for_nudge,
                         "stop event: revision absorbed parent push — nudging to push to the existing PR",
                     );
-                    return self
-                        .nudge_or_park(
+                    return on_heap(|| {
+                        self.nudge_or_park(
                             &execution,
                             &probe_text,
                             &fingerprint,
                             Some(&_pr_url_for_nudge),
                             StopOutcome::AwaitingInput,
                         )
-                        .await;
+                    })
+                    .await;
                 }
-                return self
-                    .finalize_pr_transition(
+                return on_heap(|| {
+                    self.finalize_pr_transition(
                         execution_id,
                         pr_url,
                         WorkerPrCompletionTarget::InReview,
                         "stop_sha_delta",
                     )
-                    .await;
+                })
+                .await;
             }
             ShaDeltaGateOutcome::NoContribution { pr_url, head_now: _ } => {
                 // Before nudging, check whether the blocking signal (conflict /
                 // CI) is already cleared — e.g. a sibling resolver fixed the
                 // conflict before this run started. If so, retire the attempt
                 // and finalise the execution without nudging.
-                let conflict_prefetch = match self
-                    .try_retire_cleared_blocking_signal(execution_id, &execution, &pr_url)
-                    .await
+                let conflict_prefetch = match on_heap(|| {
+                    self.try_retire_cleared_blocking_signal(execution_id, &execution, &pr_url)
+                })
+                .await
                 {
                     BlockingSignalOutcome::Retired(outcome) => return outcome,
                     BlockingSignalOutcome::NotRetired(prefetch) => prefetch,
@@ -1196,9 +1225,8 @@ impl WorkerCompletionHandler {
                 // it once CI goes green — see `recheck_for_pr`). Without a
                 // delta we fall through to the normal nudge: head unchanged
                 // AND body unchanged means the worker contributed nothing.
-                if let Some(outcome) = self
-                    .try_finalize_metadata_only_fix_on_stop(execution_id, &execution, &pr_url)
-                    .await
+                if let Some(outcome) =
+                    on_heap(|| self.try_finalize_metadata_only_fix_on_stop(execution_id, &execution, &pr_url)).await
                 {
                     return outcome;
                 }
@@ -1211,19 +1239,21 @@ impl WorkerCompletionHandler {
                 // when GitHub still reports the PR conflicting (or has not
                 // finished deciding). Placed ahead of the satisfied gate so
                 // a refusal costs one probe round rather than two.
-                let conflict_refusal = self
-                    .conflict_revision_stop_refusal(execution_id, &execution, &pr_url, conflict_prefetch)
-                    .await;
+                let conflict_refusal = on_heap(|| {
+                    self.conflict_revision_stop_refusal(execution_id, &execution, &pr_url, conflict_prefetch)
+                })
+                .await;
                 if let Some((probe_text, fingerprint)) = conflict_refusal {
-                    return self
-                        .nudge_or_park(
+                    return on_heap(|| {
+                        self.nudge_or_park(
                             &execution,
                             &probe_text,
                             &fingerprint,
                             Some(&pr_url),
                             StopOutcome::AwaitingInput,
                         )
-                        .await;
+                    })
+                    .await;
                 }
                 // Deliverable-satisfied gate (zombie-worker fix): if the
                 // bound PR is already in a satisfactory state at this Stop
@@ -1282,9 +1312,15 @@ impl WorkerCompletionHandler {
                 // race rolled back in #1262. The on_stop path is safe
                 // because the Stop hook fires only when the worker
                 // completed a turn (real activity boundary, not a crash).
-                let awaiting_declaration = match self
-                    .evaluate_satisfied_deliverable_on_stop(execution_id, &execution, &pr_url, contribution_evidence)
-                    .await
+                let awaiting_declaration = match on_heap(|| {
+                    self.evaluate_satisfied_deliverable_on_stop(
+                        execution_id,
+                        &execution,
+                        &pr_url,
+                        contribution_evidence,
+                    )
+                })
+                .await
                 {
                     SatisfiedDeliverableOutcome::Finalized(outcome) => return outcome,
                     // The PR is healthy and nothing contradicts delivery,
@@ -1308,14 +1344,13 @@ impl WorkerCompletionHandler {
                 // stronger evidence (merged / queued / conflict cleared)
                 // wins where it applies.
                 if execution.kind == ExecutionKind::RevisionImplementation
-                    && let Some(outcome) = self
-                        .try_revision_no_op(&execution, &pr_url, contribution_evidence)
-                        .await
+                    && let Some(outcome) =
+                        on_heap(|| self.try_revision_no_op(&execution, &pr_url, contribution_evidence)).await
                 {
                     return outcome;
                 }
                 if awaiting_declaration {
-                    return self.await_run_done_declaration(&execution, &pr_url).await;
+                    return on_heap(|| self.await_run_done_declaration(&execution, &pr_url)).await;
                 }
                 tracing::info!(
                     execution_id,
@@ -1325,15 +1360,18 @@ impl WorkerCompletionHandler {
                 // A PR is already bound: never tell the worker to create
                 // one. Nudge it to push to the existing branch, bounded
                 // by the circuit breaker.
-                return self
-                    .nudge_or_park(
+                let probe_text = probe_push_to_existing_pr(&pr_url);
+                let fingerprint = format!("nocontribution:{pr_url}");
+                return on_heap(|| {
+                    self.nudge_or_park(
                         &execution,
-                        &probe_push_to_existing_pr(&pr_url),
-                        &format!("nocontribution:{pr_url}"),
+                        &probe_text,
+                        &fingerprint,
                         Some(&pr_url),
                         StopOutcome::AwaitingInput,
                     )
-                    .await;
+                })
+                .await;
             }
             ShaDeltaGateOutcome::Inapplicable => {
                 // A `revision_implementation` execution with a resolvable
@@ -1390,19 +1428,20 @@ impl WorkerCompletionHandler {
                     // through to the satisfied-deliverable check, so a
                     // pushed resolution does not strand in `AwaitingInput`
                     // with no nudge.
-                    let conflict_refusal = self
-                        .conflict_revision_stop_refusal(execution_id, &execution, &bound_pr_url, None)
-                        .await;
+                    let conflict_refusal =
+                        on_heap(|| self.conflict_revision_stop_refusal(execution_id, &execution, &bound_pr_url, None))
+                            .await;
                     if let Some((probe_text, fingerprint)) = conflict_refusal {
-                        return self
-                            .nudge_or_park(
+                        return on_heap(|| {
+                            self.nudge_or_park(
                                 &execution,
                                 &probe_text,
                                 &fingerprint,
                                 Some(&bound_pr_url),
                                 StopOutcome::AwaitingInput,
                             )
-                            .await;
+                        })
+                        .await;
                     }
                     // `Indeterminate`, not `ProvenAbsent`: this arm is
                     // reached precisely because the SHA comparison could
@@ -1413,14 +1452,15 @@ impl WorkerCompletionHandler {
                     // because refusing would strand any revision whose
                     // dispatch-time snapshot failed in a state no Stop can
                     // ever finalize (the stuck-revision dead end).
-                    let awaiting_declaration = match self
-                        .evaluate_satisfied_deliverable_on_stop(
+                    let awaiting_declaration = match on_heap(|| {
+                        self.evaluate_satisfied_deliverable_on_stop(
                             execution_id,
                             &execution,
                             &bound_pr_url,
                             ContributionEvidence::Indeterminate,
                         )
-                        .await
+                    })
+                    .await
                     {
                         SatisfiedDeliverableOutcome::Finalized(outcome) => return outcome,
                         SatisfiedDeliverableOutcome::AwaitingDeclaration => true,
@@ -1433,27 +1473,35 @@ impl WorkerCompletionHandler {
                         awaiting_declaration,
                         "stop event: SHA delta inconclusive; checking revision no-op after PR-health gate and before waiting"
                     );
-                    if let Some(outcome) = self
-                        .try_revision_no_op(&execution, &bound_pr_url, ContributionEvidence::Indeterminate)
-                        .await
+                    if let Some(outcome) = on_heap(|| {
+                        self.try_revision_no_op(&execution, &bound_pr_url, ContributionEvidence::Indeterminate)
+                    })
+                    .await
                     {
                         return outcome;
                     }
                     if awaiting_declaration {
-                        return self.await_run_done_declaration(&execution, &bound_pr_url).await;
+                        return on_heap(|| self.await_run_done_declaration(&execution, &bound_pr_url)).await;
                     }
                     tracing::warn!(
                         execution_id, %bound_pr_url,
                         pr_head_before_captured = execution.pr_head_before.is_some(),
                         "stop event: completion evidence inconclusive after no-op check; scheduling bounded recheck probe"
                     );
-                    return self.nudge_or_park(
-                        &execution,
-                        &format!("The engine could not confirm completion for {bound_pr_url}: its head check was inconclusive and its deliverable check was not satisfied. Recheck the existing PR and report your current outcome. Do not create an empty commit or push unchanged code to satisfy this probe."),
-                        &format!("completion-inconclusive:{bound_pr_url}"),
-                        Some(&bound_pr_url),
-                        StopOutcome::AwaitingInput,
-                    ).await;
+                    let probe_text = format!(
+                        "The engine could not confirm completion for {bound_pr_url}: its head check was inconclusive and its deliverable check was not satisfied. Recheck the existing PR and report your current outcome. Do not create an empty commit or push unchanged code to satisfy this probe."
+                    );
+                    let fingerprint = format!("completion-inconclusive:{bound_pr_url}");
+                    return on_heap(|| {
+                        self.nudge_or_park(
+                            &execution,
+                            &probe_text,
+                            &fingerprint,
+                            Some(&bound_pr_url),
+                            StopOutcome::AwaitingInput,
+                        )
+                    })
+                    .await;
                 }
                 // No bound `chore.pr_url` resolvable. Fall through to the
                 // existing branch-keyed cold-path detector (new-PR flow).
@@ -1522,15 +1570,18 @@ impl WorkerCompletionHandler {
                         kind = %execution.kind,
                         "stop event: chore already has a bound PR the branch search missed — nudging to push to it, not create"
                     );
-                    return self
-                        .nudge_or_park(
+                    let probe_text = probe_push_to_existing_pr(&bound_pr_url);
+                    let fingerprint = format!("push_existing:{bound_pr_url}");
+                    return on_heap(|| {
+                        self.nudge_or_park(
                             &execution,
-                            &probe_push_to_existing_pr(&bound_pr_url),
-                            &format!("push_existing:{bound_pr_url}"),
+                            &probe_text,
+                            &fingerprint,
                             Some(&bound_pr_url),
                             StopOutcome::AwaitingInput,
                         )
-                        .await;
+                    })
+                    .await;
                 }
                 // No bound PR resolvable. A `ci_remediation` worker must
                 // NEVER be told to create a PR — if it somehow has no
@@ -1545,15 +1596,16 @@ impl WorkerCompletionHandler {
                         kind = %execution.kind,
                         "stop event: ci_remediation execution has no resolvable bound PR — failing the execution instead of nudging it to create one"
                     );
-                    return self
-                        .fail_for_unproductive_nudges(
+                    return on_heap(|| {
+                        self.fail_for_unproductive_nudges(
                             &execution,
                             0,
                             None,
                             "ci_remediation execution has no bound PR to push to; it must not be \
 asked to open one",
                         )
-                        .await;
+                    })
+                    .await;
                 }
                 // `revision_implementation` workers must NEVER be told to
                 // create a PR — their deliverable is a commit on the parent
@@ -1570,15 +1622,16 @@ asked to open one",
                         kind = %execution.kind,
                         "stop event: revision_implementation execution has no resolvable bound PR — failing the execution instead of nudging it to create one"
                     );
-                    return self
-                        .fail_for_unproductive_nudges(
+                    return on_heap(|| {
+                        self.fail_for_unproductive_nudges(
                             &execution,
                             0,
                             None,
                             "revision_implementation execution has no bound PR to push to; it \
 must not be asked to open one",
                         )
-                        .await;
+                    })
+                    .await;
                 }
                 // Sanctioned no-op terminal: a primary-implementation
                 // worker (chore / task) that investigated and found the work
@@ -1615,18 +1668,19 @@ must not be asked to open one",
                     // Antigravity refused tools use the same read-and-clear
                     // policy; its permanent audit trail stays visible.
                     if self.refuse_no_op_declaration(&execution) {
-                        return self.nudge_refused_no_op(&execution).await;
+                        return on_heap(|| self.nudge_refused_no_op(&execution)).await;
                     }
-                    return self.finalize_no_op_completion(&execution, None, None).await;
+                    return on_heap(|| self.finalize_no_op_completion(&execution, None, None)).await;
                 }
                 tracing::info!(
                     execution_id,
                     expected_branch = %expected_branch,
                     "stop event: worker idle without an active PR — probing to push and open one"
                 );
-                return self
-                    .nudge_or_park(&execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
-                    .await;
+                return on_heap(|| {
+                    self.nudge_or_park(&execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
+                })
+                .await;
             }
             PrStatus::Stale { url, reason } => {
                 tracing::info!(
@@ -1636,18 +1690,20 @@ must not be asked to open one",
                     %reason,
                     "stop event: PR exists but local commits are unpushed — probing to push"
                 );
-                return self
-                    .nudge_or_park(
+                let fingerprint = format!("stale:{url}");
+                return on_heap(|| {
+                    self.nudge_or_park(
                         &execution,
                         PROBE_STALE_PR,
-                        &format!("stale:{url}"),
+                        &fingerprint,
                         Some(&url),
                         StopOutcome::StalePr {
                             pr_url: url.clone(),
                             reason,
                         },
                     )
-                    .await;
+                })
+                .await;
             }
             PrStatus::EmptyDiff { url } => {
                 tracing::warn!(
@@ -1656,19 +1712,21 @@ must not be asked to open one",
                     pr_url = %url,
                     "stop event: PR has an empty diff — worker pushed a no-op change; probing to fix or close"
                 );
-                return self
-                    .nudge_or_park(
+                let fingerprint = format!("empty:{url}");
+                return on_heap(|| {
+                    self.nudge_or_park(
                         &execution,
                         PROBE_EMPTY_PR,
-                        &format!("empty:{url}"),
+                        &fingerprint,
                         Some(&url),
                         StopOutcome::EmptyDiffPr { pr_url: url.clone() },
                     )
-                    .await;
+                })
+                .await;
             }
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
-        self.finalize_pr_transition(execution_id, pr_url, target, "stop").await
+        on_heap(|| self.finalize_pr_transition(execution_id, pr_url, target, "stop")).await
     }
 }

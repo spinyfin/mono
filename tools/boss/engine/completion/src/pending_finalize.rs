@@ -205,8 +205,10 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
-        self.finalize_no_op_completion_retaining_declaration(execution, &declaration_id, contribution, attention)
-            .await
+        on_heap(|| {
+            self.finalize_no_op_completion_retaining_declaration(execution, &declaration_id, contribution, attention)
+        })
+        .await
     }
 
     pub(super) async fn finalize_no_op_completion_retaining_declaration(
@@ -216,9 +218,10 @@ impl WorkerCompletionHandler {
         contribution: Option<ContributionEvidence>,
         attention: Option<CreateAttentionItemInput>,
     ) -> StopOutcome {
-        let outcome = self
-            .finalize_no_op_completion_for_declaration(execution, declaration_id, contribution, attention.clone())
-            .await;
+        let outcome = on_heap(|| {
+            self.finalize_no_op_completion_for_declaration(execution, declaration_id, contribution, attention.clone())
+        })
+        .await;
         let mut pending = self.pending_no_op_completions.lock().expect("pending no-op poisoned");
         if outcome == StopOutcome::DbError {
             RUN_DONE_FINALIZE_RETRY.inc(&self.metrics);
