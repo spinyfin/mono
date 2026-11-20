@@ -21,8 +21,9 @@
 //!   product/project existence checks, ordinal allocation, and short-id
 //!   allocation.
 //! - [`add_dependency_edge_in_tx`] — the body of `add_dependency`, so wired
-//!   edges inherit the same-product check, `would_create_cycle` gate, the
-//!   engine auto-block, and `INSERT OR IGNORE` duplicate-edge dedup.
+//!   edges inherit the same-product check, engine auto-block, and
+//!   `INSERT OR IGNORE` duplicate-edge dedup. Its shared `insert_edge` call
+//!   refuses self-edges and blocks cycles with a typed `DependencyCycleError`.
 //!
 //! Because all of that runs inside one transaction the Materializer opens and
 //! commits itself, **any error rolls the whole thing back — no partial graph
@@ -133,8 +134,9 @@ impl Materializer {
             created.push(new_id);
         }
 
-        // Wire edges through the shared write path: same-product check +
-        // `would_create_cycle` gate + `INSERT OR IGNORE` dedup.
+        // Wire edges through `add_dependency_edge_in_tx`: same-product check
+        // and `INSERT OR IGNORE` dedup. Its `insert_edge` call refuses
+        // self-edges and blocks cycles with a typed `DependencyCycleError`.
         //
         // A dependent handle can resolve to a pre-existing task (the dedup
         // above), so — unlike the freshly-created-row paths elsewhere in this
@@ -199,10 +201,10 @@ impl Materializer {
             if already {
                 continue;
             }
-            // Non-blocking insert: bypass `add_dependency_edge_in_tx`, whose
-            // auto-block and `would_create_cycle` gate are `blocks`-specific. A
-            // merge_order edge must never block a dependent or be rejected by
-            // the blocks-graph cycle check.
+            // Insert soft hints directly to avoid the auto-block behavior in
+            // `add_dependency_edge_in_tx`. For `merge_order`, `insert_edge`
+            // refuses only self-edges, already skipped above. Cycle detection
+            // never traverses `merge_order` edges.
             insert_edge(&tx, b_id, a_id, RELATION_MERGE_ORDER, &now).with_context(|| {
                 format!(
                     "materializer: wiring merge_order edge {} <-> {}",
