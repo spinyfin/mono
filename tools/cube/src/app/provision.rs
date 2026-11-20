@@ -6,6 +6,8 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+use workspace_procs::WorkspaceProcessTable;
+
 use crate::command_runner::{CommandInvocation, CommandRunner};
 use crate::metadata::{RepoRecord, WorkspaceRecord};
 use crate::setup::{SetupReport, run_setup_engine};
@@ -15,6 +17,7 @@ use crate::{audit, setup};
 use crate::app::disk::DiskSpace;
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::{is_retryable_backend_lock_error, network_cmd_timeout, workspace_path_exists};
+use crate::app::process_guard::{SweepPhase, ensure_no_live_processes, sweep_is_noteworthy, sweep_json};
 use crate::app::reclaim::assert_mint_headroom;
 use crate::app::util::current_epoch_s;
 
@@ -232,14 +235,45 @@ pub(super) fn auto_create_workspace(
 /// registry row, freeing the slot for a fresh clone. Called from the lease
 /// path so a degraded pool self-repairs instead of blocking a lease
 /// (issue #845 part 2b).
+///
+/// Returns true only when the directory and row were removed.
+///
+/// Anything still running inside the husk is reaped first; when that cannot be verified
+/// the directory is kept (a husk is never worth killing the wrong process or
+/// deleting a tree something still uses) and the lease provisions a fresh
+/// workspace instead of failing.
 pub(super) fn gc_broken_empty_workspace(
+    table: &dyn WorkspaceProcessTable,
     store: &mut Store,
     database_path: Option<&Path>,
     repo: &str,
     workspace_id: &str,
     workspace_path: &Path,
-) -> Result<()> {
+) -> Result<bool> {
     if workspace_path.exists() {
+        let verification = ensure_no_live_processes(table, workspace_id, workspace_path);
+        let removal_allowed = verification.is_ok();
+        let sweep = verification.unwrap_or_else(|refusal| refusal.report);
+        if sweep_is_noteworthy(&sweep, SweepPhase::Remove) {
+            audit!(
+                database_path,
+                "workspace.processes_reaped",
+                repo = repo,
+                workspace_id = workspace_id,
+                phase = "remove",
+                processes = sweep_json(&sweep),
+            );
+        }
+        if !removal_allowed {
+            let detail = sweep.error.clone().unwrap_or_else(|| sweep.survivor_summary());
+            eprintln!(
+                "warning: cube workspace `{repo}/{workspace_id}` is broken-empty at {} but could not be \
+                 verified free of running processes ({detail}); keeping the directory and provisioning a \
+                 fresh workspace",
+                workspace_path.display(),
+            );
+            return Ok(false);
+        }
         fs::remove_dir_all(workspace_path).map_err(|source| CubeError::WorkspaceDirRemove {
             path: workspace_path.to_path_buf(),
             source,
@@ -258,7 +292,7 @@ pub(super) fn gc_broken_empty_workspace(
         workspace_id = workspace_id,
         workspace_path = workspace_path.display().to_string(),
     );
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn run_setup_for_workspace(
@@ -474,5 +508,93 @@ mod tests {
             format_setup_message("mono-agent-001", &report),
             "Setup complete for mono-agent-001: 1 ran, 0 skipped."
         );
+    }
+}
+
+#[cfg(test)]
+mod broken_empty_removal_tests {
+    use std::io;
+
+    use workspace_procs::{LiveProcess, Signal};
+    use workspace_procs_testing::{StaticProcessTable, fake_process};
+
+    use super::*;
+    use crate::metadata::WorkspaceCandidate;
+
+    /// A process table whose listing always fails.
+    struct UnreadableTable;
+    impl WorkspaceProcessTable for UnreadableTable {
+        fn list(&self) -> io::Result<Vec<LiveProcess>> {
+            Err(io::Error::other("process list unavailable"))
+        }
+        fn snapshot(&self, _pid: i32) -> io::Result<LiveProcess> {
+            Err(io::Error::other("process list unavailable"))
+        }
+        fn signal(&self, _pid: i32, _signal: Signal) -> io::Result<()> {
+            Ok(())
+        }
+        fn own_pid(&self) -> i32 {
+            900
+        }
+    }
+
+    fn seeded(tempdir: &tempfile::TempDir) -> (Store, std::path::PathBuf) {
+        let mut store = Store::open_at(tempdir.path().join("cube.db")).unwrap();
+        let path = fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
+        fs::create_dir_all(path.join("leftover")).unwrap();
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@example.com:org/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: tempdir.path().to_path_buf(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .unwrap();
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: path.clone(),
+                }],
+            )
+            .unwrap();
+        (store, path)
+    }
+
+    #[test]
+    fn husk_with_a_killable_occupant_is_reaped_then_removed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut store, path) = seeded(&tempdir);
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(path.to_str().unwrap()))], 900);
+        gc_broken_empty_workspace(&table, &mut store, None, "mono", "mono-agent-001", &path).unwrap();
+        assert!(!path.exists());
+        assert!(!table.is_alive(40));
+        assert!(store.list_workspaces("mono").unwrap().is_empty());
+    }
+
+    #[test]
+    fn husk_with_an_immortal_occupant_is_retained_and_the_lease_continues() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut store, path) = seeded(&tempdir);
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(path.to_str().unwrap()))], 900);
+        table.immortal(40);
+        gc_broken_empty_workspace(&table, &mut store, None, "mono", "mono-agent-001", &path)
+            .expect("verification failure must not fail provisioning");
+        assert!(path.join("leftover").exists(), "directory is retained");
+        assert!(table.is_alive(40));
+        assert_eq!(store.list_workspaces("mono").unwrap().len(), 1, "row is not forgotten");
+    }
+
+    #[test]
+    fn husk_is_retained_when_the_process_table_cannot_be_read() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut store, path) = seeded(&tempdir);
+        gc_broken_empty_workspace(&UnreadableTable, &mut store, None, "mono", "mono-agent-001", &path).unwrap();
+        assert!(path.join("leftover").exists());
+        assert_eq!(store.list_workspaces("mono").unwrap().len(), 1);
     }
 }

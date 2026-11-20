@@ -18,6 +18,7 @@ rust_library(
         "//lib/rust/bazel_support",
         "//lib/rust/git_utils",
         "//lib/rust/process_runner",
+        "//lib/rust/workspace_procs",
     ] + all_crate_deps(normal = True),
 )
 
@@ -103,6 +104,8 @@ sh_test(
             proc_macro_dev = True,
         ),
         deps = [
+            "//lib/rust/workspace_procs",
+            "//lib/rust/workspace_procs:workspace_procs_testing",
             "//tools/boss/engine/test-git",
         ] + all_crate_deps(
             normal = True,

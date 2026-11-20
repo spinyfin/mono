@@ -122,6 +122,7 @@ pub mod remote_host;
 pub mod review_admission;
 pub mod review_guide_capture;
 pub mod run_done_backstop;
+pub mod run_process_reap;
 pub mod teardown_registry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
