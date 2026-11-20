@@ -13,13 +13,25 @@ fn exec(status: ExecutionStatus) -> WorkExecution {
 }
 
 fn default_until() -> Vec<ExecutionStatus> {
-    parse_until_not(&DEFAULT_UNTIL_NOT.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    parse_until_not(&[]).unwrap()
+}
+
+#[test]
+fn default_until_matches_pre_run_and_not_started_verdict() {
+    let default = default_until();
+    for status in ExecutionStatus::ALL {
+        assert_eq!(default.contains(status), status.is_pre_run(), "{status}");
+        assert_eq!(
+            verdict_for_exit(status) == WaitVerdict::NotStarted,
+            status.is_pre_run(),
+            "{status}"
+        );
+    }
 }
 
 #[test]
 fn parse_until_not_rejects_unknown_and_empty() {
     assert!(parse_until_not(&["bogus".into()]).is_err());
-    assert!(parse_until_not(&[]).is_err());
     assert_eq!(
         parse_until_not(&["ready".into(), "claimed".into(), "ready".into()]).unwrap(),
         vec![ExecutionStatus::Ready, ExecutionStatus::Claimed]
@@ -94,14 +106,6 @@ async fn times_out_and_reports_wait_reason() {
 }
 
 #[test]
-fn hard_cap_refusal_is_recognised() {
-    assert!(is_hard_cap_refusal(
-        "main pool already at hard cap (16); cannot force-dispatch x"
-    ));
-    assert!(!is_hard_cap_refusal("unmet dependency"));
-}
-
-#[test]
 fn latest_execution_picks_newest() {
     let mut older = exec(ExecutionStatus::Completed);
     older.id = "exec_old".into();
@@ -109,7 +113,21 @@ fn latest_execution_picks_newest() {
     let mut newer = exec(ExecutionStatus::Ready);
     newer.id = "exec_new".into();
     newer.created_at = "200".into();
-    assert_eq!(latest_execution(vec![newer, older]).unwrap().id, "exec_new");
+    assert_eq!(latest_execution(vec![newer, older], "task_1").unwrap().id, "exec_new");
+}
+
+#[test]
+fn latest_execution_ignores_other_work_items_review_guide_runs() {
+    let mut own = exec(ExecutionStatus::Completed);
+    own.id = "exec_own".into();
+    own.created_at = "100".into();
+    let mut guide = exec(ExecutionStatus::Running);
+    guide.id = "exec_guide".into();
+    guide.work_item_id = "comparison_1".into();
+    guide.kind = boss_protocol::ExecutionKind::PrReviewGuide;
+    guide.owning_task_id = Some("task_1".into());
+    guide.created_at = "200".into();
+    assert_eq!(latest_execution(vec![guide, own], "task_1").unwrap().id, "exec_own");
 }
 
 #[tokio::test]

@@ -1054,8 +1054,8 @@ async fn launch_retries_only_cap_refusals() {
     use std::cell::Cell;
     use std::time::Duration;
     for (wait, message, expected) in [
-        (true, "main pool at hard cap", 2),
-        (false, "main pool at hard cap", 1),
+        (true, "main pool already at hard cap (16); cannot force-dispatch x", 2),
+        (false, "main pool already at hard cap (16); cannot force-dispatch x", 1),
         (true, "unmet dependency", 1),
     ] {
         let calls = Cell::new(0);
@@ -1071,6 +1071,7 @@ async fn launch_retries_only_cap_refusals() {
             },
             wait,
             None,
+            Duration::ZERO,
             Duration::ZERO,
         )
         .await
@@ -1093,6 +1094,7 @@ async fn launch_does_not_retry_transport_errors() {
         true,
         None,
         std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .unwrap_err();
@@ -1111,20 +1113,23 @@ async fn launch_short_deadline_returns_cap_refusal_without_another_request() {
                 calls.set(calls.get() + 1);
                 async {
                     Ok(FrontendEvent::WorkError {
-                        message: "pool at hard cap".into(),
+                        message: "pool already at hard cap (16)".into(),
                     })
                 }
             },
             true,
             Some(tokio::time::Instant::now() + Duration::from_millis(10)),
             Duration::from_secs(5),
+            Duration::from_secs(5),
         ),
     )
     .await
     .unwrap()
-    .unwrap();
+    .unwrap_err();
     assert_eq!(calls.get(), 1);
-    assert!(matches!(response, FrontendEvent::WorkError { message } if message == "pool at hard cap"));
+    let text = response.to_string();
+    assert!(text.contains("timed out after"), "{text}");
+    assert!(text.contains("pool already at hard cap (16)"), "{text}");
 }
 
 #[tokio::test]
@@ -1141,6 +1146,7 @@ async fn launch_expired_deadline_never_sends() {
         },
         true,
         Some(tokio::time::Instant::now()),
+        std::time::Duration::ZERO,
         std::time::Duration::ZERO,
     )
     .await;
