@@ -390,8 +390,9 @@ impl WorkerCompletionHandler {
     ///
     /// Mirrors [`Self::finalize_pr_transition`]'s termination write and
     /// teardown exactly. The only inline network calls are the bounded
-    /// branch check, branch-keyed detection, and conflict-resolution mergeability
-    /// verification — see
+    /// branch check, branch-keyed detection, conflict-resolution mergeability
+    /// verification, and, for a revision, the bounded read of the head it
+    /// delivered ([`Self::delivered_revision_head`]) — see
     /// the module doc. Every other network-touching step that function
     /// layers on top (reviewer-batch enqueue, doc-link detection) runs in
     /// [`Self::spawn_declared_delivery_post_effects`], the same best-effort,
@@ -436,21 +437,16 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
+        let mut verified_head = None;
         if !merged && !closed_unmerged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
                 ConflictDeliveryDecision::Merged => merged = true,
                 ConflictDeliveryDecision::ClosedUnmerged => closed_unmerged = true,
-                ConflictDeliveryDecision::Proceed => {}
+                ConflictDeliveryDecision::Proceed { verified_head: head } => verified_head = head,
             }
         }
 
-        // Captured before `record_worker_pr_completion` nulls
-        // `workspace_path` in the same transaction that terminalizes the
-        // execution — this path owns driver teardown.
-        let workspace_path = execution.workspace_path.clone();
-        // Marked before the terminalizing write — see `super::teardown`.
-        let teardown = self.begin_teardown(&execution.id);
         // The local completion write must preserve the same hold used by
         // Stop-triggered reviewer admission. Network-dependent refinement
         // and enqueue happen after teardown below. A PR that is already
@@ -469,22 +465,67 @@ impl WorkerCompletionHandler {
         } else {
             WorkerPrCompletionTarget::InReview
         };
-        let completion =
-            match self
-                .work_db
-                .record_worker_pr_completion(&execution.id, &pr_url, None, None, target, None)
-            {
-                Ok(Some(completion)) => completion,
-                Ok(None) => return StopOutcome::AlreadyTerminal,
-                Err(err) => {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "run_done finalize (delivered): failed to record PR completion",
-                    );
-                    return StopOutcome::DbError;
-                }
-            };
+
+        // The head this revision's delivery finished at. The review hold
+        // below is keyed on it, so it is recorded with the completion. See
+        // `super::revision_review_hold`. A parked revision or one at the
+        // review-cycle bound goes straight to `in_review` and takes no hold.
+        let holds_revision_for_review = execution.kind == ExecutionKind::RevisionImplementation
+            && matches!(target, WorkerPrCompletionTarget::PendingReview)
+            && !review_skipped_before_hold(&self.work_db, &execution.work_item_id, self.max_review_cycles);
+        let delivered_head = if execution.kind == ExecutionKind::RevisionImplementation && !merged && !closed_unmerged {
+            self.delivered_revision_head(execution, &pr_url, verified_head).await
+        } else {
+            None
+        };
+        // A hold with no head is one nothing can release, so a delivery whose
+        // head cannot be read fails visibly instead of taking it.
+        if holds_revision_for_review && delivered_head.is_none() {
+            return self.fail_delivery_with_unreadable_head(execution, &pr_url).await;
+        }
+
+        // Captured before `record_worker_pr_completion` nulls
+        // `workspace_path` in the same transaction that terminalizes the
+        // execution — this path owns driver teardown.
+        let workspace_path = execution.workspace_path.clone();
+        // The hold is released by the review of this head, so it is recorded
+        // before the write that takes the hold, as the Stop boundary records
+        // it before finalizing. A failed write retries with the declaration
+        // still stamped.
+        if holds_revision_for_review
+            && let Some(head) = delivered_head.as_deref()
+            && let Err(err) = self.work_db.set_revision_stop_contributed_head(&execution.id, head)
+        {
+            tracing::error!(
+                execution_id = %execution.id,
+                head,
+                ?err,
+                "run_done finalize (delivered): failed to record the head this revision is held for; \
+                 leaving the execution live for the finalize retry",
+            );
+            return StopOutcome::DbError;
+        }
+        // Marked before the terminalizing write — see `super::teardown`.
+        let teardown = self.begin_teardown(&execution.id);
+        let completion = match self.work_db.record_worker_pr_completion(
+            &execution.id,
+            &pr_url,
+            delivered_head.as_deref(),
+            None,
+            target,
+            None,
+        ) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "run_done finalize (delivered): failed to record PR completion",
+                );
+                return StopOutcome::DbError;
+            }
+        };
         self.reconcile_review_guide_source_for_execution(
             &execution.id,
             &pr_url,
@@ -521,6 +562,9 @@ impl WorkerCompletionHandler {
             execution_id = %execution.id,
             work_item_id = %work_item_id,
             pr_url = %pr_url,
+            target = ?target,
+            pr_head_before = execution.pr_head_before.as_deref().unwrap_or("(none recorded)"),
+            pr_head_after = delivered_head.as_deref().unwrap_or("(not read for this kind)"),
             "run_done finalize: declared `delivered`, bound to a resolvable PR — terminalized at submit",
         );
 
@@ -928,8 +972,21 @@ async fn run_declared_delivery_post_effects(
 /// fails to match leaves the task stranded in `active` with no live
 /// execution and nothing left to un-stick it.
 fn release_pending_review_hold_with_verdict(work_db: &crate::work::WorkDb, work_item_id: &str, cycle_root_id: &str) {
-    match work_db.advance_pending_review_task_to_in_review_with_verdict_source(work_item_id, cycle_root_id) {
+    match work_db.release_review_hold(work_item_id, Some(cycle_root_id)) {
         Ok(true) => {}
+        // A revision's hold is its own, not the cycle root's, so no verdict
+        // under the root is required to release it: the decision not to
+        // review what it pushed is already made, and the Stop boundary sends
+        // the same skip straight to `in_review`.
+        Ok(false) if work_item_id != cycle_root_id => {
+            tracing::info!(
+                work_item_id,
+                cycle_root_id,
+                "run_done post-effects: no verdict under the cycle root to release this revision's hold \
+                 with; the review of its push was skipped, so releasing it without one",
+            );
+            release_pending_review_hold_unconditional(work_db, work_item_id);
+        }
         Ok(false) => tracing::warn!(
             work_item_id,
             cycle_root_id,
@@ -944,6 +1001,17 @@ fn release_pending_review_hold_with_verdict(work_db: &crate::work::WorkDb, work_
             "run_done post-effects: failed to release PendingReview hold",
         ),
     }
+}
+
+/// `true` when a revision's push will not be reviewed because its row is
+/// parked or its review cycle is at `max_review_cycles`; such a revision goes
+/// straight to `in_review` and takes no hold, so it needs no recorded head.
+pub(super) fn review_skipped_before_hold(work_db: &crate::work::WorkDb, work_item_id: &str, max_cycles: usize) -> bool {
+    if reviewer_suppressed_by_park(work_db, work_item_id) {
+        return true;
+    }
+    let cycle_root_id = work_db.review_cycle_root_id(work_item_id);
+    matches!(work_db.get_task_review_cycle_state(&cycle_root_id), Ok((cycle, _)) if (cycle as usize) >= max_cycles)
 }
 
 /// `true` when `work_item_id` is parked, so no automated reviewer may be
@@ -964,7 +1032,7 @@ pub(super) fn reviewer_suppressed_by_park(work_db: &crate::work::WorkDb, work_it
 /// verdict can exist yet) or a legacy-reviewer-creation failure. See
 /// [`crate::work::WorkDb::advance_held_pending_review_task_to_in_review`].
 fn release_pending_review_hold_unconditional(work_db: &crate::work::WorkDb, work_item_id: &str) {
-    match work_db.advance_held_pending_review_task_to_in_review(work_item_id) {
+    match work_db.release_review_hold(work_item_id, None) {
         Ok(true) => {}
         Ok(false) => tracing::warn!(
             work_item_id,
@@ -1087,35 +1155,44 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
             .enqueue(work_db, work_item_id, repo_remote_url, pr_url, review_pool_size)
             .await
         {
-            Ok(crate::work::ReviewBatchDispatch::AdmissionDeferred)
-            | Ok(crate::work::ReviewBatchDispatch::AlreadyReviewed) => {
+            Ok(
+                dispatch @ (crate::work::ReviewBatchDispatch::AdmissionDeferred
+                | crate::work::ReviewBatchDispatch::AlreadyReviewed),
+            ) => {
+                // Nothing was admitted. The marker hands the hold to the
+                // deferred-admission sweep, which retries every pass; this
+                // line is the only record of why the completion left it held.
+                tracing::info!(
+                    execution_id = %execution.id,
+                    work_item_id,
+                    pr_url,
+                    "run_done post-effects: no review batch admitted ({dispatch:?}); holding the task for the \
+                     deferred-admission sweep",
+                );
                 file_admission_deferred_attention(work_db, work_item_id, pr_url);
             }
             Ok(dispatch) => {
-                if execution.kind == ExecutionKind::RevisionImplementation {
-                    let target_sha = match &dispatch {
-                        crate::work::ReviewBatchDispatch::Created { batch, .. }
-                        | crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. } => {
-                            Some(batch.target_sha.as_str())
-                        }
-                        _ => None,
-                    };
-                    if let Some(target_sha) = target_sha
-                        && let Err(err) = work_db.set_revision_stop_contributed_head(&execution.id, target_sha)
-                    {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            target_sha,
-                            ?err,
-                            "run_done post-effects: failed to stamp revision contributed head for review batch",
-                        );
-                    }
-                }
                 tracing::info!(
                     work_item_id,
                     pr_url,
                     "run_done post-effects: review batch enqueued ({dispatch:?})"
                 );
+                if execution.kind == ExecutionKind::RevisionImplementation
+                    && let crate::work::ReviewBatchDispatch::Created { batch, .. }
+                    | crate::work::ReviewBatchDispatch::ExistingBatch { batch, .. } = &dispatch
+                {
+                    // The batch for this head may be one another row's
+                    // admission created, and it may already have reached its
+                    // decision. The hold is settled against it either way.
+                    super::revision_review_hold::settle_revision_hold(
+                        work_db,
+                        publisher,
+                        work_item_id,
+                        &batch.target_sha,
+                        "run_done_post_effects",
+                    )
+                    .await;
+                }
                 publisher.kick_scheduler();
             }
             Err(error) => {

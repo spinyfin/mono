@@ -150,7 +150,13 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         .subscribe(session, &[boss_protocol::work_product_topic(&product_id)])
         .await;
     let calls = Arc::new(AtomicUsize::new(0));
+    // A revision's declared delivery records the head it finished at, and
+    // the guide's source capture pins that head. It is the head the source
+    // packet below describes.
+    let verifier = boss_engine_completion::tests::StubBranchVerifier::ok("boss/test");
+    verifier.set_fresh_head_oid(Ok("revised-head".to_owned())).await;
     let handler = boss_engine_completion::integration_handler(db.clone(), pr_url)
+        .with_branch_verifier(verifier)
         .with_collaborators(boss_engine_runtime::completion_adapters::completion_collaborators())
         .with_feature_flags(state.feature_flags.clone())
         .with_publisher(state.publisher.clone())
@@ -167,7 +173,12 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     );
     // Notifications are wakeups; re-read authoritative state because the broker
     // can coalesce invalidations. Bazel's test timeout is the hang guard.
+    // Capture can enqueue before the completion post-effects release the
+    // revision hold. Drive the normal reconciliation pass that dispatches the
+    // queued guide once that writer has finished.
     let attempts = loop {
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&Default::default(), &|_| false)
+            .unwrap();
         let attempts = db.live_pr_review_guide_attempts_for_series(&series).unwrap();
         if attempts.first().is_some_and(|attempt| attempt.execution_id.is_some()) {
             break attempts;
@@ -182,6 +193,11 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         .subscribe(session, &[boss_protocol::execution_topic(guide_execution)])
         .await;
     while db.get_execution(guide_execution).unwrap().status != ExecutionStatus::Running {
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&Default::default(), &|_| false)
+            .unwrap();
+        if db.get_execution(guide_execution).unwrap().status == ExecutionStatus::Running {
+            break;
+        }
         updates.next().await.expect("guide dispatch subscription closed");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);

@@ -216,6 +216,7 @@ impl WorkerCompletionHandler {
             self.record_mid_turn_reap(execution, source).await;
         }
 
+        let mut verified_head = None;
         if !merged && let Ok(execution) = execution_result.as_ref() {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
@@ -226,16 +227,19 @@ impl WorkerCompletionHandler {
                 ConflictDeliveryDecision::ClosedUnmerged => {
                     target = WorkerPrCompletionTarget::DoneUnmerged;
                 }
-                ConflictDeliveryDecision::Proceed => {}
+                ConflictDeliveryDecision::Proceed { verified_head: head } => verified_head = head,
             }
         }
 
         // Forensic teardown head — captured before any durable reviewer
         // enqueue or terminalization write. Fail-open: this snapshot is not
         // consulted by the mid-turn guard, so a transient `gh` failure or an
-        // unparseable URL must not block PR completion engine-wide.
+        // unparseable URL must not block PR completion engine-wide. When the
+        // direct read fails, the head GitHub reported while verifying a
+        // revision's delivery stands in, so the column is empty only when
+        // neither source had one.
         let pr_head_after = match execution_result.as_ref() {
-            Ok(execution) => self.fetch_pr_head_after(execution, &pr_url).await,
+            Ok(execution) => self.fetch_pr_head_after(execution, &pr_url).await.or(verified_head),
             Err(err) => {
                 tracing::warn!(
                     execution_id,
@@ -247,6 +251,37 @@ impl WorkerCompletionHandler {
                 None
             }
         };
+
+        // The head of the batch a revision is about to be held for. The hold
+        // is released by the review of exactly that head, so it is recorded
+        // on the run with the write that takes the hold: see
+        // `super::revision_review_hold`.
+        let mut review_hold_head: Option<String> = None;
+
+        // A revision's review hold rests on a head. When neither the read
+        // above nor the Stop boundary's own stamp has one, this completion
+        // cannot say which review the push would be held for, and a hold
+        // taken anyway is one nothing releases. It fails here, before
+        // anything is admitted, the way a declared delivery does. Every
+        // other kind keeps the fail-open behaviour described above.
+        if !merged
+            && matches!(target, WorkerPrCompletionTarget::InReview)
+            && pr_head_after.is_none()
+            && self.enable_revision_triggered_reviews
+            && let Ok(execution) = execution_result.as_ref()
+            && execution.kind == ExecutionKind::RevisionImplementation
+            && !super::run_done_declaration::review_skipped_before_hold(
+                &self.work_db,
+                &execution.work_item_id,
+                self.max_review_cycles,
+            )
+            && !matches!(
+                self.work_db.get_revision_stop_contributed_head(execution_id),
+                Ok(Some(ref stamped)) if !stamped.is_empty()
+            )
+        {
+            return self.fail_delivery_with_unreadable_head(execution, &pr_url).await;
+        }
 
         // For reviewer-triggering executions with a fresh
         // (non-merged) PR, try to enqueue an independent reviewer pass
@@ -413,17 +448,47 @@ impl WorkerCompletionHandler {
                                             "review batch leaf executions enqueued; holding producing task for reviewer pass",
                                         );
                                         self.publisher.kick_scheduler();
+                                        if producing.kind == ExecutionKind::RevisionImplementation {
+                                            review_hold_head = Some(batch.target_sha.clone());
+                                        }
                                         true
                                     }
                                     Ok(crate::work::ReviewBatchDispatch::ExistingBatch { batch, executions }) => {
-                                        tracing::info!(
-                                            execution_id,
-                                            batch_id = %batch.id,
-                                            leaf_executions = executions.len(),
-                                            pr_url = %pr_url,
-                                            "review batch already enqueued for immutable target",
+                                        let decided = matches!(
+                                            batch.status,
+                                            boss_protocol::ReviewBatchStatus::Completed
+                                                | boss_protocol::ReviewBatchStatus::Failed
                                         );
-                                        true
+                                        if decided && producing.kind == ExecutionKind::RevisionImplementation {
+                                            // Another row's admission created the batch
+                                            // for this head and it has already reached
+                                            // its decision. A hold taken now would wait
+                                            // for a decision that is not coming, so the
+                                            // revision goes to `in_review` as a batch's
+                                            // decision would have sent it.
+                                            tracing::info!(
+                                                execution_id,
+                                                batch_id = %batch.id,
+                                                batch_status = %batch.status,
+                                                target_sha = %batch.target_sha,
+                                                pr_url = %pr_url,
+                                                "review batch for this head has already reached its decision; \
+                                                 advancing the revision to in_review without a hold",
+                                            );
+                                            false
+                                        } else {
+                                            tracing::info!(
+                                                execution_id,
+                                                batch_id = %batch.id,
+                                                leaf_executions = executions.len(),
+                                                pr_url = %pr_url,
+                                                "review batch already enqueued for immutable target",
+                                            );
+                                            if producing.kind == ExecutionKind::RevisionImplementation {
+                                                review_hold_head = Some(batch.target_sha.clone());
+                                            }
+                                            true
+                                        }
                                     }
                                     Ok(crate::work::ReviewBatchDispatch::LegacyExecution(review_exec)) => {
                                         tracing::info!(
@@ -624,6 +689,42 @@ impl WorkerCompletionHandler {
             target
         };
 
+        // Point the revision at the head of the batch it is about to be held
+        // for, before the write that takes the hold. The Stop boundary's own
+        // stamp is a separate read of the head: it can be missing (the read
+        // failed) or name an earlier head than the one admission just read,
+        // and a hold keyed on either is one this batch's decision would not
+        // release.
+        let review_hold_head = review_hold_head.filter(|_| enqueued_reviewer);
+        let holds_revision = enqueued_reviewer
+            && execution_result
+                .as_ref()
+                .is_ok_and(|execution| execution.kind == ExecutionKind::RevisionImplementation);
+        // When admission named no batch (it was deferred, or the pull request
+        // could not be read), a hold the Stop boundary did not stamp falls
+        // back to the head the run finished at, so a batch admitted for that
+        // head by any other path still releases the revision.
+        let stamped_at_stop = holds_revision
+            && matches!(
+                self.work_db.get_revision_stop_contributed_head(execution_id),
+                Ok(Some(ref stamped)) if !stamped.is_empty()
+            );
+        let head_to_record = match review_hold_head.as_deref() {
+            Some(head) => Some(head),
+            None if holds_revision && !stamped_at_stop => pr_head_after.as_deref(),
+            None => None,
+        };
+        if let Some(head) = head_to_record
+            && let Err(err) = self.work_db.set_revision_stop_contributed_head(execution_id, head)
+        {
+            tracing::warn!(
+                execution_id,
+                head,
+                ?err,
+                "pr completion: failed to record the head this revision is held for",
+            );
+        }
+
         // Mark the teardown in flight BEFORE the write that terminalizes
         // this execution. From here until `finish_worker_teardown` drops
         // the guard, `terminal_work_sweep` can see that this pane already
@@ -654,9 +755,29 @@ impl WorkerCompletionHandler {
             execution_id,
             source,
             target = ?effective_target,
+            pr_head_after = pr_head_after.as_deref().unwrap_or("(unread)"),
+            review_hold_head = review_hold_head.as_deref().unwrap_or("(none)"),
             elapsed_ms = record_started.elapsed().as_millis(),
             "pr completion: execution terminalized; teardown in flight",
         );
+        // The batch was admitted before the completion write, so it can have
+        // reached its decision in between, while the run was still live and
+        // its decision could not find the revision. Settling after the write
+        // releases the revision in that case.
+        let released_by_settling = match review_hold_head.as_deref() {
+            Some(head) => {
+                super::revision_review_hold::settle_revision_hold(
+                    &self.work_db,
+                    self.publisher.as_ref(),
+                    &completion.execution.work_item_id,
+                    head,
+                    source,
+                )
+                .await
+            }
+            None => false,
+        };
+        let enqueued_reviewer = enqueued_reviewer && !released_by_settling;
         self.reconcile_review_guide_source_for_execution(
             execution_id,
             &pr_url,
@@ -1125,7 +1246,11 @@ impl WorkerCompletionHandler {
     /// Fetch the head that is about to be recorded on a PR-completion
     /// teardown. Forensic only: parse failures and `gh` errors log at WARN
     /// and return `None` so terminalization still proceeds.
-    async fn fetch_pr_head_after(&self, execution: &crate::work::WorkExecution, pr_url: &str) -> Option<String> {
+    pub(super) async fn fetch_pr_head_after(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+    ) -> Option<String> {
         let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
             Ok(repo_slug) => repo_slug,
             Err(err) => {

@@ -57,6 +57,7 @@ use rusqlite::{OptionalExtension, Transaction};
 use super::automations::query_automation;
 use super::*;
 use crate::deferred_scope::DEFERRED_SCOPE_MARKER;
+use crate::event_publish::PendingEvents;
 use boss_engine_storage_values::attention_kinds::{WORKER_BLOCKED_ATTENTION_KIND, WORKER_ESCALATION_ATTENTION_KIND};
 use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
@@ -150,6 +151,9 @@ pub struct ApplyOutcome {
     /// no publisher of its own, unlike `finalize_passes.rs`'s member-failure
     /// dispatch, which does.
     pub review_batch_quorum_outcome: Option<super::ReviewBatchQuorumOutcome>,
+    /// Board events staged while applying, typically a quorum-failure
+    /// cascade. The submission transaction publishes them with its commit.
+    pub pending_events: PendingEvents,
 }
 
 /// What [`apply_in_transaction`] decided for an `AutoApply` kind: either it
@@ -310,11 +314,13 @@ fn apply_review_report(
          WHERE id = ?4",
         rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
-    let quorum_outcome = advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
+    let mut pending = PendingEvents::new();
+    let quorum_outcome = advance_review_batch_quorum_best_effort(tx, &mut pending, execution_id, &payload.batch_id);
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(member_id),
         post_commit_audit_line: None,
         review_batch_quorum_outcome: quorum_outcome,
+        pending_events: pending,
     }))
 }
 
@@ -327,11 +333,12 @@ fn apply_review_report(
 /// revisits on its own schedule).
 fn advance_review_batch_quorum_best_effort(
     tx: &Transaction<'_>,
+    pending: &mut PendingEvents,
     execution_id: &str,
     batch_id: &str,
 ) -> Option<super::ReviewBatchQuorumOutcome> {
     let registry = boss_engine_driver::DriverRegistry::default();
-    match super::review_batches::try_advance_review_batch_quorum_in_tx(tx, batch_id, &registry) {
+    match super::review_batches::try_advance_review_batch_quorum_in_tx(tx, batch_id, &registry, pending) {
         Ok(outcome) => Some(outcome),
         Err(error) => {
             tracing::error!(
@@ -470,12 +477,14 @@ fn apply_review_verdict(
          WHERE id = ?4",
         rusqlite::params![ReviewBatchMemberStatus::Reported.as_str(), proposal_id, now, member_id],
     )?;
-    let quorum_outcome = advance_review_batch_quorum_best_effort(tx, execution_id, &payload.batch_id);
+    let mut pending = PendingEvents::new();
+    let quorum_outcome = advance_review_batch_quorum_best_effort(tx, &mut pending, execution_id, &payload.batch_id);
     supersede_other_undecided_review_verdicts(tx, &payload.batch_id, proposal_id, &now)?;
     Ok(ApplyDecision::Staged(ApplyOutcome {
         applied_ref: None,
         post_commit_audit_line: None,
         review_batch_quorum_outcome: quorum_outcome,
+        pending_events: pending,
     }))
 }
 
@@ -628,6 +637,7 @@ fn create_attention_item_row(
         applied_ref: Some(item.id),
         post_commit_audit_line: None,
         review_batch_quorum_outcome: None,
+        pending_events: PendingEvents::new(),
     })
 }
 
@@ -706,6 +716,7 @@ fn apply_wait(payload_json: &str) -> Result<ApplyOutcome> {
         applied_ref: None,
         post_commit_audit_line: None,
         review_batch_quorum_outcome: None,
+        pending_events: PendingEvents::new(),
     })
 }
 
@@ -856,6 +867,7 @@ fn apply_automation_outcome(
             applied_ref: None,
             post_commit_audit_line: None,
             review_batch_quorum_outcome: None,
+            pending_events: PendingEvents::new(),
         }),
         AutomationOutcomeProposalPayload::ProducedTask { task_id } => {
             let execution = query_execution(tx, execution_id).require("execution", execution_id)?;
@@ -895,6 +907,7 @@ fn apply_automation_outcome(
                     applied_ref: Some(resolved_task_id),
                     post_commit_audit_line: None,
                     review_batch_quorum_outcome: None,
+                    pending_events: PendingEvents::new(),
                 }),
                 Some(_) => ApplyDecision::Rejected(format!(
                     "task {task_id} exists but its source_automation_id does not match automation \
@@ -1038,6 +1051,7 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
         applied_ref: Some(task.id),
         post_commit_audit_line: None,
         review_batch_quorum_outcome: None,
+        pending_events: PendingEvents::new(),
     }))
 }
 
@@ -1155,6 +1169,7 @@ fn apply_run_done(
         applied_ref: Some(execution_id.to_owned()),
         post_commit_audit_line: None,
         review_batch_quorum_outcome: None,
+        pending_events: PendingEvents::new(),
     }))
 }
 

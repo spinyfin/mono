@@ -23,6 +23,7 @@
 //! §"Data model".
 
 use super::*;
+use crate::event_publish::{PendingEvents, commit_and_publish};
 use boss_engine_proposal_validation::{ProposalCounts, check_rate_caps};
 use boss_protocol::{
     Attention, AttentionGroup, ProposalDecider, ProposalErrorCode, ProposalKind, ProposalState,
@@ -315,6 +316,7 @@ impl WorkDb {
         ) = {
             let mut conn = self.connect()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut pending = PendingEvents::new();
 
             if let Some(existing) = find_by_idempotency_key(&tx, input.execution_id, input.idempotency_key)? {
                 // The key matched, but the row it found is a different `kind` —
@@ -410,15 +412,18 @@ impl WorkDb {
                 post_commit_audit_line,
                 review_batch_quorum_outcome,
             ) = match apply_decision {
-                Some(ApplyDecision::Applied(outcome)) => (
-                    ProposalState::Applied,
-                    outcome.applied_ref,
-                    Some(ProposalDecider::Policy),
-                    None,
-                    Some(now.clone()),
-                    outcome.post_commit_audit_line,
-                    outcome.review_batch_quorum_outcome,
-                ),
+                Some(ApplyDecision::Applied(outcome)) => {
+                    pending.append(outcome.pending_events);
+                    (
+                        ProposalState::Applied,
+                        outcome.applied_ref,
+                        Some(ProposalDecider::Policy),
+                        None,
+                        Some(now.clone()),
+                        outcome.post_commit_audit_line,
+                        outcome.review_batch_quorum_outcome,
+                    )
+                }
                 Some(ApplyDecision::Rejected(reason)) => (
                     ProposalState::Rejected,
                     None,
@@ -428,15 +433,18 @@ impl WorkDb {
                     None,
                     None,
                 ),
-                Some(ApplyDecision::Staged(outcome)) => (
-                    ProposalState::Proposed,
-                    None,
-                    None,
-                    None,
-                    None,
-                    outcome.post_commit_audit_line,
-                    outcome.review_batch_quorum_outcome,
-                ),
+                Some(ApplyDecision::Staged(outcome)) => {
+                    pending.append(outcome.pending_events);
+                    (
+                        ProposalState::Proposed,
+                        None,
+                        None,
+                        None,
+                        None,
+                        outcome.post_commit_audit_line,
+                        outcome.review_batch_quorum_outcome,
+                    )
+                }
                 None => (ProposalState::Proposed, None, None, None, None, None, None),
             };
 
@@ -460,7 +468,7 @@ impl WorkDb {
                     now,
                 ],
             )?;
-            tx.commit()?;
+            commit_and_publish(tx, pending, &self.event_bus)?;
 
             (
                 id,
