@@ -692,7 +692,9 @@ struct WorkerFixture {
 
 impl WorkerFixture {
     fn new() -> Self {
-        Self::with_state(test_server_state())
+        Self::with_state(test_server_state_with_pr_state_checker(Arc::new(
+            boss_work_db::FakePrStateChecker::always(boss_work_db::PrOpenState::Open),
+        )))
     }
 
     fn with_state((server_state, dir): (Arc<ServerState>, tempfile::TempDir)) -> Self {
@@ -2987,4 +2989,31 @@ async fn a_declared_wait_is_overlaid_on_the_live_worker_state_until_it_expires()
         .unwrap();
     let after = fx.server_state.live_worker_states_snapshot();
     assert!(after[0].wait_reason.is_none() && after[0].wait_expires_at.is_none());
+}
+
+#[tokio::test]
+async fn worker_pr_created_refuses_non_default_base_without_binding() {
+    struct ParentBranch;
+    impl boss_work_db::PrStateChecker for ParentBranch {
+        fn check(&self, _: &str) -> anyhow::Result<boss_work_db::PrOpenState> {
+            boss_github::require_default_branch(Some("feature/parent"), Some("main")).map_err(anyhow::Error::msg)?;
+            Ok(boss_work_db::PrOpenState::Open)
+        }
+    }
+    let fx = WorkerFixture::with_state(test_server_state_with_pr_state_checker(Arc::new(ParentBranch)));
+    let response = submit(
+        &fx,
+        ProposalKind::PrCreated,
+        json!({"pr_url":"https://github.com/o/r/pull/1"}),
+    )
+    .await;
+    let FrontendEvent::ProposalRejected { error } = response else {
+        panic!("{response:?}")
+    };
+    assert!(format!("{error:?}").contains("feature/parent"));
+    let item = fx.server_state.work_db.get_work_item(&fx.work_item_id).unwrap();
+    let boss_work_db::WorkItem::Chore(task) = item else {
+        panic!("expected chore")
+    };
+    assert!(task.pr_url.is_none());
 }

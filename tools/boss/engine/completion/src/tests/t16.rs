@@ -887,3 +887,45 @@ async fn verify_staged_pr_url_after_capture_leaves_live_slot_unset_when_unverifi
     handler.verify_staged_pr_url_after_capture(&execution_id, false).await;
     assert_eq!(live_states.get(1).unwrap().pr_url, None);
 }
+
+struct NonDefaultBaseChecker;
+impl crate::work::PrStateChecker for NonDefaultBaseChecker {
+    fn check(&self, _url: &str) -> Result<crate::work::PrOpenState> {
+        boss_github::require_default_branch(Some("feature/parent"), Some("main")).map_err(anyhow::Error::msg)?;
+        Ok(crate::work::PrOpenState::Merged)
+    }
+}
+
+#[tokio::test]
+async fn non_default_base_cannot_bind_or_complete_from_stop_or_declaration() {
+    for declared in [false, true] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
+        let handler = TestHarness::new(
+            db.clone(),
+            StubPrDetector::ok_status(PrStatus::Merged { url: OWN_PR.into() }),
+        )
+        .handler
+        .with_pr_state_checker(Arc::new(NonDefaultBaseChecker));
+        let outcome = if declared {
+            handler
+                .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+                .await
+        } else {
+            handler
+                .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::Done, "test")
+                .await
+        };
+        assert_eq!(outcome, StopOutcome::DetectorFailed);
+        assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+        let task = task_row(&db, &chore_id);
+        assert_ne!(task.status, TaskStatus::Done);
+        assert!(task.pr_url.is_none());
+        let attentions = db.list_attention_items_for_work_item(&chore_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .any(|a| a.kind == "pr_base_refused" && a.body_markdown.contains("feature/parent"))
+        );
+    }
+}

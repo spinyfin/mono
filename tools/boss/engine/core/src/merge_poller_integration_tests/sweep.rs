@@ -139,7 +139,10 @@ async fn run_one_pass_recovers_late_pr_for_abandoned_execution() {
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
         crate::completion_adapters::completion_collaborators(),
-    );
+    )
+    .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+        crate::work::PrOpenState::Open,
+    )));
 
     let outcome = run_one_pass(
         db.as_ref(),
@@ -189,7 +192,10 @@ async fn ci_resolved_stops_live_worker_and_keeps_task_in_review() {
         Arc::new(NoopPaneReleaser),
         Arc::new(NoopProbeQueuer),
         crate::completion_adapters::completion_collaborators(),
-    );
+    )
+    .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+        crate::work::PrOpenState::Open,
+    )));
 
     let outcome = run_one_pass(
         db.as_ref(),

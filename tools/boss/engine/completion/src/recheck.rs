@@ -439,6 +439,9 @@ impl WorkerCompletionHandler {
             PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
             PrStatus::Fresh { url } | PrStatus::Merged { url } => url,
         };
+        if !self.pr_base_allows_binding(&candidate.work_item_id, &pr_url).await {
+            return StopOutcome::DetectorFailed;
+        }
         match self
             .work_db
             .bind_pr_to_active_task_from_terminal_execution(&candidate.work_item_id, &pr_url)

@@ -977,6 +977,7 @@ async fn pr_review_pass_no_result_reprompts_instead_of_silently_advancing() {
         probe_queuer.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_pr_state_checker(open_pr_checker())
     .with_structured_output_dir(out_dir.path().to_path_buf())
     .with_max_unproductive_nudges(2);
@@ -1049,6 +1050,7 @@ async fn pr_review_pass_malformed_result_reprompt_stays_driver_agnostic() {
         probe_queuer.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_pr_state_checker(open_pr_checker())
     .with_structured_output_dir(out_dir.path().to_path_buf())
     .with_max_unproductive_nudges(2);
@@ -1252,6 +1254,7 @@ async fn pr_review_pass_malformed_artifact_probe_includes_parse_error() {
         probe_queuer.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_pr_state_checker(open_pr_checker())
     .with_structured_output_dir(out_dir.path().to_path_buf())
     .with_max_unproductive_nudges(2);
@@ -2442,6 +2445,7 @@ async fn recheck_for_pr_sha_delta_suppressed_until_stop_seen() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_branch_verifier(verifier);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
@@ -2529,6 +2533,7 @@ async fn recheck_for_pr_sha_delta_fires_after_stop_seen() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_merge_probe(Arc::new(MergeableInFlightProbe))
     .with_branch_verifier(verifier)
     .with_staged_pr_urls(staged_pr_urls);
@@ -2595,6 +2600,7 @@ async fn recheck_for_pr_sha_delta_suppressed_when_baseline_matches_current_head(
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_branch_verifier(verifier);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
@@ -2666,6 +2672,7 @@ async fn recheck_for_pr_pre_stop_suppression_does_not_clobber_pr_head_before_bas
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_branch_verifier(verifier);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
@@ -2739,6 +2746,7 @@ async fn recheck_for_pr_foreign_push_post_stop_does_not_finalize_revision() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_branch_verifier(verifier);
 
     let outcome = handler.recheck_for_pr(&execution_id).await;
@@ -2823,6 +2831,7 @@ async fn on_stop_foreign_push_post_stop_does_not_finalize_revision() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_branch_verifier(verifier);
 
     let outcome = handler.on_stop(&execution_id).await;
@@ -2918,6 +2927,7 @@ async fn on_stop_revision_own_push_post_stop_finalizes_and_reaps() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_merge_probe(Arc::new(MergeableInFlightProbe))
     .with_branch_verifier(verifier)
     .with_staged_revision_pushes(staged_pushes);

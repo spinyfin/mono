@@ -1307,6 +1307,7 @@ async fn on_stop_staged_url_preserved_when_branch_verification_errors() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_staged_pr_urls(staged_pr_urls.clone())
     // Verification errors — simulates the transient GitHub API failure
     // that caused the 2026-06-09 incident.
@@ -1384,6 +1385,7 @@ async fn on_stop_chore_pr_opened_advances_to_in_review_slot_freed() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_staged_pr_urls(staged_pr_urls.clone())
     .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
         &execution_id,
@@ -1460,6 +1462,7 @@ async fn recheck_staged_url_preserved_when_branch_verification_errors() {
         probes.clone(),
         CompletionCollaborators::noop(),
     )
+    .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)))
     .with_staged_pr_urls(staged_pr_urls.clone())
     .with_branch_verifier(StubBranchVerifier::err("transient API failure"))
     .with_max_review_cycles(0);

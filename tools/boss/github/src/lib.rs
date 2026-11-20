@@ -16,6 +16,7 @@ pub mod contents;
 pub mod gh_runner;
 pub mod pr_files;
 pub mod pr_url;
+pub use git_utils::gh_cli::require_default_branch;
 pub mod trees;
 
 pub use check_runs::{

@@ -710,6 +710,31 @@ pub(crate) async fn sweep_one(
             return;
         }
     };
+    if let Some(reason) = &probe_result.base_branch_error {
+        let detail = format!(
+            "{} was observed as {:?} with base `{}`. It cannot complete this work item or release dependents. {reason}",
+            candidate.pr_url,
+            probe_result.state,
+            probe_result.base_ref_name.as_deref().unwrap_or("unknown"),
+        );
+        if let Err(err) = work_db.upsert_work_item_attention(
+            &candidate.work_item_id,
+            "pr_base_refused",
+            "PR has not landed in the default branch",
+            &detail,
+        ) {
+            tracing::warn!(?err, "merge poller: could not surface PR base refusal");
+        }
+        publisher
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "pr_base_refused")
+            .await;
+        return;
+    }
+    if !matches!(probe_result.state, PrLifecycleState::ClosedUnmerged)
+        && let Err(err) = work_db.resolve_external_tracker_attention(&candidate.work_item_id, "pr_base_refused")
+    {
+        tracing::warn!(?err, "merge poller: could not clear PR base refusal");
+    }
     // Populated in the Open arm so the post-match poll-state write can
     // reuse the reaper's active-attempt snapshot instead of re-querying.
     // `None` outside Open (or if the reaper was not run); `Some(…)` is the

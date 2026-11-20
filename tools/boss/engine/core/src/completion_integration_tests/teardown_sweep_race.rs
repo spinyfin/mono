@@ -298,6 +298,9 @@ async fn sweep_does_not_reap_a_worker_whose_pane_teardown_is_in_flight() {
             Arc::new(RecordingProbeQueuer::default()),
             teardown_collaborators(),
         )
+        .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+            crate::work::PrOpenState::Merged,
+        )))
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
         .with_teardown_registry(teardown_registry.clone()),
     );
@@ -406,6 +409,9 @@ async fn sweep_does_not_reap_a_worker_behind_a_slow_cube_release() {
             Arc::new(RecordingProbeQueuer::default()),
             teardown_collaborators(),
         )
+        .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+            crate::work::PrOpenState::Merged,
+        )))
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
         .with_teardown_registry(teardown_registry.clone()),
     );
@@ -493,6 +499,9 @@ async fn pr_completion_teardown_runs_pane_then_driver_then_cube() {
         Arc::new(RecordingProbeQueuer::default()),
         teardown_collaborators(),
     )
+    .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
+        crate::work::PrOpenState::Merged,
+    )))
     .with_branch_verifier(StubBranchVerifier::ok("boss/test"));
 
     crate::driver_teardown::test_hooks::reset();

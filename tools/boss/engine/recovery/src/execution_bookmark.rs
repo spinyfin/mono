@@ -384,9 +384,9 @@ impl RestoreReport {
         } else {
             let base = match &self.base_fallback {
                 Some(note) => format!(
-                    "WARNING: the PR's own base branch could not be used ({note}). History was restaged onto that substitute branch instead, so if the PR is stacked, its unmerged parent's commits may now appear among the inherited commits: inspect them and drop any that belong to the parent PR before publishing. "
+                    "WARNING: the PR's own base branch could not be used ({note}). History was restaged onto a substitute branch. Verify the repository default branch before publishing. If required code exists only in another open PR, stop and request its existing task as a prerequisite; do not publish a stacked change or discard inherited commits. "
                 ),
-                None => "For a revision, the PR history was restaged onto its current base branch (including a stacked PR base). ".to_owned(),
+                None => "For a revision, the PR history was restaged onto its current base branch. Only the repository default branch is allowed; if the PR targets another branch, stop and request the needed PR's existing task as a prerequisite. ".to_owned(),
             };
             format!(
                 "{base}The PR head-branch bookmark still points at the original head: publishing requires moving that bookmark to the completed history with `jj bookmark set --allow-backwards` and rewriting the existing PR through `cube pr update`.\n\n"

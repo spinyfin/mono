@@ -22,7 +22,8 @@ pub fn stored_pr_number(pr_url: &str) -> Option<i64> {
 /// would make unit tests depend on GitHub access. Production wires in
 /// [`GhPrStateChecker`]; tests pass `FakePrStateChecker`.
 pub trait PrStateChecker: Send + Sync {
-    /// Return the live lifecycle state of the given PR URL.
+    /// Return the live lifecycle state only after verifying the PR targets the
+    /// repository default branch. Unsupported or unknown bases are errors.
     fn check(&self, pr_url: &str) -> Result<PrOpenState>;
 
     /// Lifecycle state plus the current head SHA and branch name, from one
@@ -122,7 +123,7 @@ pub fn classify_pr_merge_state(state: &str, merged_at: &str) -> PrMergeClass {
     }
 }
 
-/// Production implementation: shells out to `gh pr view`.
+/// Production implementation: fetches PR state and the default branch together via GraphQL.
 ///
 /// Deletion observations are a separate, required input to verdict storage.
 pub struct GhPrStateChecker;
@@ -143,26 +144,57 @@ impl PrStateChecker for GhPrStateChecker {
         // also called from inside the merge poller's own sweep scope
         // (`merge_poller.sweep`), whose label is the more specific one and
         // must win rather than being overridden to `pr_state_check`.
+        let (owner, repo, number) = boss_github::pr_url::parse_pr_url_parts(pr_url).context("invalid GitHub PR URL")?;
+        let query = format!(
+            "query {{ repository(owner: {owner:?}, name: {repo:?}) {{ defaultBranchRef {{ name }} \
+             pullRequest(number: {number}) {{ state mergedAt headRefOid headRefName baseRefName }} }} }}"
+        );
         let output =
             boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
-                boss_github::gh_runner::gh_output_blocking(&[
-                    "pr",
-                    "view",
-                    pr_url,
-                    "--json",
-                    "state,mergedAt,headRefOid,headRefName",
-                ])
+                boss_github::gh_runner::gh_output_blocking_timeout(
+                    &["api", "graphql", "-f", &format!("query={query}")],
+                    std::time::Duration::from_secs(30),
+                )
             })
-            .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
+            .with_context(|| format!("failed to inspect PR and repository via GraphQL for {pr_url}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("`gh pr view` failed for {pr_url}: {stderr}");
+            bail!("GitHub PR inspection failed for {pr_url}: {stderr}");
         }
         let body = String::from_utf8_lossy(&output.stdout);
-        let v: serde_json::Value =
-            serde_json::from_str(&body).with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
-        Ok(map_gh_inspect(&v))
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse GitHub PR inspection for {pr_url}"))?;
+        map_checked_inspect(&v)
     }
+}
+
+fn map_checked_inspect(v: &serde_json::Value) -> Result<PrInspect> {
+    let repository = &v["data"]["repository"];
+    let pr = &repository["pullRequest"];
+    boss_github::require_default_branch(
+        pr["baseRefName"].as_str(),
+        repository["defaultBranchRef"]["name"].as_str(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(map_gh_inspect(pr))
+}
+
+#[test]
+fn checked_inspection_never_reports_a_merge_into_another_branch_as_landed() {
+    for state in ["OPEN", "MERGED"] {
+        for base in [Some("feature/parent"), None] {
+            let response = serde_json::json!({"data":{"repository":{
+                "defaultBranchRef":{"name":"trunk"},
+                "pullRequest":{"state":state,"baseRefName":base}
+            }}});
+            assert!(map_checked_inspect(&response).is_err());
+        }
+    }
+    let response = serde_json::json!({"data":{"repository":{
+        "defaultBranchRef":{"name":"trunk"},
+        "pullRequest":{"state":"MERGED","baseRefName":"trunk"}
+    }}});
+    assert_eq!(map_checked_inspect(&response).unwrap().open_state, PrOpenState::Merged);
 }
 
 /// Pure mapping from the parsed `gh pr view --json state,mergedAt` JSON to a

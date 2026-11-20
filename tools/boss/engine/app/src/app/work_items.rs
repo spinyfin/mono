@@ -900,6 +900,19 @@ pub(super) async fn apply_work_item_patch_from(
         send_work_error(&sink, &request_id, &err);
         return;
     }
+    if server_state.classify_peer(peer_pid).is_worker()
+        && let Some(pr_url) = patch.pr_url.as_ref().filter(|url| !url.is_empty())
+    {
+        let checker = server_state.pr_state_checker.clone();
+        let pr_url = pr_url.clone();
+        match tokio::task::spawn_blocking(move || checker.check(&pr_url)).await {
+            Ok(Ok(_)) => {}
+            result => {
+                send_work_error(&sink, &request_id, anyhow!("PR binding refused: {result:?}"));
+                return;
+            }
+        }
+    }
     let id = match server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {
