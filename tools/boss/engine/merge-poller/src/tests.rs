@@ -583,3 +583,6 @@ mod schedule_tests;
 mod sweep_tests;
 #[cfg(test)]
 mod unmergeable_reaction_tests;
+
+#[cfg(test)]
+mod probe_budget_tests;

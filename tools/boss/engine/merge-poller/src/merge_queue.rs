@@ -196,7 +196,7 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
         // Both steps below are no-ops without a dequeue event, so the
         // per-row parked confirmation (the batched set can be a walk stale)
         // is only paid for candidates that have one.
-        if !dequeue_events.contains_key(&candidate.pr_url) {
+        if !has_dequeue_events(&dequeue_events, &candidate.pr_url) {
             continue;
         }
         if work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge_queue rebounce") {
@@ -704,4 +704,8 @@ pub(crate) async fn renumber_merge_queue(work_db: &WorkDb, publisher: &dyn Execu
         },
     )
     .await;
+}
+
+pub(crate) fn has_dequeue_events(events: &HashMap<String, Vec<MergeQueueDequeueEvent>>, url: &str) -> bool {
+    events.get(url).is_some_and(|events| !events.is_empty())
 }

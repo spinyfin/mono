@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::pass_trace::PassTrace;
 
@@ -90,8 +90,14 @@ pub(crate) struct PassRotations {
 /// budget.
 #[derive(Debug, Default)]
 pub struct PassState {
-    pub(crate) trace: PassTrace,
+    pub(crate) trace: Arc<PassTrace>,
+    pub(crate) probe_order: Arc<Mutex<crate::probe_budget::ProbeOrder>>,
     rotations: Mutex<PassRotations>,
+    turns: PhaseTurns,
+}
+
+#[derive(Debug, Default)]
+struct PhaseTurns {
     /// Starting offset among the post-terminal groups (open walk, local
     /// upkeep, per-execution families). Advanced at the start of that work,
     /// before any of it runs, so a pass dropped in the open walk still
@@ -121,24 +127,24 @@ impl PassState {
     /// Take the next starting offset among post-terminal groups. Call once
     /// per pass, after the terminal walk and before any rotated group runs.
     pub(crate) fn next_phase_turn(&self) -> u64 {
-        self.phase_turn.fetch_add(1, Ordering::Relaxed)
+        self.turns.phase_turn.fetch_add(1, Ordering::Relaxed)
     }
 
     /// The current starting offset among the per-execution families,
     /// without advancing it.
     pub(crate) fn late_family_turn(&self) -> u64 {
-        self.late_family_turn.load(Ordering::Relaxed)
+        self.turns.late_family_turn.load(Ordering::Relaxed)
     }
 
     /// Take the next starting offset among the upkeep subphases. Call when
     /// the upkeep group has time to run, before its first awaited work.
     pub(crate) fn next_upkeep_turn(&self) -> u64 {
-        self.upkeep_turn.fetch_add(1, Ordering::Relaxed)
+        self.turns.upkeep_turn.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Take the next starting offset among PR recheck, background nudges
     /// and late PR. Call when the per-execution group has time to run.
     pub(crate) fn next_late_family_turn(&self) -> u64 {
-        self.late_family_turn.fetch_add(1, Ordering::Relaxed)
+        self.turns.late_family_turn.fetch_add(1, Ordering::Relaxed)
     }
 }

@@ -65,7 +65,7 @@ turning into PRs that are never observed:
   later group so recovery still makes progress.
 - **Rotation.** The PR walk, background nudges and the per-execution rechecks
   are ordered least recently attended first, and that memory is kept across
-  passes. Whatever one pass did not reach is what the next pass starts with.
+  passes. Subsequent passes prioritize candidates least recently attended, with known terminal candidates first.
   A candidate is marked when the pass starts on it, so a candidate whose own
   handling is what exhausts the budget goes to the back of the next pass
   instead of cutting every pass off in the same place. Open walk, local
@@ -131,14 +131,23 @@ To read it:
   `batched probe graphql` lines: a response that carries errors for some PRs
   re-probes only those; a response with no usable body, or an error that
   names no PR, is retried in halves (bisected) and says so at `warn`, down
-  to a single PR probed on its own. The whole fallback shares a 30 s budget;
-  PRs not reached come back as retryable errors, and the per-PR fallback
-  starts at a different PR each time so the same ones are not always cut off.
-  The `per-PR probe fallback finished` line gives requested / probed /
-  deferred counts and elapsed time. Separately, every probed PR with an empty
-  CI rollup makes one more serial `gh api` call for the commit's combined
-  status (ETag-cached, so a `304` costs no quota but still spawns `gh`);
-  that time is inside `probe` too and is not broken out.
+  to a single PR probed on its own. Each initial probe or refresh shares a
+  deadline of the smaller of 30 seconds and one quarter of the pass's
+  remaining time. Every awaited batch, individual probe and combined-status
+  request is cancelled at that deadline; completed observations survive and
+  unfinished URLs return retryable errors.
+  Before splitting, URLs are ordered least recently attended first, with
+  previously observed terminal PRs first. Starting a fallback batch or
+  individual probe advances attendance, including when cancelled.
+  The trace reports `probe_fallback=<ms>ms(attempted=…,completed=…,deferred=…)`
+  across bisection and individual calls, counting distinct URLs per probe
+  invocation. Completed counts cover usable fallback observations; deferred
+  counts cover fallback URLs without a completed observation. Fallback time covers bisection and individual fallback spans, including
+  combined-status work inside those spans; nested spans are counted once.
+  `probe_combined_status` separately reports elapsed time and attempted,
+  completed and deferred request counts for actual empty-rollup REST calls
+  (including ETag requests). Both measurements survive cancellation and
+  overlap their enclosing phase; do not add them to total pass time.
 - **`open_walk` is large.** The walk is local DB work, a dozen or so short
   queries per PR. Look for `work DB connection lock timing` lines whose
   `caller` is under `merge-poller/`: a large `wait_ms` means the walk is

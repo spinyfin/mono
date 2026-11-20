@@ -488,3 +488,38 @@ async fn sweep_releases_a_revision_whose_head_was_reviewed_under_its_root() {
         "a settled head is not reviewed again"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn review_pool_sampling_survives_yield_before_upkeep() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let root = in_review_root(&db);
+    db.create_pre_merge_review_batch(batch_input(root, PR_URL, "head"), "https://github.com/example/repo")
+        .unwrap();
+    let expected = db.review_pool_reserved_units().unwrap();
+    assert!(expected.0 + expected.1 > 0);
+    let state = PassState::default();
+    let (outcome, _) = run_one_pass_tracked(
+        &db,
+        StubProbe::new().as_ref(),
+        &RecordingPublisher::default(),
+        SweepHandlers {
+            cube_client: None,
+            completion_handler: None,
+            host: None,
+            parked_ids: None,
+        },
+        &state,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(outcome.reserved_review_units, expected.0 + expected.1);
+    assert!(
+        !state
+            .trace()
+            .timings()
+            .phases
+            .iter()
+            .any(|p| p.phase == PassPhase::ReviewBatchUpkeep)
+    );
+}

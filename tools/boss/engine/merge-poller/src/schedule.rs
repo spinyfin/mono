@@ -410,7 +410,7 @@ pub(crate) const SLOW_PASS_LOG_THRESHOLD: Duration = Duration::from_secs(10);
 /// mid-flight. Dropping the future cancels it at its next await point; each
 /// state write inside a pass is its own synchronous DB transaction, so a
 /// cancelled pass leaves no half-written transition — just unprocessed
-/// candidates, which the next pass starts with (see `walk_order`).
+/// candidates, which remain eligible for later passes (see `walk_order`).
 ///
 /// `trace` is the pass's own phase timing, written by the pass and read
 /// here once it has returned or been dropped. Its per-phase cost is
@@ -485,7 +485,7 @@ where
                 items_unfinished = timings.items_unfinished(),
                 phases = %timings.breakdown(),
                 "merge poller: detection pass exceeded its time budget and was abandoned mid-flight; \
-                 the next pass starts with the candidates this one did not reach",
+                 unfinished observations remain retryable; attendance rotation prioritizes unattempted candidates",
             );
             None
         }

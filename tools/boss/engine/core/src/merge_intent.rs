@@ -147,6 +147,9 @@ fn settle(db: &WorkDb, candidate: &PendingMergeCheck) -> anyhow::Result<Option<M
     let Some(intent) = db.active_merge_intent(&candidate.work_item_id, &candidate.pr_url)? else {
         return Ok(None);
     };
+    if db.is_parked_or_assume_not(&candidate.work_item_id, "settle merge intent") {
+        return Ok(None);
+    }
     let (WorkItem::Task(task) | WorkItem::Chore(task)) = db.get_work_item(&candidate.work_item_id)? else {
         return Ok(None);
     };
@@ -368,6 +371,25 @@ mod tests {
                 other => panic!("expected a chore, got {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_late_request_on_a_parked_row_is_not_settled_by_a_clean_probe() {
+        let f = fixture(APPROVED);
+        f.db.park_work_item_as_actor(&f.candidate.work_item_id, true, Some("pause merge"), "human")
+            .unwrap();
+        // Parking ends existing requests; model a request recorded by a
+        // concurrent writer after the park, before the poller's confirmation.
+        f.db.record_merge_intent(&f.candidate.work_item_id, PR, Some(APPROVED))
+            .unwrap();
+        assert!(f.standing().is_some());
+        f.settle().await;
+        assert!(f.standing().is_some());
+        f.db.park_work_item_as_actor(&f.candidate.work_item_id, false, None, "human")
+            .unwrap();
+        f.probe(APPROVED, "success");
+        f.settle().await;
+        assert!(f.standing().is_none());
     }
 
     #[tokio::test]

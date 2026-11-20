@@ -101,6 +101,7 @@ mod pass_trace;
 mod poll_metrics;
 mod post_merge_review;
 mod probe;
+mod probe_budget;
 mod schedule;
 mod sweep;
 mod walk_order;

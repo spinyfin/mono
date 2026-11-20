@@ -416,8 +416,8 @@ fn probed_terminal(results: &HashMap<String, std::result::Result<PrLifecycleProb
 /// `budget` is the same cap the loop applies as a timeout. The in-pass
 /// clock uses a shorter deadline so groups can yield; `Duration::MAX`
 /// disables that. A pass dropped at its budget leaves `state` describing
-/// how far it got; nothing it did not reach is lost, because the next
-/// pass's rotation starts with exactly those candidates.
+/// how far it got. Unfinished observations remain retryable; subsequent
+/// passes prioritize candidates least recently attended.
 pub async fn run_one_pass_tracked(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
@@ -435,6 +435,12 @@ pub async fn run_one_pass_tracked(
     let trace = &state.trace;
     trace.begin();
     let clock = PassClock::start(budget);
+    let pass_probe = crate::probe_budget::PassProbe {
+        inner: probe,
+        state,
+        pass_end: clock.yield_at,
+    };
+    let probe: &dyn MergeProbe = &pass_probe;
     trace.enter(PassPhase::ListCandidates, 0);
     let in_review = match work_db.list_chores_pending_merge_check() {
         Ok(items) => items,
@@ -606,6 +612,7 @@ pub async fn run_one_pass_tracked(
     // One batched GitHub request, so the phase is one item: entering with
     // `probe_urls.len()` and never finishing those items would report every
     // probed URL as unfinished even on a healthy pass.
+    state.probe_order.lock().unwrap().retain(&probe_urls);
     trace.enter(PassPhase::Probe, 1);
     let source_observation_sequences = allocate_source_observation_sequences(work_db, completion_handler, &probe_urls);
     let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
