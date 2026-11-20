@@ -57,6 +57,9 @@ pub enum DependencyDirection {
 #[builder(on(String, into))]
 pub struct DependencyEdge {
     pub id: String,
+    /// Product-local numeric identity; absent for unresolved peers or older engines.
+    #[serde(default)]
+    pub short_id: Option<i64>,
     pub kind: String,
     pub name: String,
     pub relation: String,
@@ -72,6 +75,9 @@ pub struct DependencyEdge {
     /// Actionable condition that caused an archived peer's transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_reason: Option<String>,
+    /// Product owning the peer, used to disambiguate cross-product edges.
+    #[serde(default)]
+    pub product_slug: Option<String>,
 }
 
 /// Predicate applied to `boss <kind> list` requests to surface only
@@ -148,4 +154,23 @@ pub struct WorkItemDependencyView {
     pub work_item_id: String,
     pub dependents: Vec<WorkItemDependency>,
     pub prerequisites: Vec<WorkItemDependency>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DependencyEdge;
+
+    #[test]
+    fn older_dependency_edges_decode_without_display_identity() {
+        let edge: DependencyEdge = serde_json::from_value(serde_json::json!({
+            "id": "task_legacy",
+            "kind": "task",
+            "name": "Legacy prerequisite",
+            "relation": "blocks",
+            "status": "todo"
+        }))
+        .unwrap();
+        assert_eq!(edge.short_id, None);
+        assert_eq!(edge.product_slug, None);
+    }
 }

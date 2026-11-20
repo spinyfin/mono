@@ -330,6 +330,12 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
     if peer_id.starts_with("proj_") {
         if let Some(project) = query_project(conn, peer_id)? {
             return Ok(DependencyEdge {
+                short_id: project.short_id,
+                product_slug: Some(conn.query_row(
+                    "SELECT slug FROM products WHERE id = ?1",
+                    params![project.product_id],
+                    |row| row.get(0),
+                )?),
                 id: project.id,
                 relation: relation.to_owned(),
                 kind: "project".to_owned(),
@@ -348,6 +354,12 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
             _ => "task",
         };
         return Ok(DependencyEdge {
+            short_id: task.short_id,
+            product_slug: Some(conn.query_row(
+                "SELECT slug FROM products WHERE id = ?1",
+                params![task.product_id],
+                |row| row.get(0),
+            )?),
             id: task.id,
             relation: relation.to_owned(),
             kind: kind.to_owned(),
@@ -359,6 +371,8 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
         });
     }
     Ok(DependencyEdge {
+        short_id: None,
+        product_slug: None,
         id: peer_id.to_owned(),
         relation: relation.to_owned(),
         kind: "unknown".to_owned(),
