@@ -29,6 +29,16 @@ use crate::terminal_work_sweep::{self, WorkerReaper};
 /// happened.
 type TeardownLog = Arc<std::sync::Mutex<Vec<String>>>;
 
+fn teardown_collaborators() -> CompletionCollaborators {
+    CompletionCollaborators {
+        // These fixtures have no worker processes. A host-wide scan can be
+        // inconclusive under concurrent tests and retain the lease before the
+        // cube stub reaches its gate, obscuring the teardown race under test.
+        workspace_occupancy: Arc::new(crate::workspace_lease_release::EmptyOccupancy),
+        ..crate::completion_adapters::completion_collaborators()
+    }
+}
+
 fn log_step(log: &TeardownLog, step: &str) {
     log.lock().expect("teardown log mutex poisoned").push(step.to_owned());
 }
@@ -286,7 +296,7 @@ async fn sweep_does_not_reap_a_worker_whose_pane_teardown_is_in_flight() {
             Arc::new(RecordingPublisher::default()),
             pane.clone(),
             Arc::new(RecordingProbeQueuer::default()),
-            crate::completion_adapters::completion_collaborators(),
+            teardown_collaborators(),
         )
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
         .with_teardown_registry(teardown_registry.clone()),
@@ -394,7 +404,7 @@ async fn sweep_does_not_reap_a_worker_behind_a_slow_cube_release() {
             Arc::new(RecordingPublisher::default()),
             pane.clone(),
             Arc::new(RecordingProbeQueuer::default()),
-            crate::completion_adapters::completion_collaborators(),
+            teardown_collaborators(),
         )
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
         .with_teardown_registry(teardown_registry.clone()),
@@ -481,7 +491,7 @@ async fn pr_completion_teardown_runs_pane_then_driver_then_cube() {
         Arc::new(RecordingPublisher::default()),
         pane.clone(),
         Arc::new(RecordingProbeQueuer::default()),
-        crate::completion_adapters::completion_collaborators(),
+        teardown_collaborators(),
     )
     .with_branch_verifier(StubBranchVerifier::ok("boss/test"));
 
