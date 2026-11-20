@@ -5,6 +5,78 @@ use common::{run_boss, run_boss_expect_failure, run_boss_human};
 use harness::{TestEngine, create_chore, create_product, create_project, create_task};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn environment_product_scopes_search_and_ids_with_explicit_overrides() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let alpha = create_product(&mut client, "Alpha").await?;
+    let beta = create_product(&mut client, "Beta").await?;
+    let a = create_chore(&mut client, &alpha.id, "Shared alpha").await?;
+    let b = create_chore(&mut client, &beta.id, "Shared beta").await?;
+    let outside = create_chore(&mut client, &beta.id, "Outside").await?;
+    assert_eq!(a.short_id, b.short_id);
+    let run = |flags: &[&str], product: &str| {
+        std::process::Command::new(common::boss_binary())
+            .args([
+                "--json",
+                "--no-input",
+                "--no-autostart",
+                "--socket-path",
+                engine.socket_str(),
+                "task",
+                "list",
+            ])
+            .args(flags)
+            .env("BOSS_PRODUCT", product)
+            .output()
+    };
+    let short = a.short_id.unwrap().to_string();
+    for flags in [vec!["--ids", &short], vec!["--match", "Shared"]] {
+        let output = run(&flags, &alpha.slug)?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["tasks"].as_array().unwrap().len(), 1, "{value}");
+        assert_eq!(value["tasks"][0]["id"], a.id);
+        let output = run(&flags, "unknown-product")?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unknown product"));
+        let mut explicit = flags.clone();
+        explicit.extend(["--product", &beta.slug]);
+        for env in [alpha.slug.as_str(), "unknown-product"] {
+            let output = run(&explicit, env)?;
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(value["tasks"].as_array().unwrap().len(), 1, "{value}");
+            assert_eq!(value["tasks"][0]["id"], b.id);
+        }
+    }
+    let outside_short = outside.short_id.unwrap().to_string();
+    let output = run(&["--ids", &outside_short], &alpha.slug)?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no matching row"));
+    for env in [alpha.slug.as_str(), "unknown-product"] {
+        let output = run(&["--all-products", "--match", "Shared"], env)?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let rows = value["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row["id"] == a.id));
+        assert!(rows.iter().any(|row| row["id"] == b.id));
+        let output = run(&["--all-products", "--ids", &short], env)?;
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("ambiguous") && error.contains(&a.id) && error.contains(&b.id),
+            "{error}"
+        );
+        let output = run(&["--all-products", "--ids", &outside_short], env)?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["tasks"][0]["id"], outside.id);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn searches_products_and_composes_filters() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;

@@ -80,6 +80,46 @@ async fn list_filters_resolve_product_scope_and_reject_unknown_selectors() -> Re
     run_boss(engine.socket_str(), &["task", "depend", "add", &revision.id, &chore.id])?;
     select_product(&mut client, &products[0].id).await?;
 
+    for (flag, expected) in [
+        ("--parent", vec![revision.id.as_str()]),
+        ("--prerequisites-of", vec![chore.id.as_str()]),
+        ("--dependents-of", vec![task.id.as_str(), revision.id.as_str()]),
+    ] {
+        let anchor = if flag == "--dependents-of" { chore } else { task };
+        let other = if flag == "--dependents-of" {
+            &rows[0].2
+        } else {
+            &rows[0].1
+        };
+        let number = anchor.short_id.unwrap().to_string();
+        let error = run_boss_expect_failure(engine.socket_str(), &["task", "list", "--all-products", flag, &number])?;
+        assert!(
+            error.contains("ambiguous") && error.contains(&anchor.id) && error.contains(&other.id),
+            "{error}"
+        );
+        for selector in [format!("{}/{}", products[1].slug, number), anchor.id.clone()] {
+            let value = run_boss(
+                engine.socket_str(),
+                &["task", "list", "--all-products", flag, &selector],
+            )?;
+            let mut actual: Vec<_> = value["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect();
+            let mut expected = expected.clone();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "{flag} {selector}: {value}");
+        }
+        let error = run_boss_expect_failure(engine.socket_str(), &["task", "list", "--all-products", flag, "999999"])?;
+        assert!(
+            error.contains("no work item") || error.contains("could not resolve"),
+            "{error}"
+        );
+    }
+
     let cases = [
         (
             "task",

@@ -22,7 +22,10 @@ pub(crate) async fn run(client: &mut BossClient, ctx: &RunContext, args: TaskLis
     let repo = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
     let products = list_products(client).await?;
     let cross_product = args.all_products
-        || (args.product.is_none() && args.project.is_none() && (args.match_term.is_some() || !args.ids.is_empty()));
+        || (args.product.is_none()
+            && selector_scope::environment_product().is_none()
+            && args.project.is_none()
+            && (args.match_term.is_some() || !args.ids.is_empty()));
     let scope = if cross_product {
         None
     } else {
