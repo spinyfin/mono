@@ -727,6 +727,8 @@ impl CommandRunner for PrJsonOnly<'_> {
 
 #[test]
 fn head_is_fetched_from_the_pull_ref_when_only_it_serves_the_head() {
+    // The pull-ref fallback spawns bare git; PATH-changing tests share this lock.
+    let _env = super::support::ENV_MUTEX.lock().unwrap();
     let f = Fixture::new();
     let head = base_repo_serving_only_a_pull_ref(&f);
     assert_eq!(f.commit(&format!("present({head})")), "", "head must start absent");
@@ -796,6 +798,8 @@ fn normal_sweep_prunes_expired_fetch_remotes_without_fetching() {
 
 #[test]
 fn pull_ref_ignores_a_github_remote_with_a_similar_repo_name() {
+    // The pull-ref fallback spawns bare git; PATH-changing tests share this lock.
+    let _env = super::support::ENV_MUTEX.lock().unwrap();
     let f = Fixture::new();
     let head = base_repo_serving_only_a_pull_ref(&f);
     f.jj(
