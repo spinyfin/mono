@@ -1,5 +1,17 @@
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
+sh_test(
+    name = "flaky_report_test",
+    size = "small",
+    srcs = ["flaky_report_test.sh"],
+    data = [
+        "flaky_report_test.py",
+        "//:.ci.bazelrc",
+        "//.buildkite/steps:bazel-build-test.sh",
+        "//.buildkite/steps:report-flaky-tests.py",
+    ],
+)
+
 # Script-level test for the per-host Bazel disk-cache GC cap that ci-env.sh
 # computes: known filesystem sizes map to the expected cap, and an
 # unresolvable cache directory, unusable df output or missing rc line fails
