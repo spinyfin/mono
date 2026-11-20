@@ -15,9 +15,11 @@ sh_test(
     args = [
         "$(location repobin-shim.sh)",
         "$(location install-workspace-shims.sh)",
+        "$(location workspace-shim-policy)",
     ],
     data = [
         "install-workspace-shims.sh",
         "repobin-shim.sh",
+        "workspace-shim-policy",
     ],
 )

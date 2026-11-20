@@ -81,6 +81,10 @@ fn checkleft_push_guard_script_has_the_load_bearing_logic() {
     assert!(s.contains("is_push_command"), "must detect push commands");
     assert!(s.contains("BOSS_CHECKLEFT_BIN"), "must honour the binary override");
     assert!(
+        s.contains("repobin_declares_checkleft") && s.contains("tomllib"),
+        "must detect a declared checkleft via the engine's TOML rules (tomllib) so the fail-closed path cannot be gutted"
+    );
+    assert!(
         s.contains("resolve_repobin") && s.contains("\"exec\""),
         "must prefer dispatching through `repobin exec checkleft` so the gate never \
          runs a stale checkleft resolved from a bare PATH lookup",
@@ -177,6 +181,43 @@ fn heal_worker_settings_json_refreshes_checkleft_push_guard_script() {
 // Bash tool_input payload, using a fake checkleft binary so the gate's
 // block/approve behaviour is verified end-to-end and deterministically.
 
+/// Write an executable fake `checkleft` that records it ran into `marker`
+/// and exits 0. Used as a PATH decoy: the marker must not exist after a
+/// declared-repo push.
+fn write_decoy_checkleft(dir: &Path, marker: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("checkleft");
+    let script = format!(
+        "#!/bin/sh\nprintf 'decoy ran\\n' >> {}\nexit 0\n",
+        shell_quote(&marker.display().to_string())
+    );
+    std::fs::write(&path, script).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// Write a non-executable file that subprocess.run cannot exec (PermissionError).
+fn write_nonexecutable_checkleft(dir: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, b"not executable\n").unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+fn python3_has_tomllib() -> bool {
+    std::process::Command::new("python3")
+        .args(["-c", "import tomllib"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Write an executable fake `checkleft` that prints `stdout` and exits
 /// with `exit_code`. Returns its path.
 fn write_fake_checkleft(dir: &Path, name: &str, exit_code: i32, stdout: &str) -> PathBuf {
@@ -221,6 +262,8 @@ fn run_push_guard(command: &str, cwd: &Path, checkleft_bin: &Path) -> serde_json
 
     let mut child = std::process::Command::new("python3")
         .arg(&script_path)
+        .env_remove("BOSS_WORKER_BIN_DIR")
+        .env_remove("BOSS_BIN_DIR")
         .env("BOSS_CHECKLEFT_BIN", checkleft_bin)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -529,7 +572,8 @@ fn push_guard_blocks_declared_repobin_checkleft_when_workspace_entry_is_missing(
     )
     .unwrap();
     let path_dir = TempDir::new().unwrap();
-    let decoy = write_fake_checkleft(path_dir.path(), "checkleft", 0, "wrong PATH checkleft ran");
+    let decoy_marker = dir.path().join("decoy-invoked");
+    write_decoy_checkleft(path_dir.path(), &decoy_marker);
 
     let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
     assert_eq!(
@@ -542,10 +586,14 @@ fn push_guard_blocks_declared_repobin_checkleft_when_workspace_entry_is_missing(
         "must name the missing workspace entry: {reason}"
     );
     assert!(
-        reason.contains("install-workspace-shims.sh"),
-        "must name the repair command: {reason}"
+        reason.contains("repobin install --bin-dir bin/"),
+        "without the mono installer, must name the generic repair: {reason}"
     );
-    assert!(decoy.exists(), "the decoy is present only to prove it was not selected");
+    assert!(
+        !decoy_marker.exists(),
+        "the PATH decoy must never have run: {}",
+        decoy_marker.display()
+    );
 }
 
 #[test]
@@ -672,4 +720,244 @@ fn push_guard_reports_internal_error_when_only_stderr() {
         reason.contains("unsupported jj diff summary line"),
         "block reason must include the stderr detail: {reason}",
     );
+}
+
+#[test]
+fn push_guard_blocks_declared_pins_checkleft_when_workspace_entry_is_missing() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("REPOBIN.toml"),
+        "  [pins.checkleft]  \nrepo = \"https://example.invalid/mono.git\"\n",
+    )
+    .unwrap();
+    let path_dir = TempDir::new().unwrap();
+    let decoy_marker = dir.path().join("decoy-invoked");
+    write_decoy_checkleft(path_dir.path(), &decoy_marker);
+
+    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
+    assert_eq!(
+        decision["decision"], "block",
+        "a declared [pins.checkleft] must not fall back to PATH: {decision}"
+    );
+    let reason = decision["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("bin/checkleft"),
+        "must name the missing workspace entry: {reason}"
+    );
+    assert!(
+        !decoy_marker.exists(),
+        "the PATH decoy must never have run: {}",
+        decoy_marker.display()
+    );
+}
+
+#[test]
+fn push_guard_names_mono_installer_when_present() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("REPOBIN.toml"),
+        "[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let installer = dir.path().join("tools/repobin/shim/install-workspace-shims.sh");
+    std::fs::create_dir_all(installer.parent().unwrap()).unwrap();
+    std::fs::write(&installer, "#!/bin/sh\n").unwrap();
+
+    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[]);
+    assert_eq!(decision["decision"], "block", "{decision}");
+    let reason = decision["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("install-workspace-shims.sh"),
+        "must name the installer when it exists: {reason}"
+    );
+    assert!(
+        !reason.contains("repobin install --bin-dir bin/"),
+        "must not name the generic repair when the installer exists: {reason}"
+    );
+}
+
+#[test]
+fn push_guard_blocks_when_declared_checkleft_raises() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("REPOBIN.toml"),
+        "[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let blocked = write_nonexecutable_checkleft(dir.path(), "not-executable-checkleft");
+    let decision = run_push_guard("jj git push -b boss/foo --allow-new", dir.path(), &blocked);
+    assert_eq!(
+        decision["decision"], "block",
+        "a declared checkleft that cannot exec must block: {decision}"
+    );
+    let reason = decision["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("did not complete"),
+        "must name the fail-closed exception: {reason}"
+    );
+    assert!(
+        reason.contains("repobin install --bin-dir bin/"),
+        "non-timeout exception must name a repair: {reason}"
+    );
+}
+
+#[test]
+fn push_guard_approves_when_undeclared_checkleft_raises() {
+    let dir = TempDir::new().unwrap();
+    let blocked = write_nonexecutable_checkleft(dir.path(), "not-executable-checkleft");
+    let decision = run_push_guard("jj git push -b boss/foo --allow-new", dir.path(), &blocked);
+    assert_eq!(
+        decision["decision"], "approve",
+        "an undeclared repo with no bin/checkleft must fail open on exec error: {decision}"
+    );
+}
+
+#[test]
+fn push_guard_blames_unusable_checkleft_override_not_workspace_entry() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("REPOBIN.toml"),
+        "[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_checkleft(&bin_dir, "checkleft", 0, "workspace checkleft would have passed");
+    let missing = dir.path().join("missing-override-checkleft");
+    let decision = run_push_guard("jj git push -b boss/foo --allow-new", dir.path(), &missing);
+    assert_eq!(
+        decision["decision"], "block",
+        "an unusable override in a declaring repo must block: {decision}"
+    );
+    let reason = decision["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("BOSS_CHECKLEFT_BIN"),
+        "must blame the override: {reason}"
+    );
+    assert!(
+        reason.contains("missing-override-checkleft"),
+        "must name the override path: {reason}"
+    );
+    assert!(
+        !reason.contains("is missing or not executable"),
+        "must not blame bin/checkleft when the override is the cause: {reason}"
+    );
+}
+
+#[test]
+fn push_guard_toml_declaration_matches_engine_shapes() {
+    // Same texts as declarations_use_toml_syntax_and_ignore_string_contents
+    // in worker-bin. tomllib (Python 3.11+) matches the engine; the line-match
+    // fallback on macOS 3.9 only agrees on canonical section headers and
+    // commented-out lines.
+    let has_tomllib = python3_has_tomllib();
+    let canonical = [
+        "[tools.checkleft]\ntarget = \"//:tool\"",
+        "[pins.checkleft]\nrepo = \"https://example.invalid/mono.git\"",
+    ];
+    let extra_declared: &[&str] = &[
+        "[tools.\"checkleft\"]\ntarget = '//:tool#name'",
+        "[ tools.checkleft ]\ntarget = '//:tool'",
+        "[tools]\n\"checkleft\" = { target = '//:tool' }",
+        "tools.checkleft.target = '//:tool'",
+        "tools = { checkleft = { target = '//:tool' } }",
+        "[pins.\"checkleft\"]\nrepo = \"https://example.invalid/mono.git\"",
+        "[ pins.checkleft ]\nrepo = \"https://example.invalid/mono.git\"",
+        "[pins]\n\"checkleft\" = { repo = \"https://example.invalid/mono.git\" }",
+        "pins.checkleft.repo = \"https://example.invalid/mono.git\"",
+        "pins = { checkleft = { repo = \"https://example.invalid/mono.git\" } }",
+    ];
+    let extra_undeclared: &[&str] = &[
+        "description = '''\n[tools.checkleft]\n'''",
+        "description = \"\"\"\n[pins.checkleft]\n\"\"\"",
+        "[tools.checkleft]\ntarget =",
+    ];
+    let always_undeclared = ["# [tools.checkleft]\nversion = 1"];
+
+    let mut declared: Vec<&str> = canonical.to_vec();
+    if has_tomllib {
+        declared.extend_from_slice(extra_declared);
+    }
+    for text in declared {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("REPOBIN.toml"), text).unwrap();
+        let path_dir = TempDir::new().unwrap();
+        let decoy_marker = dir.path().join("decoy-invoked");
+        write_decoy_checkleft(path_dir.path(), &decoy_marker);
+        let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
+        assert_eq!(
+            decision["decision"], "block",
+            "declared shape must not fall back to PATH: {text:?} {decision}"
+        );
+        assert!(!decoy_marker.exists(), "PATH decoy ran for declared shape: {text:?}");
+    }
+
+    let mut undeclared: Vec<&str> = always_undeclared.to_vec();
+    if has_tomllib {
+        undeclared.extend_from_slice(extra_undeclared);
+    }
+    for text in undeclared {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("REPOBIN.toml"), text).unwrap();
+        let path_dir = TempDir::new().unwrap();
+        let decoy_marker = dir.path().join("decoy-invoked");
+        write_decoy_checkleft(path_dir.path(), &decoy_marker);
+        let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[path_dir.path()]);
+        assert_eq!(
+            decision["decision"], "approve",
+            "undeclared shape must fail open (PATH decoy ok): {text:?} {decision}"
+        );
+    }
+}
+
+#[test]
+fn push_guard_trusts_worker_bin_launcher_over_toml_fallback() {
+    // Engine already decided: BOSS_WORKER_BIN_DIR set without a launcher
+    // means the workspace does not declare checkleft, even if REPOBIN.toml
+    // has a canonical [tools.checkleft] table.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("REPOBIN.toml"),
+        "[tools.checkleft]\ntarget = \"//tools/checkleft:checkleft\"\n",
+    )
+    .unwrap();
+    let worker_bin = TempDir::new().unwrap();
+    let path_dir = TempDir::new().unwrap();
+    let decoy_marker = dir.path().join("decoy-invoked");
+    write_decoy_checkleft(path_dir.path(), &decoy_marker);
+    let decision = run_push_guard_resolving_with_env(
+        "jj git push -b boss/foo --allow-new",
+        dir.path(),
+        &[path_dir.path()],
+        &[("BOSS_WORKER_BIN_DIR", worker_bin.path())],
+    );
+    assert_eq!(
+        decision["decision"], "approve",
+        "a pinned worker bin without a launcher must not treat TOML as required: {decision}"
+    );
+    assert!(
+        decoy_marker.exists(),
+        "PATH fallback is allowed when the engine did not pin a launcher"
+    );
+
+    // Launcher present (even a non-executable file) means required: PATH
+    // decoy must not run, and the missing workspace entry blocks.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("REPOBIN.toml"), "# [tools.checkleft]\nversion = 1\n").unwrap();
+    let worker_bin = TempDir::new().unwrap();
+    write_nonexecutable_checkleft(worker_bin.path(), "checkleft");
+    let path_dir = TempDir::new().unwrap();
+    let decoy_marker = dir.path().join("decoy-invoked");
+    write_decoy_checkleft(path_dir.path(), &decoy_marker);
+    let decision = run_push_guard_resolving_with_env(
+        "jj git push -b boss/foo --allow-new",
+        dir.path(),
+        &[path_dir.path()],
+        &[("BOSS_WORKER_BIN_DIR", worker_bin.path())],
+    );
+    assert_eq!(
+        decision["decision"], "block",
+        "a pinned launcher must require checkleft even when TOML does not declare it: {decision}"
+    );
+    assert!(!decoy_marker.exists(), "PATH decoy ran despite a pinned launcher");
 }

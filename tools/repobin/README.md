@@ -115,7 +115,13 @@ checkout it lives in and `exec`s `repobin exec <tool> -- "$@"`, so the
 result is exactly what a `repobin install`ed symlink gives — at the cost of
 one `bazel build` per invocation (a no-op when warm) instead of at install
 time. mono's `.cube/setup.yaml` runs the installer on every workspace lease,
-where the lease's time budget rules out building at install time.
+where the lease's time budget rules out building at install time. A
+`shim/workspace-shim-policy` file next to the installer (this checkout ships
+one) supplies default `SKIP`/`REQUIRE` lists so a bare
+`bash tools/repobin/shim/install-workspace-shims.sh` applies the same policy
+the lease does; `REPOBIN_SHIM_SKIP` / `REPOBIN_SHIM_REQUIRE` override it when
+set. Skipped names that already point at `repobin-shim.sh` are removed so a
+later run converges.
 
 The shim never searches `PATH` for the tool (or for repobin); a missing
 bazel, a failed build, a tool `REPOBIN.toml` does not declare, or a cwd
