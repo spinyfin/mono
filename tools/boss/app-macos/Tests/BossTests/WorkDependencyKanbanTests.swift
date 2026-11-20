@@ -733,8 +733,7 @@ final class WorkDependencyKanbanTests: XCTestCase {
                 items: items,
                 column: .doing,
                 boardStyle: .classic,
-                model: model,
-                liveStates: model.liveWorkerStates
+                model: model
             )
         )
         hosting.frame = frame

@@ -11,6 +11,13 @@ private let workNoticeLog = Logger(subsystem: "dev.spinyfin.bossmacapp", categor
 
 @MainActor
 final class ChatViewModel: ObservableObject {
+    private var presentationUpdateStore: WorkPresentationUpdates?
+    var presentationUpdates: WorkPresentationUpdates {
+        if let presentationUpdateStore { return presentationUpdateStore }
+        let store = WorkPresentationUpdates(model: self)
+        presentationUpdateStore = store
+        return store
+    }
     @Published var criticalPriorityRequests: [CriticalPriorityRequest] = []
     @Published var navigationMode: NavigationMode = .agents
     @Published var isConnected: Bool = false
@@ -843,7 +850,7 @@ final class ChatViewModel: ObservableObject {
     /// Root task ids for which `retry_review_guide` has been sent but
     /// `review_guide_retry_queued` (or `work_error`) has not yet arrived.
     /// Guards against a duplicate tap on the card's Retry affordance.
-    var retryingReviewGuideRootTaskIDs: Set<String> = []
+    @Published var retryingReviewGuideRootTaskIDs: Set<String> = []
 
     /// Indirection for opening the review-terminal window. Installed by
     /// [[ContentView]] using `@Environment(\.openWindow)`. Called on
@@ -1260,6 +1267,8 @@ final class ChatViewModel: ObservableObject {
     /// `worker.live_states`) from re-walking the projects/tasks/chores trees.
     var cachedNavigatorSections: [NavigatorSectionRows]?
     var cachedNavigatorCompatibility: (message: String?, computed: Bool)?
+    var cachedSidebarCounts: WorkSidebarCounts?
+    var cachedParkedProjects: [String: WorkProject]?
     var cachedVisibleItems: [WorkTask]?
     var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
     let boardDiagnostics = BoardDiagnostics()
@@ -1334,8 +1343,11 @@ final class ChatViewModel: ObservableObject {
     /// updates so a status flip does not rebuild the dependency graph or
     /// the full id index when bucket membership is unchanged.
     func invalidateWorkCache(_ keys: WorkCacheInvalidation) {
+        presentationUpdateStore?.workDataChanged()
         boardDiagnostics.record("invalidate", ["keys": String(keys.rawValue)])
         if keys.contains(.boardLayout) {
+            cachedSidebarCounts = nil
+            cachedParkedProjects = nil
             cachedNavigatorSections = nil
             cachedNavigatorCompatibility = nil
             cachedVisibleItems = nil

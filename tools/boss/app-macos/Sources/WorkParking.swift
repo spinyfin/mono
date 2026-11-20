@@ -196,14 +196,16 @@ extension ChatViewModel {
     /// card in one of these is "finishing its current run".
     static let liveExecutionStatuses: Set<String> = ["claimed", "running", "waiting_human"]
 
-    /// Parked projects across every product, keyed by id. Built once per
-    /// pass (board filter, sidebar counts) so per-row checks are dictionary
+    /// Parked projects across every product, keyed by id. Cached across
+    /// renders until work data changes, so per-row checks are dictionary
     /// lookups instead of a linear project scan per task.
     var parkedProjectsByID: [String: WorkProject] {
+        if let cachedParkedProjects { return cachedParkedProjects }
         var result: [String: WorkProject] = [:]
         for projects in projectsByProductID.values {
             for project in projects where project.isParked { result[project.id] = project }
         }
+        cachedParkedProjects = result
         return result
     }
 
@@ -235,10 +237,7 @@ extension ChatViewModel {
     /// Parked open tasks and chores in `projectID`, for the sidebar count.
     /// Revision rows follow their parent and are not counted separately.
     func parkedTaskCount(forProjectID projectID: String) -> Int {
-        let parkedProjects = parkedProjectsByID
-        return (tasksByProjectID[projectID] ?? []).filter {
-            $0.kind != "revision" && isParked($0, parkedProjects: parkedProjects)
-        }.count
+        sidebarCounts.projects[projectID, default: .init()].parked
     }
 
     /// What the card context menu offers for `task`.

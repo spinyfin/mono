@@ -70,7 +70,7 @@ enum BossRevisionReviewCapture {
                 } else {
                     WorkBoardSectionItemsView(
                         items: items, column: key, boardStyle: .productDefault,
-                        model: model, liveStates: model.liveWorkerStates
+                        model: model
                     )
                 }
             }
