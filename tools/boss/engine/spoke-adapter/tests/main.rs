@@ -215,7 +215,7 @@ fn peer_command(id: &str) -> Command {
 
 #[tokio::test]
 async fn a_spawn_timeout_is_uncertain_and_a_retry_never_starts_a_second_worker() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(500)).await;
     fx.ready(HOST);
     fx.ready("other");
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -274,7 +274,7 @@ fn standard_without_spawn(command: &Command) -> Option<CommandResult> {
 
 #[tokio::test]
 async fn a_result_that_arrives_after_a_reconnect_answers_the_stored_spawn() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(500)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let first = fx.spoke(Box::new(standard_without_spawn), None, 0).await;
