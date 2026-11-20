@@ -17,9 +17,13 @@ impl WorkDb {
 /// Both Doing membership and task captions consume this projection.
 pub(super) fn held_review_stages(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, String>> {
     let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("c.ancestor_id");
+    // A member counts as started once its reviewer ran or reported. The batch is
+    // anchored to when the implementation run began (not when it was finalized),
+    // because the push's batch is created before the finish time is recorded.
+    let started_member = "AND (e.started_at IS NOT NULL OR e.status = 'running' OR m.status = 'reported')";
     let mut stmt = conn.prepare(&format!(
-        "WITH RECURSIVE chain(revision_id, ancestor_id, implementation_finished_at) AS (
-            SELECT t.id, t.id, (SELECT COALESCE(e.finished_at, e.created_at) FROM work_executions e
+        "WITH RECURSIVE chain(revision_id, ancestor_id, implementation_started_at) AS (
+            SELECT t.id, t.id, (SELECT COALESCE(e.started_at, e.created_at) FROM work_executions e
                 WHERE e.work_item_id = t.id AND e.kind = 'revision_implementation'
                 ORDER BY e.created_at DESC, e.id DESC LIMIT 1) FROM tasks t
             WHERE t.kind = 'revision' AND t.status = 'active' AND t.deleted_at IS NULL
@@ -28,21 +32,21 @@ pub(super) fn held_review_stages(conn: &Connection) -> rusqlite::Result<std::col
                    WHERE e.work_item_id = t.id AND e.kind = 'revision_implementation'
                    ORDER BY e.created_at DESC, e.id DESC LIMIT 1) = 'completed'
             UNION
-            SELECT c.revision_id, t.parent_task_id, c.implementation_finished_at FROM chain c
+            SELECT c.revision_id, t.parent_task_id, c.implementation_started_at FROM chain c
             JOIN tasks t ON t.id = c.ancestor_id WHERE t.parent_task_id IS NOT NULL
         ), stages AS (
             SELECT c.revision_id, CASE b.status WHEN 'applying' THEN 3
                        WHEN 'supervising' THEN 2 ELSE 1 END AS stage
             FROM chain c JOIN pr_review_batches b ON b.cycle_root_id = c.ancestor_id
-            WHERE b.phase = 'pre_merge' AND b.created_at >= c.implementation_finished_at
+            WHERE b.phase = 'pre_merge' AND b.created_at >= c.implementation_started_at
               AND b.status NOT IN ('completed', 'failed')
               AND (b.status IN ('supervising', 'applying') OR EXISTS (
                   SELECT 1 FROM pr_review_batches started
                   JOIN pr_review_batch_members m ON m.batch_id = started.id
                   LEFT JOIN work_executions e ON e.id = m.execution_id
                   WHERE started.cycle_root_id = b.cycle_root_id AND started.phase = 'pre_merge'
-                    AND started.created_at >= c.implementation_finished_at
-                    AND (e.started_at IS NOT NULL OR e.status = 'running' OR m.status = 'reported')))
+                    AND started.created_at >= c.implementation_started_at
+                    {started_member}))
             UNION ALL
             SELECT c.revision_id, 1 FROM chain c
             WHERE ({needs_readmission}) AND EXISTS (
@@ -50,8 +54,8 @@ pub(super) fn held_review_stages(conn: &Connection) -> rusqlite::Result<std::col
                 JOIN pr_review_batch_members m ON m.batch_id = started.id
                 LEFT JOIN work_executions e ON e.id = m.execution_id
                 WHERE started.cycle_root_id = c.ancestor_id AND started.phase = 'pre_merge'
-                  AND started.created_at >= c.implementation_finished_at
-                  AND (e.started_at IS NOT NULL OR e.status = 'running' OR m.status = 'reported'))
+                  AND started.created_at >= c.implementation_started_at
+                  {started_member})
             UNION ALL
             SELECT c.revision_id, CASE WHEN EXISTS (
                 SELECT 1 FROM pr_review_batch_members m WHERE m.execution_id = e.id AND m.role = 'supervisor'
