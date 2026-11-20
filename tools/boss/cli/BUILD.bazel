@@ -680,3 +680,28 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+rust_test(
+    name = "task_list_search_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/task_list_search.rs",
+    ],
+    crate_root = "tests/task_list_search.rs",
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":common",
+        ":harness",
+        "//tools/boss/client",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

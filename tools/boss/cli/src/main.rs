@@ -175,6 +175,7 @@ mod project_create_args;
 mod project_deps;
 mod report;
 mod status_args;
+mod task_list;
 mod time_fmt;
 mod work_cmds;
 mod work_update_args;

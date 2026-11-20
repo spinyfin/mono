@@ -166,6 +166,7 @@ async fn list_all_work_items_for_product(client: &mut BossClient, product_id: &s
 async fn send_list_tasks(client: &mut BossClient, product_id: &str) -> Result<Vec<Task>, CliError> {
     match client
         .send_request(&FrontendRequest::ListTasks {
+            query: Default::default(),
             product_id: product_id.to_owned(),
             project_id: None,
             dep_filter: None,

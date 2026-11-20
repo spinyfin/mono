@@ -105,6 +105,9 @@ pub(crate) struct TaskListCriteria<'a> {
     pub(crate) statuses: &'a [TaskStatusArg],
     #[builder(default)]
     pub(crate) priorities: &'a [TaskPriority],
+    #[builder(default)]
+    pub(crate) kinds: &'a [boss_protocol::TaskKind],
+    pub(crate) created_since: Option<i64>,
     pub(crate) match_term: Option<&'a str>,
     #[builder(default)]
     pub(crate) ids: &'a [String],
@@ -146,6 +149,15 @@ pub(crate) fn apply_task_list_filters(
     items
         .into_iter()
         .filter(|task| {
+            if !criteria.kinds.is_empty() && !criteria.kinds.contains(&task.kind) {
+                return false;
+            }
+            if let Some(since) = criteria.created_since {
+                let created = boss_engine_utils::iso8601::parse_stored_timestamp(&task.created_at);
+                if !created.is_some_and(|created| created >= since) {
+                    return false;
+                }
+            }
             if !show_archived && task.status.as_str() == "archived" {
                 return false;
             }
@@ -330,6 +342,14 @@ pub(crate) fn print_projects_table(projects: &[Project], with_primary_id: bool) 
 }
 
 pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
+    print_tasks_table_with_products(tasks, with_primary_id, None);
+}
+
+pub(crate) fn print_tasks_table_with_products(
+    tasks: &[Task],
+    with_primary_id: bool,
+    products: Option<&HashMap<&str, &str>>,
+) {
     // Only render the EFFORT column when at least one row in the
     // view carries a level — keeps the common case (legacy rows)
     // narrow but surfaces the new field as soon as it lands on
@@ -375,6 +395,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     if !show_short_id || with_primary_id {
         header.push("ID");
     }
+    if products.is_some() {
+        header.push("PRODUCT");
+    }
     header.push("NAME");
     if show_kind {
         header.push("KIND");
@@ -412,6 +435,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         }
         if !show_short_id || with_primary_id {
             row.push(task.id.clone());
+        }
+        if let Some(products) = products {
+            row.push(products.get(task.product_id.as_str()).copied().unwrap_or("").to_owned());
         }
         row.push(task.name.clone());
         if show_kind {

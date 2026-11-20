@@ -81,17 +81,30 @@ pub(crate) async fn list_tasks(
     dep_filter: Option<DependencyFilter>,
     include_deleted: bool,
 ) -> Result<Vec<Task>, CliError> {
-    rpc_call!(
+    list_tasks_query(
         client,
-        FrontendRequest::ListTasks {
-            product_id: product_id.to_owned(),
-            project_id: project_id.map(str::to_owned),
-            dep_filter,
-            include_deleted,
-        },
-        "tasks list",
-        FrontendEvent::TasksList { tasks, .. } => tasks,
+        product_id,
+        project_id,
+        dep_filter,
+        include_deleted,
+        Default::default(),
     )
+    .await
+}
+
+pub(crate) async fn list_tasks_query(
+    client: &mut BossClient,
+    product_id: &str,
+    project_id: Option<&str>,
+    dep_filter: Option<DependencyFilter>,
+    include_deleted: bool,
+    query: boss_protocol::TaskListQuery,
+) -> Result<Vec<Task>, CliError> {
+    rpc_call!(client, FrontendRequest::ListTasks {
+        product_id: product_id.to_owned(),
+        project_id: project_id.map(str::to_owned),
+        dep_filter, include_deleted, query,
+    }, "tasks list", FrontendEvent::TasksList { tasks, .. } => tasks)
 }
 
 pub(crate) async fn list_chores(

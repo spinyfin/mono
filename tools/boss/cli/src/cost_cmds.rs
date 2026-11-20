@@ -121,7 +121,7 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
 
 /// Parse a `--since`/`--until` bound: an RFC3339 timestamp, or a
 /// relative duration ago (`24h`, `7d`, `2w`) resolved against `now`.
-fn parse_epoch_bound(input: &str, now: i64) -> Result<i64, CliError> {
+pub(crate) fn parse_epoch_bound(input: &str, now: i64) -> Result<i64, CliError> {
     let trimmed = input.trim();
     if let Some(epoch) = boss_engine_utils::iso8601::parse_iso8601_lenient(trimmed) {
         return Ok(epoch);
