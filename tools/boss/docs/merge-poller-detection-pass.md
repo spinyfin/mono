@@ -65,7 +65,8 @@ turning into PRs that are never observed:
   later group so recovery still makes progress.
 - **Rotation.** The PR walk, background nudges and the per-execution rechecks
   are ordered least recently attended first, and that memory is kept across
-  passes. Whatever one pass did not reach is what the next pass starts with.
+  passes. Subsequent passes prioritize candidates least recently attended,
+  with known terminal candidates first.
   A candidate is marked when the pass starts on it, so a candidate whose own
   handling is what exhausts the budget goes to the back of the next pass
   instead of cutting every pass off in the same place. Open walk, local
@@ -120,16 +121,35 @@ mid-flight` carries `cut_off_phase`, `cut_off_item`, `items_unfinished` and
 `phases` reads `phase=<ms>ms(<done>/<total>)`, for example:
 
 ```text
-list_candidates=14ms probe=910ms(47/47) terminal_walk=38ms(1/1) open_walk=178000ms(12/46)[cut off at chore_x]
+list_candidates=14ms probe=910ms(1/1) terminal_walk=38ms(1/1) open_walk=178000ms(12/46)[cut off at chore_x]
 ```
 
 To read it:
 
-- **`probe` is large.** The batched request was slow, or it fell back to
-  probing PRs one at a time. Look for `batched probe graphql` lines: a
-  response that carries errors for some PRs re-probes only those; a response
-  with no usable body, or an error that names no PR, re-probes all of them
-  and says so at `warn`.
+- **`probe` is large.** The phase always shows `(1/1)`: it is one item that
+  covers the batched request plus everything done inside it. The batched
+  request was slow, it fell back, or it made per-PR calls. Look for
+  `batched probe graphql` lines: a response that carries errors for some PRs
+  re-probes only those; a response with no usable body, or an error that
+  names no PR, is retried in halves (bisected) and says so at `warn`, down
+  to a single PR probed on its own. Each initial probe or refresh shares a
+  deadline of the smaller of 30 seconds and one quarter of the pass's
+  remaining time. Every awaited batch, individual probe and combined-status
+  request is cancelled at that deadline; completed observations survive and
+  unfinished URLs return retryable errors.
+  Before splitting, URLs are ordered least recently attended first, with
+  previously observed terminal PRs first. Starting a fallback batch or
+  individual probe advances attendance, including when cancelled.
+  The trace reports `probe_fallback=<ms>ms(attempted=…,completed=…,deferred=…)`
+  across bisection and individual calls, counting distinct URLs per probe
+  invocation. Completed counts cover usable fallback observations; deferred
+  counts cover fallback URLs without a completed observation. Fallback time
+  covers bisection and individual fallback spans, including
+  combined-status work inside those spans; nested spans are counted once.
+  `probe_combined_status` separately reports elapsed time and attempted,
+  completed and deferred request counts for actual empty-rollup REST calls
+  (including ETag requests). Both measurements survive cancellation and
+  overlap their enclosing phase; do not add them to total pass time.
 - **`open_walk` is large.** The walk is local DB work, a dozen or so short
   queries per PR. Look for `work DB connection lock timing` lines whose
   `caller` is under `merge-poller/`: a large `wait_ms` means the walk is

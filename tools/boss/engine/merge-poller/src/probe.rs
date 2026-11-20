@@ -6,8 +6,10 @@ pub use boss_observation_contracts::{
 };
 
 /// `MergeProbe` that shells out to `gh pr view <url> --json …`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct CommandMergeProbe {
+    #[cfg(test)]
+    pub(crate) test_runner: Option<TestProbeRunner>,
     /// ETag cache for the commit combined-status REST sub-signal
     /// (`repos/{owner}/{repo}/commits/{sha}/status`, fetched by
     /// [`Self::fetch_commit_combined_state_for_empty_rollup`]), keyed by
@@ -18,7 +20,33 @@ pub struct CommandMergeProbe {
     commit_status_cache: Mutex<HashMap<String, CachedCommitStatus>>,
 }
 
+tokio::task_local! { static RATE_LIMIT_REJECTED: std::cell::Cell<bool>; }
+
+type BoxedBatchProbe<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = HashMap<String, std::result::Result<PrLifecycleProbe, String>>> + Send + 'a>,
+>;
+
+#[cfg(test)]
+pub(crate) type TestProbeRunner = Arc<dyn Fn(Vec<String>) -> TestProbeOutput + Send + Sync>;
+#[cfg(test)]
+type TestProbeOutput =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<std::process::Output>> + Send>>;
+
+impl std::fmt::Debug for CommandMergeProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("CommandMergeProbe").finish_non_exhaustive()
+    }
+}
+
 impl CommandMergeProbe {
+    async fn output(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        if let Some(runner) = &self.test_runner {
+            return runner(args.iter().map(|s| (*s).to_owned()).collect()).await;
+        }
+        gh_output(args).await
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -27,7 +55,7 @@ impl CommandMergeProbe {
 #[async_trait]
 impl MergeProbe for CommandMergeProbe {
     async fn probe(&self, pr_url: &str) -> Result<PrLifecycleProbe> {
-        let output = gh_output(&[
+        let output = self.output(&[
             "pr",
             "view",
             pr_url,
@@ -171,15 +199,68 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
 /// Degrades per-PR, not per-pass: a URL that isn't a canonical GitHub PR
 /// URL, or whose GraphQL node comes back null (PR force-deleted/
 /// transferred — mapped to `ClosedUnmerged`, matching `probe`'s 404
-/// handling), is resolved independently of its siblings. Only a failure of
-/// the batched round trip itself (spawn failure, non-zero `gh` exit,
-/// unparseable response) fails every requested PR for this pass — the
-/// sweep already treats individual probe failures as "retry next pass", so
-/// this is a graceful (if pass-wide) degradation, not a crash.
+/// handling), is resolved independently of its siblings. Query-wide errors,
+/// malformed JSON and non-zero exits without a usable body retry in halves,
+/// reaching individual probes only at singleton leaves. The shared deadline
+/// bounds every await; completed results survive while unfinished URLs return
+/// retryable errors for a later pass. Spawn failures and rate-limit rejections
+/// return retryable errors without amplifying requests.
 impl CommandMergeProbe {
     pub(crate) async fn probe_batch_via_graphql(
         &self,
         pr_urls: &[String],
+    ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        let order = crate::probe_budget::CONTEXT
+            .try_with(|c| c.order.lock().unwrap().order(pr_urls))
+            .unwrap_or_else(|_| pr_urls.to_vec());
+        let results = crate::probe_budget::FALLBACK
+            .scope(Mutex::new(Default::default()), async {
+                let _report = crate::probe_budget::FallbackReport;
+                RATE_LIMIT_REJECTED
+                    .scope(
+                        std::cell::Cell::new(false),
+                        self.probe_batch_with_deadline(&order, crate::probe_budget::deadline()),
+                    )
+                    .await
+            })
+            .await;
+        let _ = crate::probe_budget::CONTEXT.try_with(|c| c.order.lock().unwrap().observe(&results));
+        results
+    }
+
+    /// Re-runs a batch that failed with no usable response (or with an error
+    /// naming no PR) as two half-size batches, recursing until a half
+    /// succeeds or is a single PR (which is then probed on its own). A heavy
+    /// aliased query that times out as a whole usually succeeds at half the
+    /// size, so this costs a handful of batched calls instead of `N` serial
+    /// per-PR calls. Every call shares `deadline`: once it passes, PRs not yet
+    /// reached come back as retryable errors and the next pass tries again.
+    fn probe_batch_bisect<'a>(&'a self, order: &'a [String], deadline: tokio::time::Instant) -> BoxedBatchProbe<'a> {
+        Box::pin(async move {
+            let _fallback = crate::probe_budget::start_fallback(order);
+            if order.len() <= 1 {
+                return self.probe_each_individually(order, deadline).await;
+            }
+            let (left, right) = order.split_at(order.len() / 2);
+            let mut out = self.probe_batch_with_deadline(left, deadline).await;
+            if RATE_LIMIT_REJECTED.try_with(|flag| flag.get()).unwrap_or(false) {
+                out.extend(right.iter().map(|url| {
+                    (
+                        url.clone(),
+                        Err("GitHub API rate limit exceeded; retrying next pass".to_owned()),
+                    )
+                }));
+            } else {
+                out.extend(self.probe_batch_with_deadline(right, deadline).await);
+            }
+            out
+        })
+    }
+
+    async fn probe_batch_with_deadline(
+        &self,
+        pr_urls: &[String],
+        deadline: tokio::time::Instant,
     ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
         let mut out = HashMap::new();
         // Dedup while parsing so a URL repeated in the input (e.g. a PR that's
@@ -210,18 +291,37 @@ impl CommandMergeProbe {
         tracing::debug!(
             pr_count = order.len(),
             repo_count = alias_map.len(),
-            "merge poller: batched probe — one GraphQL query for the whole pass",
+            "merge poller: batched probe — one GraphQL query for this batch",
         );
 
-        let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
+        if tokio::time::Instant::now() >= deadline {
+            let msg = "batched probe fallback budget exhausted; retrying next pass".to_owned();
+            for url in &order {
+                out.insert(url.clone(), Err(msg.clone()));
+            }
+            return out;
+        }
+        crate::probe_budget::attend(&order);
+        let output = match crate::probe_budget::bounded(
+            deadline,
+            self.output(&["api", "graphql", "-f", &format!("query={query}")]),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                for url in &order {
+                    out.insert(url.clone(), Err(err.clone()));
+                }
+                return out;
+            }
+        };
         let body: serde_json::Value = match output {
             Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout) {
                 Ok(v) => v,
                 Err(err) => {
-                    let msg = format!("failed to parse batched probe graphql response: {err}");
-                    for url in &order {
-                        out.insert(url.clone(), Err(msg.clone()));
-                    }
+                    tracing::warn!(%err, "merge poller: invalid batched probe response; retrying in halves");
+                    out.extend(self.probe_batch_bisect(&order, deadline).await);
                     return out;
                 }
             },
@@ -270,6 +370,7 @@ impl CommandMergeProbe {
                     // `throttle_factor` readings stop being a faithful record
                     // of the multiplier actually in force.
                     record_rate_limit_remaining(0, "rate_limit_rejection");
+                    let _ = RATE_LIMIT_REJECTED.try_with(|flag| flag.set(true));
                     let msg = "gh api graphql rejected: GitHub API rate limit exceeded".to_owned();
                     for url in &order {
                         out.insert(url.clone(), Err(msg.clone()));
@@ -279,18 +380,16 @@ impl CommandMergeProbe {
                 match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
                     Ok(v) if v.get("data").is_some_and(|data| data.is_object()) => v,
                     _ => {
-                        // No usable body at all: nothing says which PRs the
-                        // failure covers, so every one is probed on its own.
-                        // That is two or three `gh` calls per PR, one after
-                        // another — loud, because at a few dozen PRs it is
-                        // most of a pass's time budget.
+                        // No usable body identifies affected PRs. Retry in
+                        // halves, reaching individual probes only at leaves,
+                        // with every await bounded by the shared deadline.
                         tracing::warn!(
                             stderr = %stderr.trim(),
                             pr_count = order.len(),
                             "merge poller: batched probe graphql call failed with no usable response — \
-                             probing every PR individually for this pass",
+                             retrying in halves",
                         );
-                        out.extend(probe_each_individually(&order).await);
+                        out.extend(self.probe_batch_bisect(&order, deadline).await);
                         return out;
                     }
                 }
@@ -329,21 +428,26 @@ impl CommandMergeProbe {
                     errors = %body["errors"],
                     pr_count = order.len(),
                     "merge poller: batched probe graphql response carried an error that names no PR — \
-                     probing every PR individually for this pass",
+                     retrying in halves",
                 );
-                out.extend(probe_each_individually(&order).await);
+                out.extend(self.probe_batch_bisect(&order, deadline).await);
                 return out;
             }
         };
 
-        for (url, pr_node) in walk_batch_response(&body, &alias_map) {
-            if untrusted.contains(&url) {
+        let nodes: HashMap<_, _> = walk_batch_response(&body, &alias_map).into_iter().collect();
+        let mut pending = HashMap::new();
+        for url in &order {
+            let pr_node = nodes.get(url).copied().flatten();
+            if untrusted.contains(url) {
+                pending.insert(url.clone(), None);
                 continue;
             }
             let Some(pr_node) = pr_node else {
                 // No PullRequest for this number any more (force-deleted,
                 // transferred) — same "can't decide it's merged just because
                 // we can't see it" fallback as `probe`'s 404 path.
+                crate::probe_budget::completed(url);
                 out.insert(
                     url.clone(),
                     Ok(PrLifecycleProbe::builder()
@@ -355,16 +459,40 @@ impl CommandMergeProbe {
                 );
                 continue;
             };
-            let flat = flatten_batched_pr_node(pr_node).to_string();
-            let combined_state = self.fetch_commit_combined_state_for_empty_rollup(&flat, &url).await;
-            let result = parse_probe_json(&url, &flat, combined_state.as_deref()).map_err(|err| err.to_string());
+            let flat = flatten_batched_pr_node(pr_node);
+            if combined_status_path(&flat, url).is_some() {
+                pending.insert(url.clone(), Some(flat.to_string()));
+                continue;
+            }
+            let result = parse_probe_json(url, &flat.to_string(), None).map_err(|err| err.to_string());
+            if result.is_ok() {
+                crate::probe_budget::completed(url);
+            }
             out.insert(url.clone(), result);
         }
-        if !untrusted.is_empty() {
-            // `probe`'s own 404 handling maps a PR or repo that is really
-            // gone to `ClosedUnmerged`, exactly as before.
-            let affected: Vec<String> = order.iter().filter(|url| untrusted.contains(*url)).cloned().collect();
-            out.extend(probe_each_individually(&affected).await);
+        // Preserve every observation requiring no more I/O before spending
+        // the allowance on status lookups or untrusted nodes.
+        for url in &order {
+            let Some(flat) = pending.remove(url) else { continue };
+            let Some(flat) = flat else {
+                out.extend(self.probe_each_individually(std::slice::from_ref(url), deadline).await);
+                continue;
+            };
+            let combined_state = match self
+                .fetch_commit_combined_state_with_deadline(&flat, url, deadline)
+                .await
+            {
+                Ok(state) => state,
+                Err(err) => {
+                    out.insert(url.clone(), Err(err));
+                    continue;
+                }
+            };
+            let result = parse_probe_json(url, &flat, combined_state.as_deref()).map_err(|err| err.to_string());
+            if result.is_ok() {
+                crate::probe_budget::completed(url);
+            }
+            out.insert(url.clone(), result);
         }
         out
     }
@@ -381,7 +509,8 @@ pub(crate) enum BatchErrorScope {
     Urls(std::collections::HashSet<String>),
     /// An error names nothing in this batch (no `path`, or one that matches
     /// no alias — a query-level failure such as a server-side timeout), so
-    /// no node in the response can be trusted.
+    /// no node can be trusted. Bisect, reaching single-PR probes only at
+    /// leaves, within the shared deadline.
     Whole,
 }
 
@@ -514,25 +643,30 @@ pub(crate) fn walk_batch_response<'a>(
     out
 }
 
-/// Falls back to probing each URL individually via [`CommandMergeProbe::probe`]
-/// when the batched round trip itself failed in a way that isn't isolated
-/// to a single PR (non-zero `gh` exit, or a response carrying a top-level
-/// GraphQL `errors` array). This is what preserves per-PR isolation for
-/// repository-level errors (a tracked PR's repo has been deleted, renamed,
-/// or had access revoked) — `gh api graphql` exits non-zero for those the
-/// same way it would for a genuine transport failure, but unlike a
-/// transport failure, a single unresolvable repo must not stall
-/// reconciliation for every other PR in the pass.
-pub(crate) async fn probe_each_individually(
-    urls: &[String],
-) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
-    let probe = CommandMergeProbe::new();
-    let mut out = HashMap::new();
-    for url in urls {
-        let result = probe.probe(url).await.map_err(|err| err.to_string());
-        out.insert(url.clone(), result);
+impl CommandMergeProbe {
+    /// Probe scoped errors and singleton bisection leaves in their incoming
+    /// attendance order, within the same deadline as their parent batches.
+    async fn probe_each_individually(
+        &self,
+        urls: &[String],
+        deadline: tokio::time::Instant,
+    ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        let _fallback = crate::probe_budget::start_fallback(urls);
+        let mut out = HashMap::new();
+        for url in urls {
+            if tokio::time::Instant::now() < deadline {
+                crate::probe_budget::attend(std::slice::from_ref(url));
+            }
+            let result = crate::probe_budget::bounded(deadline, self.probe(url))
+                .await
+                .and_then(|result| result.map_err(|err| err.to_string()));
+            if result.is_ok() {
+                crate::probe_budget::completed(url);
+            }
+            out.insert(url.clone(), result);
+        }
+        out
     }
-    out
 }
 
 /// Reshape one aliased `pullRequest(...)` node from [`probe_batch_via_graphql`]'s
@@ -687,17 +821,25 @@ impl CommandMergeProbe {
     /// a full re-fetch (doc: `github-event-detection-webhooks-vs-polling`,
     /// §9.2).
     async fn fetch_commit_combined_state_for_empty_rollup(&self, json_body: &str, pr_url: &str) -> Option<String> {
-        let root: serde_json::Value = serde_json::from_str(json_body.trim()).ok()?;
-        let rollup = root.get("statusCheckRollup").and_then(|v| v.as_array())?;
-        if !rollup.is_empty() {
-            return None; // non-empty rollup; use rollup data
+        self.fetch_commit_combined_state_with_deadline(json_body, pr_url, crate::probe_budget::deadline())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn fetch_commit_combined_state_with_deadline(
+        &self,
+        json_body: &str,
+        pr_url: &str,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<Option<String>, String> {
+        let root: serde_json::Value = serde_json::from_str(json_body.trim()).map_err(|err| err.to_string())?;
+        let Some(api_path) = combined_status_path(&root, pr_url) else {
+            return Ok(None);
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err("probe deadline exhausted; retrying next pass".to_owned());
         }
-        let head_sha = root
-            .get("headRefOid")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())?;
-        let repo = repo_from_pr_url(pr_url)?;
-        let api_path = format!("repos/{repo}/commits/{head_sha}/status");
 
         let cached_etag = self
             .commit_status_cache
@@ -717,11 +859,32 @@ impl CommandMergeProbe {
             args.push("-H");
             args.push(header);
         }
-        let output = gh_output(&args).await.ok()?;
+        let mut measurement = crate::probe_budget::Measurement::start("probe_combined_status", 1);
+        measurement.attempt();
+        let _ = crate::probe_budget::CONTEXT.try_with(|c| c.order.lock().unwrap().attempt(pr_url));
+        let output = crate::probe_budget::bounded(deadline, self.output(&args)).await?;
+        let Ok(output) = output else { return Ok(None) };
+        measurement.complete();
 
         let outcome = classify_conditional_output(&output);
-        resolve_and_cache_combined_state(&self.commit_status_cache, &api_path, outcome)
+        Ok(resolve_and_cache_combined_state(
+            &self.commit_status_cache,
+            &api_path,
+            outcome,
+        ))
     }
+}
+
+/// Terminal observations and populated rollups are complete without REST.
+fn combined_status_path(root: &serde_json::Value, pr_url: &str) -> Option<String> {
+    if root.get("state").and_then(|v| v.as_str()) != Some("OPEN")
+        || !root.get("statusCheckRollup")?.as_array()?.is_empty()
+    {
+        return None;
+    }
+    let head = root.get("headRefOid")?.as_str().filter(|s| !s.is_empty())?;
+    let repo = repo_from_pr_url(pr_url)?;
+    Some(format!("repos/{repo}/commits/{head}/status"))
 }
 
 /// Pure parser for GitHub's `repos/{owner}/{repo}/commits/{sha}/status`

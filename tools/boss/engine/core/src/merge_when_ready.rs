@@ -263,6 +263,9 @@ pub async fn resume_after_conflict(
         if !db.merge_conflict_resolution_requested(&candidate.work_item_id, &candidate.pr_url)? {
             return Ok(false);
         }
+        if db.is_parked_or_assume_not(&candidate.work_item_id, "resume merge after conflict") {
+            return Ok(false);
+        }
         // A clean observation can race a mechanical push. Wait until the
         // resolver has finished its safety checks and released the attempt.
         if db
@@ -522,6 +525,15 @@ mod tests {
                 .unwrap();
             db.mark_conflict_resolution_succeeded_at_rung(&attempt.id, Some("resolved-head"), 1)
                 .unwrap();
+            db.park_work_item_as_actor(&task.id, true, Some("pause merge"), "human")
+                .unwrap();
+            resume_after_conflict(&db, &NoopExecutionPublisher, &candidate, &executor).await;
+            assert_eq!(
+                executor.calls.load(Ordering::SeqCst),
+                0,
+                "a parked request cannot resume"
+            );
+            db.park_work_item_as_actor(&task.id, false, None, "human").unwrap();
             resume_after_conflict(&db, &NoopExecutionPublisher, &candidate, &executor).await;
             resume_after_conflict(&db, &NoopExecutionPublisher, &candidate, &executor).await;
             assert_eq!(executor.calls.load(Ordering::SeqCst), 1);

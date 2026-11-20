@@ -7,6 +7,7 @@
 //! still read which phase was in flight, how far through its items it was,
 //! and what every earlier phase cost.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -130,7 +131,7 @@ crate::register_gauge!(
 crate::register_gauge!(
     PASS_ITEMS_UNFINISHED,
     "merge_poller.items_unfinished",
-    "Items the most recent full detection pass listed but did not finish; the next pass starts with them."
+    "Items the most recent full detection pass listed but did not finish; they remain eligible for later passes."
 );
 crate::register_counter!(
     PASSES,
@@ -189,16 +190,35 @@ pub struct PassTimings {
     pub phases: Vec<PhaseTiming>,
     /// The phase in flight. `None` once the pass has run to its end.
     pub in_flight: Option<PhaseTiming>,
+    /// Cancellation-safe probe sub-work, overlapping the enclosing phase.
+    pub probe_work: BTreeMap<String, ProbeWork>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeWork {
+    pub elapsed: Duration,
+    pub attempted: usize,
+    pub completed: usize,
+    pub deferred: usize,
 }
 
 impl PassTimings {
     /// One line naming each phase's cost, e.g.
-    /// `list_candidates=14ms probe=910ms(47/47) open_walk=178000ms(12/46)[cut off at chore_x]`.
+    /// `list_candidates=14ms probe=910ms(1/1) open_walk=178000ms(12/46)[cut off at chore_x]`.
     pub fn breakdown(&self) -> String {
         self.phases
             .iter()
             .map(|phase| phase.render(false))
             .chain(self.in_flight.iter().map(|phase| phase.render(true)))
+            .chain(self.probe_work.iter().map(|(kind, work)| {
+                format!(
+                    "{kind}={}ms(attempted={},completed={},deferred={})",
+                    work.elapsed.as_millis(),
+                    work.attempted,
+                    work.completed,
+                    work.deferred
+                )
+            }))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -276,6 +296,7 @@ struct TraceState {
     started: Option<Instant>,
     finished: Vec<PhaseTiming>,
     open: Option<OpenPhase>,
+    probe_work: BTreeMap<String, ProbeWork>,
 }
 
 impl TraceState {
@@ -357,6 +378,22 @@ impl PassTrace {
         self.state().close_open(now);
     }
 
+    pub(crate) fn record_probe_work(
+        &self,
+        kind: &str,
+        elapsed: Duration,
+        attempted: usize,
+        completed: usize,
+        deferred: usize,
+    ) {
+        let mut state = self.state();
+        let work = state.probe_work.entry(kind.to_owned()).or_default();
+        work.elapsed += elapsed;
+        work.attempted += attempted;
+        work.completed += completed;
+        work.deferred += deferred;
+    }
+
     /// Read the trace. Safe at any point, including after the pass future
     /// was dropped mid-phase.
     pub fn timings(&self) -> PassTimings {
@@ -368,6 +405,7 @@ impl PassTrace {
                 .map(|started| now.saturating_duration_since(started))
                 .unwrap_or_default(),
             phases: state.finished.clone(),
+            probe_work: state.probe_work.clone(),
             in_flight: state.open.as_ref().map(|open| open.timing(now)),
         }
     }
@@ -496,8 +534,9 @@ pub fn detection_stall_health_issue(stall: &DetectionStall, now_epoch_secs: i64)
         title: format!("PR merge detection is running out of time: {passes} did not finish"),
         body: format!(
             "Starting {since}, {passes} did not finish within the {budget}s budget. {cut_off}\n\n\
-             Merged and closed PRs are recorded first on every pass, and each pass resumes with the \
-             items the previous one did not reach, so nothing is skipped. Until a pass walks every \
+             Observed merged and closed PRs are recorded first. Probe fallback attempts rotate \
+             by attendance, prioritizing previously observed terminal candidates; unfinished observations \
+             are retried on later passes. Until a pass walks every \
              open PR, CI, review and merge-queue state on the board can be several minutes behind GitHub.\n\n\
              Phase timings of the most recent pass ({unfinished} item(s) left unfinished):\n{breakdown}\n\n\
              This notice clears itself once a pass walks every open candidate.",
