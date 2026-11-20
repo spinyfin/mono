@@ -225,7 +225,6 @@ fn resolved_lockfile_child_with_legacy_pr_pointer_pushes_only_after_gate_passes(
     };
     let _lock = ENV_MUTEX.lock().unwrap();
     let _env = CheckleftEnvGuard {
-        orig_path: std::env::var_os("PATH"),
         orig_cube_bin: std::env::var_os("CUBE_CHECKLEFT_BIN"),
     };
     let gate_root = repo._dir.path().join("gate");
