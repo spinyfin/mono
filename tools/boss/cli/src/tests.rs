@@ -82,6 +82,8 @@ fn archived_dependency_edge_renders_its_provenance() {
     let line = format_dependency_edge_line(
         &DependencyEdge {
             id: "task_archived".to_owned(),
+            short_id: None,
+            product_slug: None,
             kind: "task".to_owned(),
             name: "Fix CI".to_owned(),
             relation: "blocks".to_owned(),

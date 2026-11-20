@@ -2071,7 +2071,8 @@ pub(crate) fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete
     } else {
         status_vocab::to_ui(&edge.status)
     };
-    let mut line = format!("    {id:<32}  {status:<10}{name}{suffix}", id = edge.id,);
+    let id = boss_protocol::short_id_label(edge.short_id).unwrap_or_else(|| edge.id.clone());
+    let mut line = format!("    {id:<32}  {status:<10}{name}{suffix}");
     if edge.status == "archived" {
         let mechanism = edge.archived_by.as_deref().unwrap_or("unknown");
         let timestamp = edge

@@ -408,6 +408,8 @@ pub(crate) enum ProjectCommand {
     Create(ProjectCreateArgs),
     List(ProjectListArgs),
     Show(ProjectShowArgs),
+    /// Show project dependency edges and unfinished tasks with satisfied prerequisites.
+    Deps(ProjectSelectorArgs),
     Update(ProjectUpdateArgs),
     /// Park a project and cascade onto its open children.
     Park(ProjectParkArgs),

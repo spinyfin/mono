@@ -419,6 +419,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
                 || print_projects_table(&projects, args.with_primary_id),
             )
         }
+        ProjectCommand::Deps(args) => crate::project_deps::run(args, &mut client, ctx).await,
         ProjectCommand::Show(args) => {
             let with_primary_id = args.with_primary_id;
             let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;

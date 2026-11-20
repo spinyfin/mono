@@ -172,6 +172,7 @@ mod idea_commands;
 mod operator_question_text;
 mod output;
 mod project_create_args;
+mod project_deps;
 mod report;
 mod status_args;
 mod time_fmt;
