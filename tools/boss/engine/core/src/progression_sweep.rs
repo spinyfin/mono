@@ -39,11 +39,11 @@
 //! ## Failed launches and the backoff
 //!
 //! A progression run whose agent never started is not an attempt on its item
-//! (`progression_ladder`, "Failed launches"): it starts the item's cooldown,
-//! which is the backoff between launch attempts, but it never files the
+//! (`progression_ladder`, "Failed launches"): it starts a separate launch
+//! backoff (2 minutes, doubling to a 30-minute cap), but it never files the
 //! ladder's question, so a driver whose launch is broken cannot park the items
-//! it is given on the owner. Each item is nominated again when its cooldown
-//! ends, with no limit on how many times.
+//! it is given on the owner. Each item is nominated again when its launch
+//! backoff ends, with no limit on how many times. An agent starting resets it.
 //!
 //! That wait must not be silent. After every pass the sweep reads
 //! [`WorkDb::progression_launch_backoff`] and publishes it on the
@@ -51,7 +51,7 @@
 //! ([`launch_backoff_health_issue`]): how many items are waiting, the error,
 //! and when the next attempt is due. It is derived from the database on each
 //! pass, so an engine restart does not lose it, and it clears on the first pass
-//! after an agent starts or the last such cooldown ends.
+//! after an agent starts or the last such backoff ends.
 //!
 //! A pass also withdraws any infrastructure-failure question that was filed
 //! for failed launches before they stopped being counted, so those items are
@@ -74,7 +74,7 @@ use boss_protocol::EngineHealthIssue;
 use crate::work::{ProgressionLaunchBackoff, WorkDb};
 
 /// Where the sweep publishes progression's launch backoff for the engine
-/// health report: `Some` while stuck items are waiting out the cooldown a
+/// health report: `Some` while stuck items are waiting out the backoff a
 /// failed launch started, `None` otherwise. A watch channel so the health
 /// broadcaster pushes a fresh report on every change without polling.
 pub type LaunchBackoffSignal = tokio::sync::watch::Sender<Option<ProgressionLaunchBackoff>>;
@@ -85,7 +85,7 @@ pub fn launch_backoff_signal() -> Arc<LaunchBackoffSignal> {
 }
 
 /// Wake health rendering on changes, and once a minute during an unchanged
-/// cooldown so relative retry and failure ages keep advancing.
+/// backoff so relative retry and failure ages keep advancing.
 pub async fn wait_for_backoff_health_refresh(
     changes: &mut tokio::sync::watch::Receiver<Option<ProgressionLaunchBackoff>>,
 ) -> Result<(), tokio::sync::watch::error::RecvError> {
@@ -134,7 +134,7 @@ pub fn launch_backoff_health_issue(backoff: &ProgressionLaunchBackoff, now_epoch
             "Latest error ({failed}, execution {execution}):\n{error}\n\n\
              Boss could not start a progression agent for {items}, so nothing is working them. No agent \
              looked at those items, so the failed starts are not counted against them and nothing is asked \
-             of you. Each item is tried again when its cooldown after the failed start ends; the next attempt \
+             of you. Each item is tried again when its launch backoff ends; the next attempt \
              is due {next}. This notice clears itself once an agent starts, or when no item is waiting.",
             execution = backoff.latest_execution_id,
             error = backoff.latest_error,
@@ -252,7 +252,7 @@ pub fn spawn_loop(
                             latest_execution_id = %backoff.latest_execution_id,
                             latest_error = %backoff.latest_error,
                             "progression sweep: backing off after failed agent launches; each waiting item is \
-                             retried when its cooldown ends",
+                             retried when its launch backoff ends",
                         );
                     } else {
                         tracing::debug!(?backoff, "progression sweep: launch backoff unchanged");
@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(progression_runs(&db, &oldest).len(), 1);
     }
 
-    /// A stuck item whose progression agent failed to start an hour ago is
+    /// A stuck item whose progression agent failed to start a minute ago is
     /// neither given up on nor silently skipped: the pass reports the backoff,
     /// the loop publishes it for the health report, and it reads as a plain
     /// sentence with no raw timestamp.
@@ -485,7 +485,7 @@ mod tests {
             .execute(
                 "UPDATE work_executions SET pre_start_failure_count = 1, last_error = ?3,
                     created_at = ?2, started_at = ?2, finished_at = ?2 WHERE id = ?1",
-                rusqlite::params![run.id, now - 3600, ERROR],
+                rusqlite::params![run.id, now - 60, ERROR],
             )
             .unwrap();
         let db = Arc::new(db);
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(
             (outcome.minted, outcome.asked),
             (0, 0),
-            "inside the cooldown: {outcome:?}"
+            "inside the launch backoff: {outcome:?}"
         );
         let backoff = outcome.launch_backoff.clone().expect("the pass reports the backoff");
         assert_eq!(
@@ -511,9 +511,9 @@ mod tests {
         );
         assert_eq!(
             issue.title,
-            "Progression is backing off: its agent failed to start for 1 stuck item; next attempt in about 5 hours"
+            "Progression is backing off: its agent failed to start for 1 stuck item; next attempt in about 1 minute"
         );
-        for expected in [ERROR, run.id.as_str(), "1 hour ago", "nothing is asked of you"] {
+        for expected in [ERROR, run.id.as_str(), "1 minute ago", "nothing is asked of you"] {
             assert!(issue.body.contains(expected), "{expected}: {}", issue.body);
         }
         assert!(!issue.title.contains('Z') && !issue.body.contains("1970"), "{issue:?}");
@@ -545,7 +545,7 @@ mod tests {
         let now = 1_000_000;
         let backoff = ProgressionLaunchBackoff {
             waiting_items: 1,
-            next_attempt_epoch_s: now + 6 * 3600,
+            next_attempt_epoch_s: now + 30 * 60,
             latest_execution_id: "exec_waiting".to_owned(),
             latest_failure_epoch_s: now,
             latest_error: "slot occupied".to_owned(),
@@ -555,15 +555,15 @@ mod tests {
         let mut changes = signal.subscribe();
         let before = launch_backoff_health_issue(&backoff, now);
         let started = tokio::time::Instant::now();
-        for _ in 0..60 {
+        for _ in 0..10 {
             wait_for_backoff_health_refresh(&mut changes).await.unwrap();
         }
         assert_eq!(*changes.borrow(), Some(backoff.clone()));
         assert!(!changes.has_changed().unwrap(), "no sweep update was needed");
         let after = launch_backoff_health_issue(&backoff, now + started.elapsed().as_secs() as i64);
-        assert!(before.title.contains("in about 6 hours"), "{before:?}");
-        assert!(after.title.contains("in about 5 hours"), "{after:?}");
-        assert!(after.body.contains("1 hour ago"), "{after:?}");
+        assert!(before.title.contains("in about 30 minutes"), "{before:?}");
+        assert!(after.title.contains("in about 20 minutes"), "{after:?}");
+        assert!(after.body.contains("10 minutes ago"), "{after:?}");
 
         signal.send_replace(None);
         wait_for_backoff_health_refresh(&mut changes).await.unwrap();

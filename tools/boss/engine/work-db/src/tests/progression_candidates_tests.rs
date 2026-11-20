@@ -1410,7 +1410,7 @@ fn a_run_the_engine_withdrew_before_it_started_is_not_a_failure_or_a_cooldown() 
 }
 
 #[test]
-fn failed_launches_retry_after_cooldown_but_orphaned_runs_count_as_infrastructure_failures() {
+fn failed_launches_retry_after_backoff_but_orphaned_runs_count_as_infrastructure_failures() {
     for status in [ExecutionStatus::Failed, ExecutionStatus::Orphaned] {
         let f = fixture();
         let id = f.stuck_chore("Died before start");
@@ -1433,7 +1433,7 @@ fn failed_launches_retry_after_cooldown_but_orphaned_runs_count_as_infrastructur
                 now()
             ));
             f.assert_candidate(&id, false);
-            assert!(f.clauses(&id).in_cooldown, "failed launches still back off");
+            assert!(!f.clauses(&id).in_cooldown, "launch backoff is separate from cooldown");
             assert_eq!(f.db.progression_launch_backoff().unwrap().unwrap().waiting_items, 1);
         }
     }

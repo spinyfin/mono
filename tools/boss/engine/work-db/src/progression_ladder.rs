@@ -47,7 +47,7 @@
 //! failed) is not an attempt on the item: no agent looked at it. Such a run is
 //! left out of the two runs the `infrastructure_failure` rung counts, so a
 //! driver whose launch is broken cannot turn the stuck items it is given into
-//! questions that blame the items. The item is retried when its cooldown ends,
+//! questions that blame the items. The item is retried when its separate launch backoff ends,
 //! and the wait is reported by `WorkDb::progression_launch_backoff`.
 //!
 //! A question this rung filed while failed launches were still counted has no

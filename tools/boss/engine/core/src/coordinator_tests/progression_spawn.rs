@@ -308,7 +308,10 @@ async fn a_failed_progression_spawn_fails_the_run_but_not_the_item_and_removes_t
             pre_start_failure_count
         );
         let clauses = f.db.progression_clauses(&item_id).unwrap().unwrap();
-        assert!(clauses.in_cooldown && !clauses.infrastructure_failing, "{clauses:?}");
+        assert!(
+            !clauses.in_cooldown && !clauses.cooldown_and_budget_clear && !clauses.infrastructure_failing,
+            "{clauses:?}"
+        );
         let backoff =
             f.db.progression_launch_backoff()
                 .unwrap()
