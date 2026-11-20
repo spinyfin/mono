@@ -4,10 +4,8 @@
 # to stop a bazel server that an earlier job on the same agent left holding the
 # command lock.
 #
-# Bazel and `ps` are not run: the lock probe and the "is this a bazel server"
-# check are overridden by the test (the library documents both as overridable).
-# The pid lookup, the rc parsing and the signalling run for real, against a
-# throwaway process.
+# Only the lock probe is overridden. Identity, lookup and signals run for
+# real against throwaway processes with controlled server arguments.
 #
 # Fixture files are written with printf, not here-documents: bash 3.2 (the
 # macOS /bin/bash) backs here-documents with files under /tmp regardless of
@@ -53,7 +51,7 @@ fi
 make_base aaa /some/other/workspace 111
 make_base bbb "$ws" 222
 got="$(ci_bazel_server_pid "$root" "$ws")" || got="<failed>"
-[[ "$got" == "222" ]] || fail "server_pid: expected 222, got ${got}"
+[[ "$got" == "$(printf '222\n%s' "${root}/bbb")" ]] || fail "server_pid: unexpected result ${got}"
 if ci_bazel_server_pid "$root" "/no/such/workspace" > /dev/null; then
   fail "server_pid: an unknown workspace must fail"
 fi
@@ -70,10 +68,12 @@ _ci_bazel_lock_held() {
   probe_calls=$((probe_calls + 1))
   [[ "$lock_state" == held ]]
 }
-is_bazel=yes
-_ci_bazel_pid_is_bazel_server() { [[ "$is_bazel" == yes ]]; }
+spawn_server() {
+  bash -c 'exec -a "bazel(mono)" /bin/bash -c "$1" fixture -jar /fixture/A-server.jar "--output_base=$2" "--workspace_directory=$3"' fixture "$1" "$2" "$3" > /dev/null 2>&1 &
+  echo $!
+}
 
-# A free lock: nothing is read, probed twice, or signalled.
+# A free lock: nothing is read or signalled, and the lock is probed once.
 lock_state=free
 probe_calls=0
 if ! ci_bazel_release_stale_lock "${tmp}/startup.bazelrc" "$ws" --max_idle_secs=1 > /dev/null 2>&1; then
@@ -85,7 +85,8 @@ fi
 # may continue. The probe reports "free" once the server has exited.
 # Spawn through a subshell so the process is reparented and reaped on exit;
 # a direct child would stay a zombie that `kill -0` still sees.
-victim="$(sleep 300 > /dev/null 2>&1 & echo $!)"
+victim="$(spawn_server 'while :; do sleep 1; done' "${root}/bbb" "$ws")"
+sleep 1
 make_base bbb "$ws" "$victim"
 _ci_bazel_lock_held() { kill -0 "$victim" 2> /dev/null; }
 if ! ci_bazel_release_stale_lock "${tmp}/startup.bazelrc" "$ws" --max_idle_secs=1 > /dev/null 2>&1; then
@@ -97,7 +98,7 @@ if kill -0 "$victim" 2> /dev/null; then
 fi
 
 # A server that ignores SIGTERM is killed after the grace period.
-stubborn="$(bash -c 'trap "" TERM; while :; do sleep 1; done' > /dev/null 2>&1 & echo $!)"
+stubborn="$(spawn_server 'trap "" TERM; while :; do sleep 1; done' "${root}/bbb" "$ws")"
 sleep 1
 make_base bbb "$ws" "$stubborn"
 _ci_bazel_lock_held() { kill -0 "$stubborn" 2> /dev/null; }
@@ -109,17 +110,46 @@ if kill -0 "$stubborn" 2> /dev/null; then
   fail "stubborn server: pid ${stubborn} survived SIGKILL"
 fi
 
+# Foreign servers and commands mentioning bazel must fail the real predicate
+# and survive the full recovery path.
+for kind in workspace base client jar; do
+  case "$kind" in
+    workspace) bystander="$(spawn_server 'while :; do sleep 1; done' "${root}/bbb" "${ws}-other")" ;;
+    base) bystander="$(spawn_server 'while :; do sleep 1; done' "${root}/bbb-other" "$ws")" ;;
+    client) bystander="$(bash -c 'while :; do sleep 1; done' bazel --output_base="${root}/bbb" > /dev/null 2>&1 & echo $!)" ;;
+    jar) bystander="$(bash -c 'exec -a "bazel(mono)" /bin/bash -c "while :; do sleep 1; done" fixture -jar /other.jar "--output_base=$1" "--workspace_directory=$2"' fixture "${root}/bbb" "$ws" > /dev/null 2>&1 & echo $!)" ;;
+  esac
+  sleep 1
+  make_base bbb "$ws" "$bystander"
+  _ci_bazel_lock_held() { return 0; }
+  if ci_bazel_release_stale_lock "${tmp}/startup.bazelrc" "$ws" > /dev/null 2>&1; then
+    fail "$kind: expected identity rejection"
+  fi
+  kill -0 "$bystander" 2> /dev/null || fail "$kind: bystander was signalled"
+  kill -KILL "$bystander" 2> /dev/null || true
+done
+
+# Simulate PID reuse during the grace period by replacing the server argv
+# after TERM. The second identity check must prevent SIGKILL.
+reused="$(spawn_server 'trap "exec sleep 300" TERM; while :; do sleep 1; done' "${root}/bbb" "$ws")"
+sleep 1
+make_base bbb "$ws" "$reused"
+_ci_bazel_lock_held() { return 0; }
+if ci_bazel_release_stale_lock "${tmp}/startup.bazelrc" "$ws" > /dev/null 2>&1; then
+  fail "changed identity: expected refusal to escalate"
+fi
+kill -0 "$reused" 2> /dev/null || fail "changed identity: process was killed"
+kill -KILL "$reused" 2> /dev/null || true
+
 # A held lock whose recorded pid is not a bazel process is never signalled.
 bystander="$(sleep 300 > /dev/null 2>&1 & echo $!)"
 make_base bbb "$ws" "$bystander"
-is_bazel=no
 _ci_bazel_lock_held() { return 0; }
 if ci_bazel_release_stale_lock "${tmp}/startup.bazelrc" "$ws" --max_idle_secs=1 > /dev/null 2>&1; then
   fail "unrelated pid: expected failure"
 fi
 kill -0 "$bystander" 2> /dev/null || fail "unrelated pid: the bystander process was signalled"
 kill -KILL "$bystander" 2> /dev/null || true
-is_bazel=yes
 
 # A held lock with no recorded server, or no way to find one, fails.
 if ci_bazel_release_stale_lock "${tmp}/startup.bazelrc" "/no/such/workspace" --max_idle_secs=1 > /dev/null 2>&1; then

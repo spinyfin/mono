@@ -48,7 +48,7 @@ ci_bazel_output_user_root() {
 
 # ci_bazel_server_pid <output_user_root> <workspace>
 #
-# Prints the pid recorded by the Bazel server whose output base belongs to
+# Prints the pid and output base on separate lines for the server belonging to
 # <workspace>. Each output base under <output_user_root> holds a
 # DO_NOT_BUILD_HERE file containing its workspace path and, while a server owns
 # it, server/server.pid.txt. Returns non-zero when no such server is recorded.
@@ -60,7 +60,7 @@ ci_bazel_server_pid() {
     [[ "$recorded" == "$workspace" ]] || continue
     pid="$(cat "${base}server/server.pid.txt")"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    printf '%s\n' "$pid"
+    printf '%s\n%s\n' "$pid" "${base%/}"
     return 0
   done
   return 1
@@ -69,25 +69,46 @@ ci_bazel_server_pid() {
 # _ci_bazel_lock_held <startup flags...>
 #
 # Succeeds when another command is running on this workspace's Bazel server.
-# `bazel --noblock_for_lock info` (a startup option) exits 9 ("Another command is running. Exiting
-# immediately.") instead of waiting; any other result, including a failure that
-# has nothing to do with the lock, is "not held" so this never invents a stale
-# command. Overridden by the test.
+# Probe with `bazel <startup flags> --noblock_for_lock info server_pid`.
+# --noblock_for_lock is a startup option, so it precedes the command. Bazel
+# exits 9 ("Another command is running. Exiting immediately.") instead of
+# waiting; any other result is treated as "not held". Overridden by the test.
 _ci_bazel_lock_held() {
   local rc=0
   command bazel "$@" --noblock_for_lock info server_pid > /dev/null 2>&1 || rc=$?
   [[ "$rc" -eq 9 ]]
 }
 
-# _ci_bazel_pid_is_bazel_server <pid>
+# _ci_bazel_pid_is_bazel_server <pid> <output_base> <workspace>
 #
-# Succeeds when <pid> is a live process whose command line names bazel, so a
-# stale pid file that now points at an unrelated process is never signalled.
-# Overridden by the test.
+# Require the server marker, server jar, and exact base and workspace startup
+# arguments. Read argv as in tools/boss/worker-processes/src/processes.py;
+# unlike ps output this preserves argument boundaries, including spaces.
 _ci_bazel_pid_is_bazel_server() {
-  local cmdline
-  cmdline="$(ps -p "$1" -o command= 2> /dev/null)" || return 1
-  [[ "$cmdline" == *bazel* ]]
+  python3 -c '
+import ctypes, os, pathlib, struct, sys
+pid, base, workspace = sys.argv[1:]
+try:
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(1024 * 1024)
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0):
+            sys.exit(1)
+        argc = struct.unpack_from("i", buffer)[0]
+        args = buffer.raw[4:size.value].split(b"\0", 1)[1].lstrip(b"\0").split(b"\0")[:argc]
+    else:
+        args = pathlib.Path("/proc", pid, "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+    args = [os.fsdecode(arg) for arg in args]
+    server = bool(args) and args[0].startswith("bazel(") and any(
+        flag == "-jar" and pathlib.Path(value).name == "A-server.jar"
+        for flag, value in zip(args, args[1:]))
+    sys.exit(0 if server and "--output_base=" + base in args
+             and "--workspace_directory=" + workspace in args else 1)
+except (OSError, ValueError, IndexError, struct.error):
+    sys.exit(1)
+' "$1" "$2" "$3"
 }
 
 # ci_bazel_release_stale_lock <startup_bazelrc> <workspace> <startup flags...>
@@ -105,17 +126,19 @@ ci_bazel_release_stale_lock() {
   echo "^^^ +++"
   echo "[ci-env] another bazel command already holds this agent's bazel server at step start; it belongs to an earlier job (one job runs at a time per agent). Stopping that server so this step is not stuck waiting on it."
 
-  local root pid waited=0
+  local root server pid base waited=0
   if ! root="$(ci_bazel_output_user_root "$startup_rc")"; then
     echo "[ci-env] error: cannot find --output_user_root in ${startup_rc}, so the stuck bazel server cannot be located." >&2
     return 1
   fi
-  if ! pid="$(ci_bazel_server_pid "$root" "$workspace")"; then
+  if ! server="$(ci_bazel_server_pid "$root" "$workspace")"; then
     echo "[ci-env] error: no bazel server pid recorded under ${root} for ${workspace}." >&2
     return 1
   fi
-  if ! _ci_bazel_pid_is_bazel_server "$pid"; then
-    echo "[ci-env] error: recorded bazel server pid ${pid} is not a running bazel process; refusing to signal it." >&2
+  pid="${server%%$'\n'*}"
+  base="${server#*$'\n'}"
+  if ! _ci_bazel_pid_is_bazel_server "$pid" "$base" "$workspace"; then
+    echo "[ci-env] error: recorded bazel server pid ${pid} is not the expected bazel server; refusing to signal it." >&2
     return 1
   fi
 
@@ -126,6 +149,10 @@ ci_bazel_release_stale_lock() {
     waited=$((waited + 1))
   done
   if kill -0 "$pid" 2> /dev/null; then
+    if ! _ci_bazel_pid_is_bazel_server "$pid" "$base" "$workspace"; then
+      echo "[ci-env] error: pid ${pid} changed identity after SIGTERM; refusing SIGKILL." >&2
+      return 1
+    fi
     echo "[ci-env] bazel server pid ${pid} ignored SIGTERM for ${waited}s; sending SIGKILL"
     kill -KILL "$pid" 2> /dev/null || true
     sleep 1
