@@ -993,7 +993,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!fallback.exists());
-        assert!(!runtime.control_dir.exists());
+        assert!(runtime.control_dir.is_dir(), "launch evidence survives teardown");
         assert!(
             !runtime.process_home.exists(),
             "a home with durable transcript storage keeps nothing of its own"
@@ -1664,6 +1664,73 @@ mod tests {
             .unwrap();
         let input = permission_input(tmp, run_id, workspace);
         driver.write_permission_config(&input, tmp.path()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn launch_argv_conforms_and_failed_cli_evidence_survives_teardown() {
+        use crate::initial_prompt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        // Exercise shell quoting, including the permission-argument merge.
+        let homes = tmp.path().join("homes with ' spaces");
+        let _guard = env_for_provision(&homes);
+        let binary = homes.join("bin/agy");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, include_str!("agy/testdata/launch.py")).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        for reject in [false, true] {
+            let run_id = if reject { "run-rejected" } else { "run-composer" };
+            let artifacts = armed_run(&tmp, run_id).await;
+            fs::write(agent_rules_path_for_run(run_id).unwrap(), "Fixture worker rules").unwrap();
+            let plan = AgyDriver::default().spawn_invocation(spawn_request(
+                "gemini-4-hydrogen-medium",
+                Some("medium"),
+                Some(run_id),
+            ));
+            let command = crate::apply_permission_extra_args(&plan.command, &artifacts.extra_args);
+            let mut shell = std::process::Command::new("/bin/sh");
+            shell.arg("-c").arg(&command).stdin(std::process::Stdio::null());
+            for directive in plan.env {
+                match directive {
+                    EnvDirective::Set(key, value) => {
+                        shell.env(key, value);
+                    }
+                    EnvDirective::Unset(key) => {
+                        shell.env_remove(key);
+                    }
+                }
+            }
+            shell.env_remove("AGY_FAKE_REJECT");
+            if reject {
+                shell.env("AGY_FAKE_REJECT", "1");
+            }
+            let output = crate::bounded_command::run_bounded_as(
+                &mut shell,
+                std::time::Duration::from_secs(15),
+                "fake agy launch",
+            )
+            .unwrap();
+            let control = control_dir_for_run(run_id).unwrap();
+            if reject {
+                assert_eq!(output.status.code(), Some(initial_prompt::BRIEF_NOT_DELIVERED_EXIT));
+                let diagnostics = initial_prompt::startup_failure_diagnostics(&control).unwrap();
+                assert!(diagnostics.contains("CLI exit status: 2"), "{diagnostics}");
+                assert!(diagnostics.contains("rejected invocation sentinel"), "{diagnostics}");
+                assert!(!initial_prompt::delivered_marker_present(&control));
+                home::reclaim_agy_run(&process_home_for_run(run_id).unwrap()).unwrap();
+                assert!(control.join("agy.log").is_file());
+                assert!(control.join("session-settings.json").is_file());
+                assert_eq!(
+                    initial_prompt::startup_failure_diagnostics(&control).unwrap(),
+                    diagnostics
+                );
+            } else {
+                assert!(output.status.success(), "{output:?}\n{command}");
+                assert!(initial_prompt::delivered_marker_present(&control));
+                assert!(initial_prompt::startup_failure_diagnostics(&control).is_none());
+            }
+        }
     }
 
     #[tokio::test]

@@ -240,7 +240,7 @@ fn process_home_for_run_with(homes: &Path, run_id: &str) -> PathBuf {
 }
 
 #[test]
-fn reclaim_keeps_conversations_and_brain_and_removes_the_rest() {
+fn reclaim_keeps_control_and_legacy_transcripts_and_removes_process_settings() {
     let tmp = TempDir::new().unwrap();
     let homes = tmp.path().join("homes");
     let _guard = env_for_provision(&homes);
@@ -260,7 +260,8 @@ fn reclaim_keeps_conversations_and_brain_and_removes_the_rest() {
     fs::write(rules_root.join("AGENTS.md"), b"drop-rules").unwrap();
     let control = container.join("control");
     fs::create_dir_all(&control).unwrap();
-    fs::write(control.join("session-settings.json"), b"drop-control").unwrap();
+    fs::write(control.join("session-settings.json"), b"keep-control").unwrap();
+    fs::write(control.join("agy.log"), b"startup failure").unwrap();
 
     reclaim_agy_run(&process_home).unwrap();
 
@@ -269,7 +270,11 @@ fn reclaim_keeps_conversations_and_brain_and_removes_the_rest() {
     assert!(!cli.join("settings.json").exists());
     assert!(!cli.join("log").exists());
     assert!(!container.join("rules-root").exists());
-    assert!(!control.exists());
+    assert_eq!(
+        fs::read_to_string(control.join("session-settings.json")).unwrap(),
+        "keep-control"
+    );
+    assert_eq!(fs::read_to_string(control.join("agy.log")).unwrap(), "startup failure");
 }
 
 #[test]
@@ -438,7 +443,7 @@ fn only_the_brain_link_is_exempt_from_the_private_tree_symlink_ban() {
 }
 
 #[test]
-fn a_durable_home_is_unprotected_and_reclaimed_whole_while_its_transcript_remains() {
+fn a_durable_home_retains_control_until_the_sweep_while_its_transcript_remains() {
     let tmp = TempDir::new().unwrap();
     let homes = tmp.path().join("homes");
     let _guard = env_for_provision(&homes);
@@ -459,9 +464,11 @@ fn a_durable_home_is_unprotected_and_reclaimed_whole_while_its_transcript_remain
 
     assert_eq!(
         fs::read_dir(&container).unwrap().count(),
-        0,
-        "nothing is retained in the home"
+        1,
+        "only the control directory is retained for the bounded sweep"
     );
+    assert!(runtime.control_dir.is_dir());
+    assert!(!runtime.process_home.exists());
     assert_eq!(
         fs::read_to_string(durable_dir(&homes, "run-reclaim").join("cid-1").join(TRANSCRIPT_LEAF)).unwrap(),
         "durable\n"

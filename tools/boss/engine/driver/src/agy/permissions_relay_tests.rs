@@ -173,6 +173,25 @@ spec.loader.exec_module(launcher)
 assert launcher.take_terminal_replies(b"\x1b[24;80R", b"") == (b"\x1b[24;80R", b"", False)
 assert launcher.take_terminal_replies(b"hello", b"")[2]
 assert launcher.take_terminal_replies(b"\x1b[1;", b"") == (b"", b"\x1b[1;", False)
+for color in (b"10", b"11", b"12"):
+    for terminator in (b"\x07", b"\x1b\\"):
+        reply = b"\x1b]" + color + b";rgb:ab/CD01/2" + terminator
+        for split in range(len(reply)):
+            before, pending, refused = launcher.take_terminal_replies(reply[:split], b"")
+            assert not refused, (reply, split)
+            after, pending, refused = launcher.take_terminal_replies(reply[split:], pending)
+            assert not refused and not pending and before + after == reply, (reply, split)
+        assert launcher.take_terminal_replies(reply + b"run me\r", b"") == (reply, b"run me\r", True)
+for invalid in (b"\x1b]52;c;clipboard\x07", b"\x1b]11;rgb:12345/0/0\x07",
+                b"\x1b]11;rgb:0/0/0\r", b"\x1b]11;rgb:0/0/0/0\x07",
+                b"\x1bP>|run me\r\x1b\\", b"\x1bP>|" + b"x" * 129):
+    assert launcher.take_terminal_replies(invalid, b"")[2], invalid
+reply = b"\x1bP>|tmux 3.5a\x1b\\"
+for split in range(len(reply)):
+    before, pending, refused = launcher.take_terminal_replies(reply[:split], b"")
+    assert not refused, split
+    after, pending, refused = launcher.take_terminal_replies(reply[split:], pending)
+    assert not refused and not pending and before + after == reply, split
 (root / "stub.py").write_text('''
 import os, pathlib, select, sys, time, tty
 root = pathlib.Path(__file__).parent
@@ -182,6 +201,17 @@ response = b""
 while not response.endswith(b"R"):
     response += os.read(0, 4096)
 assert response == b"\\x1b[24;10R", response
+# agy's Bubble Tea startup requests terminal colors before settings admission.
+os.write(1, b"\\x1b]11;?\\x07")
+response = b""
+while not response.endswith(b"\\x1b\\\\"):
+    response += os.read(0, 4096)
+assert response == b"\\x1b]11;rgb:1212/3434/5656\\x1b\\\\", response
+os.write(1, b"\\x1b[>q")
+response = b""
+while not response.endswith(b"\\x1b\\\\"):
+    response += os.read(0, 4096)
+assert response == b"\\x1bP>|tmux 3.5a\\x1b\\\\", response
 os.write(1, b"QUERY_OK")
 assert not select.select([0], [], [], 0.3)[0], "brief before initialization"
 (root / "agy.log").write_text("CLI settings initialized: " + sys.argv[1] + "\\n")
@@ -217,6 +247,10 @@ def wait_for(marker):
 try:
     wait_for(b"\x1b[6n")
     os.write(master, b"\x1b[24;10R")
+    wait_for(b"\x1b]11;?\x07")
+    os.write(master, b"\x1b]11;rgb:1212/3434/5656\x1b\\")
+    wait_for(b"\x1b[>q")
+    os.write(master, b"\x1bP>|tmux 3.5a\x1b\\")
     wait_for(b"QUERY_OK")
     assert not (root / "initial-prompt.delivered").exists()
     wait_for(b"FIRST_DELIVERED")

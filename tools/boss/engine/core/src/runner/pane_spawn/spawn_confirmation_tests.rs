@@ -736,3 +736,44 @@ async fn agy_blocking_dialog_refusal_is_read_from_the_control_dir() {
         .unwrap_or_else(|| panic!("expected BlockingDialogOnScreen, got {err:#}"));
     assert_eq!(dialog.marker, "Do you trust the contents of this project?");
 }
+
+#[tokio::test(start_paused = true)]
+async fn agy_spawn_error_includes_cli_status_and_stderr_from_the_control_dir() {
+    let workspace = TempDir::new().unwrap();
+    let homes = workspace.path().join("agy-homes");
+    let _homes = crate::driver::test_support::agy_homes_override(&homes);
+    let (spawner, _weak, _cfg, work_db) = spawn_test_env(&workspace);
+    let run_id = "exec-agy-early-exit";
+    let control = homes.join(run_id).join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    std::fs::write(
+        control.join(crate::driver::initial_prompt::DELIVERY_LOG),
+        concat!(
+            "{\"step\":\"driver_exited\",\"at_ms\":0,\"exit_code\":2}\n",
+            "{\"step\":\"startup_failed\",\"at_ms\":0,\"reason\":\"driver exited before receiving the initial brief\",\"output_tail\":\"agy: rejected invocation sentinel\"}\n",
+            "{\"step\":\"failed\",\"at_ms\":0,\"reason\":\"driver exited before receiving the initial brief\"}\n",
+        ),
+    ).unwrap();
+    let tmux = Tmux::with_runner_and_socket("/fake/tmux", spawner.clone(), boss_tmux::TEST_SOCKET_PATH).unwrap();
+    let tmux_host = TmuxWorkerHost::new(tmux, spawner, "boss-test-worker".into());
+    let err = confirm_local_spawn(
+        &tmux_host,
+        &crate::driver::AgyDriver::default(),
+        None,
+        &work_db,
+        run_id,
+        workspace.path(),
+    )
+    .await
+    .expect_err("a CLI that exited cannot become ready");
+    // The dispatcher persists this full error chain as spawn_failed.detail.
+    let message = format!("{err:#}");
+    assert!(message.contains("composer never became ready"), "{message}");
+    assert!(message.contains("CLI exit status: 2"), "{message}");
+    assert!(message.contains("rejected invocation sentinel"), "{message}");
+    assert!(message.contains(control.to_str().unwrap()), "{message}");
+    assert!(
+        err.downcast_ref::<boss_execution_contracts::SpawnConfirmationError>()
+            .is_some()
+    );
+}
