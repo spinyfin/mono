@@ -2,7 +2,9 @@
 //! Verification runs before the write transaction; acceptance rechecks assignment.
 
 use super::*;
-use boss_protocol::{ReviewFindingDisposition, ReviewFindingOutcome, ReviewOutcomesProposalPayload};
+use boss_protocol::{
+    ExecutionKind, ProposalState, ReviewFindingDisposition, ReviewFindingOutcome, ReviewOutcomesProposalPayload,
+};
 use rusqlite::Transaction;
 use std::collections::BTreeSet;
 
@@ -28,8 +30,50 @@ pub(crate) struct PreparedOutcomes {
     payload_json: String,
 }
 
+/// A remediation execution finished without a complete outcome set for its
+/// assigned finding ids. Distinct from a storage failure so Stop/finalize
+/// can surface it as incomplete instead of retrying as `DbError`.
+#[derive(Debug)]
+pub struct ReviewRemediationIncomplete(pub String);
+
+impl std::fmt::Display for ReviewRemediationIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReviewRemediationIncomplete {}
+
+fn remediates_review_findings(kind: ExecutionKind) -> bool {
+    matches!(
+        kind,
+        ExecutionKind::RevisionImplementation
+            | ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::InvestigationImplementation
+    )
+}
+
+fn finding_ids_in_verdict_payload(raw: &str) -> Result<BTreeSet<String>> {
+    let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(raw)?;
+    let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
+    let finding_ids: BTreeSet<_> = verdict
+        .findings
+        .iter()
+        .filter_map(|finding| finding.id.clone())
+        .collect();
+    anyhow::ensure!(
+        finding_ids.is_empty() || finding_ids.len() == verdict.findings.len(),
+        "review verdict has mixed or duplicate finding ids"
+    );
+    Ok(finding_ids)
+}
+
 fn assignment(conn: &Connection, execution_id: &str) -> Result<Option<Assignment>> {
     let execution = query_execution(conn, execution_id).require("execution", execution_id)?;
+    if !remediates_review_findings(execution.kind) {
+        return Ok(None);
+    }
     let mut stmt = conn.prepare(
         "SELECT v.id, p.payload_json FROM pr_review_verdicts v
          JOIN worker_proposals p ON p.id = v.proposal_id
@@ -41,21 +85,11 @@ fn assignment(conn: &Connection, execution_id: &str) -> Result<Option<Assignment
     let mut found = None;
     for row in rows {
         let (verdict_id, raw) = row?;
-        let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(&raw)?;
-        let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
-        let finding_ids: BTreeSet<_> = verdict
-            .findings
-            .iter()
-            .filter_map(|finding| finding.id.clone())
-            .collect();
+        let finding_ids = finding_ids_in_verdict_payload(&raw)?;
         if finding_ids.is_empty() {
             continue;
         }
         anyhow::ensure!(found.is_none(), "multiple review verdicts assigned to this execution");
-        anyhow::ensure!(
-            finding_ids.len() == verdict.findings.len(),
-            "review verdict has mixed or duplicate finding ids"
-        );
         let root = chain_root(conn, &execution.work_item_id)?;
         let pr_url = query_task(conn, &root)?.and_then(|task| task.pr_url);
         found = Some(Assignment {
@@ -95,11 +129,25 @@ impl WorkDb {
             "expected review outcomes"
         );
         // Replays recover the original acknowledgement without another network read.
-        if self
-            .find_worker_proposal_by_idempotency_key(input.execution_id, input.idempotency_key)?
-            .is_some()
+        // A key hit is only a replay when the stored row is still the live set
+        // for this assignment's PR; otherwise the worker must submit again.
+        if let Some(existing) =
+            self.find_worker_proposal_by_idempotency_key(input.execution_id, input.idempotency_key)?
         {
-            return self.submit_worker_proposal_prepared(input, None, &|_| false, None);
+            let assigned = assignment(&*self.connect()?, input.execution_id)?;
+            let replayable = existing.state == ProposalState::Applied
+                && assigned.as_ref().is_some_and(|assigned| {
+                    serde_json::from_str::<StoredOutcomes>(&existing.payload_json)
+                        .ok()
+                        .is_some_and(|stored| stored.pr_url == assigned.pr_url)
+                });
+            if replayable {
+                return self.submit_worker_proposal_prepared(input, None, &|_| false, None);
+            }
+            return Ok(Err(boss_protocol::ProposalSubmissionError::new(
+                boss_protocol::ProposalErrorCode::NotAccepted,
+                "idempotency key already used for a stale outcome set; resubmit with a new key",
+            )));
         }
         let prepared = (|| -> Result<PreparedOutcomes> {
             let assigned = assignment(&*self.connect()?, input.execution_id)?
@@ -139,6 +187,31 @@ impl WorkDb {
     /// Full history, including the execution responsible for each accepted set.
     pub fn review_finding_outcomes(&self, verdict_id: &str) -> Result<Vec<boss_protocol::WorkerProposal>> {
         outcome_records(&*self.connect()?, verdict_id)
+    }
+
+    /// Finding ids this execution must account for, if it remediates a verdict.
+    pub fn assigned_review_finding_ids(&self, execution_id: &str) -> Result<Vec<String>> {
+        Ok(assignment(&*self.connect()?, execution_id)?
+            .map(|assigned| assigned.finding_ids.into_iter().collect())
+            .unwrap_or_default())
+    }
+
+    /// Identified finding ids recorded on a verdict, if any.
+    pub fn review_verdict_finding_ids(&self, verdict_id: &str) -> Result<Vec<String>> {
+        let raw: Option<String> = self
+            .connect()?
+            .query_row(
+                "SELECT p.payload_json FROM pr_review_verdicts v
+             JOIN worker_proposals p ON p.id = v.proposal_id
+             WHERE v.id = ?1",
+                params![verdict_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(raw) => Ok(finding_ids_in_verdict_payload(&raw)?.into_iter().collect()),
+            None => Ok(Vec::new()),
+        }
     }
 }
 
@@ -196,14 +269,16 @@ pub(crate) fn require_complete(conn: &Connection, execution_id: &str) -> Result<
     let Some(assigned) = assignment(conn, execution_id)? else {
         return Ok(());
     };
-    let stored = latest_outcomes(conn, &assigned.verdict_id, Some(execution_id))?.context(
-        "review remediation incomplete: submit boss propose review-outcomes --body-file before declaring done",
-    )?;
-    anyhow::ensure!(
-        stored.pr_url == assigned.pr_url,
-        "remediation PR changed; resubmit review outcomes"
-    );
-    validate_set(&assigned, &stored.submission)
+    let stored = latest_outcomes(conn, &assigned.verdict_id, Some(execution_id))?.ok_or_else(|| {
+        ReviewRemediationIncomplete(
+            "review remediation incomplete: submit boss propose review-outcomes --body-file before declaring done"
+                .into(),
+        )
+    })?;
+    if stored.pr_url != assigned.pr_url {
+        return Err(ReviewRemediationIncomplete("remediation PR changed; resubmit review outcomes".into()).into());
+    }
+    validate_set(&assigned, &stored.submission).map_err(|err| ReviewRemediationIncomplete(err.to_string()).into())
 }
 
 fn latest_outcomes(conn: &Connection, verdict_id: &str, execution_id: Option<&str>) -> Result<Option<StoredOutcomes>> {

@@ -1,6 +1,8 @@
 use super::*;
 use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
-use boss_protocol::{ProposalKind, ProposalState, RunDoneOutcome};
+use boss_protocol::{
+    CreateExecutionInput, ExecutionKind, ExecutionStatus, ProposalKind, ProposalState, RunDoneOutcome,
+};
 use serde_json::json;
 
 const PR: &str = "https://github.com/example/repo/pull/42";
@@ -312,4 +314,103 @@ fn assignment_is_rechecked_after_network_verification() {
         .unwrap();
     assert!(outcome.is_err());
     assert!(require_complete(&db.connect().unwrap(), &execution).is_err());
+}
+
+#[test]
+fn progression_on_a_remediation_task_is_not_gated() {
+    let (_dir, db) = open_db();
+    let (_, task, execution) = fixture(&db, false);
+    let progression = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&task)
+                .kind(ExecutionKind::Progression)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        done(&db, &task, &progression.id, RunDoneOutcome::Delivered),
+        ProposalState::Applied
+    );
+    assert_eq!(
+        done(&db, &task, &execution, RunDoneOutcome::Delivered),
+        ProposalState::Rejected
+    );
+}
+
+#[test]
+fn merged_completion_without_outcomes_terminalizes_as_incomplete() {
+    let (_dir, db) = open_db();
+    let (_, _, execution) = fixture(&db, false);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'running' WHERE id = ?1",
+            params![execution],
+        )
+        .unwrap();
+    let completion = db
+        .record_worker_pr_completion(
+            &execution,
+            PR,
+            Some(&"a".repeat(40)),
+            None,
+            WorkerPrCompletionTarget::Done,
+            None,
+        )
+        .unwrap()
+        .expect("merged completion must terminalize");
+    assert!(completion.execution.status.is_terminal());
+    let items = db.list_attention_items(&execution).unwrap();
+    assert!(
+        items.iter().any(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::REVIEW_OUTCOMES_NOT_SUBMITTED_ATTENTION_KIND
+        }),
+        "{items:?}"
+    );
+    let err = require_complete(&db.connect().unwrap(), &execution).unwrap_err();
+    assert!(err.is::<ReviewRemediationIncomplete>(), "{err:#}");
+}
+
+#[test]
+fn default_idempotency_key_does_not_replay_a_stale_pr_binding() {
+    let (_dir, db) = open_db();
+    let (_, task, execution) = fixture(&db, false);
+    let payload = fixed();
+    let key = payload.to_string();
+    db.submit_review_outcomes(
+        SubmitWorkerProposalInput {
+            execution_id: &execution,
+            work_item_id: &task,
+            kind: ProposalKind::ReviewOutcomes,
+            payload_json: &payload.to_string(),
+            idempotency_key: &key,
+        },
+        &|_, _| Ok(true),
+    )
+    .unwrap()
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            params![task, "https://github.com/example/repo/pull/43"],
+        )
+        .unwrap();
+    assert!(require_complete(&db.connect().unwrap(), &execution).is_err());
+    let replay = db
+        .submit_review_outcomes(
+            SubmitWorkerProposalInput {
+                execution_id: &execution,
+                work_item_id: &task,
+                kind: ProposalKind::ReviewOutcomes,
+                payload_json: &payload.to_string(),
+                idempotency_key: &key,
+            },
+            &|_, _| Ok(true),
+        )
+        .unwrap()
+        .expect_err("stale idempotency key must not replay");
+    assert!(replay.message.contains("stale outcome set"), "{}", replay.message);
 }

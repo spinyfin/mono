@@ -529,6 +529,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          first sweep, every time.",
     ),
     entry(
+        REVIEW_OUTCOMES_NOT_SUBMITTED_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Records that a review-remediation run ended without structured outcomes for its assigned \
+         findings. A later run does not answer those findings; a human judges the incomplete set.",
+    ),
+    entry(
         COMPLETION_WITH_BOUND_PR_ATTENTION_KIND,
         ClearedBy::HumanDecision,
         "Records a completion claim contradicted by an owned PR without merge evidence.

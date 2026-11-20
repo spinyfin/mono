@@ -155,25 +155,43 @@ fn recover_one(db: &WorkDb, submission: &OrphanedGuideSubmission) -> Result<Opti
     db.adopt_and_publish_orphaned_review_guide_submission(submission, &validated.markdown, &payload.body_markdown)
 }
 
-/// Resolve the current PR head, then prove the cited commit is its ancestor.
+/// A cited fix commit must be an ancestor of the PR head and must not also
+/// be an ancestor of the PR base (otherwise any historical main commit passes).
+fn commit_is_on_pr_branch(sha: &str, merge_base_with_head: &str, merge_base_with_base: &str) -> bool {
+    merge_base_with_head.eq_ignore_ascii_case(sha) && !merge_base_with_base.eq_ignore_ascii_case(sha)
+}
+
+/// Resolve the current PR head and base, then prove the cited commit is on
+/// the PR branch (ancestor of head, not of base).
 fn verify_fix_commit(pr_url: &str, sha: &str) -> Result<bool> {
     let (owner, repo, number) =
         boss_github::pr_url::parse_pr_url_parts(pr_url).context("invalid remediation PR URL")?;
     let endpoint = format!("repos/{owner}/{repo}/pulls/{number}");
-    let output = boss_github::gh_runner::gh_output_blocking(&["api", &endpoint, "--jq", ".head.sha"])?;
+    let output =
+        boss_github::gh_runner::gh_output_blocking(&["api", &endpoint, "--jq", "{head: .head.sha, base: .base.sha}"])?;
     anyhow::ensure!(
         output.status.success(),
-        "reading remediation PR head failed: {}",
+        "reading remediation PR refs failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let head = String::from_utf8(output.stdout)?.trim().to_owned();
-    anyhow::ensure!(
-        head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()),
-        "invalid PR head"
-    );
-    let merge_base =
-        boss_github::compare::gh_compare_jq_blocking(&format!("{owner}/{repo}"), sha, &head, ".merge_base_commit.sha")?;
-    Ok(merge_base.eq_ignore_ascii_case(sha))
+    #[derive(serde::Deserialize)]
+    struct PullRefs {
+        head: String,
+        base: String,
+    }
+    let refs: PullRefs = serde_json::from_slice(output.stdout.trim_ascii())?;
+    for (label, value) in [("head", refs.head.as_str()), ("base", refs.base.as_str())] {
+        anyhow::ensure!(
+            value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid PR {label}"
+        );
+    }
+    let repo_slug = format!("{owner}/{repo}");
+    let merge_base_head =
+        boss_github::compare::gh_compare_jq_blocking(&repo_slug, sha, &refs.head, ".merge_base_commit.sha")?;
+    let merge_base_base =
+        boss_github::compare::gh_compare_jq_blocking(&repo_slug, sha, &refs.base, ".merge_base_commit.sha")?;
+    Ok(commit_is_on_pr_branch(sha, &merge_base_head, &merge_base_base))
 }
 
 #[cfg(test)]
@@ -365,5 +383,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt_status, "failed", "the attempt is not reopened");
+    }
+
+    #[test]
+    fn a_base_branch_commit_is_not_on_the_pr_branch() {
+        let sha = "a".repeat(40);
+        let later = "b".repeat(40);
+        assert!(commit_is_on_pr_branch(&sha, &sha, &later));
+        assert!(!commit_is_on_pr_branch(&sha, &sha, &sha));
+        assert!(!commit_is_on_pr_branch(&sha, &later, &later));
     }
 }

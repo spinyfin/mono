@@ -166,7 +166,12 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
                 .iter()
                 .map(finding_outcome_record_json)
                 .collect::<Result<Vec<_>>>()?;
-            Ok(serde_json::json!({"verdict_id": verdict.id, "records": records}))
+            let finding_ids = db.review_verdict_finding_ids(&verdict.id)?;
+            Ok(serde_json::json!({
+                "verdict_id": verdict.id,
+                "records": records,
+                "needs_outcomes": !finding_ids.is_empty(),
+            }))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -262,7 +267,10 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
     }
 
     for entry in &finding_outcomes {
-        println!("finding outcome history for {}:", entry["verdict_id"]);
+        let Some(verdict_id) = finding_outcome_history_heading(entry) else {
+            continue;
+        };
+        println!("finding outcome history for {verdict_id}:");
         if entry["records"].as_array().is_some_and(Vec::is_empty) {
             println!("  no structured outcomes submitted");
         }
@@ -290,6 +298,14 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
     }
 
     Ok(())
+}
+
+fn finding_outcome_history_heading(entry: &serde_json::Value) -> Option<&str> {
+    let records_empty = entry["records"].as_array().is_some_and(Vec::is_empty);
+    if records_empty && !entry["needs_outcomes"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    Some(entry["verdict_id"].as_str().unwrap_or("unknown"))
 }
 
 fn finding_outcome_record_json(record: &boss_protocol::WorkerProposal) -> Result<serde_json::Value> {
@@ -788,6 +804,16 @@ mod tests {
         let json = verdict_json_with_informative_flag(&verdict(REVIEW_GATE_OUTCOME_GAVE_UP));
         assert_eq!(json["informative"], serde_json::json!(false));
     }
+    #[test]
+    fn finding_outcome_heading_skips_clean_and_legacy_and_unquotes_ids() {
+        let clean = serde_json::json!({"verdict_id":"verdict_1","records":[],"needs_outcomes":false});
+        assert_eq!(finding_outcome_history_heading(&clean), None);
+        let missing = serde_json::json!({"verdict_id":"verdict_2","records":[],"needs_outcomes":true});
+        assert_eq!(finding_outcome_history_heading(&missing), Some("verdict_2"));
+        let quoted_display = format!("{}", missing["verdict_id"]);
+        assert_eq!(quoted_display, "\"verdict_2\"");
+    }
+
     #[test]
     fn outcome_json_exposes_findings_and_execution_without_encoded_json() {
         let proposal = boss_protocol::WorkerProposal::builder()

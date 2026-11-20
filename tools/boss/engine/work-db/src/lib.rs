@@ -961,6 +961,7 @@ mod review_guide_jobs;
 mod review_guide_recovery;
 mod review_outcomes;
 pub use review_guide_recovery::OrphanedGuideSubmission;
+pub use review_outcomes::ReviewRemediationIncomplete;
 mod review_guide_sources;
 mod review_guide_submission;
 mod review_section;

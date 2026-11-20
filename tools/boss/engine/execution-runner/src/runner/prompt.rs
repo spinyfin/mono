@@ -126,6 +126,8 @@ pub(super) struct ExecutionPromptParams<'a> {
     bazel_workspace: Option<bool>,
     #[builder(default)]
     remote_workspace: bool,
+    #[builder(default)]
+    review_finding_ids: Vec<String>,
 }
 
 /// The structured-output payload this execution's prompt is built around —
@@ -230,6 +232,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         merge_order_preservation,
         bazel_workspace,
         remote_workspace,
+        review_finding_ids,
     } = params;
     let bazel_workspace = if remote_workspace {
         bazel_workspace
@@ -577,8 +580,8 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         worker_kind_for_execution(&execution.kind) == WorkerKind::Standard,
         bazel_workspace,
     ));
-    if worker_kind_for_execution(&execution.kind) == WorkerKind::Standard {
-        prompt.push_str("\nIf the task description assigns review findings with stable finding ids, submit every id exactly once using `\"$BOSS_BIN\" propose review-outcomes --body-file /absolute/path/outcomes.json` after publishing the fix and before `propose done`. The JSON is {\"outcomes\":[{\"finding_id\":\"C1\",\"outcome\":\"fixed\",\"commit_sha\":\"<full published commit SHA>\"}]}. Outcomes are fixed, not_fixed, or not_applicable. A non-fixed outcome requires a nonempty reason; fixed requires a full commit SHA on your remediation PR branch. Include all ids even when nothing was changed. Unknown, duplicate, or missing ids are errors. Completion without a complete set is refused. This structured record replaces the legacy findings-status comment for findings with ids; do not post that template for them. Legacy findings without ids retain the comment instructions.\n");
+    if !review_finding_ids.is_empty() {
+        prompt.push_str(&format!("\nThis run is assigned review findings [{}]. Submit every id exactly once using `\"$BOSS_BIN\" propose review-outcomes --body-file /absolute/path/outcomes.json` after publishing the fix and before `propose done`. The JSON is {{\"outcomes\":[{{\"finding_id\":\"C1\",\"outcome\":\"fixed\",\"commit_sha\":\"<full published commit SHA>\"}}]}}. Outcomes are fixed, not_fixed, or not_applicable. A non-fixed outcome requires a nonempty reason; fixed requires a full commit SHA on your remediation PR branch. Include all ids even when nothing was changed. Unknown, duplicate, or missing ids are errors. Completion without a complete set is refused. This structured record replaces the legacy findings-status comment for findings with ids; do not post that template for them. Legacy findings without ids retain the comment instructions.\n", review_finding_ids.join(", ")));
     }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
