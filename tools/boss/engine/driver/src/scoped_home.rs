@@ -445,6 +445,9 @@ mod tests {
             let lock = SCOPED_HOME_ENV_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Bind Bazel's isolated root before clearing TEST_TMPDIR. Registry
+            // and transcript tests resolve it concurrently without this lock.
+            boss_log_files::default_state_root().expect("Bazel supplies an isolated state root");
             let mut prior = Vec::new();
             for (key, value) in pairs {
                 prior.push((*key, std::env::var_os(key)));
@@ -486,6 +489,28 @@ mod tests {
             "BAZELISK_HOME",
             "TEST_TMPDIR",
         ]
+    }
+
+    #[test]
+    fn registry_resolves_state_root_while_host_environment_is_cleared() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = EnvGuard::set_and_clear(&[("HOME", tmp.path())], &host_clear());
+        let wrapper_root = _guard
+            .prior
+            .iter()
+            .find_map(|(key, value)| (*key == "TEST_TMPDIR").then_some(value))
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert!(std::env::var_os("TEST_TMPDIR").is_none());
+        // Registration probes Codex progress wiring, which resolves the durable
+        // transcript store beneath the isolated Boss state root.
+        let registry = crate::registry::DriverRegistry::default();
+        assert!(registry.require("codex").is_ok());
+        assert_eq!(
+            boss_log_files::default_state_root().unwrap(),
+            PathBuf::from(wrapper_root)
+        );
     }
 
     #[test]
