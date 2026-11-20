@@ -343,6 +343,17 @@ final class WorkerSlotSnapshotTests: XCTestCase {
         let caption = snap.live?.waitCaption
         XCTAssertTrue(caption?.hasPrefix("Waiting: bazel test · until ") == true, caption ?? "nil")
 
+        let overdue = Self.makeLiveState(
+            activity: .waitOverdue, liveStatus: nil,
+            waitReason: "bazel test", waitExpiresAt: "2026-10-09T12:00:00Z"
+        )
+        let overdueSnap = WorkerSlotSnapshot.build(slot: slot, liveState: overdue)
+        XCTAssertEqual(overdueSnap.statusPillLabel, "Wait overdue")
+        XCTAssertEqual(
+            overdueSnap.live?.waitCaption,
+            AgentActivityState.overdueCaption(reason: "bazel test")
+        )
+
         // A prompt raised mid-turn keeps `.waitingForInput`: still the
         // owner's, so no wait caption even though the reason is carried.
         let midTurn = Self.makeLiveState(activity: .waitingForInput, waitReason: "bazel test")

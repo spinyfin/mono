@@ -881,6 +881,40 @@ async fn snapshot_normalizes_a_legacy_input_state_to_waiting_on_work() {
 }
 
 #[tokio::test]
+async fn overdue_snapshot_keeps_the_wait_reason() {
+    let (server_state, _dir) = test_server_state();
+    let execution_id = spawned_worker(&server_state);
+
+    dispatch_worker_event_fanout(&server_state, &pre_tool_use(&execution_id, "Bash", 1)).await;
+    declare_wait(&server_state, &execution_id);
+    dispatch_worker_event_fanout(&server_state, &stop(&execution_id, 2)).await;
+    assert_eq!(snapshot(&server_state).activity, WorkerActivity::WaitingOnWork);
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    server_state
+        .wait_registry
+        .declare_after(&execution_id, WAIT_REASON.to_owned(), None, 60, now - 3600, Some(1))
+        .expect("wait is within budget");
+    let changed = server_state.live_worker_states.reconcile_declared_waits(now);
+    assert_eq!(
+        changed,
+        vec![(SLOT, WorkerActivity::WaitingOnWork, WorkerActivity::WaitOverdue)]
+    );
+
+    let overdue = snapshot(&server_state);
+    assert_eq!(overdue.activity, WorkerActivity::WaitOverdue);
+    assert_eq!(overdue.wait_reason.as_deref(), Some(WAIT_REASON));
+    let expiry = overdue
+        .wait_expires_at
+        .as_deref()
+        .expect("overdue keeps the original expiry");
+    assert!(
+        expiry.len() == 20 && expiry.ends_with('Z') && expiry.as_bytes()[10] == b'T',
+        "expiry must be ISO-8601 UTC; got {expiry}",
+    );
+}
+
+#[tokio::test]
 async fn a_blocking_prompt_after_stop_is_not_hidden_by_snapshot_wait_normalization() {
     let (server_state, _dir) = test_server_state();
     let execution_id = spawned_worker(&server_state);

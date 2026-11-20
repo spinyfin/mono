@@ -588,7 +588,11 @@ enum WorkCardLiveStatus {
                               lead: task.status != "todo" && !isPendingExecution(runtime) ? "Waiting" : "Queued")
         }
         // A declared job wait names what the worker is waiting on, so it
-        // is shown even for conflict / CI-remediation runs.
+        // is shown even for conflict / CI-remediation runs. An expired wait
+        // is stalled, not ordinary waiting.
+        if let liveState, liveState.activity == .waitOverdue {
+            return AgentActivityState.overdueCaption(liveState)
+        }
         if let liveState, liveState.isWaitingOnJob {
             return AgentActivityState.waitCaption(liveState)
         }

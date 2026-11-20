@@ -853,11 +853,10 @@ pub(super) async fn dispatch_live_worker_state(
     let changed = applied.repaired || matches!(applied.outcome, ApplyEventOutcome::Applied { changed: true });
     let new_state = server_state.live_worker_states.get(slot_id);
     let new_activity = new_state.as_ref().map(|s| s.activity);
-    // Wait consumption is part of the main-session turn reduction. A late
-    // Stop can prove a resume without changing activity, but the cleared
-    // wait caption still needs publication. A main-session resume can change
-    // that overlay even when a subagent already made the raw slot read
-    // Working with the same tool.
+    // A main-session resume changes the published wait overlay (the snapshot
+    // hides the wait caption during an active turn) even when activity is
+    // unchanged, e.g. a late Stop that proves a resume or a subagent that
+    // already made the slot read Working, so broadcast on `resumed_after` too.
     if changed || applied.resumed_after.is_some() {
         server_state.broadcast_live_worker_states().await;
     }

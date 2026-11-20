@@ -9,8 +9,9 @@
 //! a transient API error — "API Error: The socket connection was closed
 //! unexpectedly", `overloaded_error`, a 5xx, a 429, a request timeout —
 //! it prints the error, ends the turn, and returns to its REPL. The
-//! events socket reports the turn-ending `Stop` as `Idle`, so the
-//! worker *looks done* while actually being wedged mid-chore. The
+//! events socket reports the turn-ending `Stop` as parked — `WaitingForInput`
+//! for an awaiting-input-capable worker with no declared wait, otherwise
+//! `Idle` — so the worker *looks done* while actually being wedged mid-chore. The
 //! dead-PID sweep can't see it (the process is alive); the completion
 //! path can't see it (no PR, no clean finish). Recovery detects the
 //! trailing error and resumes the stalled work.
@@ -556,7 +557,7 @@ async fn process_state(
             // session: if it didn't clear the error by the next
             // sweep, fall through to orphan+respawn.
             let already_nudged = nudged_executions.remove(&execution_id);
-            let try_nudge = !already_nudged && can_nudge(state.activity);
+            let try_nudge = !already_nudged && can_nudge(live_states, &state);
 
             if try_nudge {
                 let msg = if stall_reason == "no_activity" {
@@ -890,11 +891,12 @@ fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {
     }
 }
 
-fn can_nudge(activity: WorkerActivity) -> bool {
-    matches!(
-        activity,
-        WorkerActivity::Idle | WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue
-    )
+fn can_nudge(live_states: &LiveWorkerStateRegistry, state: &LiveWorkerState) -> bool {
+    match state.activity {
+        WorkerActivity::Idle | WorkerActivity::WaitingOnWork | WorkerActivity::WaitOverdue => true,
+        WorkerActivity::WaitingForInput => !live_states.has_blocking_prompt(state.slot_id),
+        _ => false,
+    }
 }
 
 fn should_inspect(activity: WorkerActivity) -> bool {
@@ -1160,7 +1162,7 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use boss_protocol::WorkItemBinding;
+    use boss_protocol::{StopReason, WorkItemBinding, WorkerEvent};
     use tempfile::TempDir;
 
     use super::*;
@@ -1319,6 +1321,14 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    fn stop_event() -> WorkerEvent {
+        WorkerEvent::Stop {
+            session_id: "s".into(),
+            stop_hook_active: false,
+            stop_reason: StopReason::Completed,
+        }
+    }
+
     fn register_idle_slot(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str, work_item_id: &str) {
         live_states.register_spawn(
             slot_id,
@@ -1331,8 +1341,7 @@ mod tests {
                 execution_id: execution_id.to_owned(),
             }),
         );
-        // Seed legacy Idle explicitly; a no-wait Stop now requires input.
-        live_states.set_activity_for_test(slot_id, WorkerActivity::Idle);
+        live_states.apply_event(slot_id, &stop_event());
     }
 
     const SOCKET_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: The socket connection was closed unexpectedly."}]}}"#;
@@ -1404,6 +1413,12 @@ mod tests {
         let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
         let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+        assert_eq!(
+            live.get(slot_id).unwrap().activity,
+            WorkerActivity::WaitingForInput,
+            "a no-wait Stop on an awaiting-input-capable worker parks as WaitingForInput"
+        );
+        assert!(!live.has_blocking_prompt(slot_id));
 
         let nudger = RecordingNudger::new();
         let mut nudged = HashSet::new();
@@ -1433,6 +1448,51 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "transient_recovery_nudge");
         assert_eq!(events[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn stop_without_wait_after_transient_error_nudges() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t-stop.jsonl", &[NORMAL_LINE, SOCKET_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = boss_execution_contracts::slot_id_from_worker_id(&worker_id).unwrap();
+        live.register_spawn(
+            slot_id,
+            &exec_id,
+            "claude-opus-4-7",
+            12345,
+            Some(WorkItemBinding {
+                work_item_id: work_item_id.to_owned(),
+                work_item_name: "test chore".to_owned(),
+                execution_id: exec_id.clone(),
+            }),
+        );
+        live.apply_event(
+            slot_id,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::Value::Null,
+            },
+        );
+        live.apply_event(slot_id, &stop_event());
+        assert_eq!(live.get(slot_id).unwrap().activity, WorkerActivity::WaitingForInput);
+        assert!(!live.has_blocking_prompt(slot_id));
+
+        let nudger = RecordingNudger::new();
+        let mut nudged = HashSet::new();
+        let (outcome, _sink, reaped) = run_pass(&db, &live, &coordinator, &nudger, &mut nudged).await;
+        assert_eq!(outcome.nudged, 1, "Stop with no wait must take the nudge path");
+        assert_eq!(outcome.resumed, 0);
+        assert!(reaped.is_empty(), "nudge must leave the pane/slot intact: {reaped:?}");
+        assert_eq!(nudger.nudged_ids().await, vec![exec_id.clone()]);
     }
 
     #[tokio::test]
@@ -2404,18 +2464,34 @@ mod tests {
 
     #[test]
     fn nudge_only_non_human_parked_workers() {
+        let live = LiveWorkerStateRegistry::new();
+        live.register_spawn(1, "run-1", "claude-opus-4-7", 0, None);
         for (activity, expected) in [
             (WorkerActivity::Spawning, false),
             (WorkerActivity::Working, false),
             (WorkerActivity::Idle, true),
-            (WorkerActivity::WaitingForInput, false),
+            (WorkerActivity::WaitingForInput, true),
             (WorkerActivity::WaitingOnWork, true),
             (WorkerActivity::WaitOverdue, true),
             (WorkerActivity::Errored, false),
             (WorkerActivity::Terminated, false),
         ] {
-            assert_eq!(can_nudge(activity), expected, "{activity:?}");
+            live.set_activity_for_test(1, activity);
+            let state = live.get(1).unwrap();
+            assert_eq!(can_nudge(&live, &state), expected, "{activity:?}");
         }
+
+        live.apply_event(
+            1,
+            &WorkerEvent::Notification {
+                session_id: "s".into(),
+                message: "Claude needs your permission to use Bash".into(),
+            },
+        );
+        live.set_activity_for_test(1, WorkerActivity::WaitingForInput);
+        let state = live.get(1).unwrap();
+        assert!(live.has_blocking_prompt(1));
+        assert!(!can_nudge(&live, &state), "a blocking prompt is the owner's");
     }
 
     #[test]
