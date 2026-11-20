@@ -33,12 +33,26 @@ impl DependencyFilterArgs {
         client: &mut BossClient,
         product_id: &str,
     ) -> Result<Option<DependencyFilter>, CliError> {
+        self.resolve_in_scope(client, Some(product_id)).await
+    }
+
+    pub(crate) async fn resolve_in_scope(
+        self,
+        client: &mut BossClient,
+        product_id: Option<&str>,
+    ) -> Result<Option<DependencyFilter>, CliError> {
         if let Some(id) = self.prerequisites_of {
-            let id = crate::selector_scope::resolve_filter_id(client, &id, product_id).await?;
+            let id = match product_id {
+                Some(product_id) => crate::selector_scope::resolve_filter_id(client, &id, product_id).await?,
+                None => get_work_item(client, &id).await?.primary_id().to_owned(),
+            };
             return Ok(Some(DependencyFilter::PrerequisitesOf { id }));
         }
         if let Some(id) = self.dependents_of {
-            let id = crate::selector_scope::resolve_filter_id(client, &id, product_id).await?;
+            let id = match product_id {
+                Some(product_id) => crate::selector_scope::resolve_filter_id(client, &id, product_id).await?,
+                None => get_work_item(client, &id).await?.primary_id().to_owned(),
+            };
             return Ok(Some(DependencyFilter::DependentsOf { id }));
         }
         if self.unblocked {
