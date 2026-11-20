@@ -103,10 +103,6 @@ rust_test(
         "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
         "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
         "HOME": "/tmp",
-        # Unoptimized async futures that carry whole execution rows (the
-        # worker-event fan-out tests) outgrow the 2 MiB default test-thread
-        # stack as `WorkExecution` gains fields; give each test thread 8 MiB.
-        "RUST_MIN_STACK": "8388608",
     },
     experimental_enable_sharding = True,
     proc_macro_deps = all_crate_deps(

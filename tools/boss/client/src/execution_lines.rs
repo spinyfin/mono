@@ -1,5 +1,5 @@
-//! Human-readable detail lines for execution rows in `boss task show` and
-//! `boss task executions`.
+//! Human-readable detail lines for execution rows in `boss task show`,
+//! `boss task executions` and `bossctl work executions`.
 //!
 //! The JSON views already carry every field verbatim; these lines are the
 //! text-mode answer to "why is this run held?" and "why did it fail?" so a
@@ -15,12 +15,12 @@ const MAX_ERROR_CHARS: usize = 200;
 
 /// Render a stored epoch-seconds value as an ISO-8601 local timestamp, or
 /// `-` when the value is unset.
-pub(crate) fn display_time(raw: Option<&str>) -> String {
+pub fn display_time(raw: Option<&str>) -> String {
     raw.map_or_else(|| "-".to_owned(), format_stored_epoch)
 }
 
 /// Collapse `text` onto one line and cut it to [`MAX_ERROR_CHARS`] characters.
-pub(crate) fn truncate_one_line(text: &str) -> String {
+pub fn truncate_one_line(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= MAX_ERROR_CHARS {
         return flat;
@@ -33,7 +33,7 @@ pub(crate) fn truncate_one_line(text: &str) -> String {
 /// that the dispatcher is currently holding. `None` for terminal executions
 /// (a stale wait reason on a finished row is not a wait) and for executions
 /// that are not being held.
-pub(crate) fn waiting_line(exec: &WorkExecution) -> Option<String> {
+pub fn waiting_line(exec: &WorkExecution) -> Option<String> {
     if exec.status.is_terminal() {
         return None;
     }
@@ -55,7 +55,7 @@ pub(crate) fn waiting_line(exec: &WorkExecution) -> Option<String> {
 /// or queued one that has recorded a pre-start failure and is retrying. Falls
 /// back to the newest failed run's error text when the execution row itself
 /// carries none.
-pub(crate) fn error_line(exec: &WorkExecution, runs: &[WorkRun]) -> Option<String> {
+pub fn error_line(exec: &WorkExecution, runs: &[WorkRun]) -> Option<String> {
     let failed = matches!(exec.status, boss_protocol::ExecutionStatus::Failed);
     let text = exec
         .last_error
@@ -77,7 +77,7 @@ pub(crate) fn error_line(exec: &WorkExecution, runs: &[WorkRun]) -> Option<Strin
 
 /// One `flags:` line naming how the execution was created and launched, or
 /// `None` when it is an ordinary execution with nothing to report.
-pub(crate) fn provenance_line(exec: &WorkExecution) -> Option<String> {
+pub fn provenance_line(exec: &WorkExecution) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(created_via) = exec.created_via.as_deref() {
         parts.push(format!("created_via={created_via}"));
@@ -98,11 +98,39 @@ pub(crate) fn provenance_line(exec: &WorkExecution) -> Option<String> {
 }
 
 /// The wait, error and provenance lines for one execution, in print order.
-pub(crate) fn execution_detail_lines(exec: &WorkExecution, runs: &[WorkRun]) -> Vec<String> {
+pub fn execution_detail_lines(exec: &WorkExecution, runs: &[WorkRun]) -> Vec<String> {
     [waiting_line(exec), error_line(exec, runs), provenance_line(exec)]
         .into_iter()
         .flatten()
         .collect()
+}
+
+/// The text rows `bossctl work executions` prints for one execution: a
+/// summary line, the PR URL when there is one, then the detail lines
+/// indented beneath.
+pub fn history_row_lines(exec: &WorkExecution, runs: &[WorkRun]) -> Vec<String> {
+    let host = exec.host_id.as_deref().unwrap_or("local");
+    let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
+    let mut lines = vec![format!(
+        "{}  [{}]  kind={}  host={}  workspace={}  created={}  started={}  finished={}",
+        exec.id,
+        exec.status,
+        exec.kind,
+        host,
+        workspace,
+        display_time(Some(&exec.created_at)),
+        display_time(exec.started_at.as_deref()),
+        display_time(exec.finished_at.as_deref()),
+    )];
+    if let Some(pr_url) = &exec.pr_url {
+        lines.push(format!("  pr_url: {pr_url}"));
+    }
+    lines.extend(
+        execution_detail_lines(exec, runs)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
+    lines
 }
 
 #[cfg(test)]
@@ -206,5 +234,36 @@ mod tests {
                  force_launched operator_forced_admission"
             )
         );
+    }
+
+    #[test]
+    fn history_row_prints_iso_timestamps_and_waiting_since() {
+        let mut exec = execution(ExecutionStatus::Ready);
+        exec.started_at = Some("1700000100".into());
+        exec.dispatch_wait_reason = Some("pool_exhausted".into());
+        exec.dispatch_wait_since = Some("1700000200".into());
+        let text = history_row_lines(&exec, &[]).join("\n");
+        assert!(text.contains("created=2023-11-1"), "{text}");
+        assert!(text.contains("started=2023-11-1"), "{text}");
+        assert!(text.contains("finished=-"), "{text}");
+        assert!(text.contains("waiting: pool_exhausted since 2023-11-1"), "{text}");
+        for epoch in ["1700000000", "1700000100", "1700000200"] {
+            assert!(!text.contains(epoch), "raw epoch {epoch} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn history_row_falls_back_to_the_run_error_for_a_failed_execution() {
+        let exec = execution(ExecutionStatus::Failed);
+        let text = history_row_lines(&exec, &[run_with_error(Some("workspace lease failed"))]).join("\n");
+        assert!(text.contains("  error: workspace lease failed"), "{text}");
+    }
+
+    #[test]
+    fn history_row_hides_the_error_of_a_cancelled_execution() {
+        let mut exec = execution(ExecutionStatus::Cancelled);
+        exec.last_error = Some("host offline".into());
+        let text = history_row_lines(&exec, &[]).join("\n");
+        assert!(!text.contains("error"), "{text}");
     }
 }

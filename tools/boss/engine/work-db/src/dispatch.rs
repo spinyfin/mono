@@ -1388,42 +1388,6 @@ impl WorkDb {
         Ok(())
     }
 
-    /// `work_executions.host_id` for every execution of `work_item_id`, in
-    /// one query. Backs `bossctl work executions`, which previously issued
-    /// one [`Self::execution_host_id`] point read per row; batching avoids
-    /// the N+1 query pattern for work items with many executions.
-    pub fn execution_host_ids_for_item(&self, work_item_id: &str) -> Result<HashMap<String, String>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT id, host_id FROM work_executions WHERE work_item_id = ?1")?;
-        let rows = stmt.query_map(params![work_item_id], |row| {
-            let id: String = row.get(0)?;
-            let host_id: Option<String> = row.get(1)?;
-            Ok((id, host_id.unwrap_or_else(|| "local".to_owned())))
-        })?;
-        let mut hosts: HashMap<String, String> =
-            collect_rows(rows).map(|entries: Vec<(String, String)>| entries.into_iter().collect())?;
-
-        // `list_executions`/`list_executions_for_chain` union in review-guide
-        // executions owned by this task via the comparison -> series ->
-        // root-task join, keyed by the execution's own id even though its
-        // `work_item_id` is the comparison, not this task. Look those up by
-        // id too so `bossctl work executions` doesn't fall back to "local"
-        // for a review-guide run that actually executed on a remote host.
-        let mut guide_stmt = conn.prepare(&format!(
-            "SELECT we.id, we.host_id {REVIEW_GUIDE_EXECUTIONS_FOR_TASK_FROM}"
-        ))?;
-        let guide_rows = guide_stmt.query_map(params![work_item_id], |row| {
-            let id: String = row.get(0)?;
-            let host_id: Option<String> = row.get(1)?;
-            Ok((id, host_id.unwrap_or_else(|| "local".to_owned())))
-        })?;
-        for entry in collect_rows(guide_rows)? {
-            let (id, host_id): (String, String) = entry;
-            hosts.insert(id, host_id);
-        }
-        Ok(hosts)
-    }
-
     /// Return true if `execution` is a stale prior occupant of a reused
     /// (warm-cached) cube workspace: another live (`running` /
     /// `waiting_human`) execution now claims the same `cube_workspace_id`

@@ -19,8 +19,9 @@
 //!
 //! The four fields the design names are `transcript_path`, `host_id`,
 //! `remote_pid`, and `shell_pid`. `transcript_path`, `artifacts_path` and
-//! `host_id` are on the wire today (`host_id` on [`WorkExecution`], so the
-//! operator CLI can show where a run was placed); `remote_pid` and
+//! `host_id` are on the wire today (`host_id` on [`WorkExecution`], so
+//! `boss task executions` and `bossctl work executions` can show where a run
+//! was placed); `remote_pid` and
 //! `shell_pid` are `work_executions` / `work_runs` **columns that
 //! `mappers.rs` never maps into [`WorkExecution`] or [`WorkRun`]**.
 //! Stripping a field that does not exist is not something the type system

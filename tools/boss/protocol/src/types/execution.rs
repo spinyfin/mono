@@ -965,13 +965,13 @@ pub struct WorkExecution {
     #[builder(default)]
     pub launch_failed: bool,
 
-    /// `true` when an operator force-launched this execution past the pool
+    /// `true` when this execution was force-launched (`--force`) past the pool
     /// and pause gates.
     #[serde(default)]
     #[builder(default)]
     pub force_launched: bool,
 
-    /// `true` when an operator explicitly admitted this execution over a
+    /// `true` when this execution was explicitly admitted over a
     /// conflicting-state refusal, so ordinary admission checks did not
     /// apply to it.
     #[serde(default)]

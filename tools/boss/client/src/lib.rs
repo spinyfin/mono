@@ -8,11 +8,13 @@
 
 #[cfg(target_os = "macos")]
 use boss_engine_utils::process_args;
+pub mod execution_lines;
 mod replay;
 mod retry;
 #[cfg(test)]
 mod retry_tests;
 pub mod stuck_report;
+pub mod time_fmt;
 
 use std::io;
 use std::path::{Path, PathBuf};

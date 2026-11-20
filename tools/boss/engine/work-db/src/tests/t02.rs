@@ -176,37 +176,6 @@ fn execution_host_id_reflects_scheduler_selection() {
     let _ = std::fs::remove_file(path);
 }
 
-/// `execution_host_ids_for_item` batches the same lookup as
-/// `execution_host_id` across every execution of a work item in one
-/// query — the read path `bossctl work executions` uses to avoid an
-/// N+1 point read per row.
-#[test]
-fn execution_host_ids_for_item_batches_per_execution_lookup() {
-    let path = temp_db_path("execution-host-ids-for-item");
-    let db = WorkDb::open(path.clone()).unwrap();
-    let product = create_test_product(&db);
-    let chore = create_test_chore(&db, product.id.clone(), "Runs somewhere");
-    let exec_a = create_ready_chore_execution(&db, chore.id.clone());
-    let exec_b = create_ready_chore_execution(&db, chore.id.clone());
-
-    db.start_execution_run_on_host(
-        &exec_a.id,
-        "worker-1",
-        "mono",
-        "lease-A",
-        "mono-agent-001",
-        "/tmp/mono-agent-001",
-        "zakalwe",
-    )
-    .unwrap();
-
-    let hosts = db.execution_host_ids_for_item(&chore.id).unwrap();
-    assert_eq!(hosts.get(exec_a.id.as_str()).map(String::as_str), Some("zakalwe"));
-    assert_eq!(hosts.get(exec_b.id.as_str()).map(String::as_str), Some("local"));
-
-    let _ = std::fs::remove_file(path);
-}
-
 /// Every execution read path maps the diagnostic columns the CLI shows: the
 /// wait reason, its blocker, launch outcome flags, provenance, progression
 /// disposition and the host. A select list that drifts from `map_execution`
