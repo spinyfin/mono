@@ -224,8 +224,10 @@ async fn revision_no_op_declaration_fails_closed_through_the_real_dispatch_path(
     // The driver's turn boundary, carried the whole production way: the
     // shim's JSON over the events socket, through per-connection driver
     // resolution, into the fan-out.
-    let stop = stop_hook_through_the_events_socket(&server_state, &execution_id).await;
-    dispatch_worker_event_fanout(&server_state, &stop).await;
+    let stop = Box::pin(stop_hook_through_the_events_socket(&server_state, &execution_id)).await;
+    // Boxed so the fan-out's large generated future lives on the heap rather
+    // than inline in this test's state machine on the small test-thread stack.
+    Box::pin(dispatch_worker_event_fanout(&server_state, &stop)).await;
 
     let execution = server_state.work_db.get_execution(&execution_id).unwrap();
     assert_eq!(
@@ -278,8 +280,10 @@ async fn revision_without_declaration_is_never_closed_as_a_no_op_by_inference() 
         None
     );
 
-    let stop = stop_hook_through_the_events_socket(&server_state, &execution_id).await;
-    dispatch_worker_event_fanout(&server_state, &stop).await;
+    let stop = Box::pin(stop_hook_through_the_events_socket(&server_state, &execution_id)).await;
+    // Boxed so the fan-out's large generated future lives on the heap rather
+    // than inline in this test's state machine on the small test-thread stack.
+    Box::pin(dispatch_worker_event_fanout(&server_state, &stop)).await;
 
     let execution = server_state.work_db.get_execution(&execution_id).unwrap();
     assert!(
@@ -368,7 +372,7 @@ async fn codex_applied_no_op_with_changed_description_releases_the_live_slot() {
             None,
             None,
         );
-        dispatch_worker_event_fanout(&state, &incoming).await;
+        Box::pin(dispatch_worker_event_fanout(&state, &incoming)).await;
     }
     assert_eq!(
         state.work_db.get_execution(&execution_id).unwrap().status,
