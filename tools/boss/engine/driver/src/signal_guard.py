@@ -73,10 +73,25 @@ def signal_program(word):
         word = word[1:]
     return word, os.path.basename(word)
 
+def signal_split_heredocs(group):
+    # A heredoc attached to its command (cat<<EOF) is one shell word; split the
+    # unquoted operator off so the program and its redirections read normally.
+    masks = getattr(group, 'literal_chars', None) or []
+    words = []
+    for i, word in enumerate(group):
+        mask = masks[i] if i < len(masks) else [True] * len(word)
+        at = word.find('<<')
+        if at > 0 and not any(mask[at:at+2]) and word[at+2:at+3] != '<' and (
+                word[at-1] not in '<>&' and not re.fullmatch('[0-9]+', word[:at])):
+            words.extend([word[:at], word[at:]])
+        else:
+            words.append(word)
+    return words
+
 def signal_argv(group):
     # Assignments, xargs provenance and wrapper peeling come from the shared
     # tokenizer so launch-guard and signal-guard see the same program.
-    words = without_redirections(group)
+    words = without_redirections(signal_split_heredocs(group))
     rest = words
     assigns, strings = [], []
     indirect = False
@@ -160,11 +175,11 @@ def signal_script_file(args):
     operands = signal_shell_operands(args[1:])
     return operands[0] if operands else None
 
-def signal_text(text, depth, values=None, unknown=None, holders=None, scripts=None, ariths=None):
+def signal_text(text, depth, values=None, unknown=None, holders=None, scripts=None, ariths=None, written=None):
     # Inspect text that a shell will later read. Text that cannot be parsed is
     # still refused when it names the forbidden programs.
     try:
-        signal_check(text, depth, values, unknown, holders, scripts, ariths)
+        signal_check(text, depth, values, unknown, holders, scripts, ariths, written)
     except ValueError:
         if SIG_NAME.search(text):
             _block(SIGNAL_REASON)
@@ -199,35 +214,45 @@ def signal_writes(group, args):
     return names
 
 def signal_output(group):
-    content = getattr(group, 'body', '') or here_string_body(group)
+    content = getattr(group, 'body', '')
     if content:
         return content
+    if here_string_body(group):
+        return here_string_body(group) + SIG_NL
     args, _, _, _ = signal_argv(group)
     if not args:
         return ''
     _, base = signal_program(args[0])
     if base == 'echo':
         words = args[1:]
-        expanding = False
+        expanding, newline = False, SIG_NL
         while words and re.fullmatch('-[neE]+', words[0]):
             expanding = expanding or 'e' in words[0]
+            newline = '' if 'n' in words[0] else newline
             words = words[1:]
         text = ' '.join(words)
-        return 'pkill' if expanding and SIG_KILL_WORD.search(text) else text
+        return 'pkill' if expanding and SIG_KILL_WORD.search(text) else text + newline
     if base == 'printf' and len(args) > 1:
-        if args[1] in ('%s', '%b', '%s' + SIG_BS + 'n'):
-            return SIG_NL.join(args[2:])
+        if args[1] in ('%s', '%b'):
+            # These formats write their arguments back to back.
+            return ''.join(args[2:])
+        if args[1] == '%s' + SIG_BS + 'n':
+            return ''.join(item + SIG_NL for item in args[2:])
         if '%' not in args[1]:
             return args[1]
     if SIG_KILL_WORD.search(signal_chain_text(group)):
-        return 'pkill'
+        return 'pkill' + SIG_NL
     return ''
 
 def signal_redirects(group, writing):
     found = []
+    group = signal_split_heredocs(group)
     for i, token in enumerate(group):
         pattern = '^(?:[0-9]+|&)?(>>|>[|]?)(.*)' if writing else '^(?:0)?(<)([^<].*|)'
         match = re.fullmatch(pattern, token)
+        if not match and writing:
+            # cat <<EOF>out.txt: the redirection follows the heredoc word.
+            match = re.fullmatch('^(?:[0-9]+)?<<-?[^<>]+(>>|>[|]?)(.+)', token)
         if match:
             path = match.group(2) or (group[i+1] if i + 1 < len(group) else '')
             if path:
@@ -240,7 +265,7 @@ def signal_chain_text(upstream):
     here = here_string_body(upstream)
     return ' '.join(parts) + ' ' + body + ' ' + here
 
-def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, scripts=None, ariths=None):
+def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, scripts=None, ariths=None, written=None):
     if depth > 40:
         _block(SIGNAL_REASON + ' Shell nesting is too deep to inspect safely.')
     if holders is None:
@@ -249,6 +274,8 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
         scripts = set()
     if ariths is None:
         ariths = []
+    if written is None:
+        written = {}
     scan = extract_substitutions(source, holders, scripts, ariths)
     records = command_records(scan['out'])
     if any(group.error for group in records):
@@ -303,14 +330,6 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
     for name in rebound:
         unknown[name] = unknown.get(name, False) or bool(mentions)
 
-    for substitution in scan['subs']:
-        signal_check(substitution, depth+1, values, unknown, holders, scripts, ariths)
-    for group in groups:
-        if group.body and group.expanding_body:
-            nested = extract_substitutions(group.body, holders, scripts, ariths, 0, None, 'literal')
-            for substitution in nested['subs']:
-                signal_check(substitution, depth+1, values, unknown, holders, scripts, ariths)
-
     def inspect(text, hops=0):
         # Expand recorded command-string variables without executing the shell.
         if hops >= 8:
@@ -322,7 +341,7 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
                 for value in sorted(values[name]):
                     inspect(text[:variable.start()] + value + text[variable.end():], hops + 1)
                 return
-        signal_text(text, depth+1, values, unknown, holders, scripts, ariths)
+        signal_text(text, depth+1, values, unknown, holders, scripts, ariths, written)
 
     def input_words(text):
         rewritten = extract_substitutions(text, holders, scripts, ariths)['out']
@@ -443,7 +462,6 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
             for string in signal_cstrings(args[1:]):
                 inspect(string)
 
-    written = {}
     def inspect_written(path):
         key = os.path.normpath(path)
         if key in written:
@@ -451,7 +469,8 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
 
     for index, group in enumerate(groups):
         args, indirect, strings, _ = parsed[index]
-        content = getattr(group, 'body', '') or here_string_body(group)
+        content = getattr(group, 'body', '') or (
+            here_string_body(group) + SIG_NL if here_string_body(group) else '')
         targets = signal_redirects(group, True)
         if args:
             _, base = signal_program(args[0])
@@ -461,17 +480,27 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
                 targets.extend((word, '-a' in args or '--append' in args)
                                for word in args[1:] if not word.startswith('-'))
             if not content:
-                content = SIG_NL.join(signal_output(upstream)
-                                   for upstream in getattr(group, 'pipe_sources', []))
+                content = ''.join(signal_output(upstream)
+                                  for upstream in getattr(group, 'pipe_sources', []))
             if not content and SIG_KILL_WORD.search(' '.join(args)):
-                content = 'pkill'
+                content = 'pkill' + SIG_NL
         for target, append in targets:
             key = os.path.normpath(target)
-            written[key] = (written.get(key, '') + SIG_NL if append else '') + content
+            written[key] = (written.get(key, '') if append else '') + content
         for string in strings:
             inspect(string)
         captures = {name for name in qualified if first[name] < index}
         dispatch(group, args, indirect, getattr(group, 'pipe_sources', []), 0, captures)
+
+    # Substitutions run before or during the commands that contain them, so
+    # check them once every script written by this command is on record.
+    for substitution in scan['subs']:
+        signal_check(substitution, depth+1, values, unknown, holders, scripts, ariths, written)
+    for group in groups:
+        if group.body and group.expanding_body:
+            nested = extract_substitutions(group.body, holders, scripts, ariths, 0, None, 'literal')
+            for substitution in nested['subs']:
+                signal_check(substitution, depth+1, values, unknown, holders, scripts, ariths, written)
 
 try:
     signal_check(cmd)

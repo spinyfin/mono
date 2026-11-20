@@ -6,6 +6,16 @@ use std::process::{Command, Stdio};
 pub(crate) fn denied() -> Vec<String> {
     let mut commands = [
         "echo -n 'pkill foo' > k.sh; sh ./k.sh",
+        "echo 'pkill -f foo' > /tmp/k.sh; bash -c 'sh /tmp/k.sh'",
+        "echo 'pkill -f foo' > /tmp/k.sh; eval 'sh /tmp/k.sh'",
+        "cat > /tmp/k.sh <<'EOF'\npkill -f foo\nEOF\nout=$(bash /tmp/k.sh)",
+        "printf '%s' pk 'ill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf pk > /tmp/k.sh; printf 'ill -f foo' >> /tmp/k.sh; sh /tmp/k.sh",
+        "echo -n pk > /tmp/k.sh; echo -n 'ill -f foo' >> /tmp/k.sh; sh /tmp/k.sh",
+        "cat <<EOF>/tmp/k.sh\npkill -f foo\nEOF\nsh /tmp/k.sh",
+        "cat<<'EOF' > /tmp/k.sh\npkill -f foo\nEOF\nsh /tmp/k.sh",
+        "cat <<EOF; echo $((1 << 3))\nuse care\nEOF\npkill -f foo",
+        "cat <<EOF >/dev/null; x=$((1 << 3))\nuse care\nEOF\n3\npkill -f foo",
         "echo -e 'pkill foo' > k.sh; sh ./k.sh",
         "awk 'BEGIN {print \"pkill foo\"}' > /tmp/k.sh; sh /tmp/k.sh",
         "cat > /tmp/k.sh <<'EOF'\npkill foo\nEOF\ncat >> /tmp/k.sh <<'EOF'\necho fine\nEOF\nsh /tmp/k.sh",
@@ -236,6 +246,11 @@ pub(crate) fn denied() -> Vec<String> {
 }
 
 pub(crate) const ALLOWED: &[&str] = &[
+    "cat <<EOF>out.txt\nuse pkill carefully\nEOF",
+    "cat<<'EOF' > notes.md\nit's fine to mention pkill here\nEOF",
+    "echo 'echo hi' > /tmp/k.sh; bash -c 'sh /tmp/k.sh'",
+    "printf '%s\\n' pk 'ill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "echo pk > /tmp/k.sh; echo 'ill -f foo' >> /tmp/k.sh; sh /tmp/k.sh",
     "echo 'echo safe' > k.sh; sh ./k.sh",
     "printf '%s' 'echo safe' > k.sh; sh < ./k.sh",
     "cat <<'EOF'; echo done\npkill foo\nEOF",

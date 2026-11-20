@@ -80,8 +80,10 @@ def heredoc_word(rest):
     return (''.join(word), quoted, index) if word else False
 
 
-def heredoc_delim(line):
-    # Unquoted << only. A quoted substring is an argument, not an operator.
+def heredoc_ops(line):
+    # Every unquoted, non-arithmetic << heredoc as (offset, word, quoted), or
+    # False when the syntax cannot be parsed safely.
+    found = []
     quote, escaped, index = None, False, 0
     while index < len(line):
         char = line[index]
@@ -120,13 +122,30 @@ def heredoc_delim(line):
         if char == '<' and index + 1 < len(line) and line[index + 1] == '<':
             rest = line[index + 2:]
             if rest.startswith('<'):
-                return None
+                index += 3
+                continue
             if rest.startswith('-'):
                 rest = rest[1:]
             rest = rest.lstrip(SHLEX_WS)
-            return heredoc_word(rest)
+            parsed = heredoc_word(rest)
+            if parsed is False:
+                return False
+            found.append((index, parsed[0], parsed[1]))
+            index += 2
+            continue
         index += 1
-    return None
+    return found
+
+
+def heredoc_delim(line):
+    # First heredoc only: (word, quoted), None when there is none, False when
+    # the syntax cannot be parsed.
+    ops = heredoc_ops(line)
+    if ops is False:
+        return False
+    return ops[0][1:] if ops else None
+
+
 
 class CommandGroup(list):
     def __init__(self, tokens, body='', boundary=None, error=None, literal_chars=None, quote_segments=None):
@@ -432,6 +451,37 @@ def shell_text(text):
     return ''.join(out)
 
 
+def heredoc_candidates(groups):
+    # (group, delimiter word) for every unquoted << token, in source order.
+    found = []
+    for group in groups:
+        masks = getattr(group, 'literal_chars', None) or []
+        for i, word in enumerate(group):
+            at = word.find('<<')
+            while at != -1:
+                mask = masks[i] if i < len(masks) else [False] * len(word)
+                if not any(mask[at:at + 2]) and word[at + 2:at + 3] != '<' and word[at - 1:at] != '<':
+                    attached = word[at + 2:]
+                    base = at + 2
+                    if attached.startswith('-'):
+                        attached, base = attached[1:], base + 1
+                    source, offset = word, base
+                    if not attached and i + 1 < len(group):
+                        source, offset = group[i + 1], 0
+                        mask = masks[i + 1] if i + 1 < len(masks) else [False] * len(source)
+                        attached = source
+                    end = len(source)
+                    for k in range(offset, len(source)):
+                        if source[k] in '<>' and not mask[k]:
+                            end = k
+                            break
+                    text = source[offset:end]
+                    if text:
+                        found.append((group, text))
+                at = word.find('<<', at + 2)
+    return found
+
+
 def command_records(command, stripped=False):
     groups = []
     pending = ''
@@ -508,25 +558,25 @@ def command_records(command, stripped=False):
                     current_segments.append(segments[index])
         if current:
             groups.append(CommandGroup(current, literal_chars=current_literal, quote_segments=current_segments))
-        delim = heredoc_delim(logical_line)
-        if delim is False:
+        ops = heredoc_ops(logical_line)
+        if ops is False:
             groups.append(CommandGroup([], error='incomplete shell syntax'))
-        elif delim and groups:
-            for owner in groups[line_group_start:]:
-                for i, word in enumerate(owner):
-                    match = re.match(r'^(?:[0-9]+)?<<(-?)(.*)$', word)
-                    if not match or match.group(2).startswith('<'):
-                        continue
-                    marker = word.index('<<')
-                    if any(owner.literal_chars[i][marker:marker+2]):
-                        continue
-                    attached = match.group(2)
-                    j = i if attached else i + 1
-                    if j >= len(owner):
-                        continue
-                    end = attached or owner[j]
-                    quoted = any(owner.literal_chars[j])
-                    heredocs.append((owner, end, quoted))
+        elif ops:
+            owners = [g for g in groups[line_group_start:] if g] or [g for g in groups if g]
+            if not owners:
+                owners = [CommandGroup([])]
+            candidates = heredoc_candidates(groups[line_group_start:])
+            for _, word, quoted in ops:
+                # Each real heredoc belongs to the token that declares it;
+                # arithmetic shifts never reach this list, and an unmatched
+                # operator falls back to the last command on the line.
+                owner = owners[-1]
+                for k, (group, cand) in enumerate(candidates):
+                    if cand == word:
+                        owner = group
+                        del candidates[k]
+                        break
+                heredocs.append((owner, word, quoted))
             if heredocs:
                 receiver, heredoc_end, quoted = heredocs.pop(0)
                 receiver.expanding_body = not quoted
