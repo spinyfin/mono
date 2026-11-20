@@ -117,6 +117,13 @@ pub struct SweepOutcome {
     pub reserved_review_units: i64,
     /// Point-in-time count of PendingReview tasks waiting on admission.
     pub deferred_pre_merge_count: usize,
+    /// Review-lane cards the blocked-PR sweep stored a (new or changed)
+    /// diagnosis for this pass — the reason the card shows for being
+    /// blocked or stalled (`crate::blocked_pr_sweep`).
+    pub blocked_pr_diagnosed: usize,
+    /// Dead revisions (no live worker, last run terminal) the blocked-PR
+    /// sweep re-dispatched this pass, within its per-revision budget.
+    pub blocked_pr_redispatched: usize,
 }
 
 impl SweepOutcome {
@@ -138,6 +145,10 @@ impl SweepOutcome {
             + self.trunk_episodes_adopted
             + self.review_admission_recovered
             + self.review_batches_reaped
+            // `blocked_pr_diagnosed` is deliberately not a transition: a
+            // stored reason describes state the pass already wrote, and the
+            // sweep logs its own pass summary.
+            + self.blocked_pr_redispatched
     }
 }
 

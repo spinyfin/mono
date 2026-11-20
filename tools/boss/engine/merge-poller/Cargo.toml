@@ -19,6 +19,7 @@ test-support = [
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+boss-blocked-pr-diagnosis = { path = "../blocked-pr-diagnosis" }
 boss-ci-log-reader = { path = "../ci-log-reader" }
 boss-engine-gh-invocation = { path = "../gh-invocation" }
 boss-engine-recovery = { path = "../recovery", optional = true }

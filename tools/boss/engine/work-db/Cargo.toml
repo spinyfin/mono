@@ -12,6 +12,7 @@ boss-write-batch = { path = "../write-batch" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+boss-blocked-pr-diagnosis = { path = "../blocked-pr-diagnosis" }
 boss-board-projection = { path = "../board-projection" }
 boss-comment-anchor = { path = "../../comment_anchor" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
