@@ -220,6 +220,7 @@ impl WorkDb {
             );
         }
 
+        super::review_outcomes::require_complete(&tx, execution_id)?;
         let original_lease_id = execution.cube_lease_id.clone();
         let original_workspace_id = execution.cube_workspace_id.clone();
 
@@ -470,6 +471,7 @@ impl WorkDb {
         if execution.status.is_terminal() {
             return Ok(None);
         }
+        super::review_outcomes::require_complete(&tx, execution_id)?;
         if !execution.status.is_live() {
             bail!(
                 "execution {execution_id} cannot complete from worker no-op signal in status `{}`",

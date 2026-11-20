@@ -183,6 +183,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_GUIDE);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_REPORT);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_VERDICT);
+    registry.register_counter(&PROPOSAL_SUBMITTED_REVIEW_OUTCOMES);
     registry.register_counter(&PROPOSAL_SUBMITTED_RUN_DONE);
     registry.register_counter(&PROPOSAL_SUBMITTED_WAIT);
     registry.register_counter(&PROPOSAL_SUBMITTED_REVISE);
@@ -197,6 +198,12 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PROPOSAL_RATE_LIMITED);
 }
 
+boss_metrics::register_counter!(
+    PROPOSAL_SUBMITTED_REVIEW_OUTCOMES,
+    "worker_proposals.submitted.review_outcomes",
+    "Structured review-finding outcome submissions.",
+);
+
 /// Increment the `worker_proposals.submitted.<kind>` counter for `kind`.
 fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
     match kind {
@@ -210,6 +217,7 @@ fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
         ProposalKind::ReviewGuide => PROPOSAL_SUBMITTED_REVIEW_GUIDE.inc(metrics),
         ProposalKind::ReviewReport => PROPOSAL_SUBMITTED_REVIEW_REPORT.inc(metrics),
         ProposalKind::ReviewVerdict => PROPOSAL_SUBMITTED_REVIEW_VERDICT.inc(metrics),
+        ProposalKind::ReviewOutcomes => PROPOSAL_SUBMITTED_REVIEW_OUTCOMES.inc(metrics),
         ProposalKind::RunDone => PROPOSAL_SUBMITTED_RUN_DONE.inc(metrics),
         ProposalKind::Wait => PROPOSAL_SUBMITTED_WAIT.inc(metrics),
         ProposalKind::Revise => PROPOSAL_SUBMITTED_REVISE.inc(metrics),

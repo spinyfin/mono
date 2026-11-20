@@ -49,7 +49,8 @@ pub(crate) fn validate_at_workspace(
 
 /// Submit a worker proposal, validating a review guide's body first.
 ///
-/// Every other kind goes straight to storage. For [`ProposalKind::ReviewGuide`]
+/// Review outcomes verify commit ancestry before storage. Other kinds go
+/// straight to storage. For [`ProposalKind::ReviewGuide`]
 /// the submission is loaded and validated before the transaction opens, so a
 /// large packet read and the `git` calls hold no lock; storage then refuses
 /// the submission, storing nothing, if the attempt is not running or the
@@ -58,6 +59,11 @@ pub fn submit_worker_proposal(
     db: &WorkDb,
     input: SubmitWorkerProposalInput<'_>,
 ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+    if input.kind == ProposalKind::ReviewOutcomes {
+        return crate::review_guide_workspace::off_runtime_worker(|| {
+            db.submit_review_outcomes(input, &verify_fix_commit)
+        });
+    }
     let guide = (input.kind == ProposalKind::ReviewGuide).then(|| {
         db.load_review_guide_for_validation(input.execution_id, input.payload_json)
             .map(|guide| {
@@ -147,6 +153,27 @@ fn recover_one(db: &WorkDb, submission: &OrphanedGuideSubmission) -> Result<Opti
     let validated = validate_at_workspace(db, &submission.execution_id, &payload.body_markdown, &capture.packet)
         .map_err(|err| anyhow!("stored guide body failed validation: {err:#}"))?;
     db.adopt_and_publish_orphaned_review_guide_submission(submission, &validated.markdown, &payload.body_markdown)
+}
+
+/// Resolve the current PR head, then prove the cited commit is its ancestor.
+fn verify_fix_commit(pr_url: &str, sha: &str) -> Result<bool> {
+    let (owner, repo, number) =
+        boss_github::pr_url::parse_pr_url_parts(pr_url).context("invalid remediation PR URL")?;
+    let endpoint = format!("repos/{owner}/{repo}/pulls/{number}");
+    let output = boss_github::gh_runner::gh_output_blocking(&["api", &endpoint, "--jq", ".head.sha"])?;
+    anyhow::ensure!(
+        output.status.success(),
+        "reading remediation PR head failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let head = String::from_utf8(output.stdout)?.trim().to_owned();
+    anyhow::ensure!(
+        head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid PR head"
+    );
+    let merge_base =
+        boss_github::compare::gh_compare_jq_blocking(&format!("{owner}/{repo}"), sha, &head, ".merge_base_commit.sha")?;
+    Ok(merge_base.eq_ignore_ascii_case(sha))
 }
 
 #[cfg(test)]

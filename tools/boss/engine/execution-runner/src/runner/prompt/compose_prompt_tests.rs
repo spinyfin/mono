@@ -1953,6 +1953,9 @@ fn revision_directive_requires_findings_status_comment() {
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
             .build(),
     );
+    assert!(prompt.contains("propose review-outcomes --body-file"));
+    assert!(prompt.contains("WITHOUT stable finding ids only"));
+    assert!(prompt.contains("Completion without a complete set is refused"));
     assert!(
         prompt.contains("findings-status summary comment"),
         "revision directive must require a findings-status summary comment:\n{prompt}",

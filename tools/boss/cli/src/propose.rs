@@ -142,6 +142,8 @@ pub(crate) enum ProposeCommand {
     /// Example: `boss propose review-verdict --batch-id rvb_abc --verdict-file
     /// verdict.json`
     ReviewVerdict(ReviewVerdictArgs),
+    /// Submit one structured outcome for every assigned review finding.
+    ReviewOutcomes(ReviewOutcomesArgs),
     /// Declare that this run is finished — your terminal statement to the
     /// engine, and the only one that applies to every execution kind
     /// (a revision, a reviewer pass, a CI fix and a chore all end the same
@@ -489,6 +491,15 @@ pub(crate) struct ReviewReportArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub(crate) struct ReviewOutcomesArgs {
+    /// JSON object containing an outcomes array.
+    #[arg(long, value_name = "PATH")]
+    body_file: PathBuf,
+    #[command(flatten)]
+    common: IdempotencyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
 pub(crate) struct ReviewVerdictArgs {
     /// Durable review batch the supervisor is consolidating.
     #[arg(long = "batch-id")]
@@ -689,6 +700,7 @@ pub(crate) enum ProposalKindArg {
     ReviewGuide,
     ReviewReport,
     ReviewVerdict,
+    ReviewOutcomes,
     RunDone,
     Wait,
     Revise,
@@ -713,6 +725,7 @@ impl From<ProposalKindArg> for ProposalKind {
             ProposalKindArg::PrCreated => ProposalKind::PrCreated,
             ProposalKindArg::ReviewGuide => ProposalKind::ReviewGuide,
             ProposalKindArg::ReviewReport => ProposalKind::ReviewReport,
+            ProposalKindArg::ReviewOutcomes => ProposalKind::ReviewOutcomes,
             ProposalKindArg::ReviewVerdict => ProposalKind::ReviewVerdict,
             ProposalKindArg::RunDone => ProposalKind::RunDone,
             ProposalKindArg::Wait => ProposalKind::Wait,
@@ -943,6 +956,11 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
                 report: read_json_object_file("body", args.body_file)?,
             })
             .map_err(CliError::internal)?,
+            args.common.idempotency_key,
+        ),
+        ProposeCommand::ReviewOutcomes(args) => (
+            ProposalKind::ReviewOutcomes,
+            read_json_object_file("outcomes", args.body_file)?,
             args.common.idempotency_key,
         ),
         ProposeCommand::ReviewVerdict(args) => (
@@ -1391,6 +1409,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::ReviewReport, "report") => Some("--body-file"),
         (ProposalKind::ReviewVerdict, "batch_id") => Some("--batch-id"),
         (ProposalKind::ReviewVerdict, "verdict") => Some("--verdict-file"),
+        (ProposalKind::ReviewOutcomes, "outcomes") => Some("--body-file"),
         (ProposalKind::RunDone, "outcome") => Some("--outcome"),
         (ProposalKind::RunDone, "summary") => Some("--summary"),
         (ProposalKind::RunDone, "question" | "question.text") => Some("--question"),
@@ -2493,5 +2512,19 @@ mod tests {
             std::env::remove_var("BOSS_RUN_ID");
         }
         assert!(matches!(result, Err(CliError::Usage(_))));
+    }
+    #[test]
+    fn review_outcomes_reads_structured_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{"outcomes":[{"finding_id":"C1","outcome":"not_applicable","reason":"Path removed"}]}"#,
+        )
+        .unwrap();
+        let args = parse_propose(&["review-outcomes", "--body-file", file.path().to_str().unwrap()]);
+        let (kind, payload, _) = payload_for(args.command.unwrap()).unwrap();
+        assert_eq!(kind, ProposalKind::ReviewOutcomes);
+        assert_eq!(payload["outcomes"][0]["finding_id"], "C1");
+        assert_eq!(payload["outcomes"][0]["outcome"], "not_applicable");
     }
 }

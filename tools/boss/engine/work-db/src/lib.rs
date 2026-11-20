@@ -959,6 +959,7 @@ mod review_guide_context;
 mod review_guide_findings;
 mod review_guide_jobs;
 mod review_guide_recovery;
+mod review_outcomes;
 pub use review_guide_recovery::OrphanedGuideSubmission;
 mod review_guide_sources;
 mod review_guide_submission;

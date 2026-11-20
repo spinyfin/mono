@@ -63,6 +63,37 @@ fn findings(db: &WorkDb, root: &str) -> Option<boss_protocol::ReviewGuideFinding
     db.review_guide_findings(root, task.pr_url.as_deref().unwrap()).unwrap()
 }
 
+fn record_outcome(db: &WorkDb, revision: &str, fixed: bool) {
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let finding = if fixed {
+        serde_json::json!({"finding_id":"C1", "outcome":"fixed", "commit_sha":"a".repeat(40)})
+    } else {
+        serde_json::json!({"finding_id":"C1", "outcome":"not_fixed", "reason":"Still needs remediation"})
+    };
+    let accepted = db
+        .submit_review_outcomes(
+            SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: revision,
+                kind: ProposalKind::ReviewOutcomes,
+                payload_json: &serde_json::json!({"outcomes":[finding]}).to_string(),
+                idempotency_key: "outcomes",
+            },
+            &|pr_url, sha| Ok(pr_url == PR_URL && sha == "a".repeat(40)),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.proposal.state, ProposalState::Applied);
+}
+
 #[test]
 fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
     let (_dir, db) = open_db();
@@ -97,7 +128,7 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
     assert_eq!(before.status_text, "1 finding: 0 fixed on PR, 1 in progress, 0 open");
     assert_eq!(
         before.addendum_markdown,
-        format!("- ◷ [high] Unchecked index — ID {label} — in progress")
+        format!("- ◷ [high] Unchecked index — ID {label} — in progress — outcome not submitted for this PR")
     );
 
     for (status, marker, counts) in [
@@ -111,6 +142,7 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
         raw(&db)
             .execute("UPDATE tasks SET status = ?2 WHERE id = ?1", params![revision, status])
             .unwrap();
+        record_outcome(&db, &revision, matches!(status, "in_review" | "done"));
         let updated = findings(&db, &root.id).unwrap();
         assert_eq!(updated.status_text, format!("1 finding: {counts}"), "{status}");
         assert!(
@@ -122,11 +154,10 @@ fn live_addendum_tracks_findings_and_status_without_mutating_guide() {
         assert!(updated.addendum_markdown.contains(&format!("ID {label}")));
         assert!(!updated.addendum_markdown.contains(&format!("({status})")));
         if matches!(status, "in_review" | "done") {
-            assert!(
-                updated
-                    .addendum_markdown
-                    .ends_with(&format!("- ✓ ~~[high] Unchecked index~~ — ID {label}"))
-            );
+            assert!(updated.addendum_markdown.ends_with(&format!(
+                "- ✓ ~~[high] Unchecked index~~ — ID {label} — fixed at {}",
+                "a".repeat(40)
+            )));
         }
     }
     let stored = db.get_pr_review_guide_version(&version.id).unwrap().unwrap();
@@ -313,7 +344,11 @@ fn untracked_and_deleted_findings_stay_open() {
         .unwrap();
     let untracked = findings(&db, &root.id).unwrap();
     assert_eq!(untracked.status_text, "1 finding: 0 fixed on PR, 0 in progress, 1 open");
-    assert!(untracked.addendum_markdown.ends_with("- [high] Unchecked index"));
+    assert!(
+        untracked
+            .addendum_markdown
+            .ends_with("- [high] Unchecked index — outcome not submitted for this PR")
+    );
 }
 
 /// Seed a published guide at `head-one`, then the revision's `head-two`
@@ -382,7 +417,8 @@ fn done_fix_not_yet_in_the_published_guide_shows_the_live_badge_but_is_not_resol
     let archived = findings(&db, &root.id).unwrap();
     assert!(!archived.addendum_markdown.contains("~~"));
     assert!(archived.status_text.contains("0 fixed on PR, 0 in progress, 1 open"));
-    // Done, but the published guide still covers head-one.
+    // The recorded fix is done, but the published guide still covers head-one.
+    record_outcome(&db, &guide.revision, true);
     set_status(&db, &guide.revision, "done");
     let before = findings(&db, &root.id).unwrap();
     assert!(before.addendum_markdown.contains("- ✓ ~~[high] Unchecked index~~"));
@@ -398,6 +434,7 @@ fn done_revision_contained_in_the_published_head_is_resolved() {
     let root = create_test_chore_manual(&db, product.id, "updated findings");
     bind_open_pr(&db, &root.id);
     let guide = seed_update(&db, &root.id, "head-two");
+    record_outcome(&db, &guide.revision, true);
     for status in ["in_review", "done"] {
         set_status(&db, &guide.revision, status);
         assert!(!findings(&db, &root.id).unwrap().addendum_markdown.contains(RESOLVED));
@@ -449,6 +486,7 @@ fn non_descendant_published_head_is_not_resolved_but_keeps_the_live_badge() {
     // The published head is not the head the revision produced, and no push
     // ancestry connects them (a force-push).
     let guide = seed_update(&db, &root.id, "head-three");
+    record_outcome(&db, &guide.revision, true);
     set_status(&db, &guide.revision, "done");
     publish_update(&db, &guide);
     let text = findings(&db, &root.id).unwrap();
@@ -465,6 +503,7 @@ fn recorded_push_ancestry_lets_a_later_published_head_contain_the_fix() {
     let root = create_test_chore_manual(&db, product.id, "descendant findings");
     bind_open_pr(&db, &root.id);
     let guide = seed_update(&db, &root.id, "head-three");
+    record_outcome(&db, &guide.revision, true);
     set_status(&db, &guide.revision, "done");
     publish_update(&db, &guide);
     assert!(!findings(&db, &root.id).unwrap().addendum_markdown.contains(RESOLVED));

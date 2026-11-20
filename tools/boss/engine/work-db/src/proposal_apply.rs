@@ -105,6 +105,7 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::PrCreated
         | ProposalKind::ReviewGuide
         | ProposalKind::ReviewReport
+        | ProposalKind::ReviewOutcomes
         | ProposalKind::RunDone
         | ProposalKind::Wait => ProposalApplyPolicy::AutoApply,
         // Staged at submission (member reported, batch → applying) but the
@@ -202,6 +203,7 @@ pub(super) fn apply_in_transaction(
         ProposalKind::ReviewGuide => {
             super::review_guide_submission::accept(tx, execution_id, prepared_guide.context("missing prepared guide")?)
         }
+        ProposalKind::ReviewOutcomes => anyhow::bail!("review outcomes require verified submission"),
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
         ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id, question_worker),
         ProposalKind::Wait => apply_wait(payload_json).map(ApplyDecision::Applied),
@@ -1081,6 +1083,11 @@ fn apply_run_done(
     let payload: RunDoneProposalPayload =
         serde_json::from_str(payload_json).context("run_done proposal payload_json did not deserialize")?;
 
+    if payload.outcome != boss_protocol::RunDoneOutcome::Blocked
+        && let Err(err) = super::review_outcomes::require_complete(tx, execution_id)
+    {
+        return Ok(ApplyDecision::Rejected(err.to_string()));
+    }
     if let Err(err) = super::queue_ci_evidence::validate_declaration(tx, execution_id, &payload) {
         return Ok(ApplyDecision::Rejected(err.to_string()));
     }

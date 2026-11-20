@@ -69,6 +69,9 @@ fn valid_payload_for(kind: ProposalKind) -> Value {
                 "findings": [],
             },
         }),
+        ProposalKind::ReviewOutcomes => {
+            json!({"outcomes":[{"finding_id":"C1","outcome":"not_fixed","reason":"Needs a product decision"}]})
+        }
         ProposalKind::ReviewVerdict => json!({
             "batch_id": "rvb_123",
             "verdict": {

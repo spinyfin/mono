@@ -91,6 +91,7 @@ pub fn proposal_kind_decision(tier: RpcTier, kind: ProposalKind) -> WorkerVerbDe
         | ProposalKind::ReviewGuide
         | ProposalKind::ReviewReport
         | ProposalKind::ReviewVerdict
+        | ProposalKind::ReviewOutcomes
         | ProposalKind::Wait => match tier {
             RpcTier::Progression => WorkerVerbDecision::Deny(Box::new(WorkerTierDenial::progression(
                 verb(),
