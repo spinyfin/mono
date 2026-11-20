@@ -109,16 +109,7 @@ pub(crate) fn verify(workspace: &Path, packet: &SourcePacket) -> Result<PathBuf>
 /// filters, hooks, a pager, credentials, or network fetching.
 fn range_exists(workspace: &Path, sha: &str, path: &str, start: u32, end: u32) -> Result<()> {
     require_sha(sha)?;
-    let whole_file = start == 0 && end == 0;
-    ensure!(whole_file || (start > 0 && end >= start), "invalid line range");
-    ensure!(
-        !path.is_empty()
-            && path
-                .split('/')
-                .all(|part| !part.is_empty() && part != "." && part != "..")
-            && !path.contains('\0'),
-        "invalid repository path"
-    );
+    ensure!(boss_review_guide::valid_linked_path(path), "invalid repository path");
     let object = format!("{sha}:{path}");
     let size = String::from_utf8(git(workspace, &["cat-file", "-s", &object])?)?
         .trim()
@@ -127,9 +118,9 @@ fn range_exists(workspace: &Path, sha: &str, path: &str, start: u32, end: u32) -
         size <= 16 * 1024 * 1024,
         "linked source exceeds 16 MiB validation limit"
     );
-    let text = String::from_utf8(git(workspace, &["cat-file", "blob", &object])?)?;
+    let blob = git(workspace, &["cat-file", "blob", &object])?;
     ensure!(
-        !text.contains('\0') && (whole_file || end as usize <= text.lines().count()),
+        boss_review_guide::linked_range_ok(path, start, end, &blob),
         "linked range does not exist in textual source"
     );
     Ok(())

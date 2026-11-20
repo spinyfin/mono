@@ -1,0 +1,7 @@
+INVALID — 5 issue(s):
+  - reference `https://github.com/brianduff/flunge/blob/7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1/frontend/tsconfig.json#L2-L25` does not resolve to any pinned source in the packet
+  - reference `https://github.com/brianduff/flunge/blob/7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1/.buildkite/scripts/upload_dynamic_pipeline.sh#L146-L159` does not resolve to any pinned source in the packet
+  - reference `https://github.com/brianduff/flunge/blob/7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1/.buildkite/scripts/run_frontend_tests.sh#L9-L13` does not resolve to any pinned source in the packet
+  - reference `https://github.com/brianduff/flunge/blob/7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1/frontend/package.json#L6-L10` does not resolve to any pinned source in the packet
+  - reference `https://github.com/brianduff/flunge/blob/7db88ee23b84dcc1a4d997bf4f29c19b5a8d66b1/frontend/jest.setup.cjs#L1-L11` does not resolve to any pinned source in the packet
+corpus-tool: validation failed for /Users/brianduff/.local/share/cube/workspaces/mono-agent-473/tools/boss/docs/evaluations/automatic-pr-review-guides/cases/flunge-1552/guide-production-attempt2.md

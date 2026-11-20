@@ -1,0 +1,57 @@
+I want you to provide me a guided summary of the changes in https://github.com/spinyfin/mono/pull/2890. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: spinyfin/mono
+- PR title: Stop re-measuring the whole markdown document on every layout pass
+- Merge-base revision: 6f8ca35153d0fcae9aea5e9852894ea549989ca0
+- Head revision: 12c538d6f328d9f4cbb62c0ef69d6fa9b301500a
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base ("before") content with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/spinyfin-mono/.git show 6f8ca35153d0fcae9aea5e9852894ea549989ca0:<path>`, and its diff with `git --git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/spinyfin-mono/.git diff --no-ext-diff --no-textconv 6f8ca35153d0fcae9aea5e9852894ea549989ca0 12c538d6f328d9f4cbb62c0ef69d6fa9b301500a -- <path>`. Always pass `--git-dir /Users/brianduff/.local/share/cube/workspaces/mono-agent-807/.codex/corpus-work/pinned-repos/spinyfin-mono/.git` explicitly: that is the pinned object store for this checkout, it is not exported as `GIT_DIR`, and a bare `git` has no repository to read. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
+
+## Source context
+
+Comparison: `https://github.com/spinyfin/mono/pull/2890` base `6f8ca35153d0fcae9aea5e9852894ea549989ca0` (merge base `6f8ca35153d0fcae9aea5e9852894ea549989ca0`) to head `12c538d6f328d9f4cbb62c0ef69d6fa9b301500a`.
+
+### PR description
+
+## Summary
+
+Boss’s markdown viewer splits headed documents into independently rendered sections so `LazyVStack` can defer off-screen work, caches the heading split across ordinary view invalidations, and avoids remounting parsed content when comment or find highlights change.
+
+- The document `ScrollView` hosts a direct-child `LazyVStack` with per-chunk theme modifiers and explicit chrome spacing, preserving lazy instantiation.
+- Heading chunks are refreshed only when the source or collapsible-heading configuration changes.
+- Comment anchors resolve once against the concatenated chunk projection, then clip onto only the overlapping chunks; the projection is cached separately from highlighted and flashing anchors, so comment flash changes only reassign anchors.
+- Whitespace-only clipped anchor fragments are discarded, preventing an ambiguous fragment from highlighting unrelated whitespace.
+- Parse timing remains derived from document chunk heights, and highlight refreshes re-parse in place without resetting scroll position.
+
+## Validation
+
+- `bazel build //tools/boss/app-macos:boss_mac_app_lib //tools/boss/app-macos:BossTestsShard3`
+- `bazel test //tools/boss/app-macos:BossTestsShard3`
+- `checkleft run`
+
+## Changes in this revision
+
+Comment-anchor projection caching is now independent of comment and flash state, heading-boundary whitespace fragments are rejected, and the lazy-stack probe waits for an appearance event up to a bounded deadline while only rejecting broad instantiation.
+
+
+### Changed files
+
+- `tools/boss/app-macos/Sources/Comments/MarkdownCommentAnchorMap.swift` (Added, +179/-0)
+- `tools/boss/app-macos/Sources/MarkdownDocumentChrome.swift` (Modified, +265/-114)
+- `tools/boss/app-macos/Sources/Search/MarkdownFindBar.swift` (Modified, +1/-20)
+- `tools/boss/app-macos/Sources/Search/MarkdownFindState.swift` (Modified, +6/-6)
+- `tools/boss/app-macos/Tests/BossTests/MarkdownDocumentChromeTests.swift` (Modified, +227/-20)
+
+
+### Registered screenshots
+
+No screenshots are registered for this task or its revisions.
