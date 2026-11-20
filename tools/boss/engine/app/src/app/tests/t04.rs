@@ -1284,7 +1284,7 @@ async fn seed_orphaned_slot1_with_identity(
     server_state: &ServerState,
     session_name: &str,
     token: &str,
-) -> (String, std::process::Child) {
+) -> (String, boss_engine_runtime::test_support::ProcessGroupChild) {
     use boss_engine_runtime::test_support::*;
     let db = server_state.work_db.as_ref();
     let product_id = create_product(db);
@@ -1311,7 +1311,7 @@ async fn assert_inconclusive_and_untouched(
     slot_id: u8,
     execution_id: &str,
     reason_needle: &str,
-    child: &mut std::process::Child,
+    child: &mut boss_engine_runtime::test_support::ProcessGroupChild,
 ) {
     match server_state.hosted_pane_run_for_slot(slot_id).await {
         SlotOccupancy::Inconclusive { run_id, reason } => {

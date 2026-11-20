@@ -24,4 +24,5 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", 
 [dev-dependencies]
 boss-engine-recovery-fixtures = { path = "../recovery-fixtures" }
 boss-engine-test-git = { path = "../test-git" }
+boss-engine-test-process = { path = "../test-process" }
 tempfile = { workspace = true }

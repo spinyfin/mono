@@ -7,16 +7,8 @@ use boss_engine_runtime::test_support::*;
 async fn terminal_tmux_handoff_immediately_confines_the_live_worker() {
     let (state, _dir) = test_server_state();
     state.feature_flags.set("worker_rpc_tier", true).unwrap();
-    // Reap the test-owned process even if an assertion fails.
-    struct Sleeper(std::process::Child);
-    impl Drop for Sleeper {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let child = Sleeper(spawn_group_leader_sleeper());
-    let pid = child.0.id() as i32;
+    let child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
     let db = state.work_db.as_ref();
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "live orphan");

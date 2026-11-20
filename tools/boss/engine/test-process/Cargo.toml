@@ -1,0 +1,11 @@
+[package]
+name = "boss-engine-test-process"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
