@@ -291,6 +291,9 @@ pub enum FrontendEvent {
     WorkItemRestored { item: WorkItem },
     #[worker(passthrough)]
     WorkError { message: String },
+    /// A dependency was refused because it closes a dispatch-gating cycle.
+    #[worker(passthrough)]
+    DependencyCycleRejected { error: crate::DependencyCycleError },
     /// A board gesture (`MoveWorkItemOnBoard`) was refused or reverted by
     /// the engine. Sent instead of [`Self::WorkError`] so the app can show
     /// `message` on the card that was dragged (`id`) and offer
@@ -1837,6 +1840,7 @@ impl FrontendEvent {
             FrontendEvent::OperatorQuestionError { .. }
                 | FrontendEvent::Error { .. }
                 | FrontendEvent::WorkError { .. }
+                | FrontendEvent::DependencyCycleRejected { .. }
                 | FrontendEvent::ExecutionTranscriptUnavailable { .. }
                 | FrontendEvent::ProductDesignDocContent {
                     content: crate::DesignDocContent::Failed { .. },

@@ -28,15 +28,12 @@
 //! commits itself, **any error rolls the whole thing back — no partial graph
 //! is ever created** (design §3 step 5).
 //!
-//! ## Defense in depth: validate the graph before any insert
+//! ## Cycle validation
 //!
-//! The validation layer (task 6, [`boss_engine_planner_validation`]) runs before
-//! apply on the trigger path. But `apply` is a public entry point (operator
-//! commands, replanning, tests) and must be self-contained, so it re-checks
-//! handle integrity and acyclicity *before* opening the write transaction
-//! ([`check_graph`]). A cyclic or handle-broken proposal is rejected with
-//! nothing written. `add_dependency_edge_in_tx`'s own `would_create_cycle` is
-//! then the second line of defense at edge-insert time.
+//! Planner validation checks proposal handles early. Materialization validates
+//! cycles at the shared edge insert after handles resolve to row ids, so cycles
+//! involving existing rows or deduplicated names return full row diagnostics.
+//! The enclosing transaction rolls back all tasks, edges, and status changes.
 //!
 //! ## Idempotent / re-apply safe
 //!
@@ -46,14 +43,12 @@
 //! IGNORE` no-ops. This is what makes replanning against an updated doc safe
 //! (design §2 "Reusability" #3).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
-use boss_protocol::{
-    ApplyResult, CreateInvestigationInput, CreateTaskInput, PlannerOutput, ProposedEdge, ProposedTask, TaskKind,
-};
+use boss_protocol::{ApplyResult, CreateInvestigationInput, CreateTaskInput, PlannerOutput, ProposedTask, TaskKind};
 
 use crate::event_publish::{PendingEvents, commit_and_publish};
 use crate::work::{
@@ -86,12 +81,11 @@ impl Materializer {
     /// # Errors
     ///
     /// - The proposal's graph is invalid: a duplicate task handle, an edge
-    ///   referencing an unknown handle, or a dependency cycle. Rejected
-    ///   before any DB write.
+    ///   referencing an unknown handle. Rejected before any DB write.
     /// - The project does not exist, or a reused write path fails (e.g. the
     ///   edge cycle-gate fires).
     pub fn apply(db: &WorkDb, project_id: &str, planner_run_id: &str, output: &PlannerOutput) -> Result<ApplyResult> {
-        // 1 + 2. Handle integrity + topo-sort/cycle reject, before any insert.
+        // Validate handle integrity before writing; edge inserts validate cycles.
         check_graph(output)?;
 
         let mut conn = db.connect()?;
@@ -310,11 +304,8 @@ fn existing_task_names(conn: &Connection, project_id: &str) -> Result<HashMap<St
     Ok(map)
 }
 
-/// Pure graph validation: reject duplicate handles, edges referencing unknown
-/// handles, and cycles — before any DB write. Mirrors the checks in
-/// [`boss_engine_planner_validation`] but returns a plain `Result<()>` (apply's
-/// caller has already mapped the richer `ValidationResult` to an audit
-/// outcome; here the checks are self-contained defense in depth).
+/// Reject duplicate handles and edges referencing unknown handles before
+/// writing. Cycle checks run against resolved row ids inside the transaction.
 fn check_graph(output: &PlannerOutput) -> Result<()> {
     // Every handle must be unique.
     let mut handles: HashSet<&str> = HashSet::with_capacity(output.tasks.len());
@@ -332,67 +323,16 @@ fn check_graph(output: &PlannerOutput) -> Result<()> {
             bail!("materializer: edge references unknown handle: {}", edge.prerequisite);
         }
     }
-    // The edge set must form a DAG.
-    if let Some(cycle) = find_cycle(&handles, &output.edges) {
-        bail!(
-            "materializer: dependency graph contains a cycle involving: {}",
-            cycle.join(", ")
-        );
-    }
+    // Validate cycles after handles resolve to row ids, including deduplicated
+    // names. The typed insert error survives rollback of the whole batch.
     Ok(())
-}
-
-/// Topologically sort the handle graph with Kahn's algorithm; return `None`
-/// when it is acyclic, or `Some(stuck)` — the sorted set of handles that
-/// never reached in-degree 0 (i.e. those on or feeding into a cycle) — when
-/// it is not.
-///
-/// Edge direction: `dependent` depends on `prerequisite`, so `prerequisite`
-/// must be emitted first. In-degree counts a node's unmet prerequisites.
-fn find_cycle(handles: &HashSet<&str>, edges: &[ProposedEdge]) -> Option<Vec<String>> {
-    let mut in_degree: HashMap<&str, usize> = handles.iter().map(|&h| (h, 0usize)).collect();
-    let mut adj: HashMap<&str, Vec<&str>> = handles.iter().map(|&h| (h, Vec::new())).collect();
-    for edge in edges {
-        // prerequisite → dependent: emitting the prerequisite unblocks the dependent.
-        adj.entry(edge.prerequisite.as_str())
-            .or_default()
-            .push(edge.dependent.as_str());
-        *in_degree.entry(edge.dependent.as_str()).or_insert(0) += 1;
-    }
-
-    let mut queue: VecDeque<&str> = in_degree.iter().filter(|&(_, &d)| d == 0).map(|(&h, _)| h).collect();
-    let mut emitted = 0usize;
-    while let Some(node) = queue.pop_front() {
-        emitted += 1;
-        if let Some(neighbors) = adj.get(node) {
-            for &next in neighbors {
-                let d = in_degree.get_mut(next).expect("edge endpoint is a tracked handle");
-                *d -= 1;
-                if *d == 0 {
-                    queue.push_back(next);
-                }
-            }
-        }
-    }
-
-    if emitted == handles.len() {
-        None
-    } else {
-        // Handles that never reached in-degree 0 are exactly those on/into a cycle.
-        let mut stuck: Vec<String> = in_degree
-            .iter()
-            .filter(|&(_, &d)| d > 0)
-            .map(|(&h, _)| h.to_owned())
-            .collect();
-        stuck.sort();
-        Some(stuck)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use boss_protocol::ProposedEdge;
     use boss_protocol::{Confidence, CreateTaskInput, EffortLevel, ProposedMergeOrderHint, ProposedTask, TaskKind};
 
     use crate::work::{ClaimPlannerRunInput, WorkDb};
@@ -832,6 +772,47 @@ mod tests {
     // ---- apply: rejections leave nothing behind ---------------------------
 
     #[test]
+    fn cycle_after_name_resolution_rolls_back_tasks_edges_and_status_changes() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+        let seed = output(
+            vec![
+                ptask("a", "Task A", TaskKind::ProjectTask),
+                ptask("b", "Task B", TaskKind::ProjectTask),
+            ],
+            vec![pedge("a", "b")],
+        );
+        let initial = Materializer::apply(&db, &project_id, &run, &seed).unwrap();
+        let before = db.list_task_ids_for_planner_run(&run).unwrap();
+        // Acyclic by handles, but existing A -> B closes B -> A. The first
+        // edge and new task must roll back along with the rejected edge.
+        let batch = output(
+            vec![
+                ptask("a", "Task A", TaskKind::ProjectTask),
+                ptask("b", "Task B", TaskKind::ProjectTask),
+                ptask("c", "Task C", TaskKind::ProjectTask),
+            ],
+            vec![pedge("b", "c"), pedge("b", "a")],
+        );
+        let err = Materializer::apply(&db, &project_id, &run, &batch).unwrap_err();
+        let cycle = err.downcast_ref::<boss_protocol::DependencyCycleError>().unwrap();
+        assert_eq!(
+            cycle.path.iter().map(|step| step.name.as_str()).collect::<Vec<_>>(),
+            ["Task B", "Task A"]
+        );
+        assert_eq!(db.list_task_ids_for_planner_run(&run).unwrap(), before);
+        assert_eq!(count(&db, "SELECT count(*) FROM work_item_dependencies", &[]), 1);
+        assert_eq!(count(&db, "SELECT count(*) FROM tasks WHERE name = 'Task C'", &[]), 0);
+        let task_b = initial
+            .created
+            .iter()
+            .find(|id| task_scalar::<String>(&db, id, "name") == "Task B")
+            .unwrap();
+        assert_eq!(task_scalar::<String>(&db, task_b, "status"), "todo");
+    }
+
+    #[test]
     fn rejects_cycle_and_writes_nothing() {
         let db = open();
         let (product_id, project_id) = product_and_project(&db);
@@ -846,7 +827,10 @@ mod tests {
         );
 
         let err = Materializer::apply(&db, &project_id, &run, &out).unwrap_err();
-        assert!(err.to_string().contains("cycle"), "got: {err}");
+        assert!(
+            err.downcast_ref::<boss_protocol::DependencyCycleError>().is_some(),
+            "got: {err:#}"
+        );
         assert!(db.list_task_ids_for_planner_run(&run).unwrap().is_empty());
         assert_eq!(
             count(

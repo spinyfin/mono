@@ -138,6 +138,7 @@ macro_rules! rpc_call {
             FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                 Err(CliError::application(message))
             }
+            FrontendEvent::DependencyCycleRejected { error } => Err(CliError::application(error.to_string())),
             // Worker-tier refusal. Handled in the shared macro rather than
             // per verb because any verb can draw one: the engine's gate runs
             // before dispatch and applies to the whole surface. The denial's

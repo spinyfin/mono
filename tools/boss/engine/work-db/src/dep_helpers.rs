@@ -625,9 +625,6 @@ pub(crate) fn add_dependency_edge_in_tx_as_actor(
     now_epoch: &str,
     actor: &str,
 ) -> Result<(WorkItemDependency, Option<WorkExecution>)> {
-    if dependent_id == prerequisite_id {
-        bail!("a work item cannot depend on itself: {dependent_id}");
-    }
     // All of the validation below — the archived-prerequisite rejection,
     // the same-product check, and the cycle check — only makes sense for a
     // genuinely NEW edge. `WorkDb::add_dependency` documents idempotent
@@ -656,9 +653,6 @@ pub(crate) fn add_dependency_edge_in_tx_as_actor(
             bail!(
                 "dependency edges must stay within a single product; cross-product edges are tracked in proj_18a2bbe20fc03718_8"
             );
-        }
-        if deps::would_create_cycle(conn, dependent_id, prerequisite_id)? {
-            bail!("creating this edge would form a cycle: {prerequisite_id} → … → {dependent_id}");
         }
     }
     let (edge, _outcome): (WorkItemDependency, EdgeInsertOutcome) =

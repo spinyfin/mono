@@ -94,7 +94,15 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
                 send_response_with_revision(&sink, &request_id, revision, FrontendEvent::DependencyAdded { edge });
             }
             Err(err) => {
-                send_work_error(&sink, &request_id, &err);
+                if let Some(error) = err.downcast_ref::<boss_protocol::DependencyCycleError>() {
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::DependencyCycleRejected { error: error.clone() },
+                    );
+                } else {
+                    send_work_error(&sink, &request_id, &err);
+                }
             }
         }
     }

@@ -887,12 +887,12 @@ impl Populator {
                     run_id,
                     PlannerRunPatch::builder()
                         .outcome(PLANNER_OUTCOME_PLANNER_FAILED)
-                        .result_summary(format!("apply failed: {err}"))
+                        .result_summary(format!("apply failed: {err:#}"))
                         .build(),
                     "Auto-populate failed: could not apply task graph",
                     format!(
                         "The planner's proposal passed validation but could not be applied \
-                         ({err}). No tasks were created (the apply is transactional). Re-run \
+                         ({err:#}). No tasks were created (the apply is transactional). Re-run \
                          `boss project plan <project>`."
                     ),
                     publisher,
