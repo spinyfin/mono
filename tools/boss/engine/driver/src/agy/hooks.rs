@@ -23,7 +23,7 @@ use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::home::{agy_homes_root, process_home_for_run, session_settings_path_for_run};
+use super::home::{agy_homes_root, brain_link, process_home_for_run, session_settings_path_for_run};
 use crate::hook_guards::{Guard, guard_commands, write_executable};
 use crate::hook_settings::forwarder_command;
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig, WorkerKind};
@@ -324,6 +324,10 @@ pub(super) fn expected_authorization_policy(
         "workspace_path": obs.workspace_path.display().to_string(),
         "process_home": process_home.display().to_string(),
         "protected_paths": protected_paths(process_home, interception),
+        // Where agy keeps per-conversation scratch and truncated-output files.
+        // The adapter exempts only `<this>/<the hook payload's conversation id>`
+        // from `protected_paths`, never the directory itself or a sibling.
+        "conversation_scratch_root": brain_link(process_home).display().to_string(),
         "artifact_write_paths": artifact_write_paths_json(worker_kind, &obs.run_id),
         "forwarder": obs.forwarder_binary.display().to_string(),
         "attestation_path": attestation_path(process_home).display().to_string(),

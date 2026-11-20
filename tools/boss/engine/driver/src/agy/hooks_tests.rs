@@ -800,3 +800,6 @@ mod startup_tests;
 
 #[path = "protected_operand_tests.rs"]
 mod protected_operand_tests;
+
+#[path = "scratch_and_quoting_tests.rs"]
+mod scratch_and_quoting_tests;

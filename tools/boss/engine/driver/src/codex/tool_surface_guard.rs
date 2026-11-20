@@ -210,6 +210,34 @@ def has_inline_program(program, arguments):
     return False
 
 
+# An unquoted `<file`, `<<delimiter` or `<<<word` redirection (optionally on
+# fd 0). `<&n` and `<>` are not input redirections from a fixed source.
+STDIN_REDIRECT = re.compile(r"^0?<(?![&>])")
+
+
+def stdin_comes_from_redirect(group):
+    """True when an unquoted redirection feeds the program's stdin.
+
+    Such a program's stdin is a file or a heredoc, closed at its end, not the
+    terminal session `write_stdin` writes into, so it is not a command channel.
+    A quoted `<` is an ordinary argument and does not count.
+    """
+    for index, token in enumerate(group):
+        literal = group.literal_chars[index] if index < len(group.literal_chars) else []
+        if literal and literal[0]:
+            continue
+        match = STDIN_REDIRECT.match(token)
+        if not match:
+            continue
+        if token[match.end():].startswith("<"):
+            return True  # heredoc or here-string
+        target = token[match.end():] or (group[index + 1] if index + 1 < len(group) else "")
+        # A terminal or process device is still a live channel.
+        if not target.startswith(("/dev/", "/proc/")):
+            return True
+    return False
+
+
 def stdin_channel_detail(group):
     """Why this argv opens a stdin-driven session, or None if it does not."""
     rest = strip_prefixes(group)
@@ -223,6 +251,12 @@ def stdin_channel_detail(group):
 
     interpreter = program in INTERPRETERS or program in INTERPRETERS_NEEDING_TWO_ARGS
     if not interpreter:
+        return None
+
+    # `python3 - <<'PY'` and `sqlite3 db < script.sql` read a heredoc or file,
+    # not a live session. A shell is excluded: the body it would read is a
+    # script the other guards cannot attribute to a command of its own.
+    if program not in SHELLS and stdin_comes_from_redirect(group):
         return None
 
     for argument in arguments:
@@ -265,6 +299,13 @@ def main():
     command = tool_input.get("command")
     if not isinstance(command, str):
         emit("block", MALFORMED + "tool_input.command was not a string")
+
+    if payload.get("redirects_stripped") is True:
+        # The adapter also offers each command with its redirections removed,
+        # so a prefix guard can see the program. This guard reads redirections
+        # itself, from the unstripped form it is also given; the stripped form
+        # would only lose a heredoc or file that is the program's stdin.
+        emit("approve")
 
     masked = review_guide_masked_command(command)
     if masked is not None:
@@ -471,6 +512,51 @@ mod tests {
         ] {
             let (decision, reason) = bash(command);
             assert_eq!(decision, "approve", "{command:?} must be allowed: {reason}");
+        }
+    }
+
+    #[test]
+    fn approves_interpreters_whose_stdin_is_a_heredoc_or_file() {
+        for command in [
+            "python3 - <<'PY'\nprint(1)\nPY",
+            "python3 - <<PY\nprint(1)\nPY",
+            "python3 - <<-'PY'\nprint(1)\nPY",
+            "python3 <<'PY'\nprint(1)\nPY",
+            "python3 - < script.py",
+            "python3 - <<<'print(1)'",
+            "sqlite3 db.sqlite < script.sql",
+            "node - <<'JS'\nconsole.log(1)\nJS",
+            "python3 - 2>/dev/null <<'PY'\nprint(1)\nPY",
+        ] {
+            let (decision, reason) = bash(command);
+            assert_eq!(decision, "approve", "{command:?} reads a heredoc or file: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_or_non_input_redirect_does_not_hide_a_stdin_channel() {
+        for command in [
+            // Quoted: an ordinary argument that merely starts with `<`.
+            "python3 - '<x'",
+            "python3 - \"<<PY\"",
+            "python3 - \\<x",
+            // Not a file or heredoc feeding stdin.
+            "python3 - <&3",
+            "python3 - <>f",
+            "python3 - >out",
+            // A terminal or process device is a live channel, not a file.
+            "python3 - < /dev/tty",
+            "python3 -</dev/stdin",
+            "python3 - 0< /proc/self/fd/0",
+            // A shell reading a heredoc stays blocked.
+            "bash <<'EOF'\necho hi\nEOF",
+            "sh -s <<'EOF'\necho hi\nEOF",
+            // The redirect belongs to another command.
+            "echo x <<'EOF' && python3 -\nbody\nEOF",
+            "cat < in.txt | python3 -",
+        ] {
+            let (decision, reason) = bash(command);
+            assert_eq!(decision, "block", "{command:?} still opens a stdin channel: {reason}");
         }
     }
 
