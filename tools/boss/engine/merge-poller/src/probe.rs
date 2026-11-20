@@ -20,6 +20,8 @@ pub struct CommandMergeProbe {
     commit_status_cache: Mutex<HashMap<String, CachedCommitStatus>>,
 }
 
+tokio::task_local! { static RATE_LIMIT_REJECTED: std::cell::Cell<bool>; }
+
 type BoxedBatchProbe<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = HashMap<String, std::result::Result<PrLifecycleProbe, String>>> + Send + 'a>,
 >;
@@ -214,7 +216,11 @@ impl CommandMergeProbe {
         let results = crate::probe_budget::FALLBACK
             .scope(Mutex::new(Default::default()), async {
                 let _report = crate::probe_budget::FallbackReport;
-                self.probe_batch_with_deadline(&order, crate::probe_budget::deadline())
+                RATE_LIMIT_REJECTED
+                    .scope(
+                        std::cell::Cell::new(false),
+                        self.probe_batch_with_deadline(&order, crate::probe_budget::deadline()),
+                    )
                     .await
             })
             .await;
@@ -237,7 +243,16 @@ impl CommandMergeProbe {
             }
             let (left, right) = order.split_at(order.len() / 2);
             let mut out = self.probe_batch_with_deadline(left, deadline).await;
-            out.extend(self.probe_batch_with_deadline(right, deadline).await);
+            if RATE_LIMIT_REJECTED.try_with(|flag| flag.get()).unwrap_or(false) {
+                out.extend(right.iter().map(|url| {
+                    (
+                        url.clone(),
+                        Err("GitHub API rate limit exceeded; retrying next pass".to_owned()),
+                    )
+                }));
+            } else {
+                out.extend(self.probe_batch_with_deadline(right, deadline).await);
+            }
             out
         })
     }
@@ -276,7 +291,7 @@ impl CommandMergeProbe {
         tracing::debug!(
             pr_count = order.len(),
             repo_count = alias_map.len(),
-            "merge poller: batched probe — one GraphQL query for the whole pass",
+            "merge poller: batched probe — one GraphQL query for this batch",
         );
 
         if tokio::time::Instant::now() >= deadline {
@@ -355,6 +370,7 @@ impl CommandMergeProbe {
                     // `throttle_factor` readings stop being a faithful record
                     // of the multiplier actually in force.
                     record_rate_limit_remaining(0, "rate_limit_rejection");
+                    let _ = RATE_LIMIT_REJECTED.try_with(|flag| flag.set(true));
                     let msg = "gh api graphql rejected: GitHub API rate limit exceeded".to_owned();
                     for url in &order {
                         out.insert(url.clone(), Err(msg.clone()));
@@ -420,10 +436,11 @@ impl CommandMergeProbe {
         };
 
         let nodes: HashMap<_, _> = walk_batch_response(&body, &alias_map).into_iter().collect();
+        let mut pending = HashMap::new();
         for url in &order {
             let pr_node = nodes.get(url).copied().flatten();
             if untrusted.contains(url) {
-                out.extend(self.probe_each_individually(std::slice::from_ref(url), deadline).await);
+                pending.insert(url.clone(), None);
                 continue;
             }
             let Some(pr_node) = pr_node else {
@@ -442,13 +459,28 @@ impl CommandMergeProbe {
                 );
                 continue;
             };
-            let _ = crate::probe_budget::CONTEXT.try_with(|c| c.order.lock().unwrap().attempt(url));
-            let flat = flatten_batched_pr_node(pr_node).to_string();
-            let combined_state = match crate::probe_budget::bounded(
-                deadline,
-                self.fetch_commit_combined_state_for_empty_rollup(&flat, url),
-            )
-            .await
+            let flat = flatten_batched_pr_node(pr_node);
+            if combined_status_path(&flat, url).is_some() {
+                pending.insert(url.clone(), Some(flat.to_string()));
+                continue;
+            }
+            let result = parse_probe_json(url, &flat.to_string(), None).map_err(|err| err.to_string());
+            if result.is_ok() {
+                crate::probe_budget::completed(url);
+            }
+            out.insert(url.clone(), result);
+        }
+        // Preserve every observation requiring no more I/O before spending
+        // the allowance on status lookups or untrusted nodes.
+        for url in &order {
+            let Some(flat) = pending.remove(url) else { continue };
+            let Some(flat) = flat else {
+                out.extend(self.probe_each_individually(std::slice::from_ref(url), deadline).await);
+                continue;
+            };
+            let combined_state = match self
+                .fetch_commit_combined_state_with_deadline(&flat, url, deadline)
+                .await
             {
                 Ok(state) => state,
                 Err(err) => {
@@ -789,17 +821,25 @@ impl CommandMergeProbe {
     /// a full re-fetch (doc: `github-event-detection-webhooks-vs-polling`,
     /// §9.2).
     async fn fetch_commit_combined_state_for_empty_rollup(&self, json_body: &str, pr_url: &str) -> Option<String> {
-        let root: serde_json::Value = serde_json::from_str(json_body.trim()).ok()?;
-        let rollup = root.get("statusCheckRollup").and_then(|v| v.as_array())?;
-        if !rollup.is_empty() {
-            return None; // non-empty rollup; use rollup data
+        self.fetch_commit_combined_state_with_deadline(json_body, pr_url, crate::probe_budget::deadline())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn fetch_commit_combined_state_with_deadline(
+        &self,
+        json_body: &str,
+        pr_url: &str,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<Option<String>, String> {
+        let root: serde_json::Value = serde_json::from_str(json_body.trim()).map_err(|err| err.to_string())?;
+        let Some(api_path) = combined_status_path(&root, pr_url) else {
+            return Ok(None);
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err("probe deadline exhausted; retrying next pass".to_owned());
         }
-        let head_sha = root
-            .get("headRefOid")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())?;
-        let repo = repo_from_pr_url(pr_url)?;
-        let api_path = format!("repos/{repo}/commits/{head_sha}/status");
 
         let cached_etag = self
             .commit_status_cache
@@ -821,12 +861,30 @@ impl CommandMergeProbe {
         }
         let mut measurement = crate::probe_budget::Measurement::start("probe_combined_status", 1);
         measurement.attempt();
-        let output = self.output(&args).await.ok()?;
+        let _ = crate::probe_budget::CONTEXT.try_with(|c| c.order.lock().unwrap().attempt(pr_url));
+        let output = crate::probe_budget::bounded(deadline, self.output(&args)).await?;
+        let Ok(output) = output else { return Ok(None) };
         measurement.complete();
 
         let outcome = classify_conditional_output(&output);
-        resolve_and_cache_combined_state(&self.commit_status_cache, &api_path, outcome)
+        Ok(resolve_and_cache_combined_state(
+            &self.commit_status_cache,
+            &api_path,
+            outcome,
+        ))
     }
+}
+
+/// Terminal observations and populated rollups are complete without REST.
+fn combined_status_path(root: &serde_json::Value, pr_url: &str) -> Option<String> {
+    if root.get("state").and_then(|v| v.as_str()) != Some("OPEN")
+        || !root.get("statusCheckRollup")?.as_array()?.is_empty()
+    {
+        return None;
+    }
+    let head = root.get("headRefOid")?.as_str().filter(|s| !s.is_empty())?;
+    let repo = repo_from_pr_url(pr_url)?;
+    Some(format!("repos/{repo}/commits/{head}/status"))
 }
 
 /// Pure parser for GitHub's `repos/{owner}/{repo}/commits/{sha}/status`

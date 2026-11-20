@@ -1,5 +1,11 @@
 use super::*;
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_DEQUEUE_EVENTS: HashMap<String, Vec<MergeQueueDequeueEvent>>;
+    pub(crate) static TEST_REBOUNCE_CONFIRMATIONS: Mutex<Vec<String>>;
+}
+
 /// Timeline-events selection set for [`build_batch_query`]'s `fields`
 /// parameter, used by [`fetch_merge_queue_dequeue_events_batch`]. Requests
 /// the last 20 PR-head / dequeue timeline entries. Including PR commits and
@@ -38,6 +44,10 @@ pub(crate) const DEQUEUE_EVENTS_FIELDS: &str = concat!(
 pub(crate) async fn fetch_merge_queue_dequeue_events_batch(
     pr_urls: &[String],
 ) -> HashMap<String, Vec<MergeQueueDequeueEvent>> {
+    #[cfg(test)]
+    if let Ok(events) = TEST_DEQUEUE_EVENTS.try_with(Clone::clone) {
+        return events;
+    }
     let mut out = HashMap::new();
     let mut parsed: HashMap<String, (String, String, u64)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -199,6 +209,8 @@ pub(crate) async fn run_merge_queue_rebounce_pass(
         if !has_dequeue_events(&dequeue_events, &candidate.pr_url) {
             continue;
         }
+        #[cfg(test)]
+        let _ = TEST_REBOUNCE_CONFIRMATIONS.try_with(|ids| ids.lock().unwrap().push(candidate.work_item_id.clone()));
         if work_db.is_parked_or_assume_not(&candidate.work_item_id, "merge_queue rebounce") {
             continue;
         }

@@ -65,7 +65,8 @@ turning into PRs that are never observed:
   later group so recovery still makes progress.
 - **Rotation.** The PR walk, background nudges and the per-execution rechecks
   are ordered least recently attended first, and that memory is kept across
-  passes. Subsequent passes prioritize candidates least recently attended, with known terminal candidates first.
+  passes. Subsequent passes prioritize candidates least recently attended,
+  with known terminal candidates first.
   A candidate is marked when the pass starts on it, so a candidate whose own
   handling is what exhausts the budget goes to the back of the next pass
   instead of cutting every pass off in the same place. Open walk, local
@@ -142,7 +143,8 @@ To read it:
   The trace reports `probe_fallback=<ms>ms(attempted=…,completed=…,deferred=…)`
   across bisection and individual calls, counting distinct URLs per probe
   invocation. Completed counts cover usable fallback observations; deferred
-  counts cover fallback URLs without a completed observation. Fallback time covers bisection and individual fallback spans, including
+  counts cover fallback URLs without a completed observation. Fallback time
+  covers bisection and individual fallback spans, including
   combined-status work inside those spans; nested spans are counted once.
   `probe_combined_status` separately reports elapsed time and attempted,
   completed and deferred request counts for actual empty-rollup REST calls
