@@ -97,7 +97,11 @@ pub(super) fn non_bazel_rebase_clause(conflict_resolution: bool) -> &'static str
 /// Pre-push gate when the build system could not be confirmed (`None`).
 /// The worker discovers markers on the execution host and then applies
 /// the matching policy; an unavailable probe is not treated as non-Bazel.
-pub(super) fn unresolved_gate_text(conflict_resolution: bool, worker_signal_seam_enabled: bool) -> String {
+pub(super) fn unresolved_gate_text(
+    conflict_resolution: bool,
+    worker_signal_seam_enabled: bool,
+    run_done_seam_enabled: bool,
+) -> String {
     let blocked_action = if worker_signal_seam_enabled {
         "call `\"$BOSS_BIN\" propose blocked --reason \"...\"` naming that no build command was found and stop"
     } else {
@@ -117,8 +121,16 @@ pub(super) fn unresolved_gate_text(conflict_resolution: bool, worker_signal_seam
     let bazel_bullet = if conflict_resolution {
         "- If any of those Bazel markers is present, run `bazel build` of the touched/upstream targets, regenerate invalidated lockfiles (e.g. `MODULE.bazel.lock` via `bazel mod deps --lockfile_mode=update`), and then run the tests for the targets affected by the files that had conflicts — NOT the whole suite. Resolve them with `bazel query 'kind(\".*_test rule\", rdeps(//..., set(<conflicted source files>)))'`, run `bazel test` on that set, and report the exact command and its exit code. Lockfiles regenerated deterministically (e.g. `MODULE.bazel.lock`, `Cargo.lock`) do NOT on their own select tests; leave them out of the query set, and if no source file conflicted there is no affected-test set to run. If the affected-test query itself fails, report the failing command and its output and stop as blocked; do NOT skip the tests. Do NOT run the full `bazel test //...` suite in this gate."
     } else {
-        "- If any of those Bazel markers is present, apply the full Bazel policy: `bazel build` and `bazel test` of the touched targets."
+        "- If any of those Bazel markers is present, apply the conditional Bazel policy below."
     };
+    let bazel_gate = if conflict_resolution {
+        super::bazel_conflict_resolution_gate_text(worker_signal_seam_enabled)
+    } else {
+        super::bazel_prepush_gate_text(worker_signal_seam_enabled, run_done_seam_enabled)
+    };
+    // Reuse the complete requirements without claiming discovery already succeeded.
+    let requirements = bazel_gate.find("Required ").expect("Bazel gate requirements");
+    let conditional_bazel_policy = &bazel_gate[requirements..];
     format!(
         "\n## {heading}\n\
          \n\
@@ -127,12 +139,12 @@ pub(super) fn unresolved_gate_text(conflict_resolution: bool, worker_signal_seam
          {scope}\n\
          \n\
          Required BEFORE you push:\n\
-         - On this session's cwd, look for `MODULE.bazel`, `WORKSPACE`, `WORKSPACE.bazel`, or `BUILD.bazel` at the workspace root.\n\
+         - On this session's cwd, look for `MODULE.bazel`, `WORKSPACE`, `WORKSPACE.bazel` at the workspace root.\n\
          {bazel_bullet}\n\
-         - If none is present, discover the repo's documented compile, type-check and test commands from `AGENTS.md` / `CLAUDE.md`, the README, package-manager manifests, and CI workflows, then run those. Prefer the commands CI runs.\n\
+         - If none is present, discover the repo's documented compile, type-check and test commands from `AGENTS.md` / `CLAUDE.md`, the README, package-manager manifests, and CI workflows, then run those. Prefer the commands CI runs. Every required non-Bazel command must exit 0 before you push.\n\
          - Run them in the FOREGROUND, read each exit code directly, and report the commands and their exit codes in your Validation section. Do not wrap them in a shell `timeout`.\n\
-         - Every required command must exit 0 before you push.\n\
-         - If nothing is discoverable, do not invent a command and do not skip validation silently: say explicitly that no build command was found, then {blocked_action}.\n"
+         - If nothing is discoverable, do not invent a command and do not skip validation silently: say explicitly that no build command was found, then {blocked_action}.\n\
+         \n### Conditional policy: only if Bazel markers are present\n{conditional_bazel_policy}\n"
     )
 }
 

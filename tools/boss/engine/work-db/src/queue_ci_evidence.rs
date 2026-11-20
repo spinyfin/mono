@@ -4,7 +4,12 @@
 use super::*;
 use boss_protocol::{QueueCiEvidence, RunDoneOutcome, RunDoneProposalPayload};
 
-pub const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every command in each failed job's captured verification contract (BOSS_CI_VERIFICATION.json). For jobs without a declaration, the engine accepts as evidence: a Bazel build/test of the job's targets (the full job invocation for whole-job failures), `checkleft run` for a lint job, or the job's own npm/pnpm/yarn invocation. Cargo, go, make, and other undocumented invocations are not evidence; stop as blocked if the job is none of those and has no declaration. Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). A requeue of an unchanged head also needs queue_entry_id and queue_entry_enqueued_at from the enqueuePullRequest receipt (mergeQueueEntry { id enqueuedAt }). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
+/// Escalation does not declare a CI verdict or waive verification.
+pub const EVIDENCE_UNAVAILABLE: &str = r#"
+Evidence-unavailable escalation: if an undeclared job has no accepted evidence command, stop as blocked naming the job and its rejected command. Call `"$BOSS_BIN" propose blocked --reason "..."` when worker-signal proposals are enabled; otherwise emit a `[blocked] reason="..."` marker in the final response. This raises attention without a terminal CI verdict. Do not use `propose done --outcome blocked` or `engine ci mark-failed` for this escalation: both still require verification evidence.
+"#;
+
+pub const REQUIRED: &str = "Merge-queue CI verification required: fetch origin, rebase the PR onto current origin/main, and run every command in each failed job's captured verification contract (BOSS_CI_VERIFICATION.json). For jobs without a declaration, the engine accepts as evidence: a Bazel build/test of the job's targets (the full job invocation for whole-job failures), `checkleft run` for a lint job, or the job's own npm/pnpm/yarn invocation. Cargo, go, make, and other undocumented invocations are not evidence; if the job is none of those and has no declaration, call `\"$BOSS_BIN\" propose blocked --reason \"<job and rejected command>\"` when worker-signal proposals are enabled, otherwise emit a `[blocked] reason=\"<job and rejected command>\"` marker. This escalation raises attention without a CI verdict; do not use `propose done --outcome blocked` or `engine ci mark-failed`, which still require evidence. Supply --queue-ci-evidence-file with main_sha, verified_head_sha, queue_sha, queue_base_sha and successful runs (check_name, source_url, command, exit_code, output, coverage). A requeue of an unchanged head also needs queue_entry_id and queue_entry_enqueued_at from the enqueuePullRequest receipt (mergeQueueEntry { id enqueuedAt }). PR-head checks or isolated un-rebased reruns are not evidence. This gate does not expire; continue verification before declaring failure.";
 
 pub fn queue_ci_verification_required(attempt: &CiRemediation) -> bool {
     // A Trunk construction rejection with no failing build is a conflict or
@@ -194,7 +199,7 @@ pub(crate) fn validate_give_up(
             None => {
                 anyhow::ensure!(
                     names_no_build_reason(reason),
-                    "Giving up on a Trunk eviction requires --queue-ci-evidence-file when a failing trunk-merge/pr-N/* build exists (verify it with Bazel on a rebased tree). Without a failing build, the reason must be one of: {}.",
+                    "Giving up on a Trunk eviction requires --queue-ci-evidence-file when a failing trunk-merge/pr-N/* build exists (verify it on a rebased tree using the captured BOSS_CI_VERIFICATION.json contract, or for undeclared jobs a Bazel build/test, the job's npm/pnpm/yarn invocation, or checkleft run for lint). Without a failing build, the reason must be one of: {}.",
                     NO_BUILD_REASONS.join(", ")
                 );
                 Ok(())
@@ -635,10 +640,34 @@ mod tests {
         for key in ["first", "second", "third"] {
             let rejected = submit(key, &payload);
             assert_eq!(rejected.state, ProposalState::Rejected);
-            assert!(rejected.decision_reason.unwrap().contains("origin/main"));
+            let reason = rejected.decision_reason.unwrap();
+            assert!(reason.contains("origin/main"));
+            assert!(reason.contains("propose blocked --reason"));
+            assert!(reason.contains("[blocked] reason="));
+            assert!(reason.contains("do not use `propose done --outcome blocked`"));
             assert_eq!(db.execution_run_done_outcome(&execution.id).unwrap(), None);
         }
         assert!(db.validate_queue_ci_failure(&attempt.id, None, "x").is_err());
+        let escalation = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &revision.id,
+                kind: ProposalKind::Blocked,
+                payload_json: r#"{"reason":"Undeclared Go job: go test ./... is not accepted as evidence"}"#,
+                idempotency_key: "evidence-unavailable",
+            })
+            .unwrap()
+            .unwrap()
+            .proposal;
+        assert_eq!(escalation.state, ProposalState::Applied);
+        assert_eq!(db.execution_run_done_outcome(&execution.id).unwrap(), None);
+        assert!(
+            db.list_attention_items(&execution.id)
+                .unwrap()
+                .iter()
+                .any(|item| item.body_markdown.contains("go test ./... is not accepted"))
+        );
+
         let mut proof = evidence();
         for bad in [
             "exit",

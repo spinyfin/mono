@@ -301,17 +301,43 @@ fn queue_ci_section(prompt: &str) -> String {
 
 #[test]
 fn missing_local_path_without_override_is_not_treated_as_non_bazel() {
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .review_signal_checks(|_| &[])
-            .execution(&base_execution())
-            .work_item(&chore_without_pr())
-            .workspace_path(missing_path())
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .run_done_proposals_seam_enabled(true)
-            .build(),
-    );
-    assert_unresolved_gate_neutral(&prompt);
+    for kind in [
+        super::ExecutionKind::TaskImplementation,
+        super::ExecutionKind::ChoreImplementation,
+    ] {
+        let mut execution = base_execution();
+        execution.kind = kind.clone();
+        let mut work = chore_without_pr();
+        if kind == super::ExecutionKind::TaskImplementation {
+            let super::WorkItem::Chore(mut task) = work else {
+                panic!("chore fixture")
+            };
+            task.kind = super::TaskKind::ProjectTask;
+            work = super::WorkItem::Task(task);
+        }
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
+                .execution(&execution)
+                .work_item(&work)
+                .workspace_path(missing_path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .run_done_proposals_seam_enabled(true)
+                .build(),
+        );
+        assert_unresolved_gate_neutral(&prompt);
+        assert!(prompt.contains("no build command was found"));
+        assert!(prompt.contains("[blocked] reason="));
+        for requirement in [
+            "rdeps(//..., <changed-target>)",
+            ".github/workflows/*.yml",
+            "until it returns `exit_code`",
+            "evidence-backed as pre-existing or environmental",
+        ] {
+            assert!(prompt.contains(requirement), "missing {requirement}");
+        }
+        assert!(!prompt.contains("`BUILD.bazel`"));
+    }
 }
 
 #[test]
@@ -461,4 +487,45 @@ fn npm_queue_ci_prompt_advertises_only_validator_accepted_commands() {
         section.contains("stop as blocked") || section.contains("are rejected"),
         "{section}"
     );
+}
+
+#[test]
+fn unresolved_remote_probe_ignores_existing_local_namesakes() {
+    for ws in [npm_workspace(), bazel_workspace()] {
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .review_signal_checks(|_| &[])
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(ws.path())
+                .remote_workspace(true)
+                .maybe_bazel_workspace(None)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .run_done_proposals_seam_enabled(true)
+                .build(),
+        );
+        assert_unresolved_gate_neutral(&prompt);
+        assert!(prompt.contains("no build command was found"));
+    }
+}
+
+#[test]
+fn non_bazel_ci_prompts_offer_evidence_unavailable_escalation() {
+    for (path, kind, checks) in [
+        (npm_workspace(), "trunk_queue_eviction", "[]"),
+        (
+            npm_workspace(),
+            "merge_queue_rebounce",
+            r#"[{"name":"go-test","conclusion":"FAILURE"}]"#,
+        ),
+    ] {
+        let prompt = ci_fix_prompt(path.path(), kind, checks);
+        assert!(prompt.contains("BOSS_CI_VERIFICATION.json"));
+        assert!(prompt.contains("npm/pnpm/yarn invocation"));
+        assert!(prompt.contains("`checkleft run` for a lint job"));
+        assert!(prompt.contains("propose blocked --reason"));
+        assert!(prompt.contains("[blocked] reason="));
+        assert!(prompt.contains("Do not use `propose done --outcome blocked`"));
+        assert!(prompt.contains("undeclared commands") || prompt.contains("are rejected"));
+    }
 }
