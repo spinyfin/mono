@@ -172,3 +172,24 @@ fn custom_base_under_home_does_not_grant_home() {
         Some(std::fs::canonicalize(&base).unwrap())
     );
 }
+
+#[test]
+fn symlink_and_default_branches_reject_whole_home() {
+    let ws = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel"), "").unwrap();
+    let out = home.path().join("execroot/_main/bazel-out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::os::unix::fs::symlink(&out, ws.path().join("bazel-out")).unwrap();
+    assert_eq!(
+        bazel_output_directory_with(ws.path(), home.path().to_str(), Some("u"), None, None),
+        None
+    );
+    std::fs::remove_file(ws.path().join("bazel-out")).unwrap();
+    std::os::unix::fs::symlink(home.path(), cache.path().join("_bazel_u")).unwrap();
+    assert_eq!(
+        bazel_output_directory_with(ws.path(), home.path().to_str(), Some("u"), cache.path().to_str(), None),
+        None
+    );
+}
