@@ -115,6 +115,15 @@ final class NavigatorRowTests: XCTestCase {
         try capture(large, name: "navigator-row-large-text")
     }
 
+    func testWorkingRowAccessibilityDistinguishesActiveAndIdle() throws {
+        let task = NavigatorTestFixture.task(section: "working")
+        let row = NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil)
+        let idle = NavigatorRowPresentation(row: row, project: nil, width: 260)
+        let active = NavigatorRowPresentation(row: row, project: nil, width: 260, isWorkerActive: true)
+        XCTAssertTrue(idle.accessibilityLabel.contains("Worker idle"))
+        XCTAssertTrue(active.accessibilityLabel.contains("Worker active"))
+    }
+
     func testHealthPriorityKeepsSuppressedFactsAccessible() throws {
         var task = NavigatorTestFixture.task()
         task.prMergeableState = "conflicting"

@@ -70,7 +70,8 @@ struct WorkNavigatorView: View {
                                             WorkNavigatorRow(row: row,
                                                 project: model.visibleSelectedProjectFilterIDs.count == 1 ? nil : model.projectName(for: row.task.projectID),
                                                 width: geometry.size.width,
-                                                isSelected: model.navigator.selectedRootID == row.id)
+                                                isSelected: model.navigator.selectedRootID == row.id,
+                                                liveWorkers: model.liveWorkerStates)
                                         }
                                         .buttonStyle(.plain)
                                         .focusable()
