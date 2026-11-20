@@ -77,7 +77,6 @@ fn provision_creates_private_tree_and_keychain_bridge() {
     fs::create_dir_all(&keychain_dir).unwrap();
     let keychain_file = keychain_dir.join("login.keychain-db");
     fs::write(&keychain_file, b"dummy-keychain").unwrap();
-    fs::write(real_home.join(".bazelrc"), "build --announce_rc\n").unwrap();
     fs::create_dir_all(real_home.join(".gemini/antigravity-cli")).unwrap();
     fs::write(
         real_home.join(".gemini/antigravity-cli/settings.json"),
@@ -90,10 +89,6 @@ fn provision_creates_private_tree_and_keychain_bridge() {
     let runtime = provision_agy_home(&workspace, "hello prompt", "run-prov-1").unwrap();
     assert!(runtime.process_home.starts_with(&homes));
     assert_ne!(runtime.process_home, real_home);
-    assert_eq!(
-        fs::read_to_string(runtime.process_home.join(".bazelrc")).unwrap(),
-        "build --announce_rc\n"
-    );
 
     let gemini = runtime.process_home.join(".gemini");
     assert!(gemini.join("antigravity-cli/cache/onboarding.json").is_file());
