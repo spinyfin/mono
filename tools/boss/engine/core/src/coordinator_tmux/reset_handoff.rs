@@ -3,6 +3,45 @@ use super::*;
 
 pub const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on waiting for the lifecycle lock. A competing lifecycle operation
+/// (supervisor recovery, app-registration attach) that holds the lock longer
+/// than this fails the reset visibly instead of stalling it silently.
+pub const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Both reset phases fail visibly when a competing lifecycle operation stalls.
+/// The busy error deliberately omits [`DELIVERY_FAILED_PREFIX`]: a forced
+/// reset would queue behind the same lock, so the app must not offer one.
+pub async fn acquire_lifecycle_lock<'a>(
+    lifecycle_lock: &'a tokio::sync::Mutex<()>,
+    expected_token: &str,
+    phase: &str,
+) -> Result<tokio::sync::MutexGuard<'a, ()>> {
+    let started = std::time::Instant::now();
+    let guard = tokio::time::timeout(LOCK_WAIT_TIMEOUT, lifecycle_lock.lock())
+        .await
+        .map_err(|_| {
+            let waited_ms = started.elapsed().as_millis();
+            audit::record_event(
+                "coordinator_reset_lock_wait_timeout",
+                &json!({
+                    "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(), "spawn_token": expected_token, "phase": phase, "waited_ms": waited_ms,
+                }),
+            );
+            tracing::error!(spawn_token = expected_token, waited_ms, "coordinator reset could not take the lifecycle lock");
+            anyhow!(
+                "coordinator lifecycle busy; try again: another operation held the session for over {}s. The coordinator session is still running.",
+                LOCK_WAIT_TIMEOUT.as_secs()
+            )
+        })?;
+    audit::record_event(
+        "coordinator_reset_lock_acquired",
+        &json!({
+            "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(), "spawn_token": expected_token, "phase": phase, "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    );
+    Ok(guard)
+}
+
 /// Leads the error returned when the request could not be delivered. The app
 /// matches this text to keep the reset UI alive and offer a forced reset.
 pub const DELIVERY_FAILED_PREFIX: &str = "coordinator did not receive the handoff request";
@@ -54,7 +93,7 @@ pub async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool> {
         "coordinator_handoff_delivery_started",
         &json!({ "ts_epoch_ms": boss_engine_utils::epoch_time::now_epoch_ms(), "spawn_token": expected_token }),
     );
-    let guard = lifecycle_lock.lock().await;
+    let guard = acquire_lifecycle_lock(lifecycle_lock, expected_token, "delivery").await?;
     audit::record_event(
         "coordinator_handoff_lock_acquired",
         &json!({

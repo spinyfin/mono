@@ -725,6 +725,11 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
     Ok(tmux.list_sessions().await?.iter().any(|session| session.name == name))
 }
 
+/// Bound on probing the retired `-L boss` server. A hung legacy tmux must
+/// not hold `coordinator_tmux_lock` (supervisor recovery, reset recreation)
+/// indefinitely; timeout is treated as "not there".
+const LEGACY_SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Resolve which tmux server currently hosts the coordinator session:
 /// `socket_tmux` (the durable `-S` socket) unless a live
 /// [`COORDINATOR_SESSION_NAME`] session survives on the pre-move `-L boss`
@@ -741,8 +746,8 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
 /// before invoking any lifecycle function, and passing its result through
 /// for that call routes every check (`session_exists`, `show_environment`,
 /// `kill_session_verified`, `new_session`) at the server that actually holds
-/// the session, so the legacy coordinator is recovered/replaced in place
-/// rather than shadowed by a second one.
+/// the session when only one exists, so a lone legacy coordinator is
+/// recovered/replaced in place rather than shadowed by a second one.
 ///
 /// `legacy_tmux` is `None` when the caller could not build a legacy handle
 /// (e.g. no resolved tmux executable yet) — in that case this always
@@ -751,7 +756,18 @@ pub async fn resolve_active_handle<'a>(socket_tmux: &'a Tmux, legacy_tmux: Optio
     let Some(legacy) = legacy_tmux else {
         return socket_tmux;
     };
-    match session_exists(legacy, COORDINATOR_SESSION_NAME).await {
+    // Once the durable server has the coordinator, an unrelated retired
+    // server must not delay reset, supervisor recovery or app attachment.
+    if matches!(session_exists(socket_tmux, COORDINATOR_SESSION_NAME).await, Ok(true)) {
+        return socket_tmux;
+    }
+    match tokio::time::timeout(
+        LEGACY_SESSION_PROBE_TIMEOUT,
+        session_exists(legacy, COORDINATOR_SESSION_NAME),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow!("legacy -L boss server probe timed out")))
+    {
         Ok(true) => {
             tracing::warn!(
                 "coordinator tmux: a live coordinator session survives on the pre-move -L boss server; \
@@ -1557,11 +1573,17 @@ mod tests {
         send_keys_fails: bool,
         options: Mutex<BTreeMap<String, String>>,
         calls: Mutex<Vec<Vec<String>>>,
+        list_sessions_delay: Duration,
     }
 
     impl FakeTmux {
         fn new(sessions: Vec<&str>, token: Option<&str>, pane_dead: &str) -> Self {
             Self::with_send_keys_outcome(sessions, token, pane_dead, false)
+        }
+
+        fn delaying_list_sessions(mut self, delay: Duration) -> Self {
+            self.list_sessions_delay = delay;
+            self
         }
 
         fn with_send_keys_outcome(
@@ -1577,6 +1599,7 @@ mod tests {
                 send_keys_fails,
                 options: Mutex::new(BTreeMap::new()),
                 calls: Mutex::new(Vec::new()),
+                list_sessions_delay: Duration::ZERO,
             }
         }
         fn calls(&self) -> Vec<Vec<String>> {
@@ -1590,6 +1613,9 @@ mod tests {
             assert!(cwd.is_none());
             let args: Vec<String> = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
             self.calls.lock().unwrap().push(args.clone());
+            if args.get(2).map(String::as_str) == Some("list-sessions") && !self.list_sessions_delay.is_zero() {
+                tokio::time::sleep(self.list_sessions_delay).await;
+            }
             let (success, stdout, stderr) = match args.get(2).map(String::as_str) {
                 Some("list-sessions") => (
                     true,
@@ -1832,8 +1858,27 @@ mod tests {
             "a coordinator surviving on -L boss must be routed to instead of the durable socket",
         );
         assert!(
-            socket_server.calls().is_empty(),
-            "resolving which handle to use must never itself probe the socket server",
+            socket_server
+                .calls()
+                .iter()
+                .all(|call| call.get(2).map(String::as_str) == Some("list-sessions")),
+            "resolution may probe the durable server but must not mutate it",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_active_handle_prefers_socket_without_probing_legacy_when_both_exist() {
+        let (socket_tmux, socket_server) =
+            tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("socket-token"), "0"));
+        let (legacy_tmux, legacy_server) =
+            legacy_tmux_for(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("legacy-token"), "0"));
+        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
+        assert!(std::ptr::eq(resolved, &socket_tmux));
+        assert_eq!(socket_server.calls().len(), 1);
+        assert_eq!(socket_server.calls()[0][2], "list-sessions");
+        assert!(
+            legacy_server.calls().is_empty(),
+            "duplicate legacy session must not be probed"
         );
     }
 
@@ -1842,6 +1887,22 @@ mod tests {
         let (socket_tmux, _socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
         let resolved = resolve_active_handle(&socket_tmux, None).await;
         assert_eq!(resolved.operator_prefix(), socket_tmux.operator_prefix());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_active_handle_times_out_a_hung_legacy_probe_when_socket_has_no_coordinator() {
+        let (socket_tmux, socket_server) = tmux_for(FakeTmux::new(vec![], None, "0"));
+        let (legacy_tmux, legacy_server) =
+            legacy_tmux_for(FakeTmux::new(vec![], None, "0").delaying_list_sessions(Duration::from_secs(30)));
+
+        let started = tokio::time::Instant::now();
+        let resolved = resolve_active_handle(&socket_tmux, Some(&legacy_tmux)).await;
+        assert!(std::ptr::eq(resolved, &socket_tmux));
+        assert_eq!(started.elapsed(), LEGACY_SESSION_PROBE_TIMEOUT);
+        assert_eq!(socket_server.calls().len(), 1);
+        assert_eq!(socket_server.calls()[0][2], "list-sessions");
+        assert_eq!(legacy_server.calls().len(), 1);
+        assert_eq!(legacy_server.calls()[0][2], "list-sessions");
     }
 
     /// A live coordinator surviving on the legacy server must be recovered
