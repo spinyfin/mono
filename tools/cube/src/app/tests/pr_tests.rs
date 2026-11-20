@@ -896,7 +896,7 @@ fn pr_create_existing_pr_with_new_local_commits_recommends_update() {
 }
 
 #[test]
-fn pr_update_pushes_when_pr_exists() {
+fn pr_update_pushes_when_stacked_pr_exists() {
     // `cube pr update` pushes new commits to the existing PR's branch and
     // never calls `gh pr create`.
     let cwd = std::env::current_dir().expect("cwd");
@@ -923,7 +923,7 @@ fn pr_update_pushes_when_pr_exists() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7","base":{"ref":"feature/parent","repo":{"default_branch":"main"}}}]"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),

@@ -1054,3 +1054,26 @@ async fn base_lookup_timeout_leaves_delivery_retryable_without_attention() {
     assert_eq!(db.get_execution(&execution_id).unwrap().status, execution.status);
     assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn declared_state_resolution_distinguishes_base_refusal_from_network_failure() {
+    use crate::run_done_declaration::DeclaredPrResolution;
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, _) = followup_fixture(workspace.path());
+    let handler = TestHarness::new(db, StubPrDetector::ok(Some(OWN_PR)))
+        .handler
+        .with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Merged).with_base(PrBaseVerdict::Refused("feature/parent".into())),
+        ));
+    assert!(matches!(
+        handler.resolve_verified_pr_state(OWN_PR.into()).await,
+        DeclaredPrResolution::BaseRefused { pr_url, reason }
+            if pr_url == OWN_PR && reason == "feature/parent"
+    ));
+    let handler = handler.with_pr_state_checker(Arc::new(UnavailableBaseChecker));
+    assert!(matches!(
+        handler.resolve_verified_pr_state(OWN_PR.into()).await,
+        DeclaredPrResolution::Transient { detail } if detail.contains("GitHub unavailable")
+    ));
+}

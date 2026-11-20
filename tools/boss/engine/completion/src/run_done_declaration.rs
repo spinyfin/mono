@@ -111,6 +111,8 @@ pub(super) enum DeclaredPrResolution {
     /// already-bound PR for a resume / revision). `merged` mirrors
     /// [`PrStatus::Merged`]: the deliverable is done, not reviewable.
     Bound { pr_url: String, merged: bool },
+    /// GitHub answered, but the PR targets a non-default branch.
+    BaseRefused { pr_url: String, reason: String },
     /// GitHub answered and there is definitively no PR on this execution's
     /// branch. `detail` names the branch, what the detector saw and which
     /// staged URLs were rejected; it becomes the row's visible failure.
@@ -370,7 +372,24 @@ impl WorkerCompletionHandler {
 
     /// Branch identity is already verified; read lifecycle fresh because a
     /// capture-time branch cache cannot certify that a PR is still open.
-    async fn resolve_verified_pr_state(&self, pr_url: String) -> DeclaredPrResolution {
+    pub(super) async fn resolve_verified_pr_state(&self, pr_url: String) -> DeclaredPrResolution {
+        match crate::work::bounded_base_verdict(
+            Arc::clone(&self.pr_state_checker),
+            &pr_url,
+            DECLARED_DELIVERY_NETWORK_BUDGET,
+        )
+        .await
+        {
+            Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+                return DeclaredPrResolution::BaseRefused { pr_url, reason };
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return DeclaredPrResolution::Transient {
+                    detail: format!("could not verify base of PR {pr_url}: {err}"),
+                };
+            }
+        }
         let checker = Arc::clone(&self.pr_state_checker);
         let url = pr_url.clone();
         let check = tokio::task::spawn_blocking(move || checker.check(&url));
@@ -402,6 +421,10 @@ impl WorkerCompletionHandler {
     pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let (pr_url, mut merged, mut closed_unmerged) = match self.resolve_declared_pr_url(execution).await {
             DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged, false),
+            DeclaredPrResolution::BaseRefused { pr_url, reason } => {
+                self.record_pr_base_refusal(execution, &pr_url, &reason).await;
+                return StopOutcome::DetectorFailed;
+            }
             DeclaredPrResolution::ClosedUnmerged { pr_url } => {
                 if self.is_merge_conflict_revision(execution) {
                     (pr_url, false, true)

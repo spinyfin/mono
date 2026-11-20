@@ -531,6 +531,3 @@ pub const QUESTION_RESUME_DISPATCH_FAILED: &str = "question_resume_dispatch_fail
 /// repaired automatically (no PR on its branch, a foreign PR, or repeated
 /// GitHub failures).
 pub const ATTENTION_KIND_PR_BINDING_REPAIR: &str = "pr_binding_repair";
-
-/// A delivery PR targets a branch other than the repository default.
-pub const PR_BASE_REFUSED: &str = "pr_base_refused";

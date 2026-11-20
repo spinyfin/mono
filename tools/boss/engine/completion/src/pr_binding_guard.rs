@@ -56,23 +56,33 @@ impl WorkerCompletionHandler {
             }
             Ok(PrBaseVerdict::NotChecked) => None,
             Ok(PrBaseVerdict::Refused(reason)) => {
-                if let Err(err) = self
-                    .upsert_execution_attention(
-                        execution,
-                        PR_BASE_REFUSED,
-                        "PR must target the default branch",
-                        &format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
-                    )
-                    .await
-                {
-                    tracing::warn!(?err, "failed to record PR base refusal");
-                }
+                self.record_pr_base_refusal(execution, pr_url, &reason).await;
                 Some(StopOutcome::DetectorFailed)
             }
             result => {
                 tracing::warn!(?result, pr_url, "PR base check unavailable; retrying delivery");
                 Some(StopOutcome::DetectorFailed)
             }
+        }
+    }
+
+    pub(super) async fn record_pr_base_refusal(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+        reason: &str,
+    ) {
+        use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+        if let Err(err) = self
+            .upsert_execution_attention(
+                execution,
+                PR_BASE_REFUSED,
+                "PR must target the default branch",
+                &format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
+            )
+            .await
+        {
+            tracing::warn!(?err, "failed to record PR base refusal");
         }
     }
 

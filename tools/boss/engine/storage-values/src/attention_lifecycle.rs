@@ -578,11 +578,6 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          records that further unobserved commands went uncounted — a gap no later run fills in.",
     ),
     entry(
-        PR_BASE_REFUSED,
-        ClearedBy::ProducerReconciles,
-        "The completion guard resolves this only after observing the repository default branch as the PR base.",
-    ),
-    entry(
         ATTENTION_KIND_RECOVERY_PERMANENT,
         ClearedBy::HumanDecision,
         "This is a dispatch gate, not a report: `list_orphan_active_candidates` excludes items with \

@@ -389,8 +389,24 @@ async fn repair_candidate(
     match crate::work::bounded_base_verdict(Arc::clone(&pr_checker), &own_pr_url, crate::work::PR_BASE_CHECK_BUDGET)
         .await
     {
-        Ok(crate::work::PrBaseVerdict::DefaultBranch | crate::work::PrBaseVerdict::NotChecked) => {}
+        Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
+            if let Err(err) = work_db.resolve_external_tracker_attention(
+                &candidate.task_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+            ) {
+                tracing::warn!(?err, "could not clear recovered PR base refusal");
+            }
+        }
+        Ok(crate::work::PrBaseVerdict::NotChecked) => {}
         Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+            if let Err(err) = work_db.upsert_work_item_attention(
+                &candidate.task_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+                "PR base could not be accepted",
+                &format!("Cannot bind {own_pr_url}: {reason}"),
+            ) {
+                tracing::warn!(?err, "could not surface recovered PR base refusal");
+            }
             outcome.base_refused += 1;
             tracing::warn!(
                 task_id = %candidate.task_id,
@@ -424,28 +440,6 @@ async fn repair_candidate(
             exec = candidate.execution_id,
         );
         return park_unresolved(work_db, candidate, &detail, outcome);
-    }
-    match pr_checker.base_verdict(&own_pr_url) {
-        Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
-            let detail = format!(
-                "This row was bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its \
-                 branch `{expected_branch}`, {own_pr_url}, cannot be adopted: {reason} The engine cleared the \
-                 wrong binding.",
-                bound = candidate.bound_pr_url,
-                exec = candidate.execution_id,
-            );
-            if let Err(err) = work_db.upsert_work_item_attention(
-                &candidate.task_id,
-                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
-                "PR base could not be accepted",
-                &detail,
-            ) {
-                tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: could not surface PR base refusal");
-            }
-            return park_unresolved(work_db, candidate, &detail, outcome);
-        }
-        Ok(_) => {}
-        Err(err) => return Err(Inconclusive::GitHub(format!("PR base check for {own_pr_url}: {err:#}"))),
     }
     let scan = doc_refresher
         .scan(&candidate.task_id, &own_pr_url)
@@ -867,11 +861,19 @@ mod tests {
         let docs = RecordingDocRefresher::default();
         let mut attempts = HashMap::new();
 
-        let outcome = run_one_pass(&db, &detector, &verifier, &ParentBranchChecker, &docs, &mut attempts).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &verifier,
+            Arc::new(ParentBranchChecker),
+            &docs,
+            &mut attempts,
+        )
+        .await;
 
         assert_eq!(outcome.rebound, 0, "{outcome:?}");
-        assert_eq!(outcome.unresolved, 1, "{outcome:?}");
-        assert_eq!(task(&db, &task_id).pr_url, None);
+        assert_eq!(outcome.base_refused, 1, "{outcome:?}");
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
         assert!(docs.0.lock().unwrap().is_empty());
         assert!(
             db.list_attention_items_for_work_item(&task_id)

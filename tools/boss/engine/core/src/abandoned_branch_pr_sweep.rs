@@ -113,7 +113,7 @@ use boss_protocol::WorkItem;
 use crate::completion::{CommandPrDetector, PrDetector, PrStatus, expected_branch_name, parse_repo_slug};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::sweep_loop::{SweepOutcome, spawn_sweep_loop};
-use crate::work::{LatePrCandidate, PrBaseVerdict, PrStateChecker, WorkDb};
+use crate::work::{LatePrCandidate, WorkDb};
 
 /// How often the sweep runs. Deliberately slower than most reconcilers
 /// (dead-pid / orphan sweep run every 60s) — see the module doc's "Retry,
@@ -702,7 +702,15 @@ async fn bind_and_record(
 ) {
     let (BindAction::Bound(pr_url) | BindAction::Created(pr_url)) = action;
     match crate::work::bounded_base_verdict(pr_checker, pr_url, crate::work::PR_BASE_CHECK_BUDGET).await {
-        Ok(crate::work::PrBaseVerdict::DefaultBranch | crate::work::PrBaseVerdict::NotChecked) => {}
+        Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
+            if let Err(err) = work_db.resolve_external_tracker_attention(
+                &candidate.work_item_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+            ) {
+                tracing::warn!(?err, "could not clear recovered PR base refusal");
+            }
+        }
+        Ok(crate::work::PrBaseVerdict::NotChecked) => {}
         Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
             tracing::warn!(%reason, pr_url, "abandoned PR base refused; leaving binding untouched");
             if let Err(err) = work_db.upsert_work_item_attention(
@@ -1070,12 +1078,14 @@ mod tests {
     /// A checker that reports every PR as targeting a non-default branch.
     struct ParentBranchChecker;
 
-    impl PrStateChecker for ParentBranchChecker {
+    impl crate::work::PrStateChecker for ParentBranchChecker {
         fn check(&self, _pr_url: &str) -> anyhow::Result<crate::work::PrOpenState> {
             Ok(crate::work::PrOpenState::Merged)
         }
-        fn base_verdict(&self, _pr_url: &str) -> anyhow::Result<PrBaseVerdict> {
-            Ok(PrBaseVerdict::Refused("PR targets `feature/parent`".to_owned()))
+        fn base_verdict(&self, _pr_url: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+            Ok(crate::work::PrBaseVerdict::Refused(
+                "PR targets `feature/parent`".to_owned(),
+            ))
         }
     }
 
@@ -1090,7 +1100,15 @@ mod tests {
         let sink = RecordingDispatchEventSink::new();
         let mut failures = HashMap::new();
 
-        let outcome = run_one_pass(&db, &detector, &creator, Arc::new(ParentBranchChecker), &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(ParentBranchChecker),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome.recovered, 0);
         let (status, pr_url) = task_status_and_pr_url(&db, &chore_id);
         assert_ne!(status, "in_review");
