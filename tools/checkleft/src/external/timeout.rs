@@ -10,10 +10,11 @@ use std::fmt;
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::ExternalCheckLimits;
 
@@ -127,14 +128,8 @@ pub(crate) fn output_with_timeout(
         .with_context(|| format!("failed to spawn subprocess `{subprocess}` for check `{check_id}`"))?;
     let stdout = child.stdout.take().expect("stdout pipe configured before spawn");
     let stderr = child.stderr.take().expect("stderr pipe configured before spawn");
-    let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
-    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _ = stdout_tx.send(read_all(stdout));
-    });
-    thread::spawn(move || {
-        let _ = stderr_tx.send(read_all(stderr));
-    });
+    let stdout_reader = PipeReader::spawn(stdout);
+    let stderr_reader = PipeReader::spawn(stderr);
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
 
@@ -168,101 +163,128 @@ pub(crate) fn output_with_timeout(
         }
     };
 
-    // Once the child has exited its pipe ends are closed. Drain readers under a
-    // fixed grace, rather than the residual execution budget, so a successful
-    // near-deadline child cannot be reported as a timeout while posting output.
-    let stdout = receive_output(
-        stdout_rx,
+    // Once the child has exited, give the readers a fixed grace (not the
+    // residual execution budget) to reach EOF. A descendant that inherited the
+    // pipe may hold it open indefinitely; that is not an execution timeout. The
+    // child's real status and the bytes captured so far are returned instead.
+    let child_elapsed_ms = started.elapsed().as_millis();
+    let drain_deadline = Instant::now() + DRAIN_GRACE;
+    let stdout = stdout_reader.finish(
+        drain_deadline,
         "stdout",
-        started,
-        DRAIN_GRACE,
         check_id,
         subprocess,
-        timeout_ms,
+        &status,
+        child_elapsed_ms,
     )?;
-    let stderr = receive_output(
-        stderr_rx,
+    let stderr = stderr_reader.finish(
+        drain_deadline,
         "stderr",
-        started,
-        DRAIN_GRACE,
         check_id,
         subprocess,
-        timeout_ms,
+        &status,
+        child_elapsed_ms,
     )?;
     Ok(Output { status, stdout, stderr })
 }
 
-fn receive_output(
-    receiver: Receiver<Result<Vec<u8>>>,
-    stream: &str,
-    started: Instant,
-    wait: Duration,
-    check_id: &str,
-    subprocess: &str,
-    timeout_ms: u64,
-) -> Result<Vec<u8>> {
-    match receiver.recv_timeout(wait) {
-        Ok(output) => {
-            output.with_context(|| format!("failed to read {stream} for check `{check_id}` subprocess `{subprocess}`"))
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(SubprocessTimeout {
-            check_id: check_id.to_owned(),
-            subprocess: subprocess.to_owned(),
-            timeout_ms,
-            elapsed_ms: started.elapsed().as_millis(),
-        }
-        .into()),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-            "{stream} reader stopped for check `{check_id}` subprocess `{subprocess}`"
-        )),
-    }
+/// Reads a pipe on a background thread, accumulating bytes incrementally so a
+/// pipe that never reaches EOF still yields everything read so far.
+struct PipeReader {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    done: Receiver<Result<()>>,
 }
 
-fn read_all(mut pipe: impl Read) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    pipe.read_to_end(&mut output)
-        .context("failed to read subprocess output")?;
-    Ok(output)
+impl PipeReader {
+    fn spawn(mut pipe: impl Read + Send + 'static) -> Self {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let (tx, done) = mpsc::sync_channel(1);
+        let sink = Arc::clone(&buffer);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            let result = loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&chunk[..n]),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(err) => break Err(anyhow::Error::new(err).context("failed to read subprocess output")),
+                }
+            };
+            let _ = tx.send(result);
+        });
+        Self { buffer, done }
+    }
+
+    fn finish(
+        self,
+        deadline: Instant,
+        stream: &str,
+        check_id: &str,
+        subprocess: &str,
+        status: &std::process::ExitStatus,
+        child_elapsed_ms: u128,
+    ) -> Result<Vec<u8>> {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match self.done.recv_timeout(wait) {
+            Ok(result) => result
+                .with_context(|| format!("failed to read {stream} for check `{check_id}` subprocess `{subprocess}`"))?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!(
+                    "warning: check `{check_id}` subprocess `{subprocess}` exited ({status}) after {child_elapsed_ms} ms \
+                     but {stream} did not reach EOF within {} ms; a descendant process is holding the pipe open. \
+                     Using the output captured so far",
+                    DRAIN_GRACE.as_millis()
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("{stream} reader stopped for check `{check_id}` subprocess `{subprocess}`")
+            }
+        }
+        Ok(std::mem::take(
+            &mut *self.buffer.lock().unwrap_or_else(|e| e.into_inner()),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
-    use std::thread;
 
-    /// Residual execution budget exhausted must not fail the post-exit drain.
-    ///
-    /// Production code drains under fixed [`DRAIN_GRACE`], not the leftover
-    /// subprocess budget, so a child that finished near the deadline is not
-    /// reported as a timeout while its pipe readers deliver. This asserts that
-    /// path without wall-clock sleeps or load sensitivity.
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script]);
+        c
+    }
+
     #[test]
-    fn receive_output_ok_when_residual_budget_exhausted() {
-        let timeout_ms = 100;
-        let started = Instant::now()
-            .checked_sub(Duration::from_millis(timeout_ms) + Duration::from_secs(1))
-            .expect("Instant can subtract past the execution budget");
-        assert!(
-            started.elapsed() >= Duration::from_millis(timeout_ms),
-            "test setup must start with residual budget already zero"
-        );
-
-        let (tx, rx) = mpsc::sync_channel(1);
-        thread::spawn(move || {
-            let _ = tx.send(Ok(b"drained\n".to_vec()));
-        });
-
-        let output = receive_output(
-            rx,
-            "stdout",
-            started,
-            DRAIN_GRACE,
-            "test/drain-grace",
+    fn exited_child_with_pipe_held_open_is_not_a_timeout() {
+        let started = Instant::now();
+        let out = output_with_timeout(
+            &mut sh("echo partial; echo err >&2; (sleep 30 &) ; exit 3"),
+            "t/c",
             "tool",
-            timeout_ms,
+            60_000,
         )
-        .expect("residual budget exhausted must not fail the drain");
-        assert_eq!(output, b"drained\n");
+        .expect("drain overrun must not be an error");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"partial\n");
+        assert_eq!(out.stderr, b"err\n");
+    }
+
+    #[test]
+    fn exited_zero_with_pipe_held_open_succeeds() {
+        let out = output_with_timeout(&mut sh("echo ok; (sleep 30 &)"), "t/c", "tool", 60_000).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"ok\n");
+    }
+
+    #[test]
+    fn genuinely_slow_child_still_times_out() {
+        let err = output_with_timeout(&mut sh("sleep 30"), "t/c", "tool", 200).unwrap_err();
+        assert!(err.downcast_ref::<SubprocessTimeout>().is_some());
     }
 }
