@@ -14,7 +14,7 @@ use crate::host::{StartWorkerInput, TmuxWorkerHost};
 use crate::pane_summary;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_execution_contracts::slot_id_from_worker_id;
-use boss_protocol::{ExecutionKind, ExecutionStatus, ReviewBatchMemberRole, WorkItemBinding};
+use boss_protocol::{ExecutionKind, ReviewBatchMemberRole, WorkItemBinding};
 
 use super::prompt::structured_output_env_vars;
 use super::spawn_confirmation::PromptSubmitPolicy;
@@ -1580,8 +1580,8 @@ impl ExecutionRunner for PaneSpawnRunner {
 }
 
 impl PaneSpawnRunner {
-    /// If the execution was cancelled while spawn/confirmation was in
-    /// flight, reap the pane and return [`RunWaitState::CancelledDuringSpawn`].
+    /// If the execution reached a terminal status while spawn/confirmation
+    /// was in flight, reap the pane and return [`RunWaitState::CancelledDuringSpawn`].
     async fn take_cancelled_during_spawn(
         &self,
         spawner: &dyn RunnerHost,
@@ -1591,13 +1591,14 @@ impl PaneSpawnRunner {
         spawn_config: &crate::effort::SpawnConfig,
     ) -> Option<RunOutcome> {
         match self.work_db.get_execution(execution_id) {
-            Ok(exec) if exec.status == ExecutionStatus::Cancelled => {
+            Ok(exec) if exec.status.is_terminal() => {
                 tracing::warn!(
                     worker_id,
                     execution_id,
+                    status = %exec.status,
                     slot_id = started.slot_id,
                     shell_pid = started.shell_pid,
-                    "spawn completed after the execution was cancelled mid-spawn; reaping the worker pane and releasing the deferred lease",
+                    "spawn completed after the execution reached a terminal status mid-spawn; reaping the worker pane and releasing the deferred lease",
                 );
                 spawner.reap_worker_pane(execution_id).await;
                 Some(RunOutcome {
