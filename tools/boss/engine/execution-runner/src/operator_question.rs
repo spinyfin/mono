@@ -5,7 +5,7 @@ pub(crate) const GUIDANCE: &str = r#"
 
 Assume the repo owner has not seen the PR, review, code, or your run. Use everyday words: no internal symbols, types, file names, API names, review jargon, or links in the question or Yes/No meanings. Keep technical evidence reachable in a separate Details section, not mixed into the decision.
 
-Use `--question` for one specific Yes/No decision in plain language. In `--explanation`, require these labels on their own lines, in this order (actual newlines, no Markdown heading decoration):
+Use `--question` for one specific Yes/No decision in plain language. Write the labelled explanation to a file and pass `--explanation-file <path>` on a single line (or `--explanation-file -` / `--explanation -` to read stdin). You may also pass `--explanation` with one quoted argument per line. A single multi-line `--explanation` argument is accepted when the command can contain newlines; some PreToolUse guards reject any command string that contains a newline, even inside quotes. In the explanation, require these labels on their own lines, in this order (actual newlines, no Markdown heading decoration):
 
 Context:
 One or two plain-language sentences: what work you are doing and what problem forces this decision.

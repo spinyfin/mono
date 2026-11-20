@@ -225,7 +225,7 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
     // Only teach declarations when their completion seam is enabled.
     let revision_prerequisite_guidance = if input.run_done_proposals_seam_enabled {
         format!(
-            "Work that must land in another PR before this revision can finish goes through `{boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation \"<Context, Yes, No, Recommendation, and optional Details>\"` when that work has no existing owner, or `--answer-type link-prerequisite-task --prerequisite-pr \"<github-pr>\"` (and/or `--prerequisite-id`) when an existing open task already owns it; the revision waits for it and is redispatched once it is done."
+            "Work that must land in another PR before this revision can finish goes through `{boss} propose done --outcome blocked --summary \"<blocker>\" --answer-type create-prerequisite-task --prerequisite-name \"<short task name>\" --prerequisite-brief \"<self-contained description>\" --explanation-file /tmp/explanation.txt` when that work has no existing owner, or `--answer-type link-prerequisite-task --prerequisite-pr \"<github-pr>\"` (and/or `--prerequisite-id`) when an existing open task already owns it; the revision waits for it and is redispatched once it is done."
         )
     } else {
         "If another PR must land first, report the dependency using the blocker channel below.".into()

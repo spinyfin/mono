@@ -11,9 +11,8 @@ const EXPECTED_SPLIT: &str = "--explanation for a --file-count question requires
 const EXPECTED_CHOICE: &str = "--explanation for --answer-type multiple-choice requires nonempty sections with labels on separate lines, in order, and no Yes:/No: sections:\nContext:\nWork and blocker, and what each option leads to\nRecommendation:\nRecommended option and reason\nDetails:\nTechnical evidence (omit this section if unnecessary)";
 const REMAIN_BLOCKED: &str = "--explanation No: must name an actionable path the engine or the next worker will take; \"No = remain blocked\" is not a real choice. If there is only one viable path, do not ask a question.";
 
-/// Clap-time check: accepts any of the shapes. The shape that must hold depends
-/// on `--answer-type` and `--file-count`, which a value parser cannot see;
-/// `validate_for` enforces it.
+/// Accepts any of the shapes. The shape that must hold depends on
+/// `--answer-type` and `--file-count`; `validate_for` enforces it.
 pub(super) fn validate(raw: &str) -> Result<String, String> {
     let labels = AnswerOptionLabels::split_or_bypass();
     let (yes, no) = labels.headings();
@@ -214,7 +213,7 @@ pub(super) mod tests {
             VALID_SPLIT.replace("Land the first capability as its own PR, then finish the rest.", ""),
             VALID_SPLIT.replace("Keep one PR with a one-time exception.", ""),
         ] {
-            let error = Cli::try_parse_from([
+            let cli = Cli::try_parse_from([
                 "boss",
                 "propose",
                 "done",
@@ -235,8 +234,13 @@ pub(super) mod tests {
                 "--explanation",
                 &text,
             ])
-            .unwrap_err()
-            .to_string();
+            .unwrap();
+            let crate::Commands::Propose(args) = cli.command else {
+                panic!("expected propose")
+            };
+            let error = super::super::payload_for(args.command.unwrap())
+                .unwrap_err()
+                .to_string();
             assert!(error.contains(EXPECTED_SPLIT), "{error}");
         }
     }
@@ -271,7 +275,11 @@ pub(super) mod tests {
                 &text,
             ];
             args.extend(extra);
-            Cli::try_parse_from(args).unwrap();
+            let cli = Cli::try_parse_from(args).unwrap();
+            let crate::Commands::Propose(parsed) = cli.command else {
+                panic!("expected propose")
+            };
+            super::super::payload_for(parsed.command.unwrap()).unwrap();
         }
     }
 
@@ -334,8 +342,14 @@ pub(super) mod tests {
                         "Repair fixture",
                     ]);
                 }
-                let error = Cli::try_parse_from(args).expect_err("must reject malformed explanation");
-                assert!(error.to_string().contains(EXPECTED), "{error}");
+                let cli = Cli::try_parse_from(args).expect("malformed explanation still parses");
+                let crate::Commands::Propose(parsed) = cli.command else {
+                    panic!("expected propose")
+                };
+                let error = super::super::payload_for(parsed.command.unwrap())
+                    .expect_err("must reject malformed explanation")
+                    .to_string();
+                assert!(error.contains(EXPECTED), "{error}");
             }
         }
     }

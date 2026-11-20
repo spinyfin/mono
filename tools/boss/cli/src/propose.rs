@@ -17,7 +17,7 @@
 
 mod explanation;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use boss_protocol::{
     FrontendEvent, FrontendRequest, ProposalErrorCode, ProposalKind, ProposalState, ProposalSubmissionError,
@@ -155,7 +155,9 @@ pub(crate) enum ProposeCommand {
     /// Examples: `boss propose done --outcome delivered --summary "opened
     /// the PR with the md5 crate swap"` / `boss propose done --outcome
     /// no-changes-needed --summary "already on main; empty diff"`
-    Done(RunDoneArgs),
+    /// Boxed: the labelled-explanation flags make this variant larger than
+    /// its siblings.
+    Done(Box<RunDoneArgs>),
     /// Declare that this run is deliberately waiting on a long-running job
     /// and should be given more time. Applied synchronously: holds the
     /// produce-a-PR nudge ladder and the nudge circuit breaker until the
@@ -502,6 +504,38 @@ pub(crate) struct ReviewVerdictArgs {
     common: IdempotencyArgs,
 }
 
+/// Exactly one of `--explanation` / `--explanation-file` supplies the labelled
+/// explanation. Grouped so `--answer-type` can require the pair without
+/// naming one flag.
+#[derive(Debug, Clone, Args)]
+#[group(id = "explanation_source", multiple = false)]
+struct ExplanationSource {
+    /// Self-contained decision explanation with these labels on their own lines,
+    /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
+    /// For `multiple-choice` use only Context:, Recommendation:, and optional
+    /// Details: (there are no Yes/No buttons); say in Context what each option
+    /// leads to.
+    /// Context opens with 1–2 plain-language sentences about the work and blocker.
+    /// Yes and No each name an actionable path the engine or the next worker
+    /// will take, with the user-visible result and rough work size. "No = remain
+    /// blocked" is rejected. Recommend an answer with a one-line reason. Keep
+    /// symbols, types, file/API names and links in Details only; preserve all
+    /// technical evidence there.
+    /// One argument may be the whole text, including newlines. Several
+    /// arguments are joined with newlines so a command can stay on one line
+    /// (some PreToolUse guards reject a command string that contains a
+    /// newline, even inside quotes). Pass `-` as the only argument to read
+    /// stdin.
+    #[arg(long, requires = "answer_type", num_args = 1.., value_name = "LINE")]
+    explanation: Vec<String>,
+
+    /// Path to a file containing the labelled explanation, or `-` to read
+    /// stdin. Prefer this over a single multi-line `--explanation` argument
+    /// when the command cannot contain a newline.
+    #[arg(long = "explanation-file", value_name = "PATH", requires = "answer_type")]
+    explanation_file: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RunDoneArgs {
     /// JSON evidence required to finish a merge-queue CI-fix revision.
@@ -527,7 +561,7 @@ pub(crate) struct RunDoneArgs {
     /// the engine words from the named or resolved task.
     #[arg(
         long,
-        requires_all = ["answer_type", "explanation"],
+        requires_all = ["answer_type", "explanation_source"],
         required_if_eq_any([("answer_type", "yes-no"), ("answer_type", "multiple-choice")])
     )]
     question: Option<String>,
@@ -546,7 +580,7 @@ pub(crate) struct RunDoneArgs {
     #[arg(
         long,
         value_parser = ["yes-no", "multiple-choice", "create-prerequisite-task", "link-prerequisite-task"],
-        requires = "explanation"
+        requires = "explanation_source"
     )]
     answer_type: Option<String>,
 
@@ -571,19 +605,13 @@ pub(crate) struct RunDoneArgs {
     #[arg(long, value_parser = ["1", "2", "3", "4"], requires = "question")]
     criterion: Option<String>,
 
-    /// Self-contained decision explanation with these labels on their own lines,
-    /// in order: Context:, Yes:, No:, Recommendation:, and optional Details:.
-    /// For `multiple-choice` use only Context:, Recommendation:, and optional
-    /// Details: (there are no Yes/No buttons); say in Context what each option
-    /// leads to.
-    /// Context opens with 1–2 plain-language sentences about the work and blocker.
-    /// Yes and No each name an actionable path the engine or the next worker
-    /// will take, with the user-visible result and rough work size. "No = remain
-    /// blocked" is rejected. Recommend an answer with a one-line reason. Keep
-    /// symbols, types, file/API names and links in Details only; preserve all
-    /// technical evidence there.
-    #[arg(long, requires = "answer_type", value_parser = explanation::validate)]
-    explanation: Option<String>,
+    /// Labelled explanation source. Exactly one of `--explanation` /
+    /// `--explanation-file` is required with `--answer-type`. Prefer
+    /// `--explanation-file`, or `--explanation` with one argument per line,
+    /// when the text has more than one line: some PreToolUse guards reject
+    /// a command string that contains a newline, even inside quotes.
+    #[command(flatten)]
+    explanation_source: ExplanationSource,
 
     /// Name of the proposed prerequisite task (`create-prerequisite-task`).
     #[arg(
@@ -807,15 +835,42 @@ fn require_run_id() -> Result<String, CliError> {
 
 /// Resolve a `--field` / `--field-file` pair. clap's `conflicts_with`
 /// already rules out both being set; this only has to handle "exactly one"
-/// vs "neither".
+/// vs "neither". `--field-file -` reads stdin.
 fn resolve_text_or_file(flag: &str, text: Option<String>, file: Option<PathBuf>) -> Result<String, CliError> {
     match (text, file) {
         (Some(text), None) => Ok(text),
-        (None, Some(path)) => std::fs::read_to_string(&path)
-            .map_err(|err| CliError::usage(format!("failed to read --{flag}-file {}: {err}", path.display()))),
+        (None, Some(path)) => read_text_path(flag, &path),
         (None, None) => Err(CliError::usage(format!("--{flag} or --{flag}-file is required"))),
         (Some(_), Some(_)) => unreachable!("clap conflicts_with rules out --{flag} and --{flag}-file together"),
     }
+}
+
+/// Read `--flag-file PATH`, or stdin when PATH is `-`.
+fn read_text_path(flag: &str, path: &Path) -> Result<String, CliError> {
+    if path.as_os_str() == "-" {
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut body)
+            .map_err(|err| CliError::usage(format!("failed to read --{flag} from stdin: {err}")))?;
+        return Ok(body);
+    }
+    std::fs::read_to_string(path)
+        .map_err(|err| CliError::usage(format!("failed to read --{flag}-file {}: {err}", path.display())))
+}
+
+/// Resolve `--explanation` / `--explanation-file` / stdin into the labelled text.
+/// clap already forbids passing both flags; `-` on either flag reads stdin
+/// and is then validated with the same contract as an inline value. Several
+/// `--explanation` arguments are joined with newlines so a one-line command
+/// can still carry the labelled sections.
+fn resolve_explanation_source(source: &ExplanationSource) -> Result<Option<String>, CliError> {
+    let raw = match (source.explanation.as_slice(), source.explanation_file.as_ref()) {
+        ([], None) => return Ok(None),
+        (lines, None) if lines.len() == 1 && lines[0] == "-" => read_text_path("explanation", Path::new("-"))?,
+        (lines, None) => lines.join("\n"),
+        ([], Some(path)) => read_text_path("explanation", path)?,
+        (_, Some(_)) => unreachable!("clap group multiple = false rules out both explanation flags"),
+    };
+    explanation::validate(&raw).map(Some).map_err(CliError::usage)
 }
 
 /// Read a structured JSON artifact for the review ingress commands. Keeping
@@ -1063,7 +1118,7 @@ fn operator_question_from_flags(args: &RunDoneArgs) -> Result<Option<boss_protoc
     let question = args.question.clone();
     let answer_type = args.answer_type.as_deref();
     let choices = args.choices.clone();
-    let explanation = args.explanation.clone();
+    let explanation = resolve_explanation_source(&args.explanation_source)?;
     let prerequisite_name = args.prerequisite_name.clone();
     let prerequisite_brief = args.prerequisite_brief.clone();
     let prerequisite_id = args.prerequisite_id.clone();
@@ -1396,7 +1451,7 @@ fn flag_hint_for_field(kind: ProposalKind, field: &str) -> Option<&'static str> 
         (ProposalKind::RunDone, "question" | "question.text") => Some("--question"),
         (ProposalKind::RunDone, "question.answer_type.kind") => Some("--answer-type"),
         (ProposalKind::RunDone, "question.answer_type.choices") => Some("--choices"),
-        (ProposalKind::RunDone, "question.explanation") => Some("--explanation"),
+        (ProposalKind::RunDone, "question.explanation") => Some("--explanation / --explanation-file"),
         (ProposalKind::RunDone, "question.answer_type.name") => Some("--prerequisite-name"),
         (ProposalKind::RunDone, "question.answer_type.brief") => Some("--prerequisite-brief"),
         (ProposalKind::RunDone, "question.answer_type.file_count_bypass") => Some("--file-count / --file-count-limit"),
@@ -2147,7 +2202,11 @@ mod tests {
             (ProposalKind::RunDone, "question", "--question"),
             (ProposalKind::RunDone, "question.text", "--question"),
             (ProposalKind::RunDone, "question.answer_type.kind", "--answer-type"),
-            (ProposalKind::RunDone, "question.explanation", "--explanation"),
+            (
+                ProposalKind::RunDone,
+                "question.explanation",
+                "--explanation / --explanation-file",
+            ),
             (ProposalKind::Wait, "reason", "--reason"),
             (ProposalKind::Wait, "duration_secs", "--duration"),
             (ProposalKind::Wait, "waiting_on", "--waiting-on"),
@@ -2236,6 +2295,138 @@ mod tests {
         // A brief is required, as text or as a readable file.
         assert!(payload_for(command_for(&["revise"])).is_err());
         assert!(payload_for(command_for(&["revise", "--brief-file", "/nonexistent/brief.md"])).is_err());
+    }
+
+    #[test]
+    fn explanation_file_builds_the_same_question_as_inline_explanation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("explanation.txt");
+        std::fs::write(&file, explanation::tests::VALID).unwrap();
+        let path = file.to_str().unwrap();
+        let question_from = |args: &[&str]| {
+            let (_, payload, _) = payload_for(command_for(args)).unwrap();
+            payload["question"].clone()
+        };
+        let inline = [
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need a decision",
+            "--question",
+            "Approve the retry?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            explanation::tests::VALID,
+        ];
+        let from_file = [
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need a decision",
+            "--question",
+            "Approve the retry?",
+            "--answer-type",
+            "yes-no",
+            "--explanation-file",
+            path,
+        ];
+        assert_eq!(question_from(&inline), question_from(&from_file));
+        let mut from_lines = vec![
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need a decision",
+            "--question",
+            "Approve the retry?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+        ];
+        from_lines.extend(explanation::tests::VALID.lines());
+        assert_eq!(question_from(&inline), question_from(&from_lines));
+        assert!(
+            Cli::try_parse_from([
+                "boss",
+                "propose",
+                "done",
+                "--outcome",
+                "blocked",
+                "--summary",
+                "Need a decision",
+                "--question",
+                "Approve the retry?",
+                "--answer-type",
+                "yes-no",
+                "--explanation",
+                explanation::tests::VALID,
+                "--explanation-file",
+                path,
+            ])
+            .is_err(),
+            "inline and file forms are mutually exclusive"
+        );
+        std::fs::write(&file, "not a labelled explanation").unwrap();
+        let error = payload_for(command_for(&from_file)).unwrap_err();
+        assert!(error.to_string().contains("Context:"), "{error}");
+    }
+
+    #[test]
+    fn explanation_dash_is_the_stdin_sentinel() {
+        let cli = Cli::try_parse_from([
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need a decision",
+            "--question",
+            "Approve the retry?",
+            "--answer-type",
+            "yes-no",
+            "--explanation",
+            "-",
+        ])
+        .unwrap();
+        let Commands::Propose(args) = cli.command else {
+            panic!("expected propose")
+        };
+        let ProposeCommand::Done(done) = args.command.unwrap() else {
+            panic!("expected done")
+        };
+        assert_eq!(done.explanation_source.explanation, vec!["-".to_owned()]);
+        assert!(done.explanation_source.explanation_file.is_none());
+        let from_file = Cli::try_parse_from([
+            "boss",
+            "propose",
+            "done",
+            "--outcome",
+            "blocked",
+            "--summary",
+            "Need a decision",
+            "--question",
+            "Approve the retry?",
+            "--answer-type",
+            "yes-no",
+            "--explanation-file",
+            "-",
+        ])
+        .unwrap();
+        let Commands::Propose(args) = from_file.command else {
+            panic!("expected propose")
+        };
+        let ProposeCommand::Done(done) = args.command.unwrap() else {
+            panic!("expected done")
+        };
+        assert!(done.explanation_source.explanation.is_empty());
+        assert_eq!(
+            done.explanation_source.explanation_file.as_deref(),
+            Some(Path::new("-"))
+        );
     }
 
     #[test]
