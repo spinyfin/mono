@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  launchd job for a NativeLink worker on a Mac (worker-macos.json5). Install as
+  ~/Library/LaunchAgents/com.brianduff.nativelink.plist; the runbook
+  (../README.md, "Cutover") has the steps. The scheduler and shared cache are
+  the hub (hub.json5) on another host; this host only runs actions.
+
+  The placeholders are the only things to edit after copying the file:
+  USER_HOME (launchd does not expand ~ or $HOME in a plist), WORKER_NAME,
+  HUB_HOST, and the slots and store size, which the runbook's host table
+  lists. worker-macos.json5 says what each variable is for.
+
+  launchd runs the nativelink binary directly, with no wrapper script, so that
+  macOS attributes permissions to nativelink itself. It needs "Developer Tools"
+  and "Local Network" (Privacy & Security): the first so macOS does not
+  malware-scan every freshly staged compiler, the second to reach the hub.
+  Replacing the binary means granting both again.
+-->
+<dict>
+  <key>Label</key>
+  <string>com.brianduff.nativelink</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>USER_HOME/nativelink/nativelink</string>
+    <string>USER_HOME/nativelink/worker-macos.json5</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>USER_HOME/nativelink</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- This Mac's short name, as `hostname -s` prints it. -->
+    <key>NL_WORKER_NAME</key>
+    <string>WORKER_NAME</string>
+    <!-- The hub's name or address on the wired LAN, not its Tailscale name:
+         worker traffic measured 95-101 MB/s over the LAN against 33-61 MB/s
+         over Tailscale. The ports are the hub's NL_HUB_CLIENT_LISTEN and
+         NL_HUB_WORKER_LISTEN. -->
+    <key>NL_HUB_CLIENT_ADDRESS</key>
+    <string>HUB_HOST:50051</string>
+    <key>NL_HUB_WORKER_ADDRESS</key>
+    <string>HUB_HOST:50061</string>
+    <key>NL_WORKER_HOME</key>
+    <string>USER_HOME/nativelink</string>
+    <!-- Where the worker's store and its action directories live. The two
+         must share one APFS volume: executables are cloned from the store
+         into action directories, and a clone cannot cross volumes. A
+         directory of its own, so that the store of the release before this
+         one is left alone until there is no going back to it. -->
+    <key>NL_WORKER_DATA</key>
+    <string>USER_HOME/nativelink/v1.8</string>
+    <!-- Slots, and the size of the local copy of inputs in bytes. -->
+    <key>NL_WORKER_SLOTS</key>
+    <string>10</string>
+    <key>NL_WORKER_STORE_MAX_BYTES</key>
+    <string>40000000000</string>
+  </dict>
+  <!-- Without this launchd treats the job as a background daemon and delays
+       its timers: a 50 ms sleep inside an action took about 185 ms. Tests
+       with short timing windows then fail. Interactive removes that. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65536</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>USER_HOME/Library/Logs/nativelink/nativelink.log</string>
+  <key>StandardErrorPath</key>
+  <string>USER_HOME/Library/Logs/nativelink/nativelink.log</string>
+</dict>
+</plist>

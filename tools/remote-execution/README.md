@@ -1,0 +1,301 @@
+# Remote execution: the NativeLink hub and the macOS workers
+
+This directory holds everything that is installed on the hosts that run mono's remote builds on macOS workers: the NativeLink configs, the units that start them, the patch the workers need, the hub's health check, and this runbook. Nothing here is built or read by a build. The files are copied to the hosts by hand, which is why they are in the repository: a change to how the scheduler behaves is a reviewed change, and `tests/config_test.sh` keeps the files consistent with each other.
+
+What decides whether a build executes remotely is elsewhere: [`.buildkite/README.md`](../../.buildkite/README.md) for CI steps and [`tools/test-sandbox/README.md`](../test-sandbox/README.md) for a developer's Mac. The Linux workers have a hub of their own, described in [`.buildkite/linux-agents-runbook.md`](../../.buildkite/linux-agents-runbook.md); see "Not covered here" at the end.
+
+## What is here
+
+| File                                                     | Installed as                                      | What it is                                                                 |
+| -------------------------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------- |
+| `nativelink/hub.json5`                                   | `~/nativelink-macos-hub/hub.json5` on the hub     | Scheduler, CAS and action cache. Every scheduler timeout, with its reason. |
+| `nativelink/nativelink-macos-hub.service`                | `~/.config/systemd/user/` on the hub              | Starts the hub.                                                            |
+| `nativelink/hub-health.sh`                               | `~/nativelink-macos-hub/hub-health.sh` on the hub | The health check.                                                          |
+| `nativelink/nativelink-macos-hub-health.{service,timer}` | `~/.config/systemd/user/` on the hub              | Runs the health check every minute.                                        |
+| `nativelink/worker-macos.json5`                          | `~/nativelink/worker-macos.json5` on each Mac     | The worker. The same file on every Mac.                                    |
+| `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac             | Starts the worker and sets what differs per Mac.                           |
+| `nativelink/action-env.sh`                               | `~/nativelink/action-env.sh` on each Mac          | Wraps every action: picks the Xcode and SDK the action asks for.           |
+| `nativelink/build-worker.sh` and `nativelink/patches/`   | run on one Mac                                    | Builds the worker binary: the pinned release plus the patch.               |
+
+## Hosts
+
+The hub is a Linux host with the stores on an internal disk. It runs no actions. Its listen addresses, data directory and store size are in `~/nativelink-macos-hub/hub.env` on that host, which is not in the repository; `hub.json5` lists the variables.
+
+The workers, as inspected on 2026-11-18:
+
+| Mac           | Model    | Cores | RAM   | `NL_WORKER_SLOTS` | `NL_WORKER_STORE_MAX_BYTES` |
+| ------------- | -------- | ----- | ----- | ----------------- | --------------------------- |
+| `anaplian`    | Mac16,10 | 10    | 16 GB | 10                | 40000000000                 |
+| `skaffen`     | Mac16,10 | 10    | 16 GB | 10                | 40000000000                 |
+| `arbitrary`   | Mac18,5  | 12    | 16 GB | 12                | 25000000000                 |
+| `determinist` | Mac18,5  | 12    | 16 GB | 12                | 25000000000                 |
+| `rascal`      | Mac18,5  | 12    | 16 GB | 12                | 25000000000                 |
+
+`zakalwe` (10 cores, 16 GB) was the hub and a ten-slot worker in one process, with its stores on an external disk. It stops being the hub at the cutover. If it stays in the pool it is a worker like the others, with `NL_WORKER_DATA` on its internal disk: stalls of the external disk were what the scheduler turned into the hang of 2026-11-18.
+
+The slot counts are the numbers the workers ran with before this change. They are sized by cores, and about four concurrent Rust compiles was the RAM-safe figure measured for a 16 GB host in September ([investigation](../../docs/investigations/nativelink-macos-remote-execution.md)), so expect memory pressure on a worker; the scheduler's `worker_timeout_s` is set with that in mind.
+
+## Version and patch
+
+Every host runs NativeLink **1.8.6** (`37f3b206a8e6d55613abae2b18a0665fff24e096`), and the hub and the workers are upgraded together: an older binary rejects fields these configs use, and an older worker does not acknowledge a dispatch, which `dispatch_ack_timeout_s` relies on.
+
+- **The hub** runs the upstream release, `nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz` from the [v1.8.6 release](https://github.com/TraceMachina/nativelink/releases/tag/v1.8.6), sha256 `9bad10aa1c11a00fb1544ddd28a5a5ab892cfa42817e96a6cf18f169df7f0472`. `nativelink --version` prints `nativelink 1.8.6`.
+- **The workers** run that release with [`patches/macos-clonefile-executables.patch`](nativelink/patches/macos-clonefile-executables.patch), built from source by `build-worker.sh`. `nativelink --version` prints `nativelink 1.8.6+macos-clonefile`, so a worker that was given an upstream binary by mistake can be told apart. Every worker runs the same file: compare its sha256 after copying it.
+
+The patch exists because upstream stages an executable input as a hardlink out of the worker's store. On macOS dyld resolves `@loader_path` from whichever name of that inode the kernel reports, finds the store, and `rustc` fails with `Library not loaded: @rpath/librustc_driver-<hash>.dylib`. The patch stages executables with `clonefile(2)` instead, which gives each its own inode. It is the commit the workers already ran on 1.6.6 (`brianduff/nativelink` `3125a4fd`), carried forward; the patch file's header lists what changed on the way. It is not upstream: [issue #3137](https://github.com/TraceMachina/nativelink/issues/3137) is open, and so are the two pull requests that address it differently (#3138, #3191). Do not turn on `directory_cache` in the worker config: it stages inputs by another path, which the patch does not touch.
+
+Why 1.8.6 and not the 1.6.6 it replaces: on 2026-11-18 the 1.6.6 scheduler timed out operations on live workers after 5 s, evicted the workers, and went round again for hours while every client waited. The fixes, by the release that first had them:
+
+| Fix                                                           | Release | What it changes                                                                               |
+| ------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| [#2797](https://github.com/TraceMachina/nativelink/pull/2797) | 1.7.3   | Any message from a worker counts as a sign of life, not only a keepalive; default 5 s → 10 s. |
+| [#2826](https://github.com/TraceMachina/nativelink/pull/2826) | 1.7.3   | A live worker's action is no longer timed out over the worker's head.                         |
+| [#2846](https://github.com/TraceMachina/nativelink/pull/2846) | 1.7.3   | A kill reaches an action that is fetching inputs or uploading, so it is acknowledged.         |
+| [#2856](https://github.com/TraceMachina/nativelink/pull/2856) | 1.7.3   | A worker whose scheduler connection stalls reconnects instead of sitting idle.                |
+| [#2900](https://github.com/TraceMachina/nativelink/pull/2900) | 1.7.6   | A clock step backwards no longer drops results and leaves actions executing.                  |
+| [#2923](https://github.com/TraceMachina/nativelink/pull/2923) | 1.7.7   | Executing actions are swept on the scheduler's own clock, with or without a client.           |
+| [#2925](https://github.com/TraceMachina/nativelink/pull/2925) | 1.7.7   | Keepalives report what a worker runs; what it no longer runs is queued again.                 |
+
+The "Worker ids do not match" error that ended each round of the loop is gone as well: evicting a worker now skips an action that has already moved to another.
+
+To move to a later release: change the three pins at the top of `build-worker.sh`, refresh the patch against the new tag (or delete it once a release stages executables on their own inode), run `build-worker.sh`, which runs the tests that cover the patch, and update the version in this file and in the two configs. `config_test` fails until they agree.
+
+## Timeouts
+
+Every value is written out in the config, including the ones that equal NativeLink's default, with its reason next to it. This is the same list in one place, with what a Bazel client is told when a limit is what ends its action.
+
+| Setting                          | Value           | In     | What it bounds                                                                                     | What the client sees                                                                  |
+| -------------------------------- | --------------- | ------ | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `worker_timeout_s`               | 30 s            | hub    | Silence from a worker before it is evicted and its actions queued again. Twelve missed keepalives. | Nothing: the action runs elsewhere.                                                   |
+| `max_worker_loss_retries`        | 6               | hub    | Times one action may lose its worker. As many as the pool has workers.                             | `FAILED_PRECONDITION`: `The worker running this action was lost 7 times`              |
+| `max_job_retries`                | 3               | hub    | Retries of an action after an internal error or a scheduler timeout.                               | `FAILED_PRECONDITION`: `Job cancelled because it attempted to execute too many times` |
+| `max_timeout_retries`            | 1               | hub    | A command that timed out on one worker is tried once on another.                                   | `DEADLINE_EXCEEDED`: `Command … timed out after N seconds`                            |
+| `no_worker_action_timeout_s`     | 120 s           | hub    | Wait of a queued action while no worker at all is connected.                                       | `FAILED_PRECONDITION`: `Action cannot be scheduled, no worker is connected`           |
+| `unsatisfiable_action_timeout_s` | 300 s           | hub    | Wait of a queued action that no connected worker could run even when idle.                         | `FAILED_PRECONDITION`: `Action cannot be scheduled`                                   |
+| `max_action_executing_timeout_s` | 2700 s (45 min) | hub    | An action executing with no change of state, on a worker that still reports it.                    | `FAILED_PRECONDITION`: `Job cancelled …`, ending with the timeout that caused it      |
+| `executing_sweep_interval_s`     | 30 s            | hub    | How late the limits on executing actions are noticed when no client is attached.                   | Nothing by itself.                                                                    |
+| `unacknowledged_kill_timeout_s`  | 60 s            | hub    | Silence from a worker about an action it was told to kill, before the worker is evicted.           | Nothing: its other actions run elsewhere.                                             |
+| `dispatch_ack_timeout_s`         | 20 s            | hub    | An action handed to a worker that never acknowledged it is queued again, untried.                  | Nothing.                                                                              |
+| `client_action_timeout_s`        | 60 s            | hub    | How long a queued action outlives a client that has gone.                                          | Nothing: the client has gone.                                                         |
+| `execute_stream_heartbeat_s`     | 30 s            | hub    | Quiet on an execution stream before the hub repeats the action's state.                            | Nothing.                                                                              |
+| `max_download_timeout_s`         | 600 s           | worker | Fetching one action's inputs.                                                                      | `FAILED_PRECONDITION`: `Job cancelled …`, ending with the timeout that caused it      |
+| `max_action_timeout_s`           | 1200 s          | worker | One command. Applies to an action with no timeout of its own, and caps one that has a longer one.  | `DEADLINE_EXCEEDED`, after `max_timeout_retries`                                      |
+| `max_upload_timeout_s`           | 600 s           | worker | Uploading one action's outputs.                                                                    | `FAILED_PRECONDITION`: `Job cancelled …`, ending with the timeout that caused it      |
+| `http2_keepalive_interval_s`     | 10 s            | worker | How often the worker pings the hub on its connection.                                              | Nothing.                                                                              |
+| `http2_keepalive_timeout_s`      | 20 s            | worker | An unanswered ping before the worker reconnects. With the interval, 30 s: `worker_timeout_s`.      | Nothing.                                                                              |
+
+Three of these depend on each other, and `config_test` checks the arithmetic: the hub's 45-minute ceiling is the sum of the worker's three limits plus five minutes, so that a worker's own, more specific error arrives first; a worker notices a dead connection (10 s + 20 s) no later than the hub evicts a silent worker (30 s); and `worker_timeout_s` is several keepalive intervals (a keepalive goes out every 2.5 s).
+
+The worker's three limits are NativeLink's defaults, kept because nothing has measured this pool's longest fetch, command or upload. Lowering them, and the ceiling with them, needs that measurement first.
+
+## What bounds a stuck action
+
+A remote action that cannot make progress ends in one of the ways below. The times and the CI column are measured, with Bazel 9.1.0 against a 1.8.6 hub and two workers running these configs on one machine, unless a time is marked as derived from the settings. The developer column is measured for every worker freezing and for a hub that stops answering **before** a build; the during-a-build developer bound is derived from the watchdog's interval and probe timeout (it has not been measured against a frozen hub). The other rows follow from the rule Bazel applies, which is to run an action on the Mac when its remote execution failed for any reason but the action's own timeout.
+
+| What happens                                                 | What ends it                                                                                             | How long                                    | CI step (`ci-remote`)                                                                                                                                    | Developer's Mac (`dev-remote`)                                                                                                                                                                                   |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The worker running an action freezes or dies                 | `worker_timeout_s`; the action runs on another worker                                                    | Evicted after 30 s                          | Succeeds                                                                                                                                                 | Succeeds                                                                                                                                                                                                         |
+| Every worker freezes or is gone                              | `worker_timeout_s`, then `no_worker_action_timeout_s`                                                    | Failed 151 s after the freeze               | Fails: `Action cannot be scheduled, no worker is connected to the scheduler.`                                                                            | The action runs on the Mac                                                                                                                                                                                       |
+| Workers are evicted again and again (the loop of 2026-11-18) | `max_worker_loss_retries`                                                                                | 3 to 6 min (derived: six losses of 30–60 s) | Fails: `The worker running this action was lost 7 times`                                                                                                 | The action runs on the Mac                                                                                                                                                                                       |
+| A command hangs on a worker                                  | The test's own timeout, or `max_action_timeout_s`; then one more worker                                  | At most 2 × 20 min (derived)                | Fails with the timeout                                                                                                                                   | Fails with the timeout                                                                                                                                                                                           |
+| A worker reports an action as running and never finishes it  | `max_action_executing_timeout_s`                                                                         | 45 min per attempt (derived)                | Fails after the retries                                                                                                                                  | The action runs on the Mac                                                                                                                                                                                       |
+| The hub's process dies                                       | The connection breaks                                                                                    | 4 s                                         | Fails: `(Exit 34): UNAVAILABLE: io exception`                                                                                                            | The action runs on the Mac                                                                                                                                                                                       |
+| The hub stops answering **before** a build starts            | CI: the status probe. Bazel: its first call, six tries of 60 s each                                      | CI probe: 10 s. Bazel: 366 s and 369 s      | The step builds on its agent, with a warning. Without the probe: `Failed to query remote execution capabilities: DEADLINE_EXCEEDED`                      | The build runs on the Mac                                                                                                                                                                                        |
+| The hub stops answering **during** a build                   | Client status watchdog (same `/status` request as the CI start-of-step probe), repeated while bazel runs | ~15 s + 10 s (derived)                      | The command is stopped. An error annotation names the executor and the probe result. `timeout_in_minutes` is the last resort if the watchdog cannot run. | The in-flight bazel command is stopped and a line is written to that command's terminal (or `$TMPDIR/dev-remote-watchdog-<pid>.reason` if it has no tty). Re-run with `--config=dev-local` to finish on the Mac. |
+
+A scheduler that still answers its status page but stops completing actions is a different row: NativeLink 1.8.6 fails those actions itself (`no_worker_action_timeout_s`, `max_worker_loss_retries`, `max_action_executing_timeout_s`), and the developer fallback or the CI annotation then applies. The last row is only the hub that goes silent.
+
+Bazel 9.1 puts no deadline on an execution call: `--remote_timeout` covers cache calls only, and the flag that used to cover execution (`--experimental_remote_execution_keepalive`) is a no-op since 9.0. `--grpc_keepalive_time` **is** on by default in 9.1, at 60 s (pings after that much quiet, while a call is pending; 0 disables them). `dev-remote`, `ci-remote` and `ci-remote-linux` set `--grpc_keepalive_time=30s --grpc_keepalive_timeout=20s` so those values live in the rc files, and so a future Bazel that defaults them to 0 still pings. They are not the bound for a stopped hub. Measured with keepalive on at the 60 s default: with the hub's process stopped in the middle of an action, the build was still waiting, with no error, 17 minutes later. When the hub was allowed to run again the build carried on and finished by itself, which is also what a restart of the hub does to builds that are waiting on it. The 30 s / 20 s values were not re-measured; the 60 s measurement is why the bound is the status watchdog instead.
+
+So, for a hub that stops answering:
+
+- **A CI step that starts** asks the hub for its status page first (`.buildkite/steps/remote-execution.sh`) and builds on its agent if there is no answer within 10 s (curl exit 28) or the answer is 503. A TCP connection is not enough: the kernel accepts one for a process that has stopped. Any other probe failure (reset, TLS, no route) is treated as "no status page" and the step still executes remotely.
+- **A CI step that is running** is bounded by the status watchdog in `ci-env.sh`: every 15 s it repeats that same request for every bazel client the step started, including ones repobin and checkleft launch themselves. If the hub accepted a connection and then does not answer (or answers 503) it stops those bazel clients and annotates the build with the executor's host, port and probe result. An unreachable hub is not treated as stuck. `timeout_in_minutes` on every remote-enabled step (`pipeline.yml` and the integrity pipeline) is the last resort if the watchdog cannot run (no curl); a Buildkite SIGTERM then names the executor immediately and runs a short (3 s) probe to amend the annotation.
+- **A developer's build that is running** is bounded by `dev-remote`'s workspace-status command (`tools/remote-execution/dev-remote-workspace-status.sh`): the same status request, against the endpoint in `~/.bazelrc`. If the hub accepted a connection and then does not answer, it writes why to the in-flight bazel command's terminal and stops that command. `--config=dev-local` restores the default stamp script, so the watchdog does not run. An unreachable hub is not treated as stuck. Re-run with `--config=dev-local` to finish on the Mac.
+- The hub's health check reports it within a minute (next section), and restarting the hub releases every waiting build.
+
+A per-RPC deadline in the client would fail the Execute call itself, so a developer build could fall back instead of stopping. That needs Bazel 9.3 or later (`--remote_grpc_service_config`). The status watchdog is the bound on 9.1.
+
+## Health check
+
+`hub-health.sh` runs on the hub every minute and prints one line:
+
+```
+healthy: 6/6 workers, 18 of 66 slots busy, 0 queued; last 600s: 0 forced evictions, 0 operation timeouts, 0 lost results, 412 log lines
+UNHEALTHY: no worker is connected; 4 workers were evicted for being silent or for not acknowledging a kill in the last 600s (limit 2) | 0/6 workers, …
+```
+
+It exits non-zero while the hub is unhealthy, so the unit's state is the signal:
+
+```sh
+systemctl --user is-failed nativelink-macos-hub-health.service   # "failed" while unhealthy
+journalctl --user --unit nativelink-macos-hub-health.service --since -1h --output cat
+```
+
+What makes it unhealthy, and why each limit is where it is:
+
+| Condition                                                                     | Limit           | Reason                                                                                                                                                     |
+| ----------------------------------------------------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The status page does not answer in 10 s, or answers 503                       | —               | The hub's own check of a store gives up after 5 s and answers 503. No answer in 10 s is a process that is not serving.                                     |
+| Fewer workers connected than `NL_HEALTH_EXPECTED_WORKERS`                     | the pool's size | A worker that lost its connection and cannot end an action it was running does not come back by itself (see "Recovery").                                   |
+| Workers evicted for silence or for ignoring a kill, in the last 10 min        | more than 2     | One is a Mac that rebooted. On 2026-11-18 it was 41 closed worker connections in the hour. A worker that disconnects by itself (a restart) is not counted. |
+| Actions the scheduler timed out, in the last 10 min                           | more than 4     | In 1.8.6 a live worker's action is not timed out, so each of these is an action whose worker went silent or that hit a ceiling.                            |
+| Actions queued again because their worker no longer had them, in 10 min       | more than 4     | A result lost between a worker and the hub. One is a blip; a run of them is a connection that keeps breaking.                                              |
+| The oldest queued action is older than 5 min **and** a worker has a free slot | 300 s           | Work, capacity, and nothing moving. With every slot busy a long queue is only a busy pool, and is not reported.                                            |
+
+These limits have not yet run against a day of real traffic on 1.8.6. Expect to adjust them in the first week; they are variables in `hub.env` (the script's header lists them), and a changed default belongs in the script with its reason.
+
+**The alert.** Set `NL_HEALTH_ALERT_CMD` in `hub.env` to whatever should tell a person. It runs when the hub becomes unhealthy, again when it recovers, and when the check cannot run, with the line in `NL_HEALTH_LINE` and `unhealthy`, `healthy` or `error` in `NL_HEALTH_STATE`. A repeating configuration error (a missing `NL_HUB_ADMIN_LISTEN`, a bad argument) alerts once: the check keeps its last state in `NL_HEALTH_STATE_FILE` before it validates anything. Until the command is set, the signal is the unit's state and nothing pushes it anywhere.
+
+**In CI.** A step that fails because the executor failed says so on its build page: `ci-env.sh` recognises the errors in the table above in the log of a failed bazel command and adds an annotation that names the reason and points here. A step that could not use the executor at all, and built on its agent, has a warning annotation.
+
+The check only reports. It does not restart the hub, and nothing else does on a schedule or on a failed check: a scheduler that is running and not scheduling is a fault to look at, and a restart destroys what there is to look at.
+
+## Recovery
+
+Start from the health line. Its problems map to these.
+
+**`N of M workers are connected`.** On the missing Mac:
+
+```sh
+launchctl print gui/$(id -u)/com.brianduff.nativelink | grep -E 'state =|pid =|last exit'
+tail -n 50 ~/Library/Logs/nativelink/nativelink.log
+```
+
+A worker that lost its connection kills what it was running before it reconnects, and waits for those actions to end without a limit. If one cannot be killed, the worker never returns: the log ends with `Worker disconnected from scheduler, reconnecting` and no later `Worker registered with scheduler`. Restart that worker. It costs nothing the hub has not already queued again:
+
+```sh
+launchctl kickstart -k gui/$(id -u)/com.brianduff.nativelink
+```
+
+**`workers were evicted for being silent …`, `the scheduler timed out … actions`.** Find which workers; the worker id starts with the Mac's name:
+
+```sh
+journalctl --user --unit nativelink-macos-hub.service --since -15min --output cat |
+  grep -E 'Worker timed out|did not acknowledge a kill|Timing out operation'
+```
+
+If it is one Mac, the fault is on it (memory pressure, a disk, a hung action): restart its worker, or take it out of the pool with `launchctl bootout gui/$(id -u)/com.brianduff.nativelink` until it is understood. If it is every Mac, look at what they share: the hub's host (`uptime`, the disk under `NL_HUB_DATA`) and the network between them.
+
+**`the hub did not answer a status request`, `reports a failed or stalled store`, `actions are queued … while N slots are free`.** The hub itself. First keep what happened, then restart it:
+
+```sh
+set -a
+. ~/nativelink-macos-hub/hub.env
+set +a
+journalctl --user --unit nativelink-macos-hub.service --since -1h --output cat > ~/hub-$(date +%Y%m%dT%H%M).log
+curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/workers || true
+curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/demand || true
+systemctl --user restart nativelink-macos-hub.service
+```
+
+A restart ends every action in flight. The queue is in memory and is lost; the workers kill what they were running and reconnect within half a minute. Each CI step that was executing remotely fails with `UNAVAILABLE` and is annotated as an executor failure; retry those steps. A developer's build falls back to the Mac for the actions that were in flight. Builds that were waiting on a hub that had stopped answering are released the same way.
+
+A hub that needed a restart to schedule again has a bug. With the saved log, open an issue upstream; that the restart worked is not the end of it.
+
+**Taking the pool out of use** needs no merge. Remove `CI_BAZEL_REMOTE_EXECUTOR` from an agent's `environment` hook and that agent builds on itself from its next job; comment the `dev-remote-endpoint` lines out of a Mac's `~/.bazelrc`.
+
+## Cutover
+
+From NativeLink 1.6.6 with the hub on `zakalwe` to 1.8.6 with the hub on the Linux host. Everything moves in one window, because the hub and the workers have to change together. The stores start empty: 1.7.0 changed the on-disk layout of a store one way, and starting clean on the new host avoids converting anything. The first builds afterwards are cold.
+
+**1. Build the worker binary**, on any of the Macs, ahead of time:
+
+```sh
+tools/remote-execution/nativelink/build-worker.sh --src ~/nativelink-src --out ~/nativelink-1.8.6
+```
+
+It fetches the pinned commit, applies the patch, runs the tests that cover it and prints the binary's sha256. Copy `~/nativelink-1.8.6/nativelink` to every Mac as `~/nativelink/nativelink-1.8.6` and check the digest there. Leave the running `~/nativelink/nativelink` alone for now.
+
+**2. Set up the hub**, on the Linux host, ahead of time. It has no clients until step 5.
+
+```sh
+mkdir -p ~/nativelink-macos-hub && cd ~/nativelink-macos-hub
+# the release tarball named under "Version and patch"; check its sha256 before unpacking
+tar xzf nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz nativelink
+install -m 644 <checkout>/tools/remote-execution/nativelink/hub.json5 .
+install -m 755 <checkout>/tools/remote-execution/nativelink/hub-health.sh .
+install -m 644 <checkout>/tools/remote-execution/nativelink/nativelink-macos-hub*.service \
+  <checkout>/tools/remote-execution/nativelink/nativelink-macos-hub-health.timer ~/.config/systemd/user/
+```
+
+Write `~/nativelink-macos-hub/hub.env`. The addresses are this host's own and stay on the host:
+
+```sh
+NL_HUB_DATA=<a directory on the internal disk>
+NL_HUB_CAS_MAX_BYTES=<at most 80% of that filesystem, less 5 GB, in bytes>
+NL_HUB_CLIENT_LISTEN=<address>:50051
+NL_HUB_WORKER_LISTEN=<address>:50061
+NL_HUB_ADMIN_LISTEN=127.0.0.1:50071
+NL_HEALTH_EXPECTED_WORKERS=<the number of Macs in the pool>
+```
+
+If the host also runs the Linux workers' hub, the two cannot share an address and port: give this one ports of its own, and use them in the workers' plists. Then:
+
+```sh
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now nativelink-macos-hub.service
+journalctl --user --unit nativelink-macos-hub.service --output cat | head     # "Ready, listening on …" three times
+curl -s --connect-timeout 10 --max-time 10 -o /dev/null -w '%{http_code}\n' http://<address>:50051/status         # 200
+```
+
+A variable missing from `hub.env` fails the start with an error that names it.
+
+**3. Stop new work.** Pause the Mac agents (`bk agent pause <agent-id> --timeout-in-minutes 60`, as in the Linux runbook's "Safe maintenance procedure") and wait for running jobs to end. Developers' builds that are in flight fall back to their Macs when the old hub goes.
+
+**4. Switch each worker.** On each Mac:
+
+```sh
+launchctl bootout gui/$(id -u)/com.brianduff.nativelink
+cd ~/nativelink
+mv nativelink nativelink-1.6.6 && mv nativelink-1.8.6 nativelink
+./nativelink --version                                    # nativelink 1.8.6+macos-clonefile
+install -m 644 <checkout>/tools/remote-execution/nativelink/worker-macos.json5 .
+install -m 755 <checkout>/tools/remote-execution/nativelink/action-env.sh .
+cp ~/Library/LaunchAgents/com.brianduff.nativelink.plist com.brianduff.nativelink.plist.1.6.6
+install -m 644 <checkout>/tools/remote-execution/nativelink/com.brianduff.nativelink.plist ~/Library/LaunchAgents/
+```
+
+Edit the placeholders in the installed plist: `USER_HOME`, `WORKER_NAME`, `HUB_HOST` (and the ports, if the hub's are not 50051 and 50061), and the slots and store size from the table under "Hosts". `NL_WORKER_DATA` is a new directory, `~/nativelink/v1.8`, so the 1.6.6 store in `~/nativelink/data` is untouched and a rollback finds it as it left it. Then:
+
+```sh
+plutil -lint ~/Library/LaunchAgents/com.brianduff.nativelink.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brianduff.nativelink.plist
+grep 'Worker registered with scheduler' ~/Library/Logs/nativelink/nativelink.log | tail -1
+```
+
+macOS ties "Developer Tools" and "Local Network" (Privacy & Security) to the binary, so the new one has to be allowed again, at the Mac's screen. Until "Local Network" is allowed the worker cannot reach the hub and never registers.
+
+`zakalwe` is the same, with one more decision: its old process was the hub as well, and its job is `rbe.json5`, not a worker config. Booting it out stops the old hub, which is step 5. Bring it back as a worker with the plist from this directory, or leave it out.
+
+**5. Check the pool, then point the clients at it.** On the hub:
+
+```sh
+set -a
+. ~/nativelink-macos-hub/hub.env
+set +a
+curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/workers | grep -o '"id":"[a-z]*' | sort
+systemctl --user enable --now nativelink-macos-hub-health.timer
+~/nativelink-macos-hub/hub-health.sh --journal-unit nativelink-macos-hub.service      # healthy: 6/6 workers …
+```
+
+Change `CI_BAZEL_REMOTE_EXECUTOR` in each Mac agent's `environment` hook, and the three `dev-remote-endpoint` lines in each developer's `~/.bazelrc`, to the new hub's client address.
+
+**6. Prove it before the agents come back.** From a checkout of `main` on a Mac that points at the new hub:
+
+```sh
+bazel test //tools/test-sandbox/... --nocache_test_results     # the gate in tools/test-sandbox/README.md
+bazel build //tools/boss/engine/core:engine                    # Rust compiles on the workers
+```
+
+The summary must report the actions as `remote`, and no worker's log may contain `Library not loaded` or `clonefile unavailable for executables`. Then run `bazel build //... && bazel test //...` once to fill the cache, so that the first CI steps do not start cold against a 60-minute limit, and resume the agents (`bk agent resume <agent-id>`).
+
+A checkout that built against the old hub may log `Lost inputs no longer available remotely` on its first build: it remembers outputs that only the old cache had. Bazel starts the build again by itself and re-runs those actions.
+
+**Rolling back.** The old state is intact on every Mac. Boot the worker out, put `nativelink-1.6.6` and the saved plist back, bootstrap it, and on `zakalwe` the old hub starts with it. Point the clients back. Do not start a 1.6.6 binary on a `v1.8` store or the 1.8.6 hub's stores: it cannot read them.
+
+## Not covered here
+
+- **The Linux workers' hub** (`.buildkite/linux-agents-runbook.md`, "Remote execution workers") still runs NativeLink 1.6.6 with no timeouts set, so it has the scheduler this change replaces for the Macs. Its hub and workers need the same upgrade and the same scheduler block. The CI probe and the step timeouts already apply to Linux steps; the probe needs a status page on that hub's client port to see more than a connection.
+- **A per-RPC deadline in the Bazel client** (`--remote_grpc_service_config` in Bazel 9.3 or later). That would fail the Execute call itself so a developer build could fall back instead of stopping. The status watchdog is the bound on Bazel 9.1.

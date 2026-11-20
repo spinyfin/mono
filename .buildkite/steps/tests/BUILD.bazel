@@ -27,5 +27,6 @@ sh_test(
     data = [
         "//:.ci.bazelrc",
         "//.buildkite/steps:remote-execution.sh",
+        "//tools/remote-execution:remote-status.sh",
     ],
 )

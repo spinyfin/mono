@@ -41,6 +41,13 @@ if ! ci_remote_execution_decide "$OS_TYPE" "$(uname -m)"; then
   exit 1
 fi
 echo "--- [ci-env] remote execution ${CI_REMOTE_EXECUTION}: ${CI_REMOTE_EXECUTION_REASON}"
+if [[ "$CI_REMOTE_EXECUTION" == "on" ]]; then
+  # Buildkite sends SIGTERM when timeout_in_minutes hits, then SIGKILL a few
+  # seconds later. Write the executor-naming line first, then a short probe:
+  # a 10 s probe against a silent hub uses up the whole cancel grace period
+  # and SIGKILL can arrive before the annotation.
+  trap '_ci_remote_on_term' TERM
+fi
 if [[ "$CI_REMOTE_EXECUTION_FELL_BACK" == "1" ]] && command -v buildkite-agent > /dev/null 2>&1; then
   # Building on the agent is correct but slow, and it puts the load back on a
   # host that also serves as a worker. Make it visible on the build page.
@@ -114,6 +121,120 @@ if [[ "$OS_TYPE" == "darwin" ]]; then
   echo "$CURRENT_XCODE_VERSION" > "$XCODE_VERSION_FILE"
 fi
 
+# _ci_note_remote_failure <log of a failed bazel command>
+#
+# On a step that executes remotely, a bazel command can fail because the
+# remote executor failed it: no worker to run an action, an action that lost
+# its worker as often as the scheduler allows, a connection that broke. Such a
+# failure says nothing about the change, and in the log it is one line among
+# thousands. ci_remote_failure_reason (remote-execution.sh) recognises it; this
+# puts it on the build page. The step still fails: ci-remote forbids a local
+# fallback inside a step, and that does not change here.
+_ci_note_remote_failure() {
+  local reason
+  [[ "$CI_REMOTE_EXECUTION" == "on" ]] || return 0
+  reason="$(ci_remote_failure_reason "$1")" || return 0
+  echo "^^^ +++"
+  echo "[ci-env] this command failed because remote execution failed: ${reason}. See tools/remote-execution/README.md, \"Recovery\"."
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    buildkite-agent annotate --style error --context "ci-remote-execution-failed-${BUILDKITE_JOB_ID:-step}" \
+      "${BUILDKITE_LABEL:-A step} failed because remote execution failed, not because an action ran and failed: ${reason}. \`tools/remote-execution/README.md\`, \"Recovery\", says how to tell whether the executor is healthy again; retry the step once it is." || true
+  fi
+}
+
+_ci_note_watchdog_failure() {
+  local reason
+  reason="$(cat "$1")"
+  echo "^^^ +++"
+  echo "[ci-env] this command failed because remote execution failed: ${reason}. See tools/remote-execution/README.md, \"What bounds a stuck action\"."
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    buildkite-agent annotate --style error --context "ci-remote-execution-failed-${BUILDKITE_JOB_ID:-step}" \
+      "${BUILDKITE_LABEL:-A step} failed because remote execution failed, not because an action ran and failed: ${reason}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\", says how the bound works; retry the step once the executor is healthy." || true
+  fi
+}
+
+_ci_remote_cleanup_step_watchdog() {
+  if [[ -n "${CI_REMOTE_STEP_WATCHDOG_PID:-}" ]]; then
+    kill "$CI_REMOTE_STEP_WATCHDOG_PID" 2>/dev/null || true
+    wait "$CI_REMOTE_STEP_WATCHDOG_PID" 2>/dev/null || true
+  fi
+}
+
+if [[ "$CI_REMOTE_EXECUTION" == "on" ]]; then
+  # Cover bazel clients this step starts, including ones repobin and
+  # checkleft spawn with Command::new("bazel") rather than the bazel()
+  # wrapper. Started here so _ci_note_watchdog_failure already exists in
+  # the watchdog's subshell. _ci_run_bazel still watches each wrapped
+  # command as well.
+  CI_REMOTE_WATCHDOG_REASON_FILE="${TMPDIR:-/tmp}/ci-remote-watchdog-${BUILDKITE_JOB_ID:-$$}.reason"
+  rm -f "$CI_REMOTE_WATCHDOG_REASON_FILE"
+  ci_remote_watchdog_stuck_hook() {
+    _ci_note_watchdog_failure "$1"
+  }
+  ci_remote_watchdog_loop_tree "$$" "$CI_REMOTE_WATCHDOG_REASON_FILE" "${CI_BAZEL_REMOTE_EXECUTOR}" &
+  CI_REMOTE_STEP_WATCHDOG_PID=$!
+  trap '_ci_remote_cleanup_step_watchdog' EXIT
+fi
+
+_ci_remote_on_term() {
+  local msg probed
+  msg="$(ci_remote_sigterm_reason_immediate)"
+  echo "^^^ +++"
+  echo "[ci-env] ${msg}. See tools/remote-execution/README.md, \"What bounds a stuck action\"."
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    buildkite-agent annotate --style error --context "ci-remote-execution-timeout-${BUILDKITE_JOB_ID:-step}" \
+      "${BUILDKITE_LABEL:-A step} was killed (SIGTERM) while remote execution was on: ${msg}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\"." || true
+  fi
+  probed="$(ci_remote_sigterm_reason)"
+  echo "[ci-env] ${probed}."
+  if command -v buildkite-agent > /dev/null 2>&1; then
+    buildkite-agent annotate --style error --context "ci-remote-execution-timeout-${BUILDKITE_JOB_ID:-step}" \
+      "${BUILDKITE_LABEL:-A step} was killed (SIGTERM) while remote execution was on: ${probed}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\"." || true
+  fi
+  _ci_remote_cleanup_step_watchdog
+  exit 143
+}
+
+# Run one bazel command, streaming its output. When the step executes remotely,
+# a status watchdog repeats the start-of-step probe while the command runs and
+# stops it if the executor goes silent; that is the bound Bazel 9.1 does not
+# put on an execution call.
+_ci_run_bazel() {
+  local tmplog="$1" subcommand="$2"
+  shift 2
+  if [[ "$CI_REMOTE_EXECUTION" != "on" ]]; then
+    command bazel \
+      $BAZEL_STARTUP_FLAGS \
+      "$subcommand" \
+      $CI_BAZEL_FLAGS \
+      "$@" 2>&1 | tee "$tmplog"
+    return $?
+  fi
+
+  local fifo bazel_pid tee_pid wd_pid rc=0
+  fifo=$(mktemp "${tmplog}.fifo.XXXXXX")
+  rm -f "$fifo"
+  mkfifo "$fifo"
+  tee "$tmplog" <"$fifo" &
+  tee_pid=$!
+  command bazel \
+    $BAZEL_STARTUP_FLAGS \
+    "$subcommand" \
+    $CI_BAZEL_FLAGS \
+    "$@" >"$fifo" 2>&1 &
+  bazel_pid=$!
+  rm -f "$tmplog.watchdog"
+  ci_remote_watchdog_loop "$bazel_pid" "$tmplog.watchdog" "${CI_BAZEL_REMOTE_EXECUTOR}" &
+  wd_pid=$!
+  wait "$bazel_pid"
+  rc=$?
+  kill "$wd_pid" 2>/dev/null || true
+  wait "$wd_pid" 2>/dev/null || true
+  wait "$tee_pid" 2>/dev/null || true
+  rm -f "$fifo"
+  return "$rc"
+}
+
 # Wrap bazel and pass in ci configuration (CI_BAZEL_FLAGS, above).
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
 # cache after an Xcode upgrade) and recovers by running `bazel clean --expunge`
@@ -125,12 +246,8 @@ bazel() {
   local tmplog
   tmplog=$(mktemp)
 
-  if command bazel \
-    $BAZEL_STARTUP_FLAGS \
-    "$subcommand" \
-    $CI_BAZEL_FLAGS \
-    "$@" 2>&1 | tee "$tmplog"; then
-    rm -f "$tmplog"
+  if _ci_run_bazel "$tmplog" "$subcommand" "$@"; then
+    rm -f "$tmplog" "$tmplog.watchdog"
     return 0
   fi
 
@@ -138,16 +255,25 @@ bazel() {
   if grep -qE "xcode-locator.*failed|Xcode version.*is not available" "$tmplog" 2>/dev/null; then
     echo "--- Xcode version mismatch detected in disk cache; running bazel clean --expunge and retrying"
     command bazel $BAZEL_STARTUP_FLAGS clean --expunge
-    rm -f "$tmplog"
-    command bazel \
-      $BAZEL_STARTUP_FLAGS \
-      "$subcommand" \
-      $CI_BAZEL_FLAGS \
-      "$@"
+    rm -f "$tmplog" "$tmplog.watchdog"
+    _ci_run_bazel "$tmplog" "$subcommand" "$@"
     return $?
   fi
 
-  rm -f "$tmplog"
+  if [[ -s "$tmplog.watchdog" ]]; then
+    _ci_note_watchdog_failure "$tmplog.watchdog"
+    rm -f "$tmplog" "$tmplog.watchdog"
+    return 1
+  fi
+
+  if [[ -n "${CI_REMOTE_WATCHDOG_REASON_FILE:-}" && -s "$CI_REMOTE_WATCHDOG_REASON_FILE" ]]; then
+    _ci_note_watchdog_failure "$CI_REMOTE_WATCHDOG_REASON_FILE"
+    rm -f "$tmplog" "$tmplog.watchdog"
+    return 1
+  fi
+
+  _ci_note_remote_failure "$tmplog"
+  rm -f "$tmplog" "$tmplog.watchdog"
   return 1
 }
 

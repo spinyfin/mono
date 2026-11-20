@@ -1,0 +1,229 @@
+// NativeLink hub for the macOS remote-execution workers: scheduler, CAS and
+// action cache. For NativeLink 1.8.6; an older binary rejects several of the
+// fields below.
+//
+// Runs on a Linux host as nativelink-macos-hub.service. It runs no actions
+// itself: every worker is a separate process on a Mac (worker-macos.json5).
+// The runbook is ../README.md.
+//
+// Values that belong to the host come from the unit's EnvironmentFile
+// (hub.env), so this file is the same on any host and names no address. A
+// variable that is not set fails the start; nothing has a default.
+//
+//   NL_HUB_DATA            Directory for the stores, on the internal disk.
+//   NL_HUB_CAS_MAX_BYTES   Size of the CAS in bytes. At most 80% of the
+//                          filesystem that holds NL_HUB_DATA, less 5 GB for
+//                          the action cache: the store evicts at this size,
+//                          and a store that fills its disk first stalls.
+//   NL_HUB_CLIENT_LISTEN   <address>:<port> for Bazel clients and workers'
+//                          cache traffic. Clients name it as
+//                          grpc://<host>:<port>.
+//   NL_HUB_WORKER_LISTEN   <address>:<port> the workers register with.
+//   NL_HUB_ADMIN_LISTEN    127.0.0.1:<port> for the health check.
+{
+  stores: [
+    {
+      name: "CAS_MAIN_STORE",
+      filesystem: {
+        content_path: "${NL_HUB_DATA}/cas-content",
+        temp_path: "${NL_HUB_DATA}/cas-tmp",
+        eviction_policy: { max_bytes: "${NL_HUB_CAS_MAX_BYTES}" },
+      },
+    },
+    // completeness_checking: a cached result is only served while every
+    // output it lists is still in the CAS; otherwise it reads as a miss and
+    // the action re-runs. Without it, a CAS eviction leaves results pointing
+    // at missing files and clients fail with "Lost inputs no longer
+    // available remotely" (seen 2026-11-16 when the CAS reached its cap).
+    {
+      name: "AC_MAIN_STORE",
+      completeness_checking: {
+        backend: {
+          filesystem: {
+            content_path: "${NL_HUB_DATA}/ac-content",
+            temp_path: "${NL_HUB_DATA}/ac-tmp",
+            eviction_policy: { max_bytes: 5000000000 },
+          },
+        },
+        cas_store: { ref_store: { name: "CAS_MAIN_STORE" } },
+      },
+    },
+  ],
+  schedulers: [
+    {
+      name: "MAIN_SCHEDULER",
+      simple: {
+        supported_platform_properties: {
+          cpu_count: "minimum",
+          OSFamily: "priority",
+          "container-image": "priority",
+        },
+
+        // Every timeout below is written out, including the ones that equal
+        // NativeLink's default, so that a change of default in a later
+        // release cannot change this scheduler, and so that each has its
+        // reason next to it. ../README.md, "Timeouts", has the same list as
+        // one table, with what a Bazel client sees when each one fires.
+        // ../tests/config_test.sh pins the values.
+
+        // A worker that has sent nothing for this long is evicted and its
+        // actions are queued again. A worker sends a keepalive every 2.5 s
+        // (half of worker_api_endpoint.timeout), and any message counts.
+        //
+        // 30 s is twelve keepalives in a row. The workers are 16 GB Macs
+        // running 10 to 12 compiles each, where a pause of several seconds is
+        // ordinary: on 2026-11-18, with NativeLink 1.6.6 and its 5 s window,
+        // 6 to 20 operations an hour were timed out on workers that were
+        // alive. The costs are not symmetric. Too long only delays the retry
+        // of what a dead worker held, by the difference. Too short evicts a
+        // live worker, which throws away everything it is running.
+        //
+        // It is also the grace the scheduler adds to an action's own timeout
+        // before ending it over the worker's head, and that clock starts at
+        // assignment, so fetching inputs and uploading outputs has to fit in
+        // it for a test that runs close to its limit.
+        worker_timeout_s: 30,
+
+        // Ends an action that has been executing this long with no change of
+        // state reported by its worker, whatever its keepalives say. It is
+        // the only bound on an action that carries no timeout (every build
+        // action; Bazel sets one on tests only) and that a live worker keeps
+        // reporting as running. Keepalives do not extend it.
+        //
+        // It has to exceed everything a healthy worker may spend on one
+        // action, or it ends work that would have finished: fetch (10 min),
+        // command (20 min) and upload (10 min), the three limits
+        // worker-macos.json5 sets. 45 min is that sum and five more, so the
+        // worker's own, more specific error arrives first.
+        max_action_executing_timeout_s: 2700,
+
+        // How often executing actions are checked against the limits above
+        // when no client is attached to do it, and how often the scheduler
+        // looks for an action whose worker no longer holds it (a result lost
+        // on the way). NativeLink's default. It only sets how late those are
+        // noticed, and half a minute is small next to every limit it serves.
+        executing_sweep_interval_s: 30,
+
+        // A worker told to kill an action, and silent about it for this
+        // long, is evicted. NativeLink's default. A kill is a signal, a grace
+        // period and the removal of the action's directory, for which the
+        // worker allows 30 s (max_cleanup_wait_s); this is twice that.
+        unacknowledged_kill_timeout_s: 60,
+
+        // An action handed to a worker that has kept talking for this long
+        // without acknowledging it is queued again, untried. Off by default.
+        // 20 s is eight keepalives sent past a dispatch the worker never
+        // took, which is a dispatch that was lost.
+        //
+        // Only workers from 1.7.3 acknowledge. Remove this line before
+        // connecting an older worker, or every action it is given is queued
+        // again and again.
+        dispatch_ack_timeout_s: 20,
+
+        // A queued action whose client has gone is dropped after this long.
+        // NativeLink's default. Bazel reattaches within seconds after a
+        // broken connection (five retries in about 3 s), so a minute never
+        // drops an action a build is still waiting for, and an interrupted
+        // build stops occupying the queue a minute later.
+        client_action_timeout_s: 60,
+
+        // Runs of one action that ended in an internal error or a scheduler
+        // timeout before the client is told. NativeLink's default: three
+        // retries, four runs. The error names the last failure.
+        max_job_retries: 3,
+
+        // Times an action may lose its worker (evicted, disconnected, timed
+        // out) before the client is told. NativeLink's default is 10, sized
+        // for pools where losing a worker is routine. This pool has six
+        // workers and none is preemptible: an action that has lost a worker
+        // six times has lost as many as there are, and the pool is what is
+        // wrong. Each loss takes 30 to 60 s to detect, so a build caught in
+        // an eviction loop fails in about five minutes instead of ten.
+        max_worker_loss_retries: 6,
+
+        // A command that ran past its timeout on one worker is tried once on
+        // another before the timeout is final. NativeLink's default. A 16 GB
+        // host under memory pressure runs everything slowly; the second
+        // worker tells that apart from an action that is slow by itself.
+        max_timeout_retries: 1,
+
+        // A queued action fails once no worker at all has been connected for
+        // this long, instead of waiting for workers that may never come. Off
+        // by default. After a restart of this hub every worker reconnects
+        // with a backoff that tops out at 30 s; two minutes is four of those.
+        no_worker_action_timeout_s: 120,
+
+        // A queued action that no connected worker could run even when idle
+        // fails after this long. Off by default. Nothing a mono build asks
+        // for is unsatisfiable, so this only catches a mistake (a client that
+        // asks for more cpu_count than any worker has). Five minutes is
+        // longer than a restart of the whole pool, during which the workers
+        // that could run it are simply not back yet.
+        unsatisfiable_action_timeout_s: 300,
+      },
+    },
+  ],
+  servers: [
+    // Client API (cache + execution). No authentication: anything that can
+    // reach this port can use it.
+    {
+      name: "public",
+      listener: { http: { socket_address: "${NL_HUB_CLIENT_LISTEN}" } },
+      services: {
+        cas: [{ cas_store: "CAS_MAIN_STORE" }],
+        ac: [{ ac_store: "AC_MAIN_STORE" }],
+        bytestream: [{ cas_store: "CAS_MAIN_STORE" }],
+        execution: [
+          {
+            cas_store: "CAS_MAIN_STORE",
+            scheduler: "MAIN_SCHEDULER",
+            // Re-send an action's current state on a stream that has been
+            // quiet this long. Off by default. Without it the hub says nothing
+            // for as long as an action is queued or running, so nothing on the
+            // path (the laptop reaches this hub through a tunnel) sees traffic,
+            // and the hub does not find out that a client has gone until the
+            // action ends. It logs "Execute stream dropped before the operation
+            // finished" when a write fails. 30 s matches the client's
+            // --grpc_keepalive_time (dev-remote / ci-remote).
+            //
+            // It does not make a Bazel 9.1 client time out, and neither does
+            // its absence: see ../README.md, "What bounds a stuck action".
+            execute_stream_heartbeat_s: 30,
+          },
+        ],
+        // remote_cache_compression: accept and serve zstd-compressed blobs.
+        // Do not turn this off without first changing the callers. The
+        // workers compress their transfers (worker-macos.json5), and Bazel
+        // clients that pass --remote_cache_compression (ci-remote in
+        // .ci.bazelrc, a developer's ~/.bazelrc) fail outright against a
+        // server that does not advertise it.
+        capabilities: [
+          { remote_execution: { scheduler: "MAIN_SCHEDULER" }, remote_cache_compression: true },
+        ],
+        // /status on the port clients use. A CI step asks it before it sends
+        // its build here (.buildkite/steps/remote-execution.sh): a hub whose
+        // process has stopped answering still accepts a TCP connection, and a
+        // Bazel 9.1 client that starts a build against one waits on its first
+        // call (about six minutes of --remote_timeout retries) unless the
+        // probe already sent the step to the agent.
+        // It answers 503 when a store has failed or stalled.
+        health: {},
+      },
+    },
+    // Worker API: the workers on other hosts register here.
+    {
+      name: "worker_api",
+      listener: { http: { socket_address: "${NL_HUB_WORKER_LISTEN}" } },
+      services: { worker_api: { scheduler: "MAIN_SCHEDULER" } },
+    },
+    // Loopback only. The admin API lists the connected workers and the
+    // queue, which is what hub-health.sh reads; it can also drain a worker,
+    // which is why it is not on a port other hosts reach.
+    {
+      name: "admin",
+      listener: { http: { socket_address: "${NL_HUB_ADMIN_LISTEN}" } },
+      services: { admin: {}, health: {} },
+    },
+  ],
+  global: { max_open_files: 24576 },
+}

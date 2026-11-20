@@ -3,9 +3,9 @@
 # Tests for .buildkite/steps/remote-execution.sh, the library ci-env.sh uses to
 # decide whether a step's bazel actions execute on remote workers.
 #
-# `nc` is stubbed with a shell function: the hermetic test sandbox has no
-# network and its PATH does not carry nc, and a stub is also what lets the test
-# make the endpoint answer or not and see how it was probed.
+# `nc` and `curl` are stubbed with shell functions: the hermetic test sandbox
+# has no network and its PATH does not carry them, and a stub is also what
+# lets the test make the endpoint answer or not and see how it was probed.
 
 set -euo pipefail
 
@@ -88,6 +88,24 @@ nc() {
   return "$nc_status"
 }
 
+# The status request. curl_http is the HTTP status the endpoint answers with;
+# 000 is what curl prints when nothing answered. A timeout is curl exit 28;
+# curl_fail_exit overrides that for other failures (reset, TLS, …).
+curl_calls="${TEST_TMPDIR:?}/curl-calls"
+curl_http=200
+curl_fail_exit=""
+curl() {
+  printf '%s\n' "$*" >> "$curl_calls"
+  printf '%s' "$curl_http"
+  if [[ -n "$curl_fail_exit" ]]; then
+    return "$curl_fail_exit"
+  fi
+  if [[ "$curl_http" == "000" ]]; then
+    return 28
+  fi
+  return 0
+}
+
 # decide <os_type> <allowed> <endpoint> <nc_status> [<arch>]: runs the decision
 # in this shell (it reports through globals) with a clean slate and the given
 # inputs. <arch> defaults to the architecture of each platform's agents.
@@ -100,6 +118,7 @@ decide() {
     esac
   fi
   : > "$nc_calls"
+  : > "$curl_calls"
   nc_status="$4"
   CI_REMOTE_EXECUTION_ALLOWED="$2"
   CI_BAZEL_REMOTE_EXECUTOR="$3"
@@ -127,6 +146,7 @@ expect_local() {
 decide darwin 0 "$endpoint" 0 || fail "not opted in: decide failed"
 expect_local "not opted in" 0
 expect_equal "" "$(cat "$nc_calls")" "not opted in: endpoint probed"
+expect_equal "" "$(cat "$curl_calls")" "not opted in: status requested"
 
 unset CI_REMOTE_EXECUTION_ALLOWED
 : > "$nc_calls"
@@ -170,11 +190,93 @@ expect_equal \
   "$CI_REMOTE_BAZEL_FLAGS" "remote: CI_REMOTE_BAZEL_FLAGS"
 expect_equal "--remote_download_minimal" "$CI_BAZEL_VERIFY_ONLY_FLAGS" "remote: CI_BAZEL_VERIFY_ONLY_FLAGS"
 expect_equal "-z -G ${CI_REMOTE_PROBE_TIMEOUT_SECS} executor.test 50051" "$(cat "$nc_calls")" "remote: probe command"
+expect_equal \
+  "--silent --output /dev/null --max-time ${CI_REMOTE_STATUS_TIMEOUT_SECS} --write-out %{http_code} http://executor.test:50051/status" \
+  "$(cat "$curl_calls")" "remote: status request"
 
 # The endpoint does not answer: the step builds on the agent, and says that it
-# was meant to execute remotely.
+# was meant to execute remotely. Nothing is asked of an endpoint that did not
+# even accept a connection.
 decide darwin 1 "$endpoint" 1 || fail "unreachable: decide failed"
 expect_local "unreachable" 1
+expect_equal "" "$(cat "$curl_calls")" "unreachable: status requested"
+
+# The endpoint accepts a connection and then says nothing (curl exit 28).
+# That is a process that has stopped answering, and a bazel command sent to
+# it would wait without a per-RPC deadline, so the step builds on the agent.
+curl_http=000
+decide darwin 1 "$endpoint" 0 || fail "silent: decide failed"
+expect_local "silent" 1
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"did not answer a status request"* ]]; then
+  fail "silent: the reason does not say what was not answered: ${CI_REMOTE_EXECUTION_REASON}"
+fi
+decide linux 1 "$endpoint" 0 || fail "linux silent: decide failed"
+expect_local "linux silent" 1
+
+# The endpoint answers that a store has failed or stalled.
+curl_http=503
+decide darwin 1 "$endpoint" 0 || fail "unhealthy: decide failed"
+expect_local "unhealthy" 1
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"503"* ]]; then
+  fail "unhealthy: the reason does not name the answer: ${CI_REMOTE_EXECUTION_REASON}"
+fi
+
+# An endpoint that answers but serves no status page on this port (an executor
+# set up before the page was put there) is used as before: an answer of any
+# other kind proves the process is serving, and nothing more can be asked.
+curl_http=404
+decide darwin 1 "$endpoint" 0 || fail "no status page: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "no status page: CI_REMOTE_EXECUTION"
+expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "no status page: CI_REMOTE_EXECUTION_FELL_BACK"
+
+# A probe that fails for any reason other than a timeout (reset, empty reply,
+# TLS, HTTP/2-only listener) is treated the same way. Today's 1.6.6 hubs have
+# no status page on the client port; only curl exit 28 means the process
+# accepted a connection and then said nothing.
+curl_http=000
+curl_fail_exit=52
+decide darwin 1 "$endpoint" 0 || fail "curl 52: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "curl 52: CI_REMOTE_EXECUTION"
+expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "curl 52: CI_REMOTE_EXECUTION_FELL_BACK"
+if [[ "$CI_REMOTE_EXECUTION_REASON" != *"curl exit 52"* ]]; then
+  fail "curl 52: the reason does not name the curl exit: ${CI_REMOTE_EXECUTION_REASON}"
+fi
+curl_fail_exit=35
+decide darwin 1 "$endpoint" 0 || fail "curl 35: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "curl 35: CI_REMOTE_EXECUTION"
+expect_equal "0" "$CI_REMOTE_EXECUTION_FELL_BACK" "curl 35: CI_REMOTE_EXECUTION_FELL_BACK"
+curl_fail_exit=""
+curl_http=200
+
+# So is any endpoint on an agent that has no curl: the connection is then all
+# there is to go on, as it was before the status request existed.
+command() {
+  if [[ "$1" == "-v" && "$2" == "curl" ]]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+curl_http=000
+decide darwin 1 "$endpoint" 0 || fail "no curl: decide failed"
+expect_equal "on" "$CI_REMOTE_EXECUTION" "no curl: CI_REMOTE_EXECUTION"
+expect_equal "" "$(cat "$curl_calls")" "no curl: curl was run"
+unset -f command
+curl_http=200
+
+# The URL of the status request: https for a TLS endpoint, and an IPv6 literal
+# bracketed again (it is bare for nc).
+: > "$curl_calls"
+expect_equal "200" "$(ci_remote_endpoint_status "grpcs://executor.test:443" "executor.test" 443)" "status of a TLS endpoint"
+expect_equal "200" "$(ci_remote_endpoint_status "grpc://[::1]:50051" "::1" 50051)" "status of an IPv6 endpoint"
+expect_equal \
+  "https://executor.test:443/status http://[::1]:50051/status" \
+  "$(awk '{ print $NF }' "$curl_calls" | tr '\n' ' ' | sed 's/ $//')" "status request URLs"
+curl_http=000
+expect_equal "timeout" "$(ci_remote_endpoint_status "$endpoint" "executor.test" 50051)" "status timeout"
+curl_fail_exit=56
+expect_equal "curl:56" "$(ci_remote_endpoint_status "$endpoint" "executor.test" 50051)" "status curl 56"
+curl_fail_exit=""
+curl_http=200
 
 # A Linux x86-64 agent: the Linux config, and the probe uses the connect
 # timeout flag of the Linux nc. Everything else is the same decision.
@@ -208,11 +310,238 @@ expect_equal "off" "$CI_REMOTE_EXECUTION" "malformed endpoint: CI_REMOTE_EXECUTI
 expect_equal "" "$CI_REMOTE_BAZEL_FLAGS" "malformed endpoint: CI_REMOTE_BAZEL_FLAGS"
 
 # ---------------------------------------------------------------------------
+# ci_remote_failure_reason: telling an executor that failed from an action
+# that failed. The first and the last two of the five executor failures are
+# what Bazel 9.1.0 printed against NativeLink 1.8.6; the two between are
+# NativeLink 1.8.6's messages as its source formats them.
+# ---------------------------------------------------------------------------
+
+# expect_failure_reason <expected substring, or "" for none> <log text>
+expect_failure_reason() {
+  local log reason
+  log="$(mktemp "${TEST_TMPDIR:?}/bazel-log.XXXXXX")"
+  printf '%s\n' "$2" > "$log"
+  if reason="$(ci_remote_failure_reason "$log")"; then
+    if [[ -z "$1" ]]; then
+      fail "a log that shows no executor failure was given the reason '${reason}': $2"
+    elif [[ "$reason" != *"$1"* ]]; then
+      fail "expected a reason containing '$1', got '${reason}'"
+    fi
+  elif [[ -n "$1" ]]; then
+    fail "no reason for a log that shows an executor failure: $2"
+  fi
+}
+
+expect_failure_reason "no worker that could run an action" \
+  "ERROR: BUILD.bazel:10:8: Executing genrule //:slow failed: (Exit 34): Remote Execution Failure:
+Failed Precondition: Action cannot be scheduled, no worker is connected to the scheduler. No capable worker has been connected for 120s."
+expect_failure_reason "lost its worker" \
+  "Failed Precondition: The worker running this action was lost 7 times, more than max_worker_loss_retries (6); the action is likely what takes the worker down (OOM-killed pod, eviction). Give it a memory reservation or raise the pool's memory limit before retrying. for operation_id: 0eae26f4, maybe_worker_id: None"
+expect_failure_reason "retried an action until it gave up" \
+  "Failed Precondition: Job cancelled because it attempted to execute too many times 4 > 3 times for operation_id: 0eae26f4, maybe_worker_id: None"
+expect_failure_reason "connection to the remote executor failed" \
+  "ERROR: BUILD.bazel:10:8: Executing genrule //:slow failed: (Exit 34): UNAVAILABLE: io exception"
+expect_failure_reason "did not answer when the build started" \
+  "ERROR: BUILD.bazel:4:8: Executing genrule //:quick failed: Failed to query remote execution capabilities: DEADLINE_EXCEEDED: CallOptions deadline exceeded after 59.999937875s. Name resolution delay 0.000000000 seconds. [closed=[], open=[[buffered_nanos=60000624500, waiting_for_connection]]]"
+# An action that ran on a worker and failed, a test that failed, and a test
+# that timed out are the change's own business.
+expect_failure_reason "" \
+  "ERROR: BUILD.bazel:10:8: Compiling Rust rlib engine failed: (Exit 1): process_wrapper failed: error executing Rustc command"
+expect_failure_reason "" "//tools/boss/engine:engine_lib_test FAILED in 12.3s"
+expect_failure_reason "" "//tools/boss/engine:engine_lib_test TIMEOUT in 300.1s"
+if ci_remote_failure_reason "${TEST_TMPDIR}/no-such-log" > /dev/null; then
+  fail "a missing log was given a reason"
+fi
+
+# ---------------------------------------------------------------------------
+# Status watchdog: the same probe as the start-of-step fallback, repeated
+# while bazel runs. A silent hub (timeout) or a stalled store (503) stops
+# the command; other probe failures do not.
+# ---------------------------------------------------------------------------
+
+CI_REMOTE_ENDPOINT_HOST_PORT="executor.test 50051"
+CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+curl_http=200
+curl_fail_exit=""
+: > "$curl_calls"
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: a 200 hub was treated as stuck"
+fi
+curl_http=000
+reason=""
+if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
+  fail "watchdog tick: a silent hub was not treated as stuck"
+fi
+if [[ "$reason" != *"executor.test port 50051"* ]] || [[ "$reason" != *"did not answer a status request"* ]]; then
+  fail "watchdog tick: timeout reason was '${reason}'"
+fi
+curl_http=503
+reason=""
+if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
+  fail "watchdog tick: a 503 hub was not treated as stuck"
+fi
+if [[ "$reason" != *"status 503"* ]]; then
+  fail "watchdog tick: 503 reason was '${reason}'"
+fi
+curl_http=000
+curl_fail_exit=52
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: curl 52 was treated as stuck"
+fi
+curl_fail_exit=""
+curl_http=404
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: HTTP 404 was treated as stuck"
+fi
+curl_http=200
+
+# A hub we cannot connect to is not stuck: Bazel falls back, and a
+# --config=dev-local / off-network build must not be killed.
+nc_status=1
+: > "$curl_calls"
+if ! ci_remote_watchdog_tick "$endpoint" > /dev/null; then
+  fail "watchdog tick: an unreachable hub was treated as stuck"
+fi
+expect_equal "" "$(cat "$curl_calls")" "watchdog tick unreachable: curl was run"
+nc_status=0
+
+# The loop signals the bazel pid when a tick is stuck. Interval 0 so the
+# test does not wait the production 15 s.
+CI_REMOTE_WATCHDOG_INTERVAL_SECS=0
+sleep 30 &
+watch_pid=$!
+reason_file="${TEST_TMPDIR:?}/watchdog-reason"
+rm -f "$reason_file"
+curl_http=000
+ci_remote_watchdog_loop "$watch_pid" "$reason_file" "$endpoint"
+wait "$watch_pid" 2>/dev/null || true
+if kill -0 "$watch_pid" 2>/dev/null; then
+  kill -KILL "$watch_pid" 2>/dev/null || true
+  fail "watchdog loop: the process was still running after a silent hub"
+fi
+if [[ ! -s "$reason_file" ]] || ! grep -q "did not answer a status request" "$reason_file"; then
+  fail "watchdog loop: missing reason file: $(cat "$reason_file" 2>/dev/null)"
+fi
+curl_http=200
+
+# SIGTERM diagnostic: the immediate line names the executor with no probe,
+# so a silent hub cannot use up Buildkite's cancel grace period. A short
+# probe then amends the reason.
+CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+CI_REMOTE_ENDPOINT_HOST_PORT="executor.test 50051"
+: > "$curl_calls"
+msg="$(ci_remote_sigterm_reason_immediate)"
+if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"executor.test port 50051"* ]]; then
+  fail "sigterm immediate: '${msg}'"
+fi
+expect_equal "" "$(cat "$curl_calls")" "sigterm immediate: curl was run"
+curl_http=000
+msg="$(ci_remote_sigterm_reason)"
+if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"executor.test port 50051"* ]] || [[ "$msg" != *"did not answer a status request"* ]]; then
+  fail "sigterm reason (timeout): '${msg}'"
+fi
+if [[ "$msg" != *"within ${CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS}s"* ]]; then
+  fail "sigterm reason (timeout) must use the short probe budget: '${msg}'"
+fi
+curl_http=200
+msg="$(ci_remote_sigterm_reason)"
+if [[ "$msg" != *"SIGTERM"* ]] || [[ "$msg" != *"then returned 200"* ]]; then
+  fail "sigterm reason (healthy): '${msg}'"
+fi
+unset CI_BAZEL_REMOTE_EXECUTOR
+unset CI_REMOTE_ENDPOINT_HOST_PORT
+msg="$(ci_remote_sigterm_reason_immediate)"
+if [[ "$msg" != *"SIGTERM while remote execution was on"* ]] || [[ "$msg" == *"executor.test"* ]]; then
+  fail "sigterm immediate (no endpoint): '${msg}'"
+fi
+CI_BAZEL_REMOTE_EXECUTOR="$endpoint"
+CI_REMOTE_ENDPOINT_HOST_PORT="executor.test 50051"
+curl_http=200
+
+# Bazel clients started outside the shell wrapper (repobin, checkleft) are
+# still signalled. A sibling sleep is not. `ps` is denied in the hermetic
+# sandbox, so the process table is a stub the test fills in.
+mkdir -p "${TEST_TMPDIR:?}/fake-bin" "${TEST_TMPDIR:?}/ps-rows"
+printf '%s\n' '#!/bin/bash' 'trap "exit 0" TERM' 'while true; do sleep 1; done' \
+  > "${TEST_TMPDIR}/fake-bin/bazel"
+chmod +x "${TEST_TMPDIR}/fake-bin/bazel"
+ps() {
+  printf '%s %s %s\n' "$$" "$PPID" "$0"
+  local row
+  for row in "${TEST_TMPDIR}/ps-rows"/*; do
+    [[ -e "$row" ]] || continue
+    cat "$row"
+  done
+}
+"${TEST_TMPDIR}/fake-bin/bazel" &
+fake_bazel=$!
+sleep 60 &
+fake_other=$!
+printf '%s %s %s\n' "$fake_bazel" "$$" "${TEST_TMPDIR}/fake-bin/bazel" \
+  > "${TEST_TMPDIR}/ps-rows/bazel"
+printf '%s %s %s\n' "$fake_other" "$$" "sleep 60" \
+  > "${TEST_TMPDIR}/ps-rows/sleep"
+ci_remote_signal_bazel_clients "$$"
+wait "$fake_bazel" 2> /dev/null || true
+if kill -0 "$fake_bazel" 2> /dev/null; then
+  kill -KILL "$fake_bazel" 2> /dev/null || true
+  kill -KILL "$fake_other" 2> /dev/null || true
+  fail "signal_bazel_clients: the bazel child was still running"
+fi
+if ! kill -0 "$fake_other" 2> /dev/null; then
+  fail "signal_bazel_clients: a non-bazel child was signalled"
+fi
+kill -KILL "$fake_other" 2> /dev/null || true
+wait "$fake_other" 2> /dev/null || true
+rm -f "${TEST_TMPDIR}/ps-rows/bazel" "${TEST_TMPDIR}/ps-rows/sleep"
+
+# Step-level loop: a silent hub stops bazel descendants of the root pid.
+CI_REMOTE_WATCHDOG_INTERVAL_SECS=0
+"${TEST_TMPDIR}/fake-bin/bazel" &
+tree_bazel=$!
+printf '%s %s %s\n' "$tree_bazel" "$$" "${TEST_TMPDIR}/fake-bin/bazel" \
+  > "${TEST_TMPDIR}/ps-rows/bazel"
+reason_file="${TEST_TMPDIR:?}/watchdog-tree-reason"
+rm -f "$reason_file"
+curl_http=000
+ci_remote_watchdog_loop_tree "$$" "$reason_file" "$endpoint"
+wait "$tree_bazel" 2> /dev/null || true
+if kill -0 "$tree_bazel" 2> /dev/null; then
+  kill -KILL "$tree_bazel" 2> /dev/null || true
+  fail "watchdog loop tree: the bazel child was still running after a silent hub"
+fi
+if [[ ! -s "$reason_file" ]] || ! grep -q "did not answer a status request" "$reason_file"; then
+  fail "watchdog loop tree: missing reason file: $(cat "$reason_file" 2>/dev/null)"
+fi
+curl_http=200
+rm -f "${TEST_TMPDIR}/ps-rows/bazel"
+unset -f ps
+
+# The step-level watchdog (covers bazel clients repobin/checkleft launch)
+# and the SIGTERM trap live in ci-env.sh; this file holds the functions they
+# call. Pin the contracts those call sites depend on.
+lib="${workspace}/.buildkite/steps/remote-execution.sh"
+if ! grep -q 'ci_remote_watchdog_loop_tree()' "$lib"; then
+  fail "remote-execution.sh must define ci_remote_watchdog_loop_tree"
+fi
+if ! grep -q 'CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS="${CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS:-3}"' "$lib"; then
+  fail "SIGTERM probe budget must default to 3s so it fits in Buildkite's cancel grace period"
+fi
+if ! grep -q 'ci_remote_sigterm_reason_immediate' "$lib"; then
+  fail "remote-execution.sh must define ci_remote_sigterm_reason_immediate"
+fi
+if ! grep -q 'tools/remote-execution/remote-status.sh' "$lib"; then
+  fail "remote-execution.sh must source the shared remote-status helper"
+fi
+
+# ---------------------------------------------------------------------------
 # The real .ci.bazelrc defines the config the flags select.
 # ---------------------------------------------------------------------------
 
 real_rc="${workspace}/.ci.bazelrc"
 for line in \
+  "build:ci-remote --grpc_keepalive_time=30s" \
+  "build:ci-remote --grpc_keepalive_timeout=20s" \
   "build:ci-remote --noremote_local_fallback" \
   "build:ci-remote --remote_cache_compression" \
   "test:ci-remote --config=remote-tests"; do
@@ -221,6 +550,8 @@ for line in \
   fi
 done
 for line in \
+  "build:ci-remote-linux --grpc_keepalive_time=30s" \
+  "build:ci-remote-linux --grpc_keepalive_timeout=20s" \
   "build:ci-remote-linux --noremote_local_fallback" \
   "build:ci-remote-linux --remote_cache_compression" \
   "build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux" \

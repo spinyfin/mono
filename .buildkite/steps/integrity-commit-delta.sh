@@ -18,6 +18,7 @@ steps:
   - label: ":bazel: integrity-bazel"
     key: "integrity-bazel"
     command: ".buildkite/steps/integrity-bazel.sh"
+    timeout_in_minutes: 90
     agents:
       queue: "macos-arm64"
     artifact_paths:
@@ -28,6 +29,7 @@ steps:
   - label: ":white_check_mark: integrity-checkleft"
     key: "integrity-checkleft"
     command: ".buildkite/steps/integrity-checkleft.sh"
+    timeout_in_minutes: 60
     agents:
       queue: "bazel-any"
 PIPELINE

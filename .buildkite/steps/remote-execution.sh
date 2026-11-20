@@ -31,10 +31,21 @@
 #      CI files, so an endpoint written there would have to be rebased into
 #      each of them when it moved, and removing the variable from an agent is
 #      the way to take that agent back to local builds without a merge.
-#   4. The endpoint accepts a TCP connection. With the scheduler down the step
-#      builds on the agent rather than failing, and says so. The fallback is
-#      decided once, here, for the whole step, so a step never mixes worker
-#      results with agent results silently.
+#   4. The endpoint accepts a TCP connection and, asked for its status page,
+#      answers. With the scheduler down or not answering the step builds on
+#      the agent rather than failing, and says so. The fallback is decided
+#      once, here, for the whole step, so a step never mixes worker results
+#      with agent results silently.
+#
+#      The second half is there because a connection proves little. The
+#      kernel accepts one for a process that has stopped answering, and a
+#      Bazel 9.1 client that sends its build to such a process has no
+#      per-RPC deadline. Keepalive was measured not to end that wait
+#      (17 minutes against a stopped hub with the 60s default). A step that
+#      would have hung at its first bazel command builds on its agent
+#      instead. A hub that stops answering after the step has started is
+#      bounded by the status watchdog in ci-env.sh. See
+#      tools/remote-execution/README.md, "What bounds a stuck action".
 #
 # What "remotely" covers differs by platform, and .ci.bazelrc has the config
 # for each:
@@ -55,8 +66,35 @@
 # How long the TCP probe waits for the endpoint.
 CI_REMOTE_PROBE_TIMEOUT_SECS=5
 
+# How long the endpoint gets to answer the status request. A healthy one
+# answers in milliseconds. One whose store has stalled gives up on its own
+# check after 5 s and answers 503, so this is long enough to be told that and
+# not merely time out.
+CI_REMOTE_STATUS_TIMEOUT_SECS=10
+
+# How long the SIGTERM trap's status probe may run. Buildkite's default
+# cancel grace period is 10 s; the trap writes the executor-naming line
+# first, then probes with this budget so SIGKILL cannot arrive first.
+CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS="${CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS:-3}"
+
+# How often a running remote bazel command re-asks the executor for its
+# status. Together with CI_REMOTE_STATUS_TIMEOUT_SECS this is the bound on a
+# hub that stops answering after the step has started. gRPC keepalive was
+# measured not to provide that bound. Tests set this to 0.
+CI_REMOTE_WATCHDOG_INTERVAL_SECS="${CI_REMOTE_WATCHDOG_INTERVAL_SECS:-15}"
+
+# Parsing, TCP probe, /status, stuck classification: shared with the
+# developer watchdog. Relative to this file so both the checkout (CI) and
+# runfiles (tests) resolve it.
+# shellcheck source=../../tools/remote-execution/remote-status.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../tools/remote-execution/remote-status.sh"
+
 _ci_remote_err() {
   echo "[ci-env] error: $*" >&2
+}
+
+_ci_remote_os() {
+  printf '%s\n' "${CI_REMOTE_WATCHDOG_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 }
 
 # ci_remote_endpoint_host_port <endpoint>
@@ -65,38 +103,248 @@ _ci_remote_err() {
 # grpcs://<host>:<port>. The value is not echoed in the error: it is host
 # configuration and CI logs are public.
 ci_remote_endpoint_host_port() {
-  local endpoint="$1" authority host port
-  case "$endpoint" in
-    grpc://*) authority="${endpoint#grpc://}" ;;
-    grpcs://*) authority="${endpoint#grpcs://}" ;;
-    *)
-      _ci_remote_err "CI_BAZEL_REMOTE_EXECUTOR must have the form grpc://<host>:<port> or grpcs://<host>:<port>"
-      return 1
-      ;;
-  esac
-  host="${authority%:*}"
-  port="${authority##*:}"
-  if [[ "$authority" != *:* || -z "$host" || ! "$port" =~ ^[0-9]+$ || "$host" == *[/[:space:]]* ]]; then
+  local out
+  if ! out="$(remote_status_endpoint_host_port "$1")"; then
     _ci_remote_err "CI_BAZEL_REMOTE_EXECUTOR must have the form grpc://<host>:<port> or grpcs://<host>:<port>"
     return 1
   fi
-  # An IPv6 literal is bracketed in the endpoint and bare for nc.
-  host="${host#\[}"
-  host="${host%\]}"
-  printf '%s %s\n' "$host" "$port"
+  printf '%s\n' "$out"
 }
 
 # ci_remote_endpoint_reachable <os_type> <host> <port>
 #
 # Succeeds if a TCP connection to the endpoint is accepted within
-# CI_REMOTE_PROBE_TIMEOUT_SECS. The connect timeout is `-G` for the macOS nc
-# and `-w` for the Linux one (netcat-openbsd, where `-G` does not exist).
+# CI_REMOTE_PROBE_TIMEOUT_SECS.
 ci_remote_endpoint_reachable() {
-  local timeout_flag="-G"
-  if [[ "$1" == "linux" ]]; then
-    timeout_flag="-w"
+  remote_status_tcp_reachable "$1" "$2" "$3" "$CI_REMOTE_PROBE_TIMEOUT_SECS"
+}
+
+# ci_remote_endpoint_status <endpoint> <host> <port>
+#
+# Asks the endpoint for its status page over HTTP, on the port Bazel uses,
+# and prints one token: 200 for an executor that is answering and whose
+# stores work, 503 for one that reports a failed or stalled store, `timeout`
+# for one that sent no answer within CI_REMOTE_STATUS_TIMEOUT_SECS (curl
+# exit 28), `curl:<n>` for any other curl failure, and any other HTTP status
+# for an endpoint that answers but serves no status page on this port. An
+# agent without curl prints "unknown". Nothing else is echoed: the endpoint
+# is host configuration.
+ci_remote_endpoint_status() {
+  remote_status_http "$1" "$2" "$3" "$CI_REMOTE_STATUS_TIMEOUT_SECS"
+}
+
+# ci_remote_stuck_status <status token>
+#
+# Succeeds for the same answers the start-of-step probe falls back on: the
+# executor sent no status page within CI_REMOTE_STATUS_TIMEOUT_SECS (curl
+# exit 28), or it reported a failed or stalled store (HTTP 503). Other
+# tokens (another HTTP status, curl:<n>, unknown, unreachable) are not
+# stuck: the process is serving, the probe could not tell, or we never
+# connected.
+ci_remote_stuck_status() {
+  remote_status_stuck "$1"
+}
+
+# ci_remote_watchdog_reason <status token>
+#
+# One line naming the executor (host and port from CI_REMOTE_ENDPOINT_HOST_PORT
+# when set) and what the status probe saw. For the step log and the annotation.
+ci_remote_watchdog_reason() {
+  local where="the remote executor"
+  if [[ -n "${CI_REMOTE_ENDPOINT_HOST_PORT:-}" ]]; then
+    where="the remote executor at ${CI_REMOTE_ENDPOINT_HOST_PORT% *} port ${CI_REMOTE_ENDPOINT_HOST_PORT##* }"
   fi
-  nc -z "$timeout_flag" "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$2" "$3" > /dev/null 2>&1
+  case "$1" in
+    timeout)
+      echo "${where} accepted a connection but did not answer a status request within ${CI_REMOTE_STATUS_TIMEOUT_SECS}s while this command was running"
+      ;;
+    503)
+      echo "${where} reports a failed or stalled store (status 503) while this command was running"
+      ;;
+    *)
+      echo "${where} stopped answering while this command was running (status ${1})"
+      ;;
+  esac
+}
+
+# ci_remote_watchdog_tick <endpoint>
+#
+# One status probe. TCP first: an unreachable hub is not stuck (the step
+# already fell back, or Bazel will). Prints a reason and returns 1 when the
+# executor accepted a connection and then went silent or answered 503;
+# returns 0 when the bazel command should keep running.
+ci_remote_watchdog_tick() {
+  local endpoint="$1" host_port status
+  host_port="$(ci_remote_endpoint_host_port "$endpoint")" || return 0
+  status="$(remote_status_probe "$endpoint" "$(_ci_remote_os)" \
+    "$CI_REMOTE_PROBE_TIMEOUT_SECS" "$CI_REMOTE_STATUS_TIMEOUT_SECS")" || return 0
+  if ci_remote_stuck_status "$status"; then
+    ci_remote_watchdog_reason "$status"
+    return 1
+  fi
+  return 0
+}
+
+# ci_remote_watchdog_loop <pid> <reason_file> <endpoint>
+#
+# While <pid> lives, probe the endpoint every CI_REMOTE_WATCHDOG_INTERVAL_SECS.
+# On a stuck status, write the reason to <reason_file> and send SIGTERM to
+# <pid>. Returns once <pid> has exited or has been signalled.
+ci_remote_watchdog_loop() {
+  local pid="$1" reason_file="$2" endpoint="$3" reason
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$CI_REMOTE_WATCHDOG_INTERVAL_SECS"
+    kill -0 "$pid" 2>/dev/null || return 0
+    if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
+      continue
+    fi
+    printf '%s\n' "$reason" > "$reason_file"
+    kill -TERM "$pid" 2>/dev/null || true
+    return 0
+  done
+}
+
+# ci_remote_sigterm_reason_immediate
+#
+# One line naming the executor, with no network. The SIGTERM trap prints
+# this before it probes, so a silent hub cannot use up Buildkite's cancel
+# grace period before the log names the executor.
+ci_remote_sigterm_reason_immediate() {
+  local endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port
+  if [[ -n "${CI_REMOTE_ENDPOINT_HOST_PORT:-}" ]]; then
+    echo "this step was sent SIGTERM while remote execution was on (executor at ${CI_REMOTE_ENDPOINT_HOST_PORT% *} port ${CI_REMOTE_ENDPOINT_HOST_PORT##* })"
+    return 0
+  fi
+  if [[ -z "$endpoint" ]]; then
+    echo "this step was sent SIGTERM while remote execution was on"
+    return 0
+  fi
+  if ! host_port="$(ci_remote_endpoint_host_port "$endpoint" 2>/dev/null)"; then
+    echo "this step was sent SIGTERM while remote execution was on; the configured endpoint is malformed"
+    return 0
+  fi
+  echo "this step was sent SIGTERM while remote execution was on (executor at ${host_port% *} port ${host_port##* })"
+}
+
+# ci_remote_sigterm_reason
+#
+# One line for a Buildkite SIGTERM (timeout_in_minutes, cancel). Re-asks the
+# executor for its status so the annotation can name what a short probe then
+# saw. Uses CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS, not the 10 s start-of-step
+# budget: the trap must finish before Buildkite's SIGKILL.
+ci_remote_sigterm_reason() {
+  local endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port status saved
+  if [[ -z "$endpoint" ]]; then
+    echo "this step was sent SIGTERM while remote execution was on"
+    return 0
+  fi
+  if ! host_port="$(ci_remote_endpoint_host_port "$endpoint" 2>/dev/null)"; then
+    echo "this step was sent SIGTERM while remote execution was on; the configured endpoint is malformed"
+    return 0
+  fi
+  saved="$CI_REMOTE_STATUS_TIMEOUT_SECS"
+  CI_REMOTE_STATUS_TIMEOUT_SECS="$CI_REMOTE_SIGTERM_PROBE_TIMEOUT_SECS"
+  status="$(ci_remote_endpoint_status "$endpoint" "${host_port% *}" "${host_port##* }")"
+  CI_REMOTE_ENDPOINT_HOST_PORT="$host_port"
+  if ci_remote_stuck_status "$status"; then
+    echo "this step was sent SIGTERM while remote execution was on; $(ci_remote_watchdog_reason "$status")"
+  else
+    echo "this step was sent SIGTERM while remote execution was on; a status probe of the remote executor at ${host_port% *} port ${host_port##* } then returned ${status}"
+  fi
+  CI_REMOTE_STATUS_TIMEOUT_SECS="$saved"
+}
+
+# ci_remote_signal_bazel_clients <root_pid>
+#
+# SIGTERM every descendant of <root_pid> whose argv0 is bazel / bazelisk /
+# bazel-real. That is the client process, including ones repobin and
+# checkleft spawn with Command::new("bazel"). The Java server is left alone.
+ci_remote_signal_bazel_clients() {
+  local root="$1" pid table
+  table="$(ps -o pid=,ppid=,args= 2> /dev/null)" || return 0
+  printf '%s\n' "$table" | awk -v root="$root" '
+    {
+      pid = $1
+      ppid = $2
+      $1 = ""
+      $2 = ""
+      args = $0
+      parent[pid] = ppid
+      cmd[pid] = args
+      pids[pid] = 1
+    }
+    END {
+      for (pid in pids) {
+        p = pid
+        seen = 0
+        while (p != "" && p != 0 && p != root) {
+          if (walked[pid, p]++) { p = 0; break }
+          p = parent[p]
+        }
+        if (p == root && pid != root && cmd[pid] ~ /^[[:space:]]*([^[:space:]]*\/)?(bazel|bazelisk|bazel-real)([[:space:]]|$)/) {
+          print pid
+        }
+      }
+    }
+  ' | while read -r pid; do
+    kill -TERM "$pid" 2> /dev/null || true
+  done
+}
+
+# ci_remote_watchdog_loop_tree <root_pid> <reason_file> <endpoint>
+#
+# While <root_pid> lives, probe the endpoint every
+# CI_REMOTE_WATCHDOG_INTERVAL_SECS. On a stuck status, write the reason,
+# call ci_remote_watchdog_stuck_hook if the caller defined it, and SIGTERM
+# bazel clients under <root_pid>. Covers bazel started by the shell wrapper
+# and by repobin/checkleft.
+ci_remote_watchdog_loop_tree() {
+  local root_pid="$1" reason_file="$2" endpoint="$3" reason
+  while kill -0 "$root_pid" 2> /dev/null; do
+    sleep "$CI_REMOTE_WATCHDOG_INTERVAL_SECS"
+    kill -0 "$root_pid" 2> /dev/null || return 0
+    if reason="$(ci_remote_watchdog_tick "$endpoint")"; then
+      continue
+    fi
+    printf '%s\n' "$reason" > "$reason_file"
+    if declare -F ci_remote_watchdog_stuck_hook > /dev/null 2>&1; then
+      ci_remote_watchdog_stuck_hook "$reason_file"
+    fi
+    ci_remote_signal_bazel_clients "$root_pid"
+    return 0
+  done
+}
+
+# ci_remote_failure_reason <bazel log file>
+#
+# Succeeds and prints one line if the log of a failed bazel command shows that
+# the remote executor failed the build, as opposed to an action that ran and
+# failed. These are the errors a build ends with when the executor cannot do
+# its job, and none of them says anything about the change under test:
+#
+#   - the scheduler had no worker to give an action to, or none that could
+#     run it (no_worker_action_timeout_s, unsatisfiable_action_timeout_s);
+#   - an action lost its worker, or was retried, as often as the scheduler
+#     allows (max_worker_loss_retries, max_job_retries);
+#   - the connection to the executor failed and stayed failed, or the
+#     executor never answered the build's first question to it.
+#
+# tools/remote-execution/README.md, "Timeouts", lists what produces each.
+ci_remote_failure_reason() {
+  local log="$1"
+  if grep -q "Action cannot be scheduled" "$log" 2> /dev/null; then
+    echo "the remote executor had no worker that could run an action"
+  elif grep -q "The worker running this action was lost" "$log" 2> /dev/null; then
+    echo "an action lost its worker as many times as the scheduler allows"
+  elif grep -q "attempted to execute too many times" "$log" 2> /dev/null; then
+    echo "the scheduler retried an action until it gave up"
+  elif grep -q "(Exit 34): UNAVAILABLE" "$log" 2> /dev/null; then
+    echo "the connection to the remote executor failed"
+  elif grep -q "Failed to query remote execution capabilities" "$log" 2> /dev/null; then
+    echo "the remote executor did not answer when the build started"
+  else
+    return 1
+  fi
 }
 
 # ci_remote_execution_decide <os_type> <arch>
@@ -109,9 +357,13 @@ ci_remote_endpoint_reachable() {
 #   CI_REMOTE_EXECUTION            "on" or "off".
 #   CI_REMOTE_EXECUTION_REASON     One line for the step's log.
 #   CI_REMOTE_EXECUTION_FELL_BACK  1 when the step was meant to execute
-#                                  remotely and the endpoint did not answer.
+#                                  remotely and the endpoint did not answer,
+#                                  or answered that it is unhealthy.
 #   CI_REMOTE_BAZEL_FLAGS          Flags to append to CI_BAZEL_FLAGS; empty
 #                                  when off.
+#   CI_REMOTE_ENDPOINT_HOST_PORT   "<host> <port>" of the endpoint when it was
+#                                  parsed, even if the step then fell back;
+#                                  empty when there is no endpoint.
 #   CI_BAZEL_VERIFY_ONLY_FLAGS     Extra flags for a build or test command that
 #                                  is run only for its result, so nothing reads
 #                                  its outputs from disk afterwards; empty when
@@ -119,11 +371,12 @@ ci_remote_endpoint_reachable() {
 #
 # Returns non-zero only for a malformed endpoint.
 ci_remote_execution_decide() {
-  local os_type="$1" arch="${2:-}" endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port config scope
+  local os_type="$1" arch="${2:-}" endpoint="${CI_BAZEL_REMOTE_EXECUTOR:-}" host_port config scope http_status
   CI_REMOTE_EXECUTION=off
   CI_REMOTE_EXECUTION_REASON=""
   CI_REMOTE_EXECUTION_FELL_BACK=0
   CI_REMOTE_BAZEL_FLAGS=""
+  CI_REMOTE_ENDPOINT_HOST_PORT=""
   CI_BAZEL_VERIFY_ONLY_FLAGS=""
 
   if [[ "${CI_REMOTE_EXECUTION_ALLOWED:-0}" != "1" ]]; then
@@ -149,11 +402,32 @@ ci_remote_execution_decide() {
     return 0
   fi
   host_port="$(ci_remote_endpoint_host_port "$endpoint")" || return 1
+  CI_REMOTE_ENDPOINT_HOST_PORT="$host_port"
   if ! ci_remote_endpoint_reachable "$os_type" "${host_port% *}" "${host_port##* }"; then
     CI_REMOTE_EXECUTION_FELL_BACK=1
     CI_REMOTE_EXECUTION_REASON="the remote executor did not accept a connection within ${CI_REMOTE_PROBE_TIMEOUT_SECS}s, so this step builds on the agent"
     return 0
   fi
+  http_status="$(ci_remote_endpoint_status "$endpoint" "${host_port% *}" "${host_port##* }")"
+  case "$http_status" in
+    timeout)
+      CI_REMOTE_EXECUTION_FELL_BACK=1
+      CI_REMOTE_EXECUTION_REASON="the remote executor accepted a connection but did not answer a status request within ${CI_REMOTE_STATUS_TIMEOUT_SECS}s, so this step builds on the agent"
+      return 0
+      ;;
+    503)
+      CI_REMOTE_EXECUTION_FELL_BACK=1
+      CI_REMOTE_EXECUTION_REASON="the remote executor reports a failed or stalled store (its status page answers 503), so this step builds on the agent"
+      return 0
+      ;;
+    curl:*)
+      # Connection reset, empty reply, TLS failure, HTTP/2-only listener, …
+      # Today's 1.6.6 hubs have no status page on the client port; only a
+      # timeout means the process accepted a connection and then said
+      # nothing. Any other probe failure is treated as "no status page".
+      scope="$scope (status probe failed: curl exit ${http_status#curl:}; treating the endpoint as having no status page)"
+      ;;
+  esac
 
   CI_REMOTE_EXECUTION=on
   CI_REMOTE_EXECUTION_REASON="$scope"

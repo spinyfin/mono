@@ -1,0 +1,486 @@
+worker: clone executables on macOS instead of hardlinking them
+
+Applies to NativeLink v1.8.6 (37f3b206a8e6d55613abae2b18a0665fff24e096).
+build-worker.sh applies it; ../../README.md, "Version and patch", says why
+the macOS workers cannot run an upstream release without it.
+
+dyld resolves @loader_path and @executable_path from the main image's path
+as the kernel reports it. For a hardlinked file that can be any name of the
+inode, and an executable staged out of the worker's flat, content-addressed
+executable store has a name there as well as in the action tree. Anything
+carrying LC_RPATH = @loader_path/../lib and loading @rpath/... then searches
+next to the store instead of next to itself. rustc is the common case:
+
+  dyld: Library not loaded: @rpath/librustc_driver-<hash>.dylib
+    Referenced from: .../worker-content.exec/d/<digest>-412504
+    Reason: tried: '.../worker-content.exec/d/../lib/librustc_driver-...'
+    (no such file)
+
+clonefile(2) gives the destination its own inode with copy-on-write blocks:
+one name, the action tree path, at roughly hardlink cost and with no extra
+disk usage. It copies the source's modes verbatim, so the executable
+variant's read-only 0o555 survives. Only executables take the new path, and
+only on macOS; every other file stays a hardlink out of the shared store.
+A failed clone (another volume, a filesystem without clones) falls back to
+the hardlink, which is the behaviour without this patch.
+
+This is brianduff/nativelink 3125a4fd (one commit on v1.6.6) carried
+forward. What changed on the way to v1.8.6:
+
+- v1.8.6 repairs a link whose source the store evicted while the tree was
+  being staged. A clone whose source is gone is therefore reported as
+  NotFound, the way the hardlink reports it, instead of being retried as a
+  hardlink, so it reaches that repair; and the repair of an executable
+  clones as well (link_executable). Before, a repaired executable would
+  have been a hardlink again.
+- PendingLink already has an `executable` field upstream, so the patch no
+  longer adds one.
+- New tests at the worker level: a staged executable has its own inode and
+  one link while a plain input is still a hardlink, and a repaired
+  executable has one link.
+- BUILD.bazel gives the binary a version. A Bazel build otherwise reports
+  0.0.0, and the suffix lets `nativelink --version` tell a worker binary
+  that carries this patch from an upstream release.
+
+Not upstream: TraceMachina/nativelink#3137 is open, as are the two pull
+requests that address it another way (#3138, #3191). Drop this file when a
+release stages macOS executables on their own inode.
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+index 06bece2a..6ac43dbd 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -44,6 +44,9 @@ rust_binary(
+     srcs = [
+         "src/bin/nativelink.rs",
+     ],
++    # Bazel builds otherwise report 0.0.0. The suffix marks a binary that
++    # carries the macOS clone patch, which `--version` could not show before.
++    version = "1.8.6+macos-clonefile",
+     deps = [
+         ":nativelink_lib",
+         "//nativelink-config",
+diff --git a/nativelink-util/src/fs.rs b/nativelink-util/src/fs.rs
+index a7eb4ac5..1143b4b1 100644
+--- a/nativelink-util/src/fs.rs
++++ b/nativelink-util/src/fs.rs
+@@ -362,6 +362,73 @@ pub async fn hard_link_many(
+     .await
+ }
+ 
++/// Clones many files under a single permit and a single `spawn_blocking`
++/// dispatch, returning one result per input in the same order. macOS only.
++///
++/// Unlike a hardlink, a `clonefile(2)` clone gets its own inode whose blocks
++/// are shared copy-on-write with the source. It costs about what a hardlink
++/// costs and adds no disk usage, but the destination is a distinct file with a
++/// single name, so the kernel answers `F_GETPATH` on it with the path it was
++/// cloned to rather than with some other name of a shared inode. Callers that
++/// materialize executables need that: see `materialize_link_batch` in
++/// `nativelink-worker`.
++///
++/// Batched for the same reason [`hard_link_many`] is, and doubly so: a clone
++/// takes the same APFS per-volume metadata lock a `hard_link(2)` does, and it
++/// never leaves a file descriptor open either, so one permit covers the batch
++/// without touching the open-file budget [`OPEN_FILE_SEMAPHORE`] protects.
++///
++/// `clonefile(2)` requires APFS and a destination that does not exist, and it
++/// is atomic on failure. A failed entry is unlinked defensively anyway so the
++/// caller can retry it through [`hard_link_many`], which also works on HFS+
++/// and any other same-volume filesystem.
++#[cfg(target_os = "macos")]
++pub async fn clonefile_many(
++    clones: Vec<(PathBuf, PathBuf)>,
++) -> Result<Vec<Result<(), Error>>, Error> {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++
++    // From <sys/clonefile.h>: don't follow symlinks. The `libc` crate exposes
++    // `clonefile` but not this flag constant.
++    const CLONE_NOFOLLOW: u32 = 0x0001;
++
++    call_with_permit(move |_| {
++        Ok(clones
++            .into_iter()
++            .map(|(src, dst)| {
++                let (Ok(src_c), Ok(dst_c)) = (
++                    CString::new(src.as_os_str().as_bytes()),
++                    CString::new(dst.as_os_str().as_bytes()),
++                ) else {
++                    return Err(make_err!(
++                        Code::InvalidArgument,
++                        "Path contains an interior NUL byte: {} -> {}",
++                        src.display(),
++                        dst.display()
++                    ));
++                };
++                // SAFETY: clonefile(2) takes two NUL-terminated C strings and a
++                // flag word. Both `CString`s are owned here for the duration of
++                // the call, so the pointers stay valid.
++                let res =
++                    unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), CLONE_NOFOLLOW) };
++                if res == 0 {
++                    return Ok(());
++                }
++                let err = io::Error::last_os_error();
++                // clonefile(2) is atomic, so `dst` should not exist after a
++                // failure. Unlink defensively regardless: the caller retries
++                // through `hard_link(2)`, which fails on an existing
++                // destination.
++                drop(std::fs::remove_file(&dst));
++                Err(Error::from(err))
++            })
++            .collect())
++    })
++    .await
++}
++
+ pub async fn set_permissions(src: impl AsRef<Path>, perm: Permissions) -> Result<(), Error> {
+     let src = src.as_ref().to_owned();
+     call_with_permit(move |_| std::fs::set_permissions(src, perm).map_err(Into::<Error>::into))
+diff --git a/nativelink-util/tests/fs_test.rs b/nativelink-util/tests/fs_test.rs
+index adbefd3b..cc430724 100644
+--- a/nativelink-util/tests/fs_test.rs
++++ b/nativelink-util/tests/fs_test.rs
+@@ -182,6 +182,82 @@ async fn remove_dir_all_leaves_shared_inodes_alone() -> Result<(), Box<dyn core:
+     Ok(())
+ }
+ 
++/// `clonefile_many` is what materializes executables on macOS, so its contract
++/// is the one hardlinking cannot meet: each destination gets its own inode
++/// (which is what makes dyld resolve `@loader_path` against the action tree
++/// rather than against the shared store), while the source's modes -- notably
++/// the read-only 0o555 of an executable variant -- survive verbatim. Batching
++/// must not change any of that, and a failing entry must neither abort the
++/// batch nor shift its neighbours' results, because the caller retries exactly
++/// the failed positions through `hard_link_many`.
++#[cfg(target_os = "macos")]
++#[nativelink_test]
++async fn clonefile_many_clones_in_order_and_isolates_failures()
++-> Result<(), Box<dyn core::error::Error>> {
++    use nativelink_util::fs::clonefile_many;
++
++    let dir = env::temp_dir().join("clonefile_many_test");
++    drop(remove_dir_all(&dir).await);
++    fs::create_dir_all(&dir)?;
++
++    let (src_a, src_b) = (dir.join("a.src"), dir.join("b.src"));
++    fs::write(&src_a, "a")?;
++    fs::write(&src_b, "b")?;
++    // The executable-variant convention: read-only and executable.
++    fs::set_permissions(&src_a, Permissions::from_mode(0o555))?;
++
++    // Middle entry's source does not exist, so only it may fail.
++    let (dst_a, dst_b) = (dir.join("a.dst"), dir.join("b.dst"));
++    let missing_dst = dir.join("missing.dst");
++    let clones = vec![
++        (src_a.clone(), dst_a.clone()),
++        (dir.join("missing.src"), missing_dst.clone()),
++        (src_b.clone(), dst_b.clone()),
++    ];
++    let results = clonefile_many(clones).await?;
++
++    assert_eq!(results.len(), 3, "one result per input");
++    assert!(results[0].is_ok(), "first clone should succeed");
++    assert!(results[1].is_err(), "missing source should fail");
++    assert!(
++        results[2].is_ok(),
++        "a failed clone must not abort the rest of the batch"
++    );
++
++    assert_eq!(fs::read_to_string(&dst_a)?, "a", "clone copies content");
++    assert_eq!(fs::read_to_string(&dst_b)?, "b", "clone copies content");
++
++    // A hardlink would share the source's inode. A clone must not: dyld
++    // resolves `@loader_path` from the path the kernel reports for the image,
++    // and a shared inode lets that be the store path instead of this one.
++    assert_ne!(
++        fs::metadata(&dst_a)?.ino(),
++        fs::metadata(&src_a)?.ino(),
++        "clone must have its own inode"
++    );
++    assert_eq!(
++        fs::metadata(&dst_a)?.nlink(),
++        1,
++        "clone must be the only name of its inode"
++    );
++
++    assert_eq!(
++        fs::metadata(&dst_a)?.permissions().mode() & 0o777,
++        0o555,
++        "clonefile copies the source's modes verbatim"
++    );
++
++    // The caller retries a failed position with `hard_link`, which fails on an
++    // existing destination, so a failure must leave nothing behind.
++    assert!(
++        !fs::exists(&missing_dst)?,
++        "a failed clone must not leave a destination behind"
++    );
++
++    remove_dir_all(&dir).await?;
++    Ok(())
++}
++
+ #[cfg(target_os = "linux")]
+ #[nativelink_test]
+ async fn freebind_allows_binding_unassigned_address() -> Result<(), Box<dyn core::error::Error>> {
+diff --git a/nativelink-worker/src/running_actions_manager.rs b/nativelink-worker/src/running_actions_manager.rs
+index 62e61718..669ab06c 100644
+--- a/nativelink-worker/src/running_actions_manager.rs
++++ b/nativelink-worker/src/running_actions_manager.rs
+@@ -1427,8 +1427,8 @@ fn download_to_directory_with_mounts<'a>(
+     .boxed()
+ }
+ 
+-/// A hardlink deferred to the end of the input-tree walk, so the whole tree is
+-/// materialized by one batched [`fs::hard_link_many`] pass instead of one
++/// A link deferred to the end of the input-tree walk, so the whole tree is
++/// materialized by one batched pass ([`materialize_link_batch`]) instead of one
+ /// `spawn_blocking` dispatch per file.
+ struct PendingLink {
+     src: PathBuf,
+@@ -1610,7 +1610,116 @@ where
+     }
+ }
+ 
+-/// Executes every deferred hardlink of an input tree in one batched pass.
++/// The `(src, dst)` pairs of the given links, in iteration order.
++fn link_pairs<'a>(links: impl IntoIterator<Item = &'a PendingLink>) -> Vec<(PathBuf, PathBuf)> {
++    links
++        .into_iter()
++        .map(|link| (link.src.clone(), link.dst.clone()))
++        .collect()
++}
++
++/// Materializes one input tree's deferred links, returning one result per link
++/// in input order.
++///
++/// Everything is a `hard_link(2)` out of the shared store, except executables
++/// on macOS, which are cloned instead.
++///
++/// dyld resolves `@loader_path` and `@executable_path` from the main image's
++/// path as the kernel reports it, and for a hardlinked file that is whichever
++/// name of the inode the kernel happens to answer with -- which for an
++/// executable materialized out of the flat, content-addressed executable store
++/// is the store path, not the action tree path. Anything carrying
++/// `LC_RPATH = @loader_path/../lib` and loading `@rpath/...` (rustc, clang and
++/// most toolchain drivers do) then searches next to the store instead of next
++/// to itself and fails to launch. A `clonefile(2)` clone has its own inode and
++/// exactly one name, so the executable resolves against the tree it was staged
++/// into. It costs about what a hardlink costs, shares its blocks
++/// copy-on-write so it adds no disk usage, and copies the source's modes
++/// verbatim, which keeps the executable variant's read-only 0o555.
++///
++/// Clones are batched exactly as hardlinks are, and for the same reason: they
++/// contend for the same APFS per-volume metadata lock, so a per-file dispatch
++/// would give back what batching bought.
++///
++/// `clonefile(2)` needs APFS specifically. A cross-volume layout, HFS+, or any
++/// filesystem without clone support fails the clone, and those entries fall
++/// back to the hardlink batch -- the behavior before this path existed, with
++/// only the dyld resolution caveat above. A clone whose source is gone is not
++/// one of those: it is reported as `NotFound`, exactly as the hardlink would
++/// report it, so the caller fetches the blob back.
++async fn materialize_link_batch(links: &[PendingLink]) -> Result<Vec<Result<(), Error>>, Error> {
++    #[cfg(target_os = "macos")]
++    {
++        let (executables, mut hardlinks): (Vec<usize>, Vec<usize>) =
++            (0..links.len()).partition(|&idx| links[idx].executable);
++        if !executables.is_empty() {
++            let mut results: Vec<Option<Result<(), Error>>> = links.iter().map(|_| None).collect();
++            let clones =
++                fs::clonefile_many(link_pairs(executables.iter().map(|&idx| &links[idx]))).await?;
++            let mut degraded = Vec::new();
++            for (idx, result) in executables.iter().copied().zip(clones) {
++                match result {
++                    Ok(()) => results[idx] = Some(Ok(())),
++                    // The store deleted the variant after it was resolved. A
++                    // hardlink would fail the same way, and the caller repairs
++                    // exactly this code with a fresh fetch.
++                    Err(e) if e.code == Code::NotFound => results[idx] = Some(Err(e)),
++                    // Not fatal: retried as a hardlink below, which is what
++                    // this code did before clones existed.
++                    Err(e) => {
++                        degraded.push(e);
++                        hardlinks.push(idx);
++                    }
++                }
++            }
++            if let Some(first) = degraded.first() {
++                warn!(
++                    degraded = degraded.len(),
++                    executables = executables.len(),
++                    error = ?first,
++                    "clonefile unavailable for executables, falling back to hardlinks; \
++                     @loader_path-relative libraries may not resolve"
++                );
++            }
++            hardlinks.sort_unstable();
++            let linked =
++                fs::hard_link_many(link_pairs(hardlinks.iter().map(|&idx| &links[idx]))).await?;
++            for (idx, result) in hardlinks.iter().copied().zip(linked) {
++                results[idx] = Some(result);
++            }
++            return Ok(results
++                .into_iter()
++                .map(|result| result.expect("every link is materialized exactly once"))
++                .collect());
++        }
++    }
++    fs::hard_link_many(link_pairs(links)).await
++}
++
++/// Links one executable variant into an action tree outside the batch: a
++/// clone on macOS, for the reason [`materialize_link_batch`] gives, and a
++/// hardlink everywhere else. The fallback and the `NotFound` rule are the
++/// batch's.
++async fn link_executable(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), Error> {
++    #[cfg(target_os = "macos")]
++    {
++        let pair = (src.as_ref().to_path_buf(), dst.as_ref().to_path_buf());
++        match fs::clonefile_many(vec![pair]).await?.pop() {
++            Some(Ok(())) => return Ok(()),
++            Some(Err(e)) if e.code == Code::NotFound => return Err(e),
++            Some(Err(error)) => warn!(
++                ?error,
++                "clonefile unavailable for an executable, falling back to a hardlink; \
++                 @loader_path-relative libraries may not resolve"
++            ),
++            // One pair in, one result out; nothing was cloned if not.
++            None => {}
++        }
++    }
++    fs::hard_link(src, dst).await
++}
++
++/// Executes every deferred link of an input tree in one batched pass.
+ ///
+ /// A link whose source has gone missing since it was resolved is made again
+ /// from a fresh copy of the blob; any other failure fails the tree.
+@@ -1620,12 +1729,8 @@ async fn materialize_links(
+     links: Vec<PendingLink>,
+     downloads: &Semaphore,
+ ) -> Result<(), Error> {
+-    let pairs = links
+-        .iter()
+-        .map(|link| (link.src.clone(), link.dst.clone()))
+-        .collect();
+     let mut evicted = Vec::new();
+-    for (link, result) in links.iter().zip(fs::hard_link_many(pairs).await?) {
++    for (link, result) in links.iter().zip(materialize_link_batch(&links).await?) {
+         let Err(err) = result else {
+             continue;
+         };
+@@ -1732,7 +1837,7 @@ async fn relink_evicted_input(
+                     .err_tip(|| {
+                         format!("Resolving the executable variant for {} again", link.digest)
+                     })?;
+-                fs::hard_link(src, &link.dst).await
++                link_executable(src, &link.dst).await
+             },
+         )
+         .await?;
+diff --git a/nativelink-worker/tests/running_actions_manager_test.rs b/nativelink-worker/tests/running_actions_manager_test.rs
+index a146dc7b..88137c28 100644
+--- a/nativelink-worker/tests/running_actions_manager_test.rs
++++ b/nativelink-worker/tests/running_actions_manager_test.rs
+@@ -1226,6 +1226,14 @@ mod tests {
+             0,
+             "the executable must keep its bit after staging"
+         );
++        // The repair links outside the batch and has to make the same kind of
++        // link the batch would have: a clone, with one name.
++        #[cfg(target_os = "macos")]
++        assert_eq!(
++            fs::metadata(&tool_path).await?.nlink(),
++            1,
++            "a relinked executable must be a clone on macOS"
++        );
+         let stamped_path = format!("{download_dir}/stamped.txt");
+         let stamped = fs::read(&stamped_path).await?;
+         assert_eq!(from_utf8(&stamped)?, STAMPED_CONTENT);
+@@ -1237,6 +1245,83 @@ mod tests {
+         Ok(())
+     }
+ 
++    /// On macOS an executable input is a clone of its variant, not a hardlink
++    /// to it: dyld resolves `@loader_path` from whichever name of the inode
++    /// the kernel reports, and a hardlink shares its inode with the variant in
++    /// the store, so a toolchain driver looked for its libraries beside the
++    /// store. Everything else stays a hardlink to the shared blob.
++    #[cfg(target_os = "macos")]
++    #[nativelink_test]
++    async fn download_to_directory_clones_executable_inputs_on_macos()
++    -> Result<(), Box<dyn core::error::Error>> {
++        const EXEC_CONTENT: &str = "#!/bin/sh\necho tool\n";
++        const PLAIN_CONTENT: &str = "plain input";
++
++        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
++        let exec_digest = DigestInfo::new([41u8; 32], EXEC_CONTENT.len() as u64);
++        slow_store
++            .as_ref()
++            .update_oneshot(exec_digest, EXEC_CONTENT.into())
++            .await?;
++        let plain_digest = DigestInfo::new([42u8; 32], PLAIN_CONTENT.len() as u64);
++        slow_store
++            .as_ref()
++            .update_oneshot(plain_digest, PLAIN_CONTENT.into())
++            .await?;
++
++        let download_dir = stage_tree(
++            &slow_store,
++            &cas_store,
++            &fast_store,
++            vec![
++                FileNode {
++                    name: "tool".to_string(),
++                    digest: Some(exec_digest.into()),
++                    is_executable: true,
++                    ..Default::default()
++                },
++                FileNode {
++                    name: "plain.txt".to_string(),
++                    digest: Some(plain_digest.into()),
++                    ..Default::default()
++                },
++            ],
++        )
++        .await?;
++
++        let tool_path = format!("{download_dir}/tool");
++        let tool = fs::read(&tool_path).await?;
++        assert_eq!(from_utf8(&tool)?, EXEC_CONTENT);
++        let tool_metadata = fs::metadata(&tool_path).await?;
++        let variant_path = fast_store
++            .get_executable_hardlink_source(&exec_digest)
++            .await?;
++        assert_ne!(
++            tool_metadata.ino(),
++            fs::metadata(&variant_path).await?.ino(),
++            "the staged executable must not share the variant's inode"
++        );
++        assert_eq!(
++            tool_metadata.nlink(),
++            1,
++            "the staged executable must be the only name of its inode"
++        );
++        assert_eq!(
++            tool_metadata.mode() & 0o777,
++            0o555,
++            "a clone keeps the variant's read-only executable mode"
++        );
++
++        let plain_path = format!("{download_dir}/plain.txt");
++        let plain = fs::read(&plain_path).await?;
++        assert_eq!(from_utf8(&plain)?, PLAIN_CONTENT);
++        assert!(
++            fs::metadata(&plain_path).await?.nlink() >= 2,
++            "a plain input stays a hardlink to the shared blob"
++        );
++        Ok(())
++    }
++
+     /// An executable variant whose blob is gone from the index is a miss, so
+     /// staging fetches the blob again: the file is linked, and the blob is
+     /// indexed so its next eviction takes the variant with it.

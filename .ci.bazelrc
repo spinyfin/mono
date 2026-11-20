@@ -83,6 +83,25 @@ build:ci-remote --jobs=64
 # execute remotely, so a step never mixes worker results with agent results.
 # The one exception is the app build in .buildkite/steps/boss-release.sh, which
 # overrides this on its command line; the reason is in that script.
+#
+# That includes an action the scheduler gives up on (no worker connected, a
+# worker lost too often, too many retries), which it does within minutes and
+# with an error that names the reason; ci-env.sh then says on the build page
+# that the executor failed and not the change. An executor that stops
+# answering after the step has started is different. Bazel 9.1 puts no
+# deadline on an execution call. --grpc_keepalive_time defaults to 60s in
+# 9.1; these two lines set 30s / 20s so the values live in this file, and so
+# a future Bazel that defaults them to 0 still pings. They are not the bound
+# for a stopped hub: measured with keepalive on at the 60s default, a hub
+# stopped in the middle of an action was still waiting 17 minutes later.
+# The bound is the status watchdog in ci-env.sh, which repeats the
+# start-of-step status request while bazel runs and fails the command if the
+# hub does not answer, with an annotation that names the executor.
+# timeout_in_minutes remains the last resort if the watchdog cannot run.
+# Do not add --remote_timeout for it; that flag applies to cache calls only.
+# See tools/remote-execution/README.md, "What bounds a stuck action".
+build:ci-remote --grpc_keepalive_time=30s
+build:ci-remote --grpc_keepalive_timeout=20s
 build:ci-remote --noremote_local_fallback
 # Tests execute on the workers too; see `test:remote-tests` in .bazelrc.
 test:ci-remote --config=remote-tests
@@ -105,6 +124,10 @@ build:ci-remote --remote_cache_compression
 # The disk cache from build:ci-linux stays on, for the reason given under
 # ci-remote.
 build:ci-remote-linux --jobs=64
+# As under ci-remote, including the keepalive lines and what bounds a step
+# whose executor stops answering.
+build:ci-remote-linux --grpc_keepalive_time=30s
+build:ci-remote-linux --grpc_keepalive_timeout=20s
 build:ci-remote-linux --noremote_local_fallback
 build:ci-remote-linux --remote_cache_compression
 # The tag that routes the build: every action asks for a worker whose

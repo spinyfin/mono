@@ -41,7 +41,13 @@ build --experimental_disk_cache_gc_max_age=7d
 # docs-only commits included. Nothing here uses rules_rust's {STABLE_*}
 # substitutions, so stamping buys nothing outside release builds. See
 # tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
-build --workspace_status_command=tools/boss/installer/workspace-status.sh
+#
+# A `common` line above `common --enable_platform_specific_config`, for the
+# same reason as the disk cache: a plain `build --workspace_status_command`
+# is applied after the macos -> dev-remote-endpoint -> dev-remote chain and
+# would replace the developer watchdog. tools/test-sandbox/dev_remote_source_test.sh
+# pins the order.
+common --workspace_status_command=tools/boss/installer/workspace-status.sh
 
 # Release config: the same status script plus Bazel-level stamping, kept as a
 # named config so release.sh and CI can use --config=release to opt into
@@ -142,6 +148,29 @@ build:dev-remote-endpoint --remote_cache=
 build:dev-remote --disk_cache=~/.cache/bazelcache-remote
 # If the endpoint cannot be reached, build on this machine instead of failing.
 # A laptop is not always on the workers' network.
+#
+# The same fallback covers an action the executor gives up on. The scheduler
+# fails an action it cannot run or keep running (no worker connected, a worker
+# lost too often, too many retries) within minutes, and that action then runs
+# here. Measured: with every worker frozen, the action ran here two minutes
+# later.
+#
+# It does not cover an executor that stops answering part-way through a build.
+# Bazel 9.1 puts no deadline on an execution call: --remote_timeout applies
+# to cache calls only. --grpc_keepalive_time defaults to 60s in 9.1 (pings
+# after that much quiet, while a call is pending); 0 would disable them.
+# These two lines set 30s / 20s so the values live in this file, and so a
+# future Bazel that defaults them to 0 still pings. They are not the bound
+# for a stopped hub: measured with keepalive on at the 60s default, a hub
+# stopped in the middle of an action was still waiting 17 minutes later.
+# The bound is the workspace-status command below, which repeats the same
+# status request CI uses and stops the in-flight bazel command if the hub
+# accepted a connection and then does not answer. Re-run with
+# --config=dev-local to finish on this Mac. See
+# tools/remote-execution/README.md, "What bounds a stuck action".
+build:dev-remote --grpc_keepalive_time=30s
+build:dev-remote --grpc_keepalive_timeout=20s
+build:dev-remote --workspace_status_command=tools/remote-execution/dev-remote-workspace-status.sh
 build:dev-remote --remote_local_fallback
 # Results of actions this machine ran itself (after a fallback, or because the
 # action cannot run remotely) stay on this machine and are not uploaded. The
@@ -162,11 +191,14 @@ test:dev-remote --test_env=MONO_TEST_REMOTE_EXECUTION=1
 # on a worker fails here too. It only undoes `dev-remote`: with no executor the
 # `remote,local` strategy above runs the test locally, the disk cache is the
 # one at the top of this file again, and removing the variable puts the result
-# under the key every other local run uses. It deliberately names no strategy,
+# under the key every other local run uses. It restores the default
+# workspace-status command so the developer watchdog does not run against a
+# build that is not executing remotely. It deliberately names no strategy,
 # so it is harmless on Linux and on a machine with no endpoint.
 build:dev-local --remote_executor=
 build:dev-local --remote_cache=
 build:dev-local --disk_cache=~/.cache/bazelcache
+build:dev-local --workspace_status_command=tools/boss/installer/workspace-status.sh
 test:dev-local --test_env==MONO_TEST_REMOTE_EXECUTION
 
 # Linux test actions must use the namespace-capable sandbox. Naming the
