@@ -14,35 +14,6 @@ use workspace_procs::{
 /// ladder's grace so the two escalate together.
 pub const REAP_GRACE: Duration = Duration::from_secs(5);
 
-/// Use only the recorded workspace, never the pane shell's mutable cwd.
-pub fn pane_tree_scope(table: &dyn WorkspaceProcessTable, pane_pid: i32, workspace: Option<&Path>) -> Scope {
-    let mut scope = workspace.map(Scope::for_workspace).unwrap_or_default();
-    if let Ok(shell) = table.snapshot(pane_pid) {
-        scope = scope.with_root(&shell);
-    }
-    scope
-}
-
-/// Await the full ladder before the caller can release the workspace.
-pub async fn reap_pane_tree(execution_id: &str, pane_pid: i32, workspace: Option<&Path>) {
-    if pane_pid <= 1 {
-        return;
-    }
-    let execution_id = execution_id.to_owned();
-    let workspace = workspace.map(Path::to_path_buf);
-    let outcome = tokio::task::spawn_blocking(move || {
-        let table = SystemWorkspaceProcessTable;
-        let scope = pane_tree_scope(&table, pane_pid, workspace.as_deref());
-        let targets = term_owned(&table, &scope, &execution_id, "pane_release");
-        workspace_procs::wait_for_exit(&table, &targets, REAP_GRACE);
-        kill_remaining(&table, &targets, &execution_id);
-    })
-    .await;
-    if let Err(err) = outcome {
-        tracing::warn!(?err, "run process reap: pane reap task did not run");
-    }
-}
-
 /// First pass: scan, `SIGTERM` every owned process, log each. Returns what
 /// was signalled so the caller knows whether an escalation pass is needed.
 pub fn term_owned(
@@ -208,7 +179,6 @@ fn log_spared(execution_id: &str, reason: &str, spared: &[workspace_procs::Spare
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use workspace_procs::Ownership;
     use workspace_procs_testing::{StaticProcessTable, fake_process};
@@ -221,41 +191,19 @@ mod tests {
     /// own group, plus an orphaned `( while … ) &` loop 400 re-parented to
     /// launchd and the workspace's bazel server 600.
     fn incident_table() -> StaticProcessTable {
-        let mut pane = fake_process(100, 50, "zsh", Some(WS));
-        pane.has_controlling_terminal = true;
-        let mut agent = fake_process(200, 100, "claude", Some(WS));
-        agent.has_controlling_terminal = true;
-        let mut tool = fake_process(300, 200, "zsh", Some(WS));
-        tool.pgid = 300;
-        let mut orphan = fake_process(400, 1, "zsh", Some(WS));
-        orphan.pgid = 300;
+        let pane = fake_process(100, 50, "zsh", Some(WS));
+        let agent = fake_process(200, 100, "claude", Some(WS));
+        let tool = fake_process(300, 200, "zsh", Some(WS));
+        let orphan = fake_process(400, 1, "zsh", Some(WS));
         let mut server = fake_process(600, 1, "java", Some(WS));
         server.argv = vec!["bazel(mono-agent-003)".into()];
         StaticProcessTable::new(vec![pane, agent, tool, orphan, server], 7)
     }
 
     #[test]
-    fn pane_scope_uses_only_the_recorded_workspace() {
-        let table = incident_table();
-        let scope = pane_tree_scope(&table, 100, Some(Path::new(WS)));
-        assert_eq!(scope.roots, vec![(100, table.snapshot(100).unwrap().start_micros)]);
-        assert_eq!(scope.paths, vec![PathBuf::from(WS)]);
-        assert!(scope.include_bazel_output_bases);
-        // A dead pane shell leaves only the root.
-        let mut pane = table.snapshot(100).unwrap();
-        pane.cwd = Some(PathBuf::from("/"));
-        table.replace(pane);
-        let guarded = pane_tree_scope(&table, 100, Some(Path::new(WS)));
-        assert_eq!(guarded.paths, vec![PathBuf::from(WS)]);
-        let scope = pane_tree_scope(&table, 101, None);
-        assert!(scope.roots.is_empty());
-        assert!(scope.paths.is_empty());
-    }
-
-    #[test]
     fn term_pass_reaches_the_orphan_and_every_descendant_but_not_the_bazel_server() {
         let table = incident_table();
-        let scope = pane_tree_scope(&table, 100, Some(Path::new(WS)));
+        let scope = Scope::for_workspace(WS).with_root(&table.snapshot(100).unwrap());
         let termed = term_owned(&table, &scope, "exec_1", "pane_release");
         let pids: Vec<i32> = termed.iter().map(|o| o.process.pid).collect();
         assert_eq!(pids, vec![100, 200, 300, 400]);
@@ -276,7 +224,7 @@ mod tests {
     fn kill_pass_escalates_only_for_what_ignored_term_and_reports_survivors() {
         let table = incident_table();
         table.ignore_term(400);
-        let scope = pane_tree_scope(&table, 100, Some(Path::new(WS)));
+        let scope = Scope::for_workspace(WS).with_root(&table.snapshot(100).unwrap());
         let targets = term_owned(&table, &scope, "exec_1", "pane_release");
         // The pane shell is gone now; the scope still carries its path.
         let report = kill_remaining(&table, &targets, "exec_1");
@@ -288,7 +236,7 @@ mod tests {
 
         let table = incident_table();
         table.immortal(400);
-        let scope = pane_tree_scope(&table, 100, Some(Path::new(WS)));
+        let scope = Scope::for_workspace(WS).with_root(&table.snapshot(100).unwrap());
         let targets = term_owned(&table, &scope, "exec_2", "pane_release");
         let report = kill_remaining(&table, &targets, "exec_2");
         assert_eq!(report.survivors.len(), 1);
@@ -298,7 +246,7 @@ mod tests {
     #[test]
     fn kill_pass_is_a_no_op_when_term_sufficed() {
         let table = incident_table();
-        let scope = pane_tree_scope(&table, 100, Some(Path::new(WS)));
+        let scope = Scope::for_workspace(WS).with_root(&table.snapshot(100).unwrap());
         let targets = term_owned(&table, &scope, "exec_1", "pane_release");
         let report = kill_remaining(&table, &targets, "exec_1");
         assert_eq!(report.passes, 2);

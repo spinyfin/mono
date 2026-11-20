@@ -20,14 +20,18 @@ pub(super) const TEARDOWN_GRACE: Duration = Duration::from_secs(2);
 pub(super) enum SweepPhase {
     Release,
     Expire,
+    Lease,
+    SetupFailed,
     Remove,
 }
 
 impl SweepPhase {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
             Self::Expire => "expire",
+            Self::Lease => "lease",
+            Self::SetupFailed => "setup_failed",
             Self::Remove => "remove",
         }
     }
@@ -71,7 +75,7 @@ pub(super) fn sweep_workspace_processes(
             survivor.ownership.describe(),
         );
     }
-    for spared in &report.spared {
+    for spared in report.spared.iter().filter(|_| phase == SweepPhase::Remove) {
         eprintln!(
             "cube {}: {workspace_id}: left pid {} ({}) alone: {}",
             phase.as_str(),
@@ -114,9 +118,33 @@ pub(super) fn ensure_no_live_processes_in(workspace_id: &str, workspace_path: &P
     ensure_no_live_processes(&SystemWorkspaceProcessTable, workspace_id, workspace_path)
 }
 
+/// Read-only occupancy verification for expired leases and prospective claims.
+/// Expiry alone does not prove that a holder has stopped working.
+pub(super) fn inspect_workspace_processes(table: &dyn WorkspaceProcessTable, workspace_path: &Path) -> ReapReport {
+    match workspace_procs::scan(table, &Scope::for_workspace(workspace_path)) {
+        Ok(scan) => ReapReport {
+            survivors: scan.owned,
+            spared: scan.spared,
+            passes: 1,
+            ..ReapReport::default()
+        },
+        Err(error) => ReapReport {
+            error: Some(error.to_string()),
+            ..ReapReport::default()
+        },
+    }
+}
+
+pub(super) fn inspect_live_workspace_processes(workspace_path: &Path) -> ReapReport {
+    inspect_workspace_processes(&SystemWorkspaceProcessTable, workspace_path)
+}
+
 /// Whether the sweep did anything worth an audit line.
-pub(super) fn sweep_is_noteworthy(report: &ReapReport) -> bool {
-    !report.signalled.is_empty() || !report.survivors.is_empty() || !report.spared.is_empty() || report.error.is_some()
+pub(super) fn sweep_is_noteworthy(report: &ReapReport, phase: SweepPhase) -> bool {
+    !report.signalled.is_empty()
+        || !report.survivors.is_empty()
+        || (phase == SweepPhase::Remove && !report.spared.is_empty())
+        || report.error.is_some()
 }
 
 /// The sweep as audit-log / `--json` fields.
@@ -190,7 +218,7 @@ mod tests {
         assert!(report.is_clean());
         assert!(table.is_alive(60));
         assert!(table.is_alive(80));
-        assert!(sweep_is_noteworthy(&report));
+        assert!(sweep_is_noteworthy(&report, SweepPhase::Remove));
         let json = sweep_json(&report);
         assert_eq!(json["killed"].as_array().unwrap().len(), 2);
         assert_eq!(json["killed"][0]["pid"], 40);
@@ -250,6 +278,34 @@ mod tests {
     }
 
     #[test]
+    fn lease_inspection_never_signals_an_active_holder() {
+        let table = table();
+        let report = inspect_workspace_processes(&table, Path::new(WS));
+        assert!(!report.is_clean());
+        assert_eq!(report.survivor_summary(), "40 (zsh), 41 (sh)");
+        assert!(table.signals().is_empty());
+        assert!(table.is_alive(40));
+    }
+
+    #[test]
+    fn warm_server_is_quiet_except_on_removal() {
+        let mut server = fake_process(60, 1, "java", Some(WS));
+        server.argv = vec!["bazel(test)".into()];
+        let table = StaticProcessTable::new(vec![server], 900);
+        let report = inspect_workspace_processes(&table, Path::new(WS));
+        assert!(report.is_clean());
+        for phase in [
+            SweepPhase::Lease,
+            SweepPhase::Expire,
+            SweepPhase::Release,
+            SweepPhase::SetupFailed,
+        ] {
+            assert!(!sweep_is_noteworthy(&report, phase));
+        }
+        assert!(sweep_is_noteworthy(&report, SweepPhase::Remove));
+    }
+
+    #[test]
     fn a_quiet_workspace_is_not_noteworthy() {
         let table = table();
         let report = sweep_workspace_processes(
@@ -258,7 +314,7 @@ mod tests {
             Path::new("/pool/mono-agent-008"),
             SweepPhase::Remove,
         );
-        assert!(!sweep_is_noteworthy(&report));
+        assert!(!sweep_is_noteworthy(&report, SweepPhase::Remove));
         assert!(table.signals().is_empty());
         ensure_no_live_processes(&table, "mono-agent-008", Path::new("/pool/mono-agent-008")).unwrap();
     }
@@ -314,7 +370,7 @@ mod verification_tests {
         let report = sweep_workspace_processes(&failing(1), "test", Path::new("/pool/test"), SweepPhase::Remove);
         assert_eq!(report.killed_pids(), vec![40]);
         assert!(report.error.is_some());
-        assert!(sweep_is_noteworthy(&report));
+        assert!(sweep_is_noteworthy(&report, SweepPhase::Remove));
         assert_eq!(sweep_json(&report)["error"], "process list unavailable");
     }
     #[test]
@@ -323,7 +379,7 @@ mod verification_tests {
         server.argv = vec!["bazel(test)".into()];
         let table = StaticProcessTable::new(vec![server], 900);
         let report = ensure_no_live_processes(&table, "test", Path::new("/pool/test")).unwrap();
-        assert!(sweep_is_noteworthy(&report));
+        assert!(sweep_is_noteworthy(&report, SweepPhase::Remove));
         assert_eq!(sweep_json(&report)["spared"][0]["pid"], 60);
     }
 }

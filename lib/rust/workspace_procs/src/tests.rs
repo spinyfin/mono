@@ -24,12 +24,9 @@ fn incident_table() -> StaticProcessTable {
         "--output_base=/cache/_bazel_me/abc".into(),
         format!("--workspace_directory={WS}"),
     ];
-    let mut human = ws_process(700, 1, "zsh");
-    human.has_controlling_terminal = true;
-    let mut pane = ws_process(100, 50, "zsh");
-    pane.has_controlling_terminal = true;
-    let mut agent = ws_process(200, 100, "claude");
-    agent.has_controlling_terminal = true;
+    let human = ws_process(700, 1, "zsh");
+    let pane = ws_process(100, 50, "zsh");
+    let agent = ws_process(200, 100, "claude");
     let processes = vec![
         pane,
         agent,

@@ -1267,3 +1267,71 @@ fn repo_remove_refuses_leased_without_force() {
     assert_eq!(result.payload["removed"], true);
     assert_eq!(result.payload["forced"], true);
 }
+
+mod purge_verification {
+    use std::io;
+
+    use workspace_procs::{LiveProcess, Signal, WorkspaceProcessTable};
+    use workspace_procs_testing::{StaticProcessTable, fake_process};
+
+    use crate::app::repo::purge_workspace_trees;
+
+    struct UnreadableTable;
+    impl WorkspaceProcessTable for UnreadableTable {
+        fn list(&self) -> io::Result<Vec<LiveProcess>> {
+            Err(io::Error::other("process list unavailable"))
+        }
+        fn snapshot(&self, _pid: i32) -> io::Result<LiveProcess> {
+            Err(io::Error::other("process list unavailable"))
+        }
+        fn signal(&self, _pid: i32, _signal: Signal) -> io::Result<()> {
+            Ok(())
+        }
+        fn own_pid(&self) -> i32 {
+            900
+        }
+    }
+
+    #[test]
+    fn purge_retains_directories_with_immortal_occupants_and_removes_the_rest() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let busy = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
+        let quiet = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-002");
+        std::fs::create_dir_all(&busy).unwrap();
+        std::fs::create_dir_all(&quiet).unwrap();
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(busy.to_str().unwrap()))], 900);
+        table.immortal(40);
+
+        let outcome = purge_workspace_trees(&table, None, "mono", &[busy.clone(), quiet.clone()]).unwrap();
+
+        assert!(busy.exists(), "refused directory is retained");
+        assert!(!quiet.exists());
+        assert_eq!(outcome.purged, vec![quiet.display().to_string()]);
+        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(outcome.refused[0]["path"], busy.display().to_string());
+        assert_eq!(outcome.refused[0]["survivor_pids"], serde_json::json!([40]));
+    }
+
+    #[test]
+    fn purge_kills_killable_occupants_before_removing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
+        std::fs::create_dir_all(&ws).unwrap();
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(ws.to_str().unwrap()))], 900);
+        let outcome = purge_workspace_trees(&table, None, "mono", std::slice::from_ref(&ws)).unwrap();
+        assert!(!ws.exists());
+        assert!(outcome.refused.is_empty());
+        assert!(!table.is_alive(40));
+    }
+
+    #[test]
+    fn purge_retains_directories_when_the_process_table_is_unreadable() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = purge_workspace_trees(&UnreadableTable, None, "mono", std::slice::from_ref(&ws)).unwrap();
+        assert!(ws.exists());
+        assert!(outcome.purged.is_empty());
+        assert_eq!(outcome.refused[0]["error"], "process list unavailable");
+    }
+}

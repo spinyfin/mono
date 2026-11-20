@@ -4,9 +4,7 @@
 //! [`crate::scan`] needs: the parent (for ancestry), the start time (so a
 //! recycled pid is never mistaken for the process that was recorded), the
 //! working directory (the ownership signal that survives re-parenting to
-//! launchd), the argument vector (to recognise a Bazel server) and whether
-//! the process has a controlling terminal. Terminal attachment does not exempt
-//! workspace occupants from cleanup.
+//! launchd), the argument vector (to recognise a Bazel server).
 //!
 //! The [`WorkspaceProcessTable`] trait is the seam between the scan and the OS:
 //! production uses [`SystemWorkspaceProcessTable`]; consumers' unit tests use
@@ -22,7 +20,6 @@ pub struct LiveProcess {
     pub pid: i32,
     /// Parent pid; `1` (launchd / init) once the original parent has exited.
     pub ppid: i32,
-    pub pgid: i32,
     /// Process start time in microseconds since the Unix epoch. Together
     /// with the pid it identifies one process incarnation.
     pub start_micros: u64,
@@ -33,10 +30,6 @@ pub struct LiveProcess {
     pub argv: Vec<String>,
     /// Current working directory when readable.
     pub cwd: Option<PathBuf>,
-    /// Whether the process has a controlling terminal. A worker's tool
-    /// shells are spawned detached and have none; a human's interactive
-    /// shell does.
-    pub has_controlling_terminal: bool,
 }
 
 impl LiveProcess {
@@ -141,28 +134,59 @@ impl WorkspaceProcessTable for SystemWorkspaceProcessTable {
     }
 }
 
+/// A missing cwd is not proof of process exit: confirm the identity reader
+/// also reports exit before allowing enumeration to discard the process.
+fn inspected_cwd(cwd: io::Result<PathBuf>, identity: impl FnOnce() -> io::Result<()>) -> io::Result<Option<PathBuf>> {
+    match cwd {
+        Ok(path) => Ok(Some(path)),
+        Err(error) => {
+            identity()?;
+            Err(io::Error::other(format!("working directory unreadable: {error}")))
+        }
+    }
+}
+
+/// Ignore only processes that exited during enumeration; every other failure
+/// makes verification inconclusive, including an unreadable working directory.
+fn collect_snapshots(
+    pids: impl IntoIterator<Item = i32>,
+    mut snapshot: impl FnMut(i32) -> io::Result<LiveProcess>,
+) -> io::Result<Vec<LiveProcess>> {
+    let mut processes = Vec::new();
+    for pid in pids {
+        match snapshot(pid) {
+            Ok(process) => processes.push(process),
+            Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot inspect pid {pid}: {error}"),
+                ));
+            }
+        }
+    }
+    Ok(processes)
+}
+
 #[cfg(target_os = "macos")]
 mod sys {
     use super::LiveProcess;
     use std::io;
     pub(super) fn list() -> io::Result<Vec<LiveProcess>> {
         // SAFETY: geteuid has no preconditions.
-        Ok(crate::darwin::list_pids_for_uid(unsafe { libc::geteuid() })?
-            .into_iter()
-            .filter_map(|pid| snapshot(pid).ok())
-            .collect())
+        super::collect_snapshots(crate::darwin::list_pids_for_uid(unsafe { libc::geteuid() })?, snapshot)
     }
     pub(super) fn snapshot(pid: i32) -> io::Result<LiveProcess> {
         let info = crate::darwin::proc_bsd_info(pid)?;
         Ok(LiveProcess {
             pid,
             ppid: info.ppid,
-            pgid: info.pgid,
             start_micros: info.start_micros,
             command: info.command,
             argv: crate::process_args::arguments(pid as u32).unwrap_or_default(),
-            cwd: crate::darwin::proc_cwd(pid).ok(),
-            has_controlling_terminal: info.terminal_device != u32::MAX,
+            cwd: super::inspected_cwd(crate::darwin::proc_cwd(pid), || {
+                crate::darwin::proc_bsd_info(pid).map(|_| ())
+            })?,
         })
     }
 }
@@ -176,24 +200,30 @@ mod sys {
     use super::{LinuxIdentity, LiveProcess};
 
     pub(super) fn list() -> io::Result<Vec<LiveProcess>> {
-        let mut out = Vec::new();
+        use std::os::unix::fs::MetadataExt;
+        let mut pids = Vec::new();
         for entry in std::fs::read_dir("/proc")? {
-            let Ok(entry) = entry else { continue };
+            let entry = entry?;
             let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
                 continue;
             };
-            if let Ok(process) = snapshot(pid) {
-                out.push(process);
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            // Like Darwin, inspect only processes owned by this user.
+            // SAFETY: geteuid has no preconditions.
+            if metadata.uid() == unsafe { libc::geteuid() } {
+                pids.push(pid);
             }
         }
-        Ok(out)
+        super::collect_snapshots(pids, snapshot)
     }
 
     pub(super) fn snapshot(pid: i32) -> io::Result<LiveProcess> {
         let LinuxIdentity {
             ppid,
-            pgid,
-            tty_nr,
             start_ticks,
             command,
         } = linux_identity(pid)?;
@@ -201,12 +231,12 @@ mod sys {
         Ok(LiveProcess {
             pid,
             ppid,
-            pgid,
             start_micros: boot_micros().saturating_add(start_ticks.saturating_mul(1_000_000) / clock_ticks()),
             command,
             argv,
-            cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
-            has_controlling_terminal: tty_nr != 0,
+            cwd: super::inspected_cwd(std::fs::read_link(format!("/proc/{pid}/cwd")), || {
+                linux_identity(pid).map(|_| ())
+            })?,
         })
     }
 
@@ -225,14 +255,15 @@ mod sys {
         // is field 22 overall, i.e. index 19 after the comm.
         let fields: Vec<&str> = tail.split_whitespace().collect();
         let field = |i: usize| fields.get(i).copied().ok_or_else(|| invalid("too few fields"));
+        // Zombies have exited but retain a stat entry until their parent
+        // collects them; their missing cwd is not an inspection failure.
+        if matches!(field(0)?, "Z" | "X" | "x") {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("pid {pid} has exited")));
+        }
         let ppid = field(1)?.parse::<i32>().map_err(|_| invalid("ppid"))?;
-        let pgid = field(2)?.parse::<i32>().map_err(|_| invalid("pgrp"))?;
-        let tty_nr = field(4)?.parse::<i64>().map_err(|_| invalid("tty_nr"))?;
         let start_ticks = field(19)?.parse::<u64>().map_err(|_| invalid("starttime"))?;
         Ok(LinuxIdentity {
             ppid,
-            pgid,
-            tty_nr,
             start_ticks,
             command,
         })
@@ -261,7 +292,7 @@ mod sys {
 mod sys {
     use std::io;
 
-    use super::{LinuxIdentity, LiveProcess};
+    use super::LiveProcess;
 
     pub(super) fn list() -> io::Result<Vec<LiveProcess>> {
         Err(io::Error::new(
@@ -284,6 +315,82 @@ mod tests {
     use crate::testing::{StaticProcessTable, fake_process};
 
     #[test]
+    fn missing_cwd_requires_confirmed_process_exit() {
+        let missing = || Err(io::Error::from(io::ErrorKind::NotFound));
+        assert_ne!(
+            inspected_cwd(missing(), || Ok(())).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            inspected_cwd(missing(), || Err(io::Error::from(io::ErrorKind::NotFound)))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn reader_only_discards_exited_processes() {
+        let processes = collect_snapshots([10, 11], |pid| {
+            if pid == 10 {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                Ok(fake_process(pid, 1, "tool", Some("/pool/test")))
+            }
+        })
+        .unwrap();
+        assert_eq!(processes.len(), 1);
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::InvalidData] {
+            let error =
+                collect_snapshots([10], |_| Err(io::Error::new(kind, "snapshot or cwd unreadable"))).unwrap_err();
+            assert!(error.to_string().contains("pid 10"));
+        }
+    }
+
+    #[test]
+    fn reader_failure_after_term_preserves_signal_audit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Reader {
+            inner: StaticProcessTable,
+            reads: AtomicUsize,
+        }
+        impl WorkspaceProcessTable for Reader {
+            fn list(&self) -> io::Result<Vec<LiveProcess>> {
+                let read = self.reads.fetch_add(1, Ordering::SeqCst);
+                collect_snapshots([10], |pid| {
+                    if read == 0 {
+                        self.inner.snapshot(pid)
+                    } else {
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "cwd unreadable"))
+                    }
+                })
+            }
+            fn snapshot(&self, pid: i32) -> io::Result<LiveProcess> {
+                self.inner.snapshot(pid)
+            }
+            fn signal(&self, pid: i32, signal: Signal) -> io::Result<()> {
+                self.inner.signal(pid, signal)
+            }
+            fn own_pid(&self) -> i32 {
+                900
+            }
+        }
+        let table = Reader {
+            inner: StaticProcessTable::new(vec![fake_process(10, 1, "tool", Some("/pool/test"))], 900),
+            reads: AtomicUsize::new(0),
+        };
+        let report = crate::reap(
+            &table,
+            &crate::Scope::for_workspace("/pool/test"),
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(report.killed_pids(), vec![10]);
+        assert!(!report.is_clean());
+        assert!(report.error.unwrap().contains("cwd unreadable"));
+    }
+
+    #[test]
     fn self_snapshot_reports_identity_and_working_directory() {
         let table = SystemWorkspaceProcessTable;
         let me = table.snapshot(table.own_pid()).unwrap();
@@ -295,8 +402,6 @@ mod tests {
         let expected = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         let reported = std::fs::canonicalize(me.cwd.expect("own cwd must be readable")).unwrap();
         assert_eq!(reported, expected);
-        // Under `bazel test` there is never a controlling terminal.
-        assert!(!me.has_controlling_terminal);
     }
 
     #[test]
@@ -369,8 +474,6 @@ mod tests {
 #[cfg(target_os = "linux")]
 pub struct LinuxIdentity {
     pub ppid: i32,
-    pub pgid: i32,
-    pub tty_nr: i64,
     pub start_ticks: u64,
     pub command: String,
 }

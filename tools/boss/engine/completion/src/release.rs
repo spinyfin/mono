@@ -134,11 +134,7 @@ impl WorkerCompletionHandler {
             crate::driver_teardown::TeardownReason::ForceRelease,
         )
         .await;
-        // Same pass as `finish_worker_teardown`: nothing the run started may
-        // outlive its lease (`crate::run_process_reap`).
-        if let Some(path) = execution.workspace_path.as_deref() {
-            crate::run_process_reap::reap_workspace(execution_id, std::path::Path::new(path), "force_release").await;
-        }
+        // Cube sweeps only after verifying that this lease is still held.
         self.release_held_lease(&execution, crate::workspace_lease_release::TerminalCause::ProvenStopped)
             .await
     }

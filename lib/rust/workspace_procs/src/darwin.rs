@@ -69,8 +69,6 @@ struct RawProcBsdInfo {
 #[derive(Clone, Debug)]
 pub struct ProcBsdInfo {
     pub ppid: libc::pid_t,
-    pub pgid: i32,
-    pub terminal_device: u32,
     /// Process start time in microseconds since the epoch (`pbi_start_tvsec` /
     /// `pbi_start_tvusec`). Together with the pid it identifies one process
     /// incarnation: a recycled pid always starts later.
@@ -211,10 +209,16 @@ pub fn proc_bsd_info(pid: libc::pid_t) -> std::io::Result<ProcBsdInfo> {
             "proc_pidinfo returned {n} bytes for pid {pid}; expected {info_size}"
         )));
     }
+    // Darwin sys/proc.h: SZOMB = 5, awaiting collection by the parent.
+    // A zombie no longer has a cwd and is not a live workspace occupant.
+    if info.header.status == 5 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("pid {pid} has exited"),
+        ));
+    }
     Ok(ProcBsdInfo {
         ppid: info.header.ppid as libc::pid_t,
-        pgid: info.job_control.process_group as i32,
-        terminal_device: info.job_control.terminal_device,
         start_micros: info
             .start_time
             .seconds

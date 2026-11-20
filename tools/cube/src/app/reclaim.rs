@@ -82,7 +82,7 @@ use crate::app::disk::{DiskSpace, human_bytes};
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{self, budgeted_timeout, cleanup_workspace_logs, workspace_path_exists};
-use crate::app::process_guard::{ensure_no_live_processes_in, sweep_is_noteworthy, sweep_json};
+use crate::app::process_guard::{SweepPhase, ensure_no_live_processes_in, sweep_is_noteworthy, sweep_json};
 use crate::app::util::repo_lock_path;
 
 /// Wall-clock bound for the purely local jj subprocesses this module spawns:
@@ -761,7 +761,7 @@ fn audit_processes_reaped(
     phase: &str,
     sweep: &workspace_procs::ReapReport,
 ) {
-    if !sweep_is_noteworthy(sweep) {
+    if !sweep_is_noteworthy(sweep, SweepPhase::Remove) {
         return;
     }
     audit!(
