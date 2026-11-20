@@ -191,7 +191,6 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
         ("pool_size", 3),
         ("sweep_interval_secs", 3000),
         ("stuck_after_secs", 30000),
-        ("cooldown_secs", 60000),
         ("max_creates_per_item_window", 6),
         ("run_timeout_secs", 32400),
         ("expected_questions_per_week", 2),
@@ -203,6 +202,13 @@ fn seeded_ledger_computes_formulas_publishes_report_and_caches_the_day() {
             expected
         );
     }
+    // The cooldown is a fixed fallback: the seeded revision-to-review time is
+    // measured and reported, but never turned into the cooldown.
+    assert!(report.inputs["revision_to_review_max_secs"] > 0);
+    assert_eq!(value(&report, "cooldown_secs"), Some(6 * 3600));
+    assert_eq!(report.limits["cooldown_secs"].source, "fallback");
+    assert!(report.limits["cooldown_secs"].basis.starts_with("fixed fallback"));
+    assert_eq!(db.progression_limit("progression.cooldown_secs", 0).unwrap(), 6 * 3600);
     // Seeded questions were answered after four days; the placeholder is a
     // ceiling, so the reminder stays at three days here.
     assert_eq!(value(&report, "remind_after_secs"), Some(3 * DAY as u64));
