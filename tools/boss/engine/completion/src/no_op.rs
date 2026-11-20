@@ -32,23 +32,22 @@ impl WorkerCompletionHandler {
             return None;
         }
         if self.refuse_no_op_declaration(execution) {
-            return Some(self.nudge_refused_no_op(execution).await);
+            return Some(on_heap(|| self.nudge_refused_no_op(execution)).await);
         }
         let attention = Self::revision_no_op_attention_input(bound_pr_url, contribution);
-        Some(
-            self.finalize_no_op_completion_retaining(execution, Some(contribution), Some(attention))
-                .await,
-        )
+        Some(on_heap(|| self.finalize_no_op_completion_retaining(execution, Some(contribution), Some(attention))).await)
     }
 
     pub(super) async fn nudge_refused_no_op(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
-        self.nudge_or_park(
-            execution,
-            NO_OP_DECLARATION_REFUSED_PROBE,
-            "no_op_declaration_refused",
-            None,
-            StopOutcome::AwaitingInput,
-        )
+        on_heap(|| {
+            self.nudge_or_park(
+                execution,
+                NO_OP_DECLARATION_REFUSED_PROBE,
+                "no_op_declaration_refused",
+                None,
+                StopOutcome::AwaitingInput,
+            )
+        })
         .await
     }
 
@@ -118,7 +117,7 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
-        self.finalize_no_op_completion_for_declaration(execution, &declaration_id, contribution, attention)
+        on_heap(|| self.finalize_no_op_completion_for_declaration(execution, &declaration_id, contribution, attention))
             .await
     }
 
@@ -149,15 +148,16 @@ impl WorkerCompletionHandler {
                 false
             };
             if !empty {
-                return self
-                    .nudge_or_park(execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
-                    .await;
+                return on_heap(|| {
+                    self.nudge_or_park(execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
+                })
+                .await;
             }
         }
         let mut confirmed_merged_pr = None;
         if execution.kind == ExecutionKind::RevisionImplementation {
             let pr_url = self.resolve_bound_pr_url(execution);
-            match self.conflict_delivery_decision(execution, pr_url.as_deref()).await {
+            match on_heap(|| self.conflict_delivery_decision(execution, pr_url.as_deref())).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
                 ConflictDeliveryDecision::Merged => confirmed_merged_pr = pr_url,
                 ConflictDeliveryDecision::ClosedUnmerged | ConflictDeliveryDecision::Proceed => {}
@@ -243,14 +243,16 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
-        self.finish_worker_teardown(
-            &execution.id,
-            &completion.execution.work_item_id,
-            completion.released_lease_id.as_deref(),
-            workspace_path.as_deref().map(std::path::Path::new),
-            "no_op",
-            teardown,
-        )
+        on_heap(|| {
+            self.finish_worker_teardown(
+                &execution.id,
+                &completion.execution.work_item_id,
+                completion.released_lease_id.as_deref(),
+                workspace_path.as_deref().map(std::path::Path::new),
+                "no_op",
+                teardown,
+            )
+        })
         .await;
         let work_item_id = completion.execution.work_item_id.clone();
         let product_id = completion.work_item.product_id().to_string();

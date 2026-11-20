@@ -8,6 +8,7 @@ pub(super) use super::transcript_persist::transcript_offset_for_run;
 use super::*;
 use boss_engine_driver::{AgentDriver, Capability, ClaudeDriver};
 use boss_engine_live_worker_state::{ApplyEventOutcome, DriverSignalKind, HookOrigin};
+use boss_engine_utils::heap_future::on_heap;
 
 impl ServerState {
     /// Stamp a driver-originated signal and, if this run is the in-flight
@@ -197,7 +198,7 @@ pub(super) async fn dispatch_worker_event_fanout(
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
 ) {
     dispatch_codex_unobserved_command_on_notification(server_state, incoming);
-    dispatch_staged_worker_event_fanout(server_state, incoming).await;
+    on_heap(|| dispatch_staged_worker_event_fanout(server_state, incoming)).await;
 }
 
 /// Fan one normalised worker event out to every engine subsystem that reacts
@@ -216,6 +217,12 @@ pub(super) async fn dispatch_worker_event_fanout(
 /// `Stop` could then be evaluated before the marker is visible.
 ///
 /// Ordering here is load-bearing; see the per-call comments.
+///
+/// Each stage's future is built by [`on_heap`], so this function's stack frame
+/// holds a pointer per stage and not a copy of every stage's state machine.
+/// Everything a worker event triggers runs beneath this frame, so its size is
+/// paid on every dispatch; see [`boss_engine_utils::heap_future`]. Await a new
+/// stage the same way.
 pub(super) async fn dispatch_staged_worker_event_fanout(
     server_state: &Arc<ServerState>,
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
@@ -232,8 +239,8 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
         incoming.run_id.as_deref(),
         &incoming.event,
     );
-    server_state.publish_hook_derived_events(incoming).await;
-    dispatch_live_worker_state(server_state, incoming).await;
+    on_heap(|| server_state.publish_hook_derived_events(incoming)).await;
+    on_heap(|| dispatch_live_worker_state(server_state, incoming)).await;
     // Codex guard-trace observation: record whether this turn's PreToolUse
     // guards ran and what they decided — and, when tool calls ran with no
     // guard invocation at all, that Boss's command guardrails were not
@@ -244,14 +251,14 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // product's editorial rules and record the
     // decision in `editorial_actions`. Fire-and-
     // forget; never blocks the event dispatch.
-    dispatch_editorial_on_pretooluse(server_state, incoming).await;
+    on_heap(|| dispatch_editorial_on_pretooluse(server_state, incoming)).await;
     // Post-hoc interception fallback: for any driver
     // that lacks real-time PreToolUse hooks (the
     // ToolUseInterception Degrade path), this is the
     // only place editorial/path/revision-PR/
     // checkleft loss ever gets surfaced. No-op for
     // Claude, which already ran those guards above.
-    dispatch_post_hoc_interception_on_post_tool_use(server_state, incoming).await;
+    on_heap(|| dispatch_post_hoc_interception_on_post_tool_use(server_state, incoming)).await;
     // Probes fire on PostToolUse so the
     // coordinator can redirect a worker
     // mid-task without waiting for Stop —
@@ -259,7 +266,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // effectively the worker's terminal one.
     // The tool call has already returned at
     // this point, so no in-flight work is lost.
-    let _ = dispatch_probe_on_post_tool_use(server_state, incoming).await;
+    let _ = on_heap(|| dispatch_probe_on_post_tool_use(server_state, incoming)).await;
     // ProbeReplied runs first: emit the reply for the
     // prior probe before dispatching the next one so
     // a single Stop never fires both reply and dispatch
@@ -270,7 +277,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // survives a completion handler that errors, an engine restart, or the
     // pane going away milliseconds later.
     record_turn_boundary_on_stop(server_state, incoming);
-    dispatch_probe_reply_on_stop(server_state, incoming).await;
+    on_heap(|| dispatch_probe_reply_on_stop(server_state, incoming)).await;
     // **Probe dispatch runs on both sides of completion, and that is
     // load-bearing in each direction.**
     //
@@ -317,7 +324,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // leaves the completion nudge queued — exactly what the single
     // post-completion pass did before, since a pre-existing probe already sat
     // ahead of the nudge in the queue.
-    let pre_pass = dispatch_probe_on_stop(server_state, incoming).await;
+    let pre_pass = on_heap(|| dispatch_probe_on_stop(server_state, incoming)).await;
     // A boundary that lands while an interrupting delivery holds its claim
     // and has not written yet is the engine's own interrupt taking effect,
     // not the worker stopping, and the probe is about to be written. The
@@ -336,8 +343,8 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
              that decision re-evaluates; every other completion side effect still runs",
         );
     }
-    dispatch_completion_on_stop(server_state, incoming, defer_finalization).await;
-    let _ = dispatch_probe_on_stop(server_state, incoming).await;
+    on_heap(|| dispatch_completion_on_stop(server_state, incoming, defer_finalization)).await;
+    let _ = on_heap(|| dispatch_probe_on_stop(server_state, incoming)).await;
 }
 
 /// True when the pre-completion probe pass in [`dispatch_worker_event_fanout`]
@@ -2816,10 +2823,14 @@ pub(super) async fn dispatch_completion_on_stop(
     if defer_finalization {
         server_state.defer_completion_for_parked_probe(run_id);
     }
-    let outcome = server_state
-        .completion_handler
-        .on_stop_with_turn_end_deferrable(run_id, incoming.turn_boundary(), defer_finalization)
-        .await;
+    let outcome = on_heap(|| {
+        server_state.completion_handler.on_stop_with_turn_end_deferrable(
+            run_id,
+            incoming.turn_boundary(),
+            defer_finalization,
+        )
+    })
+    .await;
     // Info-level so non-success outcomes (DetectorFailed, AwaitingInput,
     // StalePr, EmptyDiffPr) appear in the engine log without enabling
     // debug. The 2026-05-13 three-concurrent-workers regression had
@@ -2895,105 +2906,5 @@ mod editorial_gate_tests {
 }
 
 #[cfg(test)]
-mod post_hoc_interception_decision_tests {
-    use super::post_hoc_interception_decision;
-    use boss_engine_driver::test_support::StubDriver;
-    use boss_engine_driver::{
-        AbsenceDisposition, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PostHocInterceptionAction,
-    };
-    use serde_json::json;
-
-    fn descriptor(name: &'static str) -> DriverDescriptor {
-        DriverDescriptor {
-            name,
-            label: name,
-            binary: name,
-            config_dir: ".stub",
-            agent_rules_filename: "AGENTS.md",
-            initial_prompt_filename: "initial-prompt.txt",
-            model_menu: ModelMenu {
-                resolve_model_effort: None,
-                engine_default: "stub-model",
-                effort_value_for_level: |_| None,
-                default_model_for_level: |_| "stub-model",
-                model_for_reasoning: |_| "stub-model",
-                review_model_for_tier: |_| "stub-model",
-                design_investigation_model: None,
-                prompt_addendum_for_level: |_| None,
-                model_requires_auto_permissions: |_| false,
-                model_belongs_to_driver: |_| true,
-            },
-        }
-    }
-
-    fn always_request_edit(
-        _tool_name: &str,
-        _tool_input: &serde_json::Value,
-        _tool_output: &serde_json::Value,
-    ) -> PostHocInterceptionAction {
-        PostHocInterceptionAction::RequestEdit {
-            reason: "flagged by fixture".to_owned(),
-        }
-    }
-
-    /// A driver that declares real-time ToolUseInterception (Claude today)
-    /// never reaches the degrade path — the caller must not log or act.
-    #[test]
-    fn driver_with_tool_use_interception_is_not_applicable() {
-        let driver = StubDriver::new(
-            descriptor("claude-like"),
-            CapabilitySet::new([Capability::ToolUseInterception]),
-        );
-        let outcome =
-            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
-        assert_eq!(outcome, None);
-    }
-
-    /// A driver without ToolUseInterception and no registered post-hoc fn
-    /// still hits the degrade path — the implicit decision is `Accept` (the
-    /// caller logs the loss-of-guards warning regardless).
-    #[test]
-    fn degraded_driver_without_registered_fn_implicitly_accepts() {
-        let driver = StubDriver::new(descriptor("hookless"), CapabilitySet::new([]));
-        let outcome =
-            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
-        assert_eq!(outcome, Some(PostHocInterceptionAction::Accept));
-    }
-
-    /// A degraded driver's registered fn is actually called, and its
-    /// decision passed through verbatim.
-    #[test]
-    fn degraded_driver_with_registered_fn_returns_its_decision() {
-        let driver = StubDriver::new(descriptor("hookless"), CapabilitySet::new([]))
-            .with_post_hoc_interception(always_request_edit);
-        let outcome = post_hoc_interception_decision(
-            &driver,
-            "Bash",
-            &json!({"command": "rm -rf /"}),
-            &json!({"output": "ok"}),
-        );
-        assert_eq!(
-            outcome,
-            Some(PostHocInterceptionAction::RequestEdit {
-                reason: "flagged by fixture".to_owned(),
-            }),
-        );
-    }
-
-    /// A driver that does not provide ToolUseInterception but has
-    /// explicitly overridden its absence disposition to `Refuse` (rather
-    /// than the `Degrade` default) must not be routed through the degrade
-    /// path — dispatch is expected to have refused this driver before any
-    /// tool call could run, so treating it as "degraded" here would be
-    /// logged as if it were silently accepting reduced fidelity when its
-    /// declared policy is the opposite.
-    #[test]
-    fn driver_with_refuse_override_is_not_applicable() {
-        let caps =
-            CapabilitySet::new([]).with_absence_override(Capability::ToolUseInterception, AbsenceDisposition::Refuse);
-        let driver = StubDriver::new(descriptor("refuses-without-interception"), caps);
-        let outcome =
-            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
-        assert_eq!(outcome, None);
-    }
-}
+#[path = "worker_events_post_hoc_interception_tests.rs"]
+mod post_hoc_interception_decision_tests;
