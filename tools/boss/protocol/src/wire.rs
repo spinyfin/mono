@@ -911,6 +911,20 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Read-only. Denied to workers.
+    GetMetricCatalog,
+    GetMetricSeries {
+        series: String,
+        since_epoch_s: i64,
+        until_epoch_s: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bucket: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        filters: Vec<MetricFilter>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_by: Option<String>,
+    },
+
     /// Read the `[backup.offsite]` off-machine backup configuration.
     /// Replies with [`FrontendEvent::OffsiteBackupSettings`]. Read-only.
     GetOffsiteBackup,
