@@ -309,6 +309,16 @@ mod sys {
     }
 }
 
+/// Linux stat identity, with start time in kernel clock ticks.
+#[cfg(target_os = "linux")]
+pub struct LinuxIdentity {
+    pub ppid: i32,
+    pub start_ticks: u64,
+    pub command: String,
+}
+#[cfg(target_os = "linux")]
+pub use sys::linux_identity;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,13 +479,3 @@ mod tests {
         assert_eq!(table.signals(), vec![(12, Signal::Term), (12, Signal::Kill)]);
     }
 }
-
-/// Linux stat identity, with start time in kernel clock ticks.
-#[cfg(target_os = "linux")]
-pub struct LinuxIdentity {
-    pub ppid: i32,
-    pub start_ticks: u64,
-    pub command: String,
-}
-#[cfg(target_os = "linux")]
-pub use sys::linux_identity;
