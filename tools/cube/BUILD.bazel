@@ -1,6 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/test-sandbox:defs.bzl", "twin_test")
 
 exports_files(["Cargo.toml"])
 
@@ -72,61 +73,57 @@ sh_test(
 
 # The same suite against the oldest and the newest jj cube supports (see
 # docs/jj-compatibility.md). `BOSS_JJ_BIN` is the jj under test.
-[
-    rust_test(
-        name = name,
-        # Includes real GC rewrites and concurrent leases; only jj 0.26 uses
-        # the 16,800-operation scale fixture (newer jj fsyncs each rewrite).
-        size = "large",
-        crate = ":cube_lib",
-        # Real-jj fixtures (a throwaway colocated repo) for the `pr/<n>` bookmark
-        # lifecycle tests; the binary is declared, never taken from PATH.
-        data = [
-            ":cube",
-            "@cube_jj_newer//:jj",
-            "@host_lsof//:lsof",
-            "@jj_test_tools//:jj",
-        ] + extra_data,
-        env = {
-            "BOSS_JJ_BIN": "$(rootpath {})".format(jj),
-            # The mixed-version GC tests use this as the oldest client,
-            # whichever jj is under test.
-            "CUBE_OLDEST_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
-            # An empty cut selects a small real history built by the test.
-            "CUBE_GC_STORE_CUT": gc_cut,
-            "CUBE_NEWER_JJ_BIN": "$(rootpath @cube_jj_newer//:jj)",
-            "CUBE_TEST_BIN": "$(rootpath :cube)",
-            "CUBE_TEST_LSOF": "$(rootpath @host_lsof//:lsof)",
-        },
-        proc_macro_deps = all_crate_deps(
-            proc_macro = True,
-            proc_macro_dev = True,
-        ),
-        deps = [
-            "//tools/boss/engine/test-git",
-        ] + all_crate_deps(
-            normal = True,
-            normal_dev = True,
-        ),
-    )
-    for name, jj, gc_cut, extra_data in [
-        (
-            "cube_lib_test",
-            "@jj_test_tools//:jj",
-            "$(rootpath @cube_gc_store_tree//:cut)",
-            [
-                "@cube_gc_store_tree//:cut",
-                "@cube_gc_store_tree//:store",
-            ],
-        ),
-        (
-            "cube_lib_jj_046_test",
-            "@jj_upgrade_test_tools//:jj",
-            "",
-            ["@jj_upgrade_test_tools//:jj"],
-        ),
-    ]
-]
+rust_test(
+    name = "cube_lib_test",
+    # Includes real GC rewrites and concurrent leases; only jj 0.26 uses
+    # the 16,800-operation scale fixture (newer jj fsyncs each rewrite).
+    size = "large",
+    crate = ":cube_lib",
+    # Real-jj fixtures (a throwaway colocated repo) for the `pr/<n>` bookmark
+    # lifecycle tests; the binary is declared, never taken from PATH.
+    data = [
+        ":cube",
+        "@cube_gc_store_tree//:cut",
+        "@cube_gc_store_tree//:store",
+        "@cube_jj_newer//:jj",
+        "@host_lsof//:lsof",
+        "@jj_test_tools//:jj",
+    ],
+    env = {
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        # The mixed-version GC tests use this as the oldest client,
+        # whichever jj is under test.
+        "CUBE_OLDEST_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        # An empty cut selects a small real history built by the test.
+        "CUBE_GC_STORE_CUT": "$(rootpath @cube_gc_store_tree//:cut)",
+        "CUBE_NEWER_JJ_BIN": "$(rootpath @cube_jj_newer//:jj)",
+        "CUBE_TEST_BIN": "$(rootpath :cube)",
+        "CUBE_TEST_LSOF": "$(rootpath @host_lsof//:lsof)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/engine/test-git",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The jj 0.46 twin reruns the binary compiled above (no second rustc action); an
+# empty GC cut selects the small real history the test builds itself.
+twin_test(
+    name = "cube_lib_jj_046_test",
+    size = "large",
+    binary = ":cube_lib_test",
+    data = ["@jj_upgrade_test_tools//:jj"],
+    env = {
+        "BOSS_JJ_BIN": "$(rootpath @jj_upgrade_test_tools//:jj)",
+        "CUBE_GC_STORE_CUT": "",
+    },
+)
 
 rust_test(
     name = "cube_bin_test",

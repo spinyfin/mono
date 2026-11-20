@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//tools/test-sandbox:defs.bzl", "twin_test")
 
 exports_files(["Cargo.toml"])
 
@@ -33,36 +34,40 @@ rust_library(
 
 # The same suite against the oldest and the newest supported jj (see
 # //tools/cube/docs/jj-compatibility.md).
-[
-    rust_test(
-        name = name,
-        size = "medium",
-        # Every bookmark/reconcile test drives a real `jj` subprocess against a
-        # scratch repo. Observed on the linux-amd64 CI runners over 60 recent
-        # main builds: p50 25 s, max 57 s against small's 60 s default budget;
-        # locally on an Apple Silicon dev box the whole target takes 12 s.
-        # Keep the moderate (300 s) timeout and medium size for loaded CI hosts.
-        timeout = "moderate",
-        crate = ":recovery",
-        data = [jj],
-        edition = "2024",
-        env = {"BOSS_JJ_BIN": "$(rootpath {})".format(jj)},
-        proc_macro_deps = all_crate_deps(
-            proc_macro = True,
-            proc_macro_dev = True,
-        ),
-        deps = [
-            "//tools/boss/engine/test-git",
-        ] + all_crate_deps(
-            normal = True,
-            normal_dev = True,
-        ),
-    )
-    for name, jj in [
-        ("recovery_test", "@jj_test_tools//:jj"),
-        ("recovery_jj_046_test", "@jj_upgrade_test_tools//:jj"),
-    ]
-]
+rust_test(
+    name = "recovery_test",
+    size = "medium",
+    # Every bookmark/reconcile test drives a real `jj` subprocess against a
+    # scratch repo. Observed on the linux-amd64 CI runners over 60 recent
+    # main builds: p50 25 s, max 57 s against small's 60 s default budget;
+    # locally on an Apple Silicon dev box the whole target takes 12 s.
+    # Keep the moderate (300 s) timeout and medium size for loaded CI hosts.
+    timeout = "moderate",
+    crate = ":recovery",
+    data = ["@jj_test_tools//:jj"],
+    edition = "2024",
+    env = {"BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/engine/test-git",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The jj 0.46 twin reruns the binary compiled above (no second rustc action).
+twin_test(
+    name = "recovery_jj_046_test",
+    size = "medium",
+    timeout = "moderate",
+    binary = ":recovery_test",
+    data = ["@jj_upgrade_test_tools//:jj"],
+    env = {"BOSS_JJ_BIN": "$(rootpath @jj_upgrade_test_tools//:jj)"},
+)
 
 # Share the pinned recovery fixture tool without widening its repository exports.
 filegroup(
