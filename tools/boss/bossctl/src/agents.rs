@@ -1310,19 +1310,21 @@ pub(crate) async fn agents_interrupt(socket_path: &Option<String>, json: bool, a
 /// Retry capacity refusals until the deadline. The interval doubles after
 /// each refusal up to `max_interval`, and the waiting notice is printed once.
 /// When the deadline passes, the last refusal is returned as a timeout error.
-async fn launch_with_retry<F, Fut>(
+async fn launch_with_retry<F, Fut, N>(
     mut send: F,
     wait: bool,
     deadline: Option<tokio::time::Instant>,
     interval: std::time::Duration,
     max_interval: std::time::Duration,
+    mut notice: N,
 ) -> Result<FrontendEvent>
 where
     F: FnMut() -> Fut,
+    N: FnMut(&str),
     Fut: std::future::Future<Output = Result<FrontendEvent>>,
 {
     let mut last: Option<String> = None;
-    let mut interval = interval;
+    let mut doublings: u32 = 0;
     let started = tokio::time::Instant::now();
     loop {
         // Never cancel an in-flight mutation: its result may already have
@@ -1346,14 +1348,15 @@ where
             return Ok(response);
         }
         if last.is_none() {
-            eprintln!("waiting for a worker slot (pool at hard cap)");
+            notice("waiting for a worker slot (pool at hard cap)");
         }
         if let FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } = response {
             last = Some(message);
         }
-        let wake = tokio::time::Instant::now() + interval;
+        let delay = boss_backoff::exponential_delay(interval, max_interval, doublings);
+        let wake = tokio::time::Instant::now() + delay;
         tokio::time::sleep_until(deadline.map_or(wake, |d| d.min(wake))).await;
-        interval = (interval * 2).min(max_interval);
+        doublings = doublings.saturating_add(1);
     }
 }
 
@@ -1403,6 +1406,7 @@ pub(crate) async fn agents_launch(
         deadline,
         std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(60),
+        |message| eprintln!("{message}"),
     )
     .await?;
     match response {

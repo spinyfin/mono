@@ -1131,6 +1131,14 @@ async fn worker_release_skips_no_autostart_active_chore() {
 
 #[tokio::test]
 async fn force_dispatch_errors_at_hard_cap() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    seed_local_claude_driver(&db);
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Wait for capacity");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    assert_eq!(execution.status, ExecutionStatus::Ready);
     let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE);
     for i in 0..MAX_WORKER_POOL_SIZE {
         pool.claim_worker(&format!("exec-{i}"), None)
@@ -1138,10 +1146,24 @@ async fn force_dispatch_errors_at_hard_cap() {
             .expect("hard-cap pool should hand out one slot per claim");
     }
     assert_eq!(pool.idle_count().await, 0);
-    assert!(
-        pool.claim_worker_force("overflow", None).await.is_none(),
-        "claim_worker_force must reject when the pool is already at the hard cap",
-    );
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        pool.clone(),
+        cube.clone(),
+        runner.clone(),
+    ));
+    let error = coordinator
+        .force_dispatch(&execution.id, DispatchAdmission::OperatorForced)
+        .await
+        .expect_err("force dispatch must refuse when every hard-cap slot is occupied");
+    let message = error.to_string();
+    assert!(message.contains(boss_protocol::POOL_HARD_CAP_REFUSAL), "{message}");
+    assert!(boss_protocol::is_pool_hard_cap_refusal(&message), "{message}");
+    assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Ready);
+    assert!(cube.lease_calls.lock().await.is_empty());
+    assert!(runner.calls.lock().await.is_empty());
     assert_eq!(
         pool.capacity().await,
         MAX_WORKER_POOL_SIZE,

@@ -2131,6 +2131,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-backoff",
  "boss-build-info",
  "boss-client",
  "boss-engine",

@@ -1073,6 +1073,7 @@ async fn launch_retries_only_cap_refusals() {
             None,
             Duration::ZERO,
             Duration::ZERO,
+            |_| {},
         )
         .await
         .unwrap();
@@ -1095,6 +1096,7 @@ async fn launch_does_not_retry_transport_errors() {
         None,
         std::time::Duration::ZERO,
         std::time::Duration::ZERO,
+        |_| {},
     )
     .await
     .unwrap_err();
@@ -1121,6 +1123,7 @@ async fn launch_short_deadline_returns_cap_refusal_without_another_request() {
             Some(tokio::time::Instant::now() + Duration::from_millis(10)),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            |_| {},
         ),
     )
     .await
@@ -1148,8 +1151,39 @@ async fn launch_expired_deadline_never_sends() {
         Some(tokio::time::Instant::now()),
         std::time::Duration::ZERO,
         std::time::Duration::ZERO,
+        |_| {},
     )
     .await;
     assert!(result.is_err());
     assert_eq!(calls.get(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn launch_backoff_doubles_caps_and_notifies_once() {
+    use std::{cell::RefCell, time::Duration};
+    let attempts = RefCell::new(Vec::new());
+    let notices = RefCell::new(Vec::new());
+    let response = launch_with_retry(
+        || {
+            let mut attempts = attempts.borrow_mut();
+            attempts.push(tokio::time::Instant::now());
+            let message = if attempts.len() <= 4 {
+                boss_protocol::pool_hard_cap_refusal_message("main", 16, "ready")
+            } else {
+                "finished waiting".to_owned()
+            };
+            async move { Ok(FrontendEvent::WorkError { message }) }
+        },
+        true,
+        None,
+        Duration::from_secs(5),
+        Duration::from_secs(12),
+        |message| notices.borrow_mut().push(message.to_owned()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(response, FrontendEvent::WorkError { message } if message == "finished waiting"));
+    let gaps: Vec<_> = attempts.borrow().windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert_eq!(gaps, [5, 10, 12, 12].map(Duration::from_secs));
+    assert_eq!(*notices.borrow(), ["waiting for a worker slot (pool at hard cap)"]);
 }
