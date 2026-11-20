@@ -106,6 +106,7 @@ mod tests {
         GitHubRelease {
             tag_name: tag.to_owned(),
             draft,
+            ..GitHubRelease::default()
         }
     }
 

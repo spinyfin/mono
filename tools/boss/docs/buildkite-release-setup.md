@@ -32,13 +32,13 @@ A push or pull-request build never reaches this step (`pipeline.yml`'s `if:`), a
 
 Inside mono the tool is always **built from source** and never consumed as a prebuilt. `ci-env.sh` runs `repobin install`, which puts `bin/release` on the step's path as a shim for `//tools/release:release`. There is no chicken-and-egg: the tool at HEAD releases Boss at HEAD. A broken published `release-v*` tag cannot block a Boss release.
 
-`tools/boss/release.toml` is the only per-product input. It names the repo, the `boss-v` tag prefix, the `1.0` patch-counter, changelog notes from `tools/boss/PROJECT.yaml`, the change-detection paths, and the required asset `Boss-{version}.zip` (`{version}` expands to the version encoded in the tag, so the published name stays `Boss-1.0.N.zip`).
+`tools/boss/release.toml` is the only per-product input. It names the repo, the `boss-v` tag prefix, the `1.0` patch-counter, changelog notes from `tools/boss/PROJECT.yaml`, the change-detection paths, the required asset `Boss-{version}.zip` (`{version}` expands to the version encoded in the tag, so the published name stays `Boss-1.0.N.zip`), and the `[recovery]` limits described under [Recovering from a partial release](#recovering-from-a-partial-release).
 
 The script makes three calls in one Buildkite step — the tool does not care that they are not three jobs:
 
 1. `release prepare` — skip or proceed, compute `boss-v1.0.N`, tag HEAD, generate notes, create the GitHub Release as a **draft**, print the tag.
 2. `release upload` — stage `Boss-1.0.N.zip` plus `Boss-1.0.N.zip.sha256`, upload with `--clobber`.
-3. `release publish` — re-download the zip and sidecar from GitHub, re-hash, then flip the draft to published.
+3. `release publish` — re-download the zip and sidecar from GitHub, re-hash, then flip the draft to published. Each download attempt is given two minutes plus the time the asset needs at 1 Mbit/s (about ten and a half minutes for a 64 MB zip); an attempt that fails or runs out of time is retried, three attempts in all.
 
 A published release now means "the zip is present and checksum-correct". The previous published-first ordering could advertise a resolvable-but-assetless tag (`boss-v1.0.21`); draft-then-publish closes that. Anything polling for the newest _published_ release will see it appear at the end of the step rather than at tag-creation time. The auto-update design already skips assetless releases, so the change is strictly an improvement.
 
@@ -149,7 +149,7 @@ Expected assets:
 - `Boss-1.0.N.zip` — **required**; the name UpdateChecker resolves by exact string
 - `Boss-1.0.N.zip.sha256` — **required**; `sha256sum -c` sidecar written by `release upload`
 
-A missing or checksum-mismatched required asset fails `release publish` and leaves the release as an unpublished draft.
+A missing or checksum-mismatched required asset fails `release publish` and leaves the release as an unpublished draft. So does a verification download that fails three times. [Recovering from a partial release](#recovering-from-a-partial-release) covers what happens to that draft.
 
 After the next top-of-hour fires, check the BK builds list for a build with message `Hourly Boss release check`. If Boss-affecting files changed since the last published tag, a new `boss-v1.0.N` release will appear on GitHub. If not, the build will show a line like:
 
@@ -161,10 +161,44 @@ release skipped: no release-affecting changes since boss-v1.0.N
 
 ## Recovering from a partial release
 
-`prepare` creates the tag and the GitHub Release as a **draft** before the zip is built, then `upload` attaches the zip and sidecar, and `publish` verifies + publishes at the end. If the build, upload, or publish fails, the release is left as a draft — never published — with whatever assets did upload still attached. To recover:
+`prepare` creates the tag and the GitHub Release as a **draft** before the zip is built, then `upload` attaches the zip and sidecar, and `publish` verifies and publishes at the end. If the build, upload, or publish fails, the release is left as a draft, never published, with whatever assets did upload still attached. When `upload` or `publish` is the step that failed, it adds an error annotation to the build page with the error, whether the release is still a draft, and how many scheduled attempts it has left.
 
-- **Re-run the failed `boss-release` job** (`bk job retry <job-id>`). A manual re-trigger of the whole `mono` pipeline on the same commit also works: because the trigger is manual (`BUILDKITE_SOURCE` is `ui`/`api`), `prepare` re-adopts the existing draft/tag instead of computing a new version, and `upload` uses `--clobber`. A **scheduled (cron)** trigger will refuse to auto-resume a stranded draft — see "Abandoning a draft release" below — to avoid silently retrying a stuck release forever.
-- **Or upload manually** from a macOS agent checked out at the tag, after building the zip with the same `-c opt --define=BOSS_SHAKE_*` flags, then:
+A draft left behind is handled by the next run. Nobody has to notice it first.
+
+### What the next run does
+
+**`main` has not moved: the draft is resumed.** A scheduled run that finds an unpublished draft for the commit it is releasing picks it up. It keeps the tag, rebuilds the zip, uploads it with `--clobber`, and runs the full download-and-checksum verification before publishing, so a resumed release is verified exactly like a new one. The run adds a warning annotation naming the draft, the attempt number, and the run that left the draft behind.
+
+**The attempts are limited.** Scheduled runs resume one draft at most three times (`scheduled_resume_attempts` in `tools/boss/release.toml`, default 3). After the third, further scheduled runs fail at `prepare` with an error annotation: the release is stranded, which run tried last, and the commands under [Recovering by hand](#recovering-by-hand). They do not try again. A release that has failed four times in a row on one commit needs a person, and `boss-release` stays red until someone acts or `main` moves. This is what stops a release that cannot be published from being retried on every schedule tick forever.
+
+**`main` has moved: the draft is abandoned.** A run only ever resumes a draft for its own commit, so a draft for an older commit would otherwise sit there for good. The run that cuts the release for the newer commit deletes each older unpublished draft and its tag, and adds a warning annotation listing what it deleted. It does this after creating its own tag and draft, and the new release takes the next number, so abandoning a draft never frees its number for a different commit. A draft is only deleted if its commit is an ancestor of the commit being released, no published release uses its tag, and GitHub still reports it as a draft when it is read again just before the delete. A draft that could not be deleted is listed in the same annotation with the reason, and a later run tries again. If a draft is deleted but its tag is not, the annotation gives the command that deletes the tag.
+
+A run that skips (nothing to release) does not look at older drafts. They wait for the next run that cuts or resumes a release.
+
+### The claim on a draft
+
+Each run records a claim in the notes of the draft it is working on, as one HTML comment that the release page does not render:
+
+```
+<!-- release-tool: claimed-at=1795059287 scheduled-resumes=1 build=https://buildkite.com/flunge/mono/builds/27488 -->
+```
+
+`claimed-at` is when a run last started `prepare`, `upload` or `publish` on the draft, `scheduled-resumes` counts the scheduled resumes so far, and `build` is the run that created or resumed it. Because the count is stored on the draft, it holds across builds and agents. A run that cannot write its claim does not resume the draft, whether it was scheduled or started by hand. `publish` removes the comment in the same edit that publishes, so it never reaches published notes.
+
+### Drafts that are still being built
+
+A draft is not always a failure: it also exists while a release is in progress. `in_flight_minutes` says how long after a run last worked on a draft other runs must assume it is still at it. During that time a scheduled run leaves a draft for its commit alone, says so in an info annotation and exits 0, and no run abandons the draft. A draft with no claim at all, such as one created before claims existed, has an unknown age: the first run to see it records the time and waits out the same period before anything is done to it.
+
+Boss sets `in_flight_minutes = 0`. The whole release is one `boss-release` job, and that step has `concurrency: 1` in `mono-boss-release`, so a second release job cannot start until the first has ended. Any draft a job finds was left behind, and the next scheduled run can resume or abandon it at once. Pipelines that run `prepare`, the builds and `publish` as separate jobs keep the default of 60 minutes, because there a second build's `prepare` can start while the first build is still compiling. If `boss-release` is ever split across jobs, raise the value above the longest gap between two phases, which is the slowest build including time spent waiting for an agent.
+
+Two checks back this up for pipelines where runs can overlap. `upload` refuses a release that is already published, so a second run cannot replace verified assets. `publish` reads the release again after verifying and stops if any configured asset — required or optional, including one that appeared during the download — changed identity or presence, so what it publishes is exactly the set it verified.
+
+### Recovering by hand
+
+- **Start a build by hand** on the same commit (`boss release`, or New Build in the Buildkite UI). A manual run (`BUILDKITE_SOURCE` is `ui`/`api`) always resumes the draft for its commit, whatever the claim says, and does not use up a scheduled attempt.
+- **Force a scheduled build to resume** by setting `RELEASE_RESUME_DRAFT=1` on it. This also ignores the claim and the attempts already used.
+- **Retry the failed `boss-release` job** (`bk job retry <job-id>`). In a scheduled build this counts as one of the scheduled attempts.
+- **Upload manually** from a macOS agent checked out at the tag, after building the zip with the same `-c opt --define=BOSS_SHAKE_*` flags, then:
 
   ```sh
   bin/release upload --config tools/boss/release.toml --tag boss-v1.0.N \
@@ -174,16 +208,43 @@ release skipped: no release-affecting changes since boss-v1.0.N
 
 (If `prepare` itself fails before the Release is created, the tool deletes any tag it pushed, so a fresh run starts clean.)
 
+### November 2026 unpublished drafts
+
+Four Boss drafts were left unpublished on 2026-11-18/19. Scheduled runs then failed at `prepare` ("scheduled runs do not resume drafts automatically") until a person resumed one by hand. The table is from those job logs (`bk job log`).
+
+| Draft            | Build / agent            | Job (UTC)               | Failed phase                                             | Error                                                                                                                                                                                                                                                          |
+| ---------------- | ------------------------ | ----------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `boss-v1.0.1051` | 27411, `determinist-1`   | 11-18 23:19:04–23:19:30 | build (`bazel build -c opt //tools/boss/app-macos:Boss`) | `Lost inputs no longer available remotely` for cargo build-script outputs. Bazel retried the build five times (`Found transient remote cache error, retrying the build...`), each time hitting another lost input, then `Build did NOT complete successfully`. |
+| `boss-v1.0.1054` | 27470, `skaffen.local-2` | 11-19 02:15:56–02:51:12 | publish (verification download)                          | `gh release download … failed: stream error: stream ID 3; PROTOCOL_ERROR; received from peer`, 1,908 s after the download started                                                                                                                              |
+| `boss-v1.0.1055` | 27485, `skaffen.local-2` | 11-19 02:51:13–03:34:23 | publish (verification download)                          | same `PROTOCOL_ERROR`, stream ID 1, after 2,416 s                                                                                                                                                                                                              |
+| `boss-v1.0.1056` | 27488, `skaffen.local-2` | 11-19 03:34:23–04:08:12 | publish (verification download)                          | same `PROTOCOL_ERROR`, stream ID 1, after 1,860 s                                                                                                                                                                                                              |
+
+1054, 1055 and 1056 had already built and uploaded; both assets were on each draft. The failure was the download `publish` uses to verify the upload. Manual resume build 27498 ran on the same agent (`skaffen.local-2`) and published `boss-v1.0.1056` at 05:46 UTC; its publish phase took 258 s. Downloading those still-draft assets from another machine took 104 s, and the zip SHA-256 (`3b07f18b…7665`) matched its sidecar.
+
+The tool bug for 1054–1056: the verification download ran once, with no time limit. One stalled HTTP/2 stream held the `mono-boss-release` concurrency group for 31–40 minutes and then failed the release. `publish` now gives that download three attempts, each limited to two minutes plus the time the asset needs at 1 Mbit/s.
+
+1051 failed in the Bazel build, before any asset was uploaded: the remote cache no longer held outputs the build expected to fetch. That is a cache condition, not a release-tool or step bug, so the build flags and the Bazel invocation were left alone. Resume of that draft rebuilds from the same commit.
+
+Once 1056 existed and `main` did not move, every later scheduled run failed at `prepare` (builds 27489 and 27491–27497). 1051, 1054 and 1055 were no longer blocking a new version, because `main` had moved, but nothing cleaned them up.
+
+**Cleanup of those leftovers is the automatic abandon path**, not a one-off script:
+
+- `boss-v1.0.877` (2026-10-31), `1051`, `1054` and `1055` are older drafts behind `main`. Boss sets `in_flight_minutes = 0`, so the first Boss release cut after this change merges deletes them and lists them in the abandonment annotation. `1056` is already published.
+- `checkleft-v0.1.0-alpha.138` (2026-08-14) has no claim, and checkleft keeps the 60 minute period, so the next checkleft release dates it and the one after abandons it.
+- Appoint's leftover `v0.1.139` lives in `brianduff/appoint`, a different GitHub repository. This pipeline cannot delete it. Appoint's next release after it is running this tool abandons drafts behind its own `main` the same way; until then that draft is deleted by hand with `gh release delete` in that repository.
+
 ## Abandoning a draft release
 
-If a draft release is stuck (e.g. a persistent agent-pool or secrets problem keeps failing the build/publish) and you do not want to keep resuming it, delete the draft and its tag so the next run — scheduled or manual — computes a fresh version instead of finding the stranded draft:
+Drafts for commits that `main` has moved past are abandoned automatically, as described above. To abandon the draft for the current commit instead of resuming it (for example a persistent agent or secrets problem keeps failing the build), delete the draft and its tag:
 
 ```sh
 gh release delete boss-v1.0.N --repo spinyfin/mono --yes
 git push origin :refs/tags/boss-v1.0.N
 ```
 
-A scheduled build that finds a draft for the current `HEAD` refuses to resume it on its own; follow this section to abandon the draft and tag, so a cron tick never gets stuck retrying indefinitely. To force a scheduled build to resume a draft instead of abandoning it, set `RELEASE_RESUME_DRAFT=1` on that build.
+The next run, scheduled or manual, then finds no draft and computes a version as usual.
+
+Deleting the newest tag by hand frees its number, which the automatic path never does. If `main` moves before the next release, that number goes to a different commit, and an agent checkout that still holds the old tag then fails the tool's `git fetch --tags` with `would clobber existing tag` until the stale tag is removed there (`git tag -d boss-v1.0.N`). Abandon by hand while `main` is still at the draft's commit, or leave the draft for the next release to abandon.
 
 ---
 
@@ -192,6 +253,7 @@ A scheduled build that finds a draft for the current `HEAD` refuses to resume it
 - **Version:** `patch-counter` with literal `major_minor = "1.0"`. The next N is `highest published (or tagged) boss-v1.0.* + 1`, starting at `boss-v1.0.0` when none exist. The bump is never committed to `main`; it lives only in the tag and the GitHub Release. The release **commit** (`HEAD`) is tagged `boss-v1.0.N` _before_ Bazel runs, so `workspace-status.sh` can `git describe --exact-match` and stamp the binary with `1.0.N`.
 - **Build tool:** `bazel build -c opt --define=BOSS_SHAKE_*=... //tools/boss/app-macos:Boss`. The `.zip` path is discovered with the same flag set via `cquery` (a different configuration would resolve the credential-free `fastbuild` zip left by `mac-app-build`). `BOSS_SHAKE_*` are compile inputs and never enter the shared tool.
 - **Structure:** one Buildkite step, three tool calls (`prepare` → build → `upload` → `publish`). The release is created as a **draft** and published only after the required zip and sidecar re-download and checksum-verify.
+- **Draft recovery:** a run that fails after `prepare` leaves a draft. The next scheduled run on the same commit resumes it, at most three times, and counts the attempts on the draft; after that scheduled runs fail until a person steps in. A run on a newer commit deletes the older draft and its tag once its own exist. Each of these is reported in a build annotation.
 - **Loop prevention:** `pipeline.yml` only schedules the step on `main` + schedule/ui/api; the tool also refuses any other `BUILDKITE_SOURCE`; no commit is pushed to `main` (only a tag); and the idempotency guard no-ops any run whose `HEAD` is already the latest published release commit.
 
 ---

@@ -20,6 +20,53 @@ pub struct ReleaseConfig {
     /// Optional release assets. Uses the same `{version}` expansion as
     /// `required_assets`.
     pub optional_assets: Vec<String>,
+    /// How later runs treat a draft release that an earlier run left
+    /// unpublished. Optional; every value has a default.
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+}
+
+/// Limits on recovering a draft release that an earlier run did not publish.
+///
+/// Each phase of a run dates a claim on the draft it is working on. These two
+/// values say how long that claim keeps other runs away from the draft, and
+/// how many times scheduled runs may pick the draft up again once it lapses.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// How many times scheduled runs may resume one unpublished draft for the
+    /// commit being released. Once they are used up, scheduled runs stop
+    /// retrying and fail until a person intervenes or a newer commit replaces
+    /// the draft. `0` never resumes from a schedule.
+    #[serde(default = "default_scheduled_resume_attempts")]
+    pub scheduled_resume_attempts: u32,
+    /// Minutes after a run last worked on a draft during which other runs
+    /// assume it is still being built and leave it alone. `prepare`, `upload`
+    /// and `publish` each count as working on it, so the value must be longer
+    /// than the longest gap between two of them: the slowest build, including
+    /// any time its job spends waiting for an agent. Set it to `0` only when a
+    /// second release run cannot start before the first has finished, for
+    /// example when all three phases run in one job under a concurrency limit
+    /// of one.
+    #[serde(default = "default_in_flight_minutes")]
+    pub in_flight_minutes: u64,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            scheduled_resume_attempts: default_scheduled_resume_attempts(),
+            in_flight_minutes: default_in_flight_minutes(),
+        }
+    }
+}
+
+fn default_scheduled_resume_attempts() -> u32 {
+    3
+}
+
+fn default_in_flight_minutes() -> u64 {
+    60
 }
 
 /// Version-related values. A patch counter obtains its major/minor pair from
@@ -230,6 +277,44 @@ mod tests {
             let error = ReleaseConfig::parse(&contents).expect_err(name);
             assert!(error.to_string().contains(expected), "{name}: {error}");
         }
+    }
+
+    #[test]
+    fn recovery_limits_default_when_the_table_is_absent() {
+        let config = ReleaseConfig::parse(RELEASE_CONFIG).expect("parse fixture config");
+
+        assert_eq!(
+            config.recovery,
+            RecoveryConfig {
+                scheduled_resume_attempts: 3,
+                in_flight_minutes: 60,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_limits_can_be_set_independently() {
+        let config = ReleaseConfig::parse(&format!("{RELEASE_CONFIG}\n[recovery]\nin_flight_minutes = 0\n"))
+            .expect("parse recovery table");
+
+        assert_eq!(config.recovery.in_flight_minutes, 0);
+        assert_eq!(config.recovery.scheduled_resume_attempts, 3);
+
+        let config = ReleaseConfig::parse(&format!(
+            "{RELEASE_CONFIG}\n[recovery]\nscheduled_resume_attempts = 1\n"
+        ))
+        .expect("parse recovery table");
+
+        assert_eq!(config.recovery.scheduled_resume_attempts, 1);
+        assert_eq!(config.recovery.in_flight_minutes, 60);
+    }
+
+    #[test]
+    fn recovery_table_rejects_unknown_keys() {
+        let error = ReleaseConfig::parse(&format!("{RELEASE_CONFIG}\n[recovery]\nretries = 2\n"))
+            .expect_err("unknown recovery key should fail");
+
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     #[test]

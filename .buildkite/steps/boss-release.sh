@@ -109,9 +109,12 @@ tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 # it overrides ci-remote's --noremote_local_fallback: if the workers stop
 # answering part-way through, the remaining actions run on this agent instead
 # of failing the step. A verification step would rather fail, but by this point
-# `prepare` has pushed the tag and created the draft, and a scheduled run does
-# not resume a draft, so a failed build here needs a manual run to finish the
-# release. It does not cover an action that runs and fails.
+# `prepare` has pushed the tag and created the draft, so a failed build here
+# leaves an unpublished draft. The next scheduled run on this commit resumes
+# it, but only a limited number of times (see "Recovering from a partial
+# release" in tools/boss/docs/buildkite-release-setup.md), and each failure
+# delays the release by a schedule interval. It does not cover an action that
+# runs and fails.
 #
 # This is plain `bazel build`, not bazel_verify_only: the zip is uploaded
 # below, so it has to be downloaded to the agent.

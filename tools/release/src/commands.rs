@@ -4,19 +4,26 @@
 //! module is their narrow boundary to the checkout, GitHub CLI, and Buildkite
 //! metadata service.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use git_changelog::{
     ChangelogRenderer, ExtractionConfig, GithubMarkdownRenderer, derive_paths_from_project, extract_changelog,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir, tempdir};
 
+use crate::draft_claim::{DraftClaim, strip_claim};
+use crate::draft_recovery::{
+    HeadDraftOutcome, RecoveryContext, abandon_stale_drafts, fresh_claim, handle_head_draft, refresh_claim,
+    resolve_family_drafts,
+};
+use crate::version::matching_tag_counter;
 use crate::{
     Command, CommandOutput, CommandRunner, GitHubRelease, NotesSource, ReleaseConfig, SkipDecision, Trigger,
     assert_allowed_trigger, compute_next_version, query_release_state, should_skip,
@@ -27,14 +34,45 @@ use crate::{
 pub const BUILDKITE_TAG_KEY: &str = "release-tag";
 
 const UPLOAD_ATTEMPTS: usize = 3;
+const VERIFY_DOWNLOAD_ATTEMPTS: usize = 3;
 const VERSION_PLACEHOLDER: &str = "{version}";
+
+/// Time every verification download gets before any allowance for its size.
+const DOWNLOAD_BASE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The slowest sustained rate a verification download may run at, 1 Mbit/s,
+/// before it is treated as stalled and tried again on a new connection.
+const DOWNLOAD_MIN_BYTES_PER_SECOND: u64 = 125_000;
 
 /// The visible result of a prepare invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareOutcome {
-    Created { tag: String },
-    Resumed { tag: String },
+    Created {
+        tag: String,
+    },
+    Resumed {
+        tag: String,
+    },
+    /// An unpublished draft for this commit exists, and the run that claimed
+    /// it may still be building it. This run did nothing to it.
+    InProgress {
+        tag: String,
+    },
     Skipped,
+}
+
+/// What `prepare` is told about the run that invoked it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrepareRequest<'a> {
+    /// Buildkite's source for the build: `schedule`, `ui` or `api`.
+    pub trigger_source: &'a str,
+    pub buildkite_job_id: Option<&'a str>,
+    /// A link to the CI build. It is recorded on the draft so that a later run
+    /// can say which run left the draft behind.
+    pub build_url: Option<&'a str>,
+    /// Set from `RELEASE_RESUME_DRAFT=1`: resume a draft for this commit from a
+    /// scheduled build, whatever its claim and however many scheduled attempts
+    /// it has used.
+    pub resume_draft: bool,
 }
 
 /// A release asset supplied by a product-specific build phase.
@@ -80,14 +118,18 @@ pub fn resolve_config_path(path: &Path, bazel_workspace: Option<&Path>) -> PathB
 
 /// Performs the prepare phase: resolve state, optionally create the tag and
 /// draft, then hand the tag to later Buildkite phases.
+///
+/// An unpublished draft for this commit is resumed, waited on, or refused, and
+/// never passed over. Drafts for older commits are deleted once this run has a
+/// release of its own, so a run that skips leaves them for the next run that
+/// releases. `draft_recovery` holds the rules.
 pub fn prepare(
     runner: &impl CommandRunner,
     config: &ReleaseConfig,
-    trigger_source: &str,
-    buildkite_job_id: Option<&str>,
-    resume_draft: bool,
+    request: PrepareRequest<'_>,
 ) -> Result<PrepareOutcome> {
-    let trigger = assert_allowed_trigger(trigger_source)?;
+    let trigger = assert_allowed_trigger(request.trigger_source)?;
+    let buildkite_job_id = request.buildkite_job_id;
     fetch_tags(runner)?;
 
     let repo_root = resolve_repo_root(runner)?;
@@ -95,21 +137,31 @@ pub fn prepare(
     let state = query_release_state(runner, config, manifest_contents.as_deref())?;
     let head_sha = head_sha(runner)?;
     let last_published_sha = resolve_tag_sha(runner, config, state.last.published.as_ref())?;
-    let last_draft_sha = resolve_tag_sha(runner, config, state.last.draft.as_ref())?;
+    let drafts = resolve_family_drafts(runner, config, manifest_contents.as_deref(), &state.releases)?;
+    let recovery = RecoveryContext {
+        runner,
+        config,
+        buildkite_job_id,
+        build_url: request.build_url,
+        head_sha: &head_sha,
+        now: unix_now(runner),
+    };
 
-    if let (Some(draft), Some(draft_sha)) = (&state.last.draft, last_draft_sha.as_deref())
-        && draft_sha == head_sha
+    // Drafts are ordered from the highest counter down, so this finds the
+    // newest draft for the commit being released.
+    if let Some(draft) = drafts
+        .iter()
+        .find(|draft| draft.commit.as_deref() == Some(head_sha.as_str()))
     {
-        if trigger == Trigger::Schedule && !resume_draft {
-            bail!(
-                "release {} is an unpublished draft for HEAD; scheduled runs do not resume drafts automatically",
-                draft.tag_name
-            );
-        }
-        record_tag(runner, buildkite_job_id, &draft.tag_name)?;
-        return Ok(PrepareOutcome::Resumed {
-            tag: draft.tag_name.clone(),
-        });
+        let tag = draft.release.tag_name.clone();
+        return match handle_head_draft(&recovery, draft, trigger, request.resume_draft)? {
+            HeadDraftOutcome::LeftInProgress => Ok(PrepareOutcome::InProgress { tag }),
+            HeadDraftOutcome::Resumed => {
+                record_tag(runner, buildkite_job_id, &tag)?;
+                abandon_stale_drafts(&recovery, &drafts, &state.releases, draft.counter, &tag);
+                Ok(PrepareOutcome::Resumed { tag })
+            }
+        };
     }
 
     let changed_paths =
@@ -146,10 +198,37 @@ pub fn prepare(
             tag: &next.tag,
             version: &next.version,
             buildkite_job_id,
+            claim: &fresh_claim(&recovery),
         },
     )?;
 
+    // Only now that the new tag is on the remote is it safe to delete older
+    // ones: the next version is always computed from the highest remote tag.
+    if let Some(counter) = matching_tag_counter(
+        &config.version,
+        &config.tag_prefix,
+        manifest_contents.as_deref(),
+        &next.tag,
+    )? {
+        abandon_stale_drafts(&recovery, &drafts, &state.releases, counter, &next.tag);
+    }
+
     Ok(PrepareOutcome::Created { tag: next.tag })
+}
+
+/// Reports on the build page that `phase` failed for `tag`, whether the
+/// release is still an unpublished draft, and what will happen to it next.
+/// Does nothing outside Buildkite, where the error on stderr is the whole
+/// report.
+pub fn report_unpublished(
+    runner: &impl CommandRunner,
+    config: &ReleaseConfig,
+    buildkite_job_id: Option<&str>,
+    tag: &str,
+    phase: &str,
+    error: &anyhow::Error,
+) {
+    crate::draft_recovery::report_unpublished(runner, config, buildkite_job_id, tag, phase, error);
 }
 
 /// Reads a tag written by `prepare`.
@@ -183,7 +262,7 @@ pub fn read_tag(runner: &impl CommandRunner, buildkite_job_id: Option<&str>) -> 
     Ok(Some(tag.to_owned()))
 }
 
-/// Stages and uploads built assets and checksum sidecars for one release.
+/// Stages and uploads built assets and checksum sidecars for one draft release.
 pub fn upload(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str, assets: &[Asset]) -> Result<()> {
     if tag.is_empty() {
         bail!("release tag must not be empty");
@@ -193,6 +272,17 @@ pub fn upload(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str, as
     }
     let assets = expand_upload_assets(config, tag, assets)?;
     validate_upload_assets(config, tag, &assets)?;
+
+    // `--clobber` deletes an asset before it uploads the replacement. On a
+    // published release that would take a verified asset away from users, so
+    // uploads only ever go to a draft. A published release here means another
+    // run finished this version while this one was still building.
+    let view = view_release(runner, config, tag)
+        .with_context(|| format!("could not read release {tag} before uploading to it"))?;
+    if !view.is_draft {
+        bail!("release {tag} is already published; not replacing the assets of a published release");
+    }
+    keep_claim_fresh(runner, config, tag, &view);
 
     let stage = stage_assets(&assets)?;
     let mut args = vec!["release".to_owned(), "upload".to_owned(), tag.to_owned()];
@@ -209,7 +299,7 @@ pub fn upload(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str, as
     args.extend(["--repo".to_owned(), config.repo.clone(), "--clobber".to_owned()]);
 
     let command = Command::new("gh", args);
-    retry_upload(runner, &command)
+    retry_command(runner, &command, UPLOAD_ATTEMPTS, "asset upload", || {})
 }
 
 /// Verifies the remote assets of a draft release, then publishes it.
@@ -217,30 +307,16 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
     if tag.is_empty() {
         bail!("release tag must not be empty");
     }
-    let output = run_checked(
-        runner,
-        Command::new(
-            "gh",
-            [
-                "release".to_owned(),
-                "view".to_owned(),
-                tag.to_owned(),
-                "--repo".to_owned(),
-                config.repo.clone(),
-                "--json".to_owned(),
-                "assets".to_owned(),
-                "--jq".to_owned(),
-                ".assets[].name".to_owned(),
-            ],
-        ),
-    )
-    .with_context(|| format!("could not list assets for {tag}; leaving the release draft"))?;
-    let remote_assets = output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .collect::<HashSet<_>>();
+    let view = view_release(runner, config, tag)
+        .with_context(|| format!("could not list assets for {tag}; leaving the release draft"))?;
+    if view.is_draft {
+        keep_claim_fresh(runner, config, tag, &view);
+    }
+    let remote_assets = view
+        .assets
+        .iter()
+        .map(|asset| (asset.name.as_str(), asset))
+        .collect::<HashMap<_, _>>();
 
     let required_assets = expand_asset_list(&config.required_assets, tag, &config.tag_prefix)?;
     let optional_assets = expand_asset_list(&config.optional_assets, tag, &config.tag_prefix)?;
@@ -248,7 +324,7 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
     let mut missing = Vec::new();
     for asset in &required_assets {
         for required_name in [asset.as_str(), &format!("{asset}.sha256")] {
-            if !remote_assets.contains(required_name) {
+            if !remote_assets.contains_key(required_name) {
                 missing.push(required_name.to_owned());
             }
         }
@@ -260,11 +336,11 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
         );
     }
 
-    let mut to_verify = required_assets;
+    let mut to_verify = required_assets.clone();
     for asset in &optional_assets {
-        if remote_assets.contains(asset.as_str()) {
+        if remote_assets.contains_key(asset.as_str()) {
             let checksum = format!("{asset}.sha256");
-            if !remote_assets.contains(checksum.as_str()) {
+            if !remote_assets.contains_key(checksum.as_str()) {
                 bail!("optional asset {asset} is present without {checksum}; leaving the release draft");
             }
             to_verify.push(asset.clone());
@@ -273,24 +349,148 @@ pub fn publish(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -
 
     let stage = tempdir().context("could not create asset verification directory")?;
     for asset in &to_verify {
-        verify_remote_asset(runner, config, tag, stage.path(), asset)?;
+        let size = remote_assets.get(asset.as_str()).map_or(0, |asset| asset.size);
+        verify_remote_asset(runner, config, tag, stage.path(), asset, size)?;
     }
-    run_checked(
+
+    // Verification can take minutes. Read the release again, so that what is
+    // published is what was verified and the notes written back are the ones
+    // the release holds now. Another run that resumed this draft would have
+    // replaced an asset in the meantime, which gives it a new identity.
+    let latest = view_release(runner, config, tag).with_context(|| {
+        format!("verification passed, but {tag} could not be read again before publishing; leaving the release draft")
+    })?;
+    // Every configured asset, required or optional, including those that were
+    // absent when verification started. An optional file uploaded during the
+    // download would otherwise be published without a checksum check.
+    for asset in required_assets.iter().chain(optional_assets.iter()) {
+        for name in [asset.clone(), format!("{asset}.sha256")] {
+            let verified = remote_assets.get(name.as_str()).copied();
+            let current = latest.assets.iter().find(|asset| asset.name == name);
+            if verified != current {
+                bail!(
+                    "{name} on {tag} changed while it was being verified, so another run is uploading to this release; leaving the release draft"
+                );
+            }
+        }
+    }
+
+    let mut args = vec![
+        "release".to_owned(),
+        "edit".to_owned(),
+        tag.to_owned(),
+        "--repo".to_owned(),
+        config.repo.clone(),
+        "--draft=false".to_owned(),
+    ];
+    // The claim in a draft's notes is bookkeeping for release runs. It is
+    // removed in the same edit that publishes, so it never becomes public and
+    // a failed edit leaves the draft exactly as it was.
+    let mut notes_file = None;
+    if let Some(notes) = latest.body.as_deref().and_then(strip_claim) {
+        let mut file = NamedTempFile::new().context("could not create release-notes file")?;
+        file.write_all(notes.as_bytes())
+            .context("could not write release notes")?;
+        args.extend(["--notes-file".to_owned(), file.path().display().to_string()]);
+        notes_file = Some(file);
+    }
+    let result = run_checked(runner, Command::new("gh", args));
+    drop(notes_file);
+    result.with_context(|| format!("verification passed, but publishing {tag} failed; the release remains a draft"))?;
+    Ok(())
+}
+
+/// What `gh release view` reports about a release, draft or published.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReleaseView {
+    #[serde(default)]
+    pub assets: Vec<ReleaseViewAsset>,
+    #[serde(default)]
+    pub body: Option<String>,
+    /// The release's address in the REST API, which ends in its id.
+    #[serde(rename = "apiUrl")]
+    pub api_url: String,
+    #[serde(rename = "isDraft")]
+    pub is_draft: bool,
+}
+
+impl ReleaseView {
+    /// The id the REST API addresses the release by, or `0` when the address
+    /// does not end in one. It is read from `apiUrl` because every `gh` that
+    /// can print a release as JSON reports that field, while `databaseId`
+    /// only exists in newer versions.
+    pub(crate) fn release_id(&self) -> u64 {
+        self.api_url
+            .rsplit('/')
+            .next()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_default()
+    }
+}
+
+/// One uploaded asset. Replacing an asset gives it a new `id`, so two views
+/// that agree on every field here are looking at the same upload.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub(crate) struct ReleaseViewAsset {
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<String>,
+}
+
+/// Reads a release by tag. Unlike GitHub's lookup by tag, this finds drafts.
+pub(crate) fn view_release(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str) -> Result<ReleaseView> {
+    let output = retry_checked(
         runner,
-        Command::new(
+        &Command::new(
             "gh",
             [
                 "release".to_owned(),
-                "edit".to_owned(),
+                "view".to_owned(),
                 tag.to_owned(),
                 "--repo".to_owned(),
                 config.repo.clone(),
-                "--draft=false".to_owned(),
+                "--json".to_owned(),
+                "apiUrl,assets,body,isDraft".to_owned(),
             ],
         ),
-    )
-    .with_context(|| format!("verification passed, but publishing {tag} failed; the release remains a draft"))?;
-    Ok(())
+        UPLOAD_ATTEMPTS,
+        "release view",
+        || {},
+    )?;
+    serde_json::from_str(&output.stdout)
+        .with_context(|| format!("could not read GitHub's description of release {tag}"))
+}
+
+/// Dates the claim on a draft to now, so other runs can see that this one is
+/// working on it and neither resume nor abandon it meanwhile.
+///
+/// This is not allowed to fail the phase. A draft whose claim could not be
+/// dated is no worse protected than before the attempt, and the upload or
+/// verification that follows is the work that matters.
+fn keep_claim_fresh(runner: &impl CommandRunner, config: &ReleaseConfig, tag: &str, view: &ReleaseView) {
+    if let Err(error) = refresh_claim(
+        runner,
+        &config.repo,
+        view.release_id(),
+        tag,
+        view.body.as_deref().unwrap_or_default(),
+        unix_now(runner),
+    ) {
+        eprintln!(
+            "warning: could not record that release {tag} is being worked on; another run may take it for abandoned: {error:#}"
+        );
+    }
+}
+
+fn unix_now(runner: &impl CommandRunner) -> u64 {
+    runner
+        .now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn fetch_tags(runner: &impl CommandRunner) -> Result<()> {
@@ -336,7 +536,7 @@ fn head_sha(runner: &impl CommandRunner) -> Result<String> {
     Ok(sha.to_owned())
 }
 
-fn resolve_tag_sha(
+pub(crate) fn resolve_tag_sha(
     runner: &impl CommandRunner,
     config: &ReleaseConfig,
     release: Option<&GitHubRelease>,
@@ -370,12 +570,19 @@ fn resolve_tag_sha(
     Ok(None)
 }
 
-fn changed_paths(runner: &impl CommandRunner, from: &str, head: &str) -> Result<Vec<String>> {
+/// Fetches the rest of the history when the checkout is shallow, so that
+/// comparisons between commits see every commit between them.
+pub(crate) fn ensure_full_history(runner: &impl CommandRunner, purpose: &str) -> Result<()> {
     let shallow = run_checked(runner, Command::new("git", ["rev-parse", "--is-shallow-repository"]))?;
     if shallow.stdout.trim() == "true" {
         run_checked(runner, Command::new("git", ["fetch", "--unshallow", "origin"]))
-            .context("could not unshallow checkout before release change detection")?;
+            .with_context(|| format!("could not unshallow checkout before {purpose}"))?;
     }
+    Ok(())
+}
+
+fn changed_paths(runner: &impl CommandRunner, from: &str, head: &str) -> Result<Vec<String>> {
+    ensure_full_history(runner, "release change detection")?;
     let output = run_checked(
         runner,
         Command::new("git", ["diff", "--name-only", &format!("{from}..{head}")]),
@@ -397,6 +604,8 @@ struct DraftRequest<'a> {
     tag: &'a str,
     version: &'a str,
     buildkite_job_id: Option<&'a str>,
+    /// This run's claim on the draft, stored in its notes from the start.
+    claim: &'a DraftClaim,
 }
 
 fn create_draft(runner: &impl CommandRunner, request: DraftRequest<'_>) -> Result<()> {
@@ -432,6 +641,7 @@ fn create_draft(runner: &impl CommandRunner, request: DraftRequest<'_>) -> Resul
             request.notes_start_tag,
             request.tag,
             request.version,
+            request.claim,
         )?;
         tag_pushed = false;
         record_tag(runner, request.buildkite_job_id, request.tag)?;
@@ -450,6 +660,7 @@ fn create_release(
     notes_start_tag: Option<&str>,
     tag: &str,
     version: &str,
+    claim: &DraftClaim,
 ) -> Result<()> {
     let mut args = vec![
         "release".to_owned(),
@@ -464,7 +675,7 @@ fn create_release(
     let mut notes_file = None;
     match config.notes.source {
         NotesSource::Changelog => {
-            let notes = changelog_notes(runner, config, repo_root, notes_start_tag, tag)?;
+            let notes = claim.write_into(&changelog_notes(runner, config, repo_root, notes_start_tag, tag)?);
             let mut file = NamedTempFile::new().context("could not create release-notes file")?;
             file.write_all(notes.as_bytes())
                 .context("could not write release notes")?;
@@ -472,7 +683,11 @@ fn create_release(
             notes_file = Some(file);
         }
         NotesSource::GithubGenerated => {
-            args.extend(github_generated_notes_args(&config.title_prefix, notes_start_tag));
+            args.extend(github_generated_notes_args(
+                &config.title_prefix,
+                notes_start_tag,
+                claim,
+            ));
         }
     }
     let result = run_checked(runner, Command::new("gh", args));
@@ -486,14 +701,22 @@ fn create_release(
 /// `--generate-notes` without `--notes-start-tag` lets GitHub pick the newest
 /// release in the repository. A first release for the prefix cannot use that
 /// API without inventing a cross-tool range, so it gets a short initial note.
-fn github_generated_notes_args(title_prefix: &str, start_tag: Option<&str>) -> Vec<String> {
+///
+/// The run's claim travels in `--notes` either way. Beside `--generate-notes`
+/// GitHub places those notes ahead of the ones it generates.
+fn github_generated_notes_args(title_prefix: &str, start_tag: Option<&str>, claim: &DraftClaim) -> Vec<String> {
     match start_tag {
         Some(tag) => vec![
             "--generate-notes".to_owned(),
             "--notes-start-tag".to_owned(),
             tag.to_owned(),
+            "--notes".to_owned(),
+            claim.write_into(""),
         ],
-        None => vec!["--notes".to_owned(), initial_release_notes(title_prefix)],
+        None => vec![
+            "--notes".to_owned(),
+            claim.write_into(&initial_release_notes(title_prefix)),
+        ],
     }
 }
 
@@ -511,11 +734,7 @@ fn changelog_notes(
     let Some(from_tag) = notes_start_tag else {
         return Ok(initial_release_notes(&config.title_prefix));
     };
-    let shallow = run_checked(runner, Command::new("git", ["rev-parse", "--is-shallow-repository"]))?;
-    if shallow.stdout.trim() == "true" {
-        run_checked(runner, Command::new("git", ["fetch", "--unshallow", "origin"]))
-            .context("could not unshallow checkout before generating release notes")?;
-    }
+    ensure_full_history(runner, "generating release notes")?;
     let project = config.notes.project.as_ref().expect("validated changelog project");
     let project = repo_root.join(project);
     let paths = derive_paths_from_project(&project, repo_root)
@@ -544,7 +763,7 @@ fn record_tag(runner: &impl CommandRunner, buildkite_job_id: Option<&str>, tag: 
     Ok(())
 }
 
-fn nonempty(value: Option<&str>) -> Option<&str> {
+pub(crate) fn nonempty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.trim().is_empty())
 }
 
@@ -642,56 +861,101 @@ fn stage_assets(assets: &[Asset]) -> Result<TempDir> {
     Ok(stage)
 }
 
-fn retry_upload(runner: &impl CommandRunner, command: &Command) -> Result<()> {
+/// Runs a network transfer up to `attempts` times, waiting 15 seconds longer
+/// before each further try. `before_retry` clears whatever a failed try left
+/// behind.
+fn retry_command(
+    runner: &impl CommandRunner,
+    command: &Command,
+    attempts: usize,
+    what: &str,
+    before_retry: impl FnMut(),
+) -> Result<()> {
+    retry_checked(runner, command, attempts, what, before_retry).map(|_| ())
+}
+
+/// Like [`retry_command`], but returns the successful output.
+fn retry_checked(
+    runner: &impl CommandRunner,
+    command: &Command,
+    attempts: usize,
+    what: &str,
+    mut before_retry: impl FnMut(),
+) -> Result<CommandOutput> {
     let mut last_error = String::new();
-    for attempt in 1..=UPLOAD_ATTEMPTS {
+    for attempt in 1..=attempts {
         match runner.run(command) {
-            Ok(output) if output.success => return Ok(()),
+            Ok(output) if output.success => return Ok(output),
             Ok(output) => last_error = command_failure(command, &output),
             Err(error) => last_error = error.to_string(),
         }
-        if attempt < UPLOAD_ATTEMPTS {
+        if attempt < attempts {
             let delay = Duration::from_secs((attempt * 15) as u64);
             eprintln!(
-                "release upload attempt {attempt}/{UPLOAD_ATTEMPTS} failed: {last_error}; retrying in {} seconds",
+                "release {what} attempt {attempt}/{attempts} failed: {last_error}; retrying in {} seconds",
                 delay.as_secs()
             );
             runner.sleep(delay);
+            before_retry();
         }
     }
-    bail!("asset upload failed after {UPLOAD_ATTEMPTS} attempts: {last_error}")
+    bail!("{what} failed after {attempts} attempts: {last_error}")
 }
 
+/// How long one verification download of an asset of `size` bytes may take.
+///
+/// A download that stalls is otherwise only ended by the far side, which can
+/// take most of an hour. Bounding it by the asset's size lets a stalled
+/// attempt be dropped and retried on a new connection without cutting off a
+/// large asset on a slow link.
+fn download_timeout(size: u64) -> Duration {
+    DOWNLOAD_BASE_TIMEOUT + Duration::from_secs(size / DOWNLOAD_MIN_BYTES_PER_SECOND)
+}
+
+/// Downloads `asset` and its sidecar from the draft and compares checksums.
+///
+/// The download is bounded and retried because a failed one leaves the release
+/// unpublished. A checksum mismatch is not retried: it means the release holds
+/// the wrong bytes, which another download cannot fix.
 fn verify_remote_asset(
     runner: &impl CommandRunner,
     config: &ReleaseConfig,
     tag: &str,
     stage: &Path,
     asset: &str,
+    size: u64,
 ) -> Result<()> {
-    run_checked(
-        runner,
-        Command::new(
-            "gh",
-            [
-                "release".to_owned(),
-                "download".to_owned(),
-                tag.to_owned(),
-                "--repo".to_owned(),
-                config.repo.clone(),
-                "--dir".to_owned(),
-                stage.display().to_string(),
-                "--clobber".to_owned(),
-                "--pattern".to_owned(),
-                asset.to_owned(),
-                "--pattern".to_owned(),
-                format!("{asset}.sha256"),
-            ],
-        ),
-    )
-    .with_context(|| format!("failed to download {asset} and its sidecar from {tag}; leaving the release draft"))?;
     let asset_path = stage.join(asset);
     let sidecar_path = stage.join(format!("{asset}.sha256"));
+    let download = Command::new(
+        "gh",
+        [
+            "release".to_owned(),
+            "download".to_owned(),
+            tag.to_owned(),
+            "--repo".to_owned(),
+            config.repo.clone(),
+            "--dir".to_owned(),
+            stage.display().to_string(),
+            "--clobber".to_owned(),
+            "--pattern".to_owned(),
+            asset.to_owned(),
+            "--pattern".to_owned(),
+            format!("{asset}.sha256"),
+        ],
+    )
+    .with_timeout(download_timeout(size));
+    retry_command(
+        runner,
+        &download,
+        VERIFY_DOWNLOAD_ATTEMPTS,
+        "verification download",
+        || {
+            let _ = fs::remove_file(&asset_path);
+            let _ = fs::remove_file(&sidecar_path);
+        },
+    )
+    .with_context(|| format!("failed to download {asset} and its sidecar from {tag}; leaving the release draft"))?;
     if !asset_path.is_file() || !sidecar_path.is_file() {
         bail!("{asset} or its checksum sidecar did not download from {tag}; leaving the release draft");
     }
@@ -753,7 +1017,7 @@ fn validate_asset_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_checked(runner: &impl CommandRunner, command: Command) -> Result<CommandOutput> {
+pub(crate) fn run_checked(runner: &impl CommandRunner, command: Command) -> Result<CommandOutput> {
     let output = runner
         .run(&command)
         .map_err(|error| anyhow!("could not run {}: {error}", display_command(&command)))?;
@@ -781,7 +1045,7 @@ fn display_command(command: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
     use super::*;
@@ -802,6 +1066,60 @@ major_minor = "1.0"
 [notes]
 source = "github-generated"
 "#;
+
+    /// The claim a fixture run records: made at `NOW`, by no known build.
+    const FIXTURE_CLAIM: &str = "<!-- release-tool: claimed-at=1800000000 scheduled-resumes=0 -->";
+
+    fn request<'a>(trigger_source: &'a str, buildkite_job_id: Option<&'a str>) -> PrepareRequest<'a> {
+        PrepareRequest {
+            trigger_source,
+            buildkite_job_id,
+            ..PrepareRequest::default()
+        }
+    }
+
+    /// `gh release view` output for a draft holding `assets`, each a few
+    /// bytes long, and `notes`.
+    fn release_view(assets: &[&str], notes: &str) -> FixtureResponse {
+        success(&view_json(assets, notes, true, 1).to_string())
+    }
+
+    /// `upload` counts as a new generation of an asset: it changes the id.
+    fn view_json(assets: &[&str], notes: &str, draft: bool, generation: u32) -> serde_json::Value {
+        let assets = assets
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "size": 24,
+                    "id": format!("{name}-upload-{generation}"),
+                    "updatedAt": "2026-11-19T00:00:00Z",
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "apiUrl": "https://api.github.com/repos/example/project/releases/7",
+            "assets": assets,
+            "body": notes,
+            "isDraft": draft,
+        })
+    }
+
+    /// What a publish of a draft asks for, in order, when nothing goes wrong:
+    /// the release, the claim write, the release again, and the edit.
+    fn publish_responses(assets: &[&str], notes: &str) -> [FixtureResponse; 4] {
+        [
+            release_view(assets, notes),
+            success(""),
+            release_view(assets, notes),
+            success(""),
+        ]
+    }
+
+    fn is_claim_write(call: &Command) -> bool {
+        call.args
+            .starts_with(&["api", "-X", "PATCH", "repos/example/project/releases/7"].map(str::to_owned))
+    }
 
     const CHANGELOG_CONFIG: &str = r#"
 repo = "example/project"
@@ -838,8 +1156,13 @@ project = "tool/PROJECT.yaml"
         calls: RefCell<Vec<Command>>,
         sleeps: RefCell<Vec<Duration>>,
         download: DownloadMaterialize,
+        /// Downloads that fail before the materialized ones start succeeding.
+        download_failures: Cell<usize>,
         notes_file: RefCell<Option<String>>,
     }
+
+    /// The fixed time fixtures report, so claims in notes are predictable.
+    const NOW: u64 = 1_800_000_000;
 
     impl FixtureRunner {
         fn new(responses: impl IntoIterator<Item = FixtureResponse>) -> Self {
@@ -848,8 +1171,14 @@ project = "tool/PROJECT.yaml"
                 calls: RefCell::new(Vec::new()),
                 sleeps: RefCell::new(Vec::new()),
                 download: DownloadMaterialize::None,
+                download_failures: Cell::new(0),
                 notes_file: RefCell::new(None),
             }
+        }
+
+        fn failing_the_first_downloads(self, count: usize) -> Self {
+            self.download_failures.set(count);
+            self
         }
 
         fn with_matching_download(mut self) -> Self {
@@ -878,6 +1207,10 @@ project = "tool/PROJECT.yaml"
                 && command.program == "gh"
                 && command.args.starts_with(&["release".to_owned(), "download".to_owned()])
             {
+                if self.download_failures.get() > 0 {
+                    self.download_failures.set(self.download_failures.get() - 1);
+                    return failure("stream error: stream ID 1; PROTOCOL_ERROR; received from peer");
+                }
                 materialize_download(command, self.download);
                 return success("");
             }
@@ -889,6 +1222,10 @@ project = "tool/PROJECT.yaml"
 
         fn sleep(&self, duration: Duration) {
             self.sleeps.borrow_mut().push(duration);
+        }
+
+        fn now(&self) -> std::time::SystemTime {
+            UNIX_EPOCH + Duration::from_secs(NOW)
         }
     }
 
@@ -986,19 +1323,71 @@ project = "tool/PROJECT.yaml"
             "ff7a5e6429d2c8511521e4abf41cd54a3e525ef4a1f24f8d1c67ede9d17874dd  demo-linux\n"
         );
 
-        let runner = FixtureRunner::new([success("")]);
+        let runner = FixtureRunner::new([release_view(&[], "notes\n"), success(""), success("")]);
 
         upload(&runner, &config, "demo-v1.0.0", &[asset]).expect("upload");
 
         let calls = runner.calls.into_inner();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].program, "gh");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].args[0..2], ["release", "view"]);
         assert!(
-            calls[0]
+            is_claim_write(&calls[1]),
+            "the claim is dated before the upload starts: {calls:?}"
+        );
+        assert_eq!(calls[2].program, "gh");
+        assert_eq!(calls[2].args[0..2], ["release", "upload"]);
+        assert!(
+            calls[2]
                 .args
                 .ends_with(&["--repo", "example/project", "--clobber"].map(str::to_owned))
         );
-        assert!(calls[0].args.iter().any(|arg| arg.ends_with("demo-linux.sha256")));
+        assert!(calls[2].args.iter().any(|arg| arg.ends_with("demo-linux.sha256")));
+    }
+
+    #[test]
+    fn upload_does_not_replace_the_assets_of_a_published_release() {
+        let source_dir = tempdir().expect("source dir");
+        let source = source_dir.path().join("binary");
+        fs::write(&source, b"release bytes").expect("write source");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let published = view_json(&["demo-linux", "demo-linux.sha256"], "notes\n", false, 1);
+        let runner = FixtureRunner::new([success(&published.to_string())]);
+
+        let error = upload(
+            &runner,
+            &config,
+            "demo-v1.0.0",
+            &[Asset {
+                name: "demo-linux".to_owned(),
+                source,
+            }],
+        )
+        .expect_err("a published release keeps its verified assets");
+
+        assert!(error.to_string().contains("already published"), "{error:#}");
+        assert_eq!(runner.calls.borrow().len(), 1, "nothing was written or uploaded");
+    }
+
+    #[test]
+    fn upload_goes_ahead_when_the_claim_cannot_be_dated() {
+        let source_dir = tempdir().expect("source dir");
+        let source = source_dir.path().join("binary");
+        fs::write(&source, b"release bytes").expect("write source");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([release_view(&[], "notes\n"), failure("HTTP 502"), success("")]);
+
+        upload(
+            &runner,
+            &config,
+            "demo-v1.0.0",
+            &[Asset {
+                name: "demo-linux".to_owned(),
+                source,
+            }],
+        )
+        .expect("bookkeeping does not fail an upload");
+
+        assert_eq!(runner.calls.borrow().len(), 3);
     }
 
     #[test]
@@ -1007,7 +1396,13 @@ project = "tool/PROJECT.yaml"
         let source = source_dir.path().join("binary");
         fs::write(&source, b"release bytes").expect("write source");
         let config = ReleaseConfig::parse(CONFIG).expect("config");
-        let runner = FixtureRunner::new([failure("first"), failure("second"), failure("third")]);
+        let runner = FixtureRunner::new([
+            release_view(&[], "notes\n"),
+            success(""),
+            failure("first"),
+            failure("second"),
+            failure("third"),
+        ]);
 
         let error = upload(
             &runner,
@@ -1021,7 +1416,7 @@ project = "tool/PROJECT.yaml"
         .expect_err("all retries fail");
 
         assert!(error.to_string().contains("after 3 attempts"), "{error:#}");
-        assert_eq!(runner.calls.borrow().len(), 3);
+        assert_eq!(runner.calls.borrow().len(), 5);
         assert_eq!(
             *runner.sleeps.borrow(),
             vec![Duration::from_secs(15), Duration::from_secs(30)]
@@ -1065,7 +1460,7 @@ source = "github-generated"
         let source = source_dir.path().join("binary");
         fs::write(&source, b"release bytes").expect("write source");
         let config = ReleaseConfig::parse(BOSS_CONFIG).expect("config");
-        let runner = FixtureRunner::new([success("")]);
+        let runner = FixtureRunner::new([release_view(&[], "notes\n"), success(""), success("")]);
 
         upload(
             &runner,
@@ -1080,17 +1475,17 @@ source = "github-generated"
 
         let calls = runner.calls.into_inner();
         assert!(
-            calls[0].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip")),
+            calls[2].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip")),
             "{:?}",
-            calls[0].args
+            calls[2].args
         );
         assert!(
-            calls[0].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip.sha256")),
+            calls[2].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip.sha256")),
             "{:?}",
-            calls[0].args
+            calls[2].args
         );
 
-        let runner = FixtureRunner::new([success("")]);
+        let runner = FixtureRunner::new([release_view(&[], "notes\n"), success(""), success("")]);
         upload(
             &runner,
             &config,
@@ -1102,26 +1497,29 @@ source = "github-generated"
         )
         .expect("already-expanded CLI name");
         let calls = runner.calls.into_inner();
-        assert!(calls[0].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip")));
+        assert!(calls[2].args.iter().any(|arg| arg.ends_with("Boss-1.0.10.zip")));
     }
 
     #[test]
     fn publish_verifies_the_expanded_versioned_asset_name() {
         let config = ReleaseConfig::parse(BOSS_CONFIG).expect("config");
-        let runner = FixtureRunner::new([success("Boss-1.0.10.zip\nBoss-1.0.10.zip.sha256\n"), success("")])
-            .with_matching_download();
+        let runner = FixtureRunner::new(publish_responses(
+            &["Boss-1.0.10.zip", "Boss-1.0.10.zip.sha256"],
+            "notes\n",
+        ))
+        .with_matching_download();
 
         publish(&runner, &config, "boss-v1.0.10").expect("publish versioned zip");
 
         let calls = runner.calls.into_inner();
-        assert_eq!(calls[1].args[0..2], ["release", "download"]);
+        assert_eq!(calls[2].args[0..2], ["release", "download"]);
         assert!(
-            calls[1]
+            calls[2]
                 .args
                 .windows(2)
                 .any(|window| window == ["--pattern", "Boss-1.0.10.zip"]),
             "{:?}",
-            calls[1].args
+            calls[2].args
         );
     }
 
@@ -1143,7 +1541,7 @@ source = "github-generated"
             success(""),
         ]);
 
-        let outcome = prepare(&runner, &config, "ui", Some("job-1"), false).expect("prepare");
+        let outcome = prepare(&runner, &config, request("ui", Some("job-1"))).expect("prepare");
 
         assert_eq!(
             outcome,
@@ -1157,10 +1555,13 @@ source = "github-generated"
             create.contains(&"--notes".to_owned()),
             "first release must not let GitHub infer a previous tag: {create:?}"
         );
+        let notes = &create[create.iter().position(|arg| arg == "--notes").expect("notes flag") + 1];
         assert_eq!(
-            create[create.iter().position(|arg| arg == "--notes").expect("notes flag") + 1],
-            "Initial Demo release.\n"
+            notes,
+            &format!("Initial Demo release.\n\n{FIXTURE_CLAIM}\n"),
+            "a new draft carries its run's claim from the moment it exists"
         );
+        assert_eq!(strip_claim(notes).as_deref(), Some("Initial Demo release.\n"));
         assert!(
             !create
                 .iter()
@@ -1180,13 +1581,26 @@ source = "github-generated"
 
     #[test]
     fn github_generated_notes_use_an_explicit_prefix_start_tag() {
+        let claim = DraftClaim {
+            claimed_at: NOW,
+            scheduled_resumes: 0,
+            build_url: None,
+        };
+
         assert_eq!(
-            github_generated_notes_args("checkleft", Some("checkleft-v0.1.0-alpha.122")),
-            ["--generate-notes", "--notes-start-tag", "checkleft-v0.1.0-alpha.122"].map(str::to_owned)
+            github_generated_notes_args("checkleft", Some("checkleft-v0.1.0-alpha.122"), &claim),
+            [
+                "--generate-notes",
+                "--notes-start-tag",
+                "checkleft-v0.1.0-alpha.122",
+                "--notes",
+                &format!("{FIXTURE_CLAIM}\n"),
+            ]
+            .map(str::to_owned)
         );
         assert_eq!(
-            github_generated_notes_args("release", None),
-            ["--notes", "Initial release release.\n"].map(str::to_owned)
+            github_generated_notes_args("release", None, &claim),
+            ["--notes", &format!("Initial release release.\n\n{FIXTURE_CLAIM}\n")].map(str::to_owned)
         );
     }
 
@@ -1211,7 +1625,7 @@ source = "github-generated"
             success(""),
         ]);
 
-        let outcome = prepare(&runner, &config, "ui", Some("job-1"), false).expect("prepare");
+        let outcome = prepare(&runner, &config, request("ui", Some("job-1"))).expect("prepare");
 
         assert_eq!(
             outcome,
@@ -1251,7 +1665,7 @@ source = "github-generated"
             success(""),
         ]);
 
-        let outcome = prepare(&runner, &config, "ui", Some("job-1"), false).expect("prepare");
+        let outcome = prepare(&runner, &config, request("ui", Some("job-1"))).expect("prepare");
 
         assert_eq!(
             outcome,
@@ -1265,11 +1679,13 @@ source = "github-generated"
             create.contains(&"--notes-file".to_owned()),
             "changelog notes are passed as a file: {create:?}"
         );
+        let notes = runner.notes_file.into_inner().expect("captured notes");
         assert_eq!(
-            runner.notes_file.into_inner().as_deref(),
+            strip_claim(&notes).as_deref(),
             Some("Initial Demo release.\n"),
             "a prefix with no prior published tag must not invent a changelog range"
         );
+        assert!(notes.ends_with(&format!("{FIXTURE_CLAIM}\n")), "{notes}");
     }
 
     #[test]
@@ -1294,7 +1710,7 @@ source = "github-generated"
             success(""),
         ]);
 
-        let outcome = prepare(&runner, &config, "ui", Some("job-1"), false).expect("prepare");
+        let outcome = prepare(&runner, &config, request("ui", Some("job-1"))).expect("prepare");
 
         assert_eq!(
             outcome,
@@ -1338,7 +1754,7 @@ source = "github-generated"
             success(""),
         ]);
 
-        prepare(&runner, &config, "ui", None, false).expect_err("release create fails");
+        prepare(&runner, &config, request("ui", None)).expect_err("release create fails");
 
         let calls = runner.calls.into_inner();
         assert!(
@@ -1354,21 +1770,23 @@ source = "github-generated"
     }
 
     #[test]
-    fn manual_prepare_resumes_a_draft_for_head_but_a_schedule_refuses_it() {
+    fn manual_prepare_resumes_a_draft_for_head_and_claims_it() {
         let config = ReleaseConfig::parse(CONFIG).expect("config");
         let root = tempdir().expect("repo root");
-        let responses = [
+        let runner = FixtureRunner::new([
             success(""),
             repo_root_response(root.path()),
-            success(r#"[{"tag_name":"demo-v1.0.0","draft":true}]"#),
+            success(r#"[{"id":7,"tag_name":"demo-v1.0.0","draft":true,"body":"notes\n"}]"#),
             success("head refs/tags/demo-v1.0.0\n"),
             success("head\n"),
             success("head\n"),
+            // The draft is read again before its notes are written.
+            success(r#"{"id":7,"tag_name":"demo-v1.0.0","draft":true,"body":"notes\n"}"#),
             success(""),
-        ];
-        let runner = FixtureRunner::new(responses);
+            success(""),
+        ]);
 
-        let outcome = prepare(&runner, &config, "ui", Some("job-1"), false).expect("manual resume");
+        let outcome = prepare(&runner, &config, request("ui", Some("job-1"))).expect("manual resume");
 
         assert_eq!(
             outcome,
@@ -1376,45 +1794,49 @@ source = "github-generated"
                 tag: "demo-v1.0.0".to_owned()
             }
         );
+        let calls = runner.calls.into_inner();
         assert!(
-            runner
-                .calls
-                .borrow()
+            calls.iter().any(|call| call
+                .args
+                .starts_with(&["api", "-X", "PATCH", "repos/example/project/releases/7"].map(str::to_owned))),
+            "the resuming run records its claim on the draft: {calls:?}"
+        );
+        assert!(
+            calls
                 .iter()
                 .any(|call| { call.args == ["meta-data", "set", BUILDKITE_TAG_KEY, "demo-v1.0.0"].map(str::to_owned) })
         );
-
-        let schedule_runner = FixtureRunner::new([
-            success(""),
-            repo_root_response(root.path()),
-            success(r#"[{"tag_name":"demo-v1.0.0","draft":true}]"#),
-            success("head refs/tags/demo-v1.0.0\n"),
-            success("head\n"),
-            success("head\n"),
-        ]);
-        let error = prepare(&schedule_runner, &config, "schedule", None, false)
-            .expect_err("scheduled prepare must not resume a draft");
-
         assert!(
-            error.to_string().contains("do not resume drafts automatically"),
-            "{error:#}"
+            !calls
+                .iter()
+                .any(|call| call.args.first().is_some_and(|arg| arg == "annotate")),
+            "a resume a person asked for needs no warning on the build page: {calls:?}"
         );
     }
 
     #[test]
     fn publish_verifies_the_downloaded_required_asset_before_editing_the_release() {
         let config = ReleaseConfig::parse(CONFIG).expect("config");
-        let runner =
-            FixtureRunner::new([success("demo-linux\ndemo-linux.sha256\n"), success("")]).with_matching_download();
+        let runner = FixtureRunner::new(publish_responses(&["demo-linux", "demo-linux.sha256"], "notes\n"))
+            .with_matching_download();
 
         publish(&runner, &config, "demo-v1.0.0").expect("publish verified release");
 
         let calls = runner.calls.into_inner();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 5);
         assert_eq!(calls[0].args[0..2], ["release", "view"]);
-        assert_eq!(calls[1].args[0..2], ["release", "download"]);
+        assert!(
+            is_claim_write(&calls[1]),
+            "the claim is dated before verification starts: {calls:?}"
+        );
+        assert_eq!(calls[2].args[0..2], ["release", "download"]);
         assert_eq!(
-            calls[2].args,
+            calls[3].args[0..2],
+            ["release", "view"],
+            "the release is read again once verification is done"
+        );
+        assert_eq!(
+            calls[4].args,
             [
                 "release",
                 "edit",
@@ -1430,19 +1852,23 @@ source = "github-generated"
     #[test]
     fn publish_leaves_the_release_draft_when_a_required_asset_is_missing() {
         let config = ReleaseConfig::parse(CONFIG).expect("config");
-        let runner = FixtureRunner::new([success("demo-linux\n")]);
+        let runner = FixtureRunner::new([release_view(&["demo-linux"], "notes\n"), success("")]);
 
         let error = publish(&runner, &config, "demo-v1.0.0").expect_err("missing sidecar blocks publish");
 
         assert!(error.to_string().contains("demo-linux.sha256"), "{error:#}");
-        assert_eq!(runner.calls.borrow().len(), 1);
+        assert_eq!(runner.calls.borrow().len(), 2);
         assert!(!published_draft(&runner));
     }
 
     #[test]
     fn publish_leaves_the_release_draft_on_checksum_mismatch() {
         let config = ReleaseConfig::parse(CONFIG).expect("config");
-        let runner = FixtureRunner::new([success("demo-linux\ndemo-linux.sha256\n")]).with_mismatched_download();
+        let runner = FixtureRunner::new([
+            release_view(&["demo-linux", "demo-linux.sha256"], "notes\n"),
+            success(""),
+        ])
+        .with_mismatched_download();
 
         let error = publish(&runner, &config, "demo-v1.0.0").expect_err("checksum mismatch blocks publish");
 
@@ -1453,14 +1879,310 @@ source = "github-generated"
     #[test]
     fn publish_leaves_the_release_draft_when_optional_asset_lacks_sidecar() {
         let config = ReleaseConfig::parse(CONFIG).expect("config");
-        let runner = FixtureRunner::new([success("demo-linux\ndemo-linux.sha256\ndemo-darwin\n")]);
+        let runner = FixtureRunner::new([
+            release_view(&["demo-linux", "demo-linux.sha256", "demo-darwin"], "notes\n"),
+            success(""),
+        ]);
 
         let error =
             publish(&runner, &config, "demo-v1.0.0").expect_err("optional asset without sidecar blocks publish");
 
         assert!(error.to_string().contains("without demo-darwin.sha256"), "{error:#}");
-        assert_eq!(runner.calls.borrow().len(), 1);
+        assert_eq!(runner.calls.borrow().len(), 2);
         assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn publish_retries_a_failed_verification_download_before_giving_up_on_the_release() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new(publish_responses(&["demo-linux", "demo-linux.sha256"], "notes\n"))
+            .with_matching_download()
+            .failing_the_first_downloads(2);
+
+        publish(&runner, &config, "demo-v1.0.0").expect("the third download verifies and publishes");
+
+        let downloads = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.args.starts_with(&["release".to_owned(), "download".to_owned()]))
+            .count();
+        assert_eq!(downloads, 3);
+        assert_eq!(
+            *runner.sleeps.borrow(),
+            vec![Duration::from_secs(15), Duration::from_secs(30)]
+        );
+        assert!(published_draft(&runner));
+    }
+
+    #[test]
+    fn publish_leaves_the_release_draft_when_every_verification_download_fails() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            release_view(&["demo-linux", "demo-linux.sha256"], "notes\n"),
+            success(""),
+        ])
+        .with_matching_download()
+        .failing_the_first_downloads(3);
+
+        let error = publish(&runner, &config, "demo-v1.0.0").expect_err("an unverified release must stay a draft");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("failed after 3 attempts"), "{rendered}");
+        assert!(rendered.contains("PROTOCOL_ERROR"), "{rendered}");
+        assert!(rendered.contains("leaving the release draft"), "{rendered}");
+        assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn verification_downloads_are_bounded_by_the_size_of_the_asset() {
+        assert_eq!(download_timeout(0), Duration::from_secs(120));
+        // A 64.6 MB Boss.app zip: two minutes plus the time 1 Mbit/s needs.
+        assert_eq!(download_timeout(64_606_777), Duration::from_secs(120 + 516));
+
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let view = serde_json::json!({
+            "assets": [{ "name": "demo-linux", "size": 1_250_000 }, { "name": "demo-linux.sha256", "size": 84 }],
+            "body": "notes\n",
+            "apiUrl": "https://api.github.com/repos/example/project/releases/7",
+            "isDraft": true,
+        })
+        .to_string();
+        let runner =
+            FixtureRunner::new([success(&view), success(""), success(&view), success("")]).with_matching_download();
+
+        publish(&runner, &config, "demo-v1.0.0").expect("publish");
+
+        let calls = runner.calls.into_inner();
+        assert_eq!(calls[2].args[0..2], ["release", "download"]);
+        assert_eq!(calls[2].timeout, Some(Duration::from_secs(130)));
+        assert!(
+            calls
+                .iter()
+                .enumerate()
+                .all(|(index, call)| index == 2 || call.timeout.is_none()),
+            "only the transfer is bounded: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn publish_removes_the_claim_from_the_notes_in_the_edit_that_publishes() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let notes = format!("## Changes\n\n* one\n\n{FIXTURE_CLAIM}\n");
+        // Notes edited while the assets were being verified must survive: the
+        // edit that publishes starts from the notes as read just before it.
+        let edited = format!("## Changes\n\n* one\n* two\n\n{FIXTURE_CLAIM}\n");
+        let runner = FixtureRunner::new([
+            release_view(&["demo-linux", "demo-linux.sha256"], &notes),
+            success(""),
+            release_view(&["demo-linux", "demo-linux.sha256"], &edited),
+            success(""),
+        ])
+        .with_matching_download();
+
+        publish(&runner, &config, "demo-v1.0.0").expect("publish");
+
+        assert_eq!(
+            runner.notes_file.borrow().as_deref(),
+            Some("## Changes\n\n* one\n* two\n"),
+            "the published notes are the latest notes without the claim"
+        );
+        let calls = runner.calls.into_inner();
+        let edit = calls.last().expect("edit call");
+        assert_eq!(
+            edit.args[..6],
+            [
+                "release",
+                "edit",
+                "demo-v1.0.0",
+                "--repo",
+                "example/project",
+                "--draft=false"
+            ]
+            .map(str::to_owned)
+        );
+        assert_eq!(edit.args[6], "--notes-file");
+        assert_eq!(edit.args.len(), 8);
+    }
+
+    #[test]
+    fn publish_reports_an_unreadable_asset_list_instead_of_publishing() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([success("demo-linux\ndemo-linux.sha256\n")]);
+
+        let error = publish(&runner, &config, "demo-v1.0.0").expect_err("a list that cannot be read blocks publish");
+
+        assert!(
+            format!("{error:#}").contains("could not list assets for demo-v1.0.0"),
+            "{error:#}"
+        );
+        assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn the_release_id_is_read_from_the_address_every_gh_version_reports() {
+        let view: ReleaseView = serde_json::from_value(view_json(&[], "notes\n", true, 1)).expect("view");
+        assert_eq!(view.release_id(), 7);
+
+        let odd: ReleaseView = serde_json::from_value(serde_json::json!({
+            "apiUrl": "https://api.github.com/repos/example/project/releases/latest",
+            "isDraft": true,
+        }))
+        .expect("view");
+        assert_eq!(odd.release_id(), 0, "an address without an id is not guessed at");
+    }
+
+    #[test]
+    fn publish_stops_when_an_asset_is_replaced_while_it_is_being_verified() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let assets = ["demo-linux", "demo-linux.sha256"];
+        let runner = FixtureRunner::new([
+            success(&view_json(&assets, "notes\n", true, 1).to_string()),
+            success(""),
+            success(&view_json(&assets, "notes\n", true, 2).to_string()),
+        ])
+        .with_matching_download();
+
+        let error = publish(&runner, &config, "demo-v1.0.0")
+            .expect_err("bytes that were not the ones verified must not be published");
+
+        assert!(
+            error.to_string().contains("changed while it was being verified"),
+            "{error:#}"
+        );
+        assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn publish_leaves_the_release_draft_when_an_optional_asset_appears_during_verification() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let required = ["demo-linux", "demo-linux.sha256"];
+        let with_optional = ["demo-linux", "demo-linux.sha256", "demo-darwin", "demo-darwin.sha256"];
+        let runner = FixtureRunner::new([
+            success(&view_json(&required, "notes\n", true, 1).to_string()),
+            success(""),
+            success(&view_json(&with_optional, "notes\n", true, 1).to_string()),
+        ])
+        .with_matching_download();
+
+        let error = publish(&runner, &config, "demo-v1.0.0")
+            .expect_err("an optional asset that was not verified must not be published");
+
+        assert!(
+            error
+                .to_string()
+                .contains("demo-darwin on demo-v1.0.0 changed while it was being verified"),
+            "{error:#}"
+        );
+        assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn publish_leaves_the_release_draft_when_an_optional_asset_appears_without_its_sidecar() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let required = ["demo-linux", "demo-linux.sha256"];
+        let optional_alone = ["demo-linux", "demo-linux.sha256", "demo-darwin"];
+        let runner = FixtureRunner::new([
+            success(&view_json(&required, "notes\n", true, 1).to_string()),
+            success(""),
+            success(&view_json(&optional_alone, "notes\n", true, 1).to_string()),
+        ])
+        .with_matching_download();
+
+        let error = publish(&runner, &config, "demo-v1.0.0")
+            .expect_err("an optional asset without a sidecar must not be published");
+
+        assert!(
+            error
+                .to_string()
+                .contains("demo-darwin on demo-v1.0.0 changed while it was being verified"),
+            "{error:#}"
+        );
+        assert!(!published_draft(&runner));
+    }
+
+    #[test]
+    fn upload_retries_a_failed_release_view() {
+        let source_dir = tempdir().expect("source dir");
+        let source = source_dir.path().join("binary");
+        fs::write(&source, b"release bytes").expect("write source");
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let runner = FixtureRunner::new([
+            failure("HTTP 502"),
+            release_view(&[], "notes\n"),
+            success(""),
+            success(""),
+        ]);
+
+        upload(
+            &runner,
+            &config,
+            "demo-v1.0.0",
+            &[Asset {
+                name: "demo-linux".to_owned(),
+                source,
+            }],
+        )
+        .expect("the second view succeeds");
+
+        let views = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.args.starts_with(&["release".to_owned(), "view".to_owned()]))
+            .count();
+        assert_eq!(views, 2);
+        assert_eq!(*runner.sleeps.borrow(), vec![Duration::from_secs(15)]);
+        assert!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.args.starts_with(&["release".to_owned(), "upload".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn publish_retries_a_failed_release_view() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let assets = ["demo-linux", "demo-linux.sha256"];
+        let runner = FixtureRunner::new([
+            failure("HTTP 502"),
+            release_view(&assets, "notes\n"),
+            success(""),
+            release_view(&assets, "notes\n"),
+            success(""),
+        ])
+        .with_matching_download();
+
+        publish(&runner, &config, "demo-v1.0.0").expect("the second view succeeds");
+
+        let views = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.args.starts_with(&["release".to_owned(), "view".to_owned()]))
+            .count();
+        assert_eq!(views, 3, "one retried view before verification, one after");
+        assert_eq!(*runner.sleeps.borrow(), vec![Duration::from_secs(15)]);
+        assert!(published_draft(&runner));
+    }
+
+    #[test]
+    fn publishing_a_release_that_is_already_published_writes_no_claim() {
+        let config = ReleaseConfig::parse(CONFIG).expect("config");
+        let published = view_json(&["demo-linux", "demo-linux.sha256"], "notes\n", false, 1).to_string();
+        let runner =
+            FixtureRunner::new([success(&published), success(&published), success("")]).with_matching_download();
+
+        publish(&runner, &config, "demo-v1.0.0").expect("a second publish verifies and changes nothing");
+
+        let calls = runner.calls.into_inner();
+        assert!(
+            !calls.iter().any(is_claim_write),
+            "published notes are not touched: {calls:?}"
+        );
+        assert_eq!(calls.last().expect("edit").args.len(), 6, "no notes are rewritten");
     }
 
     #[test]
