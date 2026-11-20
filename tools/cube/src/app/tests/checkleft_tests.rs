@@ -1,8 +1,24 @@
+use std::path::PathBuf;
+
 use tempfile::TempDir;
 
 use super::support::ENV_MUTEX;
 use crate::app::checkleft_gate::{resolve_checkleft_bin, resolve_checkleft_bin_with_env, run_checkleft_gate_impl};
 use crate::app::errors::CubeError;
+
+/// Run a freshly written script through `/bin/sh`.
+///
+/// A parallel test's `fork` can inherit the write descriptor of a script this
+/// process just created; Linux then fails `execve` of that file with ETXTBSY
+/// and the gate fail-opens. `/bin/sh` reads the script instead of mapping it
+/// as the executable image, so that race cannot skip the gate.
+fn through_sh(resolved: Option<Vec<PathBuf>>) -> Option<Vec<PathBuf>> {
+    resolved.map(|argv| {
+        let mut cmd = vec![PathBuf::from("/bin/sh")];
+        cmd.extend(argv);
+        cmd
+    })
+}
 
 /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
 /// prints `stdout` and exits with `exit_code`.
@@ -133,7 +149,7 @@ fn checkleft_gate_is_skipped_when_no_checkleft_anywhere() {
 fn checkleft_gate_proceeds_when_checkleft_clean() {
     let dir = TempDir::new().unwrap();
     write_fake_checkleft(dir.path(), 0, "checks: no findings");
-    let checkleft = Some(vec![dir.path().join("bin").join("checkleft")]);
+    let checkleft = through_sh(Some(vec![dir.path().join("bin").join("checkleft")]));
     assert!(
         run_checkleft_gate_impl(dir.path(), checkleft, None).is_ok(),
         "gate must proceed when checkleft exits 0",
@@ -144,7 +160,7 @@ fn checkleft_gate_proceeds_when_checkleft_clean() {
 fn checkleft_gate_refuses_with_findings_when_checkleft_fails() {
     let dir = TempDir::new().unwrap();
     write_fake_checkleft(dir.path(), 1, "error[rustfmt]: file needs formatting");
-    let checkleft = Some(vec![dir.path().join("bin").join("checkleft")]);
+    let checkleft = through_sh(Some(vec![dir.path().join("bin").join("checkleft")]));
     let err = run_checkleft_gate_impl(dir.path(), checkleft, None)
         .expect_err("gate must refuse when checkleft exits non-zero");
     let CubeError::InvalidArgument(msg) = err else {
@@ -172,8 +188,9 @@ fn checkleft_gate_uses_path_fallback_and_blocks_on_errors() {
         "PATH fallback must resolve the fake checkleft from the prepended dir",
     );
 
-    // Gate execution is independent of PATH; inject the resolved binary.
-    let err = run_checkleft_gate_impl(workspace.path(), resolved, None)
+    // Gate execution is independent of PATH; inject the resolved binary
+    // through `/bin/sh` so a parallel fork cannot ETXTBSY-skip the gate.
+    let err = run_checkleft_gate_impl(workspace.path(), through_sh(resolved), None)
         .expect_err("gate must block when PATH checkleft reports errors");
     let CubeError::InvalidArgument(msg) = err else {
         panic!("expected InvalidArgument, got {err:?}");
@@ -192,7 +209,7 @@ fn checkleft_gate_reports_internal_error_when_only_stderr() {
     // prevents users from thinking they have policy violations to fix.
     let dir = TempDir::new().unwrap();
     write_fake_checkleft_stderr_only(dir.path(), 1, "error: unsupported jj diff summary line: X some/file.rs");
-    let checkleft = Some(vec![dir.path().join("bin").join("checkleft")]);
+    let checkleft = through_sh(Some(vec![dir.path().join("bin").join("checkleft")]));
     let err = run_checkleft_gate_impl(dir.path(), checkleft, None)
         .expect_err("gate must block when checkleft exits non-zero");
     let CubeError::InvalidArgument(msg) = err else {
@@ -236,9 +253,7 @@ fn checkleft_gate_exports_pr_description_to_checkleft_subprocess() {
     // that env var at its highest precedence.
     let dir = TempDir::new().unwrap();
     write_fake_checkleft_env_echo(dir.path());
-    // Read the fixture through the shell: a parallel fork can briefly inherit
-    // its write descriptor and make direct script execution fail with ETXTBSY.
-    let checkleft = Some(vec!["/bin/sh".into(), dir.path().join("bin").join("checkleft")]);
+    let checkleft = through_sh(Some(vec![dir.path().join("bin").join("checkleft")]));
     let err = run_checkleft_gate_impl(dir.path(), checkleft, Some("PR body mentioning T1234"))
         .expect_err("fake checkleft always exits 1");
     let CubeError::InvalidArgument(msg) = err else {
@@ -269,9 +284,7 @@ fn checkleft_gate_leaves_pr_description_unset_when_none() {
 
     let dir = TempDir::new().unwrap();
     write_fake_checkleft_env_echo(dir.path());
-    // Read the fixture through the shell: a parallel fork can briefly inherit
-    // its write descriptor and make direct script execution fail with ETXTBSY.
-    let checkleft = Some(vec!["/bin/sh".into(), dir.path().join("bin").join("checkleft")]);
+    let checkleft = through_sh(Some(vec![dir.path().join("bin").join("checkleft")]));
     let result = run_checkleft_gate_impl(dir.path(), checkleft, None);
 
     // SAFETY: see above.
@@ -318,7 +331,7 @@ fn checkleft_gate_prefers_repobin_exec_when_repobin_is_installed() {
         "must resolve to `repobin exec checkleft` when a working repobin is installed",
     );
 
-    let result = run_checkleft_gate_impl(dir.path(), resolved, None);
+    let result = run_checkleft_gate_impl(dir.path(), through_sh(resolved), None);
     assert!(
         result.is_ok(),
         "a clean repobin-dispatched checkleft must allow the push: {result:?}"
@@ -350,7 +363,7 @@ fn checkleft_gate_falls_back_when_repobin_dispatch_probe_fails() {
         "must fall back to <cwd>/bin/checkleft when the repobin dispatch probe fails",
     );
 
-    let err = run_checkleft_gate_impl(dir.path(), resolved, None)
+    let err = run_checkleft_gate_impl(dir.path(), through_sh(resolved), None)
         .expect_err("gate must block using the fallback checkleft's findings");
     let CubeError::InvalidArgument(msg) = err else {
         panic!("expected InvalidArgument, got {err:?}");
