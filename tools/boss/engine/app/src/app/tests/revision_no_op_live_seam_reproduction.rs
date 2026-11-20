@@ -471,7 +471,7 @@ impl boss_engine_merge_poller::MergeProbe for UnreachableMergeProbe {
     }
 }
 
-/// The guard for the overflow this file's first test hit on Linux CI.
+/// Guards the Stop dispatch path against stack exhaustion.
 ///
 /// A stack overflow aborts the test process, which takes every other test in
 /// the shard down with it and names none of the code responsible. This test
