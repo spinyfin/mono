@@ -567,6 +567,14 @@ pub(crate) struct UnexplainedWaitCost {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Current dispatch attempt, including failures that never created a run row.
+    pub fn dispatch_attempt_number(&self, execution: &WorkExecution) -> Result<i64> {
+        let conn = self.connect()?;
+        let failures = collect_dispatch_failures(&conn, execution)?;
+        let legacy_count = execution.pre_start_failure_count.max(execution.transient_failure_count);
+        Ok((failures.len() as i64).max(legacy_count) + 1)
+    }
+
     /// Every wait the engine has not explained, for the scheduler heartbeat.
     ///
     /// Two kinds of row come back. An unclassified wait is one the classifier

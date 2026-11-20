@@ -2130,6 +2130,13 @@ fn diagnose_report(
         return Ok(Some(Value::Object(payload)));
     }
 
+    for exec_id in &scope.execution_ids {
+        match db {
+            Some(db) => print!("{}", render_execution_state(db, exec_id)),
+            None => println!("execution {exec_id}: current state unavailable (state database unavailable)"),
+        }
+    }
+
     match scope.resolved_as {
         ResolvedAs::Execution => {
             println!(
@@ -2151,9 +2158,8 @@ fn diagnose_report(
         }
     }
 
-    // Before the timeline, not after: an operator who reads a timeline and then
-    // learns it had holes has already formed the conclusion this is meant to
-    // prevent.
+    // Warn about lost records before the timeline. Fully recovered damage is
+    // summarized after the findings because it leaves no holes in the evidence.
     integrity.print_banner();
 
     if let Some(focus) = focus_diagnosis.as_ref().filter(|f| f.focus.is_active()) {
@@ -2205,6 +2211,30 @@ fn diagnose_report(
     print!("{}", render_findings(&findings, &integrity));
     integrity.print_footer();
     Ok(None)
+}
+
+/// Snapshot the requested execution, never the item's newer execution.
+fn render_execution_state(db: &boss_engine::work::WorkDb, id: &str) -> String {
+    let state = (|| -> Result<String> {
+        let exec = db.get_execution(id)?;
+        let blocker: Option<String> = db.connect()?.query_row(
+            "SELECT dispatch_wait_blocker_id FROM work_executions WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let attempt = db.dispatch_attempt_number(&exec)?;
+        Ok(format!(
+            "execution {}: status={} work_item={} attempt={}\n  dispatch_wait_reason={} dispatch_wait_blocker_id={} dispatch_wait_since={}\n",
+            exec.id,
+            exec.status,
+            exec.work_item_id,
+            attempt,
+            exec.dispatch_wait_reason.as_deref().unwrap_or("(none)"),
+            blocker.as_deref().unwrap_or("(none)"),
+            exec.dispatch_wait_since.as_deref().unwrap_or("(none)"),
+        ))
+    })();
+    state.unwrap_or_else(|err| format!("execution {id}: current state unavailable ({err:#})\n"))
 }
 
 /// Render one execution's timeline with its unreadable regions marked in place.

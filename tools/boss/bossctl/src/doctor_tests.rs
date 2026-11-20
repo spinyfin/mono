@@ -1103,6 +1103,39 @@ fn diagnose_wait_line_reports_the_engines_reason() {
     // A hold the scheduler recorded.
     let held = chore("held by a full pool");
     let held_execution = execution(&held.id, ExecutionStatus::Ready);
+    let header = render_execution_state(&db, &held_execution.id);
+    assert!(header.contains("dispatch_wait_reason=(none) dispatch_wait_blocker_id=(none) dispatch_wait_since=(none)"));
+    assert!(render_execution_state(&db, "exec_missing").contains("current state unavailable"));
+    db.set_dispatch_wait_reason(&held_execution.id, "pool_exhausted")
+        .unwrap();
+    let header = render_execution_state(&db, &held_execution.id);
+    assert!(
+        header.starts_with(&format!(
+            "execution {}: status=ready work_item={} attempt=1\n",
+            held_execution.id, held.id
+        )),
+        "{header}"
+    );
+    assert!(header.contains("dispatch_wait_reason=pool_exhausted"), "{header}");
+    assert!(header.contains("dispatch_wait_blocker_id=(none)"), "{header}");
+    assert!(
+        header.contains(&format!(
+            "dispatch_wait_since={}",
+            db.get_execution(&held_execution.id)
+                .unwrap()
+                .dispatch_wait_since
+                .unwrap()
+        )),
+        "{header}"
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_wait_blocker_id = 'exec_blocker' WHERE id = ?1",
+            [&held_execution.id],
+        )
+        .unwrap();
+    assert!(render_execution_state(&db, &held_execution.id).contains("dispatch_wait_blocker_id=exec_blocker"));
     db.set_dispatch_wait_reason(&held_execution.id, "pool_exhausted")
         .unwrap();
     assert_eq!(

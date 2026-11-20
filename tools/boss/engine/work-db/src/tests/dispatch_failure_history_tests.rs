@@ -161,6 +161,12 @@ fn attempt_number_counts_start_failures_before_a_transient_resume() {
     .unwrap()
     .unwrap();
     assert_attempt_follows_history(&wait_of(&db, &product.id, &item.id), 3);
+    let current = db.get_task_runtime(&item.id).unwrap().execution_id.unwrap();
+    assert_eq!(
+        db.dispatch_attempt_number(&db.get_execution(&current).unwrap())
+            .unwrap(),
+        4
+    );
 }
 
 #[test]
