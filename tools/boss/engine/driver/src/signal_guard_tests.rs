@@ -5,6 +5,55 @@ use std::process::{Command, Stdio};
 
 pub(crate) fn denied() -> Vec<String> {
     let mut commands = [
+        "((1 << 3)); bash <<3\npkill -f foo\n3",
+        "cat <<A; cat <<'B'\na\nA\nb\\\nB\npkill -f foo",
+        "printf '#!/bin/sh\\npkill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf 'cd /tmp\\npkill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf '%b' 'echo safe\\npkill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "echo 'echo safe\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf '%b' '\\0160kill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf 'pkill -f foo\\n\\c' > /tmp/k.sh; sh /tmp/k.sh",
+        "trap 'sh /tmp/k.sh' EXIT; echo 'pkill -f foo' > /tmp/k.sh",
+        "f() { sh /tmp/k.sh; }; echo 'pkill -f foo' > /tmp/k.sh; f",
+        "echo 'pkill -f foo' > /tmp/k.sh; false && echo safe > /tmp/k.sh; sh /tmp/k.sh",
+        "echo 'pkill -f foo' > /tmp/k.sh; out=$(sh /tmp/k.sh); echo 'echo safe' > /tmp/k.sh",
+        "echo -n 'pkill foo' > k.sh; sh ./k.sh",
+        "echo 'pkill -f foo' > /tmp/k.sh; bash -c 'sh /tmp/k.sh'",
+        "echo 'pkill -f foo' > /tmp/k.sh; eval 'sh /tmp/k.sh'",
+        "cat > /tmp/k.sh <<'EOF'\npkill -f foo\nEOF\nout=$(bash /tmp/k.sh)",
+        "printf '%s' pk 'ill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf pk > /tmp/k.sh; printf 'ill -f foo' >> /tmp/k.sh; sh /tmp/k.sh",
+        "echo -n pk > /tmp/k.sh; echo -n 'ill -f foo' >> /tmp/k.sh; sh /tmp/k.sh",
+        "cat <<EOF>/tmp/k.sh\npkill -f foo\nEOF\nsh /tmp/k.sh",
+        "cat<<'EOF' > /tmp/k.sh\npkill -f foo\nEOF\nsh /tmp/k.sh",
+        "cat <<EOF; echo $((1 << 3))\nuse care\nEOF\npkill -f foo",
+        "cat <<EOF >/dev/null; x=$((1 << 3))\nuse care\nEOF\n3\npkill -f foo",
+        "echo -e 'pkill foo' > k.sh; sh ./k.sh",
+        "awk 'BEGIN {print \"pkill foo\"}' > /tmp/k.sh; sh /tmp/k.sh",
+        "cat > /tmp/k.sh <<'EOF'\npkill foo\nEOF\ncat >> /tmp/k.sh <<'EOF'\necho fine\nEOF\nsh /tmp/k.sh",
+        "echo 'pkill foo' > /tmp/k.sh; echo harmless | tee -a /tmp/k.sh; sh /tmp/k.sh",
+        "pgrep -f foo | xargs -I {} kill 12345 {}",
+        "if true; then command pkill -f foo; fi",
+        "! command pkill -f foo",
+        "coproc command pkill -f foo",
+        "bash -c 'K=\"pkill -f\"; $K foo'",
+        "K=\"kill -9\"; $K -1",
+        "bash <<'EOF'; echo done\npkill -f foo\nEOF",
+        "cat > /tmp/k.sh <<'EOF'; echo done\npkill -f foo\nEOF\nbash /tmp/k.sh",
+        "echo 'pkill -f foo' | (cat) | sh",
+        "echo 'pkill -f foo' | { cat; } | sh",
+        "cat > k.sh <<'EOF'\npkill -f foo\nEOF\nbash ./k.sh",
+        "cat > /tmp/k.sh <<'EOF'\npkill -f foo\nEOF\nsh < /tmp/k.sh",
+        "cat > /tmp/k.sh <<'EOF'\npkill -f foo\nEOF\nchmod +x /tmp/k.sh; /tmp/k.sh",
+        "tee /tmp/k.sh <<'EOF'\npkill -f foo\nEOF\nbash /tmp/k.sh",
+        "echo 'pkill -f foo' | tee /tmp/k.sh; sh /tmp/k.sh",
+        "printf '%s' 'pkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+        "echo 'pkill -f foo' > /tmp/k.sh; echo harmless >> /tmp/k.sh; sh /tmp/k.sh",
+        "=sudo pkill -f foo",
+        "=nohup killall foo",
+        "pgrep foo | =xargs kill",
+        "if true; then env K=pkill command $K foo; fi",
+        "bash <<'ONE'; bash <<'TWO'\necho safe\nONE\npkill foo\nTWO",
         "K=ls; read K <<< 'pkill foo'; bash -c '$K'",
         "K=pkill; eval '$K foo'",
         "K=pkill; find . -exec sh -c '$K foo' \\;",
@@ -169,6 +218,18 @@ pub(crate) fn denied() -> Vec<String> {
         "coproc NAME { pkill foo; }",
         "$'pkill' foo",
         "pk$(echo ill) foo",
+        "K=$(command -v pkill); bash -c 'echo $(date); $K -f foo'",
+        "ps aux | grep 'cube.*pr update' | awk '{print \"kill \" $2}' | sh",
+        "(echo 'pkill -f foo'; echo done) | sh",
+        "{ echo 'pkill -f foo'; echo done; } | sh",
+        "trap 'kill 0' EXIT",
+        "trap 'pkill -f foo' EXIT",
+        "trap 'kill -9 -1' EXIT",
+        "cat > /tmp/k.sh <<'EOF'\npkill -f foo\nEOF\nbash /tmp/k.sh",
+        "=pkill -f foo",
+        "noglob pkill -f foo",
+        "nocorrect killall foo",
+        "- pkill foo",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -197,6 +258,24 @@ pub(crate) fn denied() -> Vec<String> {
 }
 
 pub(crate) const ALLOWED: &[&str] = &[
+    "printf '#!/bin/sh\\necho safe\\n' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%s' 'echo safe\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%b' 'echo safe\\c' 'pkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf 'echo safe\\c\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '#!/bin/sh\\necho safe\\n' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%s' '# literal\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%b' 'echo safe\\c' 'pkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "echo 'echo safe' > /tmp/k.sh; false && echo 'echo fine' > /tmp/k.sh; sh /tmp/k.sh",
+    "cat <<EOF>out.txt\nuse pkill carefully\nEOF",
+    "cat<<'EOF' > notes.md\nit's fine to mention pkill here\nEOF",
+    "echo 'echo hi' > /tmp/k.sh; bash -c 'sh /tmp/k.sh'",
+    "printf '%s\\n' pk 'ill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "echo pk > /tmp/k.sh; echo 'ill -f foo' >> /tmp/k.sh; sh /tmp/k.sh",
+    "echo 'echo safe' > k.sh; sh ./k.sh",
+    "printf '%s' 'echo safe' > k.sh; sh < ./k.sh",
+    "cat <<'EOF'; echo done\npkill foo\nEOF",
+    "find . -exec ls {} +",
+    "K=\"pkill -f\"; \"$K\" foo",
     "read c <<< 'pkill foo'; bash -c 'echo $c'",
     "S=cat; $S <<EOF\npkill -f foo\nEOF",
     "true # comment \\\necho hi",
@@ -271,6 +350,12 @@ pub(crate) const ALLOWED: &[&str] = &[
     "find . -maxdepth 1 -exec ls {} \\;",
     "su -c 'ls'",
     "\"$TOOL\" pr create --title 'Block pkill and killall'",
+    "eval \"$(brew shellenv)\"",
+    "bash -c \"$(cat run.sh)\"",
+    "ROOT=$(jj root); bash -c \"$ROOT/scripts/x.sh\"",
+    "trap -l",
+    "trap -p EXIT",
+    "cat > /tmp/k.sh <<'EOF'\necho hi\nEOF\nbash /tmp/k.sh",
 ];
 
 fn claude_launch_guard_script() -> tempfile::NamedTempFile {
@@ -380,4 +465,17 @@ fn claude_signal_guard_allows_safe_commands() {
 fn signal_fragment_is_safe_inside_the_inline_shell_command() {
     let fragment = include_str!("signal_guard.py");
     assert!(!fragment.contains(['"', '$', '`', '\\']));
+}
+
+#[test]
+fn launch_guard_strips_the_same_wrappers_as_the_signal_guard() {
+    let script = claude_launch_guard_script();
+    let commands: Vec<String> = ["flock /tmp/l bossctl status", "sudo -D /tmp bossctl status"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let decisions = claude_guard_decisions(script.path(), &commands);
+    for (command, decision) in commands.iter().zip(decisions) {
+        assert_eq!(decision["decision"], "block", "{command}: {decision}");
+    }
 }

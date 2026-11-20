@@ -326,7 +326,7 @@ def strip_prefixes(group, prefix_env, shell_vars):
             prefix_env[assignment.group(1)] = assignment.group(2)
             index += 1
             continue
-        base = os.path.basename(token)
+        base = wrapper_basename(token)
         if base == "env":
             index += 1
             while index < len(group) and group[index].startswith("-"):
@@ -340,10 +340,7 @@ def strip_prefixes(group, prefix_env, shell_vars):
         if base in ("xargs", "parallel"):
             prefix_env["__APPENDS_ARGS"] = "1"
         if base in WRAPPERS or base in ("builtin", "parallel"):
-            index += 1
-            continue
-        if base == "timeout" and index + 1 < len(group):
-            index += 2
+            index = consume_wrapper(group, index, base)
             continue
         break
     return [token for token in group[index:] if token != "}"]
@@ -1421,6 +1418,8 @@ git fetch --depth=200 origin main
             format!("git -C {store} gc --prune=now"),
             format!("git -C {store} branch -D stale"),
             format!("git -C {store} branch new-branch"),
+            format!("pgrep foo | xargs -I {{}} git -C {store} branch {{}}"),
+            format!("pgrep foo | =xargs git -C {store} branch"),
             format!("git -C {store} tag v9"),
             format!("git -C {store} tag -d v9"),
             format!("git -C {store} config core.sharedRepository true"),

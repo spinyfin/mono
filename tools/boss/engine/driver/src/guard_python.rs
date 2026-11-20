@@ -17,7 +17,7 @@ pub const REVIEWER_BLOCKED_PROGRAMS_PY: &str = crate::render_reviewer_blocked_pr
 macro_rules! render_command_tokenizer {
     ($before:expr, $after:expr) => { concat!($before, r#"
 DELIMS = {'&&', '||', ';', '|', '&'}
-WRAPPERS = {'env', 'command', 'builtin', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic'}
+WRAPPERS = {'env', 'command', 'builtin', 'exec', 'nohup', 'stdbuf', 'setsid', 'caffeinate', 'sudo', 'time', 'xargs', 'nice', 'ionice', 'chronic', 'timeout', 'doas', 'flock', 'chrt', 'taskset', 'script', 'watch', 'su', 'busybox', 'noglob', 'nocorrect', '-'}
 ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 
 SHLEX_WS = ' \t\r\n'
@@ -77,11 +77,13 @@ def heredoc_word(rest):
             continue
         word.append(char)
         index += 1
-    return (''.join(word), quoted) if word else False
+    return (''.join(word), quoted, index) if word else False
 
 
-def heredoc_delim(line):
-    # Unquoted << only. A quoted substring is an argument, not an operator.
+def heredoc_ops(line):
+    # Every unquoted, non-arithmetic << heredoc as (offset, word, quoted), or
+    # False when the syntax cannot be parsed safely.
+    found = []
     quote, escaped, index = None, False, 0
     while index < len(line):
         char = line[index]
@@ -120,13 +122,21 @@ def heredoc_delim(line):
         if char == '<' and index + 1 < len(line) and line[index + 1] == '<':
             rest = line[index + 2:]
             if rest.startswith('<'):
-                return None
+                index += 3
+                continue
             if rest.startswith('-'):
                 rest = rest[1:]
             rest = rest.lstrip(SHLEX_WS)
-            return heredoc_word(rest)
+            parsed = heredoc_word(rest)
+            if parsed is False:
+                return False
+            found.append((index, parsed[0], parsed[1]))
+            index += 2
+            continue
         index += 1
-    return None
+    return found
+
+
 
 class CommandGroup(list):
     def __init__(self, tokens, body='', boundary=None, error=None, literal_chars=None, quote_segments=None):
@@ -141,6 +151,7 @@ class CommandGroup(list):
         self.expanding_body = False
         self.boundary = boundary
         self.error = error
+        self.pipe_sources = []
 
 
 def split_punct_word(word, mask, segs):
@@ -155,12 +166,13 @@ def split_punct_word(word, mask, segs):
     return [word], [mask], [segs]
 
 
-def quote_provenance(text, tokens):
+def quote_provenance(text, tokens, spans=None):
     # Mirror shlex boundaries while retaining each literal character and the
     # quote/escape run it came from. Adjacent quoted strings concatenate into
     # one shlex word ("$A""B" -> $AB) but must not share a segment id.
     words, masks, segs, word, mask, segm = [], [], [], [], [], []
     quote, index, active, segment = None, 0, False, 0
+    word_start = 0
     def new_segment():
         nonlocal segment
         segment += 1
@@ -168,12 +180,16 @@ def quote_provenance(text, tokens):
         nonlocal word, mask, segm, active
         if active:
             parts, part_masks, part_segs = split_punct_word(''.join(word), mask, segm)
+            if spans is not None:
+                spans.extend([(word_start, index)] * len(parts))
             words.extend(parts)
             masks.extend(part_masks)
             segs.extend(part_segs)
         word, mask, segm, active = [], [], [], False
     while index < len(text):
         char = text[index]
+        if not active and char not in SHLEX_WS:
+            word_start = index
         if quote == ANSI:
             if char == chr(92) and index + 1 < len(text):
                 word.append(text[index + 1])
@@ -232,6 +248,9 @@ def quote_provenance(text, tokens):
                 end += 1
             for part in re.findall(r'[()]|[;&|]+', text[index:end]):
                 words.append(part)
+                if spans is not None:
+                    spans.append((index, index + len(part)))
+                    index += len(part)
                 masks.append([False] * len(part))
                 segs.append([segment] * len(part))
             index = end
@@ -334,6 +353,7 @@ def strip_line_continuations(text):
     lines = text.split(chr(10))
     out, current, pending, carry = [], '', '', ''
     heredoc_end, expanding = None, False
+    heredocs = []
     for number, line in enumerate(lines):
         last = number == len(lines) - 1
         if heredoc_end is not None:
@@ -344,7 +364,11 @@ def strip_line_continuations(text):
             carry = ''
             out.append(joined)
             if joined.lstrip(chr(9)) == heredoc_end:
-                heredoc_end = None
+                if heredocs:
+                    heredoc_end, quoted = heredocs.pop(0)
+                    expanding = not quoted
+                else:
+                    heredoc_end = None
             continue
         shaped = shell_text(pending + line + chr(10))
         body = shaped[:-1]
@@ -358,9 +382,11 @@ def strip_line_continuations(text):
             pending = shaped
             continue
         pending = ''
-        delim = heredoc_delim(shaped)
-        if delim:
-            heredoc_end, expanding = delim[0], not delim[1]
+        ops = heredoc_ops(shaped)
+        if ops:
+            heredocs = [op[1:] for op in ops]
+            heredoc_end, quoted = heredocs.pop(0)
+            expanding = not quoted
     return chr(10).join(out + ([current] if current else []))
 
 
@@ -404,9 +430,18 @@ def shell_text(text):
         elif char in (chr(39), chr(34)):
             quote = char
         elif char == '#' and (index == 0 or text[index - 1].isspace() or text[index - 1] in ';|&()<>'):
-            comment = True
-            index += 1
-            continue
+            # An escaped space is still inside a word, so a hash after that
+            # space does not start a comment and later commands stay visible.
+            slashes = 0
+            j = index - 2
+            while j >= 0 and text[j] == chr(92):
+                slashes += 1
+                j -= 1
+            escaped_space = index > 0 and text[index - 1].isspace() and slashes % 2 == 1
+            if not escaped_space:
+                comment = True
+                index += 1
+                continue
         elif char == '&':
             before = text[index - 1:index]
             after = text[index + 1:index + 2]
@@ -422,11 +457,13 @@ def shell_text(text):
     return ''.join(out)
 
 
+
 def command_records(command, stripped=False):
     groups = []
     pending = ''
     receiver = None
     heredoc_end = None
+    heredocs = []
     if not stripped:
         command = strip_line_continuations(command)
     offset = 0
@@ -435,7 +472,11 @@ def command_records(command, stripped=False):
         offset += len(line) + 1
         if heredoc_end is not None:
             if line.lstrip(chr(9)) == heredoc_end:
-                heredoc_end = None
+                if heredocs:
+                    receiver, heredoc_end, quoted = heredocs.pop(0)
+                    receiver.expanding_body = not quoted
+                else:
+                    heredoc_end = None
             else:
                 receiver.body += line + chr(10)
                 start = receiver.body_span[0] if receiver.body_span else line_start
@@ -463,10 +504,12 @@ def command_records(command, stripped=False):
             continue
         logical_line = pending
         pending = ''
+        line_group_start = len(groups)
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
+        spans = []
         try:
-            literal, segments = quote_provenance(logical_line, tokens)
+            literal, segments = quote_provenance(logical_line, tokens, spans)
         except Exception:
             literal = [[False] * len(token) for token in tokens]
             segments = None
@@ -475,10 +518,13 @@ def command_records(command, stripped=False):
             segments = None
         elif segments is not None and len(segments) != len(tokens):
             segments = None
+        if segments is None:
+            spans = []
         current_literal = []
         current_segments = [] if segments is not None else None
+        token_owners = {}
         for index, token in enumerate(tokens):
-            if token in DELIMS or (token and all(c in '()' for c in token)):
+            if token in DELIMS or token in ('(', ')') or (token in ('{', '}') and not current and not any(literal[index])):
                 if current:
                     groups.append(CommandGroup(current, literal_chars=current_literal, quote_segments=current_segments))
                 current = []
@@ -486,23 +532,38 @@ def command_records(command, stripped=False):
                 current_segments = [] if segments is not None else None
                 groups.append(CommandGroup([], boundary=token))
             else:
+                token_owners[index] = len(groups)
                 current.append(token)
                 current_literal.append(literal[index])
                 if current_segments is not None:
                     current_segments.append(segments[index])
         if current:
             groups.append(CommandGroup(current, literal_chars=current_literal, quote_segments=current_segments))
-        delim = heredoc_delim(logical_line)
-        if delim is False:
+        ops = heredoc_ops(logical_line)
+        if ops is False:
             groups.append(CommandGroup([], error='incomplete shell syntax'))
-        elif delim and groups:
-            heredoc_end, quoted = delim
-            receiver = groups[-1]
-            receiver.expanding_body = not quoted
+        elif ops:
+            owners = [g for g in groups[line_group_start:] if g] or [g for g in groups if g]
+            if not owners:
+                owners = [CommandGroup([])]
+            for source_offset, word, quoted in ops:
+                owner = None
+                for i, (start, end) in enumerate(spans):
+                    if start <= source_offset < end and i in token_owners:
+                        owner = groups[token_owners[i]]
+                        break
+                if owner is None:
+                    groups.append(CommandGroup([], error='cannot locate heredoc owner'))
+                    owner = owners[-1]
+                heredocs.append((owner, word, quoted))
+            if heredocs:
+                receiver, heredoc_end, quoted = heredocs.pop(0)
+                receiver.expanding_body = not quoted
         if tokens and tokens[-1] not in ('&&', '||', '|'):
             groups.append(CommandGroup([], boundary=';'))
     if pending or heredoc_end:
         groups.append(CommandGroup([], error='incomplete shell syntax'))
+    attach_pipe_sources(groups)
     return groups
 
 
@@ -521,8 +582,12 @@ def without_redirection_indices(group):
         token = group[index]
         redirect = re.match(r'^(?:[0-9]+|&)?(?:>\||>>?|<>|<<-?|<)(.*)$', token)
         if redirect:
-            if redirect.group(1) in ('', '&'):
+            attached = redirect.group(1)
+            if attached in ('', '&'):
                 index += 1
+            elif attached.startswith('<'):
+                if attached == '<':
+                    index += 1
         else:
             result.append(index)
         index += 1
@@ -532,49 +597,393 @@ def without_redirections(group):
     return [group[i] for i in without_redirection_indices(group)]
 
 WRAPPER_VALUE_OPTIONS = {
-    'env': {'-u', '--unset', '-C', '--chdir'},
-    'sudo': {'-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt'},
+    'env': {'-u', '--unset', '-C', '--chdir', '-a', '--argv0'},
+    'sudo': {'-u', '--user', '-g', '--group', '-h', '--host', '-p', '--prompt',
+             '-C', '-T', '-R', '-D', '-r', '-t', '-U', '--chdir', '--chroot',
+             '--role', '--type', '--other-user', '--close-from', '--command-timeout'},
+    'exec': {'-a'},
     'nice': {'-n', '--adjustment'},
-    'ionice': {'-c', '--class', '-n', '--classdata', '-p', '--pid'},
+    'ionice': {'-c', '--class', '-n', '--classdata', '-p', '--pid', '-P', '-u', '--pgid', '--uid'},
     'stdbuf': {'-i', '-o', '-e', '--input', '--output', '--error'},
     'timeout': {'-k', '--kill-after', '-s', '--signal'},
-    'xargs': {'-n', '-L', '-P', '-I', '-d', '--max-args', '--max-lines', '--max-procs', '--replace', '--delimiter'},
+    'xargs': {'-n', '-L', '-P', '-I', '-J', '-d', '-s', '-E', '--max-args', '--max-lines',
+              '--max-procs', '--replace', '--delimiter'},
+    'caffeinate': {'-t', '-w'},
+    'doas': {'-u', '-C'},
+    'flock': {'-w', '--timeout', '-E', '--conflict-exit-code', '-c', '--command'},
+    'chrt': {'-T', '-P', '-D'},
+    'taskset': {'-c', '--cpu-list'},
+    'script': {'-t', '-F', '-c', '--command', '-I', '-O', '-B', '-T', '-E', '-m',
+               '--log-in', '--log-out', '--log-io', '--log-timing', '--timing', '--output-limit'},
+    'watch': {'-n', '--interval'},
+    'su': {'-c', '--command', '-s', '--shell'},
 }
+
+WRAPPER_POSITIONAL = {'timeout': 1, 'flock': 1, 'chrt': 1, 'taskset': 1, 'script': 1}
+
+def consume_wrapper(group, index, base):
+    index += 1
+    value_options = WRAPPER_VALUE_OPTIONS.get(base, set())
+    positional = WRAPPER_POSITIONAL.get(base, 0)
+    while index < len(group) and group[index].startswith('-'):
+        option = group[index]
+        index += 1
+        if base == 'command' and option in ('-v', '-V'):
+            return len(group)
+        if option == '--':
+            break
+        if option in value_options and index < len(group):
+            index += 1
+        if base == 'taskset' and (option == '-c' or option.startswith('--cpu-list')):
+            positional = 0
+    return index + positional
+
+def wrapper_basename(token):
+    return os.path.basename(token[1:] if token.startswith('=') else token)
 
 def strip_prefix_offset(group):
     index = 0
     while index < len(group):
         token = group[index]
-        base = os.path.basename(token)
+        base = wrapper_basename(token)
         if ASSIGNMENT_RE.match(token):
             index += 1
-            continue
-        if base in WRAPPERS or base == 'timeout':
-            index += 1
-            value_options = WRAPPER_VALUE_OPTIONS.get(base, set())
-            while index < len(group) and group[index].startswith('-'):
-                option = group[index]
-                index += 1
-                if base == 'command' and option in ('-v', '-V'):
-                    return len(group)
-                if option == '--':
-                    break
-                if option in value_options and index < len(group):
-                    index += 1
-            if base == 'timeout' and index < len(group):
-                index += 1
-            continue
-        break
+        elif base in WRAPPERS:
+            index = consume_wrapper(group, index, base)
+        else:
+            break
     return index
 
+def expand_env_split_string(tokens):
+    out, index = [], 0
+    while index < len(tokens):
+        token = tokens[index]
+        out.append(token)
+        index += 1
+        if wrapper_basename(token) != 'env':
+            continue
+        while index < len(tokens) and tokens[index].startswith('-'):
+            option = tokens[index]
+            if option in ('-S', '--split-string') and index + 1 < len(tokens):
+                out.extend(shlex.split(tokens[index + 1]))
+                out.extend(tokens[index + 2:])
+                return out
+            if option.startswith('--split-string='):
+                out.extend(shlex.split(option.split('=', 1)[1]))
+                out.extend(tokens[index + 1:])
+                return out
+            if option.startswith('-S') and option != '-S':
+                out.extend(shlex.split(option[2:]))
+                out.extend(tokens[index + 1:])
+                return out
+            out.append(option)
+            index += 1
+            if option in WRAPPER_VALUE_OPTIONS.get('env', set()) and index < len(tokens):
+                out.append(tokens[index])
+                index += 1
+            if option == '--':
+                break
+    return out
+
 def strip_prefixes(group):
-    stripped = without_redirections(group)
+    stripped = expand_env_split_string(without_redirections(list(group)))
     return stripped[strip_prefix_offset(stripped):]
+
+def wrapper_has_xargs(group):
+    tokens = without_redirections(group)
+    end = min(strip_prefix_offset(tokens), len(tokens))
+    return any(wrapper_basename(tokens[i]) == 'xargs' for i in range(end))
 
 def strip_prefix_indices(group):
     kept = without_redirection_indices(group)
     start = strip_prefix_offset([group[i] for i in kept])
     return kept[start:]
+
+def write_redirection_targets(group):
+    targets, index = [], 0
+    while index < len(group):
+        token = group[index]
+        fd = 0
+        while fd < len(token) and token[fd].isdigit():
+            fd += 1
+        rest = token[fd:]
+        op = None
+        for candidate in ('&>>', '&>', '>>', '>|', '>'):
+            if rest.startswith(candidate):
+                op = candidate
+                break
+        if op is None:
+            index += 1
+            continue
+        attached = rest[len(op):]
+        if attached:
+            targets.append(attached)
+        elif index + 1 < len(group):
+            targets.append(group[index + 1])
+            index += 1
+        index += 1
+    return targets
+
+def here_string_body(group):
+    for index, token in enumerate(group):
+        if token == '<<<' and index + 1 < len(group):
+            return group[index + 1]
+        if token.startswith('<<<') and len(token) > 3:
+            return token[3:]
+    return ''
+
+class _PipeLevel:
+    def __init__(self):
+        self.all_cmds = []
+        self.pipeline = []
+        self.pending_pipe = False
+        self.inherited = []
+
+def attach_pipe_sources(records):
+    stack = [_PipeLevel()]
+    for group in records:
+        group.pipe_sources = []
+        level = stack[-1]
+        boundary = group.boundary
+        if boundary in ('(', '{'):
+            inner = _PipeLevel()
+            if level.pending_pipe:
+                inner.inherited = list(level.pipeline)
+                level.pending_pipe = False
+            stack.append(inner)
+            continue
+        if boundary in (')', '}'):
+            inner = stack.pop()
+            if not stack:
+                stack.append(_PipeLevel())
+            outer = stack[-1]
+            producers = inner.inherited + inner.all_cmds
+            outer.all_cmds.extend(producers)
+            if outer.pending_pipe:
+                outer.pipeline.extend(producers)
+            else:
+                outer.pipeline = list(producers)
+            continue
+        if boundary in ('|', '|&'):
+            level.pending_pipe = True
+            continue
+        if boundary:
+            if boundary.strip():
+                level.pipeline = []
+                level.pending_pipe = False
+            continue
+        if not group:
+            continue
+        sources = list(level.inherited)
+        if level.pending_pipe:
+            sources.extend(level.pipeline)
+            level.pipeline.append(group)
+            level.pending_pipe = False
+        else:
+            level.pipeline = [group]
+        group.pipe_sources = sources
+        level.all_cmds.append(group)
+
+def decode_ansi_c(text):
+    simple = {'n': chr(10), 't': chr(9), 'r': chr(13), 'a': chr(7), 'b': chr(8), 'e': chr(27),
+              'E': chr(27), 'f': chr(12), 'v': chr(11), chr(92): chr(92), chr(39): chr(39),
+              chr(34): chr(34), '?': '?'}
+    widths = {'x': 2, 'u': 4, 'U': 8}
+    out, i = [], 0
+    while i < len(text):
+        c = text[i]
+        if c != chr(92) or i + 1 >= len(text):
+            out.append(c)
+            i += 1
+            continue
+        d = text[i + 1]
+        if d in simple:
+            out.append(simple[d])
+            i += 2
+        elif d in widths:
+            digits = re.match('[0-9a-fA-F]*', text[i + 2:i + 2 + widths[d]]).group()
+            if digits:
+                out.append(chr(int(digits, 16)))
+            else:
+                out.append(c + d)
+            i += 2 + len(digits)
+        elif d in '01234567':
+            digits = re.match('[0-7]{1,3}', text[i + 1:]).group()
+            out.append(chr(int(digits, 8) % 256))
+            i += 1 + len(digits)
+        else:
+            out.append(c + d)
+            i += 2
+    return ''.join(out)
+
+def is_arithmetic_inner(text):
+    if not text.startswith('('):
+        return False
+    try:
+        return extract_substitutions(text, start=1, stop=')', kind='probe')['end'] == len(text) - 1
+    except ValueError:
+        return False
+
+def extract_substitutions(source, holders=None, scripts=None, ariths=None, start=0, stop=None, kind='command'):
+    # Replace dollar-paren, backtick, and process-substitution scripts with
+    # globally numbered placeholders so nested checks share one holder registry.
+    if holders is None:
+        holders = []
+    if scripts is None:
+        scripts = set()
+    if ariths is None:
+        ariths = []
+    if kind == 'command' and start == 0 and stop is None:
+        source = strip_line_continuations(source)
+    quotes, subs_on, command = kind != 'literal', kind != 'probe', kind == 'command'
+    n = len(source)
+    out, subs, pending = [], [], []
+    quote, depth, found = None, 0, False
+    word_start, arith_until, i = True, 0, start
+    blanks = ' ' + chr(9) + chr(10) + chr(13) + ';&|('
+    while i < n:
+        c = source[i]
+        if c == chr(92) and quote != chr(39):
+            if source[i + 1:i + 2] == chr(10):
+                i += 2
+                continue
+            out.append(source[i:i + 2])
+            i += 2
+            word_start = False
+            continue
+        if command and quote is None and word_start and c == '#':
+            end = source.find(chr(10), i)
+            i = n if end < 0 else end
+            continue
+        if stop == chr(96) and c == chr(96):
+            found = True
+            break
+        if stop == ')' and quote is None and c in '()':
+            if c == '(':
+                depth += 1
+            elif depth == 0:
+                found = True
+                break
+            else:
+                depth -= 1
+        if quotes and c in (chr(39), chr(34)) and quote in (None, c):
+            quote = None if quote else c
+            out.append(c)
+            i += 1
+            word_start = False
+            continue
+        if quotes and quote is None and c == chr(36) and source[i + 1:i + 2] == chr(34):
+            i += 1
+            word_start = False
+            continue
+        if quotes and quote is None and c == chr(36) and source[i + 1:i + 2] == chr(39):
+            end = i + 2
+            while end < n and source[end] != chr(39):
+                end += 2 if source[end] == chr(92) else 1
+            if end >= n:
+                raise ValueError('unterminated ANSI-C quote')
+            decoded = decode_ansi_c(source[i + 2:end]).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
+            out.append(chr(39) + decoded + chr(39))
+            i = end + 1
+            word_start = False
+            continue
+        if subs_on and quote != chr(39) and (c == chr(96) or source.startswith(chr(36) + '(', i)
+                or (quote is None and source.startswith('<(', i))):
+            if c == chr(96):
+                inner = extract_substitutions(source, holders, scripts, ariths, i + 1, chr(96))
+                j = inner['end']
+                text = source[i + 1:j]
+                subs.append(text)
+            else:
+                s, arithmetic = i + 2, False
+                if source.startswith('((', i + 1):
+                    inner = extract_substitutions(source, holders, scripts, ariths, s, ')', 'probe')
+                    j = inner['end']
+                    text = source[s:j]
+                    arithmetic = is_arithmetic_inner(text)
+                if arithmetic:
+                    nested = extract_substitutions(text, holders, scripts, ariths, 0, None, 'arith')
+                    subs.extend(nested['subs'])
+                    ariths.append(text)
+                else:
+                    inner = extract_substitutions(source, holders, scripts, ariths, s, ')')
+                    j = inner['end']
+                    text = source[s:j]
+                    subs.append(text)
+            if source.startswith('<(', i):
+                scripts.add(len(holders))
+            holders.append(text)
+            out.append('__indirect_pid_' + str(len(holders) - 1) + '__')
+            i = j + 1
+            word_start = False
+            continue
+        if command and quote is None and word_start and i >= arith_until and source.startswith('((', i):
+            try:
+                inner = extract_substitutions(source, holders, scripts, ariths, i + 2, ')', 'probe')
+                j = inner['end']
+                if source[j + 1:j + 2] == ')':
+                    ariths.append(source[i + 2:j])
+                    arith_until = j + 2
+            except ValueError:
+                pass
+        if command and quote is None and c == '<' and i >= arith_until and source.startswith('<<', i):
+            if source.startswith('<<<', i):
+                out.append('<<<')
+                i += 3
+                word_start = False
+                continue
+            j = i + 2
+            strip = j < n and source[j] == '-'
+            j += 1 if strip else 0
+            while j < n and source[j] in ' ' + chr(9):
+                j += 1
+            parsed = heredoc_word(source[j:])
+            if not parsed:
+                raise ValueError('unrecognised heredoc delimiter')
+            delimiter, quoted, consumed = parsed
+            end = j + consumed
+            pending.append((delimiter, strip, quoted))
+            out.append(source[i:end])
+            i = end
+            word_start = False
+            continue
+        if command and quote is None and c == chr(10):
+            out.append(chr(10))
+            i += 1
+            for delimiter, strip, quoted in pending:
+                body = []
+                while True:
+                    if i >= n:
+                        raise ValueError('unterminated heredoc')
+                    end = source.find(chr(10), i)
+                    end = n if end < 0 else end
+                    line = source[i:end]
+                    i = end + 1
+                    if (line.lstrip(chr(9)) if strip else line) == delimiter:
+                        out.append(line)
+                        if end < n:
+                            out.append(chr(10))
+                        break
+                    if quoted:
+                        out.append(line)
+                    else:
+                        nested = extract_substitutions(line, holders, scripts, ariths, 0, None, 'literal')
+                        out.append(nested['out'])
+                        subs.extend(nested['subs'])
+                    out.append(chr(10))
+            pending = []
+            word_start = True
+            continue
+        out.append(c)
+        i += 1
+        if quote is None:
+            word_start = c in blanks
+    if stop is not None and not found:
+        raise ValueError('unterminated command substitution')
+    if pending:
+        raise ValueError('unterminated heredoc')
+    return {'out': ''.join(out), 'subs': subs, 'holders': holders, 'ariths': ariths,
+            'scripts': scripts, 'end': i}
 "#, $after) };
 }
 pub const CODEX_COMMAND_TOKENIZER_PY: &str = crate::render_command_tokenizer!("", "");
@@ -642,7 +1051,7 @@ assert not any(g.error for g in command_records("echo $'a\\nb' x"))
 import os, re, shlex
 # COMMAND_TOKENIZER_FRAGMENT
 line = "echo $'\\' <<X #'"
-assert heredoc_delim(shell_text(line)) is None, heredoc_delim(shell_text(line))
+assert heredoc_ops(shell_text(line)) == [], heredoc_ops(shell_text(line))
 assert open_quote(line) is None
 command = line + chr(10) + "cat /etc/passwd" + chr(10) + "X"
 records = [list(g) for g in command_records(command) if list(g)]
@@ -667,6 +1076,15 @@ def token_segs(command, index=1):
     groups = [g for g in command_records(command) if list(g)]
     assert groups, command
     return groups[0][index], groups[0].quote_segments[index]
+records = command_records('((1 << 3)); bash <<3\npkill -f foo\n3')
+assert not any(g.error for g in records)
+assert next(g for g in records if g and g[0] == 'bash').body == 'pkill -f foo\n'
+assert all(not g.body for g in records if g and g[0] != 'bash')
+command = "cat <<A; cat <<'B'\na\nA\nb" + chr(92) + "\nB\npkill -f foo"
+assert strip_line_continuations(command) == command
+records = command_records(command)
+assert not any(g.error for g in records)
+assert any(g and g[0] == 'pkill' for g in records)
 word, segs = token_segs('echo "$A""B"')
 assert word == '$AB', word
 assert segs[0] == segs[1] != segs[2], segs
@@ -696,11 +1114,14 @@ import os, re, shlex
 # COMMAND_TOKENIZER_FRAGMENT
 for command in (
     'echo x > y',
+    'xargs -I {} echo \"$HOME\" {}',
     'FOO=bar env -u SECRET sudo -u nobody cat f > out',
     'command -v cube',
     'timeout 1 echo x 2>/dev/null',
 ):
     group = next(g for g in command_records(command) if list(g))
+    assert group.quote_segments is not None, command
+    assert len(group.literal_chars) == len(group), command
     stripped = strip_prefixes(group)
     kept = strip_prefix_indices(group)
     assert [group[i] for i in kept] == stripped, (command, kept, stripped)
@@ -712,5 +1133,87 @@ for command in (
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn strip_prefixes_peels_flock_and_sudo_value_options() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+assert strip_prefixes(['flock', '/tmp/l', 'bossctl', 'status']) == ['bossctl', 'status']
+assert strip_prefixes(['sudo', '-D', '/tmp', 'bossctl', 'status']) == ['bossctl', 'status']
+assert strip_prefixes(['noglob', 'pkill', '-f', 'foo']) == ['pkill', '-f', 'foo']
+assert strip_prefixes(['-', 'pkill', 'foo']) == ['pkill', 'foo']
+assert wrapper_has_xargs(['pgrep', 'foo', '|', 'xargs', 'kill']) is False
+assert wrapper_has_xargs(['xargs', 'kill']) is True
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn grouped_producers_contribute_every_command_to_pipe_sources() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+def consumer(command):
+    records = [g for g in command_records(command) if list(g)]
+    assert records, command
+    return records[-1]
+sh = consumer("(echo 'pkill -f foo'; echo done) | sh")
+assert [list(g) for g in sh.pipe_sources] == [['echo', 'pkill -f foo'], ['echo', 'done']], [list(g) for g in sh.pipe_sources]
+brace = consumer("{ echo 'pkill -f foo'; echo done; } | sh")
+assert [list(g) for g in brace.pipe_sources] == [['echo', 'pkill -f foo'], ['echo', 'done']], [list(g) for g in brace.pipe_sources]
+plain = consumer("echo a | echo b | sh")
+assert [list(g) for g in plain.pipe_sources] == [['echo', 'a'], ['echo', 'b']], [list(g) for g in plain.pipe_sources]
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn extract_substitutions_numbers_holders_across_nested_scans() {
+        let script = super::with_command_tokenizer(
+            r#"
+import os, re, shlex
+# COMMAND_TOKENIZER_FRAGMENT
+holders = []
+outer = extract_substitutions('K=$(command -v pkill); bash -c "$(cat run.sh)"', holders)
+assert holders == ['command -v pkill', 'cat run.sh'], holders
+assert 'bash' in outer['out'] and '__indirect_pid_0__' in outer['out']
+inner = extract_substitutions('echo $(date); __indirect_pid_0__ -f foo', holders)
+assert holders[2] == 'date', holders
+assert '__indirect_pid_2__' in inner['out']
+assert '__indirect_pid_0__' in inner['out']
+brew = extract_substitutions('eval "$(brew shellenv)"')
+assert brew['holders'][0] == 'brew shellenv', brew
+assert brew['out'].startswith('eval ')
+"#,
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
