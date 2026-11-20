@@ -96,26 +96,38 @@ pub(super) fn sweep_live_workspace_processes(
     sweep_workspace_processes(&SystemWorkspaceProcessTable, workspace_id, workspace_path, phase)
 }
 
+/// A refused removal retains its complete sweep for auditing and diagnostics.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub(super) struct RemovalRefusal {
+    pub(super) error: CubeError,
+    pub(super) report: ReapReport,
+}
+
 /// Sweep before a directory removal, and refuse the removal when anything
 /// owned is still alive afterwards.
 pub(super) fn ensure_no_live_processes(
     table: &dyn WorkspaceProcessTable,
     workspace_id: &str,
     workspace_path: &Path,
-) -> Result<ReapReport> {
+) -> std::result::Result<ReapReport, Box<RemovalRefusal>> {
     let report = sweep_workspace_processes(table, workspace_id, workspace_path, SweepPhase::Remove);
     if report.is_clean() {
         return Ok(report);
     }
-    Err(CubeError::WorkspaceBusy {
-        path: workspace_path.to_path_buf(),
-        processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
-    })
+    Err(Box::new(RemovalRefusal {
+        error: CubeError::WorkspaceBusy {
+            path: workspace_path.to_path_buf(),
+            processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
+        },
+        report,
+    }))
 }
 
 /// [`ensure_no_live_processes`] against the real process table.
 pub(super) fn ensure_no_live_processes_in(workspace_id: &str, workspace_path: &Path) -> Result<ReapReport> {
     ensure_no_live_processes(&SystemWorkspaceProcessTable, workspace_id, workspace_path)
+        .map_err(|refusal| refusal.error)
 }
 
 /// Read-only occupancy verification for expired leases and prospective claims.
@@ -245,7 +257,7 @@ mod tests {
         let table = table();
         table.immortal(40);
         let err = ensure_no_live_processes(&table, "mono-agent-007", Path::new(WS)).unwrap_err();
-        match &err {
+        match &err.error {
             CubeError::WorkspaceBusy { path, processes } => {
                 assert_eq!(path, Path::new(WS));
                 assert_eq!(processes, "40 (zsh)");
@@ -367,7 +379,9 @@ mod verification_tests {
     }
     #[test]
     fn post_term_failure_retains_signal_audit() {
-        let report = sweep_workspace_processes(&failing(1), "test", Path::new("/pool/test"), SweepPhase::Remove);
+        let report = ensure_no_live_processes(&failing(1), "test", Path::new("/pool/test"))
+            .unwrap_err()
+            .report;
         assert_eq!(report.killed_pids(), vec![40]);
         assert!(report.error.is_some());
         assert!(sweep_is_noteworthy(&report, SweepPhase::Remove));

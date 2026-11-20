@@ -24,7 +24,7 @@ use crate::app::errors::{
     CubeError, JJ_NO_REMOTE_BOOKMARK_SIGNATURE, JJ_REVISION_DOESNT_EXIST_SIGNATURE, Result, RunResult,
 };
 use crate::app::jj::network_cmd_timeout;
-use crate::app::process_guard::{SweepPhase, sweep_is_noteworthy, sweep_json, sweep_workspace_processes};
+use crate::app::process_guard::{SweepPhase, ensure_no_live_processes, sweep_is_noteworthy, sweep_json};
 use crate::app::store_gc::store_gc_lock_path;
 use crate::app::util::repo_lock_path;
 
@@ -321,11 +321,13 @@ pub(super) fn purge_workspace_trees(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let sweep = if path.exists() {
-            sweep_workspace_processes(table, &workspace_id, path, SweepPhase::Remove)
+        let verification = if path.exists() {
+            ensure_no_live_processes(table, &workspace_id, path)
         } else {
-            ReapReport::default()
+            Ok(ReapReport::default())
         };
+        let removal_allowed = verification.is_ok();
+        let sweep = verification.unwrap_or_else(|refusal| refusal.report);
         if sweep_is_noteworthy(&sweep, SweepPhase::Remove) {
             audit!(
                 database_path,
@@ -336,7 +338,7 @@ pub(super) fn purge_workspace_trees(
                 processes = sweep_json(&sweep),
             );
         }
-        if !sweep.is_clean() {
+        if !removal_allowed {
             let detail = sweep.error.clone().unwrap_or_else(|| sweep.survivor_summary());
             eprintln!(
                 "warning: cube repo remove: keeping {} because it could not be verified free of running processes ({detail})",

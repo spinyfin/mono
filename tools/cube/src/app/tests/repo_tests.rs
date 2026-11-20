@@ -1334,4 +1334,88 @@ mod purge_verification {
         assert!(outcome.purged.is_empty());
         assert_eq!(outcome.refused[0]["error"], "process list unavailable");
     }
+
+    #[test]
+    fn lease_allocates_a_distinct_id_and_preserves_an_unverified_husk() {
+        use super::super::support::{ExpectedCommand, FakeRunner, seed_mono_repo, with_database_path};
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        for unreadable in [false, true] {
+            for nonempty in [false, true] {
+                let (tempdir, database_path) = with_database_path();
+                let workspace_root = std::fs::canonicalize(tempdir.path()).unwrap().join("workspaces");
+                let husk_path = workspace_root.join("mono-agent-004");
+                // Intentionally no .jj/ or .git/ — this is the broken-empty state.
+                std::fs::create_dir_all(&husk_path).expect("workspace dir");
+
+                if nonempty {
+                    std::fs::create_dir_all(husk_path.join("leftover")).unwrap();
+                }
+                seed_mono_repo(&workspace_root, &database_path);
+
+                let new_path = workspace_root.join("mono-agent-005");
+                let staging = workspace_root.join(".incoming-mono-agent-005");
+                let runner = FakeRunner::new(vec![
+                    ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
+                    ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+                    ExpectedCommand::ok(
+                        new_path.clone(),
+                        "jj",
+                        &["git", "remote", "list"],
+                        "origin\tgit@github.com:spinyfin/mono.git\n",
+                    ),
+                    ExpectedCommand::ok(
+                        new_path.clone(),
+                        "jj",
+                        &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                        "",
+                    ),
+                    ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main@origin"], ""),
+                    ExpectedCommand::ok(
+                        new_path.clone(),
+                        "jj",
+                        &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                        "abc1234",
+                    ),
+                ]);
+
+                let table = StaticProcessTable::new(
+                    vec![fake_process(40, 1, "tool", Some(husk_path.to_str().unwrap()))],
+                    900,
+                );
+                table.immortal(40);
+                let process_table: &dyn WorkspaceProcessTable = if unreadable { &UnreadableTable } else { &table };
+                let crate::cli::Command::Workspace { command } =
+                    Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "retained husk"]).command
+                else {
+                    panic!("workspace command")
+                };
+                let result = crate::app::workspace::run_workspace_with_process_table(
+                    command,
+                    Some(&database_path),
+                    &runner,
+                    process_table,
+                )
+                .expect("lease should self-heal the husk and auto-create a fresh workspace");
+                runner.assert_exhausted();
+
+                assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
+                assert_eq!(result.payload["workspace"]["state"], "leased");
+
+                // Both the retained husk and the newly leased workspace remain registered.
+                assert!(husk_path.exists(), "unverified husk must remain");
+                assert_eq!(husk_path.join("leftover").exists(), nonempty);
+                use crate::store::{Store, WorkspaceListFilter};
+                let store = Store::open_at(&database_path).unwrap();
+                let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
+                let ids: Vec<_> = rows.iter().map(|r| r.workspace_id.as_str()).collect();
+                assert!(ids.contains(&"mono-agent-004"), "husk row must remain; saw {ids:?}");
+                assert!(
+                    ids.contains(&"mono-agent-005"),
+                    "fresh workspace should exist; saw {ids:?}"
+                );
+            }
+        }
+    }
 }

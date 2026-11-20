@@ -6,7 +6,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use workspace_procs::{SystemWorkspaceProcessTable, WorkspaceProcessTable};
+use workspace_procs::WorkspaceProcessTable;
 
 use crate::command_runner::{CommandInvocation, CommandRunner};
 use crate::metadata::{RepoRecord, WorkspaceRecord};
@@ -17,7 +17,7 @@ use crate::{audit, setup};
 use crate::app::disk::DiskSpace;
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::{is_retryable_backend_lock_error, network_cmd_timeout, workspace_path_exists};
-use crate::app::process_guard::{SweepPhase, sweep_is_noteworthy, sweep_json, sweep_workspace_processes};
+use crate::app::process_guard::{SweepPhase, ensure_no_live_processes, sweep_is_noteworthy, sweep_json};
 use crate::app::reclaim::assert_mint_headroom;
 use crate::app::util::current_epoch_s;
 
@@ -234,25 +234,9 @@ pub(super) fn auto_create_workspace(
 /// (no commits, no working copy), so remove the directory and forget its
 /// registry row, freeing the slot for a fresh clone. Called from the lease
 /// path so a degraded pool self-repairs instead of blocking a lease
-/// (issue #845 part 2b).
-pub(super) fn gc_broken_empty_workspace(
-    store: &mut Store,
-    database_path: Option<&Path>,
-    repo: &str,
-    workspace_id: &str,
-    workspace_path: &Path,
-) -> Result<()> {
-    gc_broken_empty_workspace_with(
-        &SystemWorkspaceProcessTable,
-        store,
-        database_path,
-        repo,
-        workspace_id,
-        workspace_path,
-    )
-}
-
-/// [`gc_broken_empty_workspace`] against an injectable process table. Anything
+/// (issue #845 part 2b). Returns true only when the directory and row were removed.
+///
+/// Anything
 /// still running inside the husk is reaped first; when that cannot be verified
 /// the directory is kept (a husk is never worth killing the wrong process or
 /// deleting a tree something still uses) and the lease provisions a fresh
@@ -264,9 +248,11 @@ pub(super) fn gc_broken_empty_workspace_with(
     repo: &str,
     workspace_id: &str,
     workspace_path: &Path,
-) -> Result<()> {
+) -> Result<bool> {
     if workspace_path.exists() {
-        let sweep = sweep_workspace_processes(table, workspace_id, workspace_path, SweepPhase::Remove);
+        let verification = ensure_no_live_processes(table, workspace_id, workspace_path);
+        let removal_allowed = verification.is_ok();
+        let sweep = verification.unwrap_or_else(|refusal| refusal.report);
         if sweep_is_noteworthy(&sweep, SweepPhase::Remove) {
             audit!(
                 database_path,
@@ -277,7 +263,7 @@ pub(super) fn gc_broken_empty_workspace_with(
                 processes = sweep_json(&sweep),
             );
         }
-        if !sweep.is_clean() {
+        if !removal_allowed {
             let detail = sweep.error.clone().unwrap_or_else(|| sweep.survivor_summary());
             eprintln!(
                 "warning: cube workspace `{repo}/{workspace_id}` is broken-empty at {} but could not be \
@@ -285,7 +271,7 @@ pub(super) fn gc_broken_empty_workspace_with(
                  fresh workspace",
                 workspace_path.display(),
             );
-            return Ok(());
+            return Ok(false);
         }
         fs::remove_dir_all(workspace_path).map_err(|source| CubeError::WorkspaceDirRemove {
             path: workspace_path.to_path_buf(),
@@ -305,7 +291,7 @@ pub(super) fn gc_broken_empty_workspace_with(
         workspace_id = workspace_id,
         workspace_path = workspace_path.display().to_string(),
     );
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn run_setup_for_workspace(
