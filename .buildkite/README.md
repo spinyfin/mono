@@ -53,6 +53,12 @@ Sourced by other steps to set up the shared bazel wrapper and CI config rather t
 
 It also decides whether the step's bazel actions execute on remote workers, and appends the remote flags to `CI_BAZEL_FLAGS` when they do; see "Remote execution on macOS agents" and "Remote execution on Linux agents" below.
 
+#### Revalidating a build that predates lock recovery
+
+Rebuilding an old commit runs that commit's checked-in pipeline and step scripts. Merging a recovery change into main does not install it into an unchanged old head. The CI operator must either recover the affected host before rebuilding the unchanged commit, or have the PR maintainer rebase onto the merged CI setup and push to trigger normal required checks on the new head.
+
+For a host that still holds an earlier job's Bazel command lock, the host owner or CI operator must inspect the affected agent and verify the server's live argv against its recorded PID, Bazel server marker, server jar, exact workspace and output-base arguments before stopping it. Recheck that identity before escalating from SIGTERM to SIGKILL. If identity cannot be established, pause the affected agent and reschedule the build on a healthy agent instead; do not signal an unverified process. Coordinate pausing with any currently running job. Record the replacement build URL and commit SHA, and verify the required `buildkite/mono/bazel-build-test` result rather than treating a queued rebuild as a passing run.
+
 ### `bazel-build-test.sh`
 
 Runs `bazel build //...` then `bazel test //...` in one step, on one agent. The build phase catches build-graph rot (visibility violations, missing deps, broken generated files) that cargo cannot see; the test phase is the canonical rust test step and, since it includes `engine_lib_test` (`tools/boss/engine/BUILD.bazel:86` — `rust_test(name = "engine_lib_test", crate = ":engine_lib")`), covers the engine lib tests that the 2026-05-12 drift incident exposed, in addition to the integration test targets. Each phase logs under its own collapsible `---` group (`[bazel-build]` / `[bazel-test]`) so a build breakage vs. a test failure stays distinguishable in the log even though they're one Buildkite step. The step's target GitHub commit status is `buildkite/mono/bazel-build-test` — see `REQUIRED_CHECKS.md`.
