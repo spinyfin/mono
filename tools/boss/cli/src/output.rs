@@ -1114,6 +1114,33 @@ fn park_detail_lines(
     lines
 }
 
+/// Lines `boss task show` prints for the merge request on a card: whether it
+/// still stands, the head it was made for, the head the engine last compared
+/// against it, and the engine's own sentence about why it ended.
+fn merge_intent_lines(intent: &boss_protocol::MergeIntent) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Merge request: {} (requested {})",
+        intent.status.replace('_', " "),
+        format_stored_epoch(&intent.requested_at)
+    )];
+    if let Some(sha) = intent.approved_head_sha.as_deref() {
+        lines.push(format!("  Approved head: {sha}"));
+    }
+    if let Some(sha) = intent.decided_head_sha.as_deref() {
+        lines.push(format!("  Head when decided: {sha}"));
+    }
+    if intent.automatic_merges > 0 {
+        lines.push(format!("  Automatic re-merges: {}", intent.automatic_merges));
+    }
+    if let Some(reason) = intent.reason.as_deref() {
+        lines.push(format!("  Reason: {reason}"));
+    }
+    if let Some(detail) = intent.detail.as_deref() {
+        lines.push(format!("  {detail}"));
+    }
+    lines
+}
+
 pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>, with_primary_id: bool) {
     println!("{title}");
     if let Some(n) = task.short_id {
@@ -1203,6 +1230,11 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     if let Some(pr_url) = &task.pr_url {
         println!("PR URL: {}", pr_url);
         println!("Ready for review: {}", if task.ready_for_review { "yes" } else { "no" });
+    }
+    if let Some(intent) = &task.merge_intent {
+        for line in merge_intent_lines(intent) {
+            println!("{line}");
+        }
     }
     if let Some(state) = &task.doc_link_state
         && let Some(line) = format_project_design_doc_line(state)
@@ -1738,6 +1770,54 @@ mod parked_list_tests {
         assert_eq!(
             visible.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             ["proj_parked"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_intent_lines_tests {
+    use super::*;
+    use boss_protocol::{MERGE_INTENT_ACTIVE, MERGE_INTENT_NEEDS_REVIEW, MERGE_INTENT_REASON_NO_DECISION, MergeIntent};
+
+    fn intent(status: &str) -> MergeIntent {
+        MergeIntent::builder()
+            .id("mi_1")
+            .work_item_id("task_1")
+            .pr_url("https://github.com/example/repo/pull/42")
+            .status(status)
+            .approved_head_sha("aaaaaaa1")
+            .requested_at("not-an-epoch")
+            .build()
+    }
+
+    #[test]
+    fn a_standing_request_shows_its_status_and_approved_head_only() {
+        assert_eq!(
+            merge_intent_lines(&intent(MERGE_INTENT_ACTIVE)),
+            [
+                "Merge request: active (requested not-an-epoch)",
+                "  Approved head: aaaaaaa1"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ended_request_shows_both_heads_and_why_it_ended() {
+        let mut ended = intent(MERGE_INTENT_NEEDS_REVIEW);
+        ended.decided_head_sha = Some("bbbbbbb2".to_owned());
+        ended.reason = Some(MERGE_INTENT_REASON_NO_DECISION.to_owned());
+        ended.detail = Some("An automatic CI fix has since changed the PR.".to_owned());
+        ended.automatic_merges = 2;
+        assert_eq!(
+            merge_intent_lines(&ended),
+            [
+                "Merge request: needs review (requested not-an-epoch)",
+                "  Approved head: aaaaaaa1",
+                "  Head when decided: bbbbbbb2",
+                "  Automatic re-merges: 2",
+                "  Reason: no_decision",
+                "  An automatic CI fix has since changed the PR.",
+            ]
         );
     }
 }

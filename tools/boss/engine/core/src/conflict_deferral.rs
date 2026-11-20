@@ -71,11 +71,15 @@ pub(crate) enum Gate {
 
 /// The evidence that a merge has been requested for this PR, or `None`.
 ///
-/// Five sources, any one of which is enough:
+/// Six sources, any one of which is enough:
 ///
 /// - The engine is already holding the person's merge request while it
 ///   resolves the conflict (`merge_queue_state = 'resolving_conflicts'`).
 ///   Checked first.
+/// - A person's merge request still stands for the PR
+///   (`WorkDb::active_merge_intent`). It outlives the submissions below, so
+///   a conflict that appears after a failed merge attempt is resolved for
+///   the merge that was asked for instead of waiting to be asked again.
 /// - GitHub reports the PR in its merge queue, or with auto-merge armed.
 ///   These cover a merge requested on GitHub directly.
 /// - The engine holds an active GitHub merge intent for the PR: a Merge When
@@ -98,6 +102,18 @@ pub(crate) fn merge_requested(
         .unwrap_or(true)
     {
         return Some("merge_conflict_resolution_requested");
+    }
+    match work_db.active_merge_intent(&candidate.work_item_id, &candidate.pr_url) {
+        Ok(Some(_)) => return Some("merge_intent"),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "conflict_deferral: could not read the standing merge request; treating the PR as merge-requested",
+            );
+            return Some("merge_intent_unreadable");
+        }
     }
     if probe.in_merge_queue {
         return Some("github_merge_queue");

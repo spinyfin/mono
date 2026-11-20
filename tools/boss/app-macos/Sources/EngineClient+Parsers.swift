@@ -241,6 +241,7 @@ extension EngineClient {
             prStatePolledAt: payload["pr_state_polled_at"] as? String,
             mergeQueueState: payload["merge_queue_state"] as? String,
             mergeQueueDetail: payload["merge_queue_detail"] as? String,
+            mergeIntent: WorkMergeIntent.parse(payload["merge_intent"]),
             prMergeableState: payload["pr_mergeable_state"] as? String,
             conflictResolutionDeferred: payload["conflict_resolution_deferred"] as? Bool ?? false,
             externalRef: parseExternalRef(payload["external_ref"]),

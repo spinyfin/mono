@@ -138,6 +138,10 @@ impl ConflictHandling for CoreSweepHost {
     ) {
         crate::merge_when_ready::resume_after_conflict(work_db, publisher, candidate, self.merge_executor.as_ref())
             .await;
+        // The same clean probe is when a merge request that outlived its
+        // attempt can be settled. It runs second so a merge the line above
+        // just re-requested is seen as the live submission it is.
+        crate::merge_intent::settle_after_clean_probe(work_db, publisher, candidate).await;
     }
 
     async fn disarm_stopped_merge(

@@ -147,6 +147,12 @@ impl WorkDb {
     /// The task terminal transition owns its queue-column clear; this records
     /// the corresponding durable fact so a future reopen/candidate cannot
     /// inherit a stale intent.
+    ///
+    /// A `merged` or `closed` retirement is the merge poller observing the
+    /// PR's end, for every merge mechanism and whether or not a submission
+    /// was still live. It ends the person's standing merge request too,
+    /// while the card is still in review, so that record says which of the
+    /// two happened.
     pub fn retire_github_merge_intent(&self, work_item_id: &str, pr_url: &str, status: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -171,6 +177,9 @@ impl WorkDb {
             } else {
                 crate::merge_conflict_merging::forget_confirmed_for_intents(&tx, work_item_id, status)?;
             }
+        }
+        if matches!(status, "merged" | "closed") {
+            crate::merge_intent::end_on_pr_terminal(&tx, work_item_id, pr_url, status == "merged")?;
         }
         tx.commit()?;
         Ok(rows > 0)

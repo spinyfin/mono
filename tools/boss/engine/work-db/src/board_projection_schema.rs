@@ -140,6 +140,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS board_changes_metadata_{operation} AFTER {operation} ON metadata WHEN {condition} BEGIN INSERT INTO board_changes(source) VALUES ('metadata'); END;"))?;
     }
     super::merge_evidence::install_journal_triggers(conn)?;
+    super::merge_intent::install_journal_triggers(conn)?;
     Ok(())
 }
 

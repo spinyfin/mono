@@ -313,6 +313,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         pr_state_polled_at: row.get::<_, Option<String>>(28)?.filter(|s| !s.is_empty()),
         merge_queue_state: row.get::<_, Option<String>>(29)?.filter(|s| !s.is_empty()),
         merge_queue_detail: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
+        merge_intent: crate::merge_intent::card_column(row)?,
         driver: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
         pr_mergeable_state: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
         // Derived from the conflict ledger during board assembly.

@@ -48,7 +48,7 @@ A deferred conflict can also end without any resolution:
 
 ### Why "a merge was requested" is the readiness signal
 
-Deferral is meant to wait until the PR is otherwise ready to merge. The engine reads that as: someone has asked for the merge. It is the one fact the engine holds that says a person decided this PR should land, because the engine never merges a PR on its own. It is read from four places, any one of which is enough: GitHub's merge-queue entry, GitHub's armed auto-merge, an active `github_merge_intents` row, and an active `trunk_merge_intents` row.
+Deferral is meant to wait until the PR is otherwise ready to merge. The engine reads that as: someone has asked for the merge. It is the one fact the engine holds that says a person decided this PR should land, because the engine never merges a PR on its own. It is read from five places, any one of which is enough: a [merge request that still stands](merge-intent.md) for the PR (it outlives a failed merge attempt, so a conflict that appears afterwards is resolved rather than held), GitHub's merge-queue entry, GitHub's armed auto-merge, an active `github_merge_intents` row, and an active `trunk_merge_intents` row.
 
 Review and CI state were the alternative and were rejected. A PR is usually reviewed and green within minutes of opening and can then sit for weeks, conflicting again on every nearby merge. Keying on review and CI would resolve exactly those conflicts, which are the ones deferral exists to skip.
 

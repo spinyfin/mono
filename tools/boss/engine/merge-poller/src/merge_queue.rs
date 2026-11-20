@@ -253,7 +253,23 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
                 return;
             }
         };
-        if prior.is_none() {
+        // The submission is gone; the person's request behind it may not
+        // be. Failed checks and a conflict are the engine's to fix, so the
+        // request stands through them. Any other departure ends it.
+        let request_ended =
+            match work_db.note_merge_intent_left_queue(&candidate.work_item_id, &candidate.pr_url, &event.reason) {
+                Ok(departure) => departure == boss_work_db::MergeQueueDeparture::Ended,
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        ?err,
+                        "merge poller: failed to update the standing merge request after observed dequeue",
+                    );
+                    false
+                }
+            };
+        if prior.is_none() && !request_ended {
             return;
         }
         tracing::info!(
@@ -404,6 +420,11 @@ pub(crate) async fn check_merge_queue_rebounce(
                     pr_head_sha,
                     before_commit_sha,
                     "merge poller: rebounce episode already recorded; skipping re-fetch",
+                );
+                ci_watch::end_merge_intent_if_ci_fix_declined(
+                    work_db,
+                    candidate,
+                    crate::work::MergeIntentCiFixDecline::EpisodeAlreadyHandled,
                 );
                 continue;
             }

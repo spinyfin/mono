@@ -954,6 +954,18 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_detail: Option<String>,
 
+    /// The standing merge request for this card's PR, when one says something
+    /// about the card: a request that still stands (including through a failed
+    /// merge attempt and the automatic fix that follows it), or one that ended
+    /// with the card back in review and a reason the reader should see.
+    /// `None` when no merge was requested, and once the card has merged, left
+    /// review or been bound to another PR.
+    ///
+    /// Read from the engine's merge-intent record, not from a `tasks` column,
+    /// and only on the single-item and board reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_intent: Option<crate::MergeIntent>,
+
     /// Raw GitHub mergeability at last poll, independent of CI/review/merge-
     /// queue state. One of `"mergeable"` (GitHub's `mergeable=MERGEABLE`),
     /// `"conflicting"` (`mergeable=CONFLICTING` — the PR cannot be merged as
