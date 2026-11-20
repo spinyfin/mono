@@ -2625,8 +2625,15 @@ impl ExecutionCoordinator {
             && (positioning || final_failure)
         {
             let host = self.work_db.execution_host_id(&execution.id).ok().flatten();
-            self.work_db
-                .fail_conflict_workspace_on_host(&attempt.id, &error_text, host.as_deref())?;
+            self.work_db.fail_conflict_workspace_on_host(
+                &attempt.id,
+                if positioning_refused {
+                    &refusal_message
+                } else {
+                    &error_text
+                },
+                host.as_deref(),
+            )?;
         }
         // A structured refusal never retries: its hold has its own recheck sweep.
         let retry_delays: &[std::time::Duration] =

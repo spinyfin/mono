@@ -983,3 +983,32 @@ async fn retryable_goto_uses_the_bounded_mechanical_retry_budget() {
             .contains("maintenance busy")
     );
 }
+
+#[tokio::test]
+async fn unclassified_goto_uses_the_bounded_mechanical_retry_budget() {
+    use crate::conflict_ladder::{LadderOutcome, try_mechanical_rungs};
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let cube = ScriptCube::new(Script::GotoUnclassified);
+    for _ in 1..crate::work::MAX_RUNG1_LEASE_FAILURES {
+        assert_eq!(
+            try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt).await,
+            LadderOutcome::MechanicalRungsUnavailable
+        );
+        assert!(db.list_attention_items_for_work_item(&chore).unwrap().is_empty());
+    }
+    assert_eq!(
+        try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt).await,
+        LadderOutcome::WorkspacePreparationFailed
+    );
+    assert!(
+        db.get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap()
+            .failure_reason
+            .unwrap()
+            .contains("failed to resolve PR 42")
+    );
+}

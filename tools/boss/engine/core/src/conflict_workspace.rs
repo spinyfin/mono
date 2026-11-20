@@ -55,10 +55,14 @@ pub(crate) async fn recover(
     };
     if let Err(error) = prepared {
         tracing::warn!(attempt_id = %attempt.id, error = %format!("{error:#}"), "conflict workspace remains unavailable; retaining failed attempt");
+        let probe_text = error
+            .downcast_ref::<boss_host_execution::cube::CubeCliError>()
+            .and_then(|error| error.refusal_message())
+            .unwrap_or_else(|| format!("{error:#}"));
         publish_if_changed(
             db.note_workspace_recovery(
                 &attempt.id,
-                &format!("The last recovery probe did not succeed: {error:#}"),
+                &format!("The last recovery probe did not succeed: {probe_text}"),
             ),
             publisher,
             candidate,

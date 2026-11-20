@@ -150,11 +150,18 @@ pub mod cube {
             })
         }
 
-        /// Honor Cube's retry classification, including legacy maintenance exits.
+        /// Cube's retry classification.
+        ///
+        /// An explicit `retryable: false` (including a structured positioning
+        /// refusal) is terminal. Missing classification is retryable so callers
+        /// apply their bounded budget: Cube's PR-resolution and PR-head-fetch
+        /// failures omit the field and exit 2, and older binaries, transport
+        /// errors, and malformed payloads say nothing. Legacy maintenance exits
+        /// (75) remain retryable.
         pub fn retryable(&self) -> bool {
             self.structured_envelope()
                 .and_then(|value| value["retryable"].as_bool())
-                .unwrap_or(self.exit_code == Some(75))
+                .unwrap_or(true)
         }
 
         /// Cube's own refusal message (the envelope's `error` string), free of the
@@ -248,6 +255,36 @@ pub mod cube {
                 stdout: String::new(),
             };
             assert!(error.retryable());
+        }
+
+        #[test]
+        fn unclassified_exit_two_envelopes_are_retryable() {
+            for payload in [
+                r#"{"error":"failed to resolve PR 42 in owner/repo: gh: connection reset"}"#,
+                r#"{"error":"PR 42's head abcdef0123456789abcdef0123456789abcdef01 is not in the shared jj store; fetching the head branch failed: network; fetching the base repository's pull ref failed: network"}"#,
+            ] {
+                let error = CubeCliError {
+                    host: "local".into(),
+                    exit_code: Some(2),
+                    stderr: payload.into(),
+                    stdout: String::new(),
+                };
+                assert!(error.retryable(), "{payload}");
+                assert!(!error.positioning_refused(), "{payload}");
+            }
+            let refused = CubeCliError {
+                host: "local".into(),
+                exit_code: Some(2),
+                stderr: concat!(
+                    r#"{"error":"PR 42 is MERGED","#,
+                    r#""error_kind":"workspace_positioning_refused","#,
+                    r#""retryable":false}"#
+                )
+                .into(),
+                stdout: String::new(),
+            };
+            assert!(!refused.retryable());
+            assert!(refused.positioning_refused());
         }
 
         #[test]
