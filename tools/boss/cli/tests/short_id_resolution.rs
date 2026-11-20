@@ -158,6 +158,50 @@ async fn list_filters_resolve_product_scope_and_reject_unknown_selectors() -> Re
             );
         }
     }
+    for (flag, id, n) in [
+        ("--task", &task.id, task.short_id.unwrap()),
+        ("--project", &project.id, project.short_id.unwrap()),
+    ] {
+        for selector in [n.to_string(), format!("{}/{n}", products[1].slug)] {
+            let created = run_boss(
+                engine.socket_str(),
+                &[
+                    "attention",
+                    "create",
+                    "--product",
+                    &products[1].slug,
+                    flag,
+                    &selector,
+                    "--group-key",
+                    &format!("scope-{flag}-{selector}"),
+                    "--kind",
+                    "question",
+                    "--question-type",
+                    "yes_no",
+                    "--prompt",
+                    "Proceed?",
+                ],
+            )?;
+            let field = if flag == "--task" {
+                "association_task_id"
+            } else {
+                "association_project_id"
+            };
+            assert_eq!(created["attention_group"][field], *id, "{created}");
+            let listed = run_boss(
+                engine.socket_str(),
+                &["attention", "list", "--product", &products[1].slug, flag, &selector],
+            )?;
+            assert!(
+                listed["attention_groups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group["id"] == created["attention_group"]["id"]),
+                "{listed}"
+            );
+        }
+    }
     // Explicit prefixes override --product for the anchor, while the listing
     // still limits returned rows to its product. Edges stay within a product,
     // so an anchor in Boss has no prerequisites in the Flunge listing.
@@ -324,6 +368,28 @@ async fn selected_product_diagnostics_and_environment_override() -> Result<()> {
     assert_eq!(value["item"]["id"], chores[1].id);
     assert!(!String::from_utf8_lossy(&output.stderr).contains("implicit scope"));
 
+    let implicit_dependent = create_chore(&mut client, &products[0].id, "Implicit dependent").await?;
+    for operation in ["add", "rm"] {
+        let output = run(&["task", "depend", operation, &implicit_dependent.id, &selector], None)?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let prerequisite = if operation == "add" {
+            &value["edge"]["prerequisite_id"]
+        } else {
+            &value["prerequisite_id"]
+        };
+        assert_eq!(prerequisite, &unique.id);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("product Boss (implicit scope)"));
+    }
+    run(&["task", "depend", "add", &implicit_dependent.id, &selector], None)?;
+    engine.db()?.delete_work_item(&unique.id)?;
+    let output = run(&["task", "depend", "rm", &implicit_dependent.id, &selector], None)?;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["prerequisite_id"], unique.id);
+    assert_eq!(value["removed"], false);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("product Boss (implicit scope)"));
+
     let dependent = create_chore(&mut client, &products[1].id, "Dependent").await?;
     let output = run(
         &["task", "depend", "add", &dependent.id, &short],
@@ -383,6 +449,30 @@ async fn get_work_item_resolves_globally_unique_short_id() -> Result<()> {
     let chore = create_chore(&mut client, &product.id, "unique short id").await?;
     let short_id = chore.short_id.ok_or_else(|| anyhow!("chore has no short_id"))?;
     let selector = boss_protocol::short_id_wire_form(short_id);
+
+    for app_connected in [false, true] {
+        if app_connected {
+            let event = client.send_request(&FrontendRequest::RegisterAppSession).await?;
+            assert!(matches!(event, FrontendEvent::AppSessionRegistered));
+        }
+        let output = Command::new(boss_binary())
+            .args([
+                "--json",
+                "--no-input",
+                "--no-autostart",
+                "--socket-path",
+                engine.socket_str(),
+                "task",
+                "show",
+                &selector,
+            ])
+            .env_remove("BOSS_PRODUCT")
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["id"], chore.id);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("implicit scope"));
+    }
 
     // Engine shared choke point (what the CLI routes bare short ids through).
     match client

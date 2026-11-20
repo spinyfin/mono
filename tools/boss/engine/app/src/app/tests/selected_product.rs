@@ -166,23 +166,28 @@ async fn missing_bare_short_id_names_the_selected_product() {
 
     let other = boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "boss");
     let task = boss_engine_runtime::test_support::create_test_chore(&server_state.work_db, &other.id, "other row");
-    let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
-    let err = server_state
-        .resolve_work_item_id(&selector)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("selected in the app"), "{err}");
-    assert!(
-        err.contains(&format!("did you mean {}/{}?", other.slug, task.short_id.unwrap())),
-        "{err}"
-    );
-    assert!(err.contains("in product flunge"), "unexpected error: {err}");
-    assert!(
-        err.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER),
-        "error must carry the not-found protocol marker so bossctl's marker-discriminating \
-         callers (e.g. agent verbs) fall through correctly, got: {err}",
-    );
+    for include_deleted in [false, true] {
+        if include_deleted {
+            server_state.work_db.delete_work_item(&task.id).unwrap();
+        }
+        for n in [task.short_id.unwrap(), 999_999] {
+            let selector = boss_protocol::short_id_wire_form(n);
+            let result = if include_deleted {
+                server_state.resolve_work_item_id_including_deleted(&selector).await
+            } else {
+                server_state.resolve_work_item_id(&selector).await
+            };
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("selected in the app"), "{err}");
+            assert!(err.contains("in product flunge"), "{err}");
+            assert!(err.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER), "{err}");
+            if n == 999_999 {
+                assert!(!err.contains("did you mean"), "{err}");
+            } else {
+                assert!(err.contains(&format!("did you mean {}/{}?", other.slug, n)), "{err}");
+            }
+        }
+    }
 }
 
 /// When the app is not connected at all, a bare short id that is unique

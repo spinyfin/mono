@@ -57,8 +57,8 @@ Without explicit scope or `BOSS_PRODUCT`, ambiguous short IDs fail with every
 candidate listed, even when the app has a selected product. If the ID is missing
 from the app's selected product, the error names that selection and suggests
 qualified IDs in other products. With no app selection, globally unique IDs
-resolve. Successful implicit resolution names the product on stderr, keeping
-JSON stdout usable by scripts.
+resolve silently. Successful resolution using the app selection names the product
+on stderr, including dependency add/remove, keeping JSON stdout usable by scripts.
 
 ## boss shake — one-time developer setup
 

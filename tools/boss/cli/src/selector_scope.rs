@@ -33,19 +33,25 @@ pub(crate) async fn scope_environment_selector(client: &mut BossClient, id: &str
     Ok(id.to_owned())
 }
 
-/// A diagnostic lookup must not turn a committed mutation into an error. If
-/// names cannot be fetched, the returned product id still identifies the scope.
-pub(crate) async fn report_implicit_resolution(client: &mut BossClient, id: &str, product_id: &str) {
+/// Diagnostics are best-effort and use the selected-product response directly,
+/// so app-closed global resolution neither prints a notice nor lists products.
+/// A successful dependency mutation can pass no product id: the engine already
+/// resolved its bare prerequisite through the selection, including tombstones.
+pub(crate) async fn report_implicit_resolution(client: &mut BossClient, id: &str, resolved_product: Option<&str>) {
     let WorkItemSelector::ShortId(n) = parse_work_item_selector(id) else {
         return;
     };
-    let product = list_products(client)
-        .await
-        .ok()
-        .and_then(|products| products.into_iter().find(|product| product.id == product_id));
-    let (name, slug) = product
-        .map(|product| (product.name, product.slug))
-        .unwrap_or_else(|| (product_id.to_owned(), product_id.to_owned()));
+    let Ok(FrontendEvent::SelectedProductResult {
+        state: boss_protocol::SelectedProductState::Selected {
+            product_id, name, slug, ..
+        },
+    }) = client.send_request(&FrontendRequest::GetSelectedProduct).await
+    else {
+        return;
+    };
+    if resolved_product.is_some_and(|resolved| resolved != product_id) {
+        return;
+    }
     eprintln!(
         "Resolved {id} in product {name} (implicit scope); use {slug}/{n} or BOSS_PRODUCT={slug} to pin the product."
     );
@@ -60,6 +66,6 @@ pub(crate) async fn get_work_item(client: &mut BossClient, id: &str) -> Result<W
         FrontendEvent::WorkItemResult { item } => item,
     )?;
     // A qualified selector (including BOSS_PRODUCT) needs no implicit notice.
-    report_implicit_resolution(client, &scoped, item.product_id()).await;
+    report_implicit_resolution(client, &scoped, Some(item.product_id())).await;
     Ok(item)
 }

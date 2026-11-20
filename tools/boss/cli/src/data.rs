@@ -1548,7 +1548,7 @@ pub(crate) async fn restore_work_item(client: &mut BossClient, id: &str) -> Resu
         "work item restore",
         FrontendEvent::WorkItemRestored { item } => item,
     )?;
-    crate::selector_scope::report_implicit_resolution(client, &scoped, item.product_id()).await;
+    crate::selector_scope::report_implicit_resolution(client, &scoped, Some(item.product_id())).await;
     Ok(item)
 }
 
@@ -1586,11 +1586,12 @@ pub(crate) async fn run_depend_command(
                 client,
                 AddDependencyInput {
                     dependent,
-                    prerequisite,
+                    prerequisite: prerequisite.clone(),
                     relation: Some(args.relation),
                 },
             )
             .await?;
+            crate::selector_scope::report_implicit_resolution(client, &prerequisite, None).await;
             print_entity(ctx, &serde_json::json!({ "edge": edge }), || {
                 if !ctx.quiet {
                     println!(
@@ -1608,11 +1609,12 @@ pub(crate) async fn run_depend_command(
                 client,
                 RemoveDependencyInput {
                     dependent,
-                    prerequisite,
+                    prerequisite: prerequisite.clone(),
                     relation: Some(args.relation.clone()),
                 },
             )
             .await?;
+            crate::selector_scope::report_implicit_resolution(client, &prerequisite, None).await;
             print_entity(
                 ctx,
                 &serde_json::json!({
@@ -2203,7 +2205,7 @@ pub(crate) async fn get_work_item_by_short_id_rpc(
 /// - **Without product scope**: `GetWorkItem` with the canonical `T{n}`
 ///   wire form, using BOSS_PRODUCT when set. Otherwise the engine checks
 ///   global ambiguity and the app's selected product, with a stderr notice
-///   on success. Ambiguous short ids list every candidate. Missing short
+///   when the selection supplies the scope. Ambiguous short ids list every candidate. Missing short
 ///   ids hard-error as "could not resolve id" / "no matching work
 ///   item" — never as "product is required".
 pub(crate) async fn resolve_short_id_item(
@@ -2299,7 +2301,7 @@ pub(crate) async fn resolve_selector_to_primary_id(
 /// mistaken for one that doesn't exist. Each entry is `(primary_id,
 /// short_id)`.
 ///
-/// Short-id selectors (`T42` / `42` / `#42`) resolve locally against
+/// Short-id selectors (`T<n>` / `<n>` / `#<n>`) resolve locally against
 /// `known`'s `short_id` column — no RPC — since `known` is already the
 /// full unfiltered listing and therefore a superset of every valid
 /// short id in this product. Typed primary ids (`task_…`) and opaque

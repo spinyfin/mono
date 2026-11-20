@@ -7,13 +7,17 @@ use crate::*;
 /// (confident empty result) and a missing/ambiguous id hard-errors.
 async fn resolve_optional_work_item_filter(
     client: &mut BossClient,
-    ctx: &RunContext,
     work_item: Option<String>,
+    product_id: Option<&str>,
 ) -> Result<Option<String>, CliError> {
     match work_item {
-        Some(sel) if !sel.trim().is_empty() => Ok(Some(
-            resolve_selector_to_primary_id(client, ctx, sel.trim(), None).await?,
-        )),
+        Some(sel) if !sel.trim().is_empty() => {
+            let id = match product_id {
+                Some(product) => crate::selector_scope::resolve_filter_id(client, sel.trim(), product).await?,
+                None => get_work_item(client, sel.trim()).await?.primary_id().to_owned(),
+            };
+            Ok(Some(id))
+        }
         _ => Ok(None),
     }
 }
@@ -385,7 +389,8 @@ pub(crate) async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunCon
                 Some(n) => Some(n),
                 None => Some(50),
             };
-            let work_item_id = resolve_optional_work_item_filter(&mut client, ctx, args.work_item).await?;
+            let work_item_id =
+                resolve_optional_work_item_filter(&mut client, args.work_item, product_id.as_deref()).await?;
             let response = client
                 .send_request(&FrontendRequest::ListCiRemediations {
                     product_id,
@@ -557,7 +562,8 @@ pub(crate) async fn run_engine_attempts_command(
                 Some(n) => Some(n),
                 None => Some(50),
             };
-            let work_item_id = resolve_optional_work_item_filter(&mut client, ctx, args.work_item).await?;
+            let work_item_id =
+                resolve_optional_work_item_filter(&mut client, args.work_item, product_id.as_deref()).await?;
             let include_background_work = args.background;
             let response = client
                 .send_request(&FrontendRequest::ListEngineAttempts {
@@ -627,7 +633,8 @@ pub(crate) async fn run_engine_conflicts_command(
                 Some(n) => Some(n),
                 None => Some(50),
             };
-            let work_item_id = resolve_optional_work_item_filter(&mut client, ctx, args.work_item).await?;
+            let work_item_id =
+                resolve_optional_work_item_filter(&mut client, args.work_item, product_id.as_deref()).await?;
             let response = client
                 .send_request(&FrontendRequest::ListConflictResolutions {
                     product_id,

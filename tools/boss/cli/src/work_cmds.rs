@@ -1962,12 +1962,9 @@ pub(crate) async fn run_restore_leaf(
     ctx: &RunContext,
     args: TaskRestoreArgs,
 ) -> Result<(), CliError> {
-    // Restore resolution is intentionally not routed through
-    // `resolve_selector_to_primary_id`: a soft-deleted row is hidden
-    // from the per-product short-id resolver, so bare `#43` / `boss/43`
-    // can't reach it. The engine resolves the globally-unique `T43`
-    // form (and canonical `task_…` ids) against tombstoned rows itself,
-    // so we add only environment product scope before the engine looks it up.
+    // Restore goes directly to the engine's including-deleted resolver:
+    // normal work-item lookup hides tombstones. Qualify environment scope
+    // before that lookup, preserving canonical and explicit slug/<n> selectors.
     let item = work_item_with_display_status(restore_work_item(client, args.id.trim()).await?);
     let (label, friendly) = match &item {
         WorkItem::Task(t) => ("Task", boss_protocol::short_id_label(t.short_id)),
