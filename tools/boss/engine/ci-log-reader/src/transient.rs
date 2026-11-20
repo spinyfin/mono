@@ -13,8 +13,9 @@
 //!    opposed to `1` for a real finding (`tools/checkleft/README.md`, "Exit
 //!    codes"). A failed PR-description lookup that answers HTTP 5xx is **not**
 //!    yet a distinct outcome: checkleft reports it as an error finding with
-//!    exit `1`, so that case (the original incident) is classified by step 3
-//!    from the log text, not by exit status.
+//!    exit `1`, so that case is classified by step 3
+//!    from the log text, not by exit status (see the `PR_DESCRIPTION_504_LOG`
+//!    fixture).
 //! 3. A conservative allowlist of upstream-unavailable log signatures (HTTP
 //!    5xx from an API, gateway timeouts, connection resets, DNS failures),
 //!    applied only when the same log carries no deterministic marker (a
@@ -167,10 +168,58 @@ const DETERMINISTIC_MARKERS: &[(&str, &str)] = &[
     ("FAIL: //", "test target failed"),
     ("TIMEOUT: //", "test target timed out"),
     ("FAILED: Build did NOT complete", "build failed"),
+    ("ERROR: Analysis of target", "build analysis failed"),
     ("error[E", "compiler error"),
     ("** TEST FAILED **", "test failed"),
     ("** BUILD FAILED **", "build failed"),
 ];
+
+/// The loading-phase terminator. It proves the build failed, but a Bazel
+/// repository fetch that dies on a retryable download also ends with it, so
+/// it vetoes a transient verdict only when the log carries no retryable
+/// download failure. Change-caused loading failures are still caught by
+/// their own lines (`ERROR: Analysis of target`, permanent downloads, and
+/// the in-repo loading defects recognised by [`is_loading_change_defect`]).
+const LOADING_TERMINATOR: &str = "ERROR: Build did NOT complete successfully";
+
+/// A loading-phase defect in the change's own packages: a missing in-repo
+/// target or package, a visibility violation, or a diagnostic in an in-repo
+/// `BUILD` / `BUILD.bazel` / `.bzl` file. These stay deterministic
+/// even when the log also carries a retryable download failure, which would
+/// otherwise exempt the bare [`LOADING_TERMINATOR`]. External-repo labels
+/// (`@repo//...`) are excluded because a failed fetch surfaces as
+/// `no such package '@repo//...'`.
+fn is_loading_change_defect(line: &str) -> bool {
+    let missing_in_repo = |needle: &str| {
+        line.find(needle)
+            .is_some_and(|i| !line[i + needle.len()..].starts_with("'@"))
+    };
+    missing_in_repo("no such target ")
+        || missing_in_repo("no such package ")
+        || line.contains(" is not visible from target ")
+        || is_in_repo_build_file_error(line)
+}
+
+/// `ERROR: <abs path>/BUILD[.bazel]:<line>:<col>: ...` or the same for a
+/// `.bzl` file: Bazel reporting a defect in a file the change can edit.
+/// Repository-fetch and download diagnostics are excluded; those name the
+/// file Bazel was fetching into, not an edit by the change.
+fn is_in_repo_build_file_error(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("ERROR: ") else {
+        return false;
+    };
+    if rest.starts_with("An error occurred during the fetch of repository") || rest.contains(DOWNLOAD_FAILURE_NEEDLE) {
+        return false;
+    }
+    let Some(path) = rest.split(':').next() else {
+        return false;
+    };
+    if !path.starts_with('/') || path.contains("/external/") {
+        return false;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file == "BUILD" || file == "BUILD.bazel" || file.ends_with(".bzl")
+}
 
 /// Upstream-unavailable log signatures: `(needle, summary)`. Matched
 /// case-sensitively against each log line; the summary is the card label.
@@ -349,8 +398,15 @@ fn first_line_containing(log: &str, needles: &[&str]) -> Option<String> {
 /// refusal, which is the tool declining to report, not a finding about the
 /// change.
 fn first_deterministic_marker(log: &str) -> Option<(String, &'static str)> {
+    let retryable_download = log.lines().any(|l| download_failure_summary(l).is_some());
     for line in log.lines() {
         let trimmed = line.trim();
+        if !retryable_download && trimmed.contains(LOADING_TERMINATOR) {
+            return Some((truncate(trimmed, 300), "build failed"));
+        }
+        if is_loading_change_defect(trimmed) {
+            return Some((truncate(trimmed, 300), "build loading failed"));
+        }
         if let Some((_, summary)) = DETERMINISTIC_MARKERS.iter().find(|(m, _)| trimmed.contains(m)) {
             return Some((truncate(trimmed, 300), summary));
         }
@@ -426,26 +482,9 @@ pub fn clean_buildkite_log(raw: &str) -> String {
     out
 }
 
-/// Keep the last `n` lines of `log`.
-pub fn tail_lines_of(log: &str, n: usize) -> String {
-    let lines: Vec<&str> = log.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
 /// Whether one more retry fits the per-head budget.
 pub fn retry_allowed(retries_used: u32, additional: u32, budget: u32) -> bool {
     retries_used.saturating_add(additional) <= budget
-}
-
-/// Card label while a retry is in flight: `CI retrying: HTTP 504 in checks (1/2)`.
-pub fn retrying_label(summary: &str, check_name: &str, attempt: u32, budget: u32) -> String {
-    format!("CI retrying: {summary} in {check_name} ({attempt}/{budget})")
-}
-
-/// Card label once the budget is spent: `CI retry budget exhausted (2/2): HTTP 504 in checks`.
-pub fn exhausted_label(summary: &str, check_name: &str, used: u32, budget: u32) -> String {
-    format!("CI retry budget exhausted ({used}/{budget}): {summary} in {check_name}")
 }
 
 #[cfg(test)]
@@ -518,6 +557,101 @@ summary: 1 error(s), 1 warning(s), 0 info finding(s)
                 "{retryable:?} should be transient: {verdict:?}"
             );
         }
+    }
+
+    #[test]
+    fn retryable_download_followed_by_loading_terminator_is_still_transient() {
+        let log = format!(
+            "{}\nERROR: Build did NOT complete successfully\n",
+            download_line("Read timed out")
+        );
+        let verdict = classify_job(&failed(1, &log));
+        assert!(
+            matches!(
+                verdict,
+                Verdict::Transient {
+                    signal: TransientSignal::UpstreamUnavailable,
+                    ..
+                }
+            ),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn loading_defect_alongside_retryable_download_is_deterministic() {
+        for defect in [
+            "ERROR: no such target '//tools/foo:bar': target 'bar' not declared",
+            "ERROR: no such package 'tools/foo': BUILD file not found",
+            "ERROR: Target '//a:b' is not visible from target '//c:d'",
+        ] {
+            let log = format!(
+                "{}\n{defect}\nERROR: Build did NOT complete successfully\n",
+                download_line("Read timed out")
+            );
+            let verdict = classify_job(&failed(1, &log));
+            assert!(
+                matches!(verdict, Verdict::Deterministic { .. }),
+                "{defect:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_repo_build_file_error_alongside_retryable_download_is_deterministic() {
+        for defect in [
+            "ERROR: /w/pkg/BUILD.bazel:3:1: syntax error at 'foo': expected value",
+            "ERROR: /w/pkg/BUILD:7:5: name 'x' is not defined",
+            "ERROR: /w/tools/defs.bzl:12:3: Traceback (most recent call last)",
+        ] {
+            let log = format!(
+                "{}\n{defect}\nERROR: Build did NOT complete successfully\n",
+                download_line("Read timed out")
+            );
+            let verdict = classify_job(&failed(1, &log));
+            assert!(
+                matches!(verdict, Verdict::Deterministic { .. }),
+                "{defect}: {verdict:?}"
+            );
+        }
+    }
+
+    /// Reconstructed from Bazel's fetch-failure output shape (a failed
+    /// repository fetch ending in a missing-package error and the bare
+    /// loading terminator, with a "FAILED: Build did NOT complete" summary
+    /// line). Paths and URLs are sanitized.
+    const FETCH_FAILURE_LOG: &str = "\
+Loading: 0 packages loaded
+ERROR: An error occurred during the fetch of repository 'rules_foo+':
+   Traceback (most recent call last):
+\tFile \"/home/agent/.cache/bazel/external/bazel_tools/tools/build_defs/repo/http.bzl\", line 132, column 45, in _http_archive_impl
+\t\tdownload_info = ctx.download_and_extract(
+Error in download_and_extract: java.io.IOException: Error downloading [https://github.com/example/rules_foo/archive/v1.tar.gz] to /home/agent/.cache/bazel/external/rules_foo+/temp/v1.tar.gz: Read timed out
+ERROR: no such package '@@rules_foo+//foo': java.io.IOException: Error downloading [https://github.com/example/rules_foo/archive/v1.tar.gz]: Read timed out
+ERROR: Build did NOT complete successfully
+";
+
+    #[test]
+    fn whole_fetch_failure_log_is_transient() {
+        let verdict = classify_job(&failed(1, FETCH_FAILURE_LOG));
+        assert!(matches!(verdict, Verdict::Transient { .. }), "{verdict:?}");
+        let with_prefix = format!("{FETCH_FAILURE_LOG}FAILED: Build did NOT complete successfully\n");
+        // The FAILED-prefixed summary is still a deterministic marker; Bazel
+        // prints it after the loading terminator on analysis/build failures.
+        assert!(matches!(
+            classify_job(&failed(1, &with_prefix)),
+            Verdict::Deterministic { .. }
+        ));
+    }
+
+    #[test]
+    fn external_repo_missing_package_from_failed_fetch_stays_transient() {
+        let log = format!(
+            "{}\nERROR: no such package '@@foo//bar': Error downloading\nERROR: Build did NOT complete successfully\n",
+            download_line("Read timed out")
+        );
+        let verdict = classify_job(&failed(1, &log));
+        assert!(matches!(verdict, Verdict::Transient { .. }), "{verdict:?}");
     }
 
     #[test]
@@ -648,6 +782,15 @@ error: GitHub API call timed out after 30 seconds while looking up the open PR f
     }
 
     #[test]
+    fn upstream_noise_before_an_analysis_failure_is_still_deterministic() {
+        let log = "WARNING: Remote Cache: 503 Service Unavailable\n\
+ERROR: /w/BUILD.bazel:3:10: in rust_library rule //x:y: target '//a:b' is not visible\n\
+ERROR: Analysis of target '//x:y' failed; build aborted\n\
+ERROR: Build did NOT complete successfully\n";
+        assert!(matches!(classify_job(&failed(1, log)), Verdict::Deterministic { .. }));
+    }
+
+    #[test]
     fn exit_3_without_checkleft_corroboration_is_indeterminate() {
         // Exit 3 alone (e.g. a shallow clone with no merge base) is not
         // evidence of a transient fault.
@@ -743,12 +886,6 @@ error: GitHub API call timed out after 30 seconds while looking up the open PR f
     }
 
     #[test]
-    fn tail_lines_keeps_only_the_last_n() {
-        assert_eq!(tail_lines_of("a\nb\nc\nd", 2), "c\nd");
-        assert_eq!(tail_lines_of("a\nb", 5), "a\nb");
-    }
-
-    #[test]
     fn retry_budget_is_per_head_and_counts_every_requested_retry() {
         let budget = TRANSIENT_RETRY_BUDGET_PER_HEAD;
         assert!(retry_allowed(0, 1, budget));
@@ -760,17 +897,5 @@ error: GitHub API call timed out after 30 seconds while looking up the open PR f
         );
         assert!(!retry_allowed(2, 1, budget), "budget exhausted after two retries");
         assert!(!retry_allowed(0, 3, budget));
-    }
-
-    #[test]
-    fn card_labels_name_signal_check_and_attempt() {
-        assert_eq!(
-            retrying_label("HTTP 504", "buildkite/mono/checks", 1, 2),
-            "CI retrying: HTTP 504 in buildkite/mono/checks (1/2)"
-        );
-        assert_eq!(
-            exhausted_label("HTTP 504", "buildkite/mono/checks", 2, 2),
-            "CI retry budget exhausted (2/2): HTTP 504 in buildkite/mono/checks"
-        );
     }
 }

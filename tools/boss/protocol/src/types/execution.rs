@@ -152,64 +152,80 @@ impl std::str::FromStr for ExecutionKind {
     }
 }
 
-/// Discriminator for the `work_executions.status` column. Exhaustive
-/// match enforces that every callsite handles new variants explicitly —
-/// adding a new status here produces a compile error at every status-keyed
-/// branch that must reason about it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionStatus {
-    #[default]
-    Queued,
-    Ready,
-    WaitingDependency,
-    /// The scheduler has claimed this execution for spawn: a worker slot is
-    /// (or is about to be) held and cube setup may be in flight, but
-    /// [`Self::Running`] has not been written yet because `start_execution_run`
-    /// has not committed.
-    ///
-    /// This is the missing intermediate between [`Self::Ready`] and
-    /// [`Self::Running`]. Without it the row stays `ready` for the whole
-    /// 1–10s cube-setup window, and `reconcile_product_executions` — which
-    /// rewrites any status [`Self::can_reconcile`] allows — can flip it to
-    /// `waiting_dependency` mid-spawn. `can_reconcile` excludes this variant
-    /// so that write is a no-op. It is not [`Self::is_live`]: there is no
-    /// pane yet, and death sweeps that assume a workspace/pane exist must
-    /// not treat a cube-setup row as a live worker.
-    Claimed,
-    /// The engine has dispatched this execution and its agent is working:
-    /// either the engine is still inside `run_execution` (the spawn
-    /// window), or the spawn completed and the worker's agent now owns the
-    /// turn loop in its pane. Either way *something is making progress*,
-    /// and nothing is blocked on a person.
-    ///
-    /// This is the status a healthy pane-hosted worker sits in for the bulk
-    /// of its life. Until mono#2673 it was `WaitingHuman`, written
-    /// unconditionally by `PaneSpawnRunner` the instant the pane came up —
-    /// so the stored value contradicted the worker's own hook stream for
-    /// the entire run.
-    Running,
-    /// The worker's agent is blocked on a person: it emitted its driver's
-    /// awaiting-input signal (Claude's `Notification` hook) and will not
-    /// make further progress until a human or the coordinator replies.
-    ///
-    /// This is the durable projection of
-    /// `boss_protocol::WorkerActivity::WaitingForInput`, and the two are
-    /// kept in agreement by the engine's worker-event dispatcher — see
-    /// `tools/boss/docs/worker-liveness-contract.md`. It is written *only*
-    /// on that transition and cleared the moment the worker resumes, so a
-    /// row reading `waiting_human` means the pane really is waiting.
-    ///
-    /// It is NOT a post-spawn park state, and nothing may write it to mean
-    /// "the engine has handed off". Use [`Self::Running`] for that.
-    WaitingHuman,
-    WaitingReview,
-    WaitingMerge,
-    Completed,
-    Failed,
-    Abandoned,
-    Cancelled,
-    Orphaned,
+/// Declares [`ExecutionStatus`] and its `ALL` list from one variant list, so
+/// a new variant cannot be left out of `ALL`.
+macro_rules! execution_status_enum {
+    ($(#[$em:meta])* pub enum $name:ident { $( $(#[$vm:meta])* $variant:ident ),+ $(,)? }) => {
+        $(#[$em])*
+        pub enum $name { $( $(#[$vm])* $variant ),+ }
+
+        impl $name {
+            /// Every variant, generated from the enum definition.
+            pub const ALL: &'static [$name] = &[$($name::$variant),+];
+        }
+    };
+}
+
+execution_status_enum! {
+    /// Discriminator for the `work_executions.status` column. Exhaustive
+    /// match enforces that every callsite handles new variants explicitly —
+    /// adding a new status here produces a compile error at every status-keyed
+    /// branch that must reason about it.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ExecutionStatus {
+        #[default]
+        Queued,
+        Ready,
+        WaitingDependency,
+        /// The scheduler has claimed this execution for spawn: a worker slot is
+        /// (or is about to be) held and cube setup may be in flight, but
+        /// [`Self::Running`] has not been written yet because `start_execution_run`
+        /// has not committed.
+        ///
+        /// This is the missing intermediate between [`Self::Ready`] and
+        /// [`Self::Running`]. Without it the row stays `ready` for the whole
+        /// 1–10s cube-setup window, and `reconcile_product_executions` — which
+        /// rewrites any status [`Self::can_reconcile`] allows — can flip it to
+        /// `waiting_dependency` mid-spawn. `can_reconcile` excludes this variant
+        /// so that write is a no-op. It is not [`Self::is_live`]: there is no
+        /// pane yet, and death sweeps that assume a workspace/pane exist must
+        /// not treat a cube-setup row as a live worker.
+        Claimed,
+        /// The engine has dispatched this execution and its agent is working:
+        /// either the engine is still inside `run_execution` (the spawn
+        /// window), or the spawn completed and the worker's agent now owns the
+        /// turn loop in its pane. Either way *something is making progress*,
+        /// and nothing is blocked on a person.
+        ///
+        /// This is the status a healthy pane-hosted worker sits in for the bulk
+        /// of its life. Until mono#2673 it was `WaitingHuman`, written
+        /// unconditionally by `PaneSpawnRunner` the instant the pane came up —
+        /// so the stored value contradicted the worker's own hook stream for
+        /// the entire run.
+        Running,
+        /// The worker's agent is blocked on a person: it emitted its driver's
+        /// awaiting-input signal (Claude's `Notification` hook) and will not
+        /// make further progress until a human or the coordinator replies.
+        ///
+        /// This is the durable projection of
+        /// `boss_protocol::WorkerActivity::WaitingForInput`, and the two are
+        /// kept in agreement by the engine's worker-event dispatcher — see
+        /// `tools/boss/docs/worker-liveness-contract.md`. It is written *only*
+        /// on that transition and cleared the moment the worker resumes, so a
+        /// row reading `waiting_human` means the pane really is waiting.
+        ///
+        /// It is NOT a post-spawn park state, and nothing may write it to mean
+        /// "the engine has handed off". Use [`Self::Running`] for that.
+        WaitingHuman,
+        WaitingReview,
+        WaitingMerge,
+        Completed,
+        Failed,
+        Abandoned,
+        Cancelled,
+        Orphaned,
+    }
 }
 
 impl ExecutionStatus {
