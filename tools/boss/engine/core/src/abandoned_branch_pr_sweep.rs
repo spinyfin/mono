@@ -363,24 +363,33 @@ fn classify_gh_error(err: GhRunnerError) -> AutoCreateOutcome {
 }
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct AbandonedBranchPrSweepOutcome {
     /// A PR already existed and was bound to the work item.
+    #[builder(default)]
     pub recovered: usize,
     /// The engine opened a new PR and bound it to the work item.
+    #[builder(default)]
     pub created: usize,
     /// The branch had nothing to open a PR for (never pushed, or no commits
     /// ahead of the default branch).
+    #[builder(default)]
     pub skipped_no_commits: usize,
     /// An auto-create attempt failed this pass (transient or permanent).
+    #[builder(default)]
     pub failed: usize,
+    /// A PR was refused because it targets a non-default branch.
+    #[builder(default)]
+    pub base_refused: usize,
     /// An attention item was filed this pass (consecutive-failure cap hit).
+    #[builder(default)]
     pub escalated: usize,
 }
 
 impl SweepOutcome for AbandonedBranchPrSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.recovered > 0 || self.created > 0 || self.failed > 0 || self.escalated > 0
+        self.recovered > 0 || self.created > 0 || self.failed > 0 || self.base_refused > 0 || self.escalated > 0
     }
 
     fn log(&self) {
@@ -389,6 +398,7 @@ impl SweepOutcome for AbandonedBranchPrSweepOutcome {
             created = self.created,
             skipped_no_commits = self.skipped_no_commits,
             failed = self.failed,
+            base_refused = self.base_refused,
             escalated = self.escalated,
             "abandoned-branch-pr sweep: pass complete",
         );
@@ -399,18 +409,18 @@ impl SweepOutcome for AbandonedBranchPrSweepOutcome {
 /// produced — replaces a stringly-typed `action: &'static str` flag so the
 /// two cases can't be confused with an unrelated string comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindAction {
+enum BindAction<'a> {
     /// A PR already existed and was bound to the work item.
-    Bound,
+    Bound(&'a str),
     /// The engine opened a new PR and bound it to the work item.
-    Created,
+    Created(&'a str),
 }
 
-impl BindAction {
+impl BindAction<'_> {
     fn as_str(self) -> &'static str {
         match self {
-            BindAction::Bound => "bound",
-            BindAction::Created => "created",
+            BindAction::Bound(_) => "bound",
+            BindAction::Created(_) => "created",
         }
     }
 }
@@ -427,6 +437,7 @@ pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     coordinator: Arc<crate::coordinator::ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
+    pr_checker: Arc<dyn crate::work::PrStateChecker>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let pr_detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
@@ -438,6 +449,7 @@ pub fn spawn_loop(
         let coordinator = Arc::clone(&coordinator);
         let pr_detector = Arc::clone(&pr_detector);
         let pr_creator = Arc::clone(&pr_creator);
+        let pr_checker = Arc::clone(&pr_checker);
         let dispatch_events = Arc::clone(&dispatch_events);
         let failure_counts = Arc::clone(&failure_counts);
         let preserved_backoff = Arc::clone(&preserved_backoff);
@@ -462,6 +474,7 @@ pub fn spawn_loop(
                     work_db.as_ref(),
                     pr_detector.as_ref(),
                     pr_creator.as_ref(),
+                    Arc::clone(&pr_checker),
                     dispatch_events.as_ref(),
                     &mut failure_counts,
                 ),
@@ -514,6 +527,7 @@ pub(crate) async fn run_one_pass(
     work_db: &WorkDb,
     pr_detector: &dyn PrDetector,
     pr_creator: &dyn PrAutoCreator,
+    pr_checker: Arc<dyn crate::work::PrStateChecker>,
     dispatch_events: &dyn DispatchEventSink,
     failure_counts: &mut HashMap<String, u32>,
 ) -> AbandonedBranchPrSweepOutcome {
@@ -569,11 +583,11 @@ pub(crate) async fn run_one_pass(
         match pr_status {
             PrStatus::Fresh { url } | PrStatus::Merged { url } => {
                 bind_and_record(
+                    Arc::clone(&pr_checker),
                     work_db,
                     dispatch_events,
                     candidate,
-                    &url,
-                    BindAction::Bound,
+                    BindAction::Bound(&url),
                     &mut outcome,
                     failure_counts,
                 )
@@ -595,11 +609,11 @@ pub(crate) async fn run_one_pass(
                 match pr_creator.try_create(&repo_slug, &expected_branch, &title, &body).await {
                     AutoCreateOutcome::AlreadyExists(url) => {
                         bind_and_record(
+                            Arc::clone(&pr_checker),
                             work_db,
                             dispatch_events,
                             candidate,
-                            &url,
-                            BindAction::Bound,
+                            BindAction::Bound(&url),
                             &mut outcome,
                             failure_counts,
                         )
@@ -607,11 +621,11 @@ pub(crate) async fn run_one_pass(
                     }
                     AutoCreateOutcome::Created(url) => {
                         bind_and_record(
+                            Arc::clone(&pr_checker),
                             work_db,
                             dispatch_events,
                             candidate,
-                            &url,
-                            BindAction::Created,
+                            BindAction::Created(&url),
                             &mut outcome,
                             failure_counts,
                         )
@@ -678,14 +692,32 @@ pub(crate) async fn run_one_pass(
 /// Bind a recovered/created PR to the work item, clear any consecutive
 /// failure count and open attention item, and record the outcome.
 async fn bind_and_record(
+    pr_checker: Arc<dyn crate::work::PrStateChecker>,
     work_db: &WorkDb,
     dispatch_events: &dyn DispatchEventSink,
     candidate: &LatePrCandidate,
-    pr_url: &str,
-    action: BindAction,
+    action: BindAction<'_>,
     outcome: &mut AbandonedBranchPrSweepOutcome,
     failure_counts: &mut HashMap<String, u32>,
 ) {
+    let (BindAction::Bound(pr_url) | BindAction::Created(pr_url)) = action;
+    match crate::work::bounded_base_verdict(pr_checker, pr_url, crate::work::PR_BASE_CHECK_BUDGET).await {
+        Ok(crate::work::PrBaseVerdict::DefaultBranch | crate::work::PrBaseVerdict::NotChecked) => {}
+        Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+            tracing::warn!(%reason, pr_url, "abandoned PR base refused; leaving binding untouched");
+            outcome.base_refused += 1;
+            return;
+        }
+        result => {
+            tracing::warn!(
+                ?result,
+                pr_url,
+                "abandoned PR base not accepted; leaving binding untouched"
+            );
+            outcome.failed += 1;
+            return;
+        }
+    }
     match work_db.bind_pr_to_task_from_terminal_execution(&candidate.work_item_id, pr_url) {
         Ok(true) => {
             failure_counts.remove(&candidate.execution_id);
@@ -699,8 +731,8 @@ async fn bind_and_record(
                 );
             }
             match action {
-                BindAction::Created => outcome.created += 1,
-                BindAction::Bound => outcome.recovered += 1,
+                BindAction::Created(_) => outcome.created += 1,
+                BindAction::Bound(_) => outcome.recovered += 1,
             }
             tracing::info!(
                 execution_id = %candidate.execution_id,
@@ -1028,6 +1060,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_default_base_is_never_bound_from_detection_or_creation() {
+        use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+        let url = "https://github.com/foo/bar/pull/7";
+        for mode in 0..3 {
+            let (_dir, db) = open_db();
+            let (chore_id, _) = make_candidate_chore(&db, "wrong-base");
+            let detector = FixedPrDetector(if mode == 0 {
+                PrStatus::Fresh { url: url.into() }
+            } else {
+                PrStatus::None
+            });
+            let creator = QueuePrAutoCreator::new(match mode {
+                1 => vec![AutoCreateOutcome::AlreadyExists(url.into())],
+                2 => vec![AutoCreateOutcome::Created(url.into())],
+                _ => vec![],
+            });
+            let checker = Arc::new(
+                FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature base".into())),
+            );
+            let result = run_one_pass(
+                &db,
+                &detector,
+                &creator,
+                checker,
+                &NoopDispatchEventSink,
+                &mut HashMap::new(),
+            )
+            .await;
+            assert_eq!(result.failed, 0);
+            assert_eq!(result.base_refused, 1);
+            assert_eq!(result.recovered + result.created, 0);
+            assert!(!work_item_pr_url_already_set(&db, &chore_id));
+        }
+    }
+
+    struct FailingBaseChecker;
+    impl crate::work::PrStateChecker for FailingBaseChecker {
+        fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {
+            Ok(crate::work::PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+            anyhow::bail!("GitHub unavailable")
+        }
+    }
+
+    struct StalledBaseChecker(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+    impl crate::work::PrStateChecker for StalledBaseChecker {
+        fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {
+            Ok(crate::work::PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+            let _ = self.0.lock().unwrap().recv();
+            Ok(crate::work::PrBaseVerdict::DefaultBranch)
+        }
+    }
+
+    #[tokio::test]
+    async fn base_lookup_error_counts_failed_without_binding_or_attention() {
+        let url = "https://github.com/foo/bar/pull/7";
+        let (_dir, db) = open_db();
+        let (chore_id, _) = make_candidate_chore(&db, "base-error");
+        let result = run_one_pass(
+            &db,
+            &FixedPrDetector(PrStatus::Fresh { url: url.into() }),
+            &QueuePrAutoCreator::new(vec![]),
+            Arc::new(FailingBaseChecker),
+            &NoopDispatchEventSink,
+            &mut HashMap::new(),
+        )
+        .await;
+        assert_eq!((result.failed, result.recovered + result.created), (1, 0));
+        assert!(!work_item_pr_url_already_set(&db, &chore_id));
+        assert!(db.list_attention_items_for_work_item(&chore_id).unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_base_lookup_times_out_without_binding() {
+        let url = "https://github.com/foo/bar/pull/7";
+        let (_dir, db) = open_db();
+        let (chore_id, _) = make_candidate_chore(&db, "base-stall");
+        let (release, wait) = std::sync::mpsc::channel();
+        let detector = FixedPrDetector(PrStatus::Fresh { url: url.into() });
+        let creator = QueuePrAutoCreator::new(vec![]);
+        let mut failures = HashMap::new();
+        let (result, ()) = tokio::join!(
+            run_one_pass(
+                &db,
+                &detector,
+                &creator,
+                Arc::new(StalledBaseChecker(std::sync::Mutex::new(wait))),
+                &NoopDispatchEventSink,
+                &mut failures,
+            ),
+            async {
+                tokio::task::yield_now().await;
+                tokio::time::advance(crate::work::PR_BASE_CHECK_BUDGET + Duration::from_secs(1)).await;
+            }
+        );
+        drop(release);
+        assert_eq!((result.failed, result.recovered + result.created), (1, 0));
+        assert!(!work_item_pr_url_already_set(&db, &chore_id));
+    }
+
+    #[tokio::test]
     async fn no_candidates_is_a_quiet_no_op() {
         let (_dir, db) = open_db();
         let detector = FixedPrDetector(PrStatus::None);
@@ -1035,7 +1171,15 @@ mod tests {
         let sink = NoopDispatchEventSink;
         let mut failures = HashMap::new();
 
-        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome, AbandonedBranchPrSweepOutcome::default());
         assert!(!outcome.has_activity());
     }
@@ -1051,7 +1195,15 @@ mod tests {
         let sink = RecordingDispatchEventSink::new();
         let mut failures = HashMap::new();
 
-        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome.recovered, 1);
         assert_eq!(outcome.created, 0);
 
@@ -1076,7 +1228,15 @@ mod tests {
         let sink = NoopDispatchEventSink;
         let mut failures = HashMap::new();
 
-        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome.created, 1);
         assert_eq!(outcome.recovered, 0);
 
@@ -1094,7 +1254,15 @@ mod tests {
         let sink = NoopDispatchEventSink;
         let mut failures = HashMap::new();
 
-        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome.skipped_no_commits, 1);
         assert!(!outcome.has_activity(), "a quiet skip must not count as sweep activity");
 
@@ -1121,7 +1289,15 @@ mod tests {
                 transient: true,
                 message: "network blip".to_owned(),
             }]);
-            let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+            let outcome = run_one_pass(
+                &db,
+                &detector,
+                &creator,
+                Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+                &sink,
+                &mut failures,
+            )
+            .await;
             assert_eq!(outcome.failed, 1);
             assert_eq!(outcome.escalated, 0);
         }
@@ -1136,7 +1312,15 @@ mod tests {
             transient: true,
             message: "network blip".to_owned(),
         }]);
-        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome.escalated, 1);
 
         let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
@@ -1150,7 +1334,15 @@ mod tests {
         let creator = QueuePrAutoCreator::new(vec![AutoCreateOutcome::Created(
             "https://github.com/foo/bar/pull/99".to_owned(),
         )]);
-        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome.created, 1);
 
         let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
@@ -1174,7 +1366,15 @@ mod tests {
         let sink = NoopDispatchEventSink;
         let mut failures = HashMap::new();
 
-        let outcome = run_one_pass(&db, &detector, &creator, &sink, &mut failures).await;
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open)),
+            &sink,
+            &mut failures,
+        )
+        .await;
         assert_eq!(outcome.created, 1);
         assert_eq!(
             creator.calls(),

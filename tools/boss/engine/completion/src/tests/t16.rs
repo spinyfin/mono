@@ -887,3 +887,170 @@ async fn verify_staged_pr_url_after_capture_leaves_live_slot_unset_when_unverifi
     handler.verify_staged_pr_url_after_capture(&execution_id, false).await;
     assert_eq!(live_states.get(1).unwrap().pr_url, None);
 }
+
+#[tokio::test(start_paused = true)]
+async fn base_refusal_blocks_delivery_and_only_explicit_refusal_files_attention() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    for declared in [false, true] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+            .handler
+            .with_branch_verifier(two_pr_verifier(&execution_id))
+            .with_pr_state_checker(Arc::new(
+                FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature base".into())),
+            ));
+        let outcome = if declared {
+            handler
+                .finalize_declared_delivery(&db.get_execution(&execution_id).unwrap())
+                .await
+        } else {
+            handler
+                .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::InReview, "test")
+                .await
+        };
+        assert!(matches!(outcome, StopOutcome::DetectorFailed), "{outcome:?}");
+        assert!(task_row(&db, &chore_id).pr_url.is_none());
+        assert_eq!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .filter(|item| item.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+                .count(),
+            1
+        );
+        let open_refusals = |db: &WorkDb| {
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .filter(|item| {
+                    item.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED && item.status == "open"
+                })
+                .count()
+        };
+        let refusal_id = db
+            .list_attention_items(&execution_id)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+            .unwrap()
+            .id;
+        let execution = db.get_execution(&execution_id).unwrap();
+        // Concurrent retries must retain one open row.
+        let (first, second) = tokio::join!(
+            handler.guard_pr_base(&execution, OWN_PR),
+            handler.guard_pr_base(&execution, OWN_PR),
+        );
+        assert!(matches!(first, Some(StopOutcome::DetectorFailed)));
+        assert!(matches!(second, Some(StopOutcome::DetectorFailed)));
+        assert_eq!(open_refusals(&db), 1);
+        let assert_original_open = || {
+            let items = db.list_attention_items(&execution_id).unwrap();
+            let item = items.iter().find(|item| item.id == refusal_id).unwrap();
+            assert_eq!(item.status, "open");
+            assert_eq!(open_refusals(&db), 1);
+        };
+        // NotChecked does not resolve it.
+        let handler = handler.with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::NotChecked),
+        ));
+        assert!(
+            handler
+                .guard_pr_base(&db.get_execution(&execution_id).unwrap(), OWN_PR)
+                .await
+                .is_none()
+        );
+        assert_eq!(open_refusals(&db), 1);
+        assert_original_open();
+        let handler = handler.with_pr_state_checker(Arc::new(UnavailableBaseChecker));
+        assert!(matches!(
+            handler.guard_pr_base(&execution, OWN_PR).await,
+            Some(StopOutcome::DetectorFailed)
+        ));
+        assert_original_open();
+        let (release, wait) = std::sync::mpsc::channel();
+        let handler = handler.with_pr_state_checker(Arc::new(WaitingBaseChecker(std::sync::Mutex::new(wait))));
+        let (outcome, ()) = tokio::join!(handler.guard_pr_base(&execution, OWN_PR), async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(
+                crate::run_done_declaration::DECLARED_DELIVERY_NETWORK_BUDGET + std::time::Duration::from_secs(1),
+            )
+            .await;
+        });
+        drop(release);
+        assert!(matches!(outcome, Some(StopOutcome::DetectorFailed)));
+        assert_original_open();
+        let handler = handler.with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::DefaultBranch),
+        ));
+        assert!(
+            handler
+                .guard_pr_base(&db.get_execution(&execution_id).unwrap(), OWN_PR)
+                .await
+                .is_none()
+        );
+        assert_eq!(open_refusals(&db), 0);
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_ne!(items.iter().find(|item| item.id == refusal_id).unwrap().status, "open");
+    }
+}
+
+struct UnavailableBaseChecker;
+impl crate::work::PrStateChecker for UnavailableBaseChecker {
+    fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {
+        Ok(crate::work::PrOpenState::Open)
+    }
+    fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+        anyhow::bail!("GitHub unavailable")
+    }
+}
+
+#[tokio::test]
+async fn base_lookup_error_leaves_delivery_retryable_without_attention() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+        .handler
+        .with_pr_state_checker(Arc::new(UnavailableBaseChecker));
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(matches!(
+        handler.guard_pr_base(&execution, OWN_PR).await,
+        Some(StopOutcome::DetectorFailed)
+    ));
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, execution.status);
+    assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+    assert!(task_row(&db, &chore_id).pr_url.is_none());
+}
+
+struct WaitingBaseChecker(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+impl crate::work::PrStateChecker for WaitingBaseChecker {
+    fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {
+        Ok(crate::work::PrOpenState::Open)
+    }
+    fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+        let _ = self.0.lock().unwrap().recv();
+        Ok(crate::work::PrBaseVerdict::DefaultBranch)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn base_lookup_timeout_leaves_delivery_retryable_without_attention() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = followup_fixture(workspace.path());
+    let (release, wait) = std::sync::mpsc::channel();
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+        .handler
+        .with_pr_state_checker(Arc::new(WaitingBaseChecker(std::sync::Mutex::new(wait))));
+    let execution = db.get_execution(&execution_id).unwrap();
+    let (outcome, ()) = tokio::join!(handler.guard_pr_base(&execution, OWN_PR), async {
+        tokio::task::yield_now().await;
+        tokio::time::advance(
+            crate::run_done_declaration::DECLARED_DELIVERY_NETWORK_BUDGET + std::time::Duration::from_secs(1),
+        )
+        .await;
+    });
+    drop(release);
+    assert!(matches!(outcome, Some(StopOutcome::DetectorFailed)));
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, execution.status);
+    assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+}

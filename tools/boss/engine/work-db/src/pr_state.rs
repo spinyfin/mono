@@ -26,7 +26,7 @@ pub trait PrStateChecker: Send + Sync {
     fn check(&self, pr_url: &str) -> Result<PrOpenState>;
 
     /// Lifecycle state plus the current head SHA and branch name, from one
-    /// `gh pr view`.
+    /// parameterised GraphQL query.
     ///
     /// Default implementation has no SHA or branch name (existing
     /// [`Self::check`]-only impls keep working). [`GhPrStateChecker`] fetches
@@ -43,6 +43,11 @@ pub trait PrStateChecker: Send + Sync {
         })
     }
 
+    /// Check base policy independently of lifecycle reads.
+    fn base_verdict(&self, _pr_url: &str) -> Result<PrBaseVerdict> {
+        Ok(PrBaseVerdict::NotChecked)
+    }
+
     /// Hermetic compare response used only by the review-service test fixtures.
     #[cfg(any(test, feature = "test-support"))]
     fn merged_parent_deletions(
@@ -54,6 +59,14 @@ pub trait PrStateChecker: Send + Sync {
     ) -> Vec<String> {
         Vec::new()
     }
+}
+
+/// Default-branch policy observation, separate from lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrBaseVerdict {
+    NotChecked,
+    DefaultBranch,
+    Refused(String),
 }
 
 /// Snapshot returned by [`PrStateChecker::inspect`].
@@ -122,7 +135,7 @@ pub fn classify_pr_merge_state(state: &str, merged_at: &str) -> PrMergeClass {
     }
 }
 
-/// Production implementation: shells out to `gh pr view`.
+/// Production implementation: reads PR and repository fields with GraphQL.
 ///
 /// Deletion observations are a separate, required input to verdict storage.
 pub struct GhPrStateChecker;
@@ -133,36 +146,96 @@ impl PrStateChecker for GhPrStateChecker {
     }
 
     fn inspect(&self, pr_url: &str) -> Result<PrInspect> {
-        // Via `gh_output_blocking` rather than a bare
-        // `Command::new("gh")`: this spends real quota from the shared
-        // token, and a raw spawn here would be invisible to the usage
-        // counter — precisely the kind of blind spot that made the
-        // GraphQL exhaustion unattributable.
-        //
-        // `_if_unattributed`, not a plain `scope_blocking`: this checker is
-        // also called from inside the merge poller's own sweep scope
-        // (`merge_poller.sweep`), whose label is the more specific one and
-        // must win rather than being overridden to `pr_state_check`.
-        let output =
-            boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
-                boss_github::gh_runner::gh_output_blocking(&[
-                    "pr",
-                    "view",
-                    pr_url,
-                    "--json",
-                    "state,mergedAt,headRefOid,headRefName",
-                ])
-            })
-            .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("`gh pr view` failed for {pr_url}: {stderr}");
-        }
-        let body = String::from_utf8_lossy(&output.stdout);
-        let v: serde_json::Value =
-            serde_json::from_str(&body).with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
-        Ok(map_gh_inspect(&v))
+        let repository = query_pr(pr_url)?;
+        Ok(map_gh_inspect(&repository["pullRequest"]))
     }
+
+    fn base_verdict(&self, pr_url: &str) -> Result<PrBaseVerdict> {
+        map_base_verdict(&query_pr(pr_url)?)
+    }
+}
+
+/// Upper bound on one base-policy lookup made from an async sweep.
+pub const PR_BASE_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Run [`PrStateChecker::base_verdict`] off the async runtime with a deadline.
+///
+/// The production checker also bounds and kills its `gh` child; running it
+/// off-thread keeps the async runtime responsive during that blocking wait.
+/// A timeout or a panicked blocking task is an `Err`: callers treat it like
+/// any other retryable lookup failure and leave their state untouched.
+pub async fn bounded_base_verdict(
+    checker: std::sync::Arc<dyn PrStateChecker>,
+    pr_url: &str,
+    budget: std::time::Duration,
+) -> Result<PrBaseVerdict> {
+    let url = pr_url.to_owned();
+    let check = tokio::task::spawn_blocking(move || checker.base_verdict(&url));
+    match tokio::time::timeout(budget, check).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => bail!("PR base check task failed for {pr_url}: {join_err}"),
+        Err(_) => bail!("PR base check for {pr_url} exceeded {budget:?}"),
+    }
+}
+
+/// `gh api graphql` arguments for the shared PR query.
+fn pr_query_args(owner: &str, repo: &str, number: u64) -> Vec<String> {
+    let query = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){defaultBranchRef{name} pullRequest(number:$number){state mergedAt headRefOid headRefName baseRefName}}}";
+    vec![
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={query}"),
+        "-f".into(),
+        format!("owner={owner}"),
+        "-f".into(),
+        format!("repo={repo}"),
+        "-F".into(),
+        format!("number={number}"),
+    ]
+}
+
+/// Pure validation of the GraphQL response: the `repository` object, or an
+/// error when GraphQL reported `errors` or the PR does not exist.
+fn repository_from_response(value: &serde_json::Value, pr_url: &str) -> Result<serde_json::Value> {
+    if value.get("errors").is_some() || !value["data"]["repository"]["pullRequest"].is_object() {
+        bail!("PR query returned errors or no PR for {pr_url}: {value}");
+    }
+    Ok(value["data"]["repository"].clone())
+}
+
+/// Both readers use one parameterised query; policy never changes lifecycle.
+fn query_pr(pr_url: &str) -> Result<serde_json::Value> {
+    let (owner, repo, number) =
+        boss_github::pr_url::parse_pr_url_parts(pr_url).with_context(|| format!("invalid PR URL: {pr_url}"))?;
+    let args = pr_query_args(owner, repo, number);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
+        boss_github::gh_runner::gh_output_blocking_timeout(&arg_refs, PR_BASE_CHECK_BUDGET)
+    })
+    .with_context(|| format!("failed to query PR {pr_url}"))?;
+    if !output.status.success() {
+        bail!(
+            "PR query failed for {pr_url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    repository_from_response(&value, pr_url)
+}
+
+fn map_base_verdict(repository: &serde_json::Value) -> Result<PrBaseVerdict> {
+    let base = optional_trimmed_json_str(&repository["pullRequest"], "baseRefName")
+        .context("PR query returned no base branch")?;
+    let default = optional_trimmed_json_str(&repository["defaultBranchRef"], "name")
+        .context("PR query returned no default branch")?;
+    Ok(if base == default {
+        PrBaseVerdict::DefaultBranch
+    } else {
+        PrBaseVerdict::Refused(format!(
+            "PR targets `{base}`, but the repository default branch is `{default}`"
+        ))
+    })
 }
 
 /// Pure mapping from the parsed `gh pr view --json state,mergedAt` JSON to a
@@ -226,6 +299,7 @@ impl PrStateChecker for StaticPrStateChecker {
 #[derive(Clone)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct FakePrStateChecker {
+    pub base: PrBaseVerdict,
     pub states: std::collections::HashMap<String, PrOpenState>,
     pub default: PrOpenState,
     pub head_sha: Option<String>,
@@ -236,11 +310,16 @@ pub struct FakePrStateChecker {
 impl FakePrStateChecker {
     pub fn always(state: PrOpenState) -> Self {
         Self {
+            base: PrBaseVerdict::NotChecked,
             states: Default::default(),
             default: state,
             head_sha: None,
             head_ref_name: None,
         }
+    }
+    pub fn with_base(mut self, verdict: PrBaseVerdict) -> Self {
+        self.base = verdict;
+        self
     }
     pub fn with(mut self, url: &str, state: PrOpenState) -> Self {
         self.states.insert(url.to_owned(), state);
@@ -258,6 +337,10 @@ impl FakePrStateChecker {
 
 #[cfg(any(test, feature = "test-support"))]
 impl PrStateChecker for FakePrStateChecker {
+    fn base_verdict(&self, _pr_url: &str) -> Result<PrBaseVerdict> {
+        Ok(self.base.clone())
+    }
+
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
         Ok(self.states.get(pr_url).cloned().unwrap_or(self.default.clone()))
     }
@@ -317,6 +400,87 @@ impl RevisionGateError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn base_policy_does_not_change_lifecycle_reads() {
+        for state in ["OPEN", "MERGED", "CLOSED"] {
+            let repository = json!({
+                "defaultBranchRef": {"name": "main"},
+                "pullRequest": {"state": state, "baseRefName": "feature", "headRefOid": "abc"}
+            });
+            assert!(matches!(
+                map_base_verdict(&repository).unwrap(),
+                PrBaseVerdict::Refused(_)
+            ));
+            let inspect = map_gh_inspect(&repository["pullRequest"]);
+            assert_eq!(inspect.open_state, map_gh_state(&json!({"state": state})));
+            assert_eq!(inspect.head_sha.as_deref(), Some("abc"));
+        }
+        assert_eq!(
+            map_base_verdict(&json!({
+                "defaultBranchRef": {"name": "trunk"},
+                "pullRequest": {"baseRefName": "trunk"}
+            }))
+            .unwrap(),
+            PrBaseVerdict::DefaultBranch
+        );
+        assert!(map_base_verdict(&json!({"pullRequest": {"baseRefName": "main"}})).is_err());
+        assert!(map_base_verdict(&json!({"defaultBranchRef": {"name": "main"}})).is_err());
+        assert_eq!(
+            StaticPrStateChecker(PrOpenState::Open).base_verdict("unused").unwrap(),
+            PrBaseVerdict::NotChecked
+        );
+    }
+
+    #[test]
+    fn query_args_carry_owner_repo_and_number() {
+        let args = pr_query_args("acme", "widgets", 42);
+        assert_eq!(&args[..3], ["api", "graphql", "-f"]);
+        assert!(args[3].starts_with("query=query($owner:String!"));
+        assert!(args.contains(&"owner=acme".to_owned()));
+        assert!(args.contains(&"repo=widgets".to_owned()));
+        let n = args.iter().position(|a| a == "number=42").unwrap();
+        assert_eq!(args[n - 1], "-F");
+    }
+
+    #[test]
+    fn response_validation_rejects_errors_and_missing_pr() {
+        let url = "https://github.com/a/b/pull/1";
+        let ok = json!({"data": {"repository": {"pullRequest": {"state": "OPEN"}}}});
+        assert_eq!(
+            repository_from_response(&ok, url).unwrap()["pullRequest"]["state"],
+            "OPEN"
+        );
+        let no_pr = json!({"data": {"repository": {"pullRequest": null}}});
+        assert!(repository_from_response(&no_pr, url).is_err());
+        let errors =
+            json!({"errors": [{"message": "boom"}], "data": {"repository": {"pullRequest": {"state": "OPEN"}}}});
+        assert!(repository_from_response(&errors, url).is_err());
+        assert!(repository_from_response(&json!({"data": null}), url).is_err());
+    }
+
+    struct Hanging(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+    impl PrStateChecker for Hanging {
+        fn check(&self, _: &str) -> Result<PrOpenState> {
+            Ok(PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> Result<PrBaseVerdict> {
+            let _ = self.0.lock().unwrap().recv();
+            Ok(PrBaseVerdict::DefaultBranch)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_base_verdict_times_out_on_a_stalled_checker() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let checker: std::sync::Arc<dyn PrStateChecker> = std::sync::Arc::new(Hanging(std::sync::Mutex::new(wait)));
+        let (result, ()) = tokio::join!(bounded_base_verdict(checker, "u", PR_BASE_CHECK_BUDGET), async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(PR_BASE_CHECK_BUDGET + std::time::Duration::from_secs(1)).await;
+        });
+        drop(release);
+        assert!(result.unwrap_err().to_string().contains("exceeded"));
+    }
 
     #[test]
     fn merged_state_maps_to_merged() {

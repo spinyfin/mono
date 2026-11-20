@@ -29,6 +29,53 @@ pub(super) struct ForeignPrConflict {
 }
 
 impl WorkerCompletionHandler {
+    /// Policy refusal is actionable; unavailable GitHub evidence is retryable.
+    pub(super) async fn guard_pr_base(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+    ) -> Option<StopOutcome> {
+        use crate::work::PrBaseVerdict;
+        use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+        match crate::work::bounded_base_verdict(
+            Arc::clone(&self.pr_state_checker),
+            pr_url,
+            super::run_done_declaration::DECLARED_DELIVERY_NETWORK_BUDGET,
+        )
+        .await
+        {
+            Ok(PrBaseVerdict::DefaultBranch) => {
+                // Filed execution-scoped, so it must be resolved by execution.
+                if let Err(err) = self
+                    .work_db
+                    .resolve_attention_kind_for_execution(&execution.id, PR_BASE_REFUSED)
+                {
+                    tracing::warn!(?err, "failed to resolve PR base refusal attention");
+                }
+                None
+            }
+            Ok(PrBaseVerdict::NotChecked) => None,
+            Ok(PrBaseVerdict::Refused(reason)) => {
+                if let Err(err) = self
+                    .upsert_execution_attention(
+                        execution,
+                        PR_BASE_REFUSED,
+                        "PR must target the default branch",
+                        &format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
+                    )
+                    .await
+                {
+                    tracing::warn!(?err, "failed to record PR base refusal");
+                }
+                Some(StopOutcome::DetectorFailed)
+            }
+            result => {
+                tracing::warn!(?result, pr_url, "PR base check unavailable; retrying delivery");
+                Some(StopOutcome::DetectorFailed)
+            }
+        }
+    }
+
     /// Expected branches of every primary implementation execution of
     /// `execution`'s work item, this execution's own first. A PR whose head
     /// identifies any of them ([`head_identifies_any_branch`]) belongs to the

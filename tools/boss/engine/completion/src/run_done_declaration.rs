@@ -436,6 +436,10 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
+        if let Some(outcome) = self.guard_pr_base(execution, &pr_url).await {
+            return outcome;
+        }
+
         if !merged && !closed_unmerged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,

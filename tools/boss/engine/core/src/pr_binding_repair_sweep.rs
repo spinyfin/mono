@@ -102,7 +102,7 @@ impl DocPointerRefresher for DesignDetectorDocPointerRefresher {
 }
 
 /// Counts from one pass; logged at `info` when non-zero.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
 pub struct PrBindingRepairOutcome {
     /// Rows re-bound to the PR on their execution's branch.
     pub rebound: usize,
@@ -114,11 +114,18 @@ pub struct PrBindingRepairOutcome {
     pub confirmed_ok: usize,
     /// Rows skipped this pass because GitHub could not be consulted.
     pub inconclusive: usize,
+    /// Rows left untouched because the PR on their branch targets a
+    /// non-default base.
+    pub base_refused: usize,
 }
 
 impl SweepOutcome for PrBindingRepairOutcome {
     fn has_activity(&self) -> bool {
-        self.rebound > 0 || self.doc_repaired > 0 || self.unresolved > 0 || self.inconclusive > 0
+        self.rebound > 0
+            || self.doc_repaired > 0
+            || self.unresolved > 0
+            || self.inconclusive > 0
+            || self.base_refused > 0
     }
 
     fn log(&self) {
@@ -128,6 +135,7 @@ impl SweepOutcome for PrBindingRepairOutcome {
             unresolved = self.unresolved,
             confirmed_ok = self.confirmed_ok,
             inconclusive = self.inconclusive,
+            base_refused = self.base_refused,
             "pr-binding-repair sweep: pass complete",
         );
     }
@@ -143,8 +151,10 @@ pub fn spawn_loop(
     let detector: Arc<dyn PrDetector> = Arc::new(CommandPrDetector::new());
     let verifier: Arc<dyn BranchVerifier> = Arc::new(CommandBranchVerifier::new());
     let doc_refresher: Arc<dyn DocPointerRefresher> = Arc::new(DesignDetectorDocPointerRefresher);
+    let pr_checker: Arc<dyn PrStateChecker> = Arc::new(GhPrStateChecker);
     let attempts: Arc<AsyncMutex<HashMap<String, u32>>> = Arc::new(AsyncMutex::new(HashMap::new()));
     spawn_sweep_loop(interval, move || {
+        let pr_checker = Arc::clone(&pr_checker);
         let work_db = Arc::clone(&work_db);
         let coordinator = Arc::clone(&coordinator);
         let detector = Arc::clone(&detector);
@@ -157,7 +167,7 @@ pub fn spawn_loop(
                 work_db.as_ref(),
                 detector.as_ref(),
                 verifier.as_ref(),
-                &GhPrStateChecker,
+                Arc::clone(&pr_checker),
                 doc_refresher.as_ref(),
                 &mut attempts,
             )
@@ -180,7 +190,7 @@ pub(crate) async fn run_one_pass(
     work_db: &WorkDb,
     detector: &dyn PrDetector,
     verifier: &dyn BranchVerifier,
-    pr_checker: &dyn PrStateChecker,
+    pr_checker: Arc<dyn PrStateChecker>,
     doc_refresher: &dyn DocPointerRefresher,
     attempts: &mut HashMap<String, u32>,
 ) -> PrBindingRepairOutcome {
@@ -206,7 +216,7 @@ pub(crate) async fn run_one_pass(
             work_db,
             detector,
             verifier,
-            pr_checker,
+            Arc::clone(&pr_checker),
             doc_refresher,
             candidate,
             &mut outcome,
@@ -258,7 +268,7 @@ async fn repair_candidate(
     work_db: &WorkDb,
     detector: &dyn PrDetector,
     verifier: &dyn BranchVerifier,
-    pr_checker: &dyn PrStateChecker,
+    pr_checker: Arc<dyn PrStateChecker>,
     doc_refresher: &dyn DocPointerRefresher,
     candidate: &PrBindingRepairCandidate,
     outcome: &mut PrBindingRepairOutcome,
@@ -376,6 +386,35 @@ async fn repair_candidate(
             return park_unresolved(work_db, candidate, &detail, outcome);
         }
     };
+    match crate::work::bounded_base_verdict(Arc::clone(&pr_checker), &own_pr_url, crate::work::PR_BASE_CHECK_BUDGET)
+        .await
+    {
+        Ok(crate::work::PrBaseVerdict::DefaultBranch | crate::work::PrBaseVerdict::NotChecked) => {}
+        Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+            outcome.base_refused += 1;
+            tracing::warn!(
+                task_id = %candidate.task_id,
+                own_pr_url,
+                %reason,
+                "pr-binding-repair sweep: PR on the execution's branch targets a non-default base; leaving the binding untouched",
+            );
+            upsert_attention(
+                work_db,
+                candidate,
+                "PR on this work item's branch targets a non-default base",
+                &format!(
+                    "This row is bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its \
+                     branch `{expected_branch}`, {own_pr_url}, cannot replace that binding because {reason}. \
+                     Nothing was changed. Retarget {own_pr_url} to the default branch; the next sweep pass then \
+                     re-binds this row to it, or re-bind by hand with `boss task update --pr-url`.",
+                    bound = candidate.bound_pr_url,
+                    exec = candidate.execution_id,
+                ),
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(Inconclusive::GitHub(format!("checking PR base: {err:#}"))),
+    }
     if let Ok(Some(other)) = work_db.other_work_item_bound_to_pr(&own_pr_url, &candidate.task_id) {
         let detail = format!(
             "This row was bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its branch \
@@ -439,7 +478,7 @@ async fn repair_candidate(
         // merged PR; requesting a review of a merged PR would only fail.
         return Ok(());
     }
-    match work_db.request_pr_review(&candidate.task_id, pr_checker) {
+    match work_db.request_pr_review(&candidate.task_id, pr_checker.as_ref()) {
         Ok(review) => tracing::info!(
             task_id = %candidate.task_id,
             review_execution_id = %review.id,
@@ -497,12 +536,13 @@ fn park_unresolved(
 }
 
 fn file_attention(work_db: &WorkDb, candidate: &PrBindingRepairCandidate, body: &str) {
-    if let Err(err) = work_db.upsert_external_tracker_attention(
-        &candidate.task_id,
-        ATTENTION_KIND_PR_BINDING_REPAIR,
-        "Bound to a PR this work item did not open",
-        body,
-    ) {
+    upsert_attention(work_db, candidate, "Bound to a PR this work item did not open", body);
+}
+
+fn upsert_attention(work_db: &WorkDb, candidate: &PrBindingRepairCandidate, title: &str, body: &str) {
+    if let Err(err) =
+        work_db.upsert_external_tracker_attention(&candidate.task_id, ATTENTION_KIND_PR_BINDING_REPAIR, title, body)
+    {
         tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: failed to file attention item");
     }
 }
@@ -640,6 +680,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_default_base_preserves_the_existing_binding_and_doc() {
+        let (_dir, db) = open_db();
+        let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_foreign".into())]));
+        let checker = FakePrStateChecker::always(PrOpenState::Open)
+            .with_base(crate::work::PrBaseVerdict::Refused("feature base".into()));
+        let outcome = run_one_pass(
+            &db,
+            &FixedDetector(PrStatus::Fresh { url: OWN.into() }, StdMutex::default()),
+            &verifier,
+            Arc::new(checker),
+            &RecordingDocRefresher::default(),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert_eq!(outcome.rebound, 0);
+        assert_eq!(outcome.base_refused, 1);
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
+        assert_eq!(
+            db.task_doc_path(&task_id).unwrap().as_deref(),
+            Some("docs/designs/origin.md")
+        );
+        let items = db.list_attention_items_for_work_item(&task_id).unwrap();
+        let item = items
+            .iter()
+            .find(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR)
+            .expect("refusal is surfaced");
+        assert_eq!(item.title, "PR on this work item's branch targets a non-default base");
+        assert!(item.body_markdown.contains(OWN) && item.body_markdown.contains(ORIGIN));
+        assert!(item.body_markdown.contains("feature base") && item.body_markdown.contains("Retarget"));
+    }
+
+    struct FailingBaseChecker;
+    impl PrStateChecker for FailingBaseChecker {
+        fn check(&self, _: &str) -> anyhow::Result<PrOpenState> {
+            Ok(PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+            anyhow::bail!("GitHub unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn base_lookup_error_is_retryable_and_leaves_the_row_untouched() {
+        let (_dir, db) = open_db();
+        let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_foreign".into())]));
+        let outcome = run_one_pass(
+            &db,
+            &FixedDetector(PrStatus::Fresh { url: OWN.into() }, StdMutex::default()),
+            &verifier,
+            Arc::new(FailingBaseChecker),
+            &RecordingDocRefresher::default(),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert_eq!((outcome.inconclusive, outcome.rebound, outcome.base_refused), (1, 0, 0));
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
+        assert!(db.list_attention_items_for_work_item(&task_id).unwrap().is_empty());
+    }
+
+    struct StalledBaseChecker(StdMutex<std::sync::mpsc::Receiver<()>>);
+    impl PrStateChecker for StalledBaseChecker {
+        fn check(&self, _: &str) -> anyhow::Result<PrOpenState> {
+            Ok(PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+            let _ = self.0.lock().unwrap().recv();
+            Ok(crate::work::PrBaseVerdict::DefaultBranch)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_base_lookup_times_out_and_leaves_the_binding_for_a_later_pass() {
+        let (_dir, db) = open_db();
+        let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_foreign".into())]));
+        let (release, wait) = std::sync::mpsc::channel();
+        let detector = FixedDetector(PrStatus::Fresh { url: OWN.into() }, StdMutex::default());
+        let docs = RecordingDocRefresher::default();
+        let mut attempts = HashMap::new();
+        let (outcome, ()) = tokio::join!(
+            run_one_pass(
+                &db,
+                &detector,
+                &verifier,
+                Arc::new(StalledBaseChecker(StdMutex::new(wait))),
+                &docs,
+                &mut attempts,
+            ),
+            async {
+                tokio::task::yield_now().await;
+                tokio::time::advance(crate::work::PR_BASE_CHECK_BUDGET + Duration::from_secs(1)).await;
+            }
+        );
+        drop(release);
+        assert_eq!((outcome.inconclusive, outcome.rebound), (1, 0));
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
+    }
+
+    #[tokio::test]
     async fn followup_bound_to_its_origin_pr_is_rebound_from_its_branch_and_reviewed() {
         let (_dir, db) = open_db();
         let (_product, task_id, exec_id) = mis_bound_followup(&db, ORIGIN);
@@ -653,7 +794,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &docs,
             &mut attempts,
         )
@@ -694,7 +835,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &RecordingDocRefresher::default(),
             &mut attempts,
         )
@@ -735,7 +876,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &docs,
             &mut attempts,
         )
@@ -773,7 +914,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &RecordingDocRefresher::default(),
             &mut attempts,
         )
@@ -796,7 +937,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &RecordingDocRefresher::default(),
             &mut attempts,
         )
@@ -817,7 +958,7 @@ mod tests {
                 &db,
                 &detector,
                 &verifier,
-                &FakePrStateChecker::always(PrOpenState::Open),
+                Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
                 &RecordingDocRefresher::default(),
                 &mut attempts,
             )
@@ -885,7 +1026,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &docs,
             &mut attempts,
         )
@@ -914,7 +1055,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &RecordingDocRefresher::default(),
             &mut attempts,
         )
@@ -941,7 +1082,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &RecordingDocRefresher::default(),
             &mut attempts,
         )
@@ -971,7 +1112,7 @@ mod tests {
             &db,
             &detector,
             &verifier,
-            &FakePrStateChecker::always(PrOpenState::Open),
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
             &RecordingDocRefresher::default(),
             &mut attempts,
         )
@@ -1011,7 +1152,7 @@ mod tests {
                 &db,
                 &FixedDetector(PrStatus::None, StdMutex::default()),
                 &verifier,
-                &FakePrStateChecker::always(PrOpenState::Open),
+                Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
                 &RecordingDocRefresher::default(),
                 &mut HashMap::new(),
             )
@@ -1073,8 +1214,8 @@ mod tests {
             let detector = FixedDetector(PrStatus::Fresh { url: OWN.into() }, StdMutex::default());
             let docs = RetryDocScanner(std::sync::atomic::AtomicBool::new(false));
             let mut attempts = HashMap::new();
-            let checker = FakePrStateChecker::always(PrOpenState::Open);
-            let first = run_one_pass(&db, &detector, &verifier, &checker, &docs, &mut attempts).await;
+            let checker: Arc<dyn PrStateChecker> = Arc::new(FakePrStateChecker::always(PrOpenState::Open));
+            let first = run_one_pass(&db, &detector, &verifier, Arc::clone(&checker), &docs, &mut attempts).await;
             assert_eq!(first.inconclusive, 1);
             assert_eq!(first.doc_repaired + first.rebound, 0);
             assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(bound));
@@ -1083,7 +1224,7 @@ mod tests {
                 Some("docs/designs/origin.md")
             );
             assert_eq!(db.list_pr_binding_repair_candidates().unwrap().len(), 1);
-            let second = run_one_pass(&db, &detector, &verifier, &checker, &docs, &mut attempts).await;
+            let second = run_one_pass(&db, &detector, &verifier, Arc::clone(&checker), &docs, &mut attempts).await;
             assert_eq!(second.inconclusive, 0);
             assert_eq!(second.doc_repaired + second.rebound, 1);
             assert_eq!(

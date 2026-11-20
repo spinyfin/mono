@@ -13,6 +13,31 @@
 use super::*;
 
 impl WorkerCompletionHandler {
+    /// Atomically refresh or create an execution attention and notify the frontend.
+    pub(super) async fn upsert_execution_attention(
+        &self,
+        execution: &crate::work::WorkExecution,
+        kind: &str,
+        title: &str,
+        body_markdown: &str,
+    ) -> Result<()> {
+        let id = self
+            .work_db
+            .upsert_execution_attention(&execution.id, kind, title, body_markdown)?;
+        if let Some(item) = self
+            .work_db
+            .list_attention_items(&execution.id)?
+            .into_iter()
+            .find(|item| item.id == id)
+            && let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id)
+        {
+            self.publisher
+                .publish_frontend_event_on_product(work_item.product_id(), FrontendEvent::AttentionItemCreated { item })
+                .await;
+        }
+        Ok(())
+    }
+
     /// File an execution-scoped attention item and publish the resulting
     /// `AttentionItemCreated` event on the work item's product.
     ///
