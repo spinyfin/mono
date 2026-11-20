@@ -241,7 +241,16 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
     let Some(events) = dequeue_events.get(&candidate.pr_url) else {
         return;
     };
-    for event in events.iter().rev() {
+    // A withdrawal must be applied before a later same-head rebounce.
+    let mut ordered_events: Vec<_> = events.iter().collect();
+    ordered_events.sort_by_key(|event| {
+        event
+            .created_at
+            .as_deref()
+            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            .map(|time| time.timestamp())
+    });
+    for event in ordered_events {
         let Some(head_sha) = event.pr_head_oid.as_deref() else {
             continue;
         };
@@ -265,7 +274,7 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
             head_sha,
             event_created_at,
         ) {
-            Ok(prior) => prior.flatten(),
+            Ok(prior) => prior,
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
@@ -283,7 +292,7 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
         // The submission is gone; the person's request behind it may not
         // be. Failed checks and a conflict are the engine's to fix, so the
         // request stands through them. Any other departure ends it.
-        let request_ended = match if current_head_matches {
+        let request_ended = match if prior.is_some() || current_head_matches {
             work_db.note_merge_intent_left_queue(
                 &candidate.work_item_id,
                 &candidate.pr_url,
@@ -310,7 +319,7 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
-            prior_merge_queue_state = prior.as_deref(),
+            prior_merge_queue_state = prior.as_ref().and_then(|state| state.as_deref()),
             new_merge_queue_state = Option::<&str>::None,
             in_merge_queue = false,
             auto_merge_enabled = false,
@@ -324,10 +333,9 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
                 "github_merge_intent_dequeued",
             )
             .await;
-        if prior.as_deref() == Some("queued") {
+        if prior.as_ref().and_then(|state| state.as_deref()) == Some("queued") {
             renumber_merge_queue(work_db, publisher, &candidate.product_id).await;
         }
-        return;
     }
 }
 

@@ -1314,7 +1314,12 @@ async fn observed_github_dequeue_retires_intent_and_clears_merging() {
 /// ends it and tells the app, even when the Merging lane was already clear.
 #[tokio::test]
 async fn observed_github_dequeue_keeps_or_ends_the_standing_merge_request_by_reason() {
-    for recorded_submission in [true, false] {
+    for (recorded_submission, stored_head) in [
+        (true, Some("head-5")),
+        (true, Some("head-6")),
+        (true, None),
+        (false, Some("head-5")),
+    ] {
         for (reason, stands) in [("FAILED_CHECKS", true), ("manual_removal", false)] {
             let (_dir, db) = open_db();
             let product =
@@ -1334,7 +1339,10 @@ async fn observed_github_dequeue_keeps_or_ends_the_standing_merge_request_by_rea
             }
             db.connect()
                 .unwrap()
-                .execute("UPDATE tasks SET pr_head_sha = 'head-5' WHERE id = ?1", [&task])
+                .execute(
+                    "UPDATE tasks SET pr_head_sha = ?2 WHERE id = ?1",
+                    rusqlite::params![task, stored_head],
+                )
                 .unwrap();
             let approved = if recorded_submission {
                 "head-5"
@@ -1383,7 +1391,11 @@ async fn observed_github_dequeue_keeps_or_ends_the_standing_merge_request_by_rea
                 .await
                 .iter()
                 .any(|(_, item_id, _)| item_id == &task);
-            assert_eq!(notified, !stands, "{reason}: only an ended request changes the card");
+            assert_eq!(
+                notified,
+                recorded_submission || !stands,
+                "{reason}: retirement or withdrawal notifies the card"
+            );
             if stands {
                 assert!(
                     db.merge_intent_remediation(&requested).unwrap().fix_owed,
@@ -1392,6 +1404,63 @@ async fn observed_github_dequeue_keeps_or_ends_the_standing_merge_request_by_rea
             }
         }
     }
+}
+
+#[tokio::test]
+async fn batched_dequeues_preserve_withdrawal_before_same_head_rebounce_and_replay() {
+    let (_dir, db) = open_db();
+    let product = create_test_product_with_repo(&db, "BatchedDequeue", Some("git@github.com:foo/bar.git"));
+    let pr_url = "https://github.com/foo/bar/pull/5";
+    let task = chore_in_review_for_product(&db, &product.id, "Withdrawal", pr_url);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_head_sha = 'head-5' WHERE id = ?1", [&task])
+        .unwrap();
+    let request = db.record_merge_intent(&task, pr_url, Some("head-5")).unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE merge_intents SET created_at = '10' WHERE id = ?1",
+            [&request.id],
+        )
+        .unwrap();
+    let candidate = PendingMergeCheck {
+        work_item_id: task.clone(),
+        product_id: product.id.clone(),
+        pr_url: pr_url.to_owned(),
+    };
+    // Supply newest first: processing must follow event time.
+    let events = HashMap::from([(
+        pr_url.to_owned(),
+        [(30, "failed_checks"), (20, "manual_removal")]
+            .into_iter()
+            .map(|(time, reason)| MergeQueueDequeueEvent {
+                queue_base_oid: None,
+                reason: reason.to_owned(),
+                created_at: Some(chrono::DateTime::from_timestamp(time, 0).unwrap().to_rfc3339()),
+                pr_head_oid: Some("head-5".to_owned()),
+                before_commit_oid: None,
+            })
+            .collect(),
+    )]);
+    let publisher = RecordingPublisher::default();
+    for _ in 0..2 {
+        clear_github_merge_intent_on_observed_dequeue(&db, &publisher, &candidate, &events).await;
+        assert!(db.active_merge_intent(&task, pr_url).unwrap().is_none());
+        let reason: String = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT reason FROM merge_intents WHERE id = ?1", [&request.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(reason, "removed_from_merge_queue");
+    }
+    assert_eq!(
+        publisher.events.lock().await.len(),
+        1,
+        "replay must not publish another withdrawal"
+    );
 }
 
 /// A historical dequeue at the same head must not retire a newly recorded

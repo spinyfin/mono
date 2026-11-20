@@ -109,6 +109,8 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     install_journal_triggers(conn)
 }
 
+/// Frozen body of shipped migration 20261118_2035; do not edit.
+/// Replaced by `migrate_dequeue_tracking`.
 fn legacy_revision_trigger() -> String {
     format!(
         "CREATE TRIGGER IF NOT EXISTS merge_intents_end_on_revision
@@ -128,10 +130,8 @@ fn legacy_revision_trigger() -> String {
     )
 }
 
-/// A later revision, including a CI fix or conflict resolution, means the
-/// sentence an already-ended intent put on the card is about a previous
-/// head. Clear it so a queued or running revision's status can show.
-/// Active intents are left for [`revision_trigger`] to invalidate.
+/// Frozen body of shipped migration 20261118_2035; do not edit.
+/// Replaced by `migrate_dequeue_tracking`.
 fn clear_ended_on_revision_trigger() -> String {
     format!(
         "CREATE TRIGGER IF NOT EXISTS merge_intents_clear_ended_on_revision
@@ -598,6 +598,9 @@ impl WorkDb {
             return Ok(MergeQueueDeparture::NoIntent);
         };
         // Timeline replay must not revive an old obligation or withdraw a newer request.
+        // This ordering assumes the host's UTC clock is synchronized with GitHub:
+        // requests and remediations use local time, but dequeues use GitHub time.
+        // Clock skew can reject a fresh dequeue or misattribute a fix.
         let observed = tx.execute(
             "UPDATE merge_intents SET last_dequeue_at = ?2 WHERE id = ?1
              AND CAST(created_at AS INTEGER) < ?2

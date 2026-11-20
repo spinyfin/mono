@@ -88,6 +88,8 @@ A standing intent also counts as "a merge has been requested" for [just-in-time 
 
 ## Not yet automatic
 
+Dequeue replay protection and CI-fix ownership assume the engine host's UTC clock is synchronized with GitHub. Requests and remediation rows use the host clock; timeline events use GitHub's clock. A host clock ahead of GitHub can reject a fresh departure as historical, and a host clock behind GitHub can misattribute a newly minted fix. These comparisons require synchronized clocks.
+
 These are limits of the current behaviour, stated so that nobody reads more into a standing intent than it does.
 
 - **No new automatic re-merge decision.** When no existing submission or automatic path below owns the merge, a completed CI-fix or conflict revision returns to Review with an explanation. A merge-queue-rebounce worker can already re-enqueue the fixed head itself, so returning to Review is not universal. The decision in `core/src/merge_intent.rs` has no outcome that merges. A change that adds one must keep "no decision" a reason to return to Review: a judgement that is missing, fails or is unsure is not approval. `automatic_merges` is always 0 until then.
