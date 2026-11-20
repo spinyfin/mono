@@ -140,10 +140,20 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
 
     state.feature_flags.set("review_guide_source_capture", true).unwrap();
     state.feature_flags.set("review_guide_generation", true).unwrap();
+    // Subscribe before completion can spawn capture. The capture task publishes
+    // a root-card invalidation after persisting and enqueuing the fresh guide.
+    let updates = make_session_sink();
+    let session = "review-guide-regeneration";
+    state.topic_broker.register_session(session, updates.clone()).await;
+    state
+        .topic_broker
+        .subscribe(session, &[boss_protocol::work_product_topic(&product_id)])
+        .await;
     let calls = Arc::new(AtomicUsize::new(0));
     let handler = boss_engine_completion::integration_handler(db.clone(), pr_url)
         .with_collaborators(boss_engine_runtime::completion_adapters::completion_collaborators())
         .with_feature_flags(state.feature_flags.clone())
+        .with_publisher(state.publisher.clone())
         .with_source_packet_collector(counting_source_collector(
             calls.clone(),
             source_capture_packet(pr_url, "base", "revised-head"),
@@ -155,19 +165,25 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         matches!(outcome, boss_engine_completion::StopOutcome::PrDetected { .. }),
         "{outcome:?}"
     );
-    let attempts = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let attempts = db.live_pr_review_guide_attempts_for_series(&series).unwrap();
-            if let Some(execution_id) = attempts.first().and_then(|attempt| attempt.execution_id.as_deref())
-                && db.get_execution(execution_id).unwrap().status == ExecutionStatus::Running
-            {
-                break attempts;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // Notifications are wakeups; re-read authoritative state because the broker
+    // can coalesce invalidations. Bazel's test timeout is the hang guard.
+    let attempts = loop {
+        let attempts = db.live_pr_review_guide_attempts_for_series(&series).unwrap();
+        if attempts.first().is_some_and(|attempt| attempt.execution_id.is_some()) {
+            break attempts;
         }
-    })
-    .await
-    .expect("revision completion must automatically capture and dispatch a fresh guide");
+        updates.next().await.expect("guide capture subscription closed");
+    };
+    let guide_execution = attempts[0].execution_id.as_deref().unwrap();
+    // Subscribe before reading status: dispatch may already have started, or
+    // its execution_started notification will wake us after the DB commit.
+    state
+        .topic_broker
+        .subscribe(session, &[boss_protocol::execution_topic(guide_execution)])
+        .await;
+    while db.get_execution(guide_execution).unwrap().status != ExecutionStatus::Running {
+        updates.next().await.expect("guide dispatch subscription closed");
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(attempts.len(), 1);
     let refreshed = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
@@ -181,7 +197,6 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     assert_eq!(capture.trigger, "completion");
     assert_eq!(capture.packet.head_sha, "revised-head");
 
-    let guide_execution = attempts[0].execution_id.as_deref().unwrap();
     db.record_execution_launch_config(guide_execution, "codex", "gpt-6-astra", None)
         .unwrap();
     assert_eq!(
