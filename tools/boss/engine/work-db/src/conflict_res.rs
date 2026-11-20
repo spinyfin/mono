@@ -1655,7 +1655,8 @@ pub(crate) fn mark_conflict_resolution_succeeded_at_rung_in_tx(
                 resolved_by_rung          = COALESCE(resolved_by_rung, ?4),
                 mechanical_rung_in_flight = NULL
           WHERE id = ?1
-            AND status IN ('pending', 'running')",
+            AND (status IN ('pending', 'running')
+                 OR (status = 'failed' AND failure_reason LIKE 'workspace_preparation_failed: %'))",
         params![attempt_id, head_sha_after, now, rung],
     )?;
     if rows == 0 {

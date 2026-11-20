@@ -166,6 +166,8 @@ pub enum ConflictRemediationMode<'a> {
     /// worker revision directly, i.e. straight to rung 3. Pre-ladder
     /// behaviour, preserved exactly.
     Disabled,
+    /// The mechanical ladder is off, but failed workspaces still recover.
+    WorkerOnly(&'a ConflictRemediationQueue),
     /// Run the ladder inline, on the caller's task. The call does not return
     /// until the ladder finishes. Correct for callers that are not the
     /// detection loop (tests, one-shot tools).
@@ -233,6 +235,29 @@ pub async fn on_conflict_detected_with(
     {
         return recorded;
     }
+    if let Ok(Some(active)) = work_db.latest_actionable_conflict_resolution(&candidate.work_item_id)
+        && active.pr_url == candidate.pr_url
+        && !work_db
+            .has_live_conflict_revision_for_pr(&candidate.pr_url)
+            .unwrap_or(true)
+    {
+        match work_db.retain_conflict_revision_workspace_failure(&active.id) {
+            Ok(true) => {
+                publisher
+                    .publish_work_item_changed(
+                        &candidate.product_id,
+                        &candidate.work_item_id,
+                        "conflict_workspace_failed",
+                    )
+                    .await
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(attempt_id = %active.id, ?err, "conflict_watch: failed to retain workspace failure");
+                return false;
+            }
+        }
+    }
     // A failed or abandoned latest attempt with no live fix vehicle must be
     // explained on the card and in an attention item. This also repairs
     // terminal rows written before the explanation was recorded.
@@ -258,6 +283,23 @@ pub async fn on_conflict_detected_with(
                 tracing::error!(attempt_id = %latest.id, ?err, "conflict_watch: failed to surface stopped remediation")
             }
         }
+    }
+    // A failed workspace is not a stale revision. Keep its evidence and
+    // recheck preparation through the bounded remediator, without minting
+    // another revision or consuming another churn attempt.
+    if let Ok(Some(attempt)) = work_db.latest_actionable_conflict_resolution(&candidate.work_item_id)
+        && attempt.pr_url == candidate.pr_url
+        && crate::work::conflict_workspace_failed(&attempt)
+    {
+        return match remediation {
+            ConflictRemediationMode::Deferred(queue) | ConflictRemediationMode::WorkerOnly(queue) => {
+                queue.try_enqueue(candidate, &attempt, probe) == EnqueueOutcome::Enqueued
+            }
+            ConflictRemediationMode::Inline(cube) => {
+                crate::conflict_workspace::recover(work_db, publisher, cube, None, candidate, &attempt, probe).await
+            }
+            ConflictRemediationMode::Disabled => false,
+        };
     }
     // Pre-flight: when an active revision fix vehicle already exists for this
     // work item, the detection flow is essentially a no-op for an `in_review`
@@ -1087,6 +1129,7 @@ pub async fn on_conflict_detected_with(
                              no worker spawned, ladder will retry on the next tick",
                         );
                     }
+                    conflict_ladder::LadderOutcome::WorkspacePreparationFailed => return true,
                 }
             } else {
                 // No cube client → the mechanical-rebase flag was set to false, so the
@@ -1547,13 +1590,19 @@ pub(crate) async fn spawn_conflict_revision_after_ladder(
     attempt: &crate::work::ConflictResolution,
     use_small_agent_profile: bool,
 ) -> bool {
+    let Ok(Some(attempt)) = work_db.get_conflict_resolution(&attempt.id) else {
+        return false;
+    };
+    if !matches!(attempt.status.as_str(), "pending" | "running") {
+        return false;
+    }
     let spawned = maybe_spawn_conflict_revision(
         work_db,
         publisher,
         pr_checker,
         candidate,
         probe,
-        attempt,
+        &attempt,
         use_small_agent_profile,
     )
     .await;
@@ -1803,6 +1852,9 @@ pub async fn on_resolved(
             "conflict_watch: could not clear stopped-remediation attention for clean PR"
         );
     }
+    // The shared retirement transaction picks the attempt to retire: the
+    // live one, or a workspace-failed one that no revision could be
+    // prepared for and that a mergeable PR makes moot.
     let result = match work_db.clear_resolved_pr_signal(&candidate.work_item_id, &candidate.pr_url, false) {
         Ok(ClearResolvedSignal::Applied(result)) => *result,
         Ok(ClearResolvedSignal::QueueSideUnresolved { .. } | ClearResolvedSignal::Nothing) => return false,

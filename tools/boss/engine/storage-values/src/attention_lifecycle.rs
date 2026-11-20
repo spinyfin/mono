@@ -151,7 +151,7 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     entry(
         CONFLICT_REMEDIATION_STOPPED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
-        "Conflict remediation clears the signal when a retry resumes or the PR becomes clean.",
+        "Conflict remediation clears the signal after workspace preparation succeeds, a retry resumes, or the PR becomes clean.",
     ),
     entry(
         WORKSPACE_POSITIONING_REFUSED,

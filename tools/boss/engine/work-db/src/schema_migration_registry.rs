@@ -279,6 +279,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: conflict_deferral::migrate,
         },
         Migration {
+            id: conflict_stop::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: conflict_stop::migrate,
+        },
+        Migration {
             id: "20261029_1430_critical_requests".into(),
             legacy_version: None,
             apply: critical_requests::migrate,
