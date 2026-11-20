@@ -990,7 +990,8 @@ enum WorkAction {
     ///
     /// Takes an execution id or a work item id (the item's newest
     /// execution is followed). Exit status: 0 started, 1 failed, 3 timed
-    /// out.
+    /// out, 4 lookup/connection/argument error, 5 left the selected states
+    /// without starting. All pre-run states are waited on by default.
     Wait {
         /// Execution id (`exec_…`) or work item id.
         reference: String,

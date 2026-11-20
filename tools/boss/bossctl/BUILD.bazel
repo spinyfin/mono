@@ -30,6 +30,7 @@ rust_binary(
         "src/tests.rs",
         "src/traffic_split.rs",
         "src/work_wait.rs",
+        "src/work_wait_tests.rs",
     ],
     compile_data = [
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
@@ -94,6 +95,19 @@ rust_test(
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/protocol",
     ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "work_wait_test",
+    size = "medium",
+    srcs = ["tests/work_wait.rs"],
+    data = [":bossctl"],
+    edition = "2024",
+    env = {"BOSSCTL_TEST_BINARY": "$(rootpath :bossctl)"},
+    deps = ["//tools/boss/protocol"] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

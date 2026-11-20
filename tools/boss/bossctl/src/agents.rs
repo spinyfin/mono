@@ -1307,12 +1307,41 @@ pub(crate) async fn agents_interrupt(socket_path: &Option<String>, json: bool, a
     }
 }
 
-/// Skip-the-queue spawn for `bossctl agents launch <work-item-id>`.
-/// Maps to `RequestExecution { force: true, .. }`: the engine grows
-/// the worker pool by one slot up to the hard cap when every
-/// configured slot is busy and dispatches the work item immediately,
-/// rather than letting the auto-dispatcher defer until a slot frees
-/// up.
+/// Retry capacity refusals until the deadline, preserving the last refusal.
+async fn launch_with_retry<F, Fut>(
+    mut send: F,
+    wait: bool,
+    deadline: Option<tokio::time::Instant>,
+    interval: std::time::Duration,
+) -> Result<FrontendEvent>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<FrontendEvent>>,
+{
+    let mut last = None;
+    loop {
+        // Never cancel an in-flight mutation: its result may already have
+        // committed. The deadline gates submission of every new request.
+        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            return last.ok_or_else(|| anyhow::anyhow!("timed out before requesting execution"));
+        }
+        let response = send().await?;
+        let at_cap = matches!(
+            &response,
+            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message }
+                if crate::work_wait::is_hard_cap_refusal(message)
+        );
+        if !wait || !at_cap {
+            return Ok(response);
+        }
+        eprintln!("waiting for a worker slot (pool at hard cap)");
+        last = Some(response);
+        let wake = tokio::time::Instant::now() + interval;
+        tokio::time::sleep_until(deadline.map_or(wake, |d| d.min(wake))).await;
+    }
+}
+
+/// Force-dispatch a work item, optionally waiting for capacity at the hard cap.
 pub(crate) async fn agents_launch(
     socket_path: &Option<String>,
     json: bool,
@@ -1323,30 +1352,36 @@ pub(crate) async fn agents_launch(
     // retry while the engine refuses at the pool's hard cap.
     wait_for_slot: Option<Option<std::time::Duration>>,
 ) -> Result<()> {
-    let mut client = connect(socket_path).await?;
-    let deadline = wait_for_slot.flatten().map(|t| std::time::Instant::now() + t);
-    let response = loop {
-        let response = client
-            .send_request(&FrontendRequest::RequestExecution {
-                input: RequestExecutionInput::builder()
-                    .work_item_id(work_item_id.clone())
-                    .maybe_preferred_workspace_id(preferred_workspace_id.clone())
-                    .maybe_requested_host_id(host.clone())
-                    .force(true)
-                    .build(),
-            })
+    let deadline = wait_for_slot.flatten().map(|t| tokio::time::Instant::now() + t);
+    let client = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, connect(socket_path))
             .await
-            .context("sending RequestExecution (force)")?;
-        let at_cap = matches!(
-            &response,
-            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message }
-                if crate::work_wait::is_hard_cap_refusal(message)
-        );
-        if wait_for_slot.is_none() || !at_cap || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            break response;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            .context("timed out connecting before requesting execution")??,
+        None => connect(socket_path).await?,
     };
+    let client = tokio::sync::Mutex::new(client);
+    let request = FrontendRequest::RequestExecution {
+        input: RequestExecutionInput::builder()
+            .work_item_id(work_item_id)
+            .maybe_preferred_workspace_id(preferred_workspace_id)
+            .maybe_requested_host_id(host)
+            .force(true)
+            .build(),
+    };
+    let response = launch_with_retry(
+        || async {
+            client
+                .lock()
+                .await
+                .send_request(&request)
+                .await
+                .context("sending RequestExecution (force)")
+        },
+        wait_for_slot.is_some(),
+        deadline,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
     match response {
         FrontendEvent::ExecutionRequested { execution }
         | FrontendEvent::ExecutionCreated { execution }
