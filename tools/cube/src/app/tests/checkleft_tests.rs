@@ -81,7 +81,7 @@ fn write_fake_repobin_failing(bin_dir: &std::path::Path) {
 }
 
 /// RAII guard that saves CUBE_CHECKLEFT_BIN on construction and
-/// restores them on drop. Always acquire `ENV_MUTEX` first.
+/// restores it on drop. Always acquire `ENV_MUTEX` first.
 pub(super) struct CheckleftEnvGuard {
     pub(super) orig_cube_bin: Option<std::ffi::OsString>,
 }
@@ -118,7 +118,6 @@ fn checkleft_gate_is_skipped_when_no_checkleft_anywhere() {
     // When there is no bin/checkleft, no CUBE_CHECKLEFT_BIN, and no
     // checkleft on PATH, the gate must emit a warning and proceed fail-open.
     let dir = TempDir::new().unwrap();
-    let _lock = ENV_MUTEX.lock().unwrap();
     assert!(
         run_checkleft_gate_impl(
             dir.path(),
@@ -161,7 +160,6 @@ fn checkleft_gate_uses_path_fallback_and_blocks_on_errors() {
     // not set, the gate must find checkleft on PATH and block when that binary
     // reports errors. This covers the cube workspace case where repobin-install
     // has not run but checkleft is globally available (e.g. via ~/bin).
-    //
     let workspace = TempDir::new().unwrap();
     let path_dir = TempDir::new().unwrap();
     write_fake_checkleft_to_dir(path_dir.path(), 1, "error[rustfmt]: file needs formatting");
@@ -313,7 +311,6 @@ fn checkleft_gate_prefers_repobin_exec_when_repobin_is_installed() {
         "checks: no findings (from bin/checkleft, must not be used)",
     );
 
-    let _lock = ENV_MUTEX.lock().unwrap();
     let resolved = resolve_checkleft_bin_with_env(dir.path(), None, Some("".into()));
     assert_eq!(
         resolved,
@@ -346,7 +343,6 @@ fn checkleft_gate_falls_back_when_repobin_dispatch_probe_fails() {
     write_fake_repobin_failing(&bin_dir);
     write_fake_checkleft(dir.path(), 1, "error[rustfmt]: file needs formatting");
 
-    let _lock = ENV_MUTEX.lock().unwrap();
     let resolved = resolve_checkleft_bin_with_env(dir.path(), None, Some("".into()));
     assert_eq!(
         resolved,

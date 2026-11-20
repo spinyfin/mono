@@ -1,7 +1,7 @@
 use super::*;
 
-/// Only the git subprocess sees an empty search path. Other tests retain
-/// their environment, unlike a process-wide PATH mutation.
+/// Runs every command normally except `git`, which is given an empty `PATH`
+/// so spawning it fails with `ENOENT`.
 struct MissingGit<'a>(&'a DeclaredJj);
 
 impl CommandRunner for MissingGit<'_> {

@@ -218,15 +218,19 @@ fn store_git_dir(cwd: &Path) -> Result<PathBuf> {
     let store = crate::lock::shared_repo_dir(cwd)?.join("store");
     let pointer = store.join("git_target");
     let target = std::fs::read_to_string(&pointer)
-        .map_err(|error| CubeError::InvalidArgument(format!("reading {}: {error}", pointer.display())))?;
+        .map_err(|error| io_context(error, format!("reading {}", pointer.display())))?;
     let path = store.join(target.trim());
     std::fs::canonicalize(&path).map_err(|error| {
-        CubeError::InvalidArgument(format!(
-            "resolving {} (from {}): {error}",
-            path.display(),
-            pointer.display()
-        ))
+        io_context(
+            error,
+            format!("resolving {} (from {})", path.display(), pointer.display()),
+        )
     })
+}
+
+/// Wrap an I/O error with context, keeping it an I/O failure of the same kind.
+fn io_context(source: std::io::Error, context: String) -> CubeError {
+    CubeError::Io(std::io::Error::new(source.kind(), format!("{context}: {source}")))
 }
 
 /// Fetch `refs/pull/<number>/head` of the base repository into the store.
@@ -277,11 +281,14 @@ fn fetch_pull_ref(
         deadline,
     );
     let fetched = fetched.map_err(|error| match error {
-        CubeError::Io(source) => CubeError::InvalidArgument(format!(
-            "running git fetch in {} with --git-dir {}: {source}",
-            cwd.display(),
-            git_dir.display()
-        )),
+        CubeError::Io(source) => io_context(
+            source,
+            format!(
+                "running git fetch in {} with --git-dir {}",
+                cwd.display(),
+                git_dir.display()
+            ),
+        ),
         other => other,
     });
     let imported = fetched.and_then(|_| import_git_refs(runner, database_path, cwd));
