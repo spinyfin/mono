@@ -35,12 +35,12 @@ pub(crate) struct TaskParkArgs {
 pub(crate) struct TaskIdArg {
     /// Task/chore id. Accepts: primary id (`task_…`), friendly short id
     /// (`42`, `#42`, or the product-local `T`-prefix form), or cross-product
-    /// form (`boss/42` or `boss/#42`). Globally unique short ids resolve
-    /// without `--product`; ambiguous ones error listing every candidate.
+    /// form (`boss/42` or `boss/#42`). Unscoped ambiguous short ids error
+    /// listing every candidate, even when the app has a selected product.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
     /// Resolve a friendly short id (`42` or `#42`) against this product
-    /// (slug or id). Optional when the short id is globally unique.
+    /// (slug or id), overriding BOSS_PRODUCT and the app selection.
     /// Ignored when the selector already embeds a product slug
     /// (`boss/42`) or when the selector is a primary id.
     #[arg(long)]
@@ -384,7 +384,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
         }
         ProjectCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
-            let dep_filter = args.dep.into_filter();
+            let dep_filter = args.dep.resolve(&mut client, &product.id).await?;
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
             let projects = list_projects(&mut client, &product.id, dep_filter.clone()).await?;
             let resolved_ids = if args.ids.is_empty() {
@@ -952,7 +952,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
         }
         ChoreCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
-            let dep_filter = args.dep.into_filter();
+            let dep_filter = args.dep.resolve(&mut client, &product.id).await?;
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
             let chores = list_chores(&mut client, &product.id, dep_filter.clone(), args.include_deleted).await?;
             let resolved_ids = if args.ids.is_empty() {
@@ -1967,7 +1967,7 @@ pub(crate) async fn run_restore_leaf(
     // from the per-product short-id resolver, so bare `#43` / `boss/43`
     // can't reach it. The engine resolves the globally-unique `T43`
     // form (and canonical `task_…` ids) against tombstoned rows itself,
-    // so we pass the raw selector straight through.
+    // so we add only environment product scope before the engine looks it up.
     let item = work_item_with_display_status(restore_work_item(client, args.id.trim()).await?);
     let (label, friendly) = match &item {
         WorkItem::Task(t) => ("Task", boss_protocol::short_id_label(t.short_id)),

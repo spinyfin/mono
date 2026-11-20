@@ -107,7 +107,7 @@ async fn reported_product_is_resolved_to_id_name_and_slug() {
 }
 
 #[tokio::test]
-async fn bare_short_ids_resolve_in_the_selected_product() {
+async fn ambiguous_short_ids_error_even_with_a_selected_product() {
     let (server_state, _dir) = test_server_state();
     let first = boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "first");
     let selected = boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "selected");
@@ -125,18 +125,26 @@ async fn bare_short_ids_resolve_in_the_selected_product() {
             .await
     );
 
-    let selector = boss_protocol::short_id_wire_form(selected_task.short_id.unwrap());
-    assert_eq!(
-        server_state.resolve_work_item_id(&selector).await.unwrap(),
-        selected_task.id
-    );
     let reader = server_state.work_db.reader().unwrap();
+    for selector in [
+        boss_protocol::short_id_wire_form(selected_task.short_id.unwrap()),
+        selected_task.short_id.unwrap().to_string(),
+    ] {
+        let results = [
+            server_state.resolve_work_item_id(&selector).await,
+            server_state.resolve_work_item_id_with_db(&reader, &selector).await,
+            server_state.resolve_work_item_id_including_deleted(&selector).await,
+        ];
+        for result in results {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("ambiguous"), "{err}");
+            assert!(err.contains(&first_task.id) && err.contains(&selected_task.id), "{err}");
+        }
+    }
+    let explicit = format!("{}/{}", first.slug, first_task.short_id.unwrap());
     assert_eq!(
-        server_state
-            .resolve_work_item_id_with_db(&reader, &selector)
-            .await
-            .unwrap(),
-        selected_task.id
+        server_state.resolve_work_item_id(&explicit).await.unwrap(),
+        first_task.id
     );
 }
 
@@ -156,12 +164,19 @@ async fn missing_bare_short_id_names_the_selected_product() {
             .await
     );
 
-    let selector = boss_protocol::short_id_wire_form(999_999);
+    let other = boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "boss");
+    let task = boss_engine_runtime::test_support::create_test_chore(&server_state.work_db, &other.id, "other row");
+    let selector = boss_protocol::short_id_wire_form(task.short_id.unwrap());
     let err = server_state
         .resolve_work_item_id(&selector)
         .await
         .unwrap_err()
         .to_string();
+    assert!(err.contains("selected in the app"), "{err}");
+    assert!(
+        err.contains(&format!("did you mean {}/{}?", other.slug, task.short_id.unwrap())),
+        "{err}"
+    );
     assert!(err.contains("in product flunge"), "unexpected error: {err}");
     assert!(
         err.contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER),
@@ -674,12 +689,10 @@ async fn report_from_a_non_app_session_is_acked_as_not_accepted() {
     );
 }
 
-/// End-to-end regression test for the bug this resolver exists to fix:
-/// `bossctl reveal T<n>` with the chooser on a product that is not the
-/// hardcoded "Boss" product must reveal the right row rather than
-/// guessing across products (or failing outright).
+/// Reveal rejects an ambiguous short id even with a selected product. A
+/// qualified selector still reveals the exact row and completes the app RPC.
 #[tokio::test]
-async fn reveal_work_item_resolves_short_id_via_the_selected_non_boss_product() {
+async fn reveal_work_item_requires_scope_for_an_ambiguous_short_id() {
     let (server_state, _dir) = test_server_state();
     let boss_product = boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "Boss");
     let other_product = boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "flunge");
@@ -700,11 +713,22 @@ async fn reveal_work_item_resolves_short_id_via_the_selected_non_boss_product() 
     );
 
     let selector = boss_protocol::short_id_wire_form(other_task.short_id.unwrap());
+    let err = server_state.reveal_work_item(&selector).await.unwrap_err().to_string();
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(err.contains(&boss_task.id) && err.contains(&other_task.id), "{err}");
+
+    server_state
+        .record_selected_product("session-app", Some(boss_product.id))
+        .await;
+    let selector = format!("{}/{}", other_product.slug, other_task.short_id.unwrap());
     let server_clone = server_state.clone();
     let selector_clone = selector.clone();
     let reveal = tokio::spawn(async move { server_clone.reveal_work_item(&selector_clone).await });
 
-    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), sink.next())
+        .await
+        .expect("reveal should enqueue an app request promptly")
+        .expect("an EngineRequest event should be enqueued");
     let request_id = match &envelope.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
             let boss_protocol::EngineToAppRequest::RevealWorkItem(input) = request else {
@@ -712,7 +736,7 @@ async fn reveal_work_item_resolves_short_id_via_the_selected_non_boss_product() 
             };
             assert_eq!(
                 input.work_item_id, other_task.id,
-                "must reveal the row from the selected product, not the same-numbered row in another product",
+                "must reveal the explicitly qualified row, regardless of the app's selected product",
             );
             request_id.clone()
         }

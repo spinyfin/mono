@@ -28,19 +28,25 @@ pub(crate) struct DependencyFilterArgs {
 }
 
 impl DependencyFilterArgs {
-    pub(crate) fn into_filter(self) -> Option<DependencyFilter> {
+    pub(crate) async fn resolve(
+        self,
+        client: &mut BossClient,
+        product_id: &str,
+    ) -> Result<Option<DependencyFilter>, CliError> {
         if let Some(id) = self.prerequisites_of {
-            return Some(DependencyFilter::PrerequisitesOf { id });
+            let id = crate::selector_scope::resolve_filter_id(client, &id, product_id).await?;
+            return Ok(Some(DependencyFilter::PrerequisitesOf { id }));
         }
         if let Some(id) = self.dependents_of {
-            return Some(DependencyFilter::DependentsOf { id });
+            let id = crate::selector_scope::resolve_filter_id(client, &id, product_id).await?;
+            return Ok(Some(DependencyFilter::DependentsOf { id }));
         }
         if self.unblocked {
-            return Some(DependencyFilter::Unblocked);
+            return Ok(Some(DependencyFilter::Unblocked));
         }
         if self.blocked_by_deps {
-            return Some(DependencyFilter::BlockedByDeps);
+            return Ok(Some(DependencyFilter::BlockedByDeps));
         }
-        None
+        Ok(None)
     }
 }

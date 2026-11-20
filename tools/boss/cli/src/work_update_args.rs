@@ -5,13 +5,13 @@ use crate::*;
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskUpdateArgs {
     /// Task/chore id. Accepts primary id, friendly short id, or
-    /// cross-product form. Globally unique short ids resolve without
-    /// `--product`; ambiguous ones error listing every candidate.
+    /// cross-product form. Unscoped ambiguous short ids error listing every
+    /// candidate, even when the app has a selected product.
     #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) id: String,
 
     /// Resolve a friendly short id (`42`, `#42`) against this product
-    /// (slug or id). Optional when the short id is globally unique.
+    /// (slug or id), overriding BOSS_PRODUCT and the app selection.
     /// Ignored when the selector already embeds a product slug
     /// (`boss/42`) or when the selector is a primary id.
     #[arg(long)]

@@ -98,6 +98,7 @@ mod propose;
 mod repo_resolution;
 pub(crate) use boss_github as github_app;
 pub(crate) use git_utils::repo_slug::short_name_for;
+pub(crate) use selector_scope::get_work_item;
 
 /// Send an RPC request and map the engine's reply to a `Result`.
 ///
@@ -174,6 +175,7 @@ mod output;
 mod project_create_args;
 mod project_deps;
 mod report;
+mod selector_scope;
 mod status_args;
 mod task_list;
 mod time_fmt;
