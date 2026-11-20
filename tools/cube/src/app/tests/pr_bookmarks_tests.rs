@@ -20,6 +20,9 @@ mod store_gc_concurrency;
 #[path = "store_gc_predecessor_tests.rs"]
 mod store_gc_predecessor;
 
+#[path = "pr_fetch_errors_tests.rs"]
+mod pr_fetch_errors;
+
 /// Runs `jj` invocations with the Bazel-declared binary and a fixed identity,
 /// so the fixture needs no global jj config and cannot read the host's.
 pub(super) struct DeclaredJj {

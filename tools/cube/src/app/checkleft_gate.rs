@@ -184,11 +184,19 @@ pub(super) fn run_checkleft_gate_impl(
 ///   3. `<cwd>/bin/checkleft` (repobin-installed artifact)
 ///   4. `checkleft` on PATH (installed globally or via PATH-based repobin)
 pub(super) fn resolve_checkleft_bin(cwd: &Path) -> Option<Vec<PathBuf>> {
-    if let Some(override_path) = std::env::var_os("CUBE_CHECKLEFT_BIN") {
+    resolve_checkleft_bin_with_env(cwd, std::env::var_os("CUBE_CHECKLEFT_BIN"), std::env::var_os("PATH"))
+}
+
+pub(super) fn resolve_checkleft_bin_with_env(
+    cwd: &Path,
+    override_path: Option<std::ffi::OsString>,
+    search_path: Option<std::ffi::OsString>,
+) -> Option<Vec<PathBuf>> {
+    if let Some(override_path) = override_path {
         let path = PathBuf::from(override_path);
         return path.is_file().then_some(vec![path]);
     }
-    if let Some(repobin) = resolve_repobin(cwd)
+    if let Some(repobin) = resolve_repobin(cwd, search_path.as_ref())
         && probe_repobin_checkleft(&repobin, cwd)
     {
         return Some(vec![repobin, PathBuf::from("exec"), PathBuf::from("checkleft")]);
@@ -197,16 +205,16 @@ pub(super) fn resolve_checkleft_bin(cwd: &Path) -> Option<Vec<PathBuf>> {
     if candidate.is_file() {
         return Some(vec![candidate]);
     }
-    which::which("checkleft").ok().map(|p| vec![p])
+    which::which_in("checkleft", search_path, cwd).ok().map(|p| vec![p])
 }
 
 /// Resolve the `repobin` binary: `<cwd>/bin/repobin`, then a PATH search.
-fn resolve_repobin(cwd: &Path) -> Option<PathBuf> {
+fn resolve_repobin(cwd: &Path, search_path: Option<&std::ffi::OsString>) -> Option<PathBuf> {
     let candidate = cwd.join("bin").join("repobin");
     if candidate.is_file() {
         return Some(candidate);
     }
-    which::which("repobin").ok()
+    which::which_in("repobin", search_path, cwd).ok()
 }
 
 /// Confirm `repobin exec checkleft` can actually dispatch before the gate

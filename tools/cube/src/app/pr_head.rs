@@ -216,8 +216,17 @@ fn base_repo_url(runner: &dyn CommandRunner, database_path: Option<&Path>, cwd: 
 /// The git directory behind the shared jj store.
 fn store_git_dir(cwd: &Path) -> Result<PathBuf> {
     let store = crate::lock::shared_repo_dir(cwd)?.join("store");
-    let target = std::fs::read_to_string(store.join("git_target")).map_err(CubeError::Io)?;
-    std::fs::canonicalize(store.join(target.trim())).map_err(CubeError::Io)
+    let pointer = store.join("git_target");
+    let target = std::fs::read_to_string(&pointer)
+        .map_err(|error| CubeError::InvalidArgument(format!("reading {}: {error}", pointer.display())))?;
+    let path = store.join(target.trim());
+    std::fs::canonicalize(&path).map_err(|error| {
+        CubeError::InvalidArgument(format!(
+            "resolving {} (from {}): {error}",
+            path.display(),
+            pointer.display()
+        ))
+    })
 }
 
 /// Fetch `refs/pull/<number>/head` of the base repository into the store.
@@ -267,6 +276,14 @@ fn fetch_pull_ref(
         ),
         deadline,
     );
+    let fetched = fetched.map_err(|error| match error {
+        CubeError::Io(source) => CubeError::InvalidArgument(format!(
+            "running git fetch in {} with --git-dir {}: {source}",
+            cwd.display(),
+            git_dir.display()
+        )),
+        other => other,
+    });
     let imported = fetched.and_then(|_| import_git_refs(runner, database_path, cwd));
     drop(fetch_lock);
     let _ = remove_remote(runner, database_path, cwd, &remote);
@@ -322,4 +339,27 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_errors_name_the_missing_pointer_or_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(".jj/repo/store");
+        std::fs::create_dir_all(&store).unwrap();
+        let pointer = store.join("git_target");
+        let error = store_git_dir(dir.path()).unwrap_err().to_string();
+        assert!(error.contains(&pointer.display().to_string()), "{error}");
+
+        std::fs::write(&pointer, "missing-git").unwrap();
+        let error = store_git_dir(dir.path()).unwrap_err().to_string();
+        assert!(error.contains(&pointer.display().to_string()), "{error}");
+        assert!(
+            error.contains(&store.join("missing-git").display().to_string()),
+            "{error}"
+        );
+    }
 }
