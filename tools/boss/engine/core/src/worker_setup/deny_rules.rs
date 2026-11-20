@@ -20,7 +20,9 @@ use std::path::Path;
 /// Rules cover:
 /// - File-write tools (`Edit`, `Write`) — **scoped to `workspace_path`**, not
 ///   a blanket `**` (see below)
-/// - VCS push — `jj git push` and `git push` in all their CLI forms
+/// - VCS push — `jj git push` and `git push` (literal-prefix spellings; the
+///   global-option / absolute-path spellings are caught by the reviewer
+///   publication PreToolUse guard, which Claude reviewers always carry)
 /// - PR mutation via `gh` — create, merge, close, edit, comment, review
 /// - Issue write via `gh` — create, comment, close, edit
 /// - `cube pr create` / `cube pr update` — Boss's PR helpers
@@ -57,10 +59,42 @@ use std::path::Path;
 /// they are safe for a read-only reviewer to run (e.g. to navigate the
 /// history for context).
 pub fn reviewer_deny_rules(workspace_path: &Path) -> Vec<String> {
-    let fence = workspace_path.parent().unwrap_or(workspace_path).display();
-    let mut rules = vec![format!("Edit({fence}/**)")];
+    let fence = workspace_path.parent().unwrap_or(workspace_path);
+    let mut rules = vec![claude_absolute_edit_rule(fence, true)];
     rules.extend(publish_deny_rules());
     rules
+}
+
+/// Claude `Edit(...)` deny rule for an absolute filesystem path.
+///
+/// Claude interprets `/path` relative to the settings/project root; `//path`
+/// is absolute. A single slash silently leaves the real path writable in both
+/// auto and bypassPermissions modes (verified with Claude 2.1.327), so every
+/// rule that names an absolute path must go through this helper. With
+/// `subtree` the rule covers everything beneath `path` (`/**`); without it, it
+/// names `path` itself.
+pub fn claude_absolute_edit_rule(path: &Path, subtree: bool) -> String {
+    let path = path.display().to_string();
+    let path = path.trim_end_matches('/');
+    let suffix = if subtree { "/**" } else { "" };
+    format!("Edit(/{path}{suffix})")
+}
+
+/// Reject a reviewer launch whose workspace path is not absolute: the
+/// absolute `Edit(//...)` fence cannot be expressed for it, so the launch
+/// fails with a typed error rather than shipping an unenforced fence.
+pub fn validate_reviewer_workspace(workspace_path: &Path) -> std::io::Result<()> {
+    if workspace_path.is_absolute() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "reviewer workspace must be absolute to fence writes, got {}",
+                workspace_path.display()
+            ),
+        ))
+    }
 }
 
 /// Tool deny rules for triage workers ([`WorkerKind::Triage`]).

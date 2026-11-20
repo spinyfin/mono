@@ -829,11 +829,13 @@ impl AgentDriver for ClaudeDriver {
         // positional argument appended after it as a second tool name.
         cmd.push_str(" --disallowedTools=AskUserQuestion");
         if let Some(mode) = permission_mode_override {
-            // Forced mode (e.g. `dontAsk` for the capability-restricted answer
-            // agent). Suppresses BOTH the `auto` and `--dangerously-skip-permissions`
-            // branches — the latter would bypass the settings allow/deny rules
-            // entirely, defeating the allowlist. The CLI flag wins over the
-            // settings-file `defaultMode`, so this is the authoritative mode.
+            // Forced mode (e.g. `dontAsk` for the capability-restricted
+            // answer agent). It suppresses both the `auto` and the
+            // `--dangerously-skip-permissions` branches, so the settings
+            // allowlist stays deny-by-default. Explicit denies and
+            // PreToolUse blocks apply in every mode. The CLI flag overrides
+            // the settings-file `defaultMode`, so this is the authoritative
+            // mode.
             cmd.push_str(" --permission-mode ");
             cmd.push_str(mode);
         } else if claude_model_requires_auto_permissions(model) || non_opus_auto_mode {
@@ -845,7 +847,7 @@ impl AgentDriver for ClaudeDriver {
             // Single-quote the path so a `$TMPDIR` with spaces survives
             // the pane's shell. Worker settings paths never contain a
             // single quote, so naive single-quoting is sufficient.
-            cmd.push_str(&format!(" --settings '{}'", settings.display()));
+            cmd.push_str(&format!("{CLAUDE_SETTINGS_FLAG}'{}'", settings.display()));
         }
         cmd.push('\n');
         let cmd = super::initial_prompt::launcher_command(CLAUDE_DESCRIPTOR.config_dir, &cmd);
@@ -1086,6 +1088,16 @@ impl AgentDriver for ClaudeDriver {
                 "matcher": "Bash",
                 "hooks": [{"type": "command", "command": REVIEWER_STATIC_ANALYSIS_GUARD_COMMAND}],
             }));
+            // Publication guard. The literal-prefix `Bash(...)` deny rules do
+            // not match global-option or absolute-path spellings such as
+            // `jj -R <ws> git push` or `gh --repo o/r pr edit`, and reviewers
+            // launched with `--dangerously-skip-permissions` run unmatched
+            // commands without approval. This PreToolUse guard normalises the
+            // command first; it is the same parser Codex reviewers use.
+            hooks.push(serde_json::json!({
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": reviewer_publish_guard_command()}],
+            }));
         }
 
         // 6. Revision PR guard. Blocks PR creation (`gh pr create`, `cube pr
@@ -1119,6 +1131,10 @@ impl AgentDriver for ClaudeDriver {
     /// from the driver-agnostic body that follows it.
     fn agent_rules_preamble(&self) -> &'static str {
         CLAUDE_AGENT_RULES_PREAMBLE
+    }
+
+    fn launch_fence_flag(&self) -> Option<&'static str> {
+        Some(CLAUDE_SETTINGS_FLAG)
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
@@ -1386,6 +1402,21 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
 }
+/// Launch flag (with its leading and trailing space) that passes the rendered
+/// worker settings file to `claude`.
+const CLAUDE_SETTINGS_FLAG: &str = " --settings ";
+
+/// The reviewer publication guard as a hook command. Claude Code treats any
+/// non-zero hook exit other than 2 as a non-blocking error, so a missing
+/// `python3` (exit 127) or a crashed script would leave the guard inert; the
+/// trailing `|| exit 2` turns every guard failure into a block.
+fn reviewer_publish_guard_command() -> String {
+    format!(
+        "python3 -c {} || exit 2",
+        shell_quote(&crate::codex::codex_reviewer_publish_guard_script())
+    )
+}
+
 #[cfg(test)]
 mod review_guide_recognizer_tests {
     // The recognizer must render identically in shell-embedded and standalone guards.
@@ -2002,11 +2033,12 @@ mod tests {
             workspace_path: None,
         };
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
-        // path guard + git store guard + boss-launch guard + static-analysis guard (no PR redirect, no checkleft)
+        // path guard + git store guard + boss-launch guard + static-analysis guard
+        // + publication guard (no PR redirect, no checkleft)
         assert_eq!(
             wiring.pre_tool_use_hooks.len(),
-            4,
-            "reviewer worker must get exactly 4 guards: {:?}",
+            5,
+            "reviewer worker must get exactly 5 guards: {:?}",
             wiring.pre_tool_use_hooks,
         );
         let cmds: Vec<&str> = wiring
@@ -2015,7 +2047,9 @@ mod tests {
             .filter_map(|e| e["hooks"][0]["command"].as_str())
             .collect();
         assert!(
-            !cmds.iter().any(|c| c.contains("jj git push")),
+            !cmds
+                .iter()
+                .any(|c| c.contains("jj git push") && !c.contains("no-write/no-publish guard")),
             "non-standard worker must not have the PR redirect guard: {cmds:?}",
         );
         assert!(
@@ -2228,6 +2262,41 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_publish_guard_fails_closed_without_python3() {
+        // Rendered into the reviewer's settings as the publication hook.
+        let wiring = ClaudeDriver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
+            data_dir: None,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+            git_store_guard_script: None,
+            is_revision: false,
+            is_standard_worker: false,
+            is_reviewer: true,
+            is_review_guide: false,
+            run_id: None,
+            workspace_path: None,
+        });
+        let command = wiring
+            .pre_tool_use_hooks
+            .iter()
+            .filter_map(|e| e["hooks"][0]["command"].as_str())
+            .find(|c| c.starts_with("python3 -c") && c.contains("no-write/no-publish guard"))
+            .expect("reviewer publication hook present")
+            .to_owned();
+        assert!(command.ends_with("|| exit 2"), "{command}");
+        // With python3 off PATH the shell exits 127 for the interpreter; the
+        // hook must turn that into Claude's blocking exit code, 2.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("PATH", "/nonexistent")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(2));
+    }
+
+    #[test]
     fn agent_rules_preamble_names_claude_hooks() {
         let preamble = ClaudeDriver.agent_rules_preamble();
         assert!(
@@ -2426,8 +2495,8 @@ mod tests {
     #[test]
     fn permission_mode_override_forces_mode_and_suppresses_skip_permissions() {
         // A non-auto model + non_opus_auto_mode=false would normally spawn with
-        // `--dangerously-skip-permissions` (which bypasses the settings
-        // allow/deny rules). The override must win and suppress that entirely,
+        // `--dangerously-skip-permissions` (which permits calls outside the
+        // allowlist unless denied). The override must win and suppress that,
         // so the capability-restricted answer agent always runs deny-by-default.
         let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
             permission_mode_override: Some("dontAsk"),

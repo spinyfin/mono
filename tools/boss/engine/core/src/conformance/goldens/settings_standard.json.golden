@@ -2,8 +2,8 @@
   "permissions": {
     "defaultMode": "auto",
     "deny": [
-      "Edit(/Users/brianduff/Library/Application Support/Boss)",
-      "Edit(/Users/brianduff/Library/Application Support/Boss/**)",
+      "Edit(//Users/brianduff/Library/Application Support/Boss)",
+      "Edit(//Users/brianduff/Library/Application Support/Boss/**)",
       "Bash(bossctl)",
       "Bash(bossctl:*)",
       "Bash(boss handoff:*)",

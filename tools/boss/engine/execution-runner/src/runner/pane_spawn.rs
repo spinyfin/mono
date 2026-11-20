@@ -1265,6 +1265,9 @@ impl ExecutionRunner for PaneSpawnRunner {
         // driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
+        worker_kind
+            .verify_launch_command_fenced(driver.launch_fence_flag(), &spawn_plan.command)
+            .map_err(|reason| anyhow!(reason))?;
         check_launch_command_arg_max(&spawn_plan.command, driver.descriptor().name)?;
         // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an

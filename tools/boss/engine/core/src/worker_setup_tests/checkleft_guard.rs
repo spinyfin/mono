@@ -63,7 +63,8 @@ fn remote_workers_omit_checkleft_push_guard() {
     // Remote SSH workers skip the push guard: the gate script is never
     // shipped to the remote host (same reason the path guard is dropped).
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver).unwrap()).unwrap();
     assert!(
         checkleft_push_guard_command(&parsed).is_none(),
         "remote workers must not carry the checkleft push guard",

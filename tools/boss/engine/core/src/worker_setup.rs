@@ -75,8 +75,9 @@ use crate::ssh_transport::shell_quote;
 
 mod deny_rules;
 pub use deny_rules::{
-    answer_agent_allow_rules, answer_agent_deny_rules, progression_allow_rules, progression_deny_rules,
-    review_guide_allow_rules, review_guide_deny_rules, reviewer_deny_rules, triage_deny_rules,
+    answer_agent_allow_rules, answer_agent_deny_rules, claude_absolute_edit_rule, progression_allow_rules,
+    progression_deny_rules, review_guide_allow_rules, review_guide_deny_rules, reviewer_deny_rules, triage_deny_rules,
+    validate_reviewer_workspace,
 };
 mod git_store_guard;
 pub use git_store_guard::{ensure_git_store_guard_script_in, git_store_guard_script_path};
@@ -227,9 +228,16 @@ pub fn render_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) 
 /// the worker-visible *forwarded* socket path on the remote (e.g.
 /// `/tmp/boss-events-<run>.sock`) and `boss_event_path` with the remote
 /// shim (typically the bare `boss-event` resolved on the remote PATH).
-pub fn render_remote_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> String {
+///
+/// A Reviewer whose workspace path is relative is rejected with the same
+/// typed error as the local write path: its absolute `Edit(//...)` write
+/// fence cannot be expressed, so shipping settings would fail open.
+pub fn render_remote_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> io::Result<String> {
+    if input.worker_kind == WorkerKind::Reviewer {
+        validate_reviewer_workspace(&input.workspace_path)?;
+    }
     let value = settings_value(input, EngineDataDirSandbox::Disabled, driver);
-    serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
+    Ok(serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable"))
 }
 
 /// Whether `driver` reports its progress through hooks that this module
@@ -418,8 +426,9 @@ fn pre_tool_use_array(hooks: &mut serde_json::Map<String, serde_json::Value>) ->
 ///   worker off from Boss's runtime state and (per kind) from writing/pushing.
 ///   Project-local settings override user-global per key, so this wins even
 ///   when the human's `~/.claude/settings.json` defaults to interactive. The
-///   `deny` rules are belt; the engine-side audit in
-///   `audit_worker_sandbox_attempt` is suspenders.
+///   `deny` rules are enforced in both `auto` and `bypassPermissions` modes;
+///   the latter bypasses approval prompts, not explicit denies. The data-dir
+///   boundary additionally has the `PATH_GUARD_SCRIPT` PreToolUse hook.
 ///
 /// - **AnswerAgent → allowlist.** `defaultMode: "dontAsk"` auto-denies every
 ///   tool call except those matching `permissions.allow` and built-in
@@ -483,7 +492,6 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
     if fence == DataDirFence::PathGuardHook
         && let Some(state_dir) = input.events_socket_path.parent()
     {
-        let dir = state_dir.display().to_string();
         // Both the bare directory and the `**` subtree are listed
         // explicitly: glob `**` doesn't match the directory itself in
         // every harness, and we want an `Edit("…/Boss")` attempt to
@@ -516,8 +524,10 @@ fn deny_rules(input: &WorkerSetupInput, fence: DataDirFence) -> Vec<String> {
         // coincidence to be rediscovered later: [`data_dir_fence`] refuses
         // to hand back [`DataDirFence::PathGuardHook`] unless the hook is
         // actually in the rendered file.
-        rules.push(format!("Edit({dir})"));
-        rules.push(format!("Edit({dir}/**)"));
+        // Absolute `//` spelling (see `claude_absolute_edit_rule`): the
+        // single-slash form is project-relative and fences nothing.
+        rules.push(claude_absolute_edit_rule(state_dir, false));
+        rules.push(claude_absolute_edit_rule(state_dir, true));
     }
 
     // `bossctl` is the coordinator's CLI surface (probes, agents
@@ -1797,6 +1807,9 @@ pub fn write_workspace_files(
     input: &WorkerSetupInput,
     driver: &dyn crate::driver::AgentDriver,
 ) -> io::Result<WrittenFiles> {
+    if input.worker_kind == WorkerKind::Reviewer {
+        validate_reviewer_workspace(&input.workspace_path)?;
+    }
     let descriptor = driver.descriptor();
     let config_dir = input.workspace_path.join(descriptor.config_dir);
     std::fs::create_dir_all(&config_dir)?;
