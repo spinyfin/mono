@@ -23,6 +23,16 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::teardown_registry::TeardownRegistry;
 use crate::terminal_work_sweep::{self, WorkerReaper};
 
+// These fixtures register virtual panes without spawning workspace processes.
+// Keep the occupancy precondition deterministic: a real host scan can fail
+// closed on unrelated unreadable processes before reaching the release gate.
+fn teardown_collaborators() -> CompletionCollaborators {
+    CompletionCollaborators {
+        workspace_occupancy: Arc::new(crate::workspace_lease_release::EmptyOccupancy),
+        ..crate::completion_adapters::completion_collaborators()
+    }
+}
+
 /// Ordered log of the teardown side effects a completion path performs,
 /// shared by the pane releaser, the cube client and the sweep's reaper so
 /// a test can assert on their relative order as well as on each having
@@ -286,7 +296,7 @@ async fn sweep_does_not_reap_a_worker_whose_pane_teardown_is_in_flight() {
             Arc::new(RecordingPublisher::default()),
             pane.clone(),
             Arc::new(RecordingProbeQueuer::default()),
-            crate::completion_adapters::completion_collaborators(),
+            teardown_collaborators(),
         )
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
         .with_teardown_registry(teardown_registry.clone()),
@@ -394,7 +404,7 @@ async fn sweep_does_not_reap_a_worker_behind_a_slow_cube_release() {
             Arc::new(RecordingPublisher::default()),
             pane.clone(),
             Arc::new(RecordingProbeQueuer::default()),
-            crate::completion_adapters::completion_collaborators(),
+            teardown_collaborators(),
         )
         .with_branch_verifier(StubBranchVerifier::ok("boss/test"))
         .with_teardown_registry(teardown_registry.clone()),
@@ -481,7 +491,7 @@ async fn pr_completion_teardown_runs_pane_then_driver_then_cube() {
         Arc::new(RecordingPublisher::default()),
         pane.clone(),
         Arc::new(RecordingProbeQueuer::default()),
-        crate::completion_adapters::completion_collaborators(),
+        teardown_collaborators(),
     )
     .with_branch_verifier(StubBranchVerifier::ok("boss/test"));
 
