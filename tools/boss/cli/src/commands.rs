@@ -87,6 +87,11 @@ pub(crate) struct GlobalFlags {
 pub(crate) enum Commands {
     /// Print authoritative Boss CLI reference documentation.
     Reference,
+    /// Query execution history across work items and products.
+    Execution {
+        #[command(subcommand)]
+        command: crate::execution_cmds::ExecutionCommand,
+    },
     Product {
         #[command(subcommand)]
         command: ProductCommand,

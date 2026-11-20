@@ -282,6 +282,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::PlanProject { .. } => Box::pin(planner_ops::handle_plan_project(ctx, r)),
         r @ FrontendRequest::ProbeRun { .. } => Box::pin(executions::handle_probe_run(ctx, r)),
         r @ FrontendRequest::ProbeStatus { .. } => Box::pin(executions::handle_probe_status(ctx, r)),
+        r @ FrontendRequest::QueryExecutions { .. } => Box::pin(executions::handle_query_executions(ctx, r)),
         r @ FrontendRequest::ReapRun { .. } => Box::pin(executions::handle_reap_run(ctx, r)),
         r @ FrontendRequest::RecordEffortEscalation { .. } => Box::pin(effort::handle_record_effort_escalation(ctx, r)),
         r @ FrontendRequest::RecordProducerSideConflict { .. } => {

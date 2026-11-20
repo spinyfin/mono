@@ -150,6 +150,9 @@ pub enum FrontendEvent {
     OperatorQuestionError { error: crate::OperatorQuestionError },
     #[worker(passthrough)]
     ProjectTasksReordered { project_id: String, task_ids: Vec<String> },
+    #[worker(passthrough)]
+    ExecutionQueryResult { result: crate::ExecutionQueryResult },
+
     #[worker(transform = executions_list)]
     ExecutionsList {
         work_item_id: Option<String>,
