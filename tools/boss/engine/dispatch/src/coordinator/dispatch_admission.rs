@@ -483,11 +483,43 @@ impl ExecutionCoordinator {
         Ok(execution)
     }
 
+    /// Whether the engine itself is still starting `execution_id`'s worker:
+    /// its dispatch has been handed off and has not returned (the row is
+    /// `claimed`, or `running` with the handoff still finishing), or the
+    /// spawn that follows is still being driven (pane creation, spawn
+    /// confirmation, or the teardown of a spawn that failed).
+    ///
+    /// The live-worker registry cannot answer this. A pane is registered only
+    /// once its shell exists, which is seconds after the row turns `running`
+    /// and commits its run; and a spawn that fails is taken back out of the
+    /// registry before its row is finished. In both windows the registry says
+    /// "no worker" about a run the engine is in the middle of starting or
+    /// tearing down. The reservation is dropped only after the driver has
+    /// taken over, so the two together leave no gap between pickup and a
+    /// registered pane.
+    pub fn is_starting_worker(&self, execution_id: &str) -> bool {
+        self.inflight_dispatches.is_execution_dispatching(execution_id) || self.is_driving_run(execution_id)
+    }
+
+    /// Create or reuse the work item's execution for an explicit request
+    /// (`bossctl work start`, `bossctl agents launch`, a kanban drag).
+    ///
+    /// An existing run counts as live when the registry has its pane or when
+    /// [`Self::is_starting_worker`] says the engine is still bringing it up.
+    /// Only a run that is neither is treated as stale and replaced, so a
+    /// request that arrives right behind a dispatch returns the run that
+    /// dispatch started instead of abandoning it.
+    ///
+    /// A run this request does replace is abandoned with its cube lease still
+    /// recorded. The request starts that run's release before returning (see
+    /// [`Self::release_abandoned_run`]), so the successor it just queued is
+    /// not left waiting for a sweep to notice.
     pub fn request_execution_via_db(
-        &self,
+        self: &Arc<Self>,
         mut input: RequestExecutionInput,
         live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
+        let has_worker = |id: &str| live_states.is_run_live(id) || self.is_starting_worker(id);
         if let Some(host_id) = input.requested_host_id.clone() {
             // `request_execution_with_live_check` (called below) resolves
             // friendly short ids (a `T`-prefixed short id, `#42`, ...) to a
@@ -515,7 +547,7 @@ impl ExecutionCoordinator {
                 .find(|execution| {
                     execution.work_item_id == input.work_item_id
                         && !execution.status.is_terminal()
-                        && live_states.is_run_live(&execution.id)
+                        && has_worker(&execution.id)
                 });
             if let Some(execution) = live_execution {
                 bail!(
@@ -527,9 +559,19 @@ impl ExecutionCoordinator {
             self.validate_requested_host(&input.work_item_id, &host_id)?;
         }
         let requested_host_id = input.requested_host_id.clone();
-        let execution = self
-            .work_db
-            .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))?;
+        // The store asks about one run at most: the started run that governs
+        // this work item. Answering "no worker" is what makes it stale.
+        let mut judged_stale = None;
+        let execution = self.work_db.request_execution_with_live_check(input, |id| {
+            let live = has_worker(id);
+            if !live {
+                judged_stale = Some(id.to_owned());
+            }
+            live
+        })?;
+        if let Some(stale) = judged_stale {
+            self.release_abandoned_run(&stale);
+        }
         if let Some(host_id) = requested_host_id {
             if execution.status != ExecutionStatus::Ready {
                 // Reached only after the live-execution pre-check above has

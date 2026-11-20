@@ -40,6 +40,17 @@ The two statuses now mean what they say, and both are `is_live()`:
 
 `waiting_human` has exactly one writer and exactly one clearer, both in `engine/core/src/awaiting_input_status.rs`, driven off the `WorkerActivity::WaitingForInput` transition on the ordinary hook-dispatch path. That signal is the driver's own notification (Claude's `Notification` hook), honoured only for a driver declaring `Capability::AwaitingInputSignal` — never inferred from tool timing or elapsed silence. The write is guarded in SQL to the `running` ⇄ `waiting_human` pair, so a late hook can never drag a settled row (terminal, `waiting_review`, `waiting_merge`) back into a live status.
 
+### A run the engine is still starting has a worker
+
+`LiveWorkerStateRegistry` learns of a worker when its pane's shell exists, and forgets it when the pane is reaped. Neither edge lines up with the row:
+
+- The row turns `running`, with its run committed and its cube lease bound, before the spawn has composed a prompt, provisioned the driver or created a pane. That gap is seconds on a good day.
+- A spawn that fails is reaped out of the registry before its row is finished: the row stays `running` while the workspace is preserved and released, which can take minutes.
+
+In both windows the registry says "no worker" about a run the engine itself is in the middle of starting or tearing down. An explicit start (`bossctl work start`, `bossctl agents launch`, a drag to Doing) replaces a `running` row that has no worker, which is how a row whose worker died with the engine gets unstuck, so it must not read these windows as "worker gone". `ExecutionCoordinator::request_execution_via_db` therefore asks two things: does the registry have a live pane for the run, or is the engine still starting it (`ExecutionCoordinator::is_starting_worker`: its dispatch reservation is held, or `run_execution` is still driving its spawn). The reservation is dropped only after the driver has taken over, so there is no gap between pickup and a registered pane. A request that lands in either window returns the existing run and dispatches nothing.
+
+Trusting the registry alone here abandoned a run three seconds after it was dispatched, when `bossctl agents launch` followed an autostart. The abandoned run kept its lease, and the launch's own execution was then refused with `awaiting_predecessor_preservation`.
+
 ### A worker is busy for the whole turn, including while it waits on its own background command
 
 `activity` is `Working` from the first turn activity the driver reports (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`) until the driver reports the turn boundary (`Stop`). Nothing in between lowers it: not a balanced tool call, not a long think, not minutes of silence. A `Stop` establishes that the turn ended. For drivers that support input detection, the parked activity then distinguishes a declared job (`WaitingOnWork` or `WaitOverdue`) from a worker requiring input (`WaitingForInput`); legacy drivers retain `Idle`.

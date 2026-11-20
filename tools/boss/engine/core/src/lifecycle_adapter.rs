@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use boss_dispatch_events::DispatchEventSink;
 use boss_execution_contracts::{
     CubeClient, ExecutionPublisher, ExecutionRunner, HostAdapter, HostAdapterProvider, LeaseReleaseOutcome,
-    LifecycleServices, LiveWorkerLiveness, NoopExecutionPublisher, PaneStatus, PidStatus, ReattachSummary,
-    RemoteLeaseReconcileOutcome, TeardownReason, TerminalCause, WorkerPaneReleaser, WorkerPool,
+    LifecycleServices, LiveWorkerLiveness, NoopExecutionPublisher, PaneStatus, PidStatus, PredecessorRelease,
+    ReattachSummary, RemoteLeaseReconcileOutcome, TeardownReason, TerminalCause, WorkerPaneReleaser, WorkerPool,
 };
 use boss_protocol::WorkExecution;
 
@@ -243,6 +243,7 @@ impl LifecycleServices for CoreLifecycleServices {
         provider: &dyn HostAdapterProvider,
         local: Arc<dyn HostAdapter>,
         _at_bound: bool,
+        release: PredecessorRelease,
     ) {
         use crate::workspace_lease_release::{
             LEASE_RECOVERY_UNAVAILABLE_ATTENTION_KIND, LEASE_UNRELEASED_ATTENTION_KIND, WorkspaceTipSource,
@@ -357,7 +358,16 @@ impl LifecycleServices for CoreLifecycleServices {
                 return;
             }
         }
-        if !crate::workspace_lease_release::previous_occupancy_keep(&self.work_db, execution) {
+        // The first release of a run belongs to whichever path ended it, so a
+        // re-check normally only repeats a release that an earlier attempt
+        // kept for occupancy. A caller that ended the run itself performs that
+        // first release here, on the proof the leftover-lease sweep releases
+        // on: a recorded worker shell that is confirmed dead. A run that never
+        // recorded a shell stays with the sweeps.
+        let owns_first_release = release == PredecessorRelease::Own
+            && adapter.host_id() == "local"
+            && crate::workspace_lease_release::recorded_shell_confirmed_dead(&self.work_db, &execution.id);
+        if !owns_first_release && !crate::workspace_lease_release::previous_occupancy_keep(&self.work_db, execution) {
             return;
         }
         let db = Arc::clone(&self.work_db);
@@ -375,7 +385,7 @@ impl LifecycleServices for CoreLifecycleServices {
                     PaneStatus::Gone,
                     Some(adapter.as_ref()),
                     None,
-                    adapter.force_release_lease(lease_id, Some("recovery successor occupancy re-check")),
+                    adapter.force_release_lease(lease_id, Some("recovery successor lease re-check")),
                 )
                 .await;
             })

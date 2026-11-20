@@ -1623,6 +1623,7 @@ mod conflict_diagnosis_for_attempt_tests {
             _: &dyn HostAdapterProvider,
             _: Arc<dyn HostAdapter>,
             _: bool,
+            _: boss_execution_contracts::PredecessorRelease,
         ) {
             unimplemented!()
         }

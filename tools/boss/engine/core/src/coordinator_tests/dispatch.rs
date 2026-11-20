@@ -326,12 +326,12 @@ async fn requested_host_rejects_missing_resolved_driver_capability() {
     let product = create_test_product(&db);
     db.set_product_default_driver(&product.id, Some("codex")).unwrap();
     let chore = create_test_chore(&db, product.id, "Codex-only requested host");
-    let coordinator = ExecutionCoordinator::new(
+    let coordinator = Arc::new(ExecutionCoordinator::new(
         db.clone(),
         WorkerPool::new(1),
         Arc::new(FakeCubeClient::default()),
         Arc::new(FakeExecutionRunner::default()),
-    );
+    ));
 
     let err = coordinator
         .request_execution_via_db(
@@ -446,12 +446,12 @@ async fn requested_host_ignores_live_review_guide_run_owned_by_a_different_compa
     let live_states = Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new());
     live_states.register_spawn(1, &guide_execution.id, "test", 1, None);
 
-    let coordinator = ExecutionCoordinator::new(
+    let coordinator = Arc::new(ExecutionCoordinator::new(
         db.clone(),
         WorkerPool::new(1),
         Arc::new(FakeCubeClient::default()),
         Arc::new(FakeExecutionRunner::default()),
-    );
+    ));
 
     let execution = coordinator
         .request_execution_via_db(

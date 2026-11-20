@@ -440,7 +440,7 @@ impl ExecutionCoordinator {
         runs.handles.remove(execution_id);
     }
 
-    fn is_driving_run(&self, execution_id: &str) -> bool {
+    pub(super) fn is_driving_run(&self, execution_id: &str) -> bool {
         self.driving_runs
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

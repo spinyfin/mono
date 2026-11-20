@@ -34,7 +34,14 @@ async fn remote_recheck_records_probe_faults_and_clears_availability_faults_when
         let service = crate::lifecycle_adapter::CoreLifecycleServices::new(s.coordinator.work_db().clone());
         let provider = ChangingRemoteProvider(adapter.clone());
         service
-            .refresh_predecessor_lease(&s.stalled(), None, &provider, s.coordinator.host_adapter(), true)
+            .refresh_predecessor_lease(
+                &s.stalled(),
+                None,
+                &provider,
+                s.coordinator.host_adapter(),
+                true,
+                boss_execution_contracts::PredecessorRelease::RetryKept,
+            )
             .await;
         let items = s.db().list_attention_items(&s.stalled_id).unwrap();
         let unavailable = items
@@ -53,7 +60,14 @@ async fn remote_recheck_records_probe_faults_and_clears_availability_faults_when
         adapter.listing_fails.store(false, Ordering::SeqCst);
         adapter.probe_fault.store(0, Ordering::SeqCst);
         service
-            .refresh_predecessor_lease(&s.stalled(), None, &provider, s.coordinator.host_adapter(), true)
+            .refresh_predecessor_lease(
+                &s.stalled(),
+                None,
+                &provider,
+                s.coordinator.host_adapter(),
+                true,
+                boss_execution_contracts::PredecessorRelease::RetryKept,
+            )
             .await;
         let items = s.db().list_attention_items(&s.stalled_id).unwrap();
         assert!(
