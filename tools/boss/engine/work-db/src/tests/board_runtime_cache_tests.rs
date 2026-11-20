@@ -201,11 +201,13 @@ type Step = (&'static str, Box<dyn Fn(&Board)>, u64);
 #[test]
 fn every_runtime_input_write_invalidates_exactly_its_item() {
     let board = board();
+    // Isolate write invalidation from relative-display expiry at clock boundaries.
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
     let target = board.chore("target");
     board.sql("UPDATE tasks SET status = 'active' WHERE id = ?1", &[&target]);
     let bystander = board.chore("bystander");
     board.execution(&bystander, ExecutionStatus::Running);
-    board.assert_equivalent();
+    board.assert_equivalent_at(now);
 
     // Each step writes one input of `target`'s runtime and must recompute
     // `target` alone (`changed` items), never the bystander.
@@ -470,9 +472,9 @@ fn every_runtime_input_write_invalidates_exactly_its_item() {
 
     for (label, mutate, changed) in steps {
         mutate(&board);
-        let (misses, _) = board.assert_equivalent();
+        let (misses, _) = board.assert_equivalent_at(now);
         assert_eq!(misses, changed, "{label}: recomputed items");
-        let (misses, queries) = board.assert_equivalent();
+        let (misses, queries) = board.assert_equivalent_at(now);
         if matches!(
             label,
             "retry backoff" | "failure run error stamp" | "failure start event"
