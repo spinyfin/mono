@@ -163,10 +163,16 @@ pub(super) fn apply_review_badges<'h>(
         let history = history_for(row);
         let state = row.ai_review_state.as_deref().expect("checked by wants_review_badge");
         let mut badge = badge_presentation(state, row.ai_review_stage.as_deref(), history, &row.id);
+        if matches!(
+            state,
+            AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS
+                | AI_REVIEW_STATE_REVIEWED_ALL_CLEAR
+                | AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING
+        ) && let Some(history) = history
+        {
+            badge.findings_markdown = findings_markdown(history, state)?;
+        }
         if state == AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS {
-            if let Some(history) = history {
-                badge.findings_markdown = findings_markdown(history)?;
-            }
             badge.tooltip.push_str(if row.ai_review_findings_revision_id.is_some() {
                 "\nClick to read the findings in the follow-up revision."
             } else {
@@ -228,21 +234,34 @@ fn failed_to_start_badges(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn findings_markdown(history: &ReviewBadgeHistory) -> Result<Option<String>> {
+fn findings_markdown(history: &ReviewBadgeHistory, state: &str) -> Result<Option<String>> {
     if let Some(payload) = &history.verdict_payload {
         let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(payload)?;
         let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
+        let clean = state != AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS;
+        if clean && verdict.rejected.is_empty() {
+            return Ok(None);
+        }
         let origin = boss_pr_review::ReviewOrigin {
             pr_number: verdict.pr_url.rsplit('/').next().and_then(|value| value.parse().ok()),
         };
-        return Ok(Some(boss_pr_review::render_revision_instructions(
-            &verdict.to_review_result(),
-            origin,
-        )));
+        let mut markdown = if clean {
+            verdict.summary.clone()
+        } else {
+            boss_pr_review::render_revision_instructions(&verdict.to_review_result(), origin)
+        };
+        let rejected = super::review_guide_findings::rejected_finding_lines(&verdict);
+        if !rejected.is_empty() {
+            markdown.push_str("\n\n### Rejected leaf findings\n\n");
+            markdown.push_str(&rejected.join("\n"));
+        }
+        return Ok(Some(markdown));
     }
     // Legacy verdicts predate proposals; their existing brief remains readable
     // even on the findings revision itself, where the self-link is suppressed.
-    Ok(history.revision_description.clone())
+    Ok((state == AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS)
+        .then(|| history.revision_description.clone())
+        .flatten())
 }
 
 /// One owner's badge evidence: the ranked verdict, the head it reviewed, and
@@ -297,8 +316,17 @@ fn failed_to_start_explanation(generation: i64, last_error: Option<&str>) -> Str
 impl ReviewBadgeHistory {
     /// Drop the findings text an owner in `state` will never render, so a
     /// cached entry holds the tooltip evidence and not a verdict payload.
+    /// Clean states still keep the payload: a rejection ledger can appear
+    /// on an otherwise-clean badge.
     pub(super) fn trimmed_for(mut self, state: Option<&str>) -> Self {
-        if state != Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS) {
+        if !matches!(
+            state,
+            Some(
+                AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS
+                    | AI_REVIEW_STATE_REVIEWED_ALL_CLEAR
+                    | AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING
+            )
+        ) {
             self.verdict_payload = None;
             self.revision_description = None;
         }

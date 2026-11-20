@@ -17,8 +17,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use boss_engine::pr_review::SupervisorVerdict;
 use boss_engine::work::{ReviewVerdict, is_informative_gate_outcome};
-use boss_protocol::{FrontendEvent, FrontendRequest, ReviewBatch, ReviewBatchMember};
+use boss_protocol::{FrontendEvent, FrontendRequest, ReviewBatch, ReviewBatchMember, ReviewVerdictProposalPayload};
 use clap::Subcommand;
 
 use super::connect;
@@ -145,6 +146,17 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
         latest_informative.and_then(|v| v.head_sha.as_deref()),
         current_head_sha.as_deref(),
     );
+    let cycle_root_id = db
+        .resolve_review_cycle_root(&work_item)
+        .context("resolving review cycle root")?;
+    let batches = db
+        .review_batches_for_cycle_root(&cycle_root_id)
+        .context("reading review batches")?;
+    let batch_verdicts: Vec<_> = batches
+        .iter()
+        .filter(|batch| batch.final_verdict_proposal_id.is_some())
+        .map(|batch| (batch, batch_verdict(&db, batch)))
+        .collect();
 
     if json {
         println!(
@@ -157,6 +169,11 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
                 "latest_informative_verdict": latest_informative.map(verdict_json),
                 "reviewed_head_is_stale": reviewed_head_is_stale,
                 "history": history.iter().map(verdict_json_with_informative_flag).collect::<Vec<_>>(),
+                "batch_verdicts": batch_verdicts.iter().map(|(batch, verdict)| serde_json::json!({
+                    "batch_id": batch.id,
+                    "target_sha": batch.target_sha,
+                    "verdict": batch_verdict_json(verdict),
+                })).collect::<Vec<_>>(),
             })
         );
         return Ok(());
@@ -231,6 +248,11 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
         }
     }
 
+    for (batch, verdict) in &batch_verdicts {
+        println!("batch {} verdict (head {}):", batch.id, batch.target_sha);
+        print_verdict(verdict);
+    }
+
     Ok(())
 }
 
@@ -256,7 +278,8 @@ pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item:
         let members = db
             .review_batch_members(&batch.id)
             .with_context(|| format!("reading members for review batch {}", batch.id))?;
-        rendered.push((batch, members));
+        let verdict = batch_verdict(&db, batch);
+        rendered.push((batch, members, verdict));
     }
 
     if json {
@@ -265,7 +288,10 @@ pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item:
             serde_json::json!({
                 "work_item_id": work_item,
                 "cycle_root_id": cycle_root_id,
-                "batches": rendered.iter().map(|(batch, members)| batch_json(batch, members)).collect::<Vec<_>>(),
+                "batches": rendered
+                    .iter()
+                    .map(|(batch, members, verdict)| batch_json(batch, members, verdict))
+                    .collect::<Vec<_>>(),
             })
         );
         return Ok(());
@@ -289,8 +315,8 @@ pub(crate) fn review_batches(json: bool, state_root: Option<PathBuf>, work_item:
         "review batches for {work_item}{resolved_suffix} ({} total, newest first):",
         rendered.len()
     );
-    for (batch, members) in &rendered {
-        print_batch(batch, members, None);
+    for (batch, members, verdict) in &rendered {
+        print_batch(batch, members, verdict, None);
     }
     Ok(())
 }
@@ -306,14 +332,18 @@ pub(crate) fn review_live_batches(json: bool, state_root: Option<PathBuf>, limit
         let members = db
             .review_batch_members(&batch.id)
             .with_context(|| format!("reading members for review batch {}", batch.id))?;
-        rendered.push((batch, members));
+        let verdict = batch_verdict(&db, batch);
+        rendered.push((batch, members, verdict));
     }
 
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "batches": rendered.iter().map(|(batch, members)| batch_json(batch, members)).collect::<Vec<_>>(),
+                "batches": rendered
+                    .iter()
+                    .map(|(batch, members, verdict)| batch_json(batch, members, verdict))
+                    .collect::<Vec<_>>(),
             })
         );
         return Ok(());
@@ -324,13 +354,75 @@ pub(crate) fn review_live_batches(json: bool, state_root: Option<PathBuf>, limit
         return Ok(());
     }
     println!("{} live review batch(es), oldest first:", rendered.len());
-    for (batch, members) in &rendered {
-        print_batch(batch, members, Some(batch.cycle_root_id.as_str()));
+    for (batch, members, verdict) in &rendered {
+        print_batch(batch, members, verdict, Some(batch.cycle_root_id.as_str()));
     }
     Ok(())
 }
 
-fn print_batch(batch: &ReviewBatch, members: &[ReviewBatchMember], cycle_root: Option<&str>) {
+/// The consolidated verdict a batch staged, if any. `Ok(None)` means none was
+/// staged; `Err` carries why a staged one could not be read, so an unreadable
+/// verdict never looks like an absent one.
+type BatchVerdict = Result<Option<SupervisorVerdict>, String>;
+
+fn batch_verdict(db: &boss_engine::work::WorkDb, batch: &ReviewBatch) -> BatchVerdict {
+    let Some(proposal_id) = batch.final_verdict_proposal_id.as_deref() else {
+        return Ok(None);
+    };
+    let proposal = db
+        .get_worker_proposal(proposal_id)
+        .map_err(|err| format!("reading verdict proposal {proposal_id}: {err}"))?;
+    let payload: ReviewVerdictProposalPayload = serde_json::from_str(&proposal.payload_json)
+        .map_err(|err| format!("parsing verdict proposal {proposal_id}: {err}"))?;
+    serde_json::from_value(payload.verdict)
+        .map(Some)
+        .map_err(|err| format!("parsing verdict proposal {proposal_id}: {err}"))
+}
+
+/// Human-readable lines for a consolidated verdict: each finding with its id
+/// and the leaf findings it merged, then every leaf finding the supervisor
+/// dropped with its reason. A legacy verdict (no ids, no `rejected`) renders
+/// its findings without ids and says so rather than implying nothing was
+/// dropped.
+fn verdict_lines(verdict: &SupervisorVerdict) -> Vec<String> {
+    let mut lines = vec![format!(
+        "    {} finding(s), {} rejected leaf finding(s), {} contradiction(s){}",
+        verdict.findings.len(),
+        verdict.rejected.len(),
+        verdict.contradictions.len(),
+        if verdict.is_legacy() {
+            " [legacy verdict: no finding ids or rejected record]"
+        } else {
+            ""
+        },
+    )];
+    for finding in &verdict.findings {
+        lines.push(format!(
+            "    finding {} [{}] {} (sources: {})",
+            finding.id.as_deref().unwrap_or("(no id)"),
+            finding.severity.as_str(),
+            finding.title,
+            finding.sources.join(", "),
+        ));
+    }
+    for rejected in &verdict.rejected {
+        lines.push(format!(
+            "    rejected {}: {}",
+            rejected.leaf_finding_id, rejected.reason
+        ));
+    }
+    lines
+}
+
+fn print_verdict(verdict: &BatchVerdict) {
+    match verdict {
+        Ok(Some(verdict)) => verdict_lines(verdict).iter().for_each(|line| println!("{line}")),
+        Ok(None) => {}
+        Err(err) => println!("    (verdict unreadable: {err})"),
+    }
+}
+
+fn print_batch(batch: &ReviewBatch, members: &[ReviewBatchMember], verdict: &BatchVerdict, cycle_root: Option<&str>) {
     println!("batch {} [{}/{}]", batch.id, batch.phase, batch.status);
     if let Some(cycle_root) = cycle_root {
         println!("  cycle root:  {cycle_root}");
@@ -351,6 +443,7 @@ fn print_batch(batch: &ReviewBatch, members: &[ReviewBatchMember], cycle_root: O
         "  verdict:     {}",
         batch.final_verdict_proposal_id.as_deref().unwrap_or("(none staged)")
     );
+    print_verdict(verdict);
     println!("  members:");
     for member in members {
         println!(
@@ -373,7 +466,15 @@ fn print_batch(batch: &ReviewBatch, members: &[ReviewBatchMember], cycle_root: O
     }
 }
 
-fn batch_json(batch: &ReviewBatch, members: &[ReviewBatchMember]) -> serde_json::Value {
+fn batch_verdict_json(verdict: &BatchVerdict) -> serde_json::Value {
+    match verdict {
+        Ok(Some(verdict)) => serde_json::to_value(verdict).unwrap_or(serde_json::Value::Null),
+        Ok(None) => serde_json::Value::Null,
+        Err(err) => serde_json::json!({ "unreadable": err }),
+    }
+}
+
+fn batch_json(batch: &ReviewBatch, members: &[ReviewBatchMember], verdict: &BatchVerdict) -> serde_json::Value {
     serde_json::json!({
         "id": batch.id,
         "cycle_root_id": batch.cycle_root_id,
@@ -388,6 +489,7 @@ fn batch_json(batch: &ReviewBatch, members: &[ReviewBatchMember]) -> serde_json:
         "updated_at": batch.updated_at,
         "completed_at": batch.completed_at,
         "final_verdict_proposal_id": batch.final_verdict_proposal_id,
+        "verdict": batch_verdict_json(verdict),
         "members": members.iter().map(member_json).collect::<Vec<_>>(),
     })
 }
@@ -519,6 +621,79 @@ mod tests {
     use boss_engine::work::REVIEW_GATE_OUTCOME_GAVE_UP;
 
     use super::*;
+
+    fn verdict_from(value: serde_json::Value) -> SupervisorVerdict {
+        SupervisorVerdict::from_json(&value.to_string()).expect("valid verdict")
+    }
+
+    fn sample_verdict_value() -> serde_json::Value {
+        serde_json::json!({
+            "batch_id": "rvb_1",
+            "pr_url": "https://github.com/org/repo/pull/7",
+            "target_sha": "head_7",
+            "phase": "pre_merge",
+            "summary": "s",
+            "revision_warranted": true,
+            "findings": [{
+                "id": "C1", "severity": "high", "category": "correctness", "confidence": "high",
+                "file": "src/lib.rs", "title": "Unchecked index", "detail": "d",
+                "sources": ["claude-1", "codex-1"]
+            }],
+            "rejected": [{"leaf_finding_id": "codex-2", "reason": "Re-read the file; not a defect."}]
+        })
+    }
+
+    #[test]
+    fn verdict_json_preserves_rejections_and_distinguishes_unreadable_from_absent() {
+        let verdict = verdict_from(sample_verdict_value());
+        let json = batch_verdict_json(&Ok(Some(verdict)));
+        assert_eq!(json["findings"][0]["id"], "C1");
+        assert_eq!(
+            json["findings"][0]["sources"],
+            serde_json::json!(["claude-1", "codex-1"])
+        );
+        assert_eq!(json["rejected"][0]["leaf_finding_id"], "codex-2");
+        assert_eq!(json["rejected"][0]["reason"], "Re-read the file; not a defect.");
+        assert!(batch_verdict_json(&Ok(None)).is_null());
+        assert_eq!(
+            batch_verdict_json(&Err("invalid stored verdict".into()))["unreadable"],
+            "invalid stored verdict"
+        );
+    }
+
+    #[test]
+    fn empty_verdict_is_not_mislabeled_as_legacy() {
+        let mut value = sample_verdict_value();
+        value["findings"] = serde_json::json!([]);
+        value["rejected"] = serde_json::json!([]);
+        assert!(!verdict_lines(&verdict_from(value)).join("\n").contains("legacy"));
+    }
+
+    #[test]
+    fn verdict_lines_show_ids_sources_and_rejected_leaf_findings() {
+        let lines = verdict_lines(&verdict_from(sample_verdict_value())).join("\n");
+        assert!(lines.contains("1 finding(s), 1 rejected leaf finding(s)"), "{lines}");
+        assert!(
+            lines.contains("finding C1 [high] Unchecked index (sources: claude-1, codex-1)"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("rejected codex-2: Re-read the file; not a defect."),
+            "{lines}"
+        );
+        assert!(!lines.contains("legacy"), "{lines}");
+    }
+
+    #[test]
+    fn verdict_lines_flag_a_legacy_verdict_instead_of_implying_nothing_was_dropped() {
+        let mut value = sample_verdict_value();
+        value["findings"][0].as_object_mut().unwrap().remove("id");
+        value["findings"][0]["sources"] = serde_json::json!(["claude"]);
+        value.as_object_mut().unwrap().remove("rejected");
+        let lines = verdict_lines(&verdict_from(value)).join("\n");
+        assert!(lines.contains("legacy verdict"), "{lines}");
+        assert!(lines.contains("finding (no id) [high]"), "{lines}");
+    }
 
     #[test]
     fn staleness_none_when_reviewed_head_unknown() {

@@ -2,9 +2,10 @@
 //! and the `ReviewResult` structured output. See [`super`] for the module
 //! role and output contract.
 
+use boss_protocol::ReviewBatchPhase;
 use serde::{Deserialize, Serialize};
 
-use boss_protocol::ReviewBatchPhase;
+use crate::supervisor_types::SupervisorSourceRole;
 
 /// Authoritative PR metadata fetched from GitHub at reviewer-spawn time.
 ///
@@ -206,6 +207,17 @@ pub struct ReviewFinding {
     /// specific enough that the revising worker can act without guessing.
     pub detail: String,
     pub confidence: ReviewFindingConfidence,
+    /// Stable id of the consolidated finding this was projected from, when it
+    /// came from a supervisor verdict. `None` for legacy single-reviewer
+    /// results and for verdicts stored before finding ids existed. Rendered
+    /// into revision / follow-up descriptions so downstream work can key on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Leaf finding ids (or, for a post-merge verdict, the producing role) the
+    /// supervisor merged into this finding. Empty when unknown (legacy).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub sources: Vec<String>,
 }
 
 /// The submitted report's coverage declaration. A reviewer must make both
@@ -228,6 +240,11 @@ pub struct ReviewCoverage {
 #[serde(deny_unknown_fields)]
 #[builder(on(String, into))]
 pub struct ReviewerReportFinding {
+    /// Engine-assigned id, unique within its report (`<role>-<n>`, see
+    /// [`leaf_finding_id`]). Never trusted from the model: it is overwritten
+    /// by [`ReviewerReport::assign_finding_ids`] when a new report is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub severity: ReviewFindingSeverity,
     pub category: ReviewFindingCategory,
     pub confidence: ReviewFindingConfidence,
@@ -266,6 +283,32 @@ impl ReviewerReport {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
+
+    /// Assign every finding its engine-owned id (`<role>-<n>`, 1-based, in
+    /// report order), overwriting anything the model supplied. Ids derive
+    /// only from `role` and position, so they are stable across reads of the
+    /// same immutable stored report and unique within it by construction.
+    pub fn assign_finding_ids(&mut self, role: SupervisorSourceRole) {
+        for (index, finding) in self.findings.iter_mut().enumerate() {
+            finding.id = Some(leaf_finding_id(role, index + 1));
+        }
+    }
+}
+
+/// The stable id of the `ordinal`-th (1-based) finding of `role`'s report.
+/// The role is recoverable from the id via [`leaf_finding_role`].
+pub fn leaf_finding_id(role: SupervisorSourceRole, ordinal: usize) -> String {
+    format!("{}-{ordinal}", role.as_str())
+}
+
+/// The reviewer role encoded in a leaf finding id minted by
+/// [`leaf_finding_id`], or `None` for any other string.
+pub fn leaf_finding_role(id: &str) -> Option<SupervisorSourceRole> {
+    let (role, ordinal) = id.rsplit_once('-')?;
+    if ordinal.is_empty() || !ordinal.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    SupervisorSourceRole::parse(role)
 }
 
 /// First-class regression/deletion check — always present in `ReviewResult`.
@@ -366,6 +409,8 @@ mod tests {
                          restore it."
                     .to_owned(),
                 confidence: ReviewFindingConfidence::High,
+                id: None,
+                sources: vec![],
             }],
             regression_check: RegressionCheck {
                 performed: true,
@@ -611,5 +656,60 @@ mod tests {
             result.regression_check.suspected_deletions.is_empty(),
             "no regression findings → suspected_deletions must be empty",
         );
+    }
+
+    fn report_with_findings(count: usize, model_supplied_id: Option<&str>) -> ReviewerReport {
+        let finding = |ordinal: usize| {
+            ReviewerReportFinding::builder()
+                .maybe_id(model_supplied_id.map(str::to_owned))
+                .severity(ReviewFindingSeverity::Low)
+                .category(ReviewFindingCategory::Readability)
+                .confidence(ReviewFindingConfidence::Low)
+                .file("src/lib.rs")
+                .title(format!("finding {ordinal}"))
+                .problem("p")
+                .impact("i")
+                .suggested_fix("f")
+                .static_evidence("e")
+                .needs_runtime_verification(false)
+                .build()
+        };
+        ReviewerReport::builder()
+            .batch_id("rvb_1")
+            .pr_url("https://github.com/org/repo/pull/7")
+            .target_sha("head_7")
+            .phase(boss_protocol::ReviewBatchPhase::PreMerge)
+            .summary("s")
+            .coverage(
+                ReviewCoverage::builder()
+                    .files_inspected(Vec::<String>::new())
+                    .files_omitted(Vec::<String>::new())
+                    .limitations(Vec::<String>::new())
+                    .build(),
+            )
+            .findings((1..=count).map(finding).collect())
+            .build()
+    }
+
+    #[test]
+    fn every_leaf_finding_gets_a_unique_engine_assigned_id() {
+        // The model tried to claim the same id on every finding; it is ignored.
+        let mut report = report_with_findings(3, Some("model-picked"));
+        report.assign_finding_ids(SupervisorSourceRole::Codex);
+        let ids: Vec<_> = report.findings.iter().map(|f| f.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["codex-1", "codex-2", "codex-3"]);
+        report.assign_finding_ids(SupervisorSourceRole::Codex);
+        assert_eq!(report.findings[0].id.as_deref(), Some("codex-1"));
+        assert_eq!(leaf_finding_role("codex-3"), Some(SupervisorSourceRole::Codex));
+        assert_eq!(leaf_finding_role("C1"), None);
+        assert_eq!(leaf_finding_role("claude"), None);
+        assert_eq!(leaf_finding_role("claude-"), None);
+    }
+
+    #[test]
+    fn a_report_without_ids_still_deserializes() {
+        let json = serde_json::to_string(&report_with_findings(1, None)).unwrap();
+        assert!(!json.contains("\"id\""), "unassigned ids are not serialized: {json}");
+        assert!(ReviewerReport::from_json(&json).is_ok());
     }
 }

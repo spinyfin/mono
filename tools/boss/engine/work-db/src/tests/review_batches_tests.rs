@@ -10,6 +10,8 @@ use super::*;
 
 #[path = "review_two_leaf_tests.rs"]
 mod two_leaf;
+#[path = "review_verdict_ids_tests.rs"]
+mod verdict_ids;
 
 #[path = "review_start_failure_tests.rs"]
 mod start_failure;

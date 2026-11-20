@@ -295,6 +295,7 @@ impl WorkDb {
             "`{}` is a progression verb; submit it through `submit_progression_verb`",
             input.kind
         );
+        let mut payload_json = input.payload_json.to_owned();
         // The transaction-holding half. Scoped to a block so the `conn`
         // guard (a lock over `WorkDb`'s single shared connection — see
         // `WorkDb::connect`'s docs) is dropped before the post-commit
@@ -372,7 +373,7 @@ impl WorkDb {
                 ProposalApplyPolicy::AutoApply | ProposalApplyPolicy::Async => Some(apply_in_transaction(
                     &tx,
                     input.execution_id,
-                    input.payload_json,
+                    &mut payload_json,
                     input.kind,
                     &id,
                     guide,
@@ -449,7 +450,7 @@ impl WorkDb {
                     input.execution_id,
                     input.work_item_id,
                     input.kind.as_str(),
-                    input.payload_json,
+                    &payload_json,
                     input.idempotency_key,
                     state.as_str(),
                     applied_ref,
@@ -493,7 +494,7 @@ impl WorkDb {
                 .created_at(now)
                 .idempotency_key(input.idempotency_key)
                 .kind(input.kind)
-                .payload_json(input.payload_json)
+                .payload_json(payload_json)
                 .state(state)
                 .work_item_id(input.work_item_id)
                 .maybe_applied_ref(applied_ref)
