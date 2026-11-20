@@ -5,9 +5,10 @@ edition.workspace = true
 workspace = "../../../.."
 
 [features]
-test-support = ["dep:tempfile", "dep:tracing-subscriber", "rusqlite/backup"]
+test-support = ["dep:libc", "dep:tempfile", "dep:tracing-subscriber", "rusqlite/backup"]
 
 [dependencies]
+libc = { version = "0.2", optional = true }
 boss-write-batch = { path = "../write-batch" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
