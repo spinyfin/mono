@@ -23,6 +23,15 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::teardown_registry::TeardownRegistry;
 use crate::terminal_work_sweep::{self, WorkerReaper};
 
+// These fixtures have virtual panes and empty temporary workspaces. Use the
+// existing empty-occupancy probe so gate synchronization does not depend on
+// scanning every process on the test host before reaching the cube stub.
+fn teardown_collaborators() -> crate::completion::CompletionCollaborators {
+    let mut collaborators = crate::completion_adapters::completion_collaborators();
+    collaborators.workspace_occupancy = Arc::new(crate::workspace_lease_release::EmptyOccupancy);
+    collaborators
+}
+
 /// Ordered log of the teardown side effects a completion path performs,
 /// shared by the pane releaser, the cube client and the sweep's reaper so
 /// a test can assert on their relative order as well as on each having
