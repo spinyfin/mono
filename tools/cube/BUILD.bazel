@@ -15,6 +15,7 @@ rust_library(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = [
+        "//lib/rust/bazel_support",
         "//lib/rust/git_utils",
         "//lib/rust/process_runner",
     ] + all_crate_deps(normal = True),

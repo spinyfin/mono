@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+bazel-support = { path = "../../../../lib/rust/bazel_support" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }

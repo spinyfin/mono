@@ -4,6 +4,8 @@
 //! behavior, and built-in checks may change without notice.
 
 pub mod annotate;
+/// Also compiled as the small bazel-support crate for engine consumers.
+pub mod bazel_support;
 pub mod bypass;
 pub mod change_detection;
 pub mod check;

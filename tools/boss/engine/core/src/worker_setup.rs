@@ -73,6 +73,7 @@ use crate::driver::{
 };
 use crate::ssh_transport::shell_quote;
 
+mod bazel_output;
 mod deny_rules;
 pub use deny_rules::{
     answer_agent_allow_rules, answer_agent_deny_rules, progression_allow_rules, progression_deny_rules,
@@ -346,8 +347,13 @@ fn settings_value(
     // instead of leaving them to agree by coincidence.
     let fence = data_dir_fence(sandbox, layer_into_settings, path_guard_hook_installed);
 
+    let mut permissions = permissions_value(input, fence);
+    // Output paths refer to this host and only belong in local worker settings.
+    if sandbox == EngineDataDirSandbox::Enabled {
+        grant_bazel_output_root(&mut permissions, input);
+    }
     let mut value = serde_json::json!({
-        "permissions": permissions_value(input, fence),
+        "permissions": permissions,
     });
     // `hooks` is the driver-produced map (all seven lifecycle events wired to
     // the forwarder), with the interception guards layered onto `PreToolUse`
@@ -405,6 +411,20 @@ fn pre_tool_use_array(hooks: &mut serde_json::Map<String, serde_json::Value>) ->
         .or_insert_with(|| serde_json::Value::Array(Vec::new()))
         .as_array_mut()
         .expect("PreToolUse hook entry is always inserted as a JSON array")
+}
+
+/// Add Bazel's output root to `permissions.additionalDirectories` for the
+/// autonomous (blocklist) worker kinds, so a command that reaches a build
+/// output through `bazel-bin` does not stop on a directory prompt. The
+/// `dontAsk` allowlist kinds are deliberately left alone: they are
+/// capability-restricted and never copy build outputs.
+fn grant_bazel_output_root(permissions: &mut serde_json::Value, input: &WorkerSetupInput) {
+    if permissions["defaultMode"] != "auto" {
+        return;
+    }
+    if let Some(dir) = bazel_output::bazel_output_directory(&input.workspace_path) {
+        permissions["additionalDirectories"] = serde_json::json!([dir.display().to_string()]);
+    }
 }
 
 /// Build the `permissions` object for the worker settings file.

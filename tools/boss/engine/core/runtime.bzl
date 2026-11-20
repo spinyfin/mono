@@ -128,6 +128,7 @@ def runtime_libraries():
         },
         visibility = ["//tools/boss/engine/app:__pkg__", "//tools/boss/engine/spoke-adapter:__pkg__"],
         deps = [
+            "//lib/rust/bazel_support",
             "//tools/boss/engine/execution-runner",
             "//tools/boss/engine/host-execution",
             "//tools/boss/engine/execution-contracts",

@@ -365,13 +365,12 @@ fn resolve_host_cache_paths() -> Option<HostCachePaths> {
             xdg_cache_home.join("bazelisk")
         }
     });
-    let bazel_output_root = nonempty_env("TEST_TMPDIR").unwrap_or_else(|| {
-        if cfg!(target_os = "macos") {
-            home.join("Library/Caches/bazel")
-        } else {
-            xdg_cache_home.join("bazel")
-        }
-    });
+    let bazel_output_root = bazel_support::cache_root(
+        std::env::var("TEST_TMPDIR").ok().as_deref(),
+        home.to_str(),
+        xdg_cache_home.to_str(),
+        cfg!(target_os = "macos"),
+    )?;
     let bazel_disk_cache = home.join(BAZEL_DISK_CACHE_LEAF);
     Some(HostCachePaths {
         xdg_cache_home,

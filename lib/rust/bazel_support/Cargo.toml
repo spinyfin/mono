@@ -1,0 +1,11 @@
+[package]
+name = "bazel-support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "../../../tools/checkleft/src/bazel_support.rs"
+
+[dependencies]
+anyhow = { workspace = true }

@@ -1088,20 +1088,16 @@ fn bazel_writable_roots_impl(
     home: Option<&str>,
     xdg_cache_home: Option<&str>,
 ) -> Vec<PathBuf> {
-    if let Some(dir) = test_tmpdir.filter(|d| !d.is_empty()) {
-        return vec![PathBuf::from(dir)];
+    let mut roots: Vec<_> = bazel_support::cache_root(test_tmpdir, home, xdg_cache_home, cfg!(target_os = "macos"))
+        .into_iter()
+        .collect();
+    if cfg!(target_os = "macos")
+        && test_tmpdir.filter(|v| !v.is_empty()).is_none()
+        && let Some(home) = home.filter(|v| !v.is_empty())
+    {
+        roots.push(PathBuf::from(home).join(".cache"));
     }
-    let Some(home) = home.filter(|h| !h.is_empty()) else {
-        return Vec::new();
-    };
-    let home = PathBuf::from(home);
-    if cfg!(target_os = "macos") {
-        return vec![home.join("Library/Caches/bazel"), home.join(".cache")];
-    }
-    match xdg_cache_home {
-        Some(xdg) if !xdg.is_empty() => vec![PathBuf::from(xdg).join("bazel")],
-        _ => vec![home.join(".cache/bazel")],
-    }
+    roots
 }
 
 /// Resolve the shared cube jj store root for `workspace`, if it is a cube

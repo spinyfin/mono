@@ -6,6 +6,7 @@ workspace = "../.."
 
 [dependencies]
 process-runner = { path = "../../lib/rust/process_runner" }
+bazel-support = { path = "../../lib/rust/bazel_support" }
 bon = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 console = { workspace = true }

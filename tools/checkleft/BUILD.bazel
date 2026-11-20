@@ -6,6 +6,11 @@ load("//tools/checkleft/wasm:defs.bzl", "precompiled_cwasm_dir")
 
 exports_files(["Cargo.toml"])
 
+exports_files(
+    ["src/bazel_support.rs"],
+    visibility = ["//lib/rust/bazel_support:__pkg__"],
+)
+
 # Extracts CARGO_PKG_VERSION (and friends) straight from Cargo.toml at build time,
 # so the version checkleft reports is always the source-controlled value — never a
 # hand-copied duplicate that can drift out of sync. The release pipeline patches
