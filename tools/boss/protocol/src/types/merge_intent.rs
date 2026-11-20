@@ -34,7 +34,7 @@ pub const MERGE_INTENT_LAPSED: &str = "lapsed";
 /// A newer merge request for the same item replaced this one.
 pub const MERGE_INTENT_SUPERSEDED: &str = "superseded";
 
-/// `reason` codes. Each names the single event that ended the intent.
+/// `reason` codes. Each names the ending category; `detail` carries the specific cause.
 pub const MERGE_INTENT_REASON_MERGED: &str = "merged";
 pub const MERGE_INTENT_REASON_TASK_FINISHED: &str = "task_finished";
 pub const MERGE_INTENT_REASON_TASK_DELETED: &str = "task_deleted";
@@ -46,8 +46,9 @@ pub const MERGE_INTENT_REASON_NON_REMEDIATION_REVISION: &str = "non_remediation_
 pub const MERGE_INTENT_REASON_PARKED: &str = "parked";
 pub const MERGE_INTENT_REASON_BLOCKED: &str = "blocked";
 pub const MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE: &str = "removed_from_merge_queue";
-/// The PR changed through automatic fixes and nothing decided whether those
-/// changes are safe to merge unseen, so a person decides.
+/// No safe automatic merge decision is available: fixes changed the PR,
+/// a required CI fix was declined or never started, or a head is unknown.
+/// The detail distinguishes these cases so a person can decide what to do.
 pub const MERGE_INTENT_REASON_NO_DECISION: &str = "no_decision";
 /// The PR head moved with no automatic fix to account for it.
 pub const MERGE_INTENT_REASON_CHANGED_OUTSIDE_REMEDIATION: &str = "changed_outside_remediation";

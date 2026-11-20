@@ -241,7 +241,16 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
     let Some(events) = dequeue_events.get(&candidate.pr_url) else {
         return;
     };
-    for event in events {
+    // A withdrawal must be applied before a later same-head rebounce.
+    let mut ordered_events: Vec<_> = events.iter().collect();
+    ordered_events.sort_by_key(|event| {
+        event
+            .created_at
+            .as_deref()
+            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            .map(|time| time.timestamp())
+    });
+    for event in ordered_events {
         let Some(head_sha) = event.pr_head_oid.as_deref() else {
             continue;
         };
@@ -265,8 +274,7 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
             head_sha,
             event_created_at,
         ) {
-            Ok(Some(prior)) => prior,
-            Ok(None) => continue,
+            Ok(prior) => prior,
             Err(err) => {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
@@ -278,29 +286,40 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
                 return;
             }
         };
+        let current_head = work_db.get_pr_status_snapshot(&candidate.work_item_id);
+        let current_head_matches =
+            matches!(current_head, Ok(Some(snapshot)) if snapshot.head_sha.as_deref() == Some(head_sha));
         // The submission is gone; the person's request behind it may not
         // be. Failed checks and a conflict are the engine's to fix, so the
         // request stands through them. Any other departure ends it.
-        let request_ended =
-            match work_db.note_merge_intent_left_queue(&candidate.work_item_id, &candidate.pr_url, &event.reason) {
-                Ok(departure) => departure == boss_work_db::MergeQueueDeparture::Ended,
-                Err(err) => {
-                    tracing::warn!(
-                        work_item_id = %candidate.work_item_id,
-                        pr_url = %candidate.pr_url,
-                        ?err,
-                        "merge poller: failed to update the standing merge request after observed dequeue",
-                    );
-                    false
-                }
-            };
+        let request_ended = match if prior.is_some() || current_head_matches {
+            work_db.note_merge_intent_left_queue(
+                &candidate.work_item_id,
+                &candidate.pr_url,
+                &event.reason,
+                event_created_at,
+            )
+        } else {
+            Ok(boss_work_db::MergeQueueDeparture::NoIntent)
+        } {
+            Ok(departure) => departure == boss_work_db::MergeQueueDeparture::Ended,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    ?err,
+                    "merge poller: failed to update the standing merge request after observed dequeue",
+                );
+                false
+            }
+        };
         if prior.is_none() && !request_ended {
-            return;
+            continue;
         }
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
-            prior_merge_queue_state = prior.as_deref(),
+            prior_merge_queue_state = prior.as_ref().and_then(|state| state.as_deref()),
             new_merge_queue_state = Option::<&str>::None,
             in_merge_queue = false,
             auto_merge_enabled = false,
@@ -314,10 +333,9 @@ pub(crate) async fn clear_github_merge_intent_on_observed_dequeue(
                 "github_merge_intent_dequeued",
             )
             .await;
-        if prior.as_deref() == Some("queued") {
+        if prior.as_ref().and_then(|state| state.as_deref()) == Some("queued") {
             renumber_merge_queue(work_db, publisher, &candidate.product_id).await;
         }
-        return;
     }
 }
 

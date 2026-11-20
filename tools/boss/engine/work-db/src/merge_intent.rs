@@ -102,11 +102,61 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
          {CLEAR_ENDED_ON_REVISION}
          {CLEAR_ENDED_ON_HEAD_MOVE}",
         FOLLOW_TASK_TRIGGER = follow_task_trigger(),
-        REVISION_TRIGGER = revision_trigger(),
+        REVISION_TRIGGER = legacy_revision_trigger(),
         CLEAR_ENDED_ON_REVISION = clear_ended_on_revision_trigger(),
         CLEAR_ENDED_ON_HEAD_MOVE = clear_ended_on_head_move_trigger(),
     ))?;
     install_journal_triggers(conn)
+}
+
+/// Frozen body of shipped migration 20261118_2035; do not edit.
+/// Replaced by `migrate_dequeue_tracking`.
+fn legacy_revision_trigger() -> String {
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS merge_intents_end_on_revision
+         AFTER INSERT ON tasks
+         WHEN NEW.kind = 'revision' AND NEW.parent_task_id IS NOT NULL
+          AND NEW.created_via NOT LIKE '{CREATED_VIA_CI_FIX_PREFIX}%'
+          AND NEW.created_via NOT LIKE '{CREATED_VIA_MERGE_CONFLICT_PREFIX}%'
+         BEGIN
+            UPDATE merge_intents SET
+                status = '{MERGE_INTENT_INVALIDATED}',
+                reason = '{MERGE_INTENT_REASON_NON_REMEDIATION_REVISION}',
+                detail = 'Merge request ended: a revision started that is not an automatic CI or conflict fix. Review the result, then merge again.',
+                ended_at = strftime('%s', 'now'),
+                fix_owed_since = NULL
+            WHERE work_item_id = NEW.parent_task_id AND status = '{MERGE_INTENT_ACTIVE}';
+         END;"
+    )
+}
+
+/// Frozen body of shipped migration 20261118_2035; do not edit.
+/// Replaced by `migrate_dequeue_tracking`.
+fn clear_ended_on_revision_trigger() -> String {
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS merge_intents_clear_ended_on_revision
+         AFTER INSERT ON tasks
+         WHEN NEW.kind = 'revision' AND NEW.parent_task_id IS NOT NULL
+         BEGIN
+            UPDATE merge_intents SET on_card = 0
+            WHERE work_item_id = NEW.parent_task_id AND on_card = 1
+              AND status != '{MERGE_INTENT_ACTIVE}';
+         END;"
+    )
+}
+
+/// Upgrade existing databases without relying on same-event trigger order.
+pub(super) fn migrate_dequeue_tracking(conn: &Connection) -> Result<()> {
+    if !crate::schema_init::table_has_column(conn, "merge_intents", "last_dequeue_at")? {
+        conn.execute_batch("ALTER TABLE merge_intents ADD COLUMN last_dequeue_at INTEGER")?;
+    }
+    conn.execute_batch(&format!(
+        "DROP TRIGGER IF EXISTS merge_intents_end_on_revision;
+         DROP TRIGGER IF EXISTS merge_intents_clear_ended_on_revision;
+         {}",
+        revision_trigger()
+    ))?;
+    Ok(())
 }
 
 /// A card that leaves review, changes PR, is parked, is asked for changes or
@@ -168,33 +218,19 @@ fn revision_trigger() -> String {
         "CREATE TRIGGER IF NOT EXISTS merge_intents_end_on_revision
          AFTER INSERT ON tasks
          WHEN NEW.kind = 'revision' AND NEW.parent_task_id IS NOT NULL
-          AND NEW.created_via NOT LIKE '{CREATED_VIA_CI_FIX_PREFIX}%'
-          AND NEW.created_via NOT LIKE '{CREATED_VIA_MERGE_CONFLICT_PREFIX}%'
          BEGIN
+            UPDATE merge_intents SET on_card = 0
+            WHERE work_item_id = NEW.parent_task_id AND on_card = 1
+              AND status != '{MERGE_INTENT_ACTIVE}';
             UPDATE merge_intents SET
                 status = '{MERGE_INTENT_INVALIDATED}',
                 reason = '{MERGE_INTENT_REASON_NON_REMEDIATION_REVISION}',
                 detail = 'Merge request ended: a revision started that is not an automatic CI or conflict fix. Review the result, then merge again.',
                 ended_at = strftime('%s', 'now'),
                 fix_owed_since = NULL
-            WHERE work_item_id = NEW.parent_task_id AND status = '{MERGE_INTENT_ACTIVE}';
-         END;"
-    )
-}
-
-/// A later revision, including a CI fix or conflict resolution, means the
-/// sentence an already-ended intent put on the card is about a previous
-/// head. Clear it so a queued or running revision's status can show.
-/// Active intents are left for [`revision_trigger`] to invalidate.
-fn clear_ended_on_revision_trigger() -> String {
-    format!(
-        "CREATE TRIGGER IF NOT EXISTS merge_intents_clear_ended_on_revision
-         AFTER INSERT ON tasks
-         WHEN NEW.kind = 'revision' AND NEW.parent_task_id IS NOT NULL
-         BEGIN
-            UPDATE merge_intents SET on_card = 0
-            WHERE work_item_id = NEW.parent_task_id AND on_card = 1
-              AND status != '{MERGE_INTENT_ACTIVE}';
+            WHERE work_item_id = NEW.parent_task_id AND status = '{MERGE_INTENT_ACTIVE}'
+              AND NEW.created_via NOT LIKE '{CREATED_VIA_CI_FIX_PREFIX}%'
+              AND NEW.created_via NOT LIKE '{CREATED_VIA_MERGE_CONFLICT_PREFIX}%';
          END;"
     )
 }
@@ -411,8 +447,8 @@ pub enum MergeQueueDeparture {
 }
 
 /// SQL predicate: does `table`'s row belong to the merge-queue episode of the
-/// PR head named by the SQL expression `head`? Both the dequeue-time
-/// prediction and the owed-fix check build their match from here.
+/// PR head named by the SQL expression `head`? The owed-fix check uses it
+/// to treat an existing same-head attempt as handling the obligation.
 fn episode_head_match_sql(table: &str, head: &str) -> String {
     format!(
         "({table}.head_sha_at_trigger = 'mq:' || {head} OR {table}.head_sha_at_trigger = {head} OR {table}.before_commit_sha = {head})"
@@ -554,12 +590,26 @@ impl WorkDb {
         work_item_id: &str,
         pr_url: &str,
         queue_reason: &str,
+        event_created_at: i64,
     ) -> Result<MergeQueueDeparture> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(intent) = query_active(&tx, work_item_id, pr_url)? else {
             return Ok(MergeQueueDeparture::NoIntent);
         };
+        // Timeline replay must not revive an old obligation or withdraw a newer request.
+        // This ordering assumes the host's UTC clock is synchronized with GitHub:
+        // requests and remediations use local time, but dequeues use GitHub time.
+        // Clock skew can reject a fresh dequeue or misattribute a fix.
+        let observed = tx.execute(
+            "UPDATE merge_intents SET last_dequeue_at = ?2 WHERE id = ?1
+             AND CAST(created_at AS INTEGER) < ?2
+             AND (last_dequeue_at IS NULL OR last_dequeue_at < ?2)",
+            params![intent.id, event_created_at],
+        )?;
+        if observed == 0 {
+            return Ok(MergeQueueDeparture::Standing);
+        }
         let departure = if queue_reason.eq_ignore_ascii_case("failed_checks") {
             // The rebounce producer decides whether a fix is minted, through
             // the real maintenance, budget, suppression and episode gates, and
@@ -567,7 +617,7 @@ impl WorkDb {
             // that a fix is owed.
             tx.execute(
                 "UPDATE merge_intents SET fix_owed_since = ?2 WHERE id = ?1",
-                params![intent.id, now_string()],
+                params![intent.id, event_created_at.to_string()],
             )?;
             MergeQueueDeparture::Standing
         } else if queue_reason.eq_ignore_ascii_case("merge_conflict") {
@@ -673,7 +723,16 @@ mod tests {
 
     impl Fixture {
         fn request(&self) -> MergeIntent {
-            self.db.record_merge_intent(&self.task, PR, Some("head-1")).unwrap()
+            let intent = self.db.record_merge_intent(&self.task, PR, Some("head-1")).unwrap();
+            self.db
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE merge_intents SET created_at = CAST(created_at AS INTEGER) - 2 WHERE id = ?1",
+                    [&intent.id],
+                )
+                .unwrap();
+            self.stored(&intent.id)
         }
 
         fn stored(&self, id: &str) -> MergeIntent {
@@ -767,7 +826,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            f.db.note_merge_intent_left_queue(&f.task, PR, "FAILED_CHECKS").unwrap(),
+            f.db.note_merge_intent_left_queue(
+                &f.task,
+                PR,
+                "FAILED_CHECKS",
+                boss_engine_utils::epoch_time::now_epoch_secs()
+            )
+            .unwrap(),
             MergeQueueDeparture::Standing
         );
         // CI remediation blocks the card, spawns its revision and unblocks it.
@@ -805,7 +870,13 @@ mod tests {
             f.db.merge_intent_remediation(&intent).unwrap(),
             MergeIntentRemediation::default()
         );
-        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap();
+        f.db.note_merge_intent_left_queue(
+            &f.task,
+            PR,
+            "failed_checks",
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
         assert!(f.db.merge_intent_remediation(&intent).unwrap().fix_owed);
         // The rebounce pass mints the attempt, as `ci_watch` does.
         f.db.insert_ci_remediation(
@@ -843,7 +914,13 @@ mod tests {
             .unwrap();
         let intent = f.request();
         assert_eq!(
-            f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
+            f.db.note_merge_intent_left_queue(
+                &f.task,
+                PR,
+                "failed_checks",
+                boss_engine_utils::epoch_time::now_epoch_secs()
+            )
+            .unwrap(),
             MergeQueueDeparture::Standing
         );
         assert!(
@@ -866,7 +943,13 @@ mod tests {
         f.db.set_ci_attempt_budget(&f.task, Some(0)).unwrap();
         let intent = f.request();
         assert_eq!(
-            f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
+            f.db.note_merge_intent_left_queue(
+                &f.task,
+                PR,
+                "failed_checks",
+                boss_engine_utils::epoch_time::now_epoch_secs()
+            )
+            .unwrap(),
             MergeQueueDeparture::Standing
         );
         assert!(
@@ -906,9 +989,15 @@ mod tests {
             .unwrap();
         // A new merge request of the same head, then the queue rejects it
         // again. Rebounce will not mint a second attempt for this episode.
-        let second = f.db.record_merge_intent(&f.task, PR, Some("head-1")).unwrap();
+        let second = f.request();
         assert_eq!(
-            f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap(),
+            f.db.note_merge_intent_left_queue(
+                &f.task,
+                PR,
+                "failed_checks",
+                boss_engine_utils::epoch_time::now_epoch_secs()
+            )
+            .unwrap(),
             MergeQueueDeparture::Standing
         );
         assert!(
@@ -925,7 +1014,7 @@ mod tests {
     fn a_repeated_decline_after_the_fix_was_minted_leaves_the_request_standing() {
         let f = fixture();
         let intent = f.request();
-        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap();
+        let event_time = boss_engine_utils::epoch_time::now_epoch_secs() - 1;
         // Rebounce mints the attempt for this dequeue.
         f.db.insert_ci_remediation(
             CiRemediationInsertInput::builder()
@@ -944,6 +1033,19 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        // Observation lagged the mint: use the event time, not the later sweep time.
+        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks", event_time)
+            .unwrap();
+        let stamp: String =
+            f.db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT fix_owed_since FROM merge_intents WHERE id = ?1",
+                    [&intent.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(stamp, event_time.to_string());
         // The next sweep sees the same episode, finds it handled, and says so.
         assert!(
             !f.db
@@ -958,7 +1060,13 @@ mod tests {
     fn an_older_same_head_attempt_counts_as_handling_an_owed_fix() {
         let f = fixture();
         let intent = f.request();
-        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap();
+        f.db.note_merge_intent_left_queue(
+            &f.task,
+            PR,
+            "failed_checks",
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
         assert!(f.db.merge_intent_remediation(&intent).unwrap().fix_owed);
         let attempt =
             f.db.insert_ci_remediation(
@@ -994,7 +1102,13 @@ mod tests {
     fn declining_an_owed_fix_from_the_rebounce_path_ends_the_request() {
         let f = fixture();
         let intent = f.request();
-        f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks").unwrap();
+        f.db.note_merge_intent_left_queue(
+            &f.task,
+            PR,
+            "failed_checks",
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
         assert!(f.db.merge_intent_remediation(&intent).unwrap().fix_owed);
         assert!(
             f.db.decline_owed_merge_intent_ci_fix(&f.task, PR, MergeIntentCiFixDecline::Suppressed)
@@ -1067,7 +1181,8 @@ mod tests {
             let f = fixture();
             let intent = f.request();
             assert_eq!(
-                f.db.note_merge_intent_left_queue(&f.task, PR, reason).unwrap(),
+                f.db.note_merge_intent_left_queue(&f.task, PR, reason, boss_engine_utils::epoch_time::now_epoch_secs())
+                    .unwrap(),
                 MergeQueueDeparture::Ended,
                 "{reason}"
             );
@@ -1083,15 +1198,78 @@ mod tests {
         let f = fixture();
         f.request();
         assert_eq!(
-            f.db.note_merge_intent_left_queue(&f.task, PR, "merge_conflict")
-                .unwrap(),
+            f.db.note_merge_intent_left_queue(
+                &f.task,
+                PR,
+                "merge_conflict",
+                boss_engine_utils::epoch_time::now_epoch_secs()
+            )
+            .unwrap(),
             MergeQueueDeparture::Standing
         );
         assert_eq!(
-            f.db.note_merge_intent_left_queue(&f.task, "https://github.com/example/repo/pull/7", "manual_removal")
-                .unwrap(),
+            f.db.note_merge_intent_left_queue(
+                &f.task,
+                "https://github.com/example/repo/pull/7",
+                "manual_removal",
+                boss_engine_utils::epoch_time::now_epoch_secs()
+            )
+            .unwrap(),
             MergeQueueDeparture::NoIntent
         );
+    }
+
+    #[test]
+    fn dequeue_replays_cannot_replace_a_newer_obligation_or_request() {
+        let f = fixture();
+        let intent = f.request();
+        f.db.connect()
+            .unwrap()
+            .execute("UPDATE merge_intents SET created_at = '10'", [])
+            .unwrap();
+        for time in [20, 20, 19, 10, 9] {
+            f.db.note_merge_intent_left_queue(&f.task, PR, "failed_checks", time)
+                .unwrap();
+        }
+        let stamp: String =
+            f.db.connect()
+                .unwrap()
+                .query_row(
+                    "SELECT fix_owed_since FROM merge_intents WHERE id = ?1",
+                    [&intent.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(stamp, "20");
+        f.db.note_merge_intent_left_queue(&f.task, PR, "manual_removal", 19)
+            .unwrap();
+        assert!(f.db.active_merge_intent(&f.task, PR).unwrap().is_some());
+        let replacement = f.request();
+        f.db.note_merge_intent_left_queue(&f.task, PR, "manual_removal", 20)
+            .unwrap();
+        assert_eq!(
+            f.db.active_merge_intent(&f.task, PR).unwrap().unwrap().id,
+            replacement.id
+        );
+    }
+
+    #[test]
+    fn upgrading_revision_triggers_keeps_the_new_ending_on_the_card() {
+        let f = fixture();
+        let intent = f.request();
+        let conn = f.db.connect().unwrap();
+        // Recreate the shipped trigger pair, then apply the new migration.
+        migrate(&conn).unwrap();
+        migrate_dequeue_tracking(&conn).unwrap();
+        let clear_triggers: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'merge_intents_clear_ended_on_revision'",
+            [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(clear_triggers, 0);
+        drop(conn);
+        f.revision("operator");
+        assert_eq!(f.on_card().unwrap().id, intent.id);
+        assert_eq!(f.stored(&intent.id).status, MERGE_INTENT_INVALIDATED);
     }
 
     #[test]

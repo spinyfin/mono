@@ -289,6 +289,8 @@ struct WorkCardSnapshot: Equatable {
         // A merge request that ended explains why the card is back in
         // Review. A live worker or dispatch status (including a queued
         // revision's "Next up") is newer, so it outranks that sentence.
+        // A disarm failure outranks both the live status and ended sentence:
+        // GitHub may still merge, so keep the engine's warning visible.
         // The sentence still outranks a leftover "Merge paused" label.
         // A request that still stands is only a fallback line. In Merging
         // the merge's own progress is the line.
@@ -307,6 +309,9 @@ struct WorkCardSnapshot: Equatable {
                 return queueLabel
                     ?? context.liveStatus
                     ?? standingMergeRequest
+            }
+            if MergeQueueDetail.parse(task.mergeQueueDetail)?.disarmError != nil {
+                return queueLabel ?? context.liveStatus ?? endedMergeRequest
             }
             return context.liveStatus
                 ?? endedMergeRequest

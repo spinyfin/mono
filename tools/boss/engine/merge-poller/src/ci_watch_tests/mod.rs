@@ -16,3 +16,5 @@ mod stale_revision;
 mod trunk_eviction;
 
 mod failure_identity;
+
+mod merge_intent;

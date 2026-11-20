@@ -915,6 +915,10 @@ mod floor_tests {
                 Box::new(|c| merge_evidence::migrate(c).unwrap()),
             ),
             (
+                "20261120_0657_merge_intent_dequeues",
+                Box::new(|c| merge_intent::migrate_dequeue_tracking(c).unwrap()),
+            ),
+            (
                 merge_intent::MIGRATION_ID,
                 Box::new(|c| merge_intent::migrate(c).unwrap()),
             ),

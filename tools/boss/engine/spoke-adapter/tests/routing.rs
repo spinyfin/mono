@@ -1220,7 +1220,8 @@ async fn a_spoke_runs_transcript_log_and_structured_output_are_answered_from_hub
     use boss_spoke_custody::{Custody, Source};
     use sha2::{Digest, Sha256};
 
-    let fx = Fixture::with(short(500)).await;
+    // Custody routing needs a healthy lease; it does not exercise command timeouts.
+    let fx = Fixture::new().await;
     fx.serve_legacy();
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();

@@ -430,7 +430,15 @@ mod tests {
         let id = &f.candidate.work_item_id;
         let requested = f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
         // The merge queue rejected the PR on failed checks.
-        f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_intents SET created_at = CAST(created_at AS INTEGER) - 2",
+                [],
+            )
+            .unwrap();
+        f.db.note_merge_intent_left_queue(id, PR, "failed_checks", boss_engine_utils::epoch_time::now_epoch_secs())
+            .unwrap();
         f.settle().await;
         assert!(f.standing().is_some(), "the CI fix that is owed has not started");
         // CI remediation starts as `ci_watch` starts it: the attempt is
@@ -487,7 +495,20 @@ mod tests {
         let f = fixture(APPROVED);
         let id = &f.candidate.work_item_id;
         f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
-        f.db.note_merge_intent_left_queue(id, PR, "manual_removal").unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_intents SET created_at = CAST(created_at AS INTEGER) - 2",
+                [],
+            )
+            .unwrap();
+        f.db.note_merge_intent_left_queue(
+            id,
+            PR,
+            "manual_removal",
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        )
+        .unwrap();
         f.settle().await;
         let shown = f.on_card().unwrap();
         assert_eq!(shown.status, MERGE_INTENT_LAPSED);
@@ -502,7 +523,15 @@ mod tests {
         let f = fixture(APPROVED);
         let id = &f.candidate.work_item_id;
         f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
-        f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_intents SET created_at = CAST(created_at AS INTEGER) - 2",
+                [],
+            )
+            .unwrap();
+        f.db.note_merge_intent_left_queue(id, PR, "failed_checks", boss_engine_utils::epoch_time::now_epoch_secs())
+            .unwrap();
         assert!(f.standing().is_some());
         f.db.connect()
             .unwrap()
@@ -527,7 +556,15 @@ mod tests {
         let id = &f.candidate.work_item_id;
         f.db.set_ci_attempt_budget(id, Some(0)).unwrap();
         f.db.record_merge_intent(id, PR, Some(APPROVED)).unwrap();
-        f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_intents SET created_at = CAST(created_at AS INTEGER) - 2",
+                [],
+            )
+            .unwrap();
+        f.db.note_merge_intent_left_queue(id, PR, "failed_checks", boss_engine_utils::epoch_time::now_epoch_secs())
+            .unwrap();
         f.db.decline_owed_merge_intent_ci_fix(id, PR, crate::work::MergeIntentCiFixDecline::BudgetExhausted)
             .unwrap();
         f.settle().await;
@@ -560,7 +597,15 @@ mod tests {
             .unwrap()
             .unwrap();
         f.db.mark_ci_remediation_abandoned(&earlier.id, "done").unwrap();
-        f.db.note_merge_intent_left_queue(id, PR, "failed_checks").unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_intents SET created_at = CAST(created_at AS INTEGER) - 2",
+                [],
+            )
+            .unwrap();
+        f.db.note_merge_intent_left_queue(id, PR, "failed_checks", boss_engine_utils::epoch_time::now_epoch_secs())
+            .unwrap();
         // Order: request < earlier attempt < fix owed since < now - 600.
         let conn = f.db.connect().unwrap();
         conn.execute(

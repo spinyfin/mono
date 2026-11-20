@@ -336,6 +336,8 @@ struct MergeQueueDetail: Equatable {
     /// `"switching_modes"`), distinct from this entry's own `state`. `nil`
     /// for a GitHub-native entry, which has no equivalent concept.
     var queueState: String?
+    /// A failed disarm means GitHub may still merge despite a paused request.
+    var disarmError: String? = nil
     /// Engine-authored progress text; presentation does not infer merge state.
     var statusLabel: String? = nil
 
@@ -352,6 +354,7 @@ struct MergeQueueDetail: Equatable {
             sectionOrder: (obj["section_order"] as? NSNumber)?.int64Value,
             source: obj["source"] as? String,
             queueState: obj["queue_state"] as? String,
+            disarmError: obj["disarm_error"] as? String,
             statusLabel: obj["status_label"] as? String
         )
     }

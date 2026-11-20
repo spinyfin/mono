@@ -1653,6 +1653,7 @@ fn bound_events_socket_path_falls_back_when_nothing_was_bound() {
 async fn spawn_request_includes_engine_claimed_slot() {
     let workspace = TempDir::new().unwrap();
     let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+    *spawner.homes_pin.lock().unwrap() = Some(HomesPin::new(workspace.path().join("codex-homes")));
     let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
         Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
     let cfg = test_runtime_config(
