@@ -437,6 +437,7 @@ def command_records(command, stripped=False):
     pending = ''
     receiver = None
     heredoc_end = None
+    heredocs = []
     if not stripped:
         command = strip_line_continuations(command)
     offset = 0
@@ -445,7 +446,11 @@ def command_records(command, stripped=False):
         offset += len(line) + 1
         if heredoc_end is not None:
             if line.lstrip(chr(9)) == heredoc_end:
-                heredoc_end = None
+                if heredocs:
+                    receiver, heredoc_end, quoted = heredocs.pop(0)
+                    receiver.expanding_body = not quoted
+                else:
+                    heredoc_end = None
             else:
                 receiver.body += line + chr(10)
                 start = receiver.body_span[0] if receiver.body_span else line_start
@@ -473,8 +478,9 @@ def command_records(command, stripped=False):
             continue
         logical_line = pending
         pending = ''
+        line_group_start = len(groups)
         current = []
-        tokens = [part for token in tokens for part in (re.findall(r'[(){}]|[;&|]+', token) if token and all(c in '();&|{}' for c in token) else [token])]
+        tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
         try:
             literal, segments = quote_provenance(logical_line, tokens)
         except Exception:
@@ -488,7 +494,7 @@ def command_records(command, stripped=False):
         current_literal = []
         current_segments = [] if segments is not None else None
         for index, token in enumerate(tokens):
-            if token in DELIMS or (token and all(c in '(){}' for c in token)):
+            if token in DELIMS or token in ('(', ')') or (token in ('{', '}') and not current and not any(literal[index])):
                 if current:
                     groups.append(CommandGroup(current, literal_chars=current_literal, quote_segments=current_segments))
                 current = []
@@ -506,9 +512,24 @@ def command_records(command, stripped=False):
         if delim is False:
             groups.append(CommandGroup([], error='incomplete shell syntax'))
         elif delim and groups:
-            heredoc_end, quoted = delim[0], delim[1]
-            receiver = groups[-1]
-            receiver.expanding_body = not quoted
+            for owner in groups[line_group_start:]:
+                for i, word in enumerate(owner):
+                    match = re.match(r'^(?:[0-9]+)?<<(-?)(.*)$', word)
+                    if not match or match.group(2).startswith('<'):
+                        continue
+                    marker = word.index('<<')
+                    if any(owner.literal_chars[i][marker:marker+2]):
+                        continue
+                    attached = match.group(2)
+                    j = i if attached else i + 1
+                    if j >= len(owner):
+                        continue
+                    end = attached or owner[j]
+                    quoted = any(owner.literal_chars[j])
+                    heredocs.append((owner, end, quoted))
+            if heredocs:
+                receiver, heredoc_end, quoted = heredocs.pop(0)
+                receiver.expanding_body = not quoted
         if tokens and tokens[-1] not in ('&&', '||', '|'):
             groups.append(CommandGroup([], boundary=';'))
     if pending or heredoc_end:
@@ -571,32 +592,37 @@ WRAPPER_VALUE_OPTIONS = {
 
 WRAPPER_POSITIONAL = {'timeout': 1, 'flock': 1, 'chrt': 1, 'taskset': 1, 'script': 1}
 
+def consume_wrapper(group, index, base):
+    index += 1
+    value_options = WRAPPER_VALUE_OPTIONS.get(base, set())
+    positional = WRAPPER_POSITIONAL.get(base, 0)
+    while index < len(group) and group[index].startswith('-'):
+        option = group[index]
+        index += 1
+        if base == 'command' and option in ('-v', '-V'):
+            return len(group)
+        if option == '--':
+            break
+        if option in value_options and index < len(group):
+            index += 1
+        if base == 'taskset' and (option == '-c' or option.startswith('--cpu-list')):
+            positional = 0
+    return index + positional
+
+def wrapper_basename(token):
+    return os.path.basename(token[1:] if token.startswith('=') else token)
+
 def strip_prefix_offset(group):
     index = 0
     while index < len(group):
         token = group[index]
-        base = os.path.basename(token)
+        base = wrapper_basename(token)
         if ASSIGNMENT_RE.match(token):
             index += 1
-            continue
-        if base in WRAPPERS:
-            index += 1
-            value_options = WRAPPER_VALUE_OPTIONS.get(base, set())
-            positional = WRAPPER_POSITIONAL.get(base, 0)
-            while index < len(group) and group[index].startswith('-'):
-                option = group[index]
-                index += 1
-                if base == 'command' and option in ('-v', '-V'):
-                    return len(group)
-                if option == '--':
-                    break
-                if option in value_options and index < len(group):
-                    index += 1
-                if base == 'taskset' and (option == '-c' or option.startswith('--cpu-list')):
-                    positional = 0
-            index += positional
-            continue
-        break
+        elif base in WRAPPERS:
+            index = consume_wrapper(group, index, base)
+        else:
+            break
     return index
 
 def expand_env_split_string(tokens):
@@ -605,7 +631,7 @@ def expand_env_split_string(tokens):
         token = tokens[index]
         out.append(token)
         index += 1
-        if os.path.basename(token) != 'env':
+        if wrapper_basename(token) != 'env':
             continue
         while index < len(tokens) and tokens[index].startswith('-'):
             option = tokens[index]
@@ -637,7 +663,7 @@ def strip_prefixes(group):
 def wrapper_has_xargs(group):
     tokens = without_redirections(group)
     end = min(strip_prefix_offset(tokens), len(tokens))
-    return any(os.path.basename(tokens[i]) == 'xargs' for i in range(end))
+    return any(wrapper_basename(tokens[i]) == 'xargs' for i in range(end))
 
 def strip_prefix_indices(group):
     kept = without_redirection_indices(group)
@@ -702,11 +728,12 @@ def attach_pipe_sources(records):
             if not stack:
                 stack.append(_PipeLevel())
             outer = stack[-1]
-            outer.all_cmds.extend(inner.all_cmds)
+            producers = inner.inherited + inner.all_cmds
+            outer.all_cmds.extend(producers)
             if outer.pending_pipe:
-                outer.pipeline.extend(inner.all_cmds)
+                outer.pipeline.extend(producers)
             else:
-                outer.pipeline = list(inner.all_cmds)
+                outer.pipeline = list(producers)
             continue
         if boundary in ('|', '|&'):
             level.pending_pipe = True
@@ -1049,11 +1076,14 @@ import os, re, shlex
 # COMMAND_TOKENIZER_FRAGMENT
 for command in (
     'echo x > y',
+    'xargs -I {} echo \"$HOME\" {}',
     'FOO=bar env -u SECRET sudo -u nobody cat f > out',
     'command -v cube',
     'timeout 1 echo x 2>/dev/null',
 ):
     group = next(g for g in command_records(command) if list(g))
+    assert group.quote_segments is not None, command
+    assert len(group.literal_chars) == len(group), command
     stripped = strip_prefixes(group)
     kept = strip_prefix_indices(group)
     assert [group[i] for i in kept] == stripped, (command, kept, stripped)

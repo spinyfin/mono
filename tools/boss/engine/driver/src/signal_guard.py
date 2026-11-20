@@ -27,19 +27,34 @@ SIG_BINDERS = ('read', 'mapfile', 'readarray', 'getopts', 'for', 'select', 'unse
 SIG_EVALUATORS = ('let', 'eval', 'source', '.')
 SIG_KEYWORDS = ('!', '{', '}', 'then', 'do', 'if', 'elif', 'while', 'until', 'else')
 
-def signal_operand(words):
-    # Shell options may follow -c before its command operand.
+def signal_shell_operands(words):
     i = 0
     while i < len(words):
         word = words[i]
         if word == '--':
-            return words[i+1:i+2]
+            return words[i+1:]
         if word in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
             i += 2
         elif word[:1] in ('-', '+'):
             i += 1
         else:
-            return words[i:i+1]
+            return words[i:]
+    return []
+
+def signal_operand(words):
+    return signal_shell_operands(words)[:1]
+
+def signal_launcher_strings(words):
+    if not words:
+        return []
+    _, base = signal_program(words[0])
+    if base in SIG_SHELLS or base in ('su', 'flock', 'script'):
+        return signal_cstrings(words[1:])
+    if base == 'watch':
+        extra = words[1:]
+        while extra and extra[0].startswith('-'):
+            extra = extra[2:] if extra[0] in ('-n', '--interval') else extra[1:]
+        return [' '.join(extra)]
     return []
 
 def signal_cstrings(words):
@@ -62,14 +77,21 @@ def signal_argv(group):
     # Assignments, xargs provenance and wrapper peeling come from the shared
     # tokenizer so launch-guard and signal-guard see the same program.
     words = without_redirections(group)
-    rest = strip_prefixes(group)
-    assigns = []
-    stop = len(words) - len(rest) if rest else len(words)
-    for token in words[:stop]:
-        match = SIG_ASSIGN.match(token)
-        if match:
-            assigns.append((match.group(1), match.group(2) == '+', match.group(3)))
+    rest = words
+    assigns, strings = [], []
+    indirect = False
     while rest:
+        indirect = indirect or wrapper_has_xargs(rest)
+        peeled = strip_prefixes(rest)
+        stop = len(rest) - len(peeled)
+        for i, token in enumerate(rest[:stop]):
+            match = SIG_ASSIGN.match(token)
+            if match:
+                assigns.append((match.group(1), match.group(2) == '+', match.group(3)))
+            strings.extend(signal_launcher_strings(rest[i:]))
+        rest = peeled
+        if not rest:
+            break
         program, base = signal_program(rest[0])
         match = SIG_ASSIGN.match(rest[0])
         if match:
@@ -89,27 +111,8 @@ def signal_argv(group):
             continue
         rest = [program] + rest[1:]
         break
-    strings = []
-    prefix = words[:len(words) - len(rest)] if rest and words[-len(rest):] == rest else (words if not rest else [])
-    for i, token in enumerate(prefix):
-        _, base = signal_program(token)
-        if base in SIG_SHELLS or base in ('su', 'flock', 'script'):
-            strings.extend(signal_cstrings(words[i+1:]))
-        if base == 'watch':
-            extra = words[i+1:]
-            while extra and extra[0].startswith('-'):
-                extra = extra[2:] if extra[0] in ('-n', '--interval') else extra[1:]
-            strings.append(' '.join(extra))
-    if rest:
-        _, base = signal_program(rest[0])
-        if base in SIG_SHELLS or base in ('su', 'flock', 'script'):
-            strings.extend(signal_cstrings(rest[1:]))
-        if base == 'watch':
-            extra = rest[1:]
-            while extra and extra[0].startswith('-'):
-                extra = extra[2:] if extra[0] in ('-n', '--interval') else extra[1:]
-            strings.append(' '.join(extra))
-    return rest, wrapper_has_xargs(group), strings, assigns
+    strings.extend(signal_launcher_strings(rest))
+    return rest, indirect, strings, assigns
 
 def signal_kill(args, indirect, captures):
     if args and args[0] in ('-l', '-L', '--list', '--table'):
@@ -141,18 +144,12 @@ def signal_shell(args):
 
 def signal_stdin(args):
     # A shell reads its commands from stdin unless given -c or a script file.
-    rest, i = args[1:], 0
+    rest = args[1:]
     if any(a.startswith('-') and not a.startswith('--') and 'c' in a for a in rest):
         return False
-    while i < len(rest):
-        if rest[i] in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
-            i += 2
-        elif rest[i][:1] in ('-', '+'):
-            i += 1
-        else:
-            return rest[i] in ('/dev/stdin', '/dev/fd/0', '-') or any(
-                a.startswith('-') and not a.startswith('--') and 's' in a for a in rest)
-    return True
+    operands = signal_shell_operands(rest)
+    return not operands or operands[0] in ('/dev/stdin', '/dev/fd/0', '-') or any(
+        a.startswith('-') and not a.startswith('--') and 's' in a for a in rest)
 
 def signal_script_file(args):
     _, base = signal_program(args[0])
@@ -160,15 +157,8 @@ def signal_script_file(args):
         return None
     if signal_cstrings(args[1:]):
         return None
-    rest, i = args[1:], 0
-    while i < len(rest):
-        if rest[i] in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
-            i += 2
-        elif rest[i][:1] in ('-', '+'):
-            i += 1
-        else:
-            return rest[i]
-    return None
+    operands = signal_shell_operands(args[1:])
+    return operands[0] if operands else None
 
 def signal_text(text, depth, values=None, unknown=None, holders=None, scripts=None, ariths=None):
     # Inspect text that a shell will later read. Text that cannot be parsed is
@@ -207,6 +197,42 @@ def signal_writes(group, args):
         elif base in SIG_EVALUATORS:
             names.update(SIG_IDENT.findall(' '.join(rest)))
     return names
+
+def signal_output(group):
+    content = getattr(group, 'body', '') or here_string_body(group)
+    if content:
+        return content
+    args, _, _, _ = signal_argv(group)
+    if not args:
+        return ''
+    _, base = signal_program(args[0])
+    if base == 'echo':
+        words = args[1:]
+        expanding = False
+        while words and re.fullmatch('-[neE]+', words[0]):
+            expanding = expanding or 'e' in words[0]
+            words = words[1:]
+        text = ' '.join(words)
+        return 'pkill' if expanding and SIG_KILL_WORD.search(text) else text
+    if base == 'printf' and len(args) > 1:
+        if args[1] in ('%s', '%b', '%s' + SIG_BS + 'n'):
+            return SIG_NL.join(args[2:])
+        if '%' not in args[1]:
+            return args[1]
+    if SIG_KILL_WORD.search(signal_chain_text(group)):
+        return 'pkill'
+    return ''
+
+def signal_redirects(group, writing):
+    found = []
+    for i, token in enumerate(group):
+        pattern = '^(?:[0-9]+|&)?(>>|>[|]?)(.*)' if writing else '^(?:0)?(<)([^<].*|)'
+        match = re.fullmatch(pattern, token)
+        if match:
+            path = match.group(2) or (group[i+1] if i + 1 < len(group) else '')
+            if path:
+                found.append((path, match.group(1) == '>>'))
+    return found
 
 def signal_chain_text(upstream):
     parts = list(upstream)
@@ -325,10 +351,20 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
                     _block(SIGNAL_REASON + ' Variable indirection is too deep to inspect safely.')
                 for value in sorted(values[name]):
                     expanded = program[:variable.start()] + value + program[variable.end():]
-                    inner, inner_indirect, inner_strings, _ = signal_argv([expanded] + args[1:])
-                    for string in inner_strings:
-                        inspect(string)
-                    dispatch(group, inner, indirect or inner_indirect, chain, hops + 1, captures)
+                    # Conservatively inspect field splitting as well when quote provenance
+                    # is unavailable after recursive expansion.
+                    positions = [i for i, word in enumerate(group) if word == program]
+                    masks = getattr(group, 'literal_chars', [])
+                    quoted = bool(positions and masks and all(
+                        masks[positions[0]][variable.start():variable.end()]))
+                    shapes = [[expanded]] if quoted else [expanded.split()]
+                    if not positions or not masks or getattr(group, 'quote_segments', None) is None:
+                        shapes.append([expanded])
+                    for fields in shapes:
+                        inner, inner_indirect, inner_strings, _ = signal_argv(fields + args[1:])
+                        for string in inner_strings:
+                            inspect(string)
+                        dispatch(group, inner, indirect or inner_indirect, chain, hops + 1, captures)
                 return
         if variables:
             for string in signal_cstrings(args[1:]):
@@ -381,10 +417,13 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
                     if index in scan['scripts']:
                         input_words(lookup_holder(index))
             path = signal_script_file(args)
-            if path and path in written:
-                inspect(written[path])
+            if path:
+                inspect_written(path)
+        inspect_written(program)
         if signal_shell(args):
             if signal_stdin(args):
+                for path, _ in signal_redirects(group, False):
+                    inspect_written(path)
                 if getattr(group, 'body', ''):
                     inspect(group.body)
                 here = here_string_body(group)
@@ -405,12 +444,30 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
                 inspect(string)
 
     written = {}
+    def inspect_written(path):
+        key = os.path.normpath(path)
+        if key in written:
+            inspect(written[key])
+
     for index, group in enumerate(groups):
         args, indirect, strings, _ = parsed[index]
         content = getattr(group, 'body', '') or here_string_body(group)
-        if content:
-            for target in write_redirection_targets(group):
-                written[target] = content
+        targets = signal_redirects(group, True)
+        if args:
+            _, base = signal_program(args[0])
+            if base in ('echo', 'printf'):
+                content = signal_output(group)
+            if base == 'tee':
+                targets.extend((word, '-a' in args or '--append' in args)
+                               for word in args[1:] if not word.startswith('-'))
+            if not content:
+                content = SIG_NL.join(signal_output(upstream)
+                                   for upstream in getattr(group, 'pipe_sources', []))
+            if not content and SIG_KILL_WORD.search(' '.join(args)):
+                content = 'pkill'
+        for target, append in targets:
+            key = os.path.normpath(target)
+            written[key] = (written.get(key, '') + SIG_NL if append else '') + content
         for string in strings:
             inspect(string)
         captures = {name for name in qualified if first[name] < index}
