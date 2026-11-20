@@ -596,9 +596,9 @@ fn two_infrastructure_failures_stop_the_nominations_and_file_the_question_with_t
 
 /// A progression agent that fails to start says nothing about the item it was
 /// sent to, so such runs never stop nominations or file the question. The item
-/// is retried after each cooldown.
+/// is retried after each launch backoff.
 #[test]
-fn failed_launches_are_retried_after_each_cooldown_and_never_file_the_question() {
+fn failed_launches_are_retried_after_each_backoff_and_never_file_the_question() {
     let fx = fx();
     let id = fx.conflicted("Its agent never starts");
     fx.failed_launch(&id, 30 * HOUR);
@@ -621,20 +621,19 @@ fn failed_launches_are_retried_after_each_cooldown_and_never_file_the_question()
     assert_eq!(fx.task(&id).blocked_reason.as_deref(), Some("merge_conflict"));
     assert_eq!(fx.progression_runs(&id).len(), 4);
 
-    // Inside the cooldown after a failed launch the item is not nominated: the
-    // backoff between attempts is unchanged.
-    let cooling = fx.conflicted("Failed to launch an hour ago");
-    fx.failed_launch(&cooling, HOUR);
+    // Inside the separate launch backoff the item is not nominated.
+    let cooling = fx.conflicted("Failed to launch a minute ago");
+    fx.failed_launch(&cooling, 60);
     assert!(!fx.is_candidate(&cooling));
     let clauses = fx.db.progression_clauses(&cooling).unwrap().unwrap();
-    assert!(clauses.in_cooldown && !clauses.infrastructure_failing, "{clauses:?}");
+    assert!(!clauses.in_cooldown && !clauses.infrastructure_failing, "{clauses:?}");
 }
 
 #[test]
-fn slot_collisions_back_off_without_filing_a_question_and_retry_after_cooldown() {
+fn slot_collisions_back_off_without_filing_a_question_and_retry_after_backoff() {
     let fx = fx();
     let id = fx.conflicted("Slot occupied");
-    for ago in [2 * HOUR, HOUR] {
+    for ago in [120, 60] {
         let execution = fx
             .db
             .create_execution(
@@ -839,15 +838,15 @@ fn a_question_filed_for_runs_that_started_and_died_stays_open() {
 fn the_launch_backoff_names_the_waiting_items_the_next_attempt_and_the_error() {
     let fx = fx();
     assert_eq!(fx.db.progression_launch_backoff().unwrap(), None);
-    let cooldown = 6 * HOUR;
+    let backoff_secs = 120;
 
-    let older = fx.conflicted("Failed to launch two hours ago");
-    fx.failed_launch(&older, 2 * HOUR);
-    let newer = fx.conflicted("Failed to launch an hour ago");
-    let latest = fx.failed_launch(&newer, HOUR);
-    // Not waiting on a launch: its cooldown is over, it stopped being stuck,
+    let older = fx.conflicted("Failed to launch a minute ago");
+    fx.failed_launch(&older, 60);
+    let newer = fx.conflicted("Failed to launch thirty seconds ago");
+    let latest = fx.failed_launch(&newer, 30);
+    // Not waiting on a launch: its backoff is over, it stopped being stuck,
     // its run completed, or its run started and then died.
-    let due = fx.conflicted("Cooldown over");
+    let due = fx.conflicted("Backoff over");
     fx.failed_launch(&due, 7 * HOUR);
     let healed = fx.conflicted("No longer stuck");
     fx.failed_launch(&healed, HOUR);
@@ -867,11 +866,11 @@ fn the_launch_backoff_names_the_waiting_items_the_next_attempt_and_the_error() {
         now() - backoff.latest_failure_epoch_s,
         backoff.next_attempt_epoch_s - now(),
     );
-    assert!((HOUR..HOUR + 60).contains(&failed_ago), "{backoff:?}");
-    let first_due = cooldown - 2 * HOUR;
+    assert!((30..90).contains(&failed_ago), "{backoff:?}");
+    let first_due = backoff_secs - 60;
     assert!((first_due - 60..=first_due).contains(&next_in), "{backoff:?}");
 
-    // The item whose cooldown is over is given its run; the two still inside
+    // The item whose backoff is over is given its run; the two still inside
     // theirs are what the report keeps naming.
     let pass = fx.pass();
     assert_eq!(
@@ -883,13 +882,127 @@ fn the_launch_backoff_names_the_waiting_items_the_next_attempt_and_the_error() {
     );
     assert_eq!(fx.db.progression_launch_backoff().unwrap().unwrap().waiting_items, 2);
 
-    // Once their cooldowns end nothing is backing off: they are candidates.
+    // Once their backoffs end nothing is backing off: they are candidates.
     fx.sql(&format!(
-        "UPDATE work_executions SET finished_at = finished_at - {cooldown}
+        "UPDATE work_executions SET finished_at = finished_at - {backoff_secs}
          WHERE kind = 'progression' AND work_item_id IN ('{older}', '{newer}')"
     ));
     assert_eq!(fx.db.progression_launch_backoff().unwrap(), None);
     assert!(fx.is_candidate(&older) && fx.is_candidate(&newer));
+}
+
+/// The production calibration must not turn a failed start into a multi-day wait.
+#[test]
+fn launch_backoff_doubles_to_thirty_minutes_independently_of_calibration() {
+    let fx = fx();
+    fx.sql("INSERT OR REPLACE INTO metadata(key, value) VALUES ('progression.cooldown_secs', '187680')");
+    let id = fx.conflicted("Retry launches promptly");
+    for (index, seconds) in [120, 240, 480, 960, 1800, 1800, 1800].into_iter().enumerate() {
+        let run = fx.failed_launch(&id, 1000 - index as i64 * 10);
+        let finished = now();
+        fx.sql(&format!(
+            "UPDATE work_executions SET finished_at = {finished} WHERE id = '{run}'"
+        ));
+        let report = fx.db.progression_launch_backoff().unwrap().unwrap();
+        assert_eq!(report.next_attempt_epoch_s, finished + seconds, "failure {}", index + 1);
+        assert_eq!(report.waiting_items, 1);
+        assert!(!fx.is_candidate(&id));
+        assert!(!fx.db.progression_clauses(&id).unwrap().unwrap().in_cooldown);
+        // The retry is eligible at the deadline even while a 52-hour cooldown
+        // would still be running. Only finished_at moves; ordering stays stable.
+        fx.sql(&format!(
+            "UPDATE work_executions SET finished_at = {} WHERE id = '{run}'",
+            now() - seconds - 1
+        ));
+        assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+        assert!(fx.is_candidate(&id), "failure {}", index + 1);
+    }
+    let acted = fx.conflicted("Started runs retain the calibrated cooldown");
+    let run = fx.past_run(&acted, "completed", Some("progressed"), 30 * HOUR, "fp", S5);
+    assert!(fx.db.progression_clauses(&acted).unwrap().unwrap().in_cooldown);
+    assert!(!fx.is_candidate(&acted));
+    fx.sql(&format!(
+        "UPDATE work_executions SET finished_at = {} WHERE id = '{run}'",
+        now() - 187681
+    ));
+    assert!(fx.is_candidate(&acted));
+}
+
+#[test]
+fn successful_launch_resets_backoff_even_if_the_started_run_later_fails_or_is_cancelled() {
+    for status in ["completed", "failed", "cancelled"] {
+        let fx = fx();
+        let id = fx.conflicted("Start resets launch streak");
+        for ago in [40 * HOUR, 39 * HOUR, 38 * HOUR, 37 * HOUR, 36 * HOUR] {
+            fx.failed_launch(&id, ago);
+        }
+        let started = fx.past_run(&id, status, None, 30 * HOUR, "fp", S5);
+        assert!(fx.db.progression_launch_backoff().unwrap().is_none());
+        let failed = fx.failed_launch(&id, 30);
+        let finished: i64 = fx
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT CAST(finished_at AS INTEGER) FROM work_executions WHERE id = ?1",
+                [&failed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fx.db
+                .progression_launch_backoff()
+                .unwrap()
+                .unwrap()
+                .next_attempt_epoch_s,
+            finished + 120,
+            "{status}: {started}"
+        );
+    }
+}
+
+#[test]
+fn unstarted_withdrawals_do_not_reset_or_increase_the_launch_streak() {
+    let fx = fx();
+    let id = fx.conflicted("Withdrawn work does not count");
+    fx.failed_launch(&id, 600);
+    for (status, ago) in [("cancelled", 500), ("abandoned", 400)] {
+        let run = fx.past_run(&id, status, None, ago, "fp", S5);
+        fx.sql(&format!(
+            "UPDATE work_executions SET started_at = NULL WHERE id = '{run}'"
+        ));
+    }
+    let failed = fx.failed_launch(&id, 30);
+    let finished: i64 = fx
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT CAST(finished_at AS INTEGER) FROM work_executions WHERE id = ?1",
+            [&failed],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.db
+            .progression_launch_backoff()
+            .unwrap()
+            .unwrap()
+            .next_attempt_epoch_s,
+        finished + 240
+    );
+}
+
+#[test]
+fn starting_an_agent_clears_the_current_launch_backoff() {
+    for status in ["running", "cancelled"] {
+        let fx = fx();
+        let id = fx.conflicted("Agent started during backoff");
+        fx.failed_launch(&id, 10);
+        assert!(fx.db.progression_launch_backoff().unwrap().is_some());
+        fx.past_run(&id, status, None, 0, "fp", S5);
+        assert!(fx.db.progression_launch_backoff().unwrap().is_none(), "{status}");
+    }
 }
 
 // ── the answers ──────────────────────────────────────────────────────────────

@@ -77,12 +77,13 @@
 //!    sweep already over budget is not nominated again.
 //!
 //!    A run whose agent never started ([`launch_failed_sql`]) starts the
-//!    cooldown like any other, which is the backoff between launch attempts,
-//!    but it is not one of the runs the infrastructure-failure cap counts. The
+//!    separate launch backoff: 2 minutes, doubling per consecutive failure up
+//!    to 30 minutes, reset when an agent starts. It does not start the calibrated
+//!    cooldown or count toward the infrastructure-failure cap. The
 //!    cap is the engine admitting it cannot unstick *this item*; a failed
 //!    launch says nothing about the item, and every item given the same
 //!    driver fails the same way while that driver's launch is broken. Such an
-//!    item is retried each time its cooldown ends, and
+//!    item is retried each time its launch backoff ends, and
 //!    [`WorkDb::progression_launch_backoff`] reports the wait so it is never
 //!    silent.
 //!
@@ -524,9 +525,7 @@ pub(crate) fn create_budget_used_sql(a: &str, window: &str) -> String {
 /// is measured from the end of the run (its creation while it has not ended), a
 /// run that was cancelled before it started does not start one, a run the engine
 /// withdrew before it ever started (`abandoned` with no `started_at`) is not an
-/// attempt at all, while a never-started `failed` or `orphaned` run still counts
-/// (a spawn that fails before start still has to be backed off from, and not
-/// counting it would let the sweep re-nominate the item every tick), and a
+/// attempt at all. Failed launches use their own bounded backoff instead. A
 /// run that judged the item not stuck (`no_changes_needed`) earns the longer cooldown. `completed_only` restricts
 /// the runs to ones that reached `completed`: the cooldown the stuck report
 /// treats as "being handled" (design 3.2), as opposed to the broader one that
@@ -537,9 +536,11 @@ fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
     } else {
         "px.status <> 'cancelled' AND NOT (px.status = 'abandoned' AND px.started_at IS NULL)"
     };
+    let launch_failed = launch_failed_sql("px");
     format!(
         "EXISTS (SELECT 1 FROM work_executions px
                  WHERE px.work_item_id = {a}.id AND px.kind = 'progression' AND {status_filter}
+                   AND NOT {launch_failed}
                    AND COALESCE(CAST(px.finished_at AS INTEGER), CAST(px.created_at AS INTEGER))
                        + ({cooldown}) * (CASE WHEN px.run_done_outcome = 'no_changes_needed'
                                               THEN {NO_ACTION_COOLDOWN_MULTIPLIER} ELSE 1 END) > {NOW})"
@@ -577,14 +578,32 @@ fn infrastructure_failing_sql(a: &str) -> String {
         .join(" AND ")
 }
 
-/// When the cooldown after the item's latest progression attempt ends, if that
-/// attempt failed to launch and the cooldown is still running; NULL otherwise.
-/// This is progression backing off on the item: nothing is wrong with the
-/// item, and the next attempt is made as soon as this moment passes.
-fn launch_backoff_until_sql(a: &str, cooldown: &str) -> String {
-    let attempt = attempt_sql("bx", a);
+/// When the latest failed launch's retry backoff ends; NULL outside backoff.
+/// Only the five most recent attempts are needed to reach the 30-minute cap.
+/// Started cancellations reset the streak too; withdrawn unstarted attempts
+/// neither reset nor increase it. Execution history makes this survive restarts.
+fn launch_backoff_until_sql(a: &str) -> String {
+    let attempt = format!(
+        "bx.work_item_id = {a}.id AND bx.kind = 'progression'
+         AND (({}) OR bx.started_at IS NOT NULL)",
+        attempt_sql("bx", a)
+    );
     let launch_failed = launch_failed_sql("bx");
-    let until = format!("COALESCE(CAST(bx.finished_at AS INTEGER), CAST(bx.created_at AS INTEGER)) + ({cooldown})");
+    let history_attempt = attempt_sql("hx", a);
+    let history_failed = launch_failed_sql("hx");
+    let streak = format!(
+        "(SELECT COALESCE(MIN(CASE WHEN NOT failed THEN position - 1 END), COUNT(*))
+          FROM (SELECT failed, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS position
+                FROM (SELECT {history_failed} AS failed, hx.created_at, hx.id
+                      FROM work_executions hx
+                      WHERE hx.work_item_id = {a}.id AND hx.kind = 'progression'
+                        AND (({history_attempt}) OR hx.started_at IS NOT NULL)
+                      ORDER BY hx.created_at DESC, hx.id DESC LIMIT 5)))"
+    );
+    let until = format!(
+        "COALESCE(CAST(bx.finished_at AS INTEGER), CAST(bx.created_at AS INTEGER))
+         + MIN(120 << (({streak}) - 1), 1800)"
+    );
     format!(
         "(SELECT CASE WHEN {launch_failed} AND {until} > {NOW} THEN {until} END
           FROM work_executions bx WHERE {attempt}
@@ -601,7 +620,7 @@ fn run_state_select(cooldown: &str) -> String {
     let in_cooldown = in_cooldown_sql("t", cooldown, false);
     let in_completed_cooldown = in_cooldown_sql("t", cooldown, true);
     let infrastructure_failing = infrastructure_failing_sql("t");
-    let launch_backoff_until = launch_backoff_until_sql("t", cooldown);
+    let launch_backoff_until = launch_backoff_until_sql("t");
     format!(
         "EXISTS (SELECT 1 FROM work_executions lx
                  WHERE lx.work_item_id = t.id AND lx.kind = 'progression'
@@ -631,7 +650,7 @@ fn views_sql() -> String {
                  AND ((s.grace_stamp IS NOT NULL AND CAST(s.grace_stamp AS INTEGER) >= s.stuck_since)
                       OR {NOW} - s.stuck_since >= {stuck_after}))"
     );
-    let c6 = "(NOT s.in_cooldown AND NOT s.infrastructure_failing AND NOT s.create_budget_exhausted)";
+    let c6 = "(NOT s.in_cooldown AND s.launch_backoff_until IS NULL AND NOT s.infrastructure_failing AND NOT s.create_budget_exhausted)";
     let create_budget_exhausted = create_budget_exhausted_sql("t", &max_creates, &create_window);
     let run_state = run_state_select(&cooldown);
     let prereq_edges = prereq_task_edges_sql();
@@ -843,7 +862,7 @@ impl ProgressionClauses {
             (
                 6,
                 self.cooldown_and_budget_clear,
-                "inside the cooldown after a progression run, progression failed twice in a row, or the create budget is exhausted",
+                "inside the cooldown or launch backoff after a progression run, progression failed twice in a row, or the create budget is exhausted",
             ),
         ]
         .into_iter()
@@ -859,15 +878,15 @@ impl WorkDb {
     /// when. `None` when no item is waiting on one.
     ///
     /// An item counts when its latest progression run failed to launch
-    /// ([`launch_failed_sql`]), the cooldown from that run is still running,
+    /// ([`launch_failed_sql`]), the launch backoff from that run is still running,
     /// and every other clause that does not depend on time or on the run
-    /// history holds, so the cooldown is the one thing between the item and
+    /// history holds, so the backoff is the one thing between the item and
     /// its next run. An item that stopped being stuck, was parked, or picked
     /// up live work in the meantime is not waiting on progression at all.
     pub fn progression_launch_backoff(&self) -> Result<Option<ProgressionLaunchBackoff>> {
         let conn = self.connect()?;
         // The run-state view is cheap; the clause view is the expensive one,
-        // so it is only read when some item is inside such a cooldown.
+        // so it is only read when some item is inside such a backoff.
         let any: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM progression_run_state WHERE launch_backoff_until IS NOT NULL)",
             [],
@@ -1078,14 +1097,14 @@ fn insert_progression_execution(conn: &Connection, work_item_id: &str) -> Result
 }
 
 /// Progression backing off after its agents failed to launch: the stuck items
-/// that would be given a run now but for the cooldown a failed launch started.
+/// that would be given a run now but for the backoff a failed launch started.
 /// Nothing is asked of the owner and nothing is given up: each item is retried
-/// when its cooldown ends. See [`WorkDb::progression_launch_backoff`].
+/// when its launch backoff ends. See [`WorkDb::progression_launch_backoff`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgressionLaunchBackoff {
-    /// Items waiting out that cooldown.
+    /// Items waiting out that launch backoff.
     pub waiting_items: usize,
-    /// Epoch seconds at which the first of those cooldowns ends, which is when
+    /// Epoch seconds at which the first of those launch backoffs ends, which is when
     /// the next launch is attempted.
     pub next_attempt_epoch_s: i64,
     /// The most recent failed launch among those items.
