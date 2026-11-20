@@ -316,6 +316,43 @@ final class PaneLayoutModelBoundaryTests: XCTestCase {
         XCTAssertEqual(model.pageSelectors.map(\.occupiedCount), [16, 1])
     }
 
+    func testPaginationUsesAllEighteenCellsInASixByThreeLayout() {
+        for count in [16, 17, 18, 19, 35, 36, 37] {
+            var model = F.model(geometry: geometry(2600, 1100))
+            model.updateMembers(F.members(0...(count - 1)))
+            XCTAssertEqual(model.capacity, 18)
+            XCTAssertEqual(model.pageCount, (count + 17) / 18)
+            XCTAssertEqual(model.pages.flatMap(F.occupiedRunIds), (0..<count).map(F.runId))
+            for page in model.pages.dropLast() {
+                XCTAssertEqual(page.shape, GridShape(columns: 6, rows: 3))
+                XCTAssertEqual(page.occupiedCount, 18)
+                XCTAssertFalse(page.cells.contains { $0.content == .empty })
+            }
+            if count <= 18 {
+                XCTAssertEqual(model.currentPage?.shape, GridShape(columns: 6, rows: 3))
+                XCTAssertEqual(model.currentPage?.cells.filter { $0.content == .empty }.count, 18 - count)
+                XCTAssertFalse(model.selectorsVisible)
+            } else {
+                XCTAssertEqual(model.pageSelectors.first?.occupiedCount, 18)
+                XCTAssertEqual(model.reveal(runId: F.runId(count - 1)), .revealed)
+                XCTAssertEqual(model.selectedPage, (count - 1) / 18)
+            }
+        }
+    }
+
+    func testGrowingToEighteenCellsBringsOverflowAgentsOntoTheFirstPage() {
+        var model = F.model(geometry: geometry(4000, 3000))
+        model.updateMembers(F.members(0...17))
+        XCTAssertEqual(model.reveal(runId: F.runId(17)), .revealed)
+        XCTAssertEqual(model.selectedPage, 1)
+        model.updateGeometry(geometry(2600, 1100))
+        XCTAssertEqual(model.capacity, 18)
+        XCTAssertEqual(model.pageCount, 1)
+        XCTAssertEqual(model.selectedPage, 0)
+        XCTAssertEqual(model.currentPage?.occupiedCount, 18)
+        XCTAssertFalse(model.selectorsVisible)
+    }
+
     func testResizeInsideTheDeadBandKeepsCapacity() {
         var model = F.model()
         model.updateGeometry(geometry(1690, 720))

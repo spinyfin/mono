@@ -74,7 +74,8 @@ public struct PaneCapacityPolicy: Equatable, Sendable {
     /// Height of the two-line pane header, in points. Estimated height of the
     /// rendered two-line header; not yet measured.
     public var headerHeight: Double
-    /// Upper bound on logical cells per page; excess workers get another page.
+    /// Target cells per page. Pagination includes any extra rectangles needed
+    /// to render this target as a complete grid.
     public var maxPanesPerPage: Int
     /// Spacing between adjacent panes, in points.
     public var gap: Double
@@ -107,7 +108,7 @@ public struct PaneCapacityPolicy: Equatable, Sendable {
         )
     }
 
-    /// Per-page logical capacity for the given limits.
+    /// Target capacity for the given limits, before rounding to a rendered grid.
     public func capacity(of limits: GridLimits) -> Int {
         min(limits.columns * limits.rows, maxPanesPerPage)
     }
