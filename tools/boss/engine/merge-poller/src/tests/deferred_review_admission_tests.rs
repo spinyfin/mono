@@ -523,3 +523,73 @@ async fn review_pool_sampling_survives_yield_before_upkeep() {
             .any(|p| p.phase == PassPhase::ReviewBatchUpkeep)
     );
 }
+
+fn contributed_head(db: &WorkDb, revision_id: &str) -> Option<String> {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT revision_stop_contributed_head FROM work_executions
+             WHERE work_item_id = ?1 AND kind = 'revision_implementation' AND status = 'completed'",
+            [revision_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A revision's run ended by declaring delivery while the review pool was
+/// full. The sweep's first pass is deferred again and records the head the
+/// revision is held for. Its next pass, with room in the pool, creates the
+/// batch for that revision, so the batch's verdict can find it.
+#[tokio::test]
+async fn sweep_records_the_head_of_a_revision_deferred_for_a_full_pool() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let root_id = in_review_root(&db);
+    let revision_id = held_revision(&db, &root_id, false);
+    assert_eq!(contributed_head(&db, &revision_id), None);
+    let publisher = RecordingPublisher::default();
+    // Another PR's review takes the pool's only slot.
+    let other_root = in_review_root(&db);
+    let ReviewBatchDispatch::Created { batch: occupier, .. } = db
+        .create_pre_merge_review_batch_for_pool(
+            batch_input(other_root, PR_URL, "other-head"),
+            "https://github.com/example/repo",
+            crate::work::PRE_MERGE_BATCH_RESERVATION_UNITS as usize,
+        )
+        .unwrap()
+    else {
+        panic!("an empty pool must admit the occupying review");
+    };
+
+    let mut outcome = SweepOutcome::default();
+    super::super::deferred_review_admission::sweep_deferred_review_admission_with(
+        &db,
+        &publisher,
+        &FixedHeadEnqueuer { head: "head-a" },
+        None,
+        crate::work::PRE_MERGE_BATCH_RESERVATION_UNITS as usize,
+        &mut outcome,
+    )
+    .await;
+
+    assert_eq!(outcome.review_admission_still_deferred, 1, "{outcome:?}");
+    assert!(db.review_batches_for_cycle_root(&root_id).unwrap().is_empty());
+    assert_eq!(contributed_head(&db, &revision_id).as_deref(), Some("head-a"));
+    assert_eq!(open_deferred_markers(&db), vec![revision_id.clone()]);
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            [&occupier.id],
+        )
+        .unwrap();
+    let outcome = sweep(&db, &publisher, "head-a").await;
+
+    assert_eq!(outcome.review_admission_recovered, 1, "{outcome:?}");
+    let batches = db.review_batches_for_cycle_root(&root_id).unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].producing_work_item_id.as_deref(), Some(revision_id.as_str()));
+    assert_eq!(batches[0].target_sha, "head-a");
+    assert!(open_deferred_markers(&db).is_empty());
+}

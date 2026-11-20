@@ -9,6 +9,7 @@ use boss_protocol::{DispatchFocus, DispatchFocusTargetKind, RequestExecutionInpu
 
 use super::*;
 use crate::work::{PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND, ReviewBatchDispatch};
+use boss_engine_storage_values::attention_kinds::PR_REVIEW_HELD_REVISION_UNPLACEABLE_ATTENTION_KIND;
 
 const REPO: &str = "https://github.com/example/repo";
 const HEAD: &str = "head-sha";
@@ -278,4 +279,208 @@ fn a_batch_leaves_the_marker_of_a_revision_awaiting_another_head() {
         vec![other],
         "only the revision awaiting a different head stays marked"
     );
+}
+
+// ── a revision whose review was deferred for a full review pool ────────────
+
+/// A review pool with room for one batch at a time.
+const ONE_BATCH_POOL: usize = crate::work::PRE_MERGE_BATCH_RESERVATION_UNITS as usize;
+
+/// Another PR's review takes the pool's only slot, so every other admission
+/// defers. Returns the occupying batch.
+fn fill_the_pool(db: &WorkDb) -> String {
+    let product = create_test_product(db);
+    let other = create_test_chore_manual(db, product.id, "Other PR owner");
+    bind_open_pr(db, &other.id);
+    let ReviewBatchDispatch::Created { batch, .. } = db
+        .create_pre_merge_review_batch_for_pool(batch_input(other.id, "other-head"), REPO, ONE_BATCH_POOL)
+        .unwrap()
+    else {
+        panic!("an empty pool must admit the occupying review");
+    };
+    batch.id
+}
+
+/// The occupying review settles, freeing the pool's slot.
+fn free_the_pool(db: &WorkDb, occupying_batch_id: &str) {
+    raw(db)
+        .execute(
+            "UPDATE pr_review_batches SET status = 'completed' WHERE id = ?1",
+            params![occupying_batch_id],
+        )
+        .unwrap();
+}
+
+/// An `in_review` PR-owning row inside dispatch focus, with a revision held
+/// on it after its run ended by declaring delivery.
+fn delivered_revision_on_in_focus_root(db: &WorkDb) -> (String, String) {
+    let product = create_test_product(db);
+    let root = create_test_chore_manual(db, product.id, "PR owner");
+    bind_open_pr(db, &root.id);
+    let revision_id = hold_revision(db, &root.id, false);
+    raw(db)
+        .execute(
+            "UPDATE work_executions
+             SET run_done_declared_at = '1', run_done_outcome = 'delivered'
+             WHERE work_item_id = ?1 AND kind = 'revision_implementation'",
+            params![revision_id],
+        )
+        .unwrap();
+    (root.id, revision_id)
+}
+
+fn revision_input(root_id: &str, revision_id: &str) -> ReviewBatchCreateInput {
+    let mut input = batch_input(root_id.to_owned(), HEAD);
+    input.legacy_task_id = Some(revision_id.to_owned());
+    input
+}
+
+fn contributed_head(db: &WorkDb, revision_id: &str) -> Option<String> {
+    raw(db)
+        .query_row(
+            "SELECT revision_stop_contributed_head FROM work_executions
+             WHERE work_item_id = ?1 AND kind = 'revision_implementation' AND status = 'completed'",
+            params![revision_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn open_unplaceable_items(db: &WorkDb) -> Vec<String> {
+    db.list_open_attention_items_of_kind(PR_REVIEW_HELD_REVISION_UNPLACEABLE_ATTENTION_KIND)
+        .unwrap()
+        .into_iter()
+        .filter_map(|item| item.work_item_id)
+        .collect()
+}
+
+/// Both leaf reviewers of `batch` die with no retry left, so the batch fails.
+fn fail_the_batch(db: &WorkDb, batch: &boss_protocol::ReviewBatch, reviewers: &[crate::work::WorkExecution]) {
+    for reviewer in reviewers {
+        raw(db)
+            .execute(
+                "UPDATE pr_review_batch_members SET attempt = 2 WHERE execution_id = ?1",
+                params![reviewer.id],
+            )
+            .unwrap();
+        assert!(db.fail_review_batch_member_for_execution(&reviewer.id).unwrap());
+    }
+    db.try_advance_review_batch_quorum(&batch.id).unwrap();
+    assert_eq!(
+        db.review_batch(&batch.id).unwrap().unwrap().status,
+        ReviewBatchStatus::Failed
+    );
+}
+
+/// The revision's review is deferred because the pool is full. The deferral
+/// records the head the revision pushed. When the retry later creates the
+/// batch, that batch's verdict finds the revision and releases it.
+#[test]
+fn a_verdict_releases_a_revision_whose_review_was_deferred_for_a_full_pool() {
+    let (_dir, db) = open_db();
+    let (root_id, revision_id) = delivered_revision_on_in_focus_root(&db);
+    assert_eq!(contributed_head(&db, &revision_id), None, "delivery stamps no head");
+
+    let occupier = fill_the_pool(&db);
+    assert!(matches!(
+        db.create_pre_merge_review_batch_for_pool(revision_input(&root_id, &revision_id), REPO, ONE_BATCH_POOL)
+            .unwrap(),
+        ReviewBatchDispatch::AdmissionDeferred
+    ));
+    free_the_pool(&db, &occupier);
+    assert_eq!(
+        contributed_head(&db, &revision_id).as_deref(),
+        Some(HEAD),
+        "a deferral still records the head the revision is held for"
+    );
+
+    let ReviewBatchDispatch::Created { batch, executions } = db
+        .create_pre_merge_review_batch_for_pool(revision_input(&root_id, &revision_id), REPO, ONE_BATCH_POOL)
+        .unwrap()
+    else {
+        panic!("the retry must be admitted once the pool has room");
+    };
+    assert_eq!(read_task(&db, &revision_id).status, TaskStatus::Active);
+
+    review_to_a_clean_verdict(&db, &root_id, &batch, &executions);
+
+    assert_eq!(read_task(&db, &revision_id).status, TaskStatus::InReview);
+    assert!(open_unplaceable_items(&db).is_empty());
+}
+
+/// Same deferral, but the batch the retry creates fails instead of reaching a
+/// verdict. A failed batch is a decision too, and releases the revision.
+#[test]
+fn a_failed_batch_releases_a_revision_whose_review_was_deferred_for_a_full_pool() {
+    let (_dir, db) = open_db();
+    let (root_id, revision_id) = delivered_revision_on_in_focus_root(&db);
+    let occupier = fill_the_pool(&db);
+    assert!(matches!(
+        db.create_pre_merge_review_batch_for_pool(revision_input(&root_id, &revision_id), REPO, ONE_BATCH_POOL)
+            .unwrap(),
+        ReviewBatchDispatch::AdmissionDeferred
+    ));
+    free_the_pool(&db, &occupier);
+    let ReviewBatchDispatch::Created { batch, executions } = db
+        .create_pre_merge_review_batch_for_pool(revision_input(&root_id, &revision_id), REPO, ONE_BATCH_POOL)
+        .unwrap()
+    else {
+        panic!("the retry must be admitted once the pool has room");
+    };
+
+    fail_the_batch(&db, &batch, &executions);
+
+    assert_eq!(read_task(&db, &revision_id).status, TaskStatus::InReview);
+    assert!(open_unplaceable_items(&db).is_empty());
+}
+
+/// A review created for a revision by a path that never recorded its head can
+/// never find it. The revision is not moved, and the decision says so.
+#[test]
+fn a_verdict_that_cannot_find_its_held_revision_raises_an_attention_item() {
+    let (_dir, db) = open_db();
+    let (root_id, revision_id) = delivered_revision_on_in_focus_root(&db);
+
+    // Admitted against the root alone, so nothing records a head on the revision.
+    let ReviewBatchDispatch::Created { batch, executions } = db
+        .create_pre_merge_review_batch(batch_input(root_id.clone(), HEAD), REPO)
+        .unwrap()
+    else {
+        panic!("the root's review must be admitted");
+    };
+    assert_eq!(contributed_head(&db, &revision_id), None);
+
+    review_to_a_clean_verdict(&db, &root_id, &batch, &executions);
+
+    assert_eq!(read_task(&db, &revision_id).status, TaskStatus::Active);
+    assert_eq!(open_unplaceable_items(&db), vec![revision_id.clone()]);
+
+    // Once admission records the head the revision awaits, a review can find
+    // it again, so the item comes down.
+    assert!(matches!(
+        db.create_pre_merge_review_batch(revision_input(&root_id, &revision_id), REPO)
+            .unwrap(),
+        ReviewBatchDispatch::ExistingBatch { .. }
+    ));
+    assert_eq!(contributed_head(&db, &revision_id).as_deref(), Some(HEAD));
+    assert!(open_unplaceable_items(&db).is_empty());
+}
+
+/// A failed batch that cannot find the revision it should release raises the
+/// same item rather than returning silently.
+#[test]
+fn a_failed_batch_that_cannot_find_its_held_revision_raises_an_attention_item() {
+    let (_dir, db) = open_db();
+    let (root_id, revision_id) = delivered_revision_on_in_focus_root(&db);
+    let ReviewBatchDispatch::Created { batch, executions } = db
+        .create_pre_merge_review_batch(batch_input(root_id.clone(), HEAD), REPO)
+        .unwrap()
+    else {
+        panic!("the root's review must be admitted");
+    };
+
+    fail_the_batch(&db, &batch, &executions);
+
+    assert_eq!(read_task(&db, &revision_id).status, TaskStatus::Active);
+    assert_eq!(open_unplaceable_items(&db), vec![revision_id]);
 }

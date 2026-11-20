@@ -410,6 +410,12 @@ pub const PR_REVIEW_BATCH_STALE_ATTENTION_KIND: &str = "pr_review_batch_stale";
 /// state.
 pub const PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND: &str = "pr_review_reported_member_live";
 
+/// `work_attention_items.kind` filed on a revision that is still held `active`
+/// for review after a review decision (a verdict, or a failed batch) settled
+/// on its PR, because its latest completed run recorded no contributed head
+/// and so no decision can match it. Released revisions resolve it.
+pub const PR_REVIEW_HELD_REVISION_UNPLACEABLE_ATTENTION_KIND: &str = "pr_review_held_revision_unplaceable";
+
 /// `work_attention_items.kind` filed when a staged `review_verdict` cannot
 /// apply because its batch is not (and could not be advanced to) `applying`.
 /// The producer (this applier) resolves it on a later pass that actually
