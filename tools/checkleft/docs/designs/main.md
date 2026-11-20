@@ -79,3 +79,4 @@ while still allowing the `mono` version to diverge afterward.
 - [`bazel-repo-local-checks`](bazel-repo-local-checks.md)
 - [`bazel-policy-checks`](bazel-policy-checks.md)
 - [`bazel-central-checks`](bazel-central-checks.md)
+- [`checkleft-extensibility`](checkleft-extensibility.md)
