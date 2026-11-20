@@ -156,10 +156,7 @@ fn setup_fixture(guard_body: &str) -> Fixture {
         .status();
 
     let guard = codex_home.join("guard.sh");
-    fs::write(&guard, guard_body).unwrap();
-    let mut perms = fs::metadata(&guard).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&guard, perms).unwrap();
+    write_test_executable(&guard, guard_body);
 
     let guard = resolve_absolute(&guard);
     // Write config first so resolve_absolute can canonicalize the path to the
@@ -439,10 +436,7 @@ fn arm_succeeds_when_observer_reports_trusted_matching_hashes() {
     verify_attestation(&att, &hooks).expect("fresh attestation must verify");
 
     // Content change makes attestation stale.
-    fs::write(&fx.guard, "#!/bin/sh\necho mutated\n").unwrap();
-    let mut perms = fs::metadata(&fx.guard).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&fx.guard, perms).unwrap();
+    write_test_executable(&fx.guard, "#!/bin/sh\necho mutated\n");
     let err = verify_attestation(&att, &hooks).unwrap_err();
     assert!(matches!(err, TrustGateError::AttestationStale { .. }));
 }
@@ -689,10 +683,7 @@ fn a_removed_guard_command_breaks_the_chain() {
 #[test]
 fn an_edited_guard_command_breaks_the_chain() {
     let (fx, att) = armed_fixture();
-    fs::write(&fx.guard, "#!/bin/sh\necho '{\"decision\":\"approve\"}'\n").unwrap();
-    let mut perms = fs::metadata(&fx.guard).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&fx.guard, perms).unwrap();
+    write_test_executable(&fx.guard, "#!/bin/sh\necho '{\"decision\":\"approve\"}'\n");
     assert!(matches!(
         verify_armed_chain_on_disk(&att).unwrap_err(),
         TrustGateError::AttestationStale { .. }
@@ -802,14 +793,42 @@ fn which_codex() -> Option<PathBuf> {
 
 // ── Diagnostics wiring ──────────────────────────────────────────────────────
 
+/// Keep writable script descriptors out of the multithreaded test process.
+/// A concurrent fork could inherit one even with CLOEXEC, preventing execution
+/// on Linux until that child execs or exits. Renaming does not change the inode.
+/// Only this single-threaded shell opens the file; its builtin printf spawns no
+/// descendants, and waiting for exit ensures every writable descriptor is closed.
+fn write_test_executable(path: &Path, body: &str) {
+    let status = Command::new("/bin/sh")
+        .args(["-c", "printf '%s' \"$2\" > \"$1\"", "write-test-executable"])
+        .arg(path)
+        .arg(body)
+        .stdin(Stdio::null())
+        .status()
+        .expect("start test executable writer");
+    assert!(status.success(), "write test executable: {status:?}");
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+#[test]
+fn test_executable_writer_preserves_literal_script_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("script with spaces ' and $quotes");
+    let body = "#!/bin/sh\nprintf '%s' 'literal $HOME and $(exit 1)'\n";
+    write_test_executable(&path, body);
+    assert_eq!(fs::read_to_string(&path).unwrap(), body);
+    let output = Command::new(&path).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"literal $HOME and $(exit 1)");
+}
+
 /// Write an executable fake `codex` that runs `body` as a shell script.
 fn fake_codex(body: &str) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("codex");
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
+    write_test_executable(&path, &format!("#!/bin/sh\n{body}\n"));
     (tmp, path)
 }
 
