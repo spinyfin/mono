@@ -7,6 +7,14 @@ struct NavigatorRowPresentation {
 
     var isWorkerActive = false
 
+    /// True when any of the row's activities maps (by run id, falling back
+    /// to execution id) to a live worker that is currently working.
+    static func isWorkerActive(row: NavigatorRow, liveStates: [String: WorkerLiveState]) -> Bool {
+        row.projection.activities.contains { activity in
+            liveStates[activity.runId ?? activity.executionId]?.activity == .working
+        }
+    }
+
     var showsSecondaryIndicators: Bool { width >= 340 }
     var health: (label: String, symbol: String)? {
         if row.task.prMergeableState == "conflicting" {
@@ -54,19 +62,17 @@ struct WorkNavigatorRow: View {
     let project: String?
     let width: CGFloat
     let isSelected: Bool
-    @ObservedObject var liveWorkers = LiveWorkerStateStore()
+    @ObservedObject var liveWorkers: LiveWorkerStateStore
     @Environment(\.dynamicTypeSize) private var textSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let isWorkerActive = row.projection.activities.contains { activity in
-            liveWorkers.byRunID[activity.runId ?? activity.executionId]?.activity == .working
-        }
+        let isWorkerActive = NavigatorRowPresentation.isWorkerActive(row: row, liveStates: liveWorkers.byRunID)
         let presentation = NavigatorRowPresentation(row: row, project: project, width: width, isWorkerActive: isWorkerActive)
         HStack(spacing: 6) {
             if row.projection.knownSection == .working {
                 Image(systemName: "circle.fill").font(.system(size: 5))
-                    .foregroundStyle(isWorkerActive ? Color.green : Color.gray.opacity(0.4))
+                    .foregroundStyle(isWorkerActive ? Color.green : Color(nsColor: .tertiaryLabelColor))
                     .symbolEffect(.pulse, options: .repeating, isActive: isWorkerActive && !reduceMotion)
             }
             Image(systemName: presentation.symbol).frame(width: 18)

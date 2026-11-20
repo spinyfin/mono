@@ -99,7 +99,7 @@ final class NavigatorRowTests: XCTestCase {
             XCTAssertTrue(presentation.accessibilityLabel.contains("Review changes requested"))
             XCTAssertTrue(presentation.accessibilityLabel.contains("1 questions"))
             XCTAssertTrue(presentation.accessibilityLabel.contains(task.name))
-            let view = WorkNavigatorRow(row: row, project: "Navigation", width: width, isSelected: true)
+            let view = WorkNavigatorRow(row: row, project: "Navigation", width: width, isSelected: true, liveWorkers: LiveWorkerStateStore())
                 .frame(width: width).background(Color(nsColor: .windowBackgroundColor))
             let host = NSHostingView(rootView: view)
             host.frame = NSRect(origin: .zero, size: host.fittingSize)
@@ -107,7 +107,7 @@ final class NavigatorRowTests: XCTestCase {
             XCTAssertEqual(host.bounds.height, 30, accuracy: 1)
             try capture(host, name: "navigator-row-\(Int(width))")
         }
-        let large = NSHostingView(rootView: WorkNavigatorRow(row: row, project: "Navigation", width: 260, isSelected: false)
+        let large = NSHostingView(rootView: WorkNavigatorRow(row: row, project: "Navigation", width: 260, isSelected: false, liveWorkers: LiveWorkerStateStore())
             .dynamicTypeSize(.accessibility3).frame(width: 260).background(Color(nsColor: .windowBackgroundColor)))
         large.frame = NSRect(origin: .zero, size: large.fittingSize)
         XCTAssertEqual(large.bounds.width, 260, accuracy: 1)
@@ -122,6 +122,21 @@ final class NavigatorRowTests: XCTestCase {
         let active = NavigatorRowPresentation(row: row, project: nil, width: 260, isWorkerActive: true)
         XCTAssertTrue(idle.accessibilityLabel.contains("Worker idle"))
         XCTAssertTrue(active.accessibilityLabel.contains("Worker active"))
+    }
+
+    func testActiveDetectionMapsLiveWorkerStateToRow() throws {
+        let task = NavigatorTestFixture.task(section: "working")
+        let row = NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil)
+        func live(_ id: String, _ activity: WorkerActivity) -> WorkerLiveState {
+            WorkerLiveState(slotId: 1, runId: id, model: "model", shellPid: 1, lastEventAt: nil, currentTool: nil,
+                            lastToolEndedAt: nil, activity: activity, liveStatus: nil, liveStatusAt: nil,
+                            recoveryStatus: nil, tmuxHosted: nil)
+        }
+        typealias P = NavigatorRowPresentation
+        XCTAssertTrue(P.isWorkerActive(row: row, liveStates: ["run": live("run", .working)]))
+        XCTAssertFalse(P.isWorkerActive(row: row, liveStates: ["run": live("run", .idle)]))
+        XCTAssertFalse(P.isWorkerActive(row: row, liveStates: ["other": live("other", .working)]))
+        XCTAssertFalse(P.isWorkerActive(row: row, liveStates: [:]))
     }
 
     func testHealthPriorityKeepsSuppressedFactsAccessible() throws {
