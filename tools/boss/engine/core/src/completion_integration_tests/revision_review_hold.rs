@@ -228,20 +228,37 @@ impl Scene {
             .filter_map(|member| member.execution_id)
             .collect();
         assert_eq!(reviewers.len(), 2);
+        let mut sources = Vec::new();
         for reviewer in &reviewers {
-            self.db
+            let leaf_findings = if findings {
+                serde_json::json!([{
+                    "severity": "high", "category": "correctness", "confidence": "high",
+                    "file": "src/lib.rs", "title": "Unchecked index", "problem": "Out of bounds read.",
+                    "impact": "The worker crashes.", "suggested_fix": "Check the index.",
+                    "static_evidence": "The index is not checked.", "needs_runtime_verification": false
+                }])
+            } else {
+                serde_json::json!([])
+            };
+            let report = self.db
                 .submit_worker_proposal(SubmitWorkerProposalInput {
                     execution_id: reviewer,
                     work_item_id: &self.root_id(),
                     kind: ProposalKind::ReviewReport,
                     payload_json: &format!(
-                        r#"{{"batch_id":"{batch_id}","target_sha":"{head}","report":{{"batch_id":"{batch_id}","pr_url":"{PR}","target_sha":"{head}","phase":"pre_merge","summary":"Reviewed.","coverage":{{"files_inspected":[],"files_omitted":[],"limitations":[]}},"findings":[]}}}}"#
+                        r#"{{"batch_id":"{batch_id}","target_sha":"{head}","report":{{"batch_id":"{batch_id}","pr_url":"{PR}","target_sha":"{head}","phase":"pre_merge","summary":"Reviewed.","coverage":{{"files_inspected":[],"files_omitted":[],"limitations":[]}},"findings":{leaf_findings}}}}}"#
                     ),
                     idempotency_key: "report",
                 })
                 .unwrap()
                 .unwrap();
+            assert_eq!(report.proposal.state, boss_protocol::ProposalState::Applied);
+            let payload: serde_json::Value = serde_json::from_str(&report.proposal.payload_json).unwrap();
+            for finding in payload["report"]["findings"].as_array().unwrap() {
+                sources.push(finding["id"].as_str().unwrap().to_owned());
+            }
         }
+        let sources = serde_json::to_string(&sources).unwrap();
         let supervisor = self
             .db
             .review_batch_members(batch_id)
@@ -252,7 +269,7 @@ impl Scene {
             .expect("both reports dispatch the supervisor");
         let verdict = if findings {
             format!(
-                r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR}","target_sha":"{head}","phase":"pre_merge","summary":"One defect.","revision_warranted":true,"findings":[{{"severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":["claude"]}}],"contradictions":[]}}}}"#
+                r#"{{"batch_id":"{batch_id}","verdict":{{"batch_id":"{batch_id}","pr_url":"{PR}","target_sha":"{head}","phase":"pre_merge","summary":"One defect.","revision_warranted":true,"findings":[{{"id":"consolidated-1","severity":"high","category":"correctness","confidence":"high","file":"src/lib.rs","title":"Unchecked index","detail":"Out of bounds read.","sources":{sources}}}],"contradictions":[]}}}}"#
             )
         } else {
             format!(
@@ -270,6 +287,7 @@ impl Scene {
             })
             .unwrap()
             .unwrap();
+        assert_eq!(submitted.proposal.state, boss_protocol::ProposalState::Proposed);
         let created = crate::test_support::apply_review_verdict(
             &self.db,
             &submitted.proposal.id,
