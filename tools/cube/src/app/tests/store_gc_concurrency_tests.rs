@@ -10,7 +10,7 @@ use clap::Parser;
 use std::cell::Cell;
 use std::sync::mpsc;
 use std::sync::{
-    Arc,
+    Arc, Barrier,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ struct Runner {
     resume: Option<mpsc::Receiver<()>>,
     cut: Option<String>,
     collector_active: Option<Arc<AtomicBool>>,
+    collection_start: Option<Arc<Barrier>>,
 }
 
 impl CommandRunner for Runner {
@@ -66,6 +67,12 @@ impl CommandRunner for Runner {
         let collecting = invocation.args.iter().any(|arg| arg == "gc");
         if collecting && let Some(active) = &self.collector_active {
             active.store(true, Ordering::SeqCst);
+        }
+        if collecting && let Some(start) = &self.collection_start {
+            // Let the first live lease observe the active collector before
+            // both launch their commands, even with a tiny view store.
+            start.wait();
+            start.wait();
         }
         let output = RealCommandRunner.run_with_timeout(&invocation, timeout);
         if collecting && let Some(active) = &self.collector_active {
@@ -153,7 +160,7 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         let staged_views = staged_views.clone();
         move || {
             std::fs::create_dir(&staged_views)?;
-            crate::app::test_fs::create_sparse_files(&staged_views, 137_000, 8192)
+            crate::app::test_fs::create_sparse_files(&staged_views, fixture::unreachable_views(), 8192)
         }
     });
     let database = f._dir.path().join("state.db");
@@ -190,8 +197,14 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         .unwrap();
     let collector_active = Arc::new(AtomicBool::new(false));
     let overlapping_leases = AtomicUsize::new(0);
-    let lease = || {
+    let lease = |collection_start: Option<&Barrier>| {
+        if let Some(start) = collection_start {
+            start.wait();
+        }
         let collecting_at_start = collector_active.load(Ordering::SeqCst);
+        if let Some(start) = collection_start {
+            start.wait();
+        }
         let started = Instant::now();
         let result = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "gc contention"]),
@@ -209,7 +222,7 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         );
         (started.elapsed(), result)
     };
-    let (baseline, first) = lease();
+    let (baseline, first) = lease(None);
     // Release through the real command path before timing reuse again.
     let release = |result: &crate::app::errors::RunResult| {
         let id = result.payload["workspace"]["lease_id"].as_str().expect("lease id");
@@ -263,7 +276,7 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     let _env = crate::app::tests::support::ENV_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let (scale_baseline, before_gc) = lease();
+    let (scale_baseline, before_gc) = lease(None);
     release(&before_gc);
     eprintln!("lease baseline: small store={baseline:?}, populated store={scale_baseline:?}");
 
@@ -279,9 +292,11 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
 
     let (collect_tx, collect_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
+    let collection_start = Arc::new(Barrier::new(2));
     let mut gc_runner = runner(&f);
     gc_runner.collector_active = Some(collector_active.clone());
-    gc_runner.cut = Some(cut);
+    gc_runner.collection_start = Some(collection_start.clone());
+    gc_runner.cut = Some(cut.clone());
     gc_runner.collecting = Some(collect_tx);
     gc_runner.resume = Some(resume_rx);
     let gc_database = database.clone();
@@ -319,7 +334,7 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     let pooled_before = pooled();
     // Deterministically hold the collection phase open: accidentally
     // extending exclusivity here would fail regardless of machine speed.
-    let (during, second) = lease();
+    let (during, second) = lease(None);
     assert_eq!(
         pooled(),
         pooled_before,
@@ -327,11 +342,11 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
     );
     release(&second);
     resume_tx.send(()).unwrap();
-    let (concurrent, third) = lease();
+    let (concurrent, third) = lease(Some(&collection_start));
     release(&third);
     let mut live_samples = vec![concurrent];
     std::thread::scope(|scope| {
-        let attempts: Vec<_> = (0..13).map(|_| scope.spawn(lease)).collect();
+        let attempts: Vec<_> = (0..13).map(|_| scope.spawn(|| lease(None))).collect();
         for attempt in attempts {
             let (latency, result) = attempt.join().unwrap();
             live_samples.push(latency);
@@ -339,7 +354,7 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         }
     });
     while !gc.is_finished() {
-        let (latency, result) = lease();
+        let (latency, result) = lease(None);
         live_samples.push(latency);
         release(&result);
     }
@@ -352,8 +367,26 @@ fn real_leases_continue_during_collection_and_exclusivity_is_retryable() {
         live_samples.iter().all(|latency| *latency < Duration::from_secs(20)),
         "collection must not exhaust the dispatch deadline: {live_samples:?}"
     );
-    assert!(report.before.operations >= 16_800);
-    assert!(report.after.operations >= 16_800);
+    let retained = fixture::retained_operations();
+    assert!(report.before.operations >= retained);
+    assert!(report.after.operations >= retained);
+    assert_eq!(report.abandoned_through.as_deref(), Some(cut.as_str()));
+    assert!(
+        !f.jj(
+            &f.root,
+            &[
+                "--ignore-working-copy",
+                "op",
+                "log",
+                "--no-graph",
+                "-T",
+                "id ++ \"\\n\""
+            ]
+        )
+        .lines()
+        .any(|id| id == cut),
+        "the selected cut must no longer be reachable after the rewrite"
+    );
     eprintln!(
         "live collector lease samples: {live_samples:?}; operations {} -> {}",
         report.before.operations, report.after.operations

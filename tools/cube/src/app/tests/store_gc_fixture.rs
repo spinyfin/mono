@@ -1,11 +1,58 @@
-//! Install a private copy of the published large operation history.
+//! Real GC history: a small compatibility fixture or the published scale fixture.
 use super::Fixture;
 use crate::app::test_fs::copy_tree;
 use std::fs;
 use std::path::Path;
 
+fn cut_path() -> String {
+    std::env::var("CUBE_GC_STORE_CUT").expect("Bazel must select the GC fixture")
+}
+
+pub(super) fn retained_operations() -> u64 {
+    if cut_path().is_empty() { 16 } else { 16_800 }
+}
+
+pub(super) fn unreachable_views() -> u64 {
+    // Collector/lease startup is synchronized, so compatibility does not need
+    // the oldest-jj variant's neglected-store scale to ensure overlap.
+    if cut_path().is_empty() { 256 } else { 137_000 }
+}
+
 pub(super) fn install(f: &Fixture) -> String {
-    let cut = std::env::var("CUBE_GC_STORE_CUT").expect("Bazel must declare the GC store cut file");
+    let cut = cut_path();
+    if cut.is_empty() {
+        // Rewrite selection depends on age, not log size. The runner ages
+        // this cut past DEFAULT_KEEP and keeps all subsequent operations young.
+        let cut = f.jj(
+            &f.root,
+            &[
+                "--ignore-working-copy",
+                "op",
+                "log",
+                "--no-graph",
+                "--limit",
+                "1",
+                "-T",
+                "id",
+            ],
+        );
+        for i in 0..retained_operations() {
+            let rev = if i % 2 == 0 { "main" } else { "feat" };
+            f.jj(
+                &f.ws,
+                &[
+                    "--ignore-working-copy",
+                    "bookmark",
+                    "set",
+                    "gc-compat",
+                    "--allow-backwards",
+                    "-r",
+                    rev,
+                ],
+            );
+        }
+        return cut.trim().to_owned();
+    }
     let source = Path::new(&cut).parent().expect("fixture directory containing cut");
     // Keep the small-store lease/release baseline and its database. Replace
     // only the scratch repositories at the registered paths with the large
