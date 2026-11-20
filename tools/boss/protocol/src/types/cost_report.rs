@@ -29,21 +29,31 @@ use serde::{Deserialize, Serialize};
 /// `runs_total == runs_measured + runs_unmeasured`. `runs_zero` is a
 /// subset of `runs_measured` (a measured run whose recorded tokens
 /// happen to be exactly zero, e.g. a run that failed before calling
-/// a model). Every token field sums only `runs_measured` rows.
+/// a model). A category is NULL if any run lacks that measurement.
+/// `total_tokens` sums available categories on measured runs; when
+/// `tokens_partial` is true it is a lower bound, not a complete total.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostMeasurement {
+    /// Reasons recorded on runs without complete provider usage.
+    #[serde(default)]
+    #[builder(default)]
+    pub usage_unavailable: Vec<String>,
+    /// Totals are a lower bound when any measured category is unknown.
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_partial: bool,
     pub agent_active_ms: i64,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
     /// `true` when at least one run folded into this measurement used
-    /// a model absent from the pricing table, meaning `estimated_usd`
+    /// a model with unverified rates or incomplete categories, meaning `estimated_usd`
     /// (when present) understates the true total. `false` when either
     /// every priced-eligible run had a known price, or no USD
     /// estimate was requested at all.
     pub estimated_usd_partial: bool,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
     /// Runs with recorded token columns — includes `runs_zero`, whose
     /// recorded tokens are all exactly zero.
     pub runs_measured: u32,
@@ -114,6 +124,9 @@ pub struct TaskCostReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WindowCostReport {
+    #[serde(default)]
+    #[builder(default)]
+    pub by_driver: Vec<CostBucket>,
     pub by_effort_level: Vec<CostBucket>,
     pub by_kind: Vec<CostBucket>,
     pub by_model: Vec<CostBucket>,
@@ -137,16 +150,19 @@ pub struct WindowCostReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CostTopRow {
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_partial: bool,
     pub execution_id: String,
     pub run_id: String,
     pub work_item_id: String,
     pub short_id: Option<i64>,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub input_tokens: i64,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub input_tokens: Option<i64>,
     pub kind: String,
     pub name: String,
-    pub output_tokens: i64,
+    pub output_tokens: Option<i64>,
     pub status: String,
     pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

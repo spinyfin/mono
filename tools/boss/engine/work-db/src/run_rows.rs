@@ -334,7 +334,12 @@ impl WorkDb {
         };
         let updated = conn.execute(
             "UPDATE work_runs
-             SET model = CASE WHEN ?12 = 1 THEN ?2 ELSE COALESCE(?2, model) END,
+             SET usage_unavailable = CASE
+                     WHEN ?12 = 1 AND ?4 IS NULL THEN COALESCE(?13, 'No provider token usage observed')
+                     WHEN ?12 = 1 OR ?4 IS NOT NULL OR ?13 IS NOT NULL THEN ?13
+                     ELSE usage_unavailable
+                 END,
+                 model = CASE WHEN ?12 = 1 THEN ?2 ELSE COALESCE(?2, model) END,
                  output_tokens = CASE WHEN ?12 = 1 THEN ?3 ELSE COALESCE(?3, output_tokens) END,
                  input_tokens = CASE WHEN ?12 = 1 THEN ?4 ELSE COALESCE(?4, input_tokens) END,
                  cache_creation_tokens = CASE
@@ -376,6 +381,7 @@ impl WorkDb {
                 snapshot.rounds,
                 snapshot.agent_active_ms,
                 snapshot.full_replacement,
+                snapshot.usage_unavailable,
             ],
         )?;
         Ok(updated > 0 || attempt_updated > 0)

@@ -25,7 +25,9 @@ const COST_RECORD_COLUMNS: &str = "
     wr.cache_creation_tokens,
     wr.cache_read_tokens,
     wr.agent_active_ms,
-    CAST(wr.started_at AS INTEGER)
+    CAST(wr.started_at AS INTEGER),
+    we.driver,
+    wr.usage_unavailable
 ";
 
 fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
@@ -48,6 +50,8 @@ fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
         cache_read_tokens: row.get(15)?,
         agent_active_ms: row.get(16)?,
         started_at_epoch_s: row.get(17)?,
+        driver: row.get(18)?,
+        usage_unavailable: row.get(19)?,
     })
 }
 
@@ -59,7 +63,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .query_row(
             "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
                     'completed', 'orphaned', 100, 42, 'model-a', 'high', 'medium',
-                    0, 11, 12, 13, 14, 99",
+                    0, 11, 12, 13, 14, 99, 'grok', NULL",
             [],
             map_cost_run_record,
         )
@@ -85,6 +89,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .cache_read_tokens(13)
         .agent_active_ms(14)
         .started_at_epoch_s(99)
+        .driver("grok")
         .build();
     assert_eq!(record, expected);
 
@@ -92,7 +97,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .query_row(
             "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
                     'completed', 'orphaned', 100, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL",
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
             [],
             map_cost_run_record,
         )

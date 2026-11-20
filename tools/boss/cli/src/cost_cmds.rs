@@ -177,11 +177,17 @@ fn print_measurement_summary(m: &CostMeasurement) {
         println!("  Total tokens: {}", format_tokens(m.total_tokens));
         println!(
             "    input={} output={} cache_write={} cache_read={}",
-            format_tokens(m.input_tokens),
-            format_tokens(m.output_tokens),
-            format_tokens(m.cache_creation_tokens),
-            format_tokens(m.cache_read_tokens),
+            format_optional_tokens(m.input_tokens),
+            format_optional_tokens(m.output_tokens),
+            format_optional_tokens(m.cache_creation_tokens),
+            format_optional_tokens(m.cache_read_tokens),
         );
+    }
+    if m.tokens_partial {
+        println!("  Token totals are a lower bound; unknown categories are not counted.");
+    }
+    for reason in &m.usage_unavailable {
+        println!("  usage_unavailable: {reason}");
     }
     println!(
         "  Runs: {} measured, {} unmeasured (no token data recorded), {} recorded zero",
@@ -203,7 +209,7 @@ fn print_pricing_gaps(gaps: &[String]) {
     }
     println!();
     println!(
-        "  USD estimate excludes these models (no pricing-table entry): {}",
+        "  USD estimate excludes these models (unverified rates or incomplete usage): {}",
         gaps.join(", ")
     );
 }
@@ -246,7 +252,7 @@ fn print_task_cost_report(report: &TaskCostReport, tz: &DisplayTz) {
             row.kind.as_str(),
             row.status.as_str(),
             models.as_str(),
-            &format_tokens(row.measurement.total_tokens),
+            &format_measurement_tokens(&row.measurement),
             &row.measurement.runs_measured.to_string(),
             &row.measurement.runs_unmeasured.to_string(),
         ]);
@@ -268,7 +274,7 @@ fn print_cost_buckets(title: &str, buckets: &[CostBucket], caveat: Option<&str>)
     for bucket in buckets {
         table.add_row(vec![
             bucket.label.as_str(),
-            &format_tokens(bucket.measurement.total_tokens),
+            &format_measurement_tokens(&bucket.measurement),
             &bucket.measurement.runs_measured.to_string(),
             &bucket.measurement.runs_unmeasured.to_string(),
             &bucket.measurement.runs_zero.to_string(),
@@ -304,6 +310,7 @@ fn print_window_cost_report(report: &WindowCostReport, tz: &DisplayTz) {
     print_measurement_summary(&report.overall);
     print_pricing_gaps(&report.pricing_gaps);
 
+    print_cost_buckets("BY DRIVER", &report.by_driver, None);
     print_cost_buckets("BY EXECUTION KIND", &report.by_kind, None);
     print_cost_buckets("BY MODEL", &report.by_model, None);
     print_cost_buckets(
@@ -361,7 +368,7 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             identity,
             row.kind.clone(),
             row.model.clone().unwrap_or_else(|| "—".to_owned()),
-            format_tokens(row.total_tokens),
+            format_token_total(row.total_tokens, row.tokens_partial),
             started,
             row.status.clone(),
         ];
@@ -384,6 +391,23 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             "  (truncated to the top {} — more measured runs exist in this window)",
             report.limit
         );
+    }
+}
+
+fn format_optional_tokens(value: Option<i64>) -> String {
+    value.map(format_tokens).unwrap_or_else(|| "unknown".into())
+}
+
+fn format_token_total(value: i64, partial: bool) -> String {
+    let total = format_tokens(value);
+    if partial { format!("{total} (partial)") } else { total }
+}
+
+fn format_measurement_tokens(value: &CostMeasurement) -> String {
+    if value.runs_measured == 0 && value.runs_unmeasured > 0 {
+        "unknown".into()
+    } else {
+        format_token_total(value.total_tokens, value.tokens_partial)
     }
 }
 
@@ -427,5 +451,8 @@ mod tests {
         assert_eq!(format_tokens(0), "0");
         assert_eq!(format_tokens(1_000_000), "1,000,000");
         assert_eq!(format_tokens(-1234), "-1,234");
+        assert_eq!(format_optional_tokens(None), "unknown");
+        assert_eq!(format_optional_tokens(Some(0)), "0");
+        assert_eq!(format_token_total(12, true), "12 (partial)");
     }
 }

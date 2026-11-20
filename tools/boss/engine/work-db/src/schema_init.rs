@@ -346,6 +346,36 @@ mod tests {
     }
 
     #[test]
+    fn usage_migration_distinguishes_unknown_from_recorded_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_runs(id TEXT, input_tokens INTEGER);
+            INSERT INTO work_runs VALUES ('missing', NULL), ('zero', 0), ('measured', 12)",
+        )
+        .unwrap();
+        let migration = registry::all()
+            .into_iter()
+            .find(|migration| migration.id == "20261120_1630_run_usage_unavailable")
+            .unwrap();
+        (migration.apply)(&conn).unwrap();
+        let rows: Vec<(String, Option<i64>, Option<String>)> = conn
+            .prepare("SELECT id, input_tokens, usage_unavailable FROM work_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("measured".into(), Some(12), None),
+                ("missing".into(), None, Some("No provider token usage observed".into())),
+                ("zero".into(), Some(0), None),
+            ]
+        );
+    }
+
+    #[test]
     fn fresh_database_produces_current_schema() {
         let db = WorkDb::open_in_memory().unwrap();
         let conn = db.connect().unwrap();
@@ -1076,6 +1106,13 @@ mod floor_tests {
                 Box::new(|c| super::super::queued_display::migrate(c).unwrap()),
             ),
         ];
+        steps.push((
+            "20261120_1630_run_usage_unavailable",
+            Box::new(|c| {
+                c.execute_batch("ALTER TABLE work_runs ADD COLUMN usage_unavailable TEXT DEFAULT 'No provider token usage observed'")
+                    .unwrap();
+            }),
+        ));
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
             apply(&expected);

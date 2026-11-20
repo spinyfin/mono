@@ -43,8 +43,8 @@
 //!   deliberately does not declare.
 //! - **Token counts are optional.** 1.5.x planner rows carry `input_tokens`,
 //!   `cache_read_tokens` and `output_tokens`; 1.1.12 rows carry none. They are
-//!   not mapped: Boss has no cost extractor for this driver, and an absent
-//!   count must never be read as zero usage.
+//!   consumed from the raw transcript by the engine cost extractor; this
+//!   display normalizer leaves accounting to that reader. Missing counts stay unknown.
 //! - **Only `PLANNER_RESPONSE` is worker prose.** Everything a command printed
 //!   (`GENERIC`), a background completion notice (`SYSTEM_MESSAGE`) and a
 //!   compaction summary (`CHECKPOINT`) is reshaped to a non-assistant entry, so

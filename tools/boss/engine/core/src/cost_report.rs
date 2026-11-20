@@ -228,6 +228,8 @@ struct Accumulator {
     priced_runs: u32,
     priced_usd: f64,
     partial: bool,
+    unknown_categories: BTreeSet<&'static str>,
+    unavailable: BTreeSet<String>,
 }
 
 impl Accumulator {
@@ -236,6 +238,19 @@ impl Accumulator {
     /// caller can surface them once at the report level.
     fn add(&mut self, record: &CostRunRecord, want_usd: bool, gaps: &mut BTreeSet<String>) {
         self.counts.total += 1;
+        if let Some(reason) = &record.usage_unavailable {
+            self.unavailable.insert(reason.clone());
+        }
+        for (name, value) in [
+            ("input", record.input_tokens),
+            ("output", record.output_tokens),
+            ("cache_creation", record.cache_creation_tokens),
+            ("cache_read", record.cache_read_tokens),
+        ] {
+            if value.is_none() {
+                self.unknown_categories.insert(name);
+            }
+        }
         let Some(input_tokens) = record.input_tokens else {
             self.counts.unmeasured += 1;
             return;
@@ -244,7 +259,15 @@ impl Accumulator {
         let output_tokens = record.output_tokens.unwrap_or(0);
         let cache_creation_tokens = record.cache_creation_tokens.unwrap_or(0);
         let cache_read_tokens = record.cache_read_tokens.unwrap_or(0);
-        if input_tokens == 0 && output_tokens == 0 && cache_creation_tokens == 0 && cache_read_tokens == 0 {
+        if [
+            record.input_tokens,
+            record.output_tokens,
+            record.cache_creation_tokens,
+            record.cache_read_tokens,
+        ]
+        .iter()
+        .all(|n| *n == Some(0))
+        {
             self.counts.zero += 1;
         }
         self.tokens.input += input_tokens;
@@ -253,7 +276,7 @@ impl Accumulator {
         self.tokens.cache_read += cache_read_tokens;
         self.agent_active_ms += record.agent_active_ms.unwrap_or(0);
         if want_usd {
-            match record.model.as_deref().and_then(cost_pricing::price_for_model) {
+            match price_for_record(record) {
                 Some(price) => {
                     self.priced_runs += 1;
                     self.priced_usd += cost_pricing::estimate_usd(
@@ -275,11 +298,17 @@ impl Accumulator {
     fn finish(&self, want_usd: bool) -> CostMeasurement {
         CostMeasurement::builder()
             .agent_active_ms(self.agent_active_ms)
-            .cache_creation_tokens(self.tokens.cache_creation)
-            .cache_read_tokens(self.tokens.cache_read)
+            .maybe_cache_creation_tokens(
+                (!self.unknown_categories.contains("cache_creation")).then_some(self.tokens.cache_creation),
+            )
+            .maybe_cache_read_tokens(
+                (!self.unknown_categories.contains("cache_read")).then_some(self.tokens.cache_read),
+            )
             .estimated_usd_partial(want_usd && self.partial)
-            .input_tokens(self.tokens.input)
-            .output_tokens(self.tokens.output)
+            .maybe_input_tokens((!self.unknown_categories.contains("input")).then_some(self.tokens.input))
+            .maybe_output_tokens((!self.unknown_categories.contains("output")).then_some(self.tokens.output))
+            .tokens_partial(!self.unknown_categories.is_empty())
+            .usage_unavailable(self.unavailable.iter().cloned().collect())
             .runs_measured(self.counts.measured)
             .runs_total(self.counts.total)
             .runs_unmeasured(self.counts.unmeasured)
@@ -288,6 +317,26 @@ impl Accumulator {
             .maybe_estimated_usd((want_usd && self.priced_runs > 0).then_some(self.priced_usd))
             .build()
     }
+}
+
+// Subscription-backed Grok/Antigravity model names are not verified API rates.
+// Incomplete categories also cannot support a complete dollar estimate.
+fn price_for_record(record: &CostRunRecord) -> Option<cost_pricing::ModelPriceUsdPerMillion> {
+    if matches!(record.driver.as_deref(), Some("grok" | "agy")) {
+        return None;
+    }
+    if [
+        record.input_tokens,
+        record.output_tokens,
+        record.cache_creation_tokens,
+        record.cache_read_tokens,
+    ]
+    .iter()
+    .any(Option::is_none)
+    {
+        return None;
+    }
+    record.model.as_deref().and_then(cost_pricing::price_for_model)
 }
 
 fn label_or_none(value: Option<&str>) -> String {
@@ -394,12 +443,17 @@ pub fn build_window_cost_report(
     let mut overall = Accumulator::default();
     let mut gaps: BTreeSet<String> = BTreeSet::new();
     let mut by_kind: BTreeMap<String, Accumulator> = BTreeMap::new();
+    let mut by_driver: BTreeMap<String, Accumulator> = BTreeMap::new();
     let mut by_model: BTreeMap<String, Accumulator> = BTreeMap::new();
     let mut by_reasoning: BTreeMap<String, Accumulator> = BTreeMap::new();
     let mut by_effort_level: BTreeMap<String, Accumulator> = BTreeMap::new();
 
     for record in records {
         overall.add(record, want_usd, &mut gaps);
+        by_driver
+            .entry(label_or_none(record.driver.as_deref()))
+            .or_default()
+            .add(record, want_usd, &mut gaps);
         by_kind
             .entry(record.execution_kind.clone())
             .or_default()
@@ -419,6 +473,7 @@ pub fn build_window_cost_report(
     }
 
     WindowCostReport::builder()
+        .by_driver(finish_buckets(by_driver, want_usd))
         .by_effort_level(finish_buckets(by_effort_level, want_usd))
         .by_kind(finish_buckets(by_kind, want_usd))
         .by_model(finish_buckets(by_model, want_usd))
@@ -459,18 +514,15 @@ pub fn build_top_cost_report(
         let cache_read_tokens = record.cache_read_tokens.unwrap_or(0);
         let total_tokens = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens;
 
-        let estimated_usd = want_usd
-            .then(|| record.model.as_deref().and_then(cost_pricing::price_for_model))
-            .flatten()
-            .map(|price| {
-                cost_pricing::estimate_usd(
-                    price,
-                    input_tokens,
-                    output_tokens,
-                    cache_creation_tokens,
-                    cache_read_tokens,
-                )
-            });
+        let estimated_usd = want_usd.then(|| price_for_record(record)).flatten().map(|price| {
+            cost_pricing::estimate_usd(
+                price,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            )
+        });
         if want_usd && estimated_usd.is_none() {
             gaps.insert(record.model.as_deref().unwrap_or(NO_MODEL_GAP_LABEL).to_owned());
         }
@@ -481,14 +533,24 @@ pub fn build_top_cost_report(
                 .run_id(record.run_id.clone())
                 .work_item_id(record.work_item_id.clone())
                 .maybe_short_id(record.work_item_short_id)
-                .cache_creation_tokens(cache_creation_tokens)
-                .cache_read_tokens(cache_read_tokens)
-                .input_tokens(input_tokens)
+                .maybe_cache_creation_tokens(record.cache_creation_tokens)
+                .maybe_cache_read_tokens(record.cache_read_tokens)
+                .maybe_input_tokens(record.input_tokens)
                 .kind(record.execution_kind.clone())
                 .name(record.work_item_name.clone())
-                .output_tokens(output_tokens)
+                .maybe_output_tokens(record.output_tokens)
                 .status(record.run_status.clone())
                 .total_tokens(total_tokens)
+                .tokens_partial(
+                    [
+                        record.input_tokens,
+                        record.output_tokens,
+                        record.cache_creation_tokens,
+                        record.cache_read_tokens,
+                    ]
+                    .iter()
+                    .any(Option::is_none),
+                )
                 .maybe_effort_level(record.effort_level.clone())
                 .maybe_estimated_usd(estimated_usd)
                 .maybe_model(record.model.clone())
