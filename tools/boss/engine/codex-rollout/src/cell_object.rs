@@ -1,6 +1,9 @@
 //! Decode static cell argument objects without evaluating JavaScript.
-//! Accept JSON plus bare property names, single-quoted strings and trailing commas. Dynamic
+//! Accept JSON plus bare property names, single-quoted strings, trailing commas,
+//! and JavaScript string escapes (`\u0041`, `\u{42}`, `\x43`). Dynamic
 //! expressions, templates, spreads and comments remain unsupported.
+
+use std::iter::Peekable;
 
 use serde_json::Value;
 
@@ -41,30 +44,86 @@ pub(super) fn parse_literal_object(source: &str) -> Option<Value> {
     serde_json::from_str(&json).ok()
 }
 
-fn literal_string(chars: &mut impl Iterator<Item = char>, quote: char) -> Option<String> {
-    let mut json = String::from("\"");
-    while let Some(ch) = chars.next() {
-        match ch {
-            ch if ch == quote => {
-                json.push('"');
-                return serde_json::from_str(&json).ok();
-            }
-            '\\' => {
-                let escaped = chars.next()?;
-                if quote == '\'' && escaped == '\'' {
-                    json.push('\'');
-                } else {
-                    // JSON validates escapes; unsupported JavaScript escapes
-                    // fail closed instead of silently changing the command.
-                    json.push('\\');
-                    json.push(escaped);
-                }
-            }
-            '"' => json.push_str("\\\""),
-            ch => json.push(ch),
+fn literal_string(chars: &mut Peekable<impl Iterator<Item = char>>, quote: char) -> Option<String> {
+    let mut out = String::new();
+    loop {
+        let ch = chars.next()?;
+        if ch == quote {
+            return Some(out);
         }
+        if ch == '\n' || ch == '\r' {
+            return None;
+        }
+        if ch == '\\' {
+            decode_js_escape(chars, &mut out)?;
+            continue;
+        }
+        out.push(ch);
     }
-    None
+}
+
+/// Decode one JS string escape whose backslash has already been consumed.
+/// Unrecognised escapes return `None` so the caller can fall back to the
+/// whole script instead of copying `\u0041` as `u0041`.
+fn decode_js_escape(chars: &mut Peekable<impl Iterator<Item = char>>, out: &mut String) -> Option<()> {
+    let ch = chars.next()?;
+    match ch {
+        'n' => out.push('\n'),
+        't' => out.push('\t'),
+        'r' => out.push('\r'),
+        'b' => out.push('\u{0008}'),
+        'f' => out.push('\u{000c}'),
+        'v' => out.push('\u{000b}'),
+        '0' => out.push('\0'),
+        '"' | '\'' | '\\' | '/' => out.push(ch),
+        '\n' => {}
+        '\r' => {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        }
+        'x' => {
+            let hex: String = [chars.next()?, chars.next()?].into_iter().collect();
+            if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+        }
+        'u' => decode_js_unicode_escape(chars, out)?,
+        // Legacy octal escapes and `\8` / `\9` are rejected in strict code;
+        // refuse to guess at them.
+        '1'..='9' => return None,
+        // Every other escape is an identity escape: `\$` is `$`, `\q` is `q`.
+        other => out.push(other),
+    }
+    Some(())
+}
+
+fn decode_js_unicode_escape(chars: &mut Peekable<impl Iterator<Item = char>>, out: &mut String) -> Option<()> {
+    if chars.peek() == Some(&'{') {
+        chars.next();
+        let mut hex = String::new();
+        loop {
+            let next = chars.next()?;
+            if next == '}' {
+                break;
+            }
+            hex.push(next);
+        }
+        if hex.is_empty() || hex.len() > 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+        return Some(());
+    }
+    let hex: String = [chars.next()?, chars.next()?, chars.next()?, chars.next()?]
+        .into_iter()
+        .collect();
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+    Some(())
 }
 
 #[cfg(test)]
@@ -81,13 +140,22 @@ mod tests {
     }
 
     #[test]
+    fn decodes_javascript_unicode_and_hex_string_escapes() {
+        let parsed = parse_literal_object(r#"{cmd:"echo \u0041\u{42}\x43"}"#).unwrap();
+        assert_eq!(parsed["cmd"], "echo ABC");
+        let parsed = parse_literal_object(r#"{cmd:'\x24BOSS_BIN propose done'}"#).unwrap();
+        assert_eq!(parsed["cmd"], "$BOSS_BIN propose done");
+        let parsed = parse_literal_object(r#"{cmd:"echo \$HOME \q"}"#).unwrap();
+        assert_eq!(parsed["cmd"], "echo $HOME q");
+    }
+
+    #[test]
     fn rejects_expressions_instead_of_guessing_the_command() {
         for source in [
             "{cmd: command}",
             "{cmd: 'boss ' + suffix}",
             "{cmd: `boss ${verb}`}",
             "{...options, cmd: 'boss propose done'}",
-            "{cmd: '\\x24BOSS_BIN propose done'}",
             "{cmd: 'unfinished}",
             "{cmd: ['boss',,]}",
             "{cmd: [,]}",
