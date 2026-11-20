@@ -459,63 +459,76 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
     // passes re-send the stored lease and hit the command deadline again.
     // Those re-sends must stay `LeaseOutcomeUncertain` (parked, retry
     // budget untouched), not a pre-start failure. `workspace_slack` would
-    // raise the lease deadline to 5 s and hide that path.
-    let fx = Fixture::with(short(300)).await;
-    let env = env(&fx, 2).await;
-    let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
-    let peer = fx
-        .spoke(
-            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
-            None,
-            0,
-        )
-        .await;
-    env.coordinator.kick();
-    until("both leases to be parked with attention", || {
-        executions.iter().all(|e| attention_open(&fx, &e.id))
+    // raise the lease deadline to 5 s and hide that path. The clock is held so
+    // that only the explicit advances below expire the deliberately unanswered
+    // leases, never CI contention while a reply is crossing the socket.
+    timing::hold();
+    let (fx, env, executions, peer) = timing::guarded(async {
+        let fx = Fixture::with_frozen_liveness(short(300)).await;
+        let env = env(&fx, 2).await;
+        let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
+        let peer = fx
+            .spoke(
+                Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+                None,
+                0,
+            )
+            .await;
+        env.coordinator.kick();
+        // Observe both lease commands before any virtual time passes.
+        timing::condition(|| peer.commands().iter().filter(|c| is_lease(c)).count() == 2).await;
+        (fx, env, executions, peer)
     })
+    .await;
+    timing::guarded(timing::advancing(|| {
+        executions.iter().all(|e| attention_open(&fx, &e.id))
+    }))
     .await;
 
     // Several dispatch passes later (more than the pre-start retry budget),
     // nothing has failed and nothing holds capacity.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    for execution in &executions {
-        let row = fx.db.get_execution(&execution.id).unwrap();
-        assert!(!row.status.is_terminal(), "{row:?}");
-        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
-    }
-    assert_eq!(fx.db.list_executions(None).unwrap().len(), 2);
-    assert_eq!(
-        env.pool.busy_count().await,
-        0,
-        "no pool slot is held while a lease is in doubt"
-    );
-    assert_eq!(env.coordinator.repo_lease_limiter().in_flight(REPO), 0);
-    assert_eq!(
-        peer.commands().iter().filter(|c| is_lease(c)).count(),
-        2,
-        "each pass reuses the stored lease command"
-    );
+    timing::guarded(async {
+        for _ in 0..60 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+        for execution in &executions {
+            let row = fx.db.get_execution(&execution.id).unwrap();
+            assert!(!row.status.is_terminal(), "{row:?}");
+            assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+        }
+        assert_eq!(fx.db.list_executions(None).unwrap().len(), 2);
+        assert_eq!(
+            env.pool.busy_count().await,
+            0,
+            "no pool slot is held while a lease is in doubt"
+        );
+        assert_eq!(env.coordinator.repo_lease_limiter().in_flight(REPO), 0);
+        assert_eq!(
+            peer.commands().iter().filter(|c| is_lease(c)).count(),
+            2,
+            "each pass reuses the stored lease command"
+        );
 
-    // The hosts answer late: both executions proceed to spawn.
-    for (n, lease) in peer.commands().into_iter().filter(is_lease).enumerate() {
-        let granted = json!({
-            "workspace_id": format!("worker-{n}"),
-            "lease_id": format!("lease-{n}"),
-            "workspace_path": format!("/hosts/workspaces/worker-{n}"),
-        });
-        peer.answer_late(&lease, answer_as(&lease, granted).unwrap()).await;
-    }
-    until("both executions to spawn", || {
-        peer.commands()
-            .iter()
-            .filter(|c| matches!(c.body, Some(command::Body::Spawn(_))))
-            .count()
-            == 2
-    })
-    .await;
-    until("the in-doubt attention to resolve", || {
-        executions.iter().all(|e| !attention_open(&fx, &e.id))
+        // The hosts answer late: both executions proceed to spawn.
+        for (n, lease) in peer.commands().into_iter().filter(is_lease).enumerate() {
+            let granted = json!({
+                "workspace_id": format!("worker-{n}"),
+                "lease_id": format!("lease-{n}"),
+                "workspace_path": format!("/hosts/workspaces/worker-{n}"),
+            });
+            peer.answer_late(&lease, answer_as(&lease, granted).unwrap()).await;
+        }
+        env.coordinator.kick();
+        timing::condition(|| {
+            peer.commands()
+                .iter()
+                .filter(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+                .count()
+                == 2
+        })
+        .await;
+        timing::condition(|| executions.iter().all(|e| !attention_open(&fx, &e.id))).await;
     })
     .await;
 }
@@ -869,7 +882,7 @@ async fn a_parked_running_spawn_is_reconciled_from_stored_state_after_a_restart(
 
 #[tokio::test]
 async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
-    let fx = Fixture::with(short(300)).await;
+    let fx = Fixture::with(workspace_slack(300)).await;
     let env = env(&fx, 1).await;
     let execution = triage(&fx, &env, "resolved spawn");
     let peer = fx
