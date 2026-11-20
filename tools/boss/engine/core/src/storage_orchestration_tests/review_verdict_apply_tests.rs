@@ -257,11 +257,23 @@ fn make_held_revision(db: &WorkDb, cycle_root_id: &str, cycle_root_pr_url: &str,
 /// to it directly.
 #[test]
 fn clean_verdict_advances_both_cycle_root_and_the_held_revision_it_reviewed() {
+    for state in ["awaiting_admission", "automated_review", "required"] {
+        assert_clean_verdict_clears_automated_review_holds(state);
+    }
+}
+
+fn assert_clean_verdict_clears_automated_review_holds(state: &str) {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);
     let cycle_root = create_test_chore_manual(&db, product.id, "review target");
     bind_open_pr(&db, &cycle_root.id);
     let revision_id = make_held_revision(&db, &cycle_root.id, PR_URL, "head-sha");
+    raw(&db)
+        .execute(
+            "UPDATE tasks SET status = 'active', review_required_state = ?3 WHERE id IN (?1, ?2)",
+            rusqlite::params![cycle_root.id, revision_id, state],
+        )
+        .unwrap();
 
     let supervisor = db
         .create_execution(
@@ -304,6 +316,12 @@ fn clean_verdict_advances_both_cycle_root_and_the_held_revision_it_reviewed() {
     let root_after = read_task(&db, &cycle_root.id);
     assert_eq!(root_after.status, TaskStatus::InReview, "cycle root must reach Review");
     let revision_after = read_task(&db, &revision_id);
+    for task in [&root_after, &revision_after] {
+        assert_eq!(
+            task.review_required_state.as_deref(),
+            (state == "required").then_some(state)
+        );
+    }
     assert_eq!(
         revision_after.status,
         TaskStatus::InReview,
