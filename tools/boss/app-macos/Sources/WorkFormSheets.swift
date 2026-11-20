@@ -901,9 +901,9 @@ struct WorkItemBriefEditor: View {
     let remoteChanged: Bool
     let readOnly: Bool
     var showsAgentNotice: Bool = false
-    /// When false the caller renders the document title (and Preview/Edit sits
-    /// beside it there), so the editor adds no header row of its own.
-    var showsTitleRow: Bool = true
+    /// Optional document control placed beside Preview/Edit in the single
+    /// header row, replacing the plain title.
+    var headerLeading: AnyView? = nil
     var onEdit: () -> Void
     var onCancel: () -> Void
     var onSave: () -> Void
@@ -913,7 +913,7 @@ struct WorkItemBriefEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                if showsTitleRow { Text(title).font(.headline) }
+                if let headerLeading { headerLeading } else { Text(title).font(.headline) }
                 Spacer()
                 Picker("Mode", selection: $showsEditor) {
                     Text("Preview").tag(false)

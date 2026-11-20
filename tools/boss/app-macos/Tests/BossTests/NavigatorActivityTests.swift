@@ -359,6 +359,7 @@ final class NavigatorActivityTests: XCTestCase {
         XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.runId, "run-one")
         model.setNavigatorActivity(executionID: "two", rootID: root.id)
         XCTAssertEqual(model.navigatorSelectedActivity(for: model.navigatorSelectedTask!)?.runId, "run-two")
+        XCTAssertTrue(WorkNavigatorActivity(context: context(model), workspace: nil).showsActivityPickerRow)
     }
 
     func testAskLabelUsesEngineRevisionSeqAndOrigin() {
@@ -493,6 +494,7 @@ final class NavigatorActivityTests: XCTestCase {
         let view = WorkNavigatorActivity(context: context(model), workspace: nil)
         let activity = model.navigatorSelectedActivity(for: root)!
         XCTAssertEqual(view.remoteHost(for: activity), "spoke-1")
+        XCTAssertTrue(view.hasAgentPane)
         model.applyEventForTest(.workerLiveStatesList(states: [liveState(runId: "run", activity: .working)]))
         XCTAssertNil(WorkNavigatorActivity(context: context(model), workspace: nil).remoteHost(for: activity))
     }
