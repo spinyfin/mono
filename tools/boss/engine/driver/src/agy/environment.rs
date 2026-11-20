@@ -23,7 +23,9 @@ use crate::scoped_home::{HostToolPaths, worker_tool_path_directive};
 pub const AGY_BIN_ENV: &str = "BOSS_AGY_BIN";
 
 /// When set to `1`/`true`, skip live identity checks (`codesign`, `--version`).
-/// Production never sets this; layout tests do.
+/// Production never sets this; layout tests do. It does not skip the `models`
+/// posture probe, which then runs whatever is at the Boss-owned binary path;
+/// `BOSS_AGY_SKIP_POSTURE_ASSERT` is the switch for that.
 pub const AGY_SKIP_BINARY_ASSERT_ENV: &str = "BOSS_AGY_SKIP_BINARY_ASSERT";
 
 /// Minimum qualified `agy` version. `auto_approve` was measured on 1.5.7.

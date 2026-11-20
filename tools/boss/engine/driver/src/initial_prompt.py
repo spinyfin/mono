@@ -45,6 +45,10 @@ REPLY_BODY = {
 }
 
 
+_CSI = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+_OSC_END = re.compile(r"\x07|\x1b\\")
+
+
 class TerminalTail:
     """Bounded current-screen text for startup detection, excluding scrollback."""
 
@@ -55,25 +59,38 @@ class TerminalTail:
         self.pending = ""
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
+    MAX_PENDING = 4096
+
     def feed(self, output):
-        self.pending += self.decoder.decode(output)
-        while self.pending:
-            char = self.pending[0]
+        text = self.pending + self.decoder.decode(output)
+        pos = 0
+        size = len(text)
+        while pos < size:
+            char = text[pos]
             consumed = 1
             if char == "\x1b":
-                if len(self.pending) < 2:
+                if size - pos < 2:
                     break
-                if self.pending[1] == "[":
-                    match = re.match(r"\x1b\[([0-?]*)([ -/]*)([@-~])", self.pending)
+                nxt = text[pos + 1]
+                if nxt == "[":
+                    match = _CSI.match(text, pos)
                     if not match:
-                        break
-                    self.control(match[1], match[3])
-                    consumed = match.end()
-                elif self.pending[1] == "]":
-                    match = re.search(r"\x07|\x1b\\", self.pending)
+                        if size - pos > self.MAX_PENDING:
+                            consumed = 2  # unterminated sequence: drop the introducer
+                        else:
+                            break
+                    else:
+                        self.control(match[1], match[3])
+                        consumed = match.end() - pos
+                elif nxt == "]":
+                    match = _OSC_END.search(text, pos)
                     if not match:
-                        break
-                    consumed = match.end()
+                        if size - pos > self.MAX_PENDING:
+                            consumed = 2  # unterminated OSC: drop it, bounded memory
+                        else:
+                            break
+                    else:
+                        consumed = match.end() - pos
                 else:
                     consumed = 2
             elif char == "\r":
@@ -93,7 +110,8 @@ class TerminalTail:
                 row[self.x] = char
                 self.x += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
             self.scroll()
-            self.pending = self.pending[consumed:]
+            pos += consumed
+        self.pending = text[pos:]
 
     def scroll(self):
         while self.y >= self.height:
@@ -296,21 +314,25 @@ def _is_later_composer(line):
     return bool(row) and (PROMPT_MARK in row or row.startswith(b">"))
 
 
-# Every row of Antigravity's two footer-less startup menus: the folder-trust
-# dialog and the `Settings Error` screen. The cursor can rest on any of them
-# (a human arrow key), so the guard must hold for each selection.
+# Every row of Antigravity's footer-less startup menus: the folder-trust
+# dialog, the `Settings Error` screen, and the sign-in menu (numbered, no
+# `esc to cancel`; Return on the default row starts Google OAuth). The
+# cursor can rest on any of them (a human arrow key), so the guard must
+# hold for each selection.
 SELECTION_MENUS = (
     (b"Yes, I trust this folder", b"No, exit"),
     (b"Exit and fix manually", b"Continue with defaults this session",
      b"Overwrite the file with defaults"),
+    (b"1. Google OAuth", b"2. Use a Google Cloud project"),
 )
 
 
 def _selection_menu_marker(lines, markers):
-    # Antigravity's trust dialog and `Settings Error` screen have no
-    # `esc to cancel` footer and no numbered choices: the answer is the
-    # `>`-marked row among unnumbered ones, last on screen. A transcript copy
-    # is followed by the real composer, so the last marker row is not a choice.
+    # Antigravity's trust dialog, `Settings Error` screen, and sign-in menu
+    # have no `esc to cancel` footer. Trust and Settings Error also have no
+    # numbered choices; the sign-in menu is numbered. The answer is the
+    # `>`-marked row, last on screen. A transcript copy is followed by the
+    # real composer, so the last marker row is not a choice.
     lines = list(lines)
     while lines and not lines[-1].strip():
         lines.pop()
@@ -363,6 +385,27 @@ def check_blocking_dialog(view, markers, payload=b""):
             if len(lines) - index <= 12 and (numbered or trust):
                 if marker and question.startswith(marker):
                     raise BlockingDialogOnScreen(marker)
+
+
+def check_relay_input(view, markers, pending):
+    """Refuse to forward relay input into a selection menu after delivery.
+
+    A menu that appears mid-run (for example expired credentials showing the
+    sign-in menu) must not receive Return or text. Pure terminal-query replies
+    still pass so the CLI is not starved of them.
+    """
+    menu = _selection_menu_marker(view.text().splitlines(), markers)
+    if menu is None:
+        return
+    _, rest, refused = take_terminal_replies(pending, b"")
+    if refused or rest:
+        raise BlockingDialogOnScreen(menu)
+
+
+def has_user_bytes(pending):
+    """True when pending holds anything other than recognised terminal replies."""
+    _, rest, refused = take_terminal_replies(pending, b"")
+    return bool(refused or rest)
 
 
 def take_terminal_replies(data, buffer):
@@ -542,6 +585,7 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
     drain_until = None
     watch_until = 0
     submit_rows = set()
+    guard_enabled = True
     payload_squashed = _squash(prompt)
     try:
         if outer_tty:
@@ -601,13 +645,24 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
                         pending += REPLIES[query[1]]
                         consumed = query.end()
                     query_buffer = query_buffer[consumed:][-32:]
+                # The screen stays current for the whole relay: later input is
+                # checked against it, not only the initial delivery.
                 if not delivered:
                     view.feed(output)
+                elif guard_enabled:
+                    try:
+                        view.feed(output)
+                    except Exception as error:
+                        # Fail open, loudly: the brief is already delivered and the
+                        # worker is long-lived, so an emulator bug disables the
+                        # relay-input guard instead of terminating the session.
+                        guard_enabled = False
+                        log("relay_guard_disabled", error=repr(error))
+                if not delivered:
                     check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
-                elif post_submit_failure_markers and now < watch_until:
+                elif guard_enabled and post_submit_failure_markers and now < watch_until:
                     # An accepted paste does not prove a turn started: the CLI
                     # can discard the brief with a vendor error and fire no hook.
-                    view.feed(output)
                     # Only rows that appeared after submit count, and only
                     # ones that are not a piece of the brief itself (however
                     # far it scrolled or however it was re-wrapped) and that
@@ -662,10 +717,16 @@ def run(argv, prompt, markers, starting_markers, readiness_timeout=30, landed_ma
             if master in writable:
                 # Drain already available output before checking the current screen.
                 # A dialog may have appeared after readiness or during the paste.
-                if not delivered and select.select([master], [], [], 0)[0]:
+                # After delivery the same drain applies whenever the pending bytes
+                # are anything but terminal-query replies: a menu already queued
+                # on the master must reach the screen view before user bytes
+                # are forwarded to it.
+                if (not delivered or has_user_bytes(pending)) and select.select([master], [], [], 0)[0]:
                     continue
                 if not delivered:
                     check_blocking_dialog(view, blocking_dialog_markers, prompt if paste_started else b"")
+                elif guard_enabled:
+                    check_relay_input(view, blocking_dialog_markers, pending)
                 count = os.write(master, pending[:4096])
                 pending = pending[count:]
                 if not pending and submitting and not delivered:
