@@ -2828,3 +2828,6 @@ pub mod capability_rules {
         ]
     }
 }
+
+#[cfg(test)]
+mod signal_guard_tests;

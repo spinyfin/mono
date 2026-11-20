@@ -938,6 +938,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_shim_translates_signal_guard_block_and_allow() {
+        let body = crate::codex::python_c_to_script(crate::claude::BOSS_LAUNCH_GUARD_COMMAND).unwrap();
+        let (verdict, _) = run_shim(
+            "signal-deny",
+            &body,
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "pkill foo"}}).to_string(),
+        );
+        assert!(matches!(verdict, Verdict::Block(_)), "{verdict:?}");
+        let (verdict, _) = run_shim(
+            "signal-allow",
+            &body,
+            &serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "pgrep -f foo"}}).to_string(),
+        );
+        assert_eq!(verdict, Verdict::Allow);
+    }
+
+    #[test]
     fn a_guard_whose_bytes_do_not_match_the_attested_hash_is_refused() {
         // Wrapping cost the trust gate its content binding on the guard file
         // itself (it hashes the wrapper now), so the shim re-checks the guard's
