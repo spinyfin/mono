@@ -577,10 +577,10 @@ pub(crate) async fn run_list_revisions(
     args: RevisionListArgs,
 ) -> Result<(), CliError> {
     let product = resolve_product_inferable(client, args.product, None, ctx).await?;
-    let dep_filter = args.dep.into_filter();
+    let dep_filter = args.dep.resolve(client, &product.id).await?;
     // Resolve --parent to a canonical id if provided.
     let parent_id = if let Some(selector) = args.parent {
-        Some(resolve_create_revision_parent(client, &selector).await?)
+        Some(crate::selector_scope::resolve_filter_id(client, &selector, &product.id).await?)
     } else {
         None
     };
@@ -640,8 +640,7 @@ pub(crate) async fn run_list_revisions(
 /// surfaces as a `CliError`, never a silent pass-through.
 ///
 /// Used by `create-revision`'s `--parent` and `--depends-on` (neither of
-/// which accepts a `--product` flag), `list-revisions`' `--parent`, and
-/// `task list`'s `--parent`.
+/// which accepts a `--product` flag). List filters use their listing product.
 pub(crate) async fn resolve_create_revision_parent(
     client: &mut BossClient,
     selector: &str,
@@ -779,15 +778,6 @@ pub(crate) async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str
         }
     }
     current
-}
-
-pub(crate) async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
-    rpc_call!(
-        client,
-        FrontendRequest::GetWorkItem { id: id.to_owned() },
-        "work item fetch",
-        FrontendEvent::WorkItemResult { item } => item,
-    )
 }
 
 pub(crate) async fn update_work_item(
@@ -1551,12 +1541,15 @@ pub(crate) async fn delete_work_item(client: &mut BossClient, id: &str) -> Resul
 }
 
 pub(crate) async fn restore_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
-    rpc_call!(
+    let scoped = crate::selector_scope::scope_environment_selector(client, id).await?;
+    let item = rpc_call!(
         client,
-        FrontendRequest::RestoreWorkItem { id: id.to_owned() },
+        FrontendRequest::RestoreWorkItem { id: scoped.clone() },
         "work item restore",
         FrontendEvent::WorkItemRestored { item } => item,
-    )
+    )?;
+    crate::selector_scope::report_implicit_resolution(client, &scoped, Some(item.product_id())).await;
+    Ok(item)
 }
 
 /// Format the dependency verbs' prerequisite selector for the RPC without
@@ -1588,15 +1581,17 @@ pub(crate) async fn run_depend_command(
         DependCommand::Add(args) => {
             let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, args.product.clone()).await?;
             let prerequisite = dependency_prerequisite_selector(&args.prerequisite, args.product.as_deref());
+            let prerequisite = crate::selector_scope::scope_environment_selector(client, &prerequisite).await?;
             let edge = add_dependency(
                 client,
                 AddDependencyInput {
                     dependent,
-                    prerequisite,
+                    prerequisite: prerequisite.clone(),
                     relation: Some(args.relation),
                 },
             )
             .await?;
+            crate::selector_scope::report_implicit_resolution(client, &prerequisite, None).await;
             print_entity(ctx, &serde_json::json!({ "edge": edge }), || {
                 if !ctx.quiet {
                     println!(
@@ -1609,15 +1604,17 @@ pub(crate) async fn run_depend_command(
         DependCommand::Rm(args) => {
             let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, args.product.clone()).await?;
             let prerequisite = dependency_prerequisite_selector(&args.prerequisite, args.product.as_deref());
+            let prerequisite = crate::selector_scope::scope_environment_selector(client, &prerequisite).await?;
             let (dependent_id, prerequisite_id, removed) = remove_dependency(
                 client,
                 RemoveDependencyInput {
                     dependent,
-                    prerequisite,
+                    prerequisite: prerequisite.clone(),
                     relation: Some(args.relation.clone()),
                 },
             )
             .await?;
+            crate::selector_scope::report_implicit_resolution(client, &prerequisite, None).await;
             print_entity(
                 ctx,
                 &serde_json::json!({
@@ -2135,7 +2132,7 @@ pub(crate) async fn resolve_product(
         return Err(CliError::not_found("no products exist"));
     }
 
-    let selector = match selector {
+    let selector = match selector.or_else(crate::selector_scope::environment_product) {
         Some(selector) => selector,
         None if products.len() == 1 => return Ok(products[0].clone()),
         None if ctx.allow_input => choose_product(&products)?,
@@ -2159,7 +2156,7 @@ pub(crate) async fn resolve_optional_product(
     selector: Option<String>,
     _ctx: &RunContext,
 ) -> Result<Option<Product>, CliError> {
-    match selector {
+    match selector.or_else(crate::selector_scope::environment_product) {
         None => {
             // Try auto-select when exactly one product exists, so A<n>
             // selectors work without --product on single-product setups.
@@ -2206,9 +2203,9 @@ pub(crate) async fn get_work_item_by_short_id_rpc(
 ///
 /// - **With product scope**: `GetWorkItemByShortId` against that product.
 /// - **Without product scope**: `GetWorkItem` with the canonical `T{n}`
-///   wire form so the engine's shared resolver does a global lookup.
-///   Globally unique short ids resolve without `--product`. Ambiguous
-///   short ids hard-error with every candidate listed. Missing short
+///   wire form, using BOSS_PRODUCT when set. Otherwise the engine checks
+///   global ambiguity and the app's selected product, with a stderr notice
+///   when the selection supplies the scope. Ambiguous short ids list every candidate. Missing short
 ///   ids hard-error as "could not resolve id" / "no matching work
 ///   item" — never as "product is required".
 pub(crate) async fn resolve_short_id_item(
@@ -2304,7 +2301,7 @@ pub(crate) async fn resolve_selector_to_primary_id(
 /// mistaken for one that doesn't exist. Each entry is `(primary_id,
 /// short_id)`.
 ///
-/// Short-id selectors (`T42` / `42` / `#42`) resolve locally against
+/// Short-id selectors (`T<n>` / `<n>` / `#<n>`) resolve locally against
 /// `known`'s `short_id` column — no RPC — since `known` is already the
 /// full unfiltered listing and therefore a superset of every valid
 /// short id in this product. Typed primary ids (`task_…`) and opaque
@@ -2512,6 +2509,17 @@ pub(crate) async fn resolve_project(
     selector: Option<String>,
     ctx: &RunContext,
 ) -> Result<Project, CliError> {
+    let selector = match selector {
+        Some(selector)
+            if matches!(
+                parse_work_item_selector(&selector),
+                WorkItemSelector::ProductShortId { .. }
+            ) =>
+        {
+            Some(crate::selector_scope::resolve_filter_id(client, &selector, product_id).await?)
+        }
+        other => other,
+    };
     let projects = list_projects(client, product_id, None).await?;
     if projects.is_empty() {
         return Err(CliError::not_found("no projects exist for the selected product"));

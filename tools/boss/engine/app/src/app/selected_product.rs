@@ -47,35 +47,67 @@ pub(super) struct SelectedProductReport {
     reported_at: String,
 }
 
-/// Rewrite a product-scoped resolution failure into one that names the
-/// product, but only for the not-found case — every other error (an
-/// ambiguity error naming candidates, a DB failure) is propagated
-/// unchanged so it is never misread as "the row does not exist".
-fn rewrite_not_found(err: anyhow::Error, id: &str, product_name: &str) -> anyhow::Error {
-    if err.to_string().contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER) {
-        anyhow::anyhow!(
-            "could not resolve id {id}: {} in product {product_name}",
-            boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
-        )
-    } else {
-        err
+/// Resolve with an app default without letting it hide ambiguity. On a miss,
+/// list explicit selectors in other products instead of silently switching.
+fn resolve_with_selection(
+    db: &boss_work_db::WorkDb,
+    id: &str,
+    selection: SelectedProductState,
+    include_deleted: bool,
+) -> anyhow::Result<String> {
+    let resolve = |selector: &str| {
+        if include_deleted {
+            db.resolve_work_item_ref_including_deleted(selector)
+        } else {
+            db.resolve_work_item_ref(selector)
+        }
+    };
+    let boss_protocol::WorkItemSelector::ShortId(short_id) = boss_protocol::parse_work_item_selector(id) else {
+        return resolve(id);
+    };
+    let SelectedProductState::Selected { product_id, name, .. } = selection else {
+        return resolve(id);
+    };
+    // Ambiguity is a global property, including when none of the candidates
+    // belongs to the app's current selection. Preserve the full candidate list.
+    let global = match resolve(id) {
+        Err(err) if !err.to_string().contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER) => return Err(err),
+        result => result,
+    };
+    match resolve(&format!("{product_id}/{short_id}")) {
+        // The selected product is only an implicit default, not permission to
+        // pick one of several rows sharing this number.
+        Ok(_) => global,
+        Err(err) if err.to_string().contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER) => {
+            let mut suggestions = Vec::new();
+            for product in db.list_products()? {
+                if product.id == product_id {
+                    continue;
+                }
+                match resolve(&format!("{}/{short_id}", product.id)) {
+                    Ok(_) => suggestions.push(format!("{}/{short_id}", product.slug)),
+                    Err(other) if other.to_string().contains(boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER) => {}
+                    Err(other) => return Err(other),
+                }
+            }
+            let hint = if suggestions.is_empty() {
+                String::new()
+            } else {
+                format!("; did you mean {}?", suggestions.join(" or "))
+            };
+            anyhow::bail!(
+                "could not resolve id {id}: {} in product {name} (selected in the app){hint}",
+                boss_protocol::WORK_ITEM_ID_NOT_FOUND_MARKER
+            )
+        }
+        Err(err) => Err(err),
     }
 }
 
 impl ServerState {
-    /// Resolve a caller-supplied work-item selector at the engine boundary.
-    /// Canonical ids and explicitly product-scoped short ids retain their
-    /// existing semantics. A bare short id is scoped to the product currently
-    /// selected in the connected app, because short ids are only unique within
-    /// a product — but only when a selection is actually available. When the
-    /// app is disconnected or has not reported a selection, this falls back
-    /// to the pre-existing global resolution (`work_db.resolve_work_item_ref`),
-    /// which still never guesses: an id unique across products resolves, and
-    /// an ambiguous one is a hard error naming every candidate. This keeps
-    /// `boss task show T<n>` working with the app closed, matching the
-    /// documented contract on `resolve_short_id_item`
-    /// (tools/boss/cli/src/data.rs) that globally-unique short ids resolve
-    /// without `--product`.
+    /// Canonical and product-qualified selectors are explicit. Unqualified
+    /// short ids must be globally unambiguous, even with an app selection.
+    /// A miss in the app's selected product suggests qualified alternatives.
     pub(super) async fn resolve_work_item_id(&self, id: &str) -> anyhow::Result<String> {
         self.resolve_work_item_id_with_db(&self.work_db, id).await
     }
@@ -85,41 +117,25 @@ impl ServerState {
         db: &boss_work_db::WorkDb,
         id: &str,
     ) -> anyhow::Result<String> {
-        let selector = boss_protocol::parse_work_item_selector(id);
-        let boss_protocol::WorkItemSelector::ShortId(short_id) = selector else {
+        if !matches!(
+            boss_protocol::parse_work_item_selector(id),
+            boss_protocol::WorkItemSelector::ShortId(_)
+        ) {
             return db.resolve_work_item_ref(id);
-        };
-
-        let SelectedProductState::Selected { product_id, name, .. } = self.selected_product_state_with_db(db).await
-        else {
-            return db.resolve_work_item_ref(id);
-        };
-        db.resolve_work_item_ref(&format!("{product_id}/{short_id}"))
-            .map_err(|err| rewrite_not_found(err, id, &name))
+        }
+        resolve_with_selection(db, id, self.selected_product_state_with_db(db).await, false)
     }
 
-    /// Resolve a selector without excluding a tombstoned row. Used by
-    /// restore and the dependency verbs (`depend add`/`depend rm`) — the
-    /// engine paths that must be able to name a deleted work item
-    /// explicitly. Mirrors [`Self::resolve_work_item_id`]'s structure
-    /// exactly, including its product-scope short-id handling and its
-    /// generic pass-through for product-scoped selectors, typed ids, and
-    /// opaque forms — the only difference is the tombstone-tolerant
-    /// resolver each step calls into. With no selected product, resolution
-    /// runs globally across products (ambiguity still a hard error) rather
-    /// than refusing outright.
+    /// Restore and dependency operations use the same scope rules, but include
+    /// tombstoned rows so callers can restore or remove their dependency edges.
     pub(super) async fn resolve_work_item_id_including_deleted(&self, id: &str) -> anyhow::Result<String> {
-        let selector = boss_protocol::parse_work_item_selector(id);
-        let boss_protocol::WorkItemSelector::ShortId(short_id) = selector else {
+        if !matches!(
+            boss_protocol::parse_work_item_selector(id),
+            boss_protocol::WorkItemSelector::ShortId(_)
+        ) {
             return self.work_db.resolve_work_item_ref_including_deleted(id);
-        };
-
-        let SelectedProductState::Selected { product_id, name, .. } = self.selected_product_state().await else {
-            return self.work_db.resolve_work_item_ref_including_deleted(id);
-        };
-        self.work_db
-            .resolve_work_item_ref_including_deleted(&format!("{product_id}/{short_id}"))
-            .map_err(|err| rewrite_not_found(err, id, &name))
+        }
+        resolve_with_selection(&self.work_db, id, self.selected_product_state().await, true)
     }
 
     /// Record the app's current chooser selection. Returns `false` — and

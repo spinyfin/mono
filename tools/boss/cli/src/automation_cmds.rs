@@ -957,12 +957,12 @@ pub(crate) async fn run_attention_command(command: AttentionCommand, ctx: &RunCo
         AttentionCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let project_id = if let Some(sel) = args.project {
-                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
+                Some(crate::selector_scope::resolve_filter_id(&mut client, &sel, &product.id).await?)
             } else {
                 None
             };
             let task_id = if let Some(sel) = args.task {
-                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
+                Some(crate::selector_scope::resolve_filter_id(&mut client, &sel, &product.id).await?)
             } else {
                 None
             };
@@ -986,6 +986,7 @@ pub(crate) async fn run_attention_command(command: AttentionCommand, ctx: &RunCo
         }
 
         AttentionCommand::Create(args) => {
+            let args = *args;
             if args.project.is_none() && args.task.is_none() {
                 return Err(CliError::usage("exactly one of --project or --task is required"));
             }
@@ -993,12 +994,12 @@ pub(crate) async fn run_attention_command(command: AttentionCommand, ctx: &RunCo
                 return Err(CliError::usage("--project and --task are mutually exclusive"));
             }
             let association_project_id = if let Some(sel) = args.project {
-                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
+                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, args.product.clone()).await?)
             } else {
                 None
             };
             let association_task_id = if let Some(sel) = args.task {
-                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
+                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, args.product.clone()).await?)
             } else {
                 None
             };

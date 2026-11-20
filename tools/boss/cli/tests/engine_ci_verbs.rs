@@ -521,3 +521,77 @@ async fn engine_attempts_list_background_renders_engine_snapshot() -> Result<()>
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_work_item_filters_honor_product_and_qualified_selectors() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let first = create_product(&mut client, "First").await?;
+    let second = create_product(&mut client, "Second").await?;
+    let db = engine.db()?;
+    let (first_id, _) = seed_chore_with_ci_attempt(&db, &first.id, "First chore", 800, "fix", "first-head")?;
+    let (second_id, second_attempt) =
+        seed_chore_with_ci_attempt(&db, &second.id, "Second chore", 801, "fix", "second-head")?;
+    let short_id = |id: &str| -> Result<i64> {
+        match db.get_work_item(id)? {
+            boss_protocol::WorkItem::Task(task) | boss_protocol::WorkItem::Chore(task) => Ok(task.short_id.unwrap()),
+            other => anyhow::bail!("expected chore, got {other:?}"),
+        }
+    };
+    let short = short_id(&second_id)?;
+    assert_eq!(short_id(&first_id)?, short);
+    for selector in [short.to_string(), format!("{}/{short}", second.slug)] {
+        for ledger in ["ci", "attempts", "conflicts"] {
+            let value = run_boss(
+                engine.socket_str(),
+                &[
+                    "engine",
+                    ledger,
+                    "list",
+                    "--product",
+                    &second.slug,
+                    "--work-item",
+                    &selector,
+                ],
+            )?;
+            let canonical = run_boss(
+                engine.socket_str(),
+                &[
+                    "engine",
+                    ledger,
+                    "list",
+                    "--product",
+                    &second.slug,
+                    "--work-item",
+                    &second_id,
+                ],
+            )?;
+            assert_eq!(value, canonical, "{ledger} {selector}");
+            if ledger == "ci" {
+                assert_eq!(value["attempts"].as_array().unwrap().len(), 1);
+                assert_eq!(value["attempts"][0]["id"], second_attempt);
+            }
+        }
+    }
+    for ledger in ["ci", "attempts", "conflicts"] {
+        for missing in ["999999", "second/999999", "task_missing", "not-a-selector"] {
+            let error = run_boss_expect_failure(
+                engine.socket_str(),
+                &[
+                    "engine",
+                    ledger,
+                    "list",
+                    "--product",
+                    &second.slug,
+                    "--work-item",
+                    missing,
+                ],
+            )?;
+            assert!(
+                error.contains("could not resolve") || error.contains("unknown"),
+                "{error}"
+            );
+        }
+    }
+    Ok(())
+}

@@ -22,7 +22,10 @@ pub(crate) async fn run(client: &mut BossClient, ctx: &RunContext, args: TaskLis
     let repo = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
     let products = list_products(client).await?;
     let cross_product = args.all_products
-        || (args.product.is_none() && args.project.is_none() && (args.match_term.is_some() || !args.ids.is_empty()));
+        || (args.product.is_none()
+            && selector_scope::environment_product().is_none()
+            && args.project.is_none()
+            && (args.match_term.is_some() || !args.ids.is_empty()));
     let scope = if cross_product {
         None
     } else {
@@ -33,12 +36,19 @@ pub(crate) async fn run(client: &mut BossClient, ctx: &RunContext, args: TaskLis
         None => None,
     };
     let parent = if let Some(selector) = args.parent.as_deref() {
-        let resolved = resolve_create_revision_parent(client, selector).await?;
+        let resolved = match scope.as_ref() {
+            Some(product) => crate::selector_scope::resolve_filter_id(client, selector, &product.id).await?,
+            None => resolve_create_revision_parent(client, selector).await?,
+        };
         Some(resolve_chain_root_id(client, &resolved).await)
     } else {
         None
     };
-    let dep_filter = args.dep.clone().into_filter();
+    let dep_filter = args
+        .dep
+        .clone()
+        .resolve_in_scope(client, scope.as_ref().map(|product| product.id.as_str()))
+        .await?;
     // Batch status reads fetch only the requested items, including tombstones
     // for existence validation. Other filters are applied afterwards.
     let selected = if args.ids.is_empty() {

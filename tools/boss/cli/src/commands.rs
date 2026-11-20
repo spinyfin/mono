@@ -987,7 +987,7 @@ pub(crate) enum AttentionCommand {
     ///
     /// The engine finds or creates the owning group based on the association
     /// and source fields.
-    Create(AttentionCreateArgs),
+    Create(Box<AttentionCreateArgs>),
     /// Record an answer for one attention member (`atn_…`).
     Answer(AttentionAnswerArgs),
     /// Dismiss an attention group or member without producing an artifact.
@@ -1040,6 +1040,9 @@ pub(crate) struct AttentionGroupSelectorArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct AttentionCreateArgs {
+    /// Product scope for unqualified association selectors.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
     /// Kind of attention to create: `question` or `followup`.
     #[arg(long)]
     pub(crate) kind: String,

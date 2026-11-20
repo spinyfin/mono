@@ -41,6 +41,25 @@ talking directly to external services instead:
   issue sync.
 - `boss uninstall` removes an installed `Boss.app` bundle.
 
+## Product scope for selectors
+
+Short work-item IDs are unique within a product. Use `--product <slug>` or
+`<slug>/<number>` to select one explicitly; a selector's product prefix takes
+precedence over the flag. List filters such as `--parent`, `--prerequisites-of`,
+`--dependents-of`, and `--ids` resolve within the listing's product, and unknown
+selectors fail instead of producing a successful empty list.
+
+Set `BOSS_PRODUCT=<slug-or-product-id>` to supply a default for scripts. Explicit
+flags and qualified selectors override it; canonical work-item IDs keep their
+own product. An unknown environment default is an error.
+
+Without explicit scope or `BOSS_PRODUCT`, ambiguous short IDs fail with every
+candidate listed, even when the app has a selected product. If the ID is missing
+from the app's selected product, the error names that selection and suggests
+qualified IDs in other products. With no app selection, globally unique IDs
+resolve silently. Successful resolution using the app selection names the product
+on stderr, including dependency add/remove, keeping JSON stdout usable by scripts.
+
 ## boss shake — one-time developer setup
 
 `boss shake <file>` files a bug or feature request against `spinyfin/mono` without any end-user configuration. Credentials for the GitHub App that powers it are embedded in the binary at build time.
