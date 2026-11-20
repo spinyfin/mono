@@ -826,6 +826,11 @@ impl WorkerCompletionHandler {
             && let Some(staged_url) =
                 on_heap(|| self.verified_staged_pr_url(execution_id, &execution, "stop event")).await
         {
+            // A verified staged PR is the progress the produce-a-PR
+            // fingerprint exists to detect. Retire that cycle before the
+            // run_done hold or finalization so a later quiet sweep cannot
+            // replay a stale `no_pr` intent.
+            self.retire_produce_pr_nudge(execution_id);
             tracing::info!(
                 execution_id,
                 pr_url = %staged_url,
@@ -1678,7 +1683,13 @@ must not be asked to open one",
                     "stop event: worker idle without an active PR — probing to push and open one"
                 );
                 return on_heap(|| {
-                    self.nudge_or_park(&execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
+                    self.nudge_or_park(
+                        &execution,
+                        PROBE_NO_PR,
+                        NO_PR_FINGERPRINT,
+                        None,
+                        StopOutcome::AwaitingInput,
+                    )
                 })
                 .await;
             }
