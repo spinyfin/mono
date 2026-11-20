@@ -10,12 +10,6 @@ path = "src/facade.rs"
 test-support = ["boss-engine-runtime/test-support"]
 
 [dependencies]
-boss-engine-driver = { path = "../driver" }
-boss-execution-runner = { path = "../execution-runner" }
-boss-pane-summary = { path = "../pane-summary" }
-boss-engine-utility-model = { path = "../utility-model" }
-boss-work-db = { path = "../work-db" }
-boss-protocol = { path = "../../protocol" }
 boss-engine-app = { path = "../app" }
 boss-engine-runtime = { path = "runtime" }
 anyhow = { workspace = true }
@@ -44,7 +38,3 @@ rusqlite = { workspace = true }
 toml = { workspace = true }
 boss-client = { path = "../../client" }
 tempfile = { workspace = true }
-
-[[bin]]
-name = "spawn_setup_probe"
-path = "bin/spawn_setup_probe.rs"

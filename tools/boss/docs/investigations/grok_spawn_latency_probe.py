@@ -1,4 +1,8 @@
-"""Time what a Grok worker spawn costs outside the engine.
+"""Dated record (2026-11-18, Grok CLI 1.0.70) of how the Grok spawn latency
+investigation was measured. Not a supported tool: it models the engine by hand
+and will drift from it, so do not rerun it to measure the current engine.
+
+Time what a Grok worker spawn costs outside the engine.
 
 Usage:
   python3 /absolute/path/grok_spawn_latency_probe.py preflight WORKSPACE SCRATCH RUNS [--parallel N]

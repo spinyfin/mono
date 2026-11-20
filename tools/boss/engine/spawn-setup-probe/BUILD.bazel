@@ -1,0 +1,19 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+# Manual diagnostic: times local worker setup through production functions.
+# Never starts a worker pane or an engine.
+rust_binary(
+    name = "spawn_setup_probe",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/engine/execution-runner",
+        "//tools/boss/engine/pane-summary",
+        "//tools/boss/engine/utility-model",
+        "//tools/boss/engine/work-db",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)

@@ -587,19 +587,14 @@ dependencies = [
  "boss-editorial",
  "boss-engine-app",
  "boss-engine-attachments",
- "boss-engine-driver",
  "boss-engine-planner-validation",
  "boss-engine-runtime",
- "boss-engine-utility-model",
  "boss-engine-utils",
  "boss-execution-contracts",
- "boss-execution-runner",
  "boss-host-execution",
  "boss-log-files",
- "boss-pane-summary",
  "boss-protocol",
  "boss-tmux",
- "boss-work-db",
  "clap",
  "libc",
  "rusqlite",
@@ -1687,6 +1682,20 @@ version = "0.1.0"
 [[package]]
 name = "boss-single-flight"
 version = "0.1.0"
+
+[[package]]
+name = "boss-spawn-setup-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-engine",
+ "boss-engine-utility-model",
+ "boss-execution-runner",
+ "boss-pane-summary",
+ "boss-protocol",
+ "boss-work-db",
+ "tokio",
+]
 
 [[package]]
 name = "boss-spoke"
