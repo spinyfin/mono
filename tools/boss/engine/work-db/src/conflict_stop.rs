@@ -366,7 +366,12 @@ impl WorkDb {
     ) -> Result<(i64, String)> {
         let context = self.workspace_failure_context(attempt, head, base)?;
         let (spent, last) = self.workspace_resume_state(&attempt.id)?;
-        let spent = if last.as_deref().is_some_and(|last| last != context) {
+        let cooldown_elapsed = attempt
+            .finished_at
+            .as_deref()
+            .and_then(|time| time.parse::<i64>().ok())
+            .is_some_and(|time| boss_engine_utils::epoch_time::now_epoch_secs().saturating_sub(time) >= 3600);
+        let spent = if cooldown_elapsed || last.as_deref().is_some_and(|last| last != context) {
             0
         } else {
             spent
@@ -376,8 +381,8 @@ impl WorkDb {
 
     /// Whether a recovery probe that succeeds would be refused because the
     /// failure episode (same host, same PR head and base) has already used its
-    /// resume budget. The probe cannot observe the bookmark or repository state
-    /// Cube refused, so only a change of host, head or base reopens it.
+    /// resume budget. An hourly cooldown also reopens probing so a repaired
+    /// bookmark recovers without requiring a new PR head or base.
     pub fn workspace_resume_paused(&self, attempt_id: &str, head: Option<&str>, base: Option<&str>) -> Result<bool> {
         let Some(attempt) = self
             .get_conflict_resolution(attempt_id)?
@@ -395,7 +400,7 @@ impl WorkDb {
     ///
     /// The resume budget lives on the attempt and is spent atomically by every
     /// resume, with or without a revision. A changed failing host, PR head or
-    /// base reopens it. Once spent, the attempt stays surfaced as paused.
+    /// base reopens it. Once spent, the attempt pauses for an hour.
     pub fn resume_conflict_workspace(
         &self,
         attempt_id: &str,
@@ -467,7 +472,7 @@ impl WorkDb {
             &attempt.id,
             &format!(
                 "Automatic recovery is paused after {MAX_UNCHANGED_WORKSPACE_RESUMES} unsuccessful resumes on the \
-                 same host and PR head and base. It resumes when the PR head or base moves or the failure \
+                 same host and PR head and base. It resumes after an hour, when the PR head or base moves, or the failure \
                  occurs on a different host."
             ),
         )

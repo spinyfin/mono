@@ -5,6 +5,15 @@ use crate::work::{PendingMergeCheck, PrOpenState, StaticPrStateChecker};
 
 #[tokio::test]
 async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
+    scheduling_refusal_survives(false).await;
+}
+
+#[tokio::test]
+async fn structured_scheduling_refusal_survives_watcher_probes_and_recovers() {
+    scheduling_refusal_survives(true).await;
+}
+
+async fn scheduling_refusal_survives(structured: bool) {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     seed_local_claude_driver(&db);
@@ -64,7 +73,12 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
         .unwrap();
     let diagnostic = "cube cannot move pr/42: cube will not pick a side with unique content; inspect jj log; jj bookmark set pr/42 -r head --allow-backwards";
     let cube = Arc::new(FakeCubeClient {
-        goto_cube_error: Some(diagnostic.into()),
+        goto_cube_error: Some(if structured {
+            serde_json::json!({"error": diagnostic, "error_kind": "workspace_positioning_refused", "retryable": false})
+                .to_string()
+        } else {
+            diagnostic.into()
+        }),
         ..Default::default()
     });
     let coordinator = Arc::new(
@@ -93,12 +107,20 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
     let WorkItem::Task(retained) = db.get_work_item(&revision).unwrap() else {
         panic!()
     };
-    assert_eq!(retained.status, TaskStatus::Todo);
-    assert_eq!(
-        retained.dispatch_failed_reason.as_deref(),
-        Some("cube_workspace_positioning_failed")
-    );
-    assert!(retained.dispatch_failed_error.unwrap().contains(diagnostic));
+    if structured {
+        assert_eq!(retained.status, TaskStatus::Blocked);
+        assert_eq!(
+            retained.blocked_reason.as_deref(),
+            Some("workspace_positioning_refused")
+        );
+    } else {
+        assert_eq!(retained.status, TaskStatus::Todo);
+        assert_eq!(
+            retained.dispatch_failed_reason.as_deref(),
+            Some("cube_workspace_positioning_failed")
+        );
+        assert!(retained.dispatch_failed_error.unwrap().contains(diagnostic));
+    }
     assert!(retained.deleted_at.is_none());
     let WorkItem::Chore(blocked) = db.get_work_item(&parent.id).unwrap() else {
         panic!()
@@ -275,12 +297,23 @@ async fn scheduling_refusal_under_a_foreign_blocker_keeps_the_blocker_and_shows_
 
 #[tokio::test]
 async fn lease_stage_cube_error_retries_and_fails_the_attempt_only_when_retries_are_exhausted() {
+    preparation_retries_until_exhausted(false).await;
+}
+
+#[tokio::test]
+async fn retryable_goto_envelope_retries_before_stopping_the_attempt() {
+    preparation_retries_until_exhausted(true).await;
+}
+
+async fn preparation_retries_until_exhausted(goto: bool) {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let (parent, attempt, _revision, exec_id) = conflict_revision_fixture(&db, None).await;
     let exec = db.get_execution(&exec_id).unwrap();
     let cube = Arc::new(FakeCubeClient {
-        fail_lease_with_cube_cli_error: true,
+        fail_lease_with_cube_cli_error: !goto,
+        goto_cube_error: goto
+            .then(|| r#"{"error":"maintenance busy","error_kind":"maintenance_busy","retryable":true}"#.into()),
         ..Default::default()
     });
     let build = |delays: Vec<Duration>| {

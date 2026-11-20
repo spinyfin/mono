@@ -145,21 +145,33 @@ pub mod cube {
         /// Only cube's explicit structured refusal suppresses positioning retries.
         /// Older binaries, transport errors and malformed payloads remain retryable.
         pub fn positioning_refused(&self) -> bool {
-            self.structured_refusal().is_some()
+            self.structured_envelope().is_some_and(|value| {
+                value["error_kind"] == "workspace_positioning_refused" && value["retryable"] == false
+            })
+        }
+
+        /// Honor Cube's retry classification, including legacy maintenance exits.
+        pub fn retryable(&self) -> bool {
+            self.structured_envelope()
+                .and_then(|value| value["retryable"].as_bool())
+                .unwrap_or(self.exit_code == Some(75))
         }
 
         /// Cube's own refusal message (the envelope's `error` string), free of the
         /// JSON wrapper, for the blocked label and the attention body.
         pub fn refusal_message(&self) -> Option<String> {
-            self.structured_refusal()?["error"].as_str().map(str::to_owned)
+            if !self.positioning_refused() {
+                return None;
+            }
+            self.structured_envelope()?["error"].as_str().map(str::to_owned)
         }
 
-        /// The refusal envelope, wherever it sits in the captured output. Cube
+        /// The error envelope, wherever it sits in the captured output. Cube
         /// prints other diagnostics (fetch retries, op-divergence recovery) to
         /// stderr before the envelope, so the whole stream is not one document:
         /// try each top-level `{` line, last first, and accept the first object
-        /// that parses and carries the refusal kind.
-        fn structured_refusal(&self) -> Option<serde_json::Value> {
+        /// that parses and carries a retry classification.
+        fn structured_envelope(&self) -> Option<serde_json::Value> {
             [&self.stderr, &self.stdout].into_iter().find_map(|output| {
                 let starts = output
                     .match_indices('{')
@@ -171,8 +183,7 @@ pub mod cube {
                         .into_iter::<serde_json::Value>()
                         .next()?
                         .ok()?;
-                    (value["error_kind"] == "workspace_positioning_refused" && value["retryable"] == false)
-                        .then_some(value)
+                    value["retryable"].is_boolean().then_some(value)
                 })
             })
         }
@@ -207,6 +218,37 @@ pub mod cube {
     #[cfg(test)]
     mod positioning_error_tests {
         use super::CubeCliError;
+
+        #[test]
+        fn retryability_uses_the_envelope_on_either_stream() {
+            for kind in [
+                "maintenance_busy",
+                "command_timed_out",
+                "deadline_exceeded",
+                "fetch_failed",
+            ] {
+                for stdout in [false, true] {
+                    let envelope =
+                        serde_json::json!({"error_kind": kind, "retryable": true, "error": "try again"}).to_string();
+                    let output = format!("fetch diagnostic\n{envelope}\n");
+                    let error = CubeCliError {
+                        host: "remote".into(),
+                        exit_code: Some(1),
+                        stderr: if stdout { String::new() } else { output.clone() },
+                        stdout: if stdout { output } else { String::new() },
+                    };
+                    assert!(error.retryable());
+                    assert!(!error.positioning_refused());
+                }
+            }
+            let error = CubeCliError {
+                host: "local".into(),
+                exit_code: Some(75),
+                stderr: String::new(),
+                stdout: String::new(),
+            };
+            assert!(error.retryable());
+        }
 
         #[test]
         fn only_structured_refusals_stop_retries_on_local_and_remote_hosts() {
