@@ -319,6 +319,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_heads_ignore_the_jj_lock_during_concurrent_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let heads = dir.path().join(".jj/repo/op_heads/heads");
+        fs::create_dir_all(&heads).unwrap();
+        fs::write(heads.join("aa"), b"").unwrap();
+        fs::write(heads.join("bb"), b"").unwrap();
+        fs::write(heads.join("lock"), b"").unwrap();
+        assert_eq!(op_heads(dir.path()).unwrap(), ["aa", "bb"]);
+        assert_eq!(crate::app::store_gc::count_op_heads(dir.path()).unwrap(), 2);
+        fs::remove_file(heads.join("lock")).unwrap();
+        assert_eq!(op_heads(dir.path()).unwrap(), ["aa", "bb"]);
+    }
+
+    #[test]
     fn prepared_heads_refuse_concurrent_progress_and_publish_only_the_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let heads = dir.path().join(".jj/repo/op_heads/heads");

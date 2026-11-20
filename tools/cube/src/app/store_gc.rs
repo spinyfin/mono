@@ -393,6 +393,9 @@ fn op_heads(source: &Path) -> Result<Vec<String>> {
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()
         .map_err(CubeError::Io)?;
+    // jj holds a transient `lock` file here while publishing operation heads.
+    // It is coordination metadata, never an operation to traverse or collect.
+    heads.retain(|head| head != "lock");
     // Directory order is arbitrary; sorted heads give a stable verification order.
     heads.sort();
     Ok(heads)
