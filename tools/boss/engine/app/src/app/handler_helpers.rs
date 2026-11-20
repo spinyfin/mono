@@ -1354,9 +1354,9 @@ pub(super) async fn open_review_terminal_async(
         fail_with_release!(e);
     }
 
-    // Step 5: jj new -r <branch>@origin
+    // Step 5: jj new <branch>@origin
     let rev = format!("{head_branch}@origin");
-    if let Err(e) = run_jj(&lease.workspace_path, &["new", "-r", &rev], &format!("jj new -r {rev}")).await {
+    if let Err(e) = run_jj(&lease.workspace_path, &["new", &rev], &format!("jj new {rev}")).await {
         fail_with_release!(e);
     }
 

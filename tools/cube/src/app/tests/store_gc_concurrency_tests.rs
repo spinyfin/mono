@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 #[path = "store_gc_fixture.rs"]
 mod fixture;
 
+#[path = "store_gc_upgrade_tests.rs"]
+mod upgrade;
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 struct Runner {

@@ -2,6 +2,35 @@
 use super::*;
 use std::fs;
 
+/// Repair primaries left stale by the legacy in-place collector before
+/// preparing a staged rewrite. Release the reader before taking exclusivity.
+pub(super) fn prepare_with_recovery(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    source: &Path,
+    cut: &str,
+) -> Result<Option<PreparedRewrite>> {
+    let reader = JjGate::shared_for_database(database_path)?;
+    let snapshot = snapshot_primary(runner, source, MAINTENANCE_CMD_TIMEOUT);
+    if let Err(error) = snapshot {
+        if crate::app::jj::jj_update_stale_recovery_kind(&error).is_none() {
+            return Err(error);
+        }
+        drop(reader);
+        let gate = jj_maintenance_gate(database_path, MAINTENANCE_CMD_TIMEOUT)?.ok_or(CubeError::MaintenanceBusy)?;
+        gate.recover_quarantine(runner)?;
+        runner.run_with_timeout(
+            &gated_jj_invocation(source, &["workspace", "update-stale"]),
+            MAINTENANCE_CMD_TIMEOUT,
+        )?;
+        drop(gate);
+    } else {
+        drop(reader);
+    }
+    let _reader = JjGate::shared_for_database(database_path)?;
+    PreparedRewrite::prepare(runner, source, cut)
+}
+
 /// Only operation heads are private. jj writes content-addressed operation
 /// files into the shared store, but cannot publish them to live readers.
 /// The GC lock prevents a collector from deleting those files meanwhile.
@@ -37,13 +66,16 @@ impl PreparedRewrite {
         }
         std::os::unix::fs::symlink(source.join(".jj/working_copy"), scratch.path().join(".jj/working_copy"))
             .map_err(CubeError::Io)?;
-        runner.run_with_timeout(
-            &gated_jj_invocation(
-                scratch.path(),
-                &["--ignore-working-copy", "op", "abandon", &format!("..{cut}")],
-            ),
-            MAINTENANCE_CMD_TIMEOUT,
-        )?;
+        // jj may allocate a new config id for this copied repo. Keep its
+        // configuration inside the disposable directory too.
+        let mut abandon = gated_jj_invocation(
+            scratch.path(),
+            &["--ignore-working-copy", "op", "abandon", &format!("..{cut}")],
+        );
+        for name in ["HOME", "XDG_CONFIG_HOME"] {
+            abandon.env.push((name.into(), scratch.path().display().to_string()));
+        }
+        runner.run_with_timeout(&abandon, MAINTENANCE_CMD_TIMEOUT)?;
         let heads = op_heads(scratch.path())?;
         let [rewritten] = heads.as_slice() else {
             return Err(CubeError::InvalidArgument(
