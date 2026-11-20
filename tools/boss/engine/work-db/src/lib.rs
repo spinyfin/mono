@@ -1142,6 +1142,7 @@ pub use pr_flow::QueuedMergeQueueMember;
 #[doc(hidden)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;
+pub use pr_state::PR_BASE_CHECK_BUDGET;
 pub use pr_state::PrBaseVerdict;
 pub use pr_state::PrInspect;
 pub use pr_state::PrMergeClass;
@@ -1149,6 +1150,7 @@ pub use pr_state::PrOpenState;
 pub use pr_state::PrStateChecker;
 pub use pr_state::RevisionGateError;
 pub use pr_state::StaticPrStateChecker;
+pub use pr_state::bounded_base_verdict;
 pub use pr_state::classify_pr_merge_state;
 pub use preserved_cleanup::{CLOSED_CHAIN_RETENTION_SECS, PreservedCleanup, PreservedCleanupReason};
 pub use proposals::SubmitWorkerProposalInput;

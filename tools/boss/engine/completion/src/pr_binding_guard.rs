@@ -42,21 +42,36 @@ impl WorkerCompletionHandler {
         let check = tokio::task::spawn_blocking(move || checker.base_verdict(&url));
         match tokio::time::timeout(super::run_done_declaration::DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
             Ok(Ok(Ok(PrBaseVerdict::DefaultBranch))) => {
-                let _ = self
+                // Filed execution-scoped, so it must be resolved by execution.
+                if let Err(err) = self
                     .work_db
-                    .resolve_external_tracker_attention(&execution.work_item_id, PR_BASE_REFUSED);
+                    .resolve_attention_kind_for_execution(&execution.id, PR_BASE_REFUSED)
+                {
+                    tracing::warn!(?err, "failed to resolve PR base refusal attention");
+                }
                 None
             }
             Ok(Ok(Ok(PrBaseVerdict::NotChecked))) => None,
             Ok(Ok(Ok(PrBaseVerdict::Refused(reason)))) => {
-                if let Err(err) = self
-                    .file_execution_attention(
-                        execution,
-                        PR_BASE_REFUSED,
-                        "PR must target the default branch",
-                        format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
-                    )
-                    .await
+                // Refused delivery is retried; keep one open item per execution.
+                let already_open = match self.work_db.list_attention_items(&execution.id) {
+                    Ok(items) => items
+                        .iter()
+                        .any(|item| item.kind == PR_BASE_REFUSED && item.status == "open"),
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to list attention items for PR base refusal");
+                        false
+                    }
+                };
+                if !already_open
+                    && let Err(err) = self
+                        .file_execution_attention(
+                            execution,
+                            PR_BASE_REFUSED,
+                            "PR must target the default branch",
+                            format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
+                        )
+                        .await
                 {
                     tracing::warn!(?err, "failed to record PR base refusal");
                 }

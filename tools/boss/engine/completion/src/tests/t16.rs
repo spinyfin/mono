@@ -919,6 +919,32 @@ async fn base_refusal_blocks_delivery_and_only_explicit_refusal_files_attention(
                 .count(),
             1
         );
+        let open_refusals = |db: &WorkDb| {
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .filter(|item| {
+                    item.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED && item.status == "open"
+                })
+                .count()
+        };
+        // A second refused retry must not add a second open row.
+        let refused = handler
+            .guard_pr_base(&db.get_execution(&execution_id).unwrap(), OWN_PR)
+            .await;
+        assert!(matches!(refused, Some(StopOutcome::DetectorFailed)));
+        assert_eq!(open_refusals(&db), 1);
+        // NotChecked does not resolve it.
+        let handler = handler.with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::NotChecked),
+        ));
+        assert!(
+            handler
+                .guard_pr_base(&db.get_execution(&execution_id).unwrap(), OWN_PR)
+                .await
+                .is_none()
+        );
+        assert_eq!(open_refusals(&db), 1);
         let handler = handler.with_pr_state_checker(Arc::new(
             FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::DefaultBranch),
         ));
@@ -928,6 +954,7 @@ async fn base_refusal_blocks_delivery_and_only_explicit_refusal_files_attention(
                 .await
                 .is_none()
         );
+        assert_eq!(open_refusals(&db), 0);
     }
 }
 

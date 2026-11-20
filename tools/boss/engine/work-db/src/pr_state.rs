@@ -155,24 +155,63 @@ impl PrStateChecker for GhPrStateChecker {
     }
 }
 
+/// Upper bound on one base-policy lookup made from an async sweep.
+pub const PR_BASE_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Run [`PrStateChecker::base_verdict`] off the async runtime with a deadline.
+///
+/// The production checker shells out to `gh` with no deadline of its own, so
+/// calling it inline would pin a runtime worker for as long as `gh` hangs.
+/// A timeout or a panicked blocking task is an `Err`: callers treat it like
+/// any other retryable lookup failure and leave their state untouched.
+pub async fn bounded_base_verdict(
+    checker: std::sync::Arc<dyn PrStateChecker>,
+    pr_url: &str,
+    budget: std::time::Duration,
+) -> Result<PrBaseVerdict> {
+    let url = pr_url.to_owned();
+    let check = tokio::task::spawn_blocking(move || checker.base_verdict(&url));
+    match tokio::time::timeout(budget, check).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => bail!("PR base check task failed for {pr_url}: {join_err}"),
+        Err(_) => bail!("PR base check for {pr_url} exceeded {budget:?}"),
+    }
+}
+
+/// `gh api graphql` arguments for the shared PR query.
+fn pr_query_args(owner: &str, repo: &str, number: u64) -> Vec<String> {
+    let query = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){defaultBranchRef{name} pullRequest(number:$number){state mergedAt headRefOid headRefName baseRefName}}}";
+    vec![
+        "api".into(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={query}"),
+        "-f".into(),
+        format!("owner={owner}"),
+        "-f".into(),
+        format!("repo={repo}"),
+        "-F".into(),
+        format!("number={number}"),
+    ]
+}
+
+/// Pure validation of the GraphQL response: the `repository` object, or an
+/// error when GraphQL reported `errors` or the PR does not exist.
+fn repository_from_response(value: &serde_json::Value, pr_url: &str) -> Result<serde_json::Value> {
+    if value.get("errors").is_some() || !value["data"]["repository"]["pullRequest"].is_object() {
+        bail!("PR query returned errors or no PR for {pr_url}: {value}");
+    }
+    Ok(value["data"]["repository"].clone())
+}
+
 /// Both readers use one parameterised query; policy never changes lifecycle.
 fn query_pr(pr_url: &str) -> Result<serde_json::Value> {
     let (owner, repo, number) =
         boss_github::pr_url::parse_pr_url_parts(pr_url).with_context(|| format!("invalid PR URL: {pr_url}"))?;
-    let query = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){defaultBranchRef{name} pullRequest(number:$number){state mergedAt headRefOid headRefName baseRefName}}}";
+    let args = pr_query_args(owner, repo, number);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
-        boss_github::gh_runner::gh_output_blocking(&[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={query}"),
-            "-f",
-            &format!("owner={owner}"),
-            "-f",
-            &format!("repo={repo}"),
-            "-F",
-            &format!("number={number}"),
-        ])
+        boss_github::gh_runner::gh_output_blocking(&arg_refs)
     })
     .with_context(|| format!("failed to query PR {pr_url}"))?;
     if !output.status.success() {
@@ -182,10 +221,7 @@ fn query_pr(pr_url: &str) -> Result<serde_json::Value> {
         );
     }
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    if value.get("errors").is_some() || !value["data"]["repository"]["pullRequest"].is_object() {
-        bail!("PR query returned errors or no PR for {pr_url}: {value}");
-    }
-    Ok(value["data"]["repository"].clone())
+    repository_from_response(&value, pr_url)
 }
 
 fn map_base_verdict(repository: &serde_json::Value) -> Result<PrBaseVerdict> {
@@ -394,6 +430,56 @@ mod tests {
             StaticPrStateChecker(PrOpenState::Open).base_verdict("unused").unwrap(),
             PrBaseVerdict::NotChecked
         );
+    }
+
+    #[test]
+    fn query_args_carry_owner_repo_and_number() {
+        let args = pr_query_args("acme", "widgets", 42);
+        assert_eq!(&args[..3], ["api", "graphql", "-f"]);
+        assert!(args[3].starts_with("query=query($owner:String!"));
+        assert!(args.contains(&"owner=acme".to_owned()));
+        assert!(args.contains(&"repo=widgets".to_owned()));
+        let n = args.iter().position(|a| a == "number=42").unwrap();
+        assert_eq!(args[n - 1], "-F");
+    }
+
+    #[test]
+    fn response_validation_rejects_errors_and_missing_pr() {
+        let url = "https://github.com/a/b/pull/1";
+        let ok = json!({"data": {"repository": {"pullRequest": {"state": "OPEN"}}}});
+        assert_eq!(
+            repository_from_response(&ok, url).unwrap()["pullRequest"]["state"],
+            "OPEN"
+        );
+        let no_pr = json!({"data": {"repository": {"pullRequest": null}}});
+        assert!(repository_from_response(&no_pr, url).is_err());
+        let errors =
+            json!({"errors": [{"message": "boom"}], "data": {"repository": {"pullRequest": {"state": "OPEN"}}}});
+        assert!(repository_from_response(&errors, url).is_err());
+        assert!(repository_from_response(&json!({"data": null}), url).is_err());
+    }
+
+    struct Hanging(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+    impl PrStateChecker for Hanging {
+        fn check(&self, _: &str) -> Result<PrOpenState> {
+            Ok(PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> Result<PrBaseVerdict> {
+            let _ = self.0.lock().unwrap().recv();
+            Ok(PrBaseVerdict::DefaultBranch)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_base_verdict_times_out_on_a_stalled_checker() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let checker: std::sync::Arc<dyn PrStateChecker> = std::sync::Arc::new(Hanging(std::sync::Mutex::new(wait)));
+        let (result, ()) = tokio::join!(bounded_base_verdict(checker, "u", PR_BASE_CHECK_BUDGET), async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(PR_BASE_CHECK_BUDGET + std::time::Duration::from_secs(1)).await;
+        });
+        drop(release);
+        assert!(result.unwrap_err().to_string().contains("exceeded"));
     }
 
     #[test]
