@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use boss_event_bus::{Event, EventBus};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::event_publish::PendingEvents;
+use crate::event_publish::{PendingEvents, commit_and_publish};
 
 /// How long sqlite will internally retry on `SQLITE_BUSY` before
 /// surfacing the error to the caller. We funnel concurrent CLI writes

@@ -461,7 +461,7 @@ impl WorkDb {
         if cleared {
             crate::board_notifications::stage_task_board_change(&mut pending, &tx, id)?;
         }
-        crate::commit_and_publish(tx, pending, self.event_bus())?;
+        crate::commit_and_publish(tx, pending, self.event_bus(), self.dispatch_events.as_ref())?;
         Ok(cleared)
     }
 
