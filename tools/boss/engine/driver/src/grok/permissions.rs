@@ -38,9 +38,9 @@ pub fn grok_sandbox_disabled(is_remote: bool) -> bool {
 /// `off`/`none` — investigation §`sandbox.toml` schema). Reviewer extends
 /// `read-only` so the custom `sandbox.toml` path (non-macOS / remote) has
 /// no-CWD-write. Local macOS Grok uses `--sandbox off` instead, so Reviewer
-/// workspace writes are denied only via the CLI `Edit(<workspace>)` rules
-/// in [`structural_deny_rules`]. Every other kind needs to write its own
-/// workspace.
+/// writes and publishing are fenced by the Reviewer PreToolUse guard as well
+/// as the CLI rules in [`structural_deny_rules`]. Every other kind needs to
+/// write its own workspace.
 fn sandbox_base_profile(worker_kind: WorkerKind) -> &'static str {
     match worker_kind {
         // Grok never actually dispatches a review-guide job (it is pinned to
@@ -165,11 +165,9 @@ pub fn structural_deny_rules(
         }
     }
 
-    // Reviewer workspace belt: CLI-grammar only. Local macOS Grok has no
-    // OS-level confinement (`--sandbox off`), so this is the remaining
-    // enforcement against Edit/Write of the PR workspace. A Bash-driven
-    // write still evades it — Grok's `Edit(path)` rules do not match
-    // `run_terminal_command`.
+    // Defense in depth for native edits. The Reviewer PreToolUse guard is
+    // authoritative for file writes, shell commands and publishing, including
+    // on local macOS where the OS sandbox is off.
     if worker_kind == WorkerKind::Reviewer
         && let Some(workspace) = workspace_path
     {

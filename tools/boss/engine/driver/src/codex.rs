@@ -45,9 +45,9 @@ mod rollout_calls;
 mod tool_surface_guard;
 
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
-pub(crate) use review_guide_guard::codex_review_guide_guard_script;
 #[cfg(test)]
 pub(crate) use review_guide_guard::with_review_guide_command as codex_review_guide_guard_script_for_test;
+pub(crate) use review_guide_guard::{codex_review_guide_guard_script, with_source_reads};
 pub(crate) use reviewer_publish_guard::codex_reviewer_publish_guard_script;
 pub(crate) use tool_surface_guard::codex_tool_surface_guard_script;
 
