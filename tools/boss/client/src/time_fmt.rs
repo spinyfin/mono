@@ -16,9 +16,9 @@
 use std::process::Command;
 use std::sync::OnceLock;
 
-pub(crate) struct DisplayTz {
-    pub(crate) offset_s: i32,
-    pub(crate) label: String,
+pub struct DisplayTz {
+    pub offset_s: i32,
+    pub label: String,
 }
 
 fn detect_local_utc_offset_seconds_uncached() -> Option<i32> {
@@ -42,18 +42,18 @@ fn detect_local_utc_offset_seconds_uncached() -> Option<i32> {
     Some(sign * (hh * 3_600 + mm * 60))
 }
 
-pub(crate) fn detect_local_utc_offset_seconds() -> Option<i32> {
+pub fn detect_local_utc_offset_seconds() -> Option<i32> {
     static OFFSET: OnceLock<Option<i32>> = OnceLock::new();
     *OFFSET.get_or_init(detect_local_utc_offset_seconds_uncached)
 }
 
-pub(crate) fn offset_suffix(offset_s: i32) -> String {
+pub fn offset_suffix(offset_s: i32) -> String {
     let sign = if offset_s < 0 { '-' } else { '+' };
     let abs = offset_s.unsigned_abs();
     format!("{sign}{:02}:{:02}", abs / 3_600, (abs % 3_600) / 60)
 }
 
-pub(crate) fn resolve_display_tz(force_utc: bool) -> DisplayTz {
+pub fn resolve_display_tz(force_utc: bool) -> DisplayTz {
     if force_utc {
         return DisplayTz {
             offset_s: 0,
@@ -76,7 +76,7 @@ pub(crate) fn resolve_display_tz(force_utc: bool) -> DisplayTz {
     }
 }
 
-pub(crate) fn format_epoch(epoch_s: i64, tz: &DisplayTz) -> String {
+pub fn format_epoch(epoch_s: i64, tz: &DisplayTz) -> String {
     let shifted = epoch_s.saturating_add(i64::from(tz.offset_s));
     let utc_form = boss_engine_utils::iso8601::format_epoch_iso8601(shifted);
     format!("{}{}", utc_form.trim_end_matches('Z'), offset_suffix(tz.offset_s))
@@ -84,7 +84,7 @@ pub(crate) fn format_epoch(epoch_s: i64, tz: &DisplayTz) -> String {
 
 /// Format a stored epoch-seconds string for human output. Falls back to the
 /// raw value when it does not parse as an `i64` (legacy non-epoch rows).
-pub(crate) fn format_stored_epoch(raw: &str) -> String {
+pub fn format_stored_epoch(raw: &str) -> String {
     let Ok(epoch_s) = raw.parse::<i64>() else {
         return raw.to_owned();
     };

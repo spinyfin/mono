@@ -175,11 +175,12 @@ mod project_create_args;
 mod project_deps;
 mod report;
 mod status_args;
-mod time_fmt;
 mod work_cmds;
 mod work_update_args;
 
 pub(crate) use automation_cmds::*;
+pub(crate) use boss_client::time_fmt::*;
+pub(crate) use boss_client::{execution_lines, time_fmt};
 pub(crate) use commands::*;
 pub(crate) use comment_commands::*;
 pub(crate) use data::*;
@@ -191,7 +192,6 @@ pub(crate) use idea_commands::*;
 pub(crate) use output::*;
 pub(crate) use project_create_args::*;
 pub(crate) use status_args::*;
-pub(crate) use time_fmt::*;
 pub(crate) use work_cmds::*;
 pub(crate) use work_update_args::*;
 

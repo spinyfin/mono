@@ -2189,26 +2189,24 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
         .resolve_work_item_ref_strict(work_item_id)
         .map_err(|err| anyhow::anyhow!("{err}"))?;
     let executions = db.list_executions(Some(&work_item_id)).context("listing executions")?;
-    let host_ids = db
-        .execution_host_ids_for_item(&work_item_id)
-        .context("resolving execution hosts")?;
-    let hosts: Vec<String> = executions
-        .iter()
-        .map(|e| host_ids.get(&e.id).cloned().unwrap_or_else(|| "local".to_owned()))
-        .collect();
+    let rows: Vec<ExecutionRow> = executions
+        .into_iter()
+        .map(|exec| {
+            // A pre-start failure records its error only on the run row, so
+            // load runs when the execution itself carries no error text.
+            let needs_runs = exec.status == boss_protocol::ExecutionStatus::Failed
+                && exec.last_error.as_deref().is_none_or(|text| text.trim().is_empty());
+            let runs = if needs_runs {
+                db.list_runs(&exec.id).context("listing execution runs")?
+            } else {
+                Vec::new()
+            };
+            Ok(ExecutionRow { exec, runs })
+        })
+        .collect::<Result<_>>()?;
 
     if json {
-        let entries: Vec<serde_json::Value> = executions
-            .iter()
-            .zip(hosts.iter())
-            .map(|(exec, host)| {
-                let mut value = serde_json::to_value(exec).unwrap_or(serde_json::Value::Null);
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert("host_id".into(), serde_json::Value::String(host.clone()));
-                }
-                value
-            })
-            .collect();
+        let entries: Vec<&WorkExecution> = rows.iter().map(|row| &row.exec).collect();
         println!(
             "{}",
             serde_json::json!({
@@ -2216,26 +2214,26 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
                 "executions": entries,
             })
         );
-    } else if executions.is_empty() {
+    } else if rows.is_empty() {
         println!("no executions for {work_item_id}");
     } else {
-        for (exec, host) in executions.iter().zip(hosts.iter()) {
-            print_execution_history_row(exec, host);
+        for row in &rows {
+            print_execution_history_row(&row.exec, &row.runs);
         }
     }
     Ok(())
 }
 
-fn print_execution_history_row(exec: &WorkExecution, host: &str) {
-    let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
-    let started = exec.started_at.as_deref().unwrap_or("-");
-    let finished = exec.finished_at.as_deref().unwrap_or("-");
-    println!(
-        "{}  [{}]  kind={}  host={}  workspace={}  created={}  started={}  finished={}",
-        exec.id, exec.status, exec.kind, host, workspace, exec.created_at, started, finished,
-    );
-    if let Some(pr_url) = &exec.pr_url {
-        println!("  pr_url: {pr_url}");
+struct ExecutionRow {
+    exec: WorkExecution,
+    runs: Vec<boss_protocol::WorkRun>,
+}
+
+/// Text rendering of one execution history row, shared with
+/// `boss task executions` through `boss_client::execution_lines`.
+fn print_execution_history_row(exec: &WorkExecution, runs: &[boss_protocol::WorkRun]) {
+    for line in boss_client::execution_lines::history_row_lines(exec, runs) {
+        println!("{line}");
     }
 }
 

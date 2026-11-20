@@ -538,10 +538,11 @@ fn every_run_carrying_event_is_sanitized() {
 
 #[test]
 fn execution_rows_carry_no_runtime_half_fields() {
-    // Today this passes because `WorkExecution` never had `host_id` /
-    // `remote_pid` / `shell_pid` on the wire — they are DB columns
-    // `mappers.rs` does not map. The assertion is here so that stays true:
-    // adding one of them to the struct fails this test until `sanitize.rs`
+    // `remote_pid` / `shell_pid` are DB columns `mappers.rs` does not map, and
+    // `host_id` is stripped by `sanitize_execution` (see
+    // `execution_host_id_is_stripped_for_workers`). A row that carries none
+    // of them must pass through the sanitizer untouched; adding another
+    // runtime-half field to the struct fails this test until `sanitize.rs`
     // strips it.
     for event in [
         FrontendEvent::ExecutionResult { execution: execution() },
@@ -571,6 +572,48 @@ fn execution_rows_carry_no_runtime_half_fields() {
         assert_nothing_leaked(&after);
         assert_eq!(serde_json::to_value(after).unwrap(), before);
     }
+}
+
+#[test]
+fn execution_host_id_is_stripped_for_workers() {
+    let mut placed = execution();
+    placed.host_id = Some("zakalwe".into());
+    // Guard the guard: the fixture must actually carry the host, or this
+    // test would pass against a sanitizer that does nothing.
+    let before = FrontendEvent::ExecutionsList {
+        work_item_id: Some("chore_1".into()),
+        executions: vec![placed.clone()],
+    };
+    assert_eq!(
+        forbidden_values(&before)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>(),
+        vec!["host_id"],
+    );
+
+    for event in [
+        FrontendEvent::ExecutionResult {
+            execution: placed.clone(),
+        },
+        before,
+    ] {
+        let after = sanitize_event_for_worker(event);
+        assert_nothing_leaked(&after);
+    }
+
+    // The rest of the row survives: only the runtime half is closed.
+    let mut waiting = placed;
+    waiting.dispatch_wait_reason = Some("pool_exhausted".into());
+    waiting.last_error = Some("workspace lease failed".into());
+    let FrontendEvent::ExecutionResult { execution } =
+        sanitize_event_for_worker(FrontendEvent::ExecutionResult { execution: waiting })
+    else {
+        panic!("sanitizing must not change the variant");
+    };
+    assert_eq!(execution.host_id, None);
+    assert_eq!(execution.dispatch_wait_reason.as_deref(), Some("pool_exhausted"));
+    assert_eq!(execution.last_error.as_deref(), Some("workspace lease failed"));
 }
 
 fn worker_context_bundle() -> WorkerContextBundle {

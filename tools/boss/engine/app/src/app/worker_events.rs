@@ -215,7 +215,8 @@ pub(super) async fn dispatch_worker_event_fanout(
 /// directly without staging silently skips marker staging, and a following
 /// `Stop` could then be evaluated before the marker is visible.
 ///
-/// Ordering here is load-bearing; see the per-call comments.
+/// Ordering here is load-bearing; see the per-call comments. Stages are
+/// `Box::pin`ned so debug-build futures stay off a 2 MiB stack.
 pub(super) async fn dispatch_staged_worker_event_fanout(
     server_state: &Arc<ServerState>,
     incoming: &boss_engine_runtime::events_socket::IncomingHookEvent,
@@ -232,8 +233,8 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
         incoming.run_id.as_deref(),
         &incoming.event,
     );
-    server_state.publish_hook_derived_events(incoming).await;
-    dispatch_live_worker_state(server_state, incoming).await;
+    Box::pin(server_state.publish_hook_derived_events(incoming)).await;
+    Box::pin(dispatch_live_worker_state(server_state, incoming)).await;
     // Codex guard-trace observation: record whether this turn's PreToolUse
     // guards ran and what they decided — and, when tool calls ran with no
     // guard invocation at all, that Boss's command guardrails were not
@@ -244,14 +245,14 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // product's editorial rules and record the
     // decision in `editorial_actions`. Fire-and-
     // forget; never blocks the event dispatch.
-    dispatch_editorial_on_pretooluse(server_state, incoming).await;
+    Box::pin(dispatch_editorial_on_pretooluse(server_state, incoming)).await;
     // Post-hoc interception fallback: for any driver
     // that lacks real-time PreToolUse hooks (the
     // ToolUseInterception Degrade path), this is the
     // only place editorial/path/revision-PR/
     // checkleft loss ever gets surfaced. No-op for
     // Claude, which already ran those guards above.
-    dispatch_post_hoc_interception_on_post_tool_use(server_state, incoming).await;
+    Box::pin(dispatch_post_hoc_interception_on_post_tool_use(server_state, incoming)).await;
     // Probes fire on PostToolUse so the
     // coordinator can redirect a worker
     // mid-task without waiting for Stop —
@@ -259,7 +260,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // effectively the worker's terminal one.
     // The tool call has already returned at
     // this point, so no in-flight work is lost.
-    let _ = dispatch_probe_on_post_tool_use(server_state, incoming).await;
+    let _ = Box::pin(dispatch_probe_on_post_tool_use(server_state, incoming)).await;
     // ProbeReplied runs first: emit the reply for the
     // prior probe before dispatching the next one so
     // a single Stop never fires both reply and dispatch
@@ -270,7 +271,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // survives a completion handler that errors, an engine restart, or the
     // pane going away milliseconds later.
     record_turn_boundary_on_stop(server_state, incoming);
-    dispatch_probe_reply_on_stop(server_state, incoming).await;
+    Box::pin(dispatch_probe_reply_on_stop(server_state, incoming)).await;
     // **Probe dispatch runs on both sides of completion, and that is
     // load-bearing in each direction.**
     //
@@ -317,7 +318,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     // leaves the completion nudge queued — exactly what the single
     // post-completion pass did before, since a pre-existing probe already sat
     // ahead of the nudge in the queue.
-    let pre_pass = dispatch_probe_on_stop(server_state, incoming).await;
+    let pre_pass = Box::pin(dispatch_probe_on_stop(server_state, incoming)).await;
     // A boundary that lands while an interrupting delivery holds its claim
     // and has not written yet is the engine's own interrupt taking effect,
     // not the worker stopping, and the probe is about to be written. The
@@ -336,8 +337,8 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
              that decision re-evaluates; every other completion side effect still runs",
         );
     }
-    dispatch_completion_on_stop(server_state, incoming, defer_finalization).await;
-    let _ = dispatch_probe_on_stop(server_state, incoming).await;
+    Box::pin(dispatch_completion_on_stop(server_state, incoming, defer_finalization)).await;
+    let _ = Box::pin(dispatch_probe_on_stop(server_state, incoming)).await;
 }
 
 /// True when the pre-completion probe pass in [`dispatch_worker_event_fanout`]

@@ -179,3 +179,92 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
     );
     Ok(())
 }
+
+/// A held execution and a failed one must explain themselves in the CLI's
+/// own output — JSON fields and text lines — without a trip to the engine
+/// database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_executions_surface_wait_reason_and_failure_text() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let chore = create_chore(&mut client, &product.id, "Explain a held run").await?;
+    let db = engine.db()?;
+
+    let failed = db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )?;
+    db.record_pre_start_failure(
+        &failed.id,
+        "worker-1",
+        None,
+        "workspace lease failed: remote unreachable",
+        &[],
+    )?;
+    // `waiting_dependency` keeps the live test engine's dispatcher from
+    // rewriting the wait reason the test sets.
+    let held = db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::WaitingDependency)
+            .build(),
+    )?;
+    db.set_dispatch_wait_with_blocker(&held.id, "awaiting_predecessor_preservation", Some(&failed.id))?;
+
+    for (verb, args) in [
+        ("executions", vec!["task", "executions", chore.id.as_str()]),
+        ("show", vec!["task", "show", chore.id.as_str()]),
+    ] {
+        let value = run_boss(engine.socket_str(), &args)?;
+        let held_json = execution_json(&value, &held.id)?;
+        assert_eq!(
+            held_json["dispatch_wait_reason"], "awaiting_predecessor_preservation",
+            "{verb}: {held_json}"
+        );
+        assert_eq!(held_json["dispatch_wait_blocker_id"], failed.id.as_str(), "{verb}");
+        assert!(held_json["dispatch_wait_since"].is_string(), "{verb}: {held_json}");
+        assert_eq!(held_json["launch_failed"], false, "{verb}: {held_json}");
+        assert_eq!(held_json["force_launched"], false, "{verb}: {held_json}");
+        assert_eq!(held_json["operator_forced_admission"], false, "{verb}: {held_json}");
+
+        let failed_json = execution_json(&value, &failed.id)?;
+        assert_eq!(failed_json["status"], "failed", "{verb}: {failed_json}");
+        assert_eq!(
+            failed_json["last_error"], "workspace lease failed: remote unreachable",
+            "{verb}: {failed_json}"
+        );
+    }
+
+    let show = run_boss(engine.socket_str(), &["task", "show", &chore.id])?;
+    assert_eq!(show["executions_total"], 2, "{show}");
+
+    for args in [
+        ["task", "executions", chore.id.as_str()],
+        ["task", "show", chore.id.as_str()],
+    ] {
+        let human = run_boss_human(engine.socket_str(), &args)?;
+        assert!(
+            human.contains("waiting: awaiting_predecessor_preservation (blocked by "),
+            "{human}"
+        );
+        assert!(
+            human.contains("error: workspace lease failed: remote unreachable"),
+            "{human}"
+        );
+        // The flag-history section below the executions has its own format.
+        let executions_text = human.split("Flag and abandonment history").next().unwrap_or(&human);
+        let epoch_free = executions_text
+            .split_whitespace()
+            .all(|word| !(word.len() >= 9 && word.chars().all(|c| c.is_ascii_digit())));
+        assert!(
+            epoch_free,
+            "text output must not print raw epoch seconds: {executions_text}"
+        );
+    }
+    Ok(())
+}
