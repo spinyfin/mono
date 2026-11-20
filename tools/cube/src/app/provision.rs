@@ -6,7 +6,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::command_runner::{CommandInvocation, CommandRunner};
+use crate::command_runner::{CommandInvocation, CommandRunner, JjGate};
 use crate::metadata::{RepoRecord, WorkspaceRecord};
 use crate::setup::{SetupReport, run_setup_engine};
 use crate::store::Store;
@@ -14,7 +14,9 @@ use crate::{audit, setup};
 
 use crate::app::disk::DiskSpace;
 use crate::app::errors::{CubeError, Result};
-use crate::app::jj::{is_retryable_backend_lock_error, network_cmd_timeout, workspace_path_exists};
+use crate::app::jj::{
+    is_retryable_backend_lock_error, jj_update_stale_recovery_kind, network_cmd_timeout, workspace_path_exists,
+};
 use crate::app::reclaim::assert_mint_headroom;
 use crate::app::util::current_epoch_s;
 
@@ -88,6 +90,7 @@ pub(super) fn auto_create_workspace(
     database_path: Option<&Path>,
     repo_record: &RepoRecord,
     existing: &[crate::metadata::WorkspaceCandidate],
+    shared_gate: &mut Option<JjGate>,
 ) -> Result<crate::metadata::WorkspaceCandidate> {
     let mut existing_ids: Vec<String> = existing.iter().map(|c| c.workspace_id.clone()).collect();
     existing_ids.extend(super::registration::quarantined_workspace_ids(repo_record)?);
@@ -168,6 +171,7 @@ pub(super) fn auto_create_workspace(
         env: vec![],
     };
     let mut attempt: u32 = 0;
+    let mut recovered_stale = false;
     loop {
         forget_staging_workspace(runner, canonical, repo_record, &workspace_id, &staging_path)?;
         match runner.run_with_timeout(&add, network_cmd_timeout()) {
@@ -179,6 +183,23 @@ pub(super) fn auto_create_workspace(
                      (attempt {attempt}/{WORKSPACE_ADD_LOCK_RETRIES}); retrying: {err}"
                 );
                 thread::sleep(WORKSPACE_ADD_LOCK_RETRY_WAIT);
+            }
+            Err(err) if !recovered_stale && jj_update_stale_recovery_kind(&err).is_some() => {
+                recovered_stale = true;
+                eprintln!(
+                    "cube: `jj workspace add --name {workspace_id}` found a stale primary; \
+                     refreshing the source working copy and retrying: {err}"
+                );
+                // Exclusive recovery cannot run while this process still holds
+                // the lease's shared gate. Drop it, refresh, then re-take shared
+                // if the caller had one.
+                let had_shared = shared_gate.is_some();
+                *shared_gate = None;
+                let recovered = crate::app::store_gc::recover_stale_primary(runner, database_path, canonical);
+                if had_shared {
+                    *shared_gate = Some(JjGate::shared_for_database_with_runner(database_path, runner)?);
+                }
+                recovered?;
             }
             Err(err) => return Err(err),
         }

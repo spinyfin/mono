@@ -122,7 +122,7 @@ use crate::app::store_gc_integrity::{GcIndex, collector_version, oldest_shared_c
 
 #[path = "store_gc_rewrite.rs"]
 mod rewrite;
-pub(crate) use rewrite::recover_refresh;
+pub(crate) use rewrite::{recover_refresh, recover_stale_primary};
 
 /// How many times a staged rewrite is prepared again because live operations
 /// advanced while it was being prepared. Each preparation takes minutes on a

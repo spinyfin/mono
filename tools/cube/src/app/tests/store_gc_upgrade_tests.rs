@@ -34,6 +34,22 @@ fn legacy_collection_primary_is_repaired_before_staged_collection() {
                 &f.root,
                 &["workspace", "add", f._dir.path().join("fresh").to_str().unwrap()],
             );
+        } else {
+            // No runbook refresh and no staged collection yet. Provisioning
+            // must recover the stale primary itself.
+            let provisioned = crate::app::provision::auto_create_workspace(
+                &current,
+                Some(&database),
+                &staged_record(&f),
+                &[],
+                &mut None,
+            )
+            .expect("provision recovers a stale primary left by 0.26 collection");
+            assert!(
+                provisioned.workspace_path.join(".jj").exists(),
+                "provisioned workspace at {} must have .jj",
+                provisioned.workspace_path.display()
+            );
         }
         let report = staged_collect(&f, &database, &current).unwrap();
         assert_eq!(report.collection, Collection::Immediate);

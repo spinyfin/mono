@@ -2,6 +2,25 @@
 use super::*;
 use std::fs;
 
+/// Refresh a primary left stale by a legacy in-place collection.
+///
+/// Callers must not hold the maintenance gate shared: this takes exclusivity
+/// the same way staged GC does, so `workspace update-stale` cannot merge a
+/// racing operation head.
+pub(crate) fn recover_stale_primary(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    source: &Path,
+) -> Result<()> {
+    let gate = jj_maintenance_gate(database_path, MAINTENANCE_CMD_TIMEOUT)?.ok_or(CubeError::MaintenanceBusy)?;
+    gate.recover_quarantine(runner)?;
+    runner.run_with_timeout(
+        &gated_jj_invocation(source, &["workspace", "update-stale"]),
+        MAINTENANCE_CMD_TIMEOUT,
+    )?;
+    Ok(())
+}
+
 /// Repair primaries left stale by the legacy in-place collector before
 /// preparing a staged rewrite. Release the reader before taking exclusivity.
 pub(super) fn prepare_with_recovery(
@@ -17,13 +36,7 @@ pub(super) fn prepare_with_recovery(
             return Err(error);
         }
         drop(reader);
-        let gate = jj_maintenance_gate(database_path, MAINTENANCE_CMD_TIMEOUT)?.ok_or(CubeError::MaintenanceBusy)?;
-        gate.recover_quarantine(runner)?;
-        runner.run_with_timeout(
-            &gated_jj_invocation(source, &["workspace", "update-stale"]),
-            MAINTENANCE_CMD_TIMEOUT,
-        )?;
-        drop(gate);
+        recover_stale_primary(runner, database_path, source)?;
     } else {
         drop(reader);
     }
