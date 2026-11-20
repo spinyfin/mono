@@ -208,6 +208,7 @@ _NAVIGATOR_SHARD_SRCS = [
     "Tests/BossTests/NavigatorModeRegressionTests.swift",
     "Tests/BossTests/NavigatorRowTests.swift",
     "Tests/BossTests/NavigatorActivityTests.swift",
+    "Tests/BossTests/NavigatorLayoutTests.swift",
     "Tests/BossTests/NavigatorLifecycleTests.swift",
     "Tests/BossTests/NavigatorReviewTests.swift",
 ]

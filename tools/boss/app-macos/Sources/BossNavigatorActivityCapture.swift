@@ -7,7 +7,8 @@ import UpdateCore
 /// --capture-to`. States: working, backlog, failure, landed, revision.
 ///
 /// Isolated captures do not mount Agents Ghostty surfaces, so the working
-/// pane shows "Agent pane not available yet" rather than a live PTY.
+/// pane shows the slim "Agent not started" row rather than a live PTY.
+/// A workspace awaiting attachment shows the slim "Agent starting…" row.
 @MainActor
 enum BossNavigatorActivityCapture {
     private static var window: NSWindow?

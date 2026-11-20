@@ -901,6 +901,9 @@ struct WorkItemBriefEditor: View {
     let remoteChanged: Bool
     let readOnly: Bool
     var showsAgentNotice: Bool = false
+    /// Optional document control placed beside Preview/Edit in the single
+    /// header row, replacing the plain title.
+    var headerLeading: AnyView? = nil
     var onEdit: () -> Void
     var onCancel: () -> Void
     var onSave: () -> Void
@@ -910,14 +913,15 @@ struct WorkItemBriefEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text(title).font(.headline)
+                if let headerLeading { headerLeading } else { Text(title).font(.headline) }
                 Spacer()
                 Picker("Mode", selection: $showsEditor) {
                     Text("Preview").tag(false)
                     Text("Edit").tag(true)
                 }
+                .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 180)
+                .fixedSize()
                 .disabled(readOnly)
                 .onChange(of: showsEditor) { _, editing in
                     if editing { onEdit() }
@@ -957,7 +961,7 @@ struct WorkItemBriefEditor: View {
                     .disabled(readOnly)
                     .accessibilityIdentifier("navigator-brief-editor")
             } else {
-                MarkdownDocumentChrome(title: title, source: draft, commentsEnabled: false)
+                MarkdownDocumentChrome(title: title, source: draft, commentsEnabled: false, compact: true)
                     .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
             }
         }
