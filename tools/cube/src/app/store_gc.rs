@@ -774,8 +774,7 @@ pub(super) fn gc_repo_store_with_deadline(
                 .is_some_and(super::store_gc_integrity::uses_staged_rewrite)
         });
         let prepare = |cut: &str| -> Result<Option<rewrite::PreparedRewrite>> {
-            let _reader = JjGate::shared_for_database(database_path)?;
-            rewrite::PreparedRewrite::prepare(runner, &source, cut)
+            rewrite::prepare_with_recovery(runner, database_path, &source, cut)
         };
         let mut staged = match staged_cut.as_deref() {
             Some(cut) => Some(prepare(cut)?),
