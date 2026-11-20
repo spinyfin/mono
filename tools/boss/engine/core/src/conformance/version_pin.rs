@@ -719,6 +719,82 @@ fn installed_agy_meets_qualified_minimum_when_present() {
     );
 }
 
+/// Live `--settings` parse pin for `queuedMessages`. Soft-skip without the
+/// binary (CI cannot authenticate agy and usually has no copy). When the
+/// binary is present, these probes exit at parse: they never start a
+/// session. A renamed key or dropped value fails before rollout.
+/// Captures: `docs/investigations/agy-permission-trust-soft-deny-artifacts/queued-messages/`.
+#[test]
+fn installed_agy_accepts_queued_messages_settings_key_when_present() {
+    let require = require_agy_cli();
+    let Some(agy_bin) = agy_cli_binary() else {
+        if require {
+            panic!("BOSS_REQUIRE_AGY_CLI is set but agy is not on PATH (and BOSS_AGY_BIN is unset)");
+        }
+        eprintln!(
+            "agy not on PATH; skipping live queuedMessages --settings pin \
+             (set BOSS_REQUIRE_AGY_CLI=1 to require it)."
+        );
+        return;
+    };
+    let tmp = tempfile::TempDir::new().expect("tempdir for agy --settings HOME");
+    let run = |settings: &str| -> Option<std::process::Output> {
+        let mut command = Command::new(&agy_bin);
+        command
+            .env("HOME", tmp.path())
+            .env(DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE)
+            .env("AGY_CLI_HIDE_ACCOUNT_INFO", "true")
+            .stdin(std::process::Stdio::null())
+            .arg("--settings")
+            .arg(settings);
+        match run_agy_bounded(&mut command, AGY_VERSION_TIMEOUT) {
+            Ok(output) => Some(output),
+            Err(err) => {
+                if require {
+                    panic!("BOSS_REQUIRE_AGY_CLI is set but agy --settings could not be spawned: {err}");
+                }
+                eprintln!(
+                    "agy not runnable ({err}); skipping live queuedMessages --settings pin \
+                     (set BOSS_REQUIRE_AGY_CLI=1 to require it)"
+                );
+                None
+            }
+        }
+    };
+
+    let Some(invalid) = run(r#"{"queuedMessages":"not-a-real-mode"}"#) else {
+        return;
+    };
+    let invalid_err = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        !invalid.status.success(),
+        "invalid queuedMessages value must exit non-zero; stdout={} stderr={invalid_err}",
+        String::from_utf8_lossy(&invalid.stdout),
+    );
+    assert!(
+        invalid_err.contains("queuedMessages") && invalid_err.contains("unrecognized value"),
+        "invalid value must name queuedMessages, got {invalid_err}"
+    );
+
+    let Some(accepted) = run(r#"{"queuedMessages":"queue","toolPermissions":"typo"}"#) else {
+        return;
+    };
+    let accepted_err = String::from_utf8_lossy(&accepted.stderr);
+    assert!(
+        !accepted.status.success(),
+        "unknown sibling key must still exit non-zero; stdout={} stderr={accepted_err}",
+        String::from_utf8_lossy(&accepted.stdout),
+    );
+    assert!(
+        accepted_err.contains("toolPermissions") && accepted_err.contains("unknown setting"),
+        "accepted queuedMessages must fail on the unknown sibling, not on queuedMessages; got {accepted_err}"
+    );
+    assert!(
+        !accepted_err.contains("queuedMessages"),
+        "queuedMessages must not be reported unknown when paired with an unknown sibling; got {accepted_err}"
+    );
+}
+
 #[test]
 fn agy_fixture_stream_carries_required_1_5_7_envelope_fields() {
     // Removals of these fields would break the progress session: 1.1.12

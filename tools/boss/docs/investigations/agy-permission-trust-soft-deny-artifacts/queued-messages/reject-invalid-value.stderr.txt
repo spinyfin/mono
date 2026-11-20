@@ -1,0 +1,1 @@
+Error: --settings: invalid value for setting "queuedMessages": queuedMessages: unrecognized value "not-a-real-mode"

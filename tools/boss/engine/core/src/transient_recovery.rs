@@ -131,7 +131,7 @@ use boss_protocol::{LiveWorkerState, WorkExecution, WorkerActivity};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::driver::{DriverRegistry, WorkerErrorClass};
+use crate::driver::{AgentDriver, WorkerErrorClass};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::transient_error::{
     ErrorClass, EscalateReason, RecoveryDecision, RecoveryPolicy, extract_worker_error, transcript_shows_no_activity,
@@ -515,19 +515,21 @@ async fn process_state(
     //     the common short delay, but a resume chain deserves this
     //     extra check even past grace because leaving it silently
     //     parked is exactly the bug this closes.
-    let (error_text, class, stall_reason) = match inspection.trailing_error {
+    let (error_text, class, worker_class, stall_reason) = match inspection.trailing_error {
         Some(text) => {
-            // Route through the resolved driver's ControlVerbs
-            // classifier — never call a provider-specific helper
-            // directly. An unresolvable driver fails closed to
-            // Indeterminate (bounded retry, then escalate) rather
-            // than inventing Claude's table for every backend.
-            let class = classify_error_for_execution(work_db, &execution_id, &text);
-            (text, class, "api_error")
+            // Route through the driver already resolved for this
+            // transcript — never call a provider-specific helper
+            // directly, and do not look the slug up a second time.
+            // An unresolvable driver fails closed to Indeterminate
+            // (bounded retry, then escalate) rather than inventing
+            // Claude's table for every backend.
+            let (class, worker_class) = classify_error_for_driver(inspection.driver.as_deref(), &text);
+            (text, class, worker_class, "api_error")
         }
         None if prior_attempts > 0 && transcript_shows_no_activity(&lines) => (
             "auto-resume produced no worker activity: no continuation prompt reached the session".to_owned(),
             ErrorClass::Transient,
+            None,
             "no_activity",
         ),
         None => {
@@ -565,7 +567,7 @@ async fn process_state(
                         .to_owned()
                 } else {
                     format!(
-                        "Your previous turn ended on a transient Claude API error. \
+                        "Your previous turn ended on a transient API error. \
                              Please retry the last step.\n\nError: {clipped}\n"
                     )
                 };
@@ -721,11 +723,13 @@ async fn process_state(
                 EscalateReason::Permanent => ATTENTION_KIND_RECOVERY_PERMANENT,
                 EscalateReason::RetriesExhausted => ATTENTION_KIND_RECOVERY_EXHAUSTED,
             };
-            // The true classified error class, independent of *why* the
-            // policy stopped retrying: `RetriesExhausted` covers both a
-            // confirmed-transient error that never cleared and an
-            // indeterminate one that got the same bounded chances.
-            let class_label = class.as_str();
+            // The driver's class when it is more specific than the
+            // policy bucket (quota / eligibility), otherwise the policy
+            // class. Independent of *why* the policy stopped retrying:
+            // `RetriesExhausted` covers both a confirmed-transient error
+            // that never cleared and an indeterminate one that got the
+            // same bounded chances.
+            let class_label = recovery_class_label(worker_class, class);
             // Settle the execution so it isn't re-inspected; ignore a
             // race where another reconciler already marked it terminal.
             match work_db.mark_execution_orphaned(
@@ -751,9 +755,19 @@ async fn process_state(
                     );
                 }
             }
-            let title = match reason {
-                EscalateReason::RetriesExhausted => "Worker auto-recovery exhausted retries".to_owned(),
-                _ => "Worker hit a non-retryable Claude API error".to_owned(),
+            let title = match (reason, worker_class) {
+                (_, Some(WorkerErrorClass::QuotaExhausted)) => {
+                    "Worker's model quota is exhausted; resolve after the quota resets".to_owned()
+                }
+                (EscalateReason::RetriesExhausted, _) => "Worker auto-recovery exhausted retries".to_owned(),
+                _ => "Worker hit a non-retryable API error".to_owned(),
+            };
+            let resolve_guidance = if worker_class == Some(WorkerErrorClass::QuotaExhausted) {
+                "Resolve this attention item after the quota resets to \
+                     allow the work item to be re-dispatched."
+            } else {
+                "Resolve this attention item once the underlying problem is fixed to \
+                     allow the work item to be re-dispatched."
             };
             let body = format!(
                 "The engine stopped auto-resuming this work item.\n\n\
@@ -761,8 +775,7 @@ async fn process_state(
                      **Error class:** {class_label}\n\n\
                      **Last worker error:** {clipped}\n\n\
                      **Transient resume attempts already made:** {prior_attempts} / {max}\n\n\
-                     Resolve this attention item once the underlying problem is fixed to \
-                     allow the work item to be re-dispatched.",
+                     {resolve_guidance}",
                 reason = reason.as_str(),
                 max = policy.max_attempts(),
             );
@@ -802,55 +815,38 @@ async fn process_state(
     }
 }
 
-/// True for slot states a stalled-on-error worker can be in. A
-/// `Working`/`Spawning` slot is actively progressing (or not yet up).
-/// Resolve the execution's driver and ask it to classify `text`.
-///
-/// Falls closed to [`ErrorClass::Indeterminate`] when the driver slug is
-/// unknown or unregistered — never invents a provider-specific table.
-fn classify_error_for_execution(work_db: &WorkDb, execution_id: &str, text: &str) -> ErrorClass {
-    let slug = match work_db.get_execution_driver_slug(execution_id) {
-        Ok(Some(slug)) => slug,
-        Ok(None) => {
-            tracing::debug!(
-                execution_id,
-                "transient-recovery: no driver recorded for execution; treating error as indeterminate",
-            );
-            return ErrorClass::Indeterminate;
+/// Classify `text` through an already-resolved driver. Falls closed to
+/// [`ErrorClass::Indeterminate`] when the driver could not be resolved —
+/// never invents a provider-specific table. Returns the driver's class
+/// alongside the policy bucket so quota / eligibility stay visible.
+fn classify_error_for_driver(driver: Option<&dyn AgentDriver>, text: &str) -> (ErrorClass, Option<WorkerErrorClass>) {
+    match driver {
+        Some(driver) => {
+            let worker_class = driver.classify_error(text);
+            (worker_error_class_to_policy(worker_class), Some(worker_class))
         }
-        Err(err) => {
-            tracing::warn!(
-                execution_id,
-                ?err,
-                "transient-recovery: driver lookup failed; treating error as indeterminate",
-            );
-            return ErrorClass::Indeterminate;
-        }
-    };
-    match DriverRegistry::default().get(&slug) {
-        Some(driver) => worker_error_class_to_policy(driver.classify_error(text)),
-        None => {
-            tracing::warn!(
-                execution_id,
-                driver = %slug,
-                "transient-recovery: driver slug not in registry; treating error as indeterminate",
-            );
-            ErrorClass::Indeterminate
-        }
+        None => (ErrorClass::Indeterminate, None),
     }
 }
 
 /// Bounded transcript tail after the execution's driver has reshaped it,
-/// plus the trailing error that driver reports (if any).
+/// plus the trailing error that driver reports (if any) and the driver
+/// used to read the native dialect.
 pub(crate) struct NormalizedTranscriptInspection {
     pub lines: Vec<Value>,
     pub trailing_error: Option<String>,
+    pub driver: Option<Arc<dyn AgentDriver>>,
 }
 
 /// Read the bounded transcript tail, reshape it through the execution's
-/// driver (`transcript_session()` when the driver correlates rows across a
-/// tail, else the per-row `normalize_transcript_entry`), and obtain any
-/// trailing error through [`AgentDriver::extract_error_from_transcript`].
+/// launched driver, and obtain any trailing error through
+/// [`AgentDriver::extract_error_from_transcript`].
+///
+/// Driver resolution uses [`crate::driver_transcript::driver_for_spawned_execution`]
+/// (the launch stamp) so a pin changed mid-run cannot switch the dialect
+/// used to read a running worker's native transcript. Normalisation is
+/// [`crate::live_status_loop::normalize_lines`], the same two-tier
+/// `transcript_session()` vs per-row selection the live-status tail uses.
 /// A driver whose native rows differ from Claude's (agy's `ERROR_MESSAGE`)
 /// is otherwise invisible to the shared extractors. Codex and Grok
 /// explicitly return `None` from the extractor, so ordinary normalised
@@ -863,28 +859,27 @@ pub(crate) async fn inspect_normalized_transcript_tail(
     path: &str,
 ) -> NormalizedTranscriptInspection {
     let lines = read_transcript_tail(path, TRANSCRIPT_TAIL_MAX_BYTES).await;
-    let driver = match work_db.get_execution_driver_slug(execution_id) {
-        Ok(Some(slug)) => DriverRegistry::default().get(&slug).cloned(),
-        _ => None,
-    };
-    let Some(driver) = driver else {
+    let Some(driver) = crate::driver_transcript::driver_for_spawned_execution(work_db, execution_id) else {
         return NormalizedTranscriptInspection {
             trailing_error: extract_worker_error(&lines),
             lines,
+            driver: None,
         };
     };
-    let lines: Vec<Value> = match driver.transcript_session() {
-        Some(mut session) => lines
-            .into_iter()
-            .map(|raw| session.normalize_transcript_entry(raw))
-            .collect(),
-        None => lines
-            .into_iter()
-            .map(|raw| driver.normalize_transcript_entry(raw))
-            .collect(),
-    };
+    let mut session = driver.transcript_session();
+    let lines = crate::live_status_loop::normalize_lines(driver.as_ref(), &mut session, lines);
     let trailing_error = driver.extract_error_from_transcript(&lines);
-    NormalizedTranscriptInspection { lines, trailing_error }
+    NormalizedTranscriptInspection {
+        lines,
+        trailing_error,
+        driver: Some(driver),
+    }
+}
+
+fn recovery_class_label(worker_class: Option<WorkerErrorClass>, policy_class: ErrorClass) -> &'static str {
+    worker_class
+        .map(WorkerErrorClass::as_str)
+        .unwrap_or(policy_class.as_str())
 }
 
 fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {

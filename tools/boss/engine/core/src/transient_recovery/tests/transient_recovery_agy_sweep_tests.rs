@@ -31,16 +31,32 @@ async fn quota_sweep(prior_attempts: i64) {
     register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
     let nudger = RecordingNudger::new();
-    let (outcome, _sink, _reaped) = run_pass(&db, &live, &coordinator, &nudger, &mut HashSet::new()).await;
+    let (outcome, sink, _reaped) = run_pass(&db, &live, &coordinator, &nudger, &mut HashSet::new()).await;
 
     assert_eq!(outcome.escalated, 1, "raw agy quota row must escalate: {outcome:?}");
     assert_eq!(outcome.resumed, 0);
     assert_eq!(outcome.nudged, 0);
     assert!(nudger.nudged_ids().await.is_empty(), "no nudge into a quota wall");
+    let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+    assert_eq!(attn.len(), 1, "escalation must raise an attention item");
     assert!(
-        !db.list_attention_items_for_work_item(&work_item_id).unwrap().is_empty(),
-        "escalation must raise an attention item",
+        attn[0].title.contains("quota"),
+        "quota wall must use a quota-specific title, got {:?}",
+        attn[0].title
     );
+    assert!(
+        attn[0].body_markdown.contains("quota_exhausted"),
+        "attention body must name the quota class, got {}",
+        attn[0].body_markdown
+    );
+    assert!(
+        !attn[0].title.to_lowercase().contains("claude"),
+        "quota title must be driver-neutral, got {:?}",
+        attn[0].title
+    );
+    let events = sink.events().await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].details["class"], "quota_exhausted");
 }
 
 #[tokio::test]

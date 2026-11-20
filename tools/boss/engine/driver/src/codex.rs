@@ -2392,8 +2392,9 @@ impl AgentDriver for CodexDriver {
         // Must not route through `classify_claude_error`. Real Codex
         // classification (rate limits, quota, auth) is ControlVerbs follow-on.
         // Indeterminate is the documented "recognised as an error but not
-        // confidently bucketed; treat as Permanent" class — explicit, not a
-        // silent Transient that would auto-resume a permanent failure.
+        // confidently bucketed; use bounded recovery" class — RecoveryPolicy
+        // retries it, then escalates. Explicit, not a silent uncapped
+        // Transient that would auto-resume a permanent failure.
         WorkerErrorClass::Indeterminate
     }
 

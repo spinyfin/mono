@@ -138,6 +138,7 @@ fn write_transcript(dir: &TempDir, name: &str, lines: &[&str]) -> String {
 
 const CODEX_API_ERROR_PROSE: &str = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"API Error handling is now fixed"}]}}"#;
 const GROK_API_ERROR_PROSE: &str = r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"API Error handling is now fixed"}}}}"#;
+const AGY_API_ERROR_PROSE: &str = r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"API Error handling is now fixed"}"#;
 const AGY_QUOTA_ROW: &str = r#"{"step_index":7,"source":"MODEL","type":"ERROR_MESSAGE","status":"ERROR","error":"You have exhausted your quota on this model."}"#;
 const AGY_TOOL_CALL_ROW: &str = r#"{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"echo recovered"}}]}"#;
 const AGY_TOOL_RESULT_ROW: &str = r#"{"step_index":9,"source":"MODEL","type":"GENERIC","status":"DONE","content":"Command exited with code 0.\n\nCommand output:\nrecovered"}"#;
@@ -166,6 +167,13 @@ async fn native_codex_api_error_prose_does_not_publish_idle_error() {
 async fn native_grok_api_error_prose_does_not_publish_idle_error() {
     let (dir, db, run_id) = db_with_started_execution(Some("grok"));
     let transcript = write_transcript(&dir, "t.jsonl", &[GROK_API_ERROR_PROSE]);
+    assert_stop_publishes_no_idle(&db, &run_id, &transcript).await;
+}
+
+#[tokio::test]
+async fn native_agy_api_error_prose_does_not_publish_idle_error() {
+    let (dir, db, run_id) = db_with_started_execution(Some("agy"));
+    let transcript = write_transcript(&dir, "t.jsonl", &[AGY_API_ERROR_PROSE]);
     assert_stop_publishes_no_idle(&db, &run_id, &transcript).await;
 }
 

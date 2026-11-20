@@ -1,0 +1,8 @@
+{
+  "queuedMessages": {
+    "type": "string",
+    "enum": ["queue", "send-immediately"],
+    "default": "queue",
+    "description": "What happens to a message you send while the agent is working: \"queue\" holds it until the current turn ends, and \"send-immediately\" interrupts the agent and sends it right away. /config: Queued Messages."
+  }
+}
