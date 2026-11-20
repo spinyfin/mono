@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 /// The surface or engine path that ended an execution.
 ///
-/// The first three variants are client surfaces: they arrive in a request
+/// `App`, `BossCli` and `Bossctl` are client surfaces: they arrive in a request
 /// and the engine takes the caller's word for which one it is. Every other
-/// variant names an engine subsystem and is only ever constructed inside the
+/// variant is an engine-assigned cause, only ever constructed inside the
 /// engine, so a client cannot claim one (see [`Self::is_client_surface`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,21 +25,15 @@ pub enum CancelSource {
     BossCli,
     /// A `bossctl` verb (the coordinator's operator surface).
     Bossctl,
-    /// Historical spelling written by earlier engines when a kanban drag
-    /// moved an `active` card back to Backlog. Current writes use the
-    /// client surface (`app` / `boss_cli` / `bossctl`) and prefix the
-    /// engine cause onto the client reason. Accepted when reading stored
-    /// rows.
+    /// A task with a live worker was moved back to Backlog (for example by a
+    /// kanban drag); the cancellation is attributed to the requesting client
+    /// surface.
     WorkItemMovedToBacklog,
-    /// Historical spelling written by earlier engines when `DeleteWorkItem`
-    /// tombstoned a task that still had a live worker. Current writes use
-    /// the client surface and prefix the cascade cause onto the client
-    /// reason. Accepted when reading stored rows.
+    /// A work item was deleted while it still had a live worker; the
+    /// cancellation is attributed to the requesting client surface.
     WorkItemDeleted,
-    /// Historical spelling written by earlier engines when
-    /// `UnpopulateProject` deleted a task that still had a live worker.
-    /// Current writes use the client surface and prefix the unpopulate
-    /// cause onto the client reason. Accepted when reading stored rows.
+    /// A project was unpopulated while one of its tasks still had a live
+    /// worker; the cancellation is attributed to the requesting client surface.
     ProjectUnpopulated,
     /// A `blocks` dependency edge landed on an actively-running dependent.
     DependencyBlock,
@@ -83,7 +77,7 @@ pub enum CancelSource {
 
 impl CancelSource {
     /// Every recognized source, in declaration order. Used by tests that must prove
-    /// each source is both reachable and distinct.
+    /// each source is distinct and round-trippable.
     pub const ALL: &'static [CancelSource] = &[
         Self::App,
         Self::BossCli,
@@ -262,6 +256,55 @@ mod tests {
             assert_eq!(raw.parse::<CancelSource>().unwrap(), *source);
             assert_eq!(serde_json::to_string(source).unwrap(), format!("\"{raw}\""));
         }
+    }
+
+    /// Adding a variant without listing it in `ALL` fails to compile here
+    /// (exhaustive match) or fails the count assertion.
+    #[test]
+    fn all_lists_every_variant() {
+        let mut expected = 0;
+        for source in CancelSource::ALL {
+            match source {
+                CancelSource::App
+                | CancelSource::BossCli
+                | CancelSource::Bossctl
+                | CancelSource::WorkItemMovedToBacklog
+                | CancelSource::WorkItemDeleted
+                | CancelSource::ProjectUnpopulated
+                | CancelSource::DependencyBlock
+                | CancelSource::MergePollerParentMerged
+                | CancelSource::MergePollerReviewTransition
+                | CancelSource::SchedulerPreemption
+                | CancelSource::DispatchAdmission
+                | CancelSource::CoordinatorPreStart
+                | CancelSource::AnswerAgent
+                | CancelSource::ReviewGuide
+                | CancelSource::ReviewVerdict
+                | CancelSource::SchemaMigration
+                | CancelSource::DoubleSpawnGuard
+                | CancelSource::ReviewBatch
+                | CancelSource::GhostActiveHeal
+                | CancelSource::StrandedExecutionSweep
+                | CancelSource::WorkItemSettled
+                | CancelSource::StaleRevisionRetirement
+                | CancelSource::StaleGoverningExecution => expected += 1,
+                CancelSource::Unrecognized => panic!("ALL must not contain Unrecognized"),
+            }
+        }
+        assert_eq!(expected, 23);
+        assert_eq!(CancelSource::ALL.len(), expected);
+    }
+
+    #[test]
+    fn provenance_serde_round_trips_and_tolerates_unrecognized_source() {
+        let p = CancelProvenance::new(CancelSource::App, "me", "because").unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<CancelProvenance>(&json).unwrap(), p);
+        let future = r#"{"source":"from_the_future","actor":"a","reason":"r"}"#;
+        assert_eq!(
+            serde_json::from_str::<CancelProvenance>(future).unwrap().source,
+            CancelSource::Unrecognized
+        );
     }
 
     #[test]
