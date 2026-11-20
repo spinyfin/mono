@@ -793,6 +793,7 @@ dependencies = [
  "boss-engine-storage-values",
  "boss-engine-structured-output",
  "boss-engine-test-git",
+ "boss-engine-test-process",
  "boss-engine-utils",
  "boss-engine-worker-bin",
  "boss-event-bus",
@@ -1245,6 +1246,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-test-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "boss-engine-transient-error"
 version = "0.1.0"
 dependencies = [
@@ -1476,6 +1485,7 @@ dependencies = [
  "boss-engine-recovery-fixtures",
  "boss-engine-structured-output",
  "boss-engine-test-git",
+ "boss-engine-test-process",
  "boss-engine-utils",
  "boss-protocol",
  "boss-protocol-spoke",
