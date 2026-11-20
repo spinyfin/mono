@@ -173,7 +173,12 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     );
     // Notifications are wakeups; re-read authoritative state because the broker
     // can coalesce invalidations. Bazel's test timeout is the hang guard.
+    // Capture can enqueue before the completion post-effects release the
+    // revision hold. Drive the normal reconciliation pass that dispatches the
+    // queued guide once that writer has finished.
     let attempts = loop {
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&Default::default(), &|_| false)
+            .unwrap();
         let attempts = db.live_pr_review_guide_attempts_for_series(&series).unwrap();
         if attempts.first().is_some_and(|attempt| attempt.execution_id.is_some()) {
             break attempts;
@@ -188,6 +193,11 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
         .subscribe(session, &[boss_protocol::execution_topic(guide_execution)])
         .await;
     while db.get_execution(guide_execution).unwrap().status != ExecutionStatus::Running {
+        db.reconcile_pr_review_guide_attempts_with_live_runs(&Default::default(), &|_| false)
+            .unwrap();
+        if db.get_execution(guide_execution).unwrap().status == ExecutionStatus::Running {
+            break;
+        }
         updates.next().await.expect("guide dispatch subscription closed");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
