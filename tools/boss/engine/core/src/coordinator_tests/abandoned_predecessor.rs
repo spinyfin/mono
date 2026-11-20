@@ -5,8 +5,8 @@
 //! its cube lease, and no teardown is started for it. The successor's dispatch
 //! only repeats a release that an earlier attempt kept for occupancy, because
 //! a run's first release belongs to the path that ended it. For a run ended
-//! by an explicit start no path did that, so the successor waited for the
-//! leftover-lease sweep and then for something to wake the scheduler.
+//! by an explicit start, the request owns that first release; otherwise the
+//! successor would wait for the leftover-lease sweep and a scheduler wakeup.
 use super::*;
 
 /// Record a worker shell for the stalled run that has already exited.
@@ -76,7 +76,7 @@ async fn a_run_abandoned_by_an_explicit_start_returns_its_lease_and_its_successo
     record_dead_shell(&s);
     let successor = start_explicitly(&s, false);
 
-    // Only the scheduler runs from here: no leftover-lease sweep, no operator step.
+    // Only the scheduler runs from here: no leftover-lease sweep or manual intervention.
     s.drain().await;
     wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
 
@@ -96,6 +96,43 @@ async fn a_forced_launch_on_a_stale_run_releases_its_lease_and_dispatches_in_the
     wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
 
     assert_released_with_work_preserved(&s, &successor).await;
+}
+
+#[tokio::test]
+async fn a_scheduler_retry_cannot_lose_the_requests_first_release() {
+    for already_kept in [false, true] {
+        let s = Stalled::new(true).await;
+        record_dead_shell(&s);
+        // Commit the successor, then let the scheduler register RetryKept before
+        // the request gets to register Own. Hold its registry query open.
+        let successor = s
+            .db()
+            .request_execution_with_live_check(
+                RequestExecutionInput::builder()
+                    .work_item_id(s.stalled().work_item_id)
+                    .explicit_start(true)
+                    .force(true)
+                    .build(),
+                |_| false,
+            )
+            .unwrap();
+        if already_kept {
+            legacy_occupancy_evidence(&s);
+            assert!(crate::workspace_lease_release::previous_occupancy_keep(
+                s.db(),
+                &s.stalled()
+            ));
+        }
+        let registry = s.cube.list_workspaces_response.lock().await;
+        s.coordinator.drain_ready_queue_for_test().await;
+        s.coordinator.release_abandoned_run_for_test(&s.stalled_id);
+        assert!(s.cube.force_release_calls.lock().await.is_empty());
+        drop(registry);
+        s.coordinator.wait_predecessor_rechecks_for_test().await;
+        s.drain().await;
+        wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+        assert_released_with_work_preserved(&s, &successor).await;
+    }
 }
 
 /// The release is still gated on proof. A recorded shell that is alive means

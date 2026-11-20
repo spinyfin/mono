@@ -163,6 +163,23 @@ impl InflightDispatches {
             .contains_key(execution_id)
     }
 
+    /// Snapshot reservation ownership before entering a database transaction.
+    pub(crate) fn execution_ids(&self) -> std::collections::HashSet<String> {
+        self.table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Park a reservation operation at its DB boundary for lock-order tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_table_locked_for_test(&self, operation: impl FnOnce()) {
+        let _table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        operation();
+    }
+
     /// In-flight dispatches on work items in `member_ids`, excluding
     /// `exclude_execution_id` (the caller itself) and excluding
     /// `exclude_work_item_id`.

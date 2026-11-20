@@ -519,7 +519,20 @@ impl ExecutionCoordinator {
         mut input: RequestExecutionInput,
         live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
-        let has_worker = |id: &str| live_states.is_run_live(id) || self.is_starting_worker(id);
+        // Reservation conflict checks take the table lock before querying the DB.
+        // Never acquire it from the store predicate, which holds the DB lock.
+        // Read reservations before driving runs: the driver takes ownership
+        // before the reservation is dropped, so a handoff stays in this union.
+        let mut starting = self.inflight_dispatches.execution_ids();
+        starting.extend(
+            self.driving_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .ids
+                .iter()
+                .cloned(),
+        );
+        let has_worker = |id: &str| live_states.is_run_live(id) || starting.contains(id);
         if let Some(host_id) = input.requested_host_id.clone() {
             // `request_execution_with_live_check` (called below) resolves
             // friendly short ids (a `T`-prefixed short id, `#42`, ...) to a
