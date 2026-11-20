@@ -209,7 +209,7 @@ impl WorkDb {
             if matches!(target, WorkerPrCompletionTarget::Done) {
                 let mut pending = PendingEvents::new();
                 merge_evidence::record_and_stage(&mut pending, &tx, &execution.work_item_id, pr_url, &now_string())?;
-                commit_and_publish(tx, pending, &self.event_bus)?;
+                self.commit_pending(tx, pending)?;
             }
             return Ok(None);
         }
@@ -366,7 +366,7 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -603,7 +603,7 @@ impl WorkDb {
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -789,7 +789,7 @@ impl WorkDb {
         // re-evaluate dependents in this transaction so they do not wait
         // for the dep-unblock sweep.
         cascade_dependents_if_worker_failed(&mut pending, &tx, &work_item_id, &now)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(WorkerFailureCompletion {
             question_attention,
             execution: updated_execution,
@@ -1614,7 +1614,7 @@ impl WorkDb {
         resolve_attention_kind_in_tx(&tx, &task.id, WORKSPACE_POSITIONING_REFUSED)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(MergeObservation {
             completed_task: Some(updated),
             changed: true,
@@ -1708,7 +1708,7 @@ impl WorkDb {
         resolve_attention_kind_in_tx(&tx, &task.id, WORKSPACE_POSITIONING_REFUSED)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(Some(updated))
     }
 
@@ -2806,7 +2806,7 @@ impl WorkDb {
 
         let mut updated = query_task(&tx, &task.id).require("task", &task.id)?;
         project_for_work_item_updated(&tx, &mut updated, "answer_operator_question");
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(OperatorAnswerOutcome::builder()
             .item(task_to_item(updated))
             .minted_execution(minted_execution)

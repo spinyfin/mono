@@ -88,7 +88,7 @@ impl WorkDb {
         project_for_work_item_updated(&tx, &mut updated, "dismiss_operator_question");
         let mut pending = PendingEvents::new();
         stage_task_board_change(&mut pending, &tx, &task.id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        self.commit_pending(tx, pending)?;
         Ok(OperatorAnswerOutcome::unchanged(task_to_item(updated)))
     }
 }

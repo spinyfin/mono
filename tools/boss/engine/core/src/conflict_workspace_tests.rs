@@ -39,7 +39,8 @@ async fn legacy_churn_stop_retains_its_scheduling_error_and_recovers() {
         .unwrap();
     for queued in db.list_executions(Some(&revision.id)).unwrap() {
         if !queued.status.is_terminal() {
-            db.cancel_execution(&queued.id).unwrap();
+            db.cancel_execution(&queued.id, crate::test_support::test_cancel_provenance())
+                .unwrap();
         }
     }
     db.create_execution(
@@ -337,7 +338,8 @@ async fn workspace_recovery_waits_for_live_writer_before_positioning() {
     assert!(crate::work::conflict_workspace_failed(
         &db.get_conflict_resolution(&attempt.id).unwrap().unwrap()
     ));
-    db.cancel_execution(&writer.id).unwrap();
+    db.cancel_execution(&writer.id, crate::test_support::test_cancel_provenance())
+        .unwrap();
     assert!(on_conflict_detected(&db, &publisher, Some(&cube), &checker, &candidate, &probe()).await);
     assert_eq!(*cube.lease_calls.lock().await, 1);
 }
@@ -444,7 +446,8 @@ fn workspace_resumes_on_an_unchanged_head_are_bounded() {
             .unwrap();
         for queued in db.list_executions(Some(&revision.id)).unwrap() {
             if !queued.status.is_terminal() {
-                db.cancel_execution(&queued.id).unwrap();
+                db.cancel_execution(&queued.id, crate::test_support::test_cancel_provenance())
+                    .unwrap();
             }
         }
         db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
@@ -767,7 +770,8 @@ fn a_consumed_churn_stop_is_not_reclassified_again() {
         .unwrap();
     for queued in db.list_executions(Some(&revision.id)).unwrap() {
         if !queued.status.is_terminal() {
-            db.cancel_execution(&queued.id).unwrap();
+            db.cancel_execution(&queued.id, crate::test_support::test_cancel_provenance())
+                .unwrap();
         }
     }
     db.bounce_dispatch_failed_to_backlog(&revision.id, "cube_workspace_positioning_failed", "refused")
@@ -830,7 +834,8 @@ fn churn_stop_with_failed_revision(
         .unwrap();
     for queued in db.list_executions(Some(&revision.id)).unwrap() {
         if !queued.status.is_terminal() {
-            db.cancel_execution(&queued.id).unwrap();
+            db.cancel_execution(&queued.id, crate::test_support::test_cancel_provenance())
+                .unwrap();
         }
     }
     let execution = db

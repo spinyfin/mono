@@ -104,7 +104,7 @@ pub(crate) fn restart_after_answer_from(
         return Ok(RestartAfterAnswer::none());
     }
     if !deps::gating_prereqs_for(tx, &task.id)?.is_empty() {
-        maybe_engine_block_dependent(pending, tx, &task.id, now)?;
+        maybe_engine_block_dependent(pending, tx, &task.id, now, &DependencyCancelOrigin::EngineInternal)?;
         let task = query_task(tx, &task.id).require("task", &task.id)?;
         if task.kind == TaskKind::Revision {
             reconcile_revision_execution(pending, tx, &mut ExecutionReconcileResult::default(), &task)?;

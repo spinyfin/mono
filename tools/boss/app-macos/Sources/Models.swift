@@ -812,6 +812,18 @@ struct ExecutionVM: Identifiable, Hashable, RevisionChainItem {
     /// or unparseable, in which case consumers fall back to the raw string.
     let startedDate: Date?
     let endedDate: Date?
+    /// Who ended this execution by decision (`cancelled` / `abandoned`) and
+    /// why. `nil` when the row is not terminal-by-decision, or when it was
+    /// cancelled before provenance was recorded.
+    let cancelProvenance: CancelProvenanceVM?
+}
+
+/// Source / actor / reason stamped when an execution was cancelled or
+/// abandoned by decision. Mirrors the engine's `CancelProvenance`.
+struct CancelProvenanceVM: Hashable {
+    let source: String
+    let actor: String
+    let reason: String
 }
 
 /// Resolved dependency row used by the card detail Dependencies

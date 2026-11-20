@@ -8,7 +8,7 @@ use std::sync::Arc;
 use boss_protocol::{RequestExecutionInput, WorkExecution, WorkRun};
 
 use crate::live_worker_state::{LiveSpawnRouting, LiveWorkerStateRegistry, ReadoptionEvidence};
-use crate::test_support::{create_test_chore_manual, create_test_product, open_db};
+use crate::test_support::{create_test_chore_manual, create_test_product, open_db, test_cancel_provenance};
 use crate::work::WorkDb;
 
 fn start(db: &WorkDb, host: &str) -> (WorkExecution, WorkRun) {
@@ -44,7 +44,8 @@ fn terminal_state_holds_persona_until_live_slot_release() {
             reason: "ended".into(),
         },
     );
-    db.cancel_running_execution(&first.id).unwrap();
+    db.cancel_running_execution(&first.id, test_cancel_provenance())
+        .unwrap();
     assert!(states.get(8).unwrap().activity.is_terminal());
     let (_, second) = start(&db, "local");
     assert_eq!(second.persona.as_deref(), Some("Data"));

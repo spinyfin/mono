@@ -1109,6 +1109,14 @@ async fn redundant_spawn_guard_emits_terminal_host_selected_error() {
 
     // Post-condition: the redundant execution is abandoned, not left in a live state.
     let after = db.get_execution(&redundant_exec.id).unwrap();
+    let provenance = after
+        .cancel_provenance
+        .as_ref()
+        .expect("duplicate cancellation provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::DoubleSpawnGuard);
+    assert_eq!(provenance.actor, "execution_coordinator");
+    assert!(provenance.reason.contains("already"), "{}", provenance.reason);
+
     assert_eq!(
         after.status,
         ExecutionStatus::Abandoned,
@@ -1790,6 +1798,12 @@ async fn merge_conflict_already_resolved_guard_short_circuits_dispatch() {
 
     // Execution retired without ever leasing a workspace.
     let after_exec = db.get_execution(&exec.id).unwrap();
+    let provenance = after_exec.cancel_provenance.as_ref().expect("retirement provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::StaleRevisionRetirement);
+    assert_eq!(provenance.actor, "execution_coordinator");
+    assert!(provenance.reason.contains("bound PR was already resolved by attempt"));
+    assert!(provenance.reason.contains("before dispatch; no worker is needed"));
+
     assert_eq!(
         after_exec.status,
         ExecutionStatus::Abandoned,

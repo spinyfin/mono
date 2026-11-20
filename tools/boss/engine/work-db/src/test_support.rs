@@ -1,6 +1,29 @@
 //! Narrow fixtures for consumers of storage; enabled only in test builds.
 use super::{CiRemediation, WorkDb};
-use boss_protocol::QueueCiEvidence;
+use boss_protocol::{CancelProvenance, CancelSource, QueueCiEvidence, WorkExecution};
+
+/// Provenance for test cancels that are exercising some other contract
+/// (demote policy, event publish, sweep setup). Production paths must
+/// construct their own; this is never a fallback.
+pub fn test_cancel_provenance() -> CancelProvenance {
+    CancelProvenance::engine(CancelSource::Bossctl, "test", "test cancel")
+}
+
+/// Assert a decision-terminal execution recorded the given source, actor and reason.
+pub fn assert_cancel_provenance(execution: &WorkExecution, source: CancelSource, actor: &str, reason: &str) {
+    assert_eq!(execution.status, boss_protocol::ExecutionStatus::Cancelled);
+    let provenance = execution
+        .cancel_provenance
+        .as_ref()
+        .expect("decision-terminal execution stamps cancel provenance");
+    assert_eq!(provenance.source, source);
+    assert_eq!(provenance.actor, actor);
+    assert!(
+        provenance.reason.contains(reason),
+        "unexpected reason: {}",
+        provenance.reason
+    );
+}
 
 #[path = "test_db_template.rs"]
 mod db_template;

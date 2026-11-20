@@ -297,7 +297,9 @@ async fn rung1_defers_while_a_worker_is_live_and_leaves_the_store_untouched() {
 #[tokio::test]
 async fn rung1_still_runs_when_no_worker_is_live() {
     let fx = fixture().await;
-    fx.db.mark_execution_redundant(&fx.live_execution_id).unwrap();
+    fx.db
+        .mark_execution_redundant(&fx.live_execution_id, test_cancel_provenance())
+        .unwrap();
     let outcome = try_mechanical_rungs(
         &fx.db,
         &RecordingPublisher::default(),
@@ -326,7 +328,9 @@ async fn rung1_still_runs_when_no_worker_is_live() {
 #[tokio::test]
 async fn a_live_review_does_not_defer_the_ladder() {
     let fx = fixture().await;
-    fx.db.mark_execution_redundant(&fx.live_execution_id).unwrap();
+    fx.db
+        .mark_execution_redundant(&fx.live_execution_id, test_cancel_provenance())
+        .unwrap();
     fx.db
         .create_execution(
             CreateExecutionInput::builder()
@@ -398,7 +402,9 @@ async fn detect_conflict(fx: &Fixture) {
 #[tokio::test]
 async fn conflict_watch_reaches_the_ladder_when_no_worker_is_live() {
     let fx = fixture().await;
-    fx.db.mark_execution_redundant(&fx.live_execution_id).unwrap();
+    fx.db
+        .mark_execution_redundant(&fx.live_execution_id, test_cancel_provenance())
+        .unwrap();
     detect_conflict(&fx).await;
     let calls = fx.cube.calls.lock().unwrap().clone();
     assert_eq!(calls.first().copied(), Some("ensure_repo"), "{calls:?}");

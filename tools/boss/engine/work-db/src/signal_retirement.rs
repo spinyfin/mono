@@ -312,7 +312,7 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let result = clear_resolved_signal_in_tx(&tx, &mut pending, item, pr, ci, "engine")?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(result)
     }
 }

@@ -88,7 +88,10 @@ async fn terminal_run_retains_confinement_when_teardown_is_refused() {
     let peer_pid = std::process::id() as libc::pid_t;
     state.worker_registry.register(peer_pid, &exec);
     state.worker_registry.register_run_slot(&exec, 1);
-    state.work_db.cancel_running_execution(&exec).unwrap();
+    state
+        .work_db
+        .cancel_running_execution(&exec, test_cancel_provenance())
+        .unwrap();
     let (tmux, _) = fake_tmux([failure("permission denied")]);
     state.set_tmux_override_for_test(tmux);
 

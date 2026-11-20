@@ -272,6 +272,9 @@ async fn run_engine() -> Result<()> {
     }
 
     audit::record_start(build_start_context(&isolation));
+    boss_engine::work::set_engine_audit_sink(|event, payload| {
+        audit::record_event(event, payload);
+    });
 
     install_audit_panic_hook();
 

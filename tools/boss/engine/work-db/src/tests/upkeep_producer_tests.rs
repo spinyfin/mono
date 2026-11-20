@@ -110,7 +110,7 @@ fn pr_review_execution(db: &WorkDb, id: &str, status: &str) {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+            "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
             rusqlite::params![execution.id, status],
         )
         .unwrap();

@@ -165,6 +165,8 @@ pub enum FrontendRequest {
     /// Idempotent: re-adding an existing edge is a no-op. Cycles are
     /// rejected at the engine before insert.
     AddDependency {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         #[serde(flatten)]
         input: AddDependencyInput,
     },
@@ -238,29 +240,24 @@ pub enum FrontendRequest {
         window_days: Option<u32>,
     },
 
-    /// Cancel a non-terminal execution. Marks the execution row
-    /// `cancelled`, releases any cube workspace lease it still holds,
-    /// and performs a token-verified teardown of the run's tmux session
-    /// (if one was allocated), detaching any app viewer.
-    /// Already-terminal rows return `WorkError` (not a silent no-op).
-    ///
-    /// When `queued_only` is true (used by `bossctl executions cancel`),
-    /// only never-started rows (`queued` / `ready` / `waiting_dependency`)
-    /// are accepted. Live or mid-flight rows are refused with a message
-    /// that points at `bossctl agents stop` (or `work cancel` for the
-    /// broader non-terminal case). Operator-supplied `reason` is recorded
-    /// in the engine audit trail and the terminalization log line so the
-    /// cancellation is distinct from `orphaned` (engine lost the run) and
-    /// `abandoned`.
+    /// Cancel a non-terminal execution. Marks the row `cancelled`, releases
+    /// any cube lease, and tears down the run's tmux session if allocated.
+    /// Already-terminal rows return `WorkError`. When `queued_only` is true
+    /// (`bossctl executions cancel`), only never-started rows are accepted.
+    /// `source` and `reason` are required; they are `Option` on the wire so
+    /// a missing field is a typed error. Stamped on the execution row.
     CancelExecution {
         execution_id: String,
-        /// Operator-supplied reason for the audit trail. Optional; when
-        /// absent the engine records a default of `explicit cancel`.
+        /// Why the caller is cancelling. Required; no default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
-        /// Restrict cancellation to never-started executions. Used by
-        /// `bossctl executions cancel`; `bossctl work cancel` leaves this
-        /// false so it can still tear down a running row.
+        /// Client surface (`app`, `boss_cli`, `bossctl`). Required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// Identity behind the request; socket peer if the client omits it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+        /// Restrict cancellation to never-started executions.
         #[serde(default)]
         queued_only: bool,
     },
@@ -598,6 +595,8 @@ pub enum FrontendRequest {
     },
 
     DeleteWorkItem {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         id: String,
     },
 
@@ -2695,9 +2694,19 @@ pub enum FrontendRequest {
     /// its execution still holds.
     /// Used by `bossctl agents stop`. Idempotent — duplicate requests
     /// (or one racing with completion-detection) collapse to a no-op
-    /// on the second pass.
+    /// on the second pass. `source` and `reason` are required and stamped
+    /// on the cancelled execution row.
     StopRun {
         run_id: String,
+        /// Why the run is being stopped. Required; no default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Client surface. Required.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// Identity behind the request, when the client knows one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
     },
 
     /// Worker → engine: store one image for the worker's own verification and
@@ -2890,6 +2899,8 @@ pub enum FrontendRequest {
     /// and reported back so the operator decides what to do with them.
     /// Replies with [`FrontendEvent::UnpopulateProjectResult`].
     UnpopulateProject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         project_id: String,
         /// The `planner_runs.id` (`run_…`) to undo.
         run_id: String,
@@ -2927,6 +2938,8 @@ pub enum FrontendRequest {
     },
 
     UpdateWorkItem {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::CancelProvenance>,
         id: String,
         /// Boxed so `FrontendRequest` stays within clippy's
         /// `large_enum_variant` budget; serde output is identical.

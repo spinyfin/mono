@@ -272,7 +272,7 @@ impl WorkDb {
         let mut result = ExecutionReconcileResult::default();
         let mut pending = PendingEvents::new();
         reconcile_tasks(&tx, &mut pending, &mut result, tasks)?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(result)
     }
 

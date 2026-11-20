@@ -19,7 +19,7 @@
 //! [`JsonlAppender`] fixes this by serializing every append — across all
 //! paths, and across every [`JsonlAppender`] instance, since the lock is a
 //! crate-level `static` rather than an instance field — through one
-//! process-wide `tokio::sync::Mutex`. That is a correctness-first choice
+//! process-wide `std::sync::Mutex`. That is a correctness-first choice
 //! over "build one buffer, issue one `write_all`": a single `write_all`
 //! call is atomic against concurrent appenders in practice (a single
 //! `write()` to a regular file opened with `O_APPEND` essentially never
@@ -29,7 +29,8 @@
 //! through a mutex removes that dependency entirely: no two appends'
 //! writes can ever be in flight at the same time, regardless of how many
 //! syscalls either one takes, and regardless of how many `JsonlAppender`
-//! values a caller happens to construct.
+//! values a caller happens to construct. A `std` mutex also lets a
+//! post-commit path append without an async runtime.
 //!
 //! File handles are deliberately NOT cached across calls. Some callers
 //! append to an effectively unbounded set of paths over a long-lived
@@ -52,16 +53,19 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
-use tokio::sync::Mutex;
 
 /// Process-wide lock backing every [`JsonlAppender`]. Living at crate scope
 /// (rather than as an instance field) is what makes the "one process-wide
 /// mutex" guarantee true regardless of how many `JsonlAppender` values a
 /// caller constructs against the same or different roots: two independently
 /// constructed appenders still serialize through this one lock.
+///
+/// A `std` mutex so a post-commit dispatch write can append without an
+/// async runtime (the engine's cancel path records provenance on the
+/// calling thread next to `audit::record_event`).
 static APPEND_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Serializes concurrent `.jsonl` appends within this process — across all
@@ -89,27 +93,12 @@ impl JsonlAppender {
     /// the process-wide lock. Returns one result per input path, in order,
     /// so a failure writing one path doesn't stop attempts at the others.
     pub async fn append_to_all(&self, paths: &[&Path], value: &impl Serialize) -> Vec<io::Result<()>> {
-        let mut line = match serde_json::to_vec(value) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                let err_msg = err.to_string();
-                return paths
-                    .iter()
-                    .map(|_| Err(io::Error::new(io::ErrorKind::InvalidData, err_msg.clone())))
-                    .collect();
-            }
+        let line = match encode_line(value) {
+            Ok(line) => line,
+            Err(err) => return paths.iter().map(|_| Err(clone_io_error(&err))).collect(),
         };
-        line.push(b'\n');
-
         let owned_paths: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
-        let guard = APPEND_LOCK.lock().await;
-        let results = tokio::task::spawn_blocking(move || {
-            let results = owned_paths.iter().map(|path| append_locked(path, &line)).collect();
-            drop(guard);
-            results
-        })
-        .await;
-        match results {
+        match tokio::task::spawn_blocking(move || append_all_locked(&owned_paths, &line)).await {
             Ok(results) => results,
             Err(join_err) => paths
                 .iter()
@@ -117,6 +106,33 @@ impl JsonlAppender {
                 .collect(),
         }
     }
+
+    /// Synchronous counterpart of [`Self::append_to_all`] for callers that
+    /// must record a line before returning (post-commit dispatch events).
+    pub fn append_to_all_sync(&self, paths: &[&Path], value: &impl Serialize) -> Vec<io::Result<()>> {
+        match encode_line(value) {
+            Ok(line) => {
+                let owned_paths: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
+                append_all_locked(&owned_paths, &line)
+            }
+            Err(err) => paths.iter().map(|_| Err(clone_io_error(&err))).collect(),
+        }
+    }
+}
+
+fn encode_line(value: &impl Serialize) -> io::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn clone_io_error(err: &io::Error) -> io::Error {
+    io::Error::new(err.kind(), err.to_string())
+}
+
+fn append_all_locked(paths: &[PathBuf], line: &[u8]) -> Vec<io::Result<()>> {
+    let _guard = APPEND_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    paths.iter().map(|path| append_locked(path, line)).collect()
 }
 
 fn append_locked(path: &Path, line: &[u8]) -> io::Result<()> {

@@ -288,7 +288,7 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET status = ?1 WHERE id = ?2",
+                "UPDATE work_executions SET status = ?1, cancel_source = CASE WHEN ?1 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?1 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?1 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?2",
                 params![status, execution],
             )
             .unwrap();

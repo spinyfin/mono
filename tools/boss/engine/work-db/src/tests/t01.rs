@@ -1807,9 +1807,13 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
         other => panic!("expected chore/task, got {other:?}"),
     }
 
-    let cancelled = db.cancel_execution(&execution.id).unwrap();
+    let cancelled = db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(cancelled.finished_at.is_some());
+    let provenance = cancelled.cancel_provenance.expect("cancel stamps provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::Bossctl);
+    assert_eq!(provenance.actor, "test");
+    assert_eq!(provenance.reason, "test cancel");
 
     // Live cancel of the current execution: active → todo + engine actor
     // so the kanban card returns to Backlog without looking random.
@@ -1848,7 +1852,7 @@ fn cancel_execution_ready_does_not_demote_active_task() {
     db.force_last_status_actor_for_test(&chore.id, "human").unwrap();
     let ready = create_ready_chore_execution(&db, chore.id.clone());
 
-    let cancelled = db.cancel_execution(&ready.id).unwrap();
+    let cancelled = db.cancel_execution(&ready.id, test_cancel_provenance()).unwrap();
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(cancelled.finished_at.is_some());
 
@@ -1912,7 +1916,7 @@ fn cancel_execution_superseded_live_does_not_demote() {
         exec_new.id
     );
 
-    db.cancel_execution(&exec_old.id).unwrap();
+    db.cancel_execution(&exec_old.id, test_cancel_provenance()).unwrap();
     assert_eq!(
         db.get_execution(&exec_old.id).unwrap().status,
         ExecutionStatus::Cancelled
@@ -1930,7 +1934,7 @@ fn cancel_execution_superseded_live_does_not_demote() {
     assert_eq!(db.get_execution(&exec_new.id).unwrap().status, ExecutionStatus::Running);
 
     // Control: cancelling the current live execution still demotes.
-    db.cancel_execution(&exec_new.id).unwrap();
+    db.cancel_execution(&exec_new.id, test_cancel_provenance()).unwrap();
     match db.get_work_item(&chore.id).unwrap() {
         WorkItem::Chore(t) | WorkItem::Task(t) => {
             assert_eq!(t.status, TaskStatus::Todo);
@@ -1968,7 +1972,7 @@ fn cancel_execution_preserves_in_review_and_done_status() {
     )
     .unwrap();
 
-    db.cancel_execution(&execution.id).unwrap();
+    db.cancel_execution(&execution.id, test_cancel_provenance()).unwrap();
 
     // `in_review` survives — the PR still exists; cancel only
     // tears down the worker session, not the PR.
@@ -1995,9 +1999,15 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
         .cancel_execution_with(
             &ready.id,
             CancelExecutionOpts {
-                reason: Some("moot after work completed elsewhere".to_owned()),
+                provenance: boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::Bossctl,
+                    "test",
+                    "moot after work completed elsewhere",
+                ),
                 queued_only: true,
                 record_failure_reason: false,
+                peer_pid: None,
+                parent_pr_merge: None,
             },
         )
         .unwrap();
@@ -2013,9 +2023,15 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
         .cancel_execution_with(
             &failure_cancel.id,
             CancelExecutionOpts {
-                reason: Some("requested host became ineligible: inner cause".to_owned()),
+                provenance: boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::Bossctl,
+                    "test",
+                    "requested host became ineligible: inner cause",
+                ),
                 queued_only: true,
                 record_failure_reason: true,
+                peer_pid: None,
+                parent_pr_merge: None,
             },
         )
         .unwrap();
@@ -2038,9 +2054,15 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
         .cancel_execution_with(
             &running.id,
             CancelExecutionOpts {
-                reason: Some("should refuse".to_owned()),
+                provenance: boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::Bossctl,
+                    "test",
+                    "should refuse",
+                ),
                 queued_only: true,
                 record_failure_reason: false,
+                peer_pid: None,
+                parent_pr_merge: None,
             },
         )
         .unwrap_err()
@@ -2234,7 +2256,7 @@ fn cancel_execution_errors_on_unknown_id() {
     let path = temp_db_path("cancel-unknown");
     let db = WorkDb::open(path.clone()).unwrap();
     let err = db
-        .cancel_execution("exec_does_not_exist")
+        .cancel_execution("exec_does_not_exist", test_cancel_provenance())
         .expect_err("cancelling an unknown execution must error");
     let msg = format!("{err:#}");
     assert!(

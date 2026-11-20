@@ -103,10 +103,10 @@ VALUES ('exec_variant_reviewer', 'task_ws04127', 'pr_review', 'running', 'https:
         '1760009000');
 -- Deliberate parks: a blocked declaration, and a nudge-breaker attention on
 -- the latest run.
-UPDATE work_executions SET status = 'cancelled', run_done_outcome = 'blocked' WHERE id = 'exec_ws04024_i';
+UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture', run_done_outcome = 'blocked' WHERE id = 'exec_ws04024_i';
 INSERT INTO work_attention_items(id, execution_id, kind, status, title, body_markdown, created_at)
 VALUES ('attn_variant_nudge', 'exec_ws04032_i', 'nudge_breaker_tripped', 'open', 't', 'b', '1760000000');
-UPDATE work_executions SET status = 'cancelled' WHERE id = 'exec_ws04032_i';
+UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = 'exec_ws04032_i';
 -- A park inherited from the project, and a human-driven item in each lane.
 UPDATE projects SET parked_at = '1760000000' WHERE id = 'proj_ws080';
 UPDATE tasks SET human_driven = 1 WHERE id IN ('task_ws04040', 'task_ws04140', 'task_ws06470', 'task_ws06510');

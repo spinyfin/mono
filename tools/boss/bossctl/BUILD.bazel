@@ -6,6 +6,7 @@ rust_binary(
     srcs = [
         "src/agents.rs",
         "src/agents_tests.rs",
+        "src/cancel_provenance_report.rs",
         "src/command_types.rs",
         "src/comments.rs",
         "src/dispatch_concurrency.rs",

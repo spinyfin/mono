@@ -48,7 +48,8 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
     // The revision's creation-time execution is superseded by the one below.
     for queued in db.list_executions(Some(&revision)).unwrap() {
         if !queued.status.is_terminal() {
-            db.cancel_execution(&queued.id).unwrap();
+            db.cancel_execution(&queued.id, crate::test_support::test_cancel_provenance())
+                .unwrap();
         }
     }
     let exec = db
@@ -194,7 +195,8 @@ async fn conflict_revision_fixture(db: &Arc<WorkDb>, blocker: Option<&str>) -> (
     let revision = attempt.revision_task_id.clone().unwrap();
     for queued in db.list_executions(Some(&revision)).unwrap() {
         if !queued.status.is_terminal() {
-            db.cancel_execution(&queued.id).unwrap();
+            db.cancel_execution(&queued.id, crate::test_support::test_cancel_provenance())
+                .unwrap();
         }
     }
     if let Some(reason) = blocker {

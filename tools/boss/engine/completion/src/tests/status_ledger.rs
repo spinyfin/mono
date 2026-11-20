@@ -658,7 +658,7 @@ fn dispatch_and_execution_producers_record_exact_bases() {
 
     let cancel = create_test_chore(&db, product.clone(), "Cancel");
     let cancel_exec = start_waiting_human(&db, &cancel.id);
-    db.cancel_execution(&cancel_exec.id).unwrap();
+    db.cancel_execution(&cancel_exec.id, test_cancel_provenance()).unwrap();
     assert_latest(&db, &cancel.id, "status", "demote_active_if_latest_execution", "engine");
 
     let orphan = create_test_chore(&db, product.clone(), "Readopt");
@@ -718,7 +718,7 @@ fn dispatch_and_execution_producers_record_exact_bases() {
                 .build(),
         )
         .unwrap();
-    db.retire_stale_revision_before_dispatch(&ready.id, &revision.id)
+    db.retire_stale_revision_before_dispatch(&ready.id, &revision.id, test_cancel_provenance())
         .unwrap();
     assert_latest(
         &db,

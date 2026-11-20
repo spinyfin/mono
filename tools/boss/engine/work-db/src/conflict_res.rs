@@ -738,7 +738,7 @@ impl WorkDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = PendingEvents::new();
         let updated = close_moot_revision_task_in_tx(&tx, &mut pending, revision_task_id, provenance, "engine")?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(updated)
     }
 

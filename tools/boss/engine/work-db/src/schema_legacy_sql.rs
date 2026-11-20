@@ -1,4 +1,27 @@
 // Historical SQL kept unchanged for legacy upgrades and their fixtures.
+
+/// Who ended an execution by decision, and why. Written in the same
+/// statement that moves a row to `cancelled` or `abandoned`. Named
+/// migration `20261118_1800_cancel_provenance` installs these; v039/v043/v059
+/// recovery re-arm also call `ensure_cancel_provenance_columns` so a
+/// floor-era database can stamp provenance while those older steps run.
+pub(super) const EXECUTIONS_CANCEL_PROVENANCE_SQL: &str = "ALTER TABLE work_executions ADD COLUMN cancel_source TEXT;
+     ALTER TABLE work_executions ADD COLUMN cancel_actor TEXT;
+     ALTER TABLE work_executions ADD COLUMN cancel_reason TEXT";
+
+/// Companion to [`EXECUTIONS_CANCEL_PROVENANCE_SQL`]. `IF NOT EXISTS` so it
+/// is safe to replay on its own.
+pub(super) const EXECUTIONS_CANCEL_PROVENANCE_TRIGGER_SQL: &str =
+    "CREATE TRIGGER IF NOT EXISTS work_executions_decision_requires_provenance
+     BEFORE UPDATE OF status ON work_executions
+     WHEN NEW.status IN ('cancelled', 'abandoned')
+      AND OLD.status IS NOT NEW.status
+      AND (NEW.cancel_source IS NULL OR trim(NEW.cancel_source) = ''
+        OR NEW.cancel_actor IS NULL OR trim(NEW.cancel_actor) = ''
+        OR NEW.cancel_reason IS NULL OR trim(NEW.cancel_reason) = '')
+     BEGIN
+         SELECT RAISE(ABORT, 'execution cancel/abandon requires cancel_source, cancel_actor and cancel_reason');
+     END";
 /// Schema 43: the baseline commit a recovery record was created at, the
 /// pointer-reconciliation note for the worker prompt, and the retirement
 /// marker that stops a record being a recovery source.

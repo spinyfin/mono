@@ -1,5 +1,6 @@
 use super::*;
 use crate::parking_reconcile::{BASIS_UNPARK_CLEARED_HALT_STAMP, HaltStamp, KeptHold, UnparkReport};
+use crate::test_support::test_cancel_provenance;
 use boss_protocol::{CreateProjectInput, CreateTaskInput, OperatorQuestion};
 
 // The database half of the un-park reconciliation sequence
@@ -554,7 +555,7 @@ fn explicit_cancels_adjacent_to_parking_stay_cancelled() {
         let chore = create_test_chore(&db, &product, name).id;
         let first = db.reconcile_item_execution(&chore).unwrap().created[0].clone();
         let cancelled = if before_park {
-            db.cancel_execution(&first.id).unwrap();
+            db.cancel_execution(&first.id, test_cancel_provenance()).unwrap();
             park(&db, &chore);
             unpark(&db, &chore);
             first
@@ -562,7 +563,7 @@ fn explicit_cancels_adjacent_to_parking_stay_cancelled() {
             park(&db, &chore);
             unpark(&db, &chore);
             let next = db.reconcile_item_execution(&chore).unwrap().created[0].clone();
-            db.cancel_execution(&next.id).unwrap();
+            db.cancel_execution(&next.id, test_cancel_provenance()).unwrap();
             next
         };
         // Force the explicit cancellation into the same second as the park

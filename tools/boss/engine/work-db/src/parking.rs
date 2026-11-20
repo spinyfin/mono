@@ -655,7 +655,7 @@ impl WorkDb {
             ItemKind::Product => bail!("cannot park product {id}: parking applies to tasks, chores and projects"),
             ItemKind::Comment | ItemKind::Comparison => bail!("{id} is not a task, chore or project"),
         };
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok((item, report))
     }
 
@@ -1025,9 +1025,13 @@ pub(crate) fn cancel_pending_executions(
             pending,
             execution_id,
             CancelExecutionOpts {
-                reason: Some(CANCEL_REASON_PARKED.to_owned()),
                 queued_only: true,
                 record_failure_reason: false,
+                ..CancelExecutionOpts::new(boss_protocol::CancelProvenance::engine(
+                    boss_protocol::CancelSource::WorkItemSettled,
+                    "parking",
+                    CANCEL_REASON_PARKED,
+                ))
             },
         )?;
     }

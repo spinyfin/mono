@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::test_support::{
     create_active_chore, create_product, open_db, review_guide_source_packet, seed_review_guide_series,
+    test_cancel_provenance,
 };
 
 fn seeded_series(db: &WorkDb) -> (String, String, String) {
@@ -611,6 +612,16 @@ fn admission_enforces_one_active_attempt_per_series() {
     );
     let exec = db.get_execution(first.execution_id.as_deref().unwrap()).unwrap();
     assert_eq!(exec.status, ExecutionStatus::Cancelled);
+    let provenance = exec
+        .cancel_provenance
+        .expect("superseding a review-guide attempt must stamp cancel provenance");
+    assert_eq!(provenance.source, boss_protocol::CancelSource::ReviewGuide);
+    assert_eq!(provenance.actor, "review_guide_jobs");
+    assert!(
+        provenance.reason.contains(&first.id),
+        "reason must name the replaced attempt, got {}",
+        provenance.reason
+    );
 }
 
 #[test]
@@ -621,7 +632,8 @@ fn cancel_execution_writes_cancelled_on_the_bound_attempt() {
     else {
         panic!("must create")
     };
-    db.cancel_execution(attempt.execution_id.as_deref().unwrap()).unwrap();
+    db.cancel_execution(attempt.execution_id.as_deref().unwrap(), test_cancel_provenance())
+        .unwrap();
     assert_eq!(attempt_status(&db, &attempt.id), "cancelled");
     let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
     assert_eq!(summary.lifecycle, "failed");
@@ -1047,7 +1059,7 @@ fn reconcile_finishes_the_attempt_of_a_deliberately_terminal_execution_even_with
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET status = 'abandoned', finished_at = datetime('now') WHERE id = ?1",
+            "UPDATE work_executions SET status = 'abandoned', finished_at = datetime('now'), cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = ?1",
             [&execution_id],
         )
         .unwrap();

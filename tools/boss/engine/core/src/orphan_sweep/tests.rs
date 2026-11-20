@@ -2226,7 +2226,9 @@ fn seed_legacy_abandonment(db: &WorkDb, execution_id: &str) {
     let conn = db.connect().unwrap();
     conn.execute(
         "UPDATE work_executions SET status = 'abandoned', cube_lease_id = NULL,
-         cube_workspace_id = NULL, workspace_path = NULL, finished_at = '1' WHERE id = ?1",
+         cube_workspace_id = NULL, workspace_path = NULL, finished_at = '1',
+         cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'legacy abandonment fixture'
+         WHERE id = ?1",
         [execution_id],
     )
     .unwrap();

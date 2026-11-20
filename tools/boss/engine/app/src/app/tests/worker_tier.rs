@@ -97,6 +97,14 @@ fn enforcing_state(run_id: &str) -> (Arc<ServerState>, tempfile::TempDir) {
 /// update` today are prompt text").
 fn denied_request() -> FrontendRequest {
     FrontendRequest::UpdateWorkItem {
+        cancel: Some(
+            boss_protocol::CancelProvenance::new(
+                boss_protocol::CancelSource::Bossctl,
+                "requesting client",
+                "apply requested work item changes",
+            )
+            .unwrap(),
+        ),
         id: "task_1".to_owned(),
         patch: Box::new(boss_protocol::WorkItemPatch::default()),
     }

@@ -70,7 +70,7 @@ fn hold_revision(db: &WorkDb, root_id: &str, launched: bool) -> String {
         .unwrap();
     raw(db)
         .execute(
-            "UPDATE work_executions SET status = 'abandoned' WHERE work_item_id = ?1 AND id != ?2",
+            "UPDATE work_executions SET status = 'abandoned', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE work_item_id = ?1 AND id != ?2",
             params![revision.id, implementation.id],
         )
         .unwrap();

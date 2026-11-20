@@ -71,6 +71,7 @@ async fn update_work_item_records_who_deferred_and_who_cleared_it() {
             FrontendRequest::UpdateWorkItem {
                 id: chore.id.clone(),
                 patch: Box::new(patch),
+                cancel: None,
             },
         )
         .await;

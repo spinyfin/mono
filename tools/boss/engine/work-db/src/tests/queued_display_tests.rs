@@ -95,7 +95,7 @@ fn abnormal_previous_outcome_precedes_the_current_hold() {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET created_at = ?2, status = ?3, finished_at = ?4 WHERE id = ?1",
+                "UPDATE work_executions SET created_at = ?2, status = ?3, finished_at = ?4, cancel_source = CASE WHEN ?3 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?3 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?3 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![previous.id, (NOW - 300).to_string(), status, (NOW - 60).to_string()],
             )
             .unwrap();
@@ -244,7 +244,7 @@ fn restart_prefix_skips_unrelated_or_stale_predecessors() {
     db.connect()
         .unwrap()
         .execute(
-            "UPDATE work_executions SET created_at = ?2, status = 'cancelled', finished_at = ?3 WHERE id = ?1",
+            "UPDATE work_executions SET created_at = ?2, status = 'cancelled', finished_at = ?3, cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = ?1",
             params![previous.id, (NOW - 200_000).to_string(), (NOW - 172_800).to_string()],
         )
         .unwrap();

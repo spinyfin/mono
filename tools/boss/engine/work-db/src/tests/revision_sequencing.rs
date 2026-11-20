@@ -69,7 +69,7 @@ fn conflict_revision_waits_for_claimed_or_live_writer_then_runs_next_even_after_
             let writer_exec = execution(&db, &writer);
             let conn = db.connect().unwrap();
             conn.execute(
-                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![writer_exec.id, status],
             )
             .unwrap();
@@ -82,7 +82,7 @@ fn conflict_revision_waits_for_claimed_or_live_writer_then_runs_next_even_after_
             assert_eq!(execution(&db, &conflict).status, ExecutionStatus::WaitingDependency);
             let conn = db.connect().unwrap();
             conn.execute(
-                "UPDATE work_executions SET status = ?2 WHERE id = ?1",
+                "UPDATE work_executions SET status = ?2, cancel_source = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN ?2 IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END WHERE id = ?1",
                 params![writer_exec.id, outcome],
             )
             .unwrap();

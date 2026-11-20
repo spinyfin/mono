@@ -78,6 +78,7 @@ mod automations;
 mod blocking_dialog;
 mod board_progress;
 mod broadcasts;
+mod cancel_rpc;
 mod ci_remediation;
 mod comments;
 mod conflict_resolution;
@@ -217,7 +218,6 @@ use handler_helpers::METADATA_KEY_DISPATCH_PAUSED_SINCE;
 use handler_helpers::TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX;
 use handler_helpers::TranscriptResolution;
 use handler_helpers::active_chore_run_id;
-use handler_helpers::active_to_todo_execution;
 use handler_helpers::build_chore_update_message;
 use handler_helpers::build_effort_audit_report;
 use handler_helpers::build_engine_health_report;
@@ -237,6 +237,7 @@ use handler_helpers::publish_work_invalidation;
 use handler_helpers::read_transcript_tail;
 use handler_helpers::resolve_transcript_for_tail;
 use handler_helpers::restore_persisted_dispatch_pause;
+use handler_helpers::rpc_cancel_actor;
 use handler_helpers::segment_to_wire;
 use handler_helpers::send_push;
 use handler_helpers::send_response;
@@ -1414,12 +1415,22 @@ impl ServerState {
             Some(db) => db,
             None => WorkDb::open(cfg.work.db_path.clone())?,
         };
+        let state_root: PathBuf = cfg
+            .work
+            .db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cfg.work.cwd.clone());
+        let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
+            Arc::new(boss_dispatch_events::JsonlFileSink::new(state_root.clone()));
         let work_db = Arc::new(
             work_db
                 .with_event_bus(event_bus.clone())
                 .with_persona_metrics(metrics_registry.clone())
                 .with_token_generator(std::sync::Arc::new(boss_engine_runtime::engine_control::generate_token))
-                .with_engine_build_identity(boss_engine_runtime::build_info::build_identity()),
+                .with_engine_build_identity(boss_engine_runtime::build_info::build_identity())
+                .with_dispatch_events(dispatch_events.clone()),
         );
         timeline.mark("work_db_open");
         let anthropic_api_key = cfg.anthropic_api_key();
@@ -1550,20 +1561,6 @@ impl ServerState {
         let staged_unobserved_commands =
             Arc::new(boss_engine_completion::codex_unobserved_command::UnobservedCommandTracker::new());
 
-        // Resolve the Boss state root early — both the feature-flags
-        // store (loaded below, before the completion handler is
-        // built) and the dispatch-event sink (set up further down)
-        // land next to `state.db` under the same root. Empty parent
-        // (test configs with `:memory:` for the DB path) falls back
-        // to `cwd` so test artifacts stay co-located.
-        let state_root: PathBuf = cfg
-            .work
-            .db_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cfg.work.cwd.clone());
-
         // Load the feature-flags store from the on-disk file. A
         // missing or unreadable file is logged but does not block
         // startup: the in-memory store falls back to registry defaults
@@ -1629,9 +1626,8 @@ impl ServerState {
         let settings_for_state = settings.clone();
 
         // Dispatch-event JSONL stream lands next to state.db / events.sock
-        // under the same state root. Build it before the completion handler
-        // so merge-triggered cancellation and ordinary dispatch share one
-        // timeline sink.
+        // under the same state root. Built before WorkDb so post-commit
+        // cancel provenance writes the same sink the coordinator uses.
         let dispatch_event_root: PathBuf = state_root.clone();
         // Shared by `ServerState` and by the remote-host adapter provider, so
         // a remote worker's `BOSS.md` read hits the same sha-keyed body cache.
@@ -1640,8 +1636,6 @@ impl ServerState {
                 state_root.join(boss_engine_design_docs::BODY_CACHE_DIR_NAME),
             ))
         });
-        let dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink> =
-            Arc::new(boss_dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
         let metrics_for_state = metrics_registry.clone();
         let metrics_for_dispatcher = metrics_registry.clone();
         let metrics_for_completion = metrics_registry.clone();

@@ -633,7 +633,7 @@ impl WorkDb {
                 now,
             ],
         )?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
 
         Ok(Ok(SubmitWorkerProposalOutcome {
             proposal: boss_protocol::WorkerProposal::builder()

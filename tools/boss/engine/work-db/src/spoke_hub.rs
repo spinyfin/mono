@@ -1698,7 +1698,7 @@ mod tests {
         db.connect()
             .unwrap()
             .execute(
-                "UPDATE work_executions SET status = 'cancelled', cube_lease_id = NULL WHERE id = 'exec_1'",
+                "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture', cube_lease_id = NULL WHERE id = 'exec_1'",
                 [],
             )
             .unwrap();

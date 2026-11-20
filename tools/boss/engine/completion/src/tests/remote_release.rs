@@ -67,7 +67,8 @@ fn remote_fixture_with_pid(pid: Option<i64>) -> (TempDir, Arc<WorkDb>, String) {
     if let Some(pid) = pid {
         db.set_run_remote_pid_for_execution(&execution.id, pid).unwrap();
     }
-    db.cancel_running_execution(&execution.id).unwrap();
+    db.cancel_running_execution(&execution.id, test_cancel_provenance())
+        .unwrap();
     (dir, db, execution.id)
 }
 

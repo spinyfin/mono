@@ -784,7 +784,8 @@ fn reaped_batch(db: &WorkDb, root_id: &str, pr_url: &str, target_sha: &str) -> S
         other => panic!("expected a new batch, got {other:?}"),
     };
     for execution in &executions {
-        db.mark_execution_redundant(&execution.id).unwrap();
+        db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+            .unwrap();
     }
     let conn = db.connect().unwrap();
     conn.execute(
@@ -849,7 +850,8 @@ fn deferred_admission_query_surfaces_an_in_review_root_whose_newest_batch_was_re
     // and the query must not keep costing a `gh pr view` every sweep.
     for execution in db.list_executions(Some(&root_id)).unwrap() {
         if execution.kind == ExecutionKind::PrReview && !execution.status.is_terminal() {
-            db.mark_execution_redundant(&execution.id).unwrap();
+            db.mark_execution_redundant(&execution.id, test_cancel_provenance())
+                .unwrap();
         }
     }
     db.connect()

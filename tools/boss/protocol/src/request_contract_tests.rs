@@ -279,6 +279,7 @@ fn update_work_item_redirect_follows_the_patch() {
     let request = |patch: WorkItemPatch| FrontendRequest::UpdateWorkItem {
         id: "task_1".into(),
         patch: Box::new(patch),
+        cancel: None,
     };
     assert_eq!(
         request_contract(&request(WorkItemPatch::default())).worker,

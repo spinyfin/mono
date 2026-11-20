@@ -302,7 +302,8 @@ impl CommandRunner for CapturingSpawner {
             Some("send-keys") => {
                 self.sent_keys.lock().unwrap().push(args.last().unwrap().clone());
                 if let Some((db, execution_id)) = self.cancel_on_send_keys.lock().unwrap().take() {
-                    db.cancel_running_execution(&execution_id).unwrap();
+                    db.cancel_running_execution(&execution_id, test_cancel_provenance())
+                        .unwrap();
                 }
                 if self.accept_prompt_on_resubmit.load(std::sync::atomic::Ordering::SeqCst) {
                     for state in self.live_states.snapshot() {
@@ -315,7 +316,8 @@ impl CommandRunner for CapturingSpawner {
             Some("capture-pane") => {
                 self.capture_seen.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Some((db, execution_id)) = self.cancel_on_capture.lock().unwrap().take() {
-                    db.cancel_running_execution(&execution_id).unwrap();
+                    db.cancel_running_execution(&execution_id, test_cancel_provenance())
+                        .unwrap();
                 }
                 if self.auto_confirm_turn.load(std::sync::atomic::Ordering::SeqCst) {
                     for state in self.live_states.snapshot() {
@@ -1763,7 +1765,11 @@ async fn run_execution_reaps_and_signals_when_cancelled_mid_spawn() {
             workspace.path().to_str().unwrap(),
         )
         .unwrap();
-    assert!(work_db.cancel_running_execution(&execution.id).unwrap());
+    assert!(
+        work_db
+            .cancel_running_execution(&execution.id, test_cancel_provenance())
+            .unwrap()
+    );
 
     let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
         workspace.path().join("feature-flags.toml"),

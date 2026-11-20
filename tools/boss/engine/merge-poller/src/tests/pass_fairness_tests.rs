@@ -556,9 +556,10 @@ impl CompletionRequests for SlowRecheckHandler {
         _execution: &WorkExecution,
         _prior_status: ExecutionStatus,
         _chain_root_id: &str,
+        _provenance: &boss_protocol::CancelProvenance,
     ) {
     }
-    async fn force_stop_execution(&self, _execution_id: &str) {}
+    async fn force_stop_execution(&self, _execution_id: &str, _provenance: boss_protocol::CancelProvenance) {}
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {
         tokio::time::sleep(UPKEEP).await;
         self.calls.rechecked.lock().unwrap().push(execution_id.to_owned());
@@ -621,7 +622,11 @@ fn waiting_human_execution(db: &WorkDb, product_id: &str, label: &str) -> String
 
 fn late_pr_execution(db: &WorkDb, product_id: &str, label: &str) -> String {
     let id = waiting_human_execution(db, product_id, label);
-    db.mark_execution_redundant(&id).unwrap();
+    db.mark_execution_redundant(
+        &id,
+        boss_protocol::CancelProvenance::engine(boss_protocol::CancelSource::Bossctl, "test", "test cancel"),
+    )
+    .unwrap();
     id
 }
 

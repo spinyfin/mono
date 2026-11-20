@@ -85,7 +85,7 @@ impl WorkDb {
             actor,
             provenance,
         )?;
-        commit_and_publish(tx, pending, self.event_bus())?;
+        self.commit_pending(tx, pending)?;
         Ok(task)
     }
 }
@@ -287,7 +287,13 @@ pub(crate) fn assert_parent_revisable_and_insert_as_actor_with_provenance(
         // `new_revision` was just inserted in this same transaction, so it
         // can't yet have a live execution attached — the cancelled-execution
         // channel here is guaranteed empty (same invariant as above).
-        maybe_engine_block_dependent(pending, conn, &new_revision.id, &now)?;
+        maybe_engine_block_dependent(
+            pending,
+            conn,
+            &new_revision.id,
+            &now,
+            &DependencyCancelOrigin::EngineInternal,
+        )?;
     }
 
     // ── 9. Create the initial execution row now ─────────────────────────────

@@ -20,6 +20,7 @@ use super::*;
 
 mod decision_notifications;
 use crate::app::proposals;
+use boss_engine_runtime::test_support::test_cancel_provenance;
 use boss_protocol::{
     PROPOSAL_CAP_PER_KIND_PER_EXECUTION, ProposalErrorCode, ProposalKind, ProposalState, ProposalSubmissionError,
     ReviewBatchPhase, ReviewClassification, ReviewLanguageBucket, ReviewProfile, WorkerProposal,
@@ -2298,7 +2299,7 @@ async fn terminal_execution_is_refused_and_its_peer_stays_confined() {
     let fx = WorkerFixture::new();
     fx.server_state
         .work_db
-        .cancel_running_execution(&fx.execution_id)
+        .cancel_running_execution(&fx.execution_id, test_cancel_provenance())
         .unwrap();
     assert!(
         fx.server_state

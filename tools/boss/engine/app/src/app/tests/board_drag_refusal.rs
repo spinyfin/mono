@@ -181,6 +181,7 @@ async fn plain_update_work_item_refusal_stays_a_work_error() {
     let req = FrontendRequest::UpdateWorkItem {
         id: chore.id.clone(),
         patch: Box::new(WorkItemPatch::builder().status("active").build()),
+        cancel: None,
     };
     handle_update_work_item(dispatch(&state, &sink), req).await;
 

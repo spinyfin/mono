@@ -184,7 +184,7 @@ Capabilities should include:
 - `bossctl agents interrupt <id>`
 - `bossctl agents transcript <id>`
 - `bossctl agents launch <id>`
-- `bossctl agents stop <id>`
+- `bossctl agents stop <id> --reason 'stop stuck worker'`
 - `bossctl workspace summary`
 - `bossctl work start <work-item-id>`
 - `bossctl work status <work-item-id>`

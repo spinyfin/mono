@@ -117,7 +117,10 @@ impl Fx {
         self.sql(&format!(
             "UPDATE work_executions
              SET status = '{status}', progression_disposition = {disposition}, run_done_outcome = {outcome},
-                 created_at = {t}, started_at = {t}, finished_at = {t}, last_error = {error}
+                 created_at = {t}, started_at = {t}, finished_at = {t}, last_error = {error},
+                 cancel_source = CASE WHEN '{status}' IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END,
+                 cancel_actor = CASE WHEN '{status}' IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END,
+                 cancel_reason = CASE WHEN '{status}' IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END
              WHERE id = '{run}'",
             disposition = disposition.map_or("NULL".to_owned(), |d| format!("'{d}'")),
             t = now() - ago,
@@ -262,7 +265,7 @@ impl Fx {
             .unwrap()
             .id;
         self.sql(&format!(
-            "UPDATE work_executions SET status = '{status}', created_at = {t}, finished_at = {t} WHERE id = '{id}'",
+            "UPDATE work_executions SET status = '{status}', cancel_source = CASE WHEN '{status}' IN ('cancelled', 'abandoned') THEN 'bossctl' ELSE cancel_source END, cancel_actor = CASE WHEN '{status}' IN ('cancelled', 'abandoned') THEN 'test' ELSE cancel_actor END, cancel_reason = CASE WHEN '{status}' IN ('cancelled', 'abandoned') THEN 'test fixture' ELSE cancel_reason END, created_at = {t}, finished_at = {t} WHERE id = '{id}'",
             t = now() - age
         ));
         id

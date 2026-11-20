@@ -32,7 +32,40 @@
 //! `stage_execution_terminal` and commit via [`commit_and_publish`];
 //! host-disable transitions publish directly (no enclosing transaction).
 
+use std::cell::RefCell;
+use std::sync::OnceLock;
+
+use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use boss_event_bus::{Event, EventBus};
+
+static ENGINE_AUDIT_SINK: OnceLock<fn(&str, &serde_json::Value)> = OnceLock::new();
+
+/// Install the process-wide writer for staged engine-audit records.
+/// The engine process registers `audit::record_event` at startup so
+/// work-db can flush cancel/abandon records without depending on core.
+pub fn set_engine_audit_sink(sink: fn(&str, &serde_json::Value)) {
+    let _ = ENGINE_AUDIT_SINK.set(sink);
+}
+
+pub(crate) fn emit_engine_audit(event: &str, payload: &serde_json::Value) {
+    if let Some(sink) = ENGINE_AUDIT_SINK.get() {
+        sink(event, payload);
+    }
+}
+
+thread_local! {
+    static INIT_PENDING: RefCell<PendingEvents> = RefCell::new(PendingEvents::new());
+}
+
+/// Stage schema-startup decisions until `WorkDb::init` commits.
+pub(crate) fn with_init_pending<T>(f: impl FnOnce(&mut PendingEvents) -> T) -> T {
+    INIT_PENDING.with(|slot| f(&mut slot.borrow_mut()))
+}
+
+/// Take staged schema-startup decisions. Empty if init did not commit.
+pub(crate) fn take_init_pending() -> PendingEvents {
+    INIT_PENDING.with(|slot| slot.replace(PendingEvents::new()))
+}
 
 /// Events staged by a state-write path for publication once its enclosing
 /// DB transaction commits. Construct one per transaction, [`push`](Self::push)
@@ -40,7 +73,13 @@ use boss_event_bus::{Event, EventBus};
 /// alongside the `Transaction` — never call [`EventBus::publish`] directly
 /// from inside a transaction.
 #[derive(Debug, Default)]
-pub struct PendingEvents(Vec<Event>);
+pub struct PendingEvents {
+    events: Vec<Event>,
+    /// Engine-audit records (`event`, payload) staged the same way: written
+    /// to `engine-audit.log` only once the transaction that produced them
+    /// has committed, so a rolled-back cancel never claims it happened.
+    audits: Vec<(String, serde_json::Value)>,
+}
 
 impl PendingEvents {
     /// An empty set of staged events.
@@ -50,12 +89,17 @@ impl PendingEvents {
 
     /// Stage `event` to publish once the transaction commits.
     pub fn push(&mut self, event: Event) {
-        self.0.push(event);
+        self.events.push(event);
+    }
+
+    /// Stage an engine-audit record to write once the transaction commits.
+    pub fn push_audit(&mut self, event: &str, payload: serde_json::Value) {
+        self.audits.push((event.to_owned(), payload));
     }
 
     /// True if nothing has been staged yet.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.events.is_empty() && self.audits.is_empty()
     }
 
     /// Consume `self`, yielding every staged event. For the rare
@@ -63,26 +107,65 @@ impl PendingEvents {
     /// [`commit_and_publish`] — its single `Connection::execute` write
     /// already auto-committed, so there's nothing left to gate the
     /// publish on; the caller publishes each event immediately instead.
+    ///
+    /// Staged audit records are written here too: the caller's write has
+    /// already committed, so there is nothing left to wait for.
     pub fn into_events(self) -> Vec<Event> {
-        self.0
+        let mut pending = self;
+        pending.flush_audits(&boss_dispatch_events::NoopDispatchEventSink);
+        pending.events
+    }
+
+    /// Write staged audits and dispatch events, then publish bus events.
+    /// Callers that already committed (or never had a transaction) use this
+    /// instead of [`commit_and_publish`].
+    pub fn flush(self, bus: &EventBus, sink: &dyn DispatchEventSink) {
+        let mut pending = self;
+        pending.flush_audits(sink);
+        for event in pending.events {
+            bus.publish(event);
+        }
+    }
+
+    fn flush_audits(&mut self, sink: &dyn DispatchEventSink) {
+        for (event, payload) in &self.audits {
+            emit_engine_audit(event, payload);
+            if matches!(event.as_str(), "execution_cancelled" | "execution_abandoned") {
+                emit_decision_dispatch(sink, payload);
+            }
+        }
     }
 }
 
+fn emit_decision_dispatch(sink: &dyn DispatchEventSink, payload: &serde_json::Value) {
+    let Some(execution_id) = payload.get("execution_id").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let mut details = payload.clone();
+    if details.get("chain_root_id").and_then(|value| value.as_str()).is_some() {
+        details["reason"] = serde_json::json!("parent_pr_merged");
+    }
+    let mut event = DispatchEvent::new(Stage::ExecutionCancelled, Outcome::Ok, execution_id).with_details(details);
+    if let Some(work_item_id) = payload.get("work_item_id").and_then(|value| value.as_str()) {
+        event = event.with_work_item(work_item_id);
+    }
+    sink.emit_sync(event);
+}
+
 /// Commit `tx`, and only if the commit succeeds, publish every event staged
-/// in `pending` onto `bus`. Returns the commit's own `Result` unchanged —
-/// on `Err`, `pending` is dropped without publishing anything, exactly as a
-/// rolled-back transaction should never have announced a transition that
-/// didn't happen.
+/// in `pending` onto `bus` and write decision provenance to `sink`. Returns
+/// the commit's own `Result` unchanged — on `Err`, `pending` is dropped
+/// without publishing anything, exactly as a rolled-back transaction should
+/// never have announced a transition that didn't happen.
 pub fn commit_and_publish(
     tx: rusqlite::Transaction<'_>,
     pending: PendingEvents,
     bus: &EventBus,
+    sink: &dyn DispatchEventSink,
 ) -> rusqlite::Result<()> {
     tx.commit()?;
     tracing::debug!(target: "work_write_timing", boundary = "commit");
-    for event in pending.0 {
-        bus.publish(event);
-    }
+    pending.flush(bus, sink);
     Ok(())
 }
 
@@ -101,6 +184,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decision_provenance_reaches_dispatch_only_after_commit() {
+        let mut conn = open_conn();
+        let bus = EventBus::new();
+        let sink = boss_dispatch_events::RecordingDispatchEventSink::new();
+        let payload = serde_json::json!({
+            "execution_id": "exec-decision", "work_item_id": "task-decision",
+            "to_status": "abandoned", "source": "scheduler_preemption",
+            "actor": "scheduler", "reason": "higher priority work needs this slot",
+        });
+        {
+            let _tx = conn.transaction().unwrap();
+            let mut pending = PendingEvents::new();
+            pending.push_audit("execution_abandoned", payload.clone());
+        }
+        assert!(sink.events().await.is_empty(), "rolled-back provenance must not escape");
+        let tx = conn.transaction().unwrap();
+        let mut pending = PendingEvents::new();
+        pending.push_audit("execution_abandoned", payload);
+        commit_and_publish(tx, pending, &bus, &sink).unwrap();
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].execution_id, "exec-decision");
+        assert_eq!(events[0].details["source"], "scheduler_preemption");
+        assert_eq!(events[0].details["actor"], "scheduler");
+        assert_eq!(events[0].details["reason"], "higher priority work needs this slot");
+        assert_eq!(events[0].details["to_status"], "abandoned");
+    }
+
+    #[tokio::test]
+    async fn every_decision_in_a_bulk_commit_reaches_the_sink() {
+        let mut conn = open_conn();
+        let bus = EventBus::new();
+        let sink = boss_dispatch_events::RecordingDispatchEventSink::new();
+        let tx = conn.transaction().unwrap();
+        let mut pending = PendingEvents::new();
+        // The in-process bus mailbox is 256; a post-commit sink must keep
+        // every decision even when a single commit stages more than that.
+        let count = 300;
+        for i in 0..count {
+            pending.push_audit(
+                "execution_cancelled",
+                serde_json::json!({
+                    "execution_id": format!("exec-{i}"),
+                    "work_item_id": format!("task-{i}"),
+                    "to_status": "cancelled",
+                    "source": "stranded_execution_sweep",
+                    "actor": "stranded_execution_sweep",
+                    "reason": format!("sweep item {i}"),
+                }),
+            );
+        }
+        commit_and_publish(tx, pending, &bus, &sink).unwrap();
+        let events = sink.events().await;
+        assert_eq!(events.len(), count);
+        assert_eq!(events[0].execution_id, "exec-0");
+        assert_eq!(events[count - 1].execution_id, format!("exec-{}", count - 1));
+    }
+
+    #[tokio::test]
     async fn publishes_after_successful_commit() {
         let mut conn = open_conn();
         let bus = EventBus::new();
@@ -112,7 +254,7 @@ mod tests {
         tx.execute("INSERT INTO t (id) VALUES (1)", []).expect("insert");
         let mut pending = PendingEvents::new();
         pending.push(Event::DispatchReady);
-        commit_and_publish(tx, pending, &bus).expect("commit");
+        commit_and_publish(tx, pending, &bus, &boss_dispatch_events::NoopDispatchEventSink).expect("commit");
 
         let event = sub.recv().await.expect("event delivered after commit");
         assert_eq!(event, Event::DispatchReady);
@@ -188,7 +330,7 @@ mod tests {
         let mut pending = PendingEvents::new();
         pending.push(Event::DispatchReady);
 
-        let result = commit_and_publish(tx, pending, &bus);
+        let result = commit_and_publish(tx, pending, &bus, &boss_dispatch_events::NoopDispatchEventSink);
         assert!(
             result.is_err(),
             "commit must fail: deferred FK violation is checked at COMMIT"

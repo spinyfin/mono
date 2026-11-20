@@ -62,7 +62,7 @@ fn create_batch(db: &WorkDb, cycle_root_id: &str, target_sha: &str) -> ReviewBat
 
 fn created_batch(dispatch: ReviewBatchDispatch) -> (ReviewBatch, Vec<WorkExecution>) {
     match dispatch {
-        ReviewBatchDispatch::Created { batch, executions } => (batch, executions),
+        ReviewBatchDispatch::Created { batch, executions } => (*batch, executions),
         other => panic!("expected Created, got {other:?}"),
     }
 }

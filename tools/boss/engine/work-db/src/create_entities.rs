@@ -50,6 +50,23 @@ pub(crate) fn create_project_in_tx(
     query_project(conn, &id)?.with_context(|| format!("missing project after insert: {id}"))
 }
 
+impl WorkDb {
+    /// Commit `tx` and flush staged audits, dispatch events, and bus
+    /// publications only if the commit succeeds.
+    pub fn commit_pending(
+        &self,
+        tx: rusqlite::Transaction<'_>,
+        pending: crate::event_publish::PendingEvents,
+    ) -> rusqlite::Result<()> {
+        crate::event_publish::commit_and_publish(tx, pending, self.event_bus(), self.dispatch_events.as_ref())
+    }
+
+    /// Flush staged side effects for a write that already auto-committed.
+    pub fn flush_pending(&self, pending: crate::event_publish::PendingEvents) {
+        pending.flush(self.event_bus(), self.dispatch_events.as_ref());
+    }
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     pub fn open(path: PathBuf) -> Result<Self> {
@@ -112,6 +129,8 @@ impl WorkDb {
             boothby_action: Arc::default(),
             engine_rebase_holds: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: super::default_dispatch_events(),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
@@ -142,6 +161,8 @@ impl WorkDb {
             boothby_action: Arc::default(),
             engine_rebase_holds: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: super::default_dispatch_events(),
+            migration_events: Arc::new(Mutex::new(PendingEvents::new())),
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
@@ -161,6 +182,15 @@ impl WorkDb {
     /// tmux spawn authorizations. Chainable after [`Self::open`].
     pub fn with_token_generator(mut self, generator: Arc<dyn Fn() -> String + Send + Sync>) -> Self {
         self.token_generator = generator;
+        self
+    }
+
+    /// Share the engine's dispatch-event sink so post-commit cancel
+    /// provenance is written to the same stream as live dispatch.
+    pub fn with_dispatch_events(mut self, sink: Arc<dyn boss_dispatch_events::DispatchEventSink>) -> Self {
+        self.dispatch_events = sink;
+        std::mem::take(&mut *self.migration_events.lock().unwrap())
+            .flush(&self.event_bus, self.dispatch_events.as_ref());
         self
     }
 

@@ -385,7 +385,7 @@ fn clause_1_worker_failed_is_admitted_on_both_primary_and_revision_items() {
     f.assert_candidate(&revision, false);
     assert!(!f.clauses(&revision).no_live_work);
     f.sql(&format!(
-        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{gate}'"
+        "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = '{gate}'"
     ));
     f.assert_candidate(&revision, true);
 
@@ -428,7 +428,7 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     f.assert_candidate(&item, false);
     assert!(!f.clauses(&item).no_live_work);
     f.sql(&format!(
-        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{gated}'"
+        "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = '{gated}'"
     ));
     f.assert_candidate(&item, true);
 
@@ -441,7 +441,7 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     );
     f.assert_candidate(&item, false);
     f.sql(&format!(
-        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{sibling_gate}'"
+        "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = '{sibling_gate}'"
     ));
     f.assert_candidate(&item, true);
 
@@ -481,7 +481,7 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     );
     f.assert_candidate(&item, false);
     f.sql(&format!(
-        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{gate}'"
+        "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = '{gate}'"
     ));
     f.assert_candidate(&item, true);
 
@@ -490,7 +490,7 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
         let own = f.execution(&item, kind, ExecutionStatus::Ready);
         f.assert_candidate(&item, false);
         f.sql(&format!(
-            "UPDATE work_executions SET status = 'cancelled' WHERE id = '{own}'"
+            "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = '{own}'"
         ));
         f.assert_candidate(&item, true);
     }
@@ -591,7 +591,7 @@ fn clause_3_a_queued_run_waiting_on_capacity_is_not_stuck() {
     assert!(!clauses.no_live_work, "the queued run is also live work");
     f.assert_candidate(&id, false);
     f.sql(&format!(
-        "UPDATE work_executions SET status = 'cancelled' WHERE id = '{queued}'"
+        "UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture' WHERE id = '{queued}'"
     ));
     assert!(f.clauses(&id).not_capacity_wait);
     f.assert_candidate(&id, true);
@@ -1216,7 +1216,7 @@ fn the_migrations_are_idempotent_and_repair_a_database_that_lacks_them() {
         assert!(db.mint_progression_execution(&id).unwrap().is_some());
         db.connect()
             .unwrap()
-            .execute("UPDATE work_executions SET status = 'cancelled'", [])
+            .execute("UPDATE work_executions SET status = 'cancelled', cancel_source = 'bossctl', cancel_actor = 'test', cancel_reason = 'test fixture'", [])
             .unwrap();
     }
 }
