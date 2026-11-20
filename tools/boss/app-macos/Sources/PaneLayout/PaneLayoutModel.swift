@@ -184,7 +184,13 @@ public struct PaneLayoutModel: Equatable, Sendable {
 
     // MARK: - Pages
 
-    public var capacity: Int { policy.capacity(of: limits) }
+    /// Use every rectangle in a full page, including rounding beyond the policy
+    /// target (for example, sixteen panes require an eighteen-cell 6x3 grid).
+    public var capacity: Int {
+        policy.shape(
+            forUsedSpan: policy.capacity(of: limits), limits: limits, geometry: geometry
+        ).cellCount
+    }
 
     /// Pages that hold at least one cell. After any boundary this is exactly
     /// `ceil(visibleCount / capacity)`; zero means the empty state.
@@ -206,7 +212,6 @@ public struct PaneLayoutModel: Equatable, Sendable {
         for local in 0..<shape.cellCount {
             let global = pageIndex * cap + local
             let content: PaneCellContent
-            // Rectangles past `capacity` are spare: they never hold a run.
             if local < cap, global < slots.count {
                 content = cellContent(slots[global])
             } else {

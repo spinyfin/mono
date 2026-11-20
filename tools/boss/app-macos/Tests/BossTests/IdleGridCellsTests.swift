@@ -53,6 +53,29 @@ final class IdleGridCellsTests: XCTestCase {
         XCTAssertEqual(grid.idleCells(for: page).map(\.localIndex), empties)
     }
 
+    func testEighteenCellPagesFillWithLiveAgentsBeforeIdleCrew() throws {
+        for count in [17, 18, 35] {
+            let grid = AgentsGridModel(isVisible: true)
+            grid.noteCellSize(width: 6, height: 13)
+            grid.noteArea(width: 2600, height: 1100, inLiveResize: false)
+            grid.flushGeometryForTesting()
+            grid.apply(
+                states: (0..<count).map { makeState(runId: "r\($0)", slotId: $0 + 1, name: "Agent \($0)") },
+                viewers: [:], interactivePoolSize: 16, automationPoolSize: 8,
+                reviewPoolSize: 16, feedUnavailable: false
+            )
+            XCTAssertEqual(grid.layout.capacity, 18)
+            XCTAssertEqual(grid.layout.pageCount, (count + 17) / 18)
+            for page in grid.layout.pages.dropLast() {
+                XCTAssertEqual(page.occupiedCount, 18)
+                XCTAssertTrue(grid.idleCells(for: page).isEmpty)
+            }
+            let last = try XCTUnwrap(grid.layout.pages.last)
+            XCTAssertEqual(last.shape, GridShape(columns: 6, rows: 3))
+            XCTAssertEqual(grid.idleCells(for: last).count, count == 18 ? 0 : 1)
+        }
+    }
+
     func testIdlePersonasDoNotCollideWithActiveAgents() throws {
         let grid = applied(["a", "b", "c"])
         let page = try firstPage(grid)
