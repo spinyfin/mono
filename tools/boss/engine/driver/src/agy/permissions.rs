@@ -14,9 +14,13 @@
 //!   `always-proceed` fails open when the hook is missing. Neither, nor
 //!   `--mode plan`, `--sandbox` or `--dangerously-skip-permissions`, is ever
 //!   rendered for any kind.
-//! - `trustedWorkspaces` — exactly the symlink-resolved workspace path. Matching
-//!   is exact: a parent directory or an unresolved spelling does not count. The
-//!   control directory is not trusted.
+//! - `trustedWorkspaces` — every spelling of the working directory
+//!   (`trust_path_variants`: the path as given, its symlink-resolved form,
+//!   and the `/tmp`↔`/private/tmp` and `/var`↔`/private/var` pairs). Matching
+//!   is exact: a parent directory or a single unresolved spelling does not
+//!   count, so a progression scratch under `/var/folders/…` must also list
+//!   `/private/var/folders/…` (and the reverse). The control directory is
+//!   not trusted.
 //! - `permissions.deny` — **native file tools only** (`read_file` /
 //!   `write_file`; a `write_file` rule also covers `edit_file`): the Boss data
 //!   directory and the run's hook, control and rules directories (write).
@@ -40,6 +44,7 @@
 //! deny rule fails open. So every rendered rule is validated here before it is
 //! written, and [`verify_settings_log`] checks the CLI's own log after spawn.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -182,9 +187,30 @@ impl SessionSettings {
                 self.tool_permission
             );
         }
-        match self.trusted_workspaces.as_slice() {
-            [workspace] if Path::new(workspace).is_absolute() => {}
-            other => bail!("agy trustedWorkspaces must hold exactly one absolute workspace path, got {other:?}"),
+        if self.trusted_workspaces.is_empty() {
+            bail!("agy trustedWorkspaces must not be empty");
+        }
+        let mut seen = BTreeSet::new();
+        for workspace in &self.trusted_workspaces {
+            if !Path::new(workspace).is_absolute() {
+                bail!("agy trustedWorkspaces must hold absolute workspace paths, got {workspace:?}");
+            }
+            if !seen.insert(workspace.clone()) {
+                bail!("agy trustedWorkspaces must not contain duplicate paths, got {workspace:?}");
+            }
+        }
+        // Every spelling of the first path, and nothing else: a parent, the
+        // control directory, or a missing `/var`↔`/private/var` form is how
+        // the folder-trust dialog still appears.
+        let required: BTreeSet<String> = trust_path_variants(Path::new(&self.trusted_workspaces[0]))
+            .into_iter()
+            .collect();
+        if seen != required {
+            bail!(
+                "agy trustedWorkspaces must list every spelling of the working directory \
+                 and nothing else (matching is exact, so omitting /var or /tmp vs /private/… \
+                 shows the folder-trust dialog); need {required:?}, got {seen:?}"
+            );
         }
         if self.permissions.deny.is_empty() {
             bail!(
@@ -245,7 +271,7 @@ pub fn render_settings(plan: &SettingsPlan<'_>) -> anyhow::Result<SessionSetting
         agent_mode: AGENT_MODE.to_owned(),
         tool_permission: TOOL_PERMISSION.to_owned(),
         queued_messages: QUEUED_MESSAGES.to_owned(),
-        trusted_workspaces: vec![plan.workspace.display().to_string()],
+        trusted_workspaces: trust_path_variants(plan.workspace),
         permissions: Permissions { allow, deny },
     };
     settings.validate()?;
@@ -511,11 +537,13 @@ pub fn validate_rule(list: RuleList, rule: &str) -> anyhow::Result<()> {
 // Writing
 // ---------------------------------------------------------------------------
 
-/// Resolve the symlink-free workspace path trust and allow rules are keyed on.
+/// Resolve the workspace path trust and allow rules are keyed on. Spellings
+/// of this path (`/var`↔`/private/var`, `/tmp`↔`/private/tmp`) are added at
+/// render time; matching is still exact per spelling.
 fn resolved_workspace(workspace: &Path) -> anyhow::Result<PathBuf> {
     fs::canonicalize(workspace).with_context(|| {
         format!(
-            "resolving agy workspace {} (trust matches the exact resolved path)",
+            "resolving agy workspace {} (trust matches each exact spelling of this path)",
             workspace.display()
         )
     })

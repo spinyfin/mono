@@ -1,6 +1,7 @@
 use super::super::home::{provision_agy_home, session_settings_path_for_run};
 use super::super::test_environment::env_for_provision;
 use super::*;
+use crate::scoped_home::trust_path_variants;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use tempfile::TempDir;
@@ -73,7 +74,11 @@ fn every_kind_renders_the_pinned_posture_and_nothing_else() {
         assert_eq!(json["agentMode"], "", "{kind:?}");
         assert_eq!(json["toolPermission"], "request-review", "{kind:?}");
         assert_eq!(json["queuedMessages"], "queue", "{kind:?}");
-        assert_eq!(json["trustedWorkspaces"], serde_json::json!([WORKSPACE]), "{kind:?}");
+        assert_eq!(
+            json["trustedWorkspaces"],
+            serde_json::json!(trust_path_variants(Path::new(WORKSPACE))),
+            "{kind:?}"
+        );
 
         let permission_keys: BTreeSet<&str> = json["permissions"]
             .as_object()
@@ -480,6 +485,35 @@ fn parse_rendered_rejects_loosened_or_misspelled_settings() {
     }
 }
 
+#[test]
+fn trusted_workspaces_lists_every_spelling_of_cube_and_progression_paths() {
+    let cube = Path::new("/tmp/cube-workspaces/impl-ws");
+    let scratch = Path::new("/var/folders/xx/T/boss-progression-scratch/exec_1");
+    for (kind, workspace) in [(WorkerKind::Standard, cube), (WorkerKind::Progression, scratch)] {
+        let mut plan = plan(kind, Some(DATA_DIR));
+        plan.workspace = workspace;
+        let settings = render_settings(&plan).unwrap();
+        let expected = trust_path_variants(workspace);
+        assert!(
+            expected.len() >= 2,
+            "{} should have /tmp or /var aliases, got {expected:?}",
+            workspace.display()
+        );
+        assert_eq!(settings.trusted_workspaces(), expected.as_slice(), "{kind:?}");
+        assert!(
+            !settings
+                .trusted_workspaces()
+                .iter()
+                .any(|path| path.contains("control"))
+        );
+
+        let mut partial = settings.clone();
+        partial.trusted_workspaces = vec![expected[0].clone()];
+        let error = partial.to_json().unwrap_err().to_string();
+        assert!(error.contains("folder-trust dialog"), "{kind:?}: {error}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Writing the file and the artifacts
 // ---------------------------------------------------------------------------
@@ -559,8 +593,18 @@ fn write_permission_config_renders_settings_over_the_provisioned_trust_only_file
         assert_eq!(json["toolPermission"], "request-review", "{kind:?}");
         assert_eq!(
             json["trustedWorkspaces"],
-            serde_json::json!([resolved.display().to_string()]),
-            "exactly the resolved workspace; the control dir is not trusted: {kind:?}"
+            serde_json::json!(trust_path_variants(&resolved)),
+            "every spelling of the resolved workspace; the control dir is not trusted: {kind:?}"
+        );
+        let trusted: Vec<&str> = json["trustedWorkspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(
+            !trusted.iter().any(|path| path.contains("control")),
+            "control dir must not be trusted: {kind:?} {trusted:?}"
         );
         assert_eq!(json["permissions"].get("allow").is_some(), is_deny_by_default(kind));
         // The file passes the same validation the post-spawn check applies.

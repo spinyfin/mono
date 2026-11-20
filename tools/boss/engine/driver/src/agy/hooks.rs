@@ -499,13 +499,18 @@ fn validate_configuration(process_home: &Path, policy: &Value) -> anyhow::Result
 
 /// Validate the final session contract: the renderer's own parse and
 /// validation (the same rule grammar, pins and strictness it applies when it
-/// writes the file), plus the one authorization-specific requirement that the
-/// session trusts exactly the canonical workspace.
+/// writes the file), plus the authorization-specific requirement that the
+/// session trusts every spelling of the working directory and nothing else.
 fn validate_session_settings(settings: &str, workspace: &Path) -> anyhow::Result<()> {
     let settings = super::permissions::parse_rendered(settings)?;
-    let workspace = fs::canonicalize(workspace)?.display().to_string();
-    if settings.trusted_workspaces() != [workspace] {
-        bail!("session settings must trust exactly the canonical workspace");
+    let workspace = fs::canonicalize(workspace)?;
+    let required = crate::scoped_home::trust_path_variants(&workspace);
+    if settings.trusted_workspaces() != required.as_slice() {
+        bail!(
+            "session settings must trust every spelling of the working directory \
+             and nothing else (need {required:?}, got {:?})",
+            settings.trusted_workspaces()
+        );
     }
     Ok(())
 }
