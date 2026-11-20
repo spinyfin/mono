@@ -363,24 +363,33 @@ fn classify_gh_error(err: GhRunnerError) -> AutoCreateOutcome {
 }
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct AbandonedBranchPrSweepOutcome {
     /// A PR already existed and was bound to the work item.
+    #[builder(default)]
     pub recovered: usize,
     /// The engine opened a new PR and bound it to the work item.
+    #[builder(default)]
     pub created: usize,
     /// The branch had nothing to open a PR for (never pushed, or no commits
     /// ahead of the default branch).
+    #[builder(default)]
     pub skipped_no_commits: usize,
     /// An auto-create attempt failed this pass (transient or permanent).
+    #[builder(default)]
     pub failed: usize,
+    /// A PR was refused because it targets a non-default branch.
+    #[builder(default)]
+    pub base_refused: usize,
     /// An attention item was filed this pass (consecutive-failure cap hit).
+    #[builder(default)]
     pub escalated: usize,
 }
 
 impl SweepOutcome for AbandonedBranchPrSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.recovered > 0 || self.created > 0 || self.failed > 0 || self.escalated > 0
+        self.recovered > 0 || self.created > 0 || self.failed > 0 || self.base_refused > 0 || self.escalated > 0
     }
 
     fn log(&self) {
@@ -389,6 +398,7 @@ impl SweepOutcome for AbandonedBranchPrSweepOutcome {
             created = self.created,
             skipped_no_commits = self.skipped_no_commits,
             failed = self.failed,
+            base_refused = self.base_refused,
             escalated = self.escalated,
             "abandoned-branch-pr sweep: pass complete",
         );
@@ -693,6 +703,11 @@ async fn bind_and_record(
     let (BindAction::Bound(pr_url) | BindAction::Created(pr_url)) = action;
     match crate::work::bounded_base_verdict(pr_checker, pr_url, crate::work::PR_BASE_CHECK_BUDGET).await {
         Ok(crate::work::PrBaseVerdict::DefaultBranch | crate::work::PrBaseVerdict::NotChecked) => {}
+        Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+            tracing::warn!(%reason, pr_url, "abandoned PR base refused; leaving binding untouched");
+            outcome.base_refused += 1;
+            return;
+        }
         result => {
             tracing::warn!(
                 ?result,
@@ -1073,7 +1088,8 @@ mod tests {
                 &mut HashMap::new(),
             )
             .await;
-            assert_eq!(result.failed, 1);
+            assert_eq!(result.failed, 0);
+            assert_eq!(result.base_refused, 1);
             assert_eq!(result.recovered + result.created, 0);
             assert!(!work_item_pr_url_already_set(&db, &chore_id));
         }

@@ -109,52 +109,24 @@ impl WorkerCompletionHandler {
         // below nulls `workspace_path` in the same transaction that
         // terminalizes the execution — this IS the path that terminalizes a
         // parked-live (`waiting_human` / `running`) execution on PR success,
-        // so it owns driver teardown; nothing downstream of this call reaps
-        // it. A DB error here is distinct from a legitimately-absent path —
-        // teardown still runs per this function's contract, but the failure
-        // must be loud rather than silently collapsed into `None`.
-        let execution_result = self.work_db.get_execution(execution_id);
-        // Foreign-PR guard: branch verification / the branch-keyed detector
-        // established that `pr_url`'s head is this execution's branch; now
-        // make sure the engine does not already hold that PR against another
-        // work item. Refusing here covers every Stop / recheck source at
-        // once (the declaration path runs the same guard itself).
-        if let Ok(execution) = execution_result.as_ref()
-            && let Some(conflict) = self.foreign_pr_binding_conflict(execution, &pr_url)
-        {
-            return self
-                .refuse_foreign_pr_binding(execution, &pr_url, &conflict, source)
-                .await;
-        }
-        match execution_result.as_ref() {
-            Ok(execution) => {
-                if let Some(outcome) = self.guard_pr_base(execution, &pr_url).await {
-                    return outcome;
-                }
-            }
+        // so it owns driver teardown. A failed execution lookup is retryable:
+        // no teardown or PR transition may run without enforcing the guards.
+        let execution = match self.work_db.get_execution(execution_id) {
+            Ok(execution) => execution,
             Err(err) => {
-                // Without the execution the PR base policy cannot be enforced;
-                // fail closed and let the caller retry.
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "pr completion: execution lookup failed; PR base unchecked"
-                );
+                tracing::warn!(execution_id, ?err, "pr completion: execution lookup failed; retrying");
                 return StopOutcome::DbError;
             }
-        }
-        let workspace_path = match &execution_result {
-            Ok(execution) => execution.workspace_path.clone(),
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "pr completion: could not read workspace_path for driver teardown; \
-                     tearing down with None",
-                );
-                None
-            }
         };
+        if let Some(conflict) = self.foreign_pr_binding_conflict(&execution, &pr_url) {
+            return self
+                .refuse_foreign_pr_binding(&execution, &pr_url, &conflict, source)
+                .await;
+        }
+        if let Some(outcome) = self.guard_pr_base(&execution, &pr_url).await {
+            return outcome;
+        }
+        let workspace_path = execution.workspace_path.clone();
 
         let mut target = target;
         let mut merged = matches!(target, WorkerPrCompletionTarget::Done);
@@ -169,11 +141,10 @@ impl WorkerCompletionHandler {
         // reap accounting so a refused finalize never looks like a reap.
         if !merged
             && matches!(target, WorkerPrCompletionTarget::InReview)
-            && let Ok(producing) = execution_result.as_ref()
-            && producing.kind == ExecutionKind::RevisionImplementation
+            && execution.kind == ExecutionKind::RevisionImplementation
         {
             match self
-                .evaluate_revision_review_contribution(execution_id, producing, &pr_url, source)
+                .evaluate_revision_review_contribution(execution_id, &execution, &pr_url, source)
                 .await
             {
                 RevisionReviewGate::Allow(reason) => {
@@ -218,9 +189,7 @@ impl WorkerCompletionHandler {
         // a worker that is still mid-turn. Read BEFORE
         // `begin_teardown`/`finish_worker_teardown` can release the pane and
         // clear the live-state slot out from under this check.
-        if let Ok(execution) = execution_result.as_ref()
-            && self.observed_mid_turn(execution_id)
-        {
+        if self.observed_mid_turn(execution_id) {
             if self.should_defer_mid_turn_pr_completion(execution_id, source) {
                 tracing::info!(
                     execution_id,
@@ -230,11 +199,11 @@ impl WorkerCompletionHandler {
                 );
                 return StopOutcome::AwaitingInput;
             }
-            self.record_mid_turn_reap(execution, source).await;
+            self.record_mid_turn_reap(&execution, source).await;
         }
 
-        if !merged && let Ok(execution) = execution_result.as_ref() {
-            match self.conflict_delivery_decision(execution, Some(&pr_url)).await {
+        if !merged {
+            match self.conflict_delivery_decision(&execution, Some(&pr_url)).await {
                 ConflictDeliveryDecision::Failed(outcome) => return outcome,
                 ConflictDeliveryDecision::Merged => {
                     target = WorkerPrCompletionTarget::Done;
@@ -251,19 +220,7 @@ impl WorkerCompletionHandler {
         // enqueue or terminalization write. Fail-open: this snapshot is not
         // consulted by the mid-turn guard, so a transient `gh` failure or an
         // unparseable URL must not block PR completion engine-wide.
-        let pr_head_after = match execution_result.as_ref() {
-            Ok(execution) => self.fetch_pr_head_after(execution, &pr_url).await,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    source,
-                    ?err,
-                    "pr completion: cannot capture pr_head_after without an execution record; \
-                     continuing terminalization with None",
-                );
-                None
-            }
-        };
+        let pr_head_after = self.fetch_pr_head_after(&execution, &pr_url).await;
 
         // For reviewer-triggering executions with a fresh
         // (non-merged) PR, try to enqueue an independent reviewer pass
@@ -274,12 +231,12 @@ impl WorkerCompletionHandler {
         // If the pr_review execution cannot be created (DB error), fall back
         // to the normal InReview path so the task is never left stuck.
         let enqueued_reviewer = if !merged && matches!(target, WorkerPrCompletionTarget::InReview) {
-            match execution_result.as_ref() {
+            match &execution {
                 // A parked row atrophies: the run that was in flight when the
                 // owner parked it records its PR and advances to `in_review`,
                 // with no AI review; scheduling it after un-park is part of the
                 // un-park reconciliation (design section 1.5).
-                Ok(producing)
+                producing
                     if super::run_done_declaration::reviewer_suppressed_by_park(
                         &self.work_db,
                         &producing.work_item_id,
@@ -293,7 +250,7 @@ impl WorkerCompletionHandler {
                     );
                     false
                 }
-                Ok(producing)
+                producing
                     if should_enqueue_reviewer_for_primary(&producing.kind)
                         || (producing.kind == ExecutionKind::RevisionImplementation
                             && self.enable_revision_triggered_reviews) =>
@@ -620,16 +577,7 @@ impl WorkerCompletionHandler {
                         }
                     } // closes the `} else {` for the noop skip gate
                 }
-                Ok(_) => false, // non-reviewer-triggering execution; advance to in_review as normal
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id,
-                        ?err,
-                        "could not load execution for reviewer-enqueue check; \
-                         falling back to immediate in_review",
-                    );
-                    false
-                }
+                _ => false, // non-reviewer-triggering execution; advance to in_review as normal
             }
         } else {
             false

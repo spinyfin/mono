@@ -160,8 +160,8 @@ pub const PR_BASE_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_
 
 /// Run [`PrStateChecker::base_verdict`] off the async runtime with a deadline.
 ///
-/// The production checker shells out to `gh` with no deadline of its own, so
-/// calling it inline would pin a runtime worker for as long as `gh` hangs.
+/// The production checker also bounds and kills its `gh` child; running it
+/// off-thread keeps the async runtime responsive during that blocking wait.
 /// A timeout or a panicked blocking task is an `Err`: callers treat it like
 /// any other retryable lookup failure and leave their state untouched.
 pub async fn bounded_base_verdict(
@@ -211,7 +211,7 @@ fn query_pr(pr_url: &str) -> Result<serde_json::Value> {
     let args = pr_query_args(owner, repo, number);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
-        boss_github::gh_runner::gh_output_blocking(&arg_refs)
+        boss_github::gh_runner::gh_output_blocking_timeout(&arg_refs, PR_BASE_CHECK_BUDGET)
     })
     .with_context(|| format!("failed to query PR {pr_url}"))?;
     if !output.status.success() {
