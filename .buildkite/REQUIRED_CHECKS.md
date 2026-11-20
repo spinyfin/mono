@@ -26,6 +26,25 @@ Each gating step in `pipeline.yml` carries one explicit `notify: github_commit_s
 
 The resulting context names are `buildkite/mono/<step-key>` — e.g. `buildkite/mono/checks`.
 
+## Test retries and flaky reports
+
+CI test commands inherit `test:ci --flaky_test_attempts=2` from `.ci.bazelrc`:
+each failed test gets one retry in PR, merge-queue and `main` builds. Developer
+defaults in `.bazelrc` are unchanged. A test that passes on retry is `FLAKY`
+and does not fail the required check; a test that fails both attempts still
+fails `buildkite/mono/bazel-build-test`.
+
+After testing, `bazel-build-test` reads Bazel's JSON Build Event Protocol,
+including on failed builds. A warning annotation lists every `FLAKY` target,
+failed test-case names when the test's XML supplies them, and links to each
+attempt's uploaded logs. The job uploads `flaky-tests.json` even when there
+are no flaky targets. It records commit, branch, build number, and a `tests`
+array with target, configuration, attempt count, test cases and individual
+attempts (run, shard, attempt, status and log paths). Paths refer to the job's
+`flaky-logs/` artifacts. Reporting failures fail the step too, so lost reports
+cannot silently turn into a successful check. Other CI steps inherit retries
+but only `bazel-build-test` publishes this report.
+
 ## Rollout: rename complete (`bazel-build` + `bazel-test` → `bazel-build-test`)
 
 The rename from the legacy `bazel-build` / `bazel-test` contexts to the consolidated `bazel-build-test` context is complete:

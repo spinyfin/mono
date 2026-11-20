@@ -32,10 +32,25 @@ echo "[bazel-build] ok"
 
 echo "--- [bazel-test] testing"
 
-if ! bazel_verify_only test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...; then
+# Use a fresh directory so an agent checkout cannot report a previous job's BEP.
+report_dir=$(mktemp -d "${TMPDIR:-/tmp}/bazel-flaky.XXXXXX")
+test_status=0
+bazel_verify_only test --build_event_json_file="${report_dir}/events.json" --nobuild_event_json_file_path_conversion --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/... || test_status=$?
+
+report_status=0
+python3 "$(dirname "${BASH_SOURCE[0]}")/report-flaky-tests.py" "${report_dir}/events.json" "${report_dir}" || report_status=$?
+if ((report_status == 0)); then
+  rm -rf "$report_dir"
+fi
+# A reporting error must stay visible, and must never hide a test failure.
+if ((test_status != 0)); then
   echo "^^^ +++"
   echo "[bazel-test] FAILED"
   exit 1
 fi
 
+if ((report_status != 0)); then
+  echo "[bazel-test] flaky reporting FAILED"
+  exit "$report_status"
+fi
 echo "[bazel-test] ok"

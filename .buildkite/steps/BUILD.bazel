@@ -2,10 +2,12 @@
 # themselves are run by Buildkite straight from the checkout, not by bazel.
 exports_files(
     [
+        "bazel-build-test.sh",
         "bazel-server-lock.sh",
         "ci-env.sh",
         "disk-cache-gc-cap.sh",
         "remote-execution.sh",
+        "report-flaky-tests.py",
     ],
     visibility = ["//.buildkite/steps/tests:__pkg__"],
 )

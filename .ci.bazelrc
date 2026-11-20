@@ -23,6 +23,9 @@ build:ci --curses=no
 build:ci --show_progress_rate_limit=5.0
 build:ci --announce_rc
 
+# Retry a failed CI test once; recovered failures are reported from the BEP.
+test:ci --flaky_test_attempts=2
+
 # max_idle_secs is a bazel STARTUP option, so a `startup:ci` line here would
 # only take effect if something passed `--config=ci` as a startup flag (i.e.
 # before the subcommand) -- nothing does; `--config=ci-<os>` is always passed
