@@ -233,6 +233,20 @@ fn io_context(source: std::io::Error, context: String) -> CubeError {
     CubeError::Io(std::io::Error::new(source.kind(), format!("{context}: {source}")))
 }
 
+/// Resolve before remote setup and lock waits, so spawning the fetch does not
+/// repeat executable lookup against an environment that may have changed.
+fn resolve_git(cwd: &Path, search_path: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    which::which_in("git", search_path, cwd).map_err(|error| {
+        io_context(
+            std::io::Error::new(std::io::ErrorKind::NotFound, error),
+            format!(
+                "resolving git executable in {} (searched PATH={search_path:?})",
+                cwd.display()
+            ),
+        )
+    })
+}
+
 /// Fetch `refs/pull/<number>/head` of the base repository into the store.
 ///
 /// jj itself only fetches branches, so the ref is fetched with git into a
@@ -249,6 +263,8 @@ fn fetch_pull_ref(
 ) -> Result<()> {
     let url = base_repo_url(runner, database_path, cwd, owner_repo);
     let git_dir = store_git_dir(cwd)?;
+    let search_path = std::env::var_os("PATH");
+    let git = resolve_git(cwd, search_path.as_deref())?;
     prune_stale_temp_remotes(runner, database_path, cwd);
     let remote = temp_remote_name(number);
     add_remote(runner, database_path, cwd, &remote, &url)?;
@@ -262,31 +278,34 @@ fn fetch_pull_ref(
         let _ = remove_remote(runner, database_path, cwd, &remote);
         return Ok(());
     }
-    let fetched = run_jj_network_within(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(
-            cwd,
-            "git",
-            &[
-                "--git-dir",
-                &git_dir.display().to_string(),
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                &url,
-                &refspec,
-            ],
-        ),
-        deadline,
+    let mut fetch = RealCommandRunner::invocation(
+        cwd,
+        &git.to_string_lossy(),
+        &[
+            "--git-dir",
+            &git_dir.display().to_string(),
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            &url,
+            &refspec,
+        ],
     );
+    // Git also finds transport helpers (including git-upload-pack for local
+    // remotes) through PATH. Keep their lookup consistent with Git's resolution.
+    if let Some(path) = &search_path {
+        fetch.env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+    }
+    let fetched = run_jj_network_within(runner, database_path, &fetch, deadline);
     let fetched = fetched.map_err(|error| match error {
         CubeError::Io(source) => io_context(
             source,
             format!(
-                "running git fetch in {} with --git-dir {}",
+                "running git fetch ({}) in {} with --git-dir {} (searched PATH={:?})",
+                git.display(),
                 cwd.display(),
-                git_dir.display()
+                git_dir.display(),
+                search_path
             ),
         ),
         other => other,
@@ -351,6 +370,17 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_git_reports_the_searched_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = resolve_git(dir.path(), Some(dir.path().as_os_str())).unwrap_err();
+        assert!(matches!(&error, CubeError::Io(source) if source.kind() == std::io::ErrorKind::NotFound));
+        let error = error.to_string();
+        assert!(error.contains("resolving git executable"), "{error}");
+        assert!(error.contains("searched PATH="), "{error}");
+        assert!(error.contains(&dir.path().display().to_string()), "{error}");
+    }
 
     #[test]
     fn store_errors_name_the_missing_pointer_or_target() {
