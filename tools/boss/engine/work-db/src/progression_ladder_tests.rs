@@ -1161,6 +1161,37 @@ fn keep_trying_forgives_the_infrastructure_failures_that_filed_the_question() {
     assert_eq!(fx.pass().minted.len(), 1);
 }
 
+/// The restore's ledger rows are stamped by SQLite while its statements run,
+/// so a second can tick over between the answer starting and the restore
+/// landing. Force that: every write to `tasks` during the answer is held until
+/// the wall-clock second changes. The waiver must still cover the restored
+/// stuck state, or "keep trying" waits out the grace a second time.
+#[test]
+fn keep_trying_waives_the_grace_when_a_second_ticks_over_during_the_restore() {
+    let fx = fx();
+    let id = fx.conflicted("Keep trying across a second boundary");
+    let question = exhausted(&fx, &id, S5);
+    fx.db
+        .connect()
+        .unwrap()
+        .update_hook(Some(|_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+            if table == "tasks" {
+                let second = now();
+                while now() == second {
+                    std::thread::yield_now();
+                }
+            }
+        }));
+
+    fx.answer(&question, KEEP_TRYING);
+
+    // Replace the blocking hook on the shared connection with the production observer.
+    crate::db_diagnostics::install_update_observer(&fx.db.connect().unwrap());
+    let clauses = fx.db.progression_clauses(&id).unwrap().unwrap();
+    assert!(clauses.grace_waived, "{clauses:?}");
+    assert!(fx.is_candidate(&id), "{clauses:?}");
+}
+
 #[test]
 fn park_it_parks_through_the_human_path_and_leaves_the_item_in_its_stuck_state_for_un_park() {
     let fx = fx();

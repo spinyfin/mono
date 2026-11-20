@@ -681,6 +681,13 @@ fn capture_prior(conn: &Connection, item_id: &str) -> Result<PriorState> {
 /// Put the item back as it was before the question. `waive_grace` stamps the
 /// stuck-after grace waiver, so a "keep trying" is not made to wait out the
 /// grace a second time. Only an item still waiting on the question is touched.
+///
+/// The waiver only counts when it is not older than the start of the stuck
+/// state it waives, and that start is the ledger row the restoring statement's
+/// trigger stamps with SQLite's clock. So the waiver is stamped by the same
+/// statement (SQLite reads `'now'` once per statement, triggers included), not
+/// from a clock read taken earlier: a second ticking over in between would
+/// leave the waiver one second older than the state and silently void it.
 fn restore_prior(
     conn: &Connection,
     item_id: &str,
@@ -689,7 +696,6 @@ fn restore_prior(
     attribution: crate::task_status_audit::WriteAttribution<'_>,
 ) -> Result<()> {
     let now = now_string();
-    let grace = waive_grace.then_some(now.as_str());
     match prior {
         Some(prior) => {
             // Restore autostart first, while the row is still waiting on the
@@ -716,7 +722,8 @@ fn restore_prior(
                  SET status = ?2, blocked_reason = ?3, blocked_detail = ?4, blocked_attempt_id = ?5,
                      dispatch_failed_reason = ?6, dispatch_failed_error = ?7, dispatch_failed_at = ?8,
                      last_status_actor = ?9, updated_at = ?10,
-                     progression_grace_waived_at = COALESCE(?11, progression_grace_waived_at)
+                     progression_grace_waived_at = CASE WHEN ?11 THEN strftime('%s','now')
+                                                        ELSE progression_grace_waived_at END
                  WHERE id = ?1 AND deleted_at IS NULL
                    AND status = 'blocked' AND blocked_reason = 'awaiting_operator_answer'",
                 params![
@@ -730,7 +737,7 @@ fn restore_prior(
                     prior.dispatch_failed_at,
                     prior.last_status_actor,
                     now,
-                    grace,
+                    waive_grace,
                 ],
             )?;
             operation.end()?;
