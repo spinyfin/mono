@@ -130,8 +130,6 @@ impl PassState {
         self.late_family_turn.load(Ordering::Relaxed)
     }
 
-    /// Take the next starting offset among PR recheck, background nudges
-    /// and late PR. Call when the per-execution group has time to run.
     /// Take the next starting offset among the upkeep subphases. Call when
     /// the upkeep group has time to run, before its first awaited work.
     pub(crate) fn next_upkeep_turn(&self) -> u64 {

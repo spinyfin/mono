@@ -120,16 +120,25 @@ mid-flight` carries `cut_off_phase`, `cut_off_item`, `items_unfinished` and
 `phases` reads `phase=<ms>ms(<done>/<total>)`, for example:
 
 ```text
-list_candidates=14ms probe=910ms(47/47) terminal_walk=38ms(1/1) open_walk=178000ms(12/46)[cut off at chore_x]
+list_candidates=14ms probe=910ms(1/1) terminal_walk=38ms(1/1) open_walk=178000ms(12/46)[cut off at chore_x]
 ```
 
 To read it:
 
-- **`probe` is large.** The batched request was slow, or it fell back to
-  probing PRs one at a time. Look for `batched probe graphql` lines: a
-  response that carries errors for some PRs re-probes only those; a response
-  with no usable body, or an error that names no PR, re-probes all of them
-  and says so at `warn`.
+- **`probe` is large.** The phase always shows `(1/1)`: it is one item that
+  covers the batched request plus everything done inside it. The batched
+  request was slow, it fell back, or it made per-PR calls. Look for
+  `batched probe graphql` lines: a response that carries errors for some PRs
+  re-probes only those; a response with no usable body, or an error that
+  names no PR, is retried in halves (bisected) and says so at `warn`, down
+  to a single PR probed on its own. The whole fallback shares a 30 s budget;
+  PRs not reached come back as retryable errors, and the per-PR fallback
+  starts at a different PR each time so the same ones are not always cut off.
+  The `per-PR probe fallback finished` line gives requested / probed /
+  deferred counts and elapsed time. Separately, every probed PR with an empty
+  CI rollup makes one more serial `gh api` call for the commit's combined
+  status (ETag-cached, so a `304` costs no quota but still spawns `gh`);
+  that time is inside `probe` too and is not broken out.
 - **`open_walk` is large.** The walk is local DB work, a dozen or so short
   queries per PR. Look for `work DB connection lock timing` lines whose
   `caller` is under `merge-poller/`: a large `wait_ms` means the walk is

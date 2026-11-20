@@ -1006,9 +1006,9 @@ pub(crate) async fn sweep_one(
             caller,
         )
         .await;
-        if !parked_for_action()
-            && open.mergeability == OpenPrMergeability::Clean
+        if open.mergeability == OpenPrMergeability::Clean
             && let Some(host) = host
+            && !parked_for_action()
         {
             host.resume_merge_after_conflict(work_db, publisher, candidate).await;
         }

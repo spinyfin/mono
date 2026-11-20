@@ -193,7 +193,7 @@ pub struct PassTimings {
 
 impl PassTimings {
     /// One line naming each phase's cost, e.g.
-    /// `list_candidates=14ms probe=910ms(47/47) open_walk=178000ms(12/46)[cut off at chore_x]`.
+    /// `list_candidates=14ms probe=910ms(1/1) open_walk=178000ms(12/46)[cut off at chore_x]`.
     pub fn breakdown(&self) -> String {
         self.phases
             .iter()

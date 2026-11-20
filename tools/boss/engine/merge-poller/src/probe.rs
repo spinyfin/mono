@@ -18,6 +18,15 @@ pub struct CommandMergeProbe {
     commit_status_cache: Mutex<HashMap<String, CachedCommitStatus>>,
 }
 
+type BoxedBatchProbe<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = HashMap<String, std::result::Result<PrLifecycleProbe, String>>> + Send + 'a>,
+>;
+
+/// Wall-clock budget shared by every fallback call (bisected batches and
+/// serial per-PR probes) of one batched probe, so a failing batch cannot
+/// consume the pass's whole time budget before the terminal walk runs.
+const PROBE_FALLBACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl CommandMergeProbe {
     pub fn new() -> Self {
         Self::default()
@@ -181,6 +190,34 @@ impl CommandMergeProbe {
         &self,
         pr_urls: &[String],
     ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        self.probe_batch_with_deadline(pr_urls, std::time::Instant::now() + PROBE_FALLBACK_BUDGET)
+            .await
+    }
+
+    /// Re-runs a batch that failed with no usable response (or with an error
+    /// naming no PR) as two half-size batches, recursing until a half
+    /// succeeds or is a single PR (which is then probed on its own). A heavy
+    /// aliased query that times out as a whole usually succeeds at half the
+    /// size, so this costs a handful of batched calls instead of `N` serial
+    /// per-PR calls. Every call shares `deadline`: once it passes, PRs not yet
+    /// reached come back as retryable errors and the next pass tries again.
+    fn probe_batch_bisect<'a>(&'a self, order: &'a [String], deadline: std::time::Instant) -> BoxedBatchProbe<'a> {
+        Box::pin(async move {
+            if order.len() <= 1 {
+                return probe_each_individually(order, deadline).await;
+            }
+            let (left, right) = order.split_at(order.len() / 2);
+            let mut out = self.probe_batch_with_deadline(left, deadline).await;
+            out.extend(self.probe_batch_with_deadline(right, deadline).await);
+            out
+        })
+    }
+
+    async fn probe_batch_with_deadline(
+        &self,
+        pr_urls: &[String],
+        deadline: std::time::Instant,
+    ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
         let mut out = HashMap::new();
         // Dedup while parsing so a URL repeated in the input (e.g. a PR that's
         // both `in_review` and, defensively, in `stranded_blocked`) costs one
@@ -213,6 +250,13 @@ impl CommandMergeProbe {
             "merge poller: batched probe — one GraphQL query for the whole pass",
         );
 
+        if std::time::Instant::now() >= deadline {
+            let msg = "batched probe fallback budget exhausted; retrying next pass".to_owned();
+            for url in &order {
+                out.insert(url.clone(), Err(msg.clone()));
+            }
+            return out;
+        }
         let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
         let body: serde_json::Value = match output {
             Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout) {
@@ -288,9 +332,9 @@ impl CommandMergeProbe {
                             stderr = %stderr.trim(),
                             pr_count = order.len(),
                             "merge poller: batched probe graphql call failed with no usable response — \
-                             probing every PR individually for this pass",
+                             retrying in halves",
                         );
-                        out.extend(probe_each_individually(&order).await);
+                        out.extend(self.probe_batch_bisect(&order, deadline).await);
                         return out;
                     }
                 }
@@ -329,9 +373,9 @@ impl CommandMergeProbe {
                     errors = %body["errors"],
                     pr_count = order.len(),
                     "merge poller: batched probe graphql response carried an error that names no PR — \
-                     probing every PR individually for this pass",
+                     retrying in halves",
                 );
-                out.extend(probe_each_individually(&order).await);
+                out.extend(self.probe_batch_bisect(&order, deadline).await);
                 return out;
             }
         };
@@ -364,7 +408,7 @@ impl CommandMergeProbe {
             // `probe`'s own 404 handling maps a PR or repo that is really
             // gone to `ClosedUnmerged`, exactly as before.
             let affected: Vec<String> = order.iter().filter(|url| untrusted.contains(*url)).cloned().collect();
-            out.extend(probe_each_individually(&affected).await);
+            out.extend(probe_each_individually(&affected, deadline).await);
         }
         out
     }
@@ -525,13 +569,38 @@ pub(crate) fn walk_batch_response<'a>(
 /// reconciliation for every other PR in the pass.
 pub(crate) async fn probe_each_individually(
     urls: &[String],
+    deadline: std::time::Instant,
 ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+    static ROTATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let probe = CommandMergeProbe::new();
     let mut out = HashMap::new();
-    for url in urls {
+    if urls.is_empty() {
+        return out;
+    }
+    // Start somewhere different each call so a budget cut-off does not leave
+    // the same tail of PRs unprobed on every pass.
+    let start = ROTATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % urls.len();
+    let began = std::time::Instant::now();
+    let mut probed = 0usize;
+    for url in urls.iter().cycle().skip(start).take(urls.len()) {
+        if std::time::Instant::now() >= deadline {
+            out.insert(
+                url.clone(),
+                Err("per-PR probe fallback budget exhausted; retrying next pass".to_owned()),
+            );
+            continue;
+        }
         let result = probe.probe(url).await.map_err(|err| err.to_string());
+        probed += 1;
         out.insert(url.clone(), result);
     }
+    tracing::info!(
+        requested = urls.len(),
+        probed,
+        deferred = urls.len() - probed,
+        elapsed_ms = began.elapsed().as_millis() as u64,
+        "merge poller: per-PR probe fallback finished (2-3 serial `gh` calls per PR)",
+    );
     out
 }
 

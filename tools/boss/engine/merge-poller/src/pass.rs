@@ -96,9 +96,6 @@ enum LatePhase {
     LatePr,
 }
 
-/// Groups after the terminal walk. Terminal merge observation always runs
-/// first; these three rotate so a slow open walk or slow upkeep cannot
-/// starve recovery forever.
 /// The local upkeep subphases, in the order a pass with turn 0 runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UpkeepPhase {
@@ -127,6 +124,9 @@ pub(crate) fn upkeep_order(turn: u64) -> [UpkeepPhase; 6] {
     subphases
 }
 
+/// Groups after the terminal walk. Terminal merge observation always runs
+/// first; these three rotate so a slow open walk or slow upkeep cannot
+/// starve recovery forever.
 #[derive(Clone, Copy)]
 enum PostTerminalGroup {
     OpenWalk,
@@ -349,10 +349,10 @@ pub async fn run_one_pass(
 ///
 /// The observation list covers every URL the pass *listed*, not only the
 /// ones it walked: the batched probe is taken up front for the whole set, so
-/// a pass abandoned mid-walk still classified them all. An entry the
-/// snapshot no longer holds (a mid-pass re-probe replaces the results map
-/// with just the unprocessed remainder) is reported as `None` — no adaptive
-/// slot, and the next sweep re-observes it.
+/// a pass abandoned mid-walk still classified them all. A mid-pass
+/// re-probe merges the remainder into the snapshot, so every listed URL keeps
+/// a result; one whose probe failed is reported as `None` — no adaptive slot,
+/// and the next sweep re-observes it.
 ///
 /// Runs with no memory of earlier passes; the poller loop calls
 /// [`run_one_pass_tracked`] with the [`PassState`] it keeps.
@@ -953,7 +953,6 @@ pub async fn run_one_pass_tracked(
                                         tracing::warn!(?err, "merge poller: failed to reap inert review batches");
                                     }
                                 }
-                                sample_review_pool_gauges(work_db, &mut outcome);
                             }
                         }
                     }
@@ -1052,6 +1051,9 @@ pub async fn run_one_pass_tracked(
             }
         }
     }
+    // Two cheap reads, taken whether or not the upkeep group had time to run,
+    // so a pass under load does not publish the gauges as 0.
+    sample_review_pool_gauges(work_db, &mut outcome);
     trace.end();
 
     let observations = poll_observations(&probe_urls, &snapshot.results);
@@ -1061,8 +1063,7 @@ pub async fn run_one_pass_tracked(
 /// Classify each probed URL into the tier that should drive its adaptive
 /// polling. Shared by the full sweep and the batched adaptive reconcile so
 /// both feed [`PrPollSchedule`] through identical rules: a URL whose probe
-/// failed, or which the snapshot no longer holds, yields `None` (no adaptive
-/// slot — the full sweep re-probes it).
+/// failed yields `None` (no adaptive slot — the full sweep re-probes it).
 pub(crate) fn poll_observations(
     pr_urls: &[String],
     results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
