@@ -217,10 +217,6 @@ impl IntegrityReport {
         out
     }
 
-    pub fn print_banner(&self) {
-        print!("{}", self.render_banner());
-    }
-
     /// One recovery summary after the findings, or full per-line accounting when records were lost.
     pub fn render_footer(&self) -> String {
         if self.is_intact() {
@@ -255,10 +251,6 @@ impl IntegrityReport {
             );
         }
         out
-    }
-
-    pub fn print_footer(&self) {
-        print!("{}", self.render_footer());
     }
 
     /// One-line notice for verbs that print a listing rather than a timeline

@@ -210,11 +210,7 @@ fn for_ready(conn: &Connection, execution: &WorkExecution, now: i64) -> Result<D
         .as_ref()
         .filter(|reason| !reason.trim().is_empty() && !is_startup_phase_code(reason))
     {
-        let blocker_id: Option<String> = conn.query_row(
-            "SELECT dispatch_wait_blocker_id FROM work_executions WHERE id = ?1",
-            [&execution.id],
-            |row| row.get(0),
-        )?;
+        let blocker_id = wait_snapshot(conn, &execution.id)?.blocker_id;
         match blocker_id {
             // A persisted chain hold is only current while its named writer/reviewer is live.
             // Do not carry its prose or link through the gap before the next scheduler pass.
@@ -272,14 +268,9 @@ fn not_before_wait(conn: &Connection, execution: &WorkExecution) -> Result<Dispa
     )?;
     if source.as_deref() == Some(DISPATCH_WAIT_REASON_FAILURE_BACKOFF) {
         let failures = collect_dispatch_failures(conn, execution)?;
-        // The upcoming attempt follows the same sequence the history lists; the
-        // row counters only cover legacy rows whose history is incomplete.
-        let legacy_count = execution.pre_start_failure_count.max(execution.transient_failure_count) as usize;
         return Ok(DispatchWait::builder()
             .reason(DISPATCH_WAIT_REASON_FAILURE_BACKOFF)
-            .label(failure_backoff_wait_label(
-                (failures.len().max(legacy_count) + 1) as i64,
-            ))
+            .label(failure_backoff_wait_label(attempt_number(&failures, execution)))
             .failures(failures)
             // Failure details have no runtime epoch triggers.
             .reads_other_items(true)
@@ -551,6 +542,39 @@ fn blocker_for(conn: &Connection, id: &str) -> Result<Option<DispatchWaitBlocker
     }))
 }
 
+/// Persisted dispatch hold, read together from the execution row.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DispatchWaitSnapshot {
+    pub reason: Option<String>,
+    pub blocker_id: Option<String>,
+    pub since: Option<String>,
+}
+
+fn wait_snapshot(conn: &Connection, execution_id: &str) -> Result<DispatchWaitSnapshot> {
+    Ok(conn.query_row(
+        "SELECT dispatch_wait_reason, dispatch_wait_blocker_id, dispatch_wait_since
+         FROM work_executions WHERE id = ?1",
+        [execution_id],
+        |row| {
+            Ok(DispatchWaitSnapshot {
+                reason: row.get(0)?,
+                blocker_id: row.get(1)?,
+                since: row.get(2)?,
+            })
+        },
+    )?)
+}
+
+fn attempt_number(failures: &[DispatchFailureAttempt], execution: &WorkExecution) -> i64 {
+    // Terminal pre-start failures include the current attempt in the counter,
+    // but do not append it to history. Started runs keep the usual +1.
+    let terminal_start = execution.status == ExecutionStatus::Failed
+        && execution.started_at.is_none()
+        && execution.pre_start_failure_count > 0;
+    let preceding_starts = execution.pre_start_failure_count - i64::from(terminal_start);
+    (failures.len() as i64).max(preceding_starts.max(execution.transient_failure_count)) + 1
+}
+
 /// What one [`WorkDb::list_unexplained_dispatch_waits`] pass read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct UnexplainedWaitCost {
@@ -567,12 +591,17 @@ pub(crate) struct UnexplainedWaitCost {
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// The persisted dispatch reason, blocker and timestamp from one row read.
+    pub fn dispatch_wait_snapshot(&self, execution_id: &str) -> Result<DispatchWaitSnapshot> {
+        let conn = self.connect()?;
+        wait_snapshot(&conn, execution_id)
+    }
+
     /// Current dispatch attempt, including failures that never created a run row.
     pub fn dispatch_attempt_number(&self, execution: &WorkExecution) -> Result<i64> {
         let conn = self.connect()?;
         let failures = collect_dispatch_failures(&conn, execution)?;
-        let legacy_count = execution.pre_start_failure_count.max(execution.transient_failure_count);
-        Ok((failures.len() as i64).max(legacy_count) + 1)
+        Ok(attempt_number(&failures, execution))
     }
 
     /// Every wait the engine has not explained, for the scheduler heartbeat.

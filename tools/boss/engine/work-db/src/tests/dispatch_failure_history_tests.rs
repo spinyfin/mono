@@ -468,3 +468,52 @@ fn failed_parked_pane_retains_its_error_after_spawn_return() {
         ["worker driver exited with code 7", "lease failed"]
     );
 }
+
+#[test]
+fn terminal_start_failures_report_the_attempt_that_failed() {
+    for retries in [0, 1] {
+        let db = db();
+        let product = create_test_product(&db);
+        let (_, execution) = ready_chore(&db, &product.id, "terminal attempt");
+        let delays = vec![Duration::from_secs(3600); retries];
+        for attempt in 1..=retries + 1 {
+            db.record_pre_start_failure(&execution.id, "worker", None, "start refused", &delays)
+                .unwrap();
+            let current = db.get_execution(&execution.id).unwrap();
+            let expected = if attempt <= retries { attempt + 1 } else { attempt };
+            assert_eq!(db.dispatch_attempt_number(&current).unwrap(), expected as i64);
+        }
+        assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Failed);
+    }
+}
+
+#[test]
+fn started_execution_keeps_its_attempt_after_runtime_failure() {
+    let db = db();
+    let product = create_test_product(&db);
+    let (_, execution) = ready_chore(&db, &product.id, "started attempt");
+    db.record_pre_start_failure(
+        &execution.id,
+        "worker",
+        None,
+        "lease failed",
+        &[Duration::from_secs(3600)],
+    )
+    .unwrap();
+    db.start_execution_run(&execution.id, "worker", "repo", "lease", "ws", "/tmp/attempt-started")
+        .unwrap();
+    let started = db.get_execution(&execution.id).unwrap();
+    assert_eq!(db.dispatch_attempt_number(&started).unwrap(), 2);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'failed' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    assert_eq!(
+        db.dispatch_attempt_number(&db.get_execution(&execution.id).unwrap())
+            .unwrap(),
+        2
+    );
+}

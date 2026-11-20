@@ -911,6 +911,7 @@ use boss_prose_vocabulary as prose_vocabulary;
 mod queued_display;
 pub use queued_display::QueuedDisplaySnapshot;
 mod queued_wait;
+pub use queued_wait::DispatchWaitSnapshot;
 #[cfg(test)]
 mod read_only_tests;
 mod remediation_state;
