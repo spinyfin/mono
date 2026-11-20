@@ -120,6 +120,7 @@ mod pid_file;
 mod planner_ops;
 mod pr_status;
 mod probe_interrupt;
+mod probe_reply_text;
 pub(crate) mod probes;
 mod process_signals;
 mod products;

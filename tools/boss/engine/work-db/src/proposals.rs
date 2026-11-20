@@ -944,6 +944,20 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Clear the undeclared-run stamp after a late declaration or after a
+    /// human lifts the park. Idempotent when the stamp is already empty.
+    pub fn clear_execution_run_undeclared(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET run_undeclared_at = NULL WHERE id = ?1",
+            params![execution_id],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
     /// Whether the backstop stamped this execution as ending undeclared.
     pub fn execution_run_undeclared(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;

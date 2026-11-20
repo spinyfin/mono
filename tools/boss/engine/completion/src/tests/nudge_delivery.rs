@@ -96,7 +96,7 @@ async fn sweep_nudges_behind_an_unanswered_nudge_never_advance_or_trip_the_break
     // the run's delivery slot, and nothing queued behind it can go out. A
     // written nudge is settled by its own delivery, not withdrawn.
     probes.set_delivery(pending(PROBE_ONE));
-    probes.nudge_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+    probes.set_nudge_in_flight(true);
 
     // Far more sweeps than the cap. Before the fix sweeps 2 and 3 each queued
     // and counted a nudge, and sweep 4 failed the execution.
