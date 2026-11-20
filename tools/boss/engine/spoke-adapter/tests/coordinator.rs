@@ -581,7 +581,7 @@ async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: 
             through: seen.iter().map(|c| c.sequence).max().unwrap_or(0),
         };
         let lease = seen.iter().find(|c| is_lease(c)).cloned().unwrap();
-        let answered = seen.iter().filter(|c| !is_lease(c)).count() as u64;
+        let last_record = peer.last_record();
         peer.disconnect();
         if other_host {
             // Every later pass now ranks the other host first.
@@ -616,7 +616,7 @@ async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: 
         assert!(fx.legacy_calls().is_empty(), "{:?}", fx.legacy_calls());
 
         // The host returns and answers the stored lease: the same command settles.
-        let peer = fx.spoke(Box::new(answer), Some(cursor), answered).await;
+        let peer = fx.spoke(Box::new(answer), Some(cursor), last_record).await;
         peer.answer_late(&lease, answer(&lease).unwrap()).await;
         env.coordinator.kick();
         timing::condition(|| {
