@@ -28,6 +28,7 @@ pub(super) fn spawn_pr_recovery_sweeps(
         server_state.work_db.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
+        server_state.pr_state_checker.clone(),
         boss_engine_runtime::abandoned_branch_pr_sweep::DEFAULT_INTERVAL,
     );
 

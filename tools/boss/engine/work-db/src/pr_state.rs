@@ -26,7 +26,7 @@ pub trait PrStateChecker: Send + Sync {
     fn check(&self, pr_url: &str) -> Result<PrOpenState>;
 
     /// Lifecycle state plus the current head SHA and branch name, from one
-    /// `gh pr view`.
+    /// parameterised GraphQL query.
     ///
     /// Default implementation has no SHA or branch name (existing
     /// [`Self::check`]-only impls keep working). [`GhPrStateChecker`] fetches
@@ -43,6 +43,11 @@ pub trait PrStateChecker: Send + Sync {
         })
     }
 
+    /// Check base policy independently of lifecycle reads.
+    fn base_verdict(&self, _pr_url: &str) -> Result<PrBaseVerdict> {
+        Ok(PrBaseVerdict::NotChecked)
+    }
+
     /// Hermetic compare response used only by the review-service test fixtures.
     #[cfg(any(test, feature = "test-support"))]
     fn merged_parent_deletions(
@@ -54,6 +59,14 @@ pub trait PrStateChecker: Send + Sync {
     ) -> Vec<String> {
         Vec::new()
     }
+}
+
+/// Default-branch policy observation, separate from lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrBaseVerdict {
+    NotChecked,
+    DefaultBranch,
+    Refused(String),
 }
 
 /// Snapshot returned by [`PrStateChecker::inspect`].
@@ -122,7 +135,7 @@ pub fn classify_pr_merge_state(state: &str, merged_at: &str) -> PrMergeClass {
     }
 }
 
-/// Production implementation: shells out to `gh pr view`.
+/// Production implementation: reads PR and repository fields with GraphQL.
 ///
 /// Deletion observations are a separate, required input to verdict storage.
 pub struct GhPrStateChecker;
@@ -133,36 +146,60 @@ impl PrStateChecker for GhPrStateChecker {
     }
 
     fn inspect(&self, pr_url: &str) -> Result<PrInspect> {
-        // Via `gh_output_blocking` rather than a bare
-        // `Command::new("gh")`: this spends real quota from the shared
-        // token, and a raw spawn here would be invisible to the usage
-        // counter — precisely the kind of blind spot that made the
-        // GraphQL exhaustion unattributable.
-        //
-        // `_if_unattributed`, not a plain `scope_blocking`: this checker is
-        // also called from inside the merge poller's own sweep scope
-        // (`merge_poller.sweep`), whose label is the more specific one and
-        // must win rather than being overridden to `pr_state_check`.
-        let output =
-            boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
-                boss_github::gh_runner::gh_output_blocking(&[
-                    "pr",
-                    "view",
-                    pr_url,
-                    "--json",
-                    "state,mergedAt,headRefOid,headRefName",
-                ])
-            })
-            .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("`gh pr view` failed for {pr_url}: {stderr}");
-        }
-        let body = String::from_utf8_lossy(&output.stdout);
-        let v: serde_json::Value =
-            serde_json::from_str(&body).with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
-        Ok(map_gh_inspect(&v))
+        let repository = query_pr(pr_url)?;
+        Ok(map_gh_inspect(&repository["pullRequest"]))
     }
+
+    fn base_verdict(&self, pr_url: &str) -> Result<PrBaseVerdict> {
+        map_base_verdict(&query_pr(pr_url)?)
+    }
+}
+
+/// Both readers use one parameterised query; policy never changes lifecycle.
+fn query_pr(pr_url: &str) -> Result<serde_json::Value> {
+    let (owner, repo, number) =
+        boss_github::pr_url::parse_pr_url_parts(pr_url).with_context(|| format!("invalid PR URL: {pr_url}"))?;
+    let query = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){defaultBranchRef{name} pullRequest(number:$number){state mergedAt headRefOid headRefName baseRefName}}}";
+    let output = boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
+        boss_github::gh_runner::gh_output_blocking(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("repo={repo}"),
+            "-F",
+            &format!("number={number}"),
+        ])
+    })
+    .with_context(|| format!("failed to query PR {pr_url}"))?;
+    if !output.status.success() {
+        bail!(
+            "PR query failed for {pr_url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if value.get("errors").is_some() || !value["data"]["repository"]["pullRequest"].is_object() {
+        bail!("PR query returned errors or no PR for {pr_url}: {value}");
+    }
+    Ok(value["data"]["repository"].clone())
+}
+
+fn map_base_verdict(repository: &serde_json::Value) -> Result<PrBaseVerdict> {
+    let base = optional_trimmed_json_str(&repository["pullRequest"], "baseRefName")
+        .context("PR query returned no base branch")?;
+    let default = optional_trimmed_json_str(&repository["defaultBranchRef"], "name")
+        .context("PR query returned no default branch")?;
+    Ok(if base == default {
+        PrBaseVerdict::DefaultBranch
+    } else {
+        PrBaseVerdict::Refused(format!(
+            "PR targets `{base}`, but the repository default branch is `{default}`"
+        ))
+    })
 }
 
 /// Pure mapping from the parsed `gh pr view --json state,mergedAt` JSON to a
@@ -226,6 +263,7 @@ impl PrStateChecker for StaticPrStateChecker {
 #[derive(Clone)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct FakePrStateChecker {
+    pub base: PrBaseVerdict,
     pub states: std::collections::HashMap<String, PrOpenState>,
     pub default: PrOpenState,
     pub head_sha: Option<String>,
@@ -236,11 +274,16 @@ pub struct FakePrStateChecker {
 impl FakePrStateChecker {
     pub fn always(state: PrOpenState) -> Self {
         Self {
+            base: PrBaseVerdict::NotChecked,
             states: Default::default(),
             default: state,
             head_sha: None,
             head_ref_name: None,
         }
+    }
+    pub fn with_base(mut self, verdict: PrBaseVerdict) -> Self {
+        self.base = verdict;
+        self
     }
     pub fn with(mut self, url: &str, state: PrOpenState) -> Self {
         self.states.insert(url.to_owned(), state);
@@ -258,6 +301,10 @@ impl FakePrStateChecker {
 
 #[cfg(any(test, feature = "test-support"))]
 impl PrStateChecker for FakePrStateChecker {
+    fn base_verdict(&self, _pr_url: &str) -> Result<PrBaseVerdict> {
+        Ok(self.base.clone())
+    }
+
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
         Ok(self.states.get(pr_url).cloned().unwrap_or(self.default.clone()))
     }
@@ -317,6 +364,37 @@ impl RevisionGateError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn base_policy_does_not_change_lifecycle_reads() {
+        for state in ["OPEN", "MERGED", "CLOSED"] {
+            let repository = json!({
+                "defaultBranchRef": {"name": "main"},
+                "pullRequest": {"state": state, "baseRefName": "feature", "headRefOid": "abc"}
+            });
+            assert!(matches!(
+                map_base_verdict(&repository).unwrap(),
+                PrBaseVerdict::Refused(_)
+            ));
+            let inspect = map_gh_inspect(&repository["pullRequest"]);
+            assert_eq!(inspect.open_state, map_gh_state(&json!({"state": state})));
+            assert_eq!(inspect.head_sha.as_deref(), Some("abc"));
+        }
+        assert_eq!(
+            map_base_verdict(&json!({
+                "defaultBranchRef": {"name": "trunk"},
+                "pullRequest": {"baseRefName": "trunk"}
+            }))
+            .unwrap(),
+            PrBaseVerdict::DefaultBranch
+        );
+        assert!(map_base_verdict(&json!({"pullRequest": {"baseRefName": "main"}})).is_err());
+        assert!(map_base_verdict(&json!({"defaultBranchRef": {"name": "main"}})).is_err());
+        assert_eq!(
+            StaticPrStateChecker(PrOpenState::Open).base_verdict("unused").unwrap(),
+            PrBaseVerdict::NotChecked
+        );
+    }
 
     #[test]
     fn merged_state_maps_to_merged() {

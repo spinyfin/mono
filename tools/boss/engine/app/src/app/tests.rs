@@ -143,6 +143,10 @@ pub(super) fn test_server_state_with_fakes_and_pr_detector(
         cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
         execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
         pr_detector: Some(pr_detector),
+        pr_state_checker: Some(Arc::new(
+            boss_work_db::FakePrStateChecker::always(boss_work_db::PrOpenState::Open)
+                .with_base(boss_work_db::PrBaseVerdict::DefaultBranch),
+        )),
         workspace_diff_verifier,
         ..Default::default()
     })

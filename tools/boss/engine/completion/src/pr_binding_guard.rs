@@ -29,6 +29,46 @@ pub(super) struct ForeignPrConflict {
 }
 
 impl WorkerCompletionHandler {
+    /// Policy refusal is actionable; unavailable GitHub evidence is retryable.
+    pub(super) async fn guard_pr_base(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+    ) -> Option<StopOutcome> {
+        use crate::work::PrBaseVerdict;
+        use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+        let checker = Arc::clone(&self.pr_state_checker);
+        let url = pr_url.to_owned();
+        let check = tokio::task::spawn_blocking(move || checker.base_verdict(&url));
+        match tokio::time::timeout(super::run_done_declaration::DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
+            Ok(Ok(Ok(PrBaseVerdict::DefaultBranch))) => {
+                let _ = self
+                    .work_db
+                    .resolve_external_tracker_attention(&execution.work_item_id, PR_BASE_REFUSED);
+                None
+            }
+            Ok(Ok(Ok(PrBaseVerdict::NotChecked))) => None,
+            Ok(Ok(Ok(PrBaseVerdict::Refused(reason)))) => {
+                if let Err(err) = self
+                    .file_execution_attention(
+                        execution,
+                        PR_BASE_REFUSED,
+                        "PR must target the default branch",
+                        format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
+                    )
+                    .await
+                {
+                    tracing::warn!(?err, "failed to record PR base refusal");
+                }
+                Some(StopOutcome::DetectorFailed)
+            }
+            result => {
+                tracing::warn!(?result, pr_url, "PR base check unavailable; retrying delivery");
+                Some(StopOutcome::DetectorFailed)
+            }
+        }
+    }
+
     /// Expected branches of every primary implementation execution of
     /// `execution`'s work item, this execution's own first. A PR whose head
     /// identifies any of them ([`head_identifies_any_branch`]) belongs to the

@@ -126,6 +126,11 @@ impl WorkerCompletionHandler {
                 .refuse_foreign_pr_binding(execution, &pr_url, &conflict, source)
                 .await;
         }
+        if let Ok(execution) = execution_result.as_ref()
+            && let Some(outcome) = self.guard_pr_base(execution, &pr_url).await
+        {
+            return outcome;
+        }
         let workspace_path = match &execution_result {
             Ok(execution) => execution.workspace_path.clone(),
             Err(err) => {

@@ -376,6 +376,14 @@ async fn repair_candidate(
             return park_unresolved(work_db, candidate, &detail, outcome);
         }
     };
+    match pr_checker.base_verdict(&own_pr_url) {
+        Ok(crate::work::PrBaseVerdict::DefaultBranch | crate::work::PrBaseVerdict::NotChecked) => {}
+        Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+            file_attention(work_db, candidate, &reason);
+            return Ok(());
+        }
+        Err(err) => return Err(Inconclusive::GitHub(format!("checking PR base: {err:#}"))),
+    }
     if let Ok(Some(other)) = work_db.other_work_item_bound_to_pr(&own_pr_url, &candidate.task_id) {
         let detail = format!(
             "This row was bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its branch \
@@ -637,6 +645,30 @@ mod tests {
             WorkItem::Task(t) | WorkItem::Chore(t) => t,
             other => panic!("expected task, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn non_default_base_preserves_the_existing_binding_and_doc() {
+        let (_dir, db) = open_db();
+        let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_foreign".into())]));
+        let checker = FakePrStateChecker::always(PrOpenState::Open)
+            .with_base(crate::work::PrBaseVerdict::Refused("feature base".into()));
+        let outcome = run_one_pass(
+            &db,
+            &FixedDetector(PrStatus::Fresh { url: OWN.into() }, StdMutex::default()),
+            &verifier,
+            &checker,
+            &RecordingDocRefresher::default(),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert_eq!(outcome.rebound, 0);
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
+        assert_eq!(
+            db.task_doc_path(&task_id).unwrap().as_deref(),
+            Some("docs/designs/origin.md")
+        );
     }
 
     #[tokio::test]
