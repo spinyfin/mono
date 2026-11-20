@@ -54,16 +54,18 @@ pub(crate) fn start(conn: &Connection, id: &str, pr_url: &str, base: &str) -> Re
     // else the one taken for the request GitHub accepted (linked to the
     // active intent). Without either (a merge armed directly on GitHub, or a
     // rebound PR) every open revision counts as unconfirmed.
-    let attached: Option<String> = conn
+    let (attached, refusal): (Option<String>, Option<String>) = conn
         .query_row(
             "SELECT CASE WHEN json_valid(merge_queue_detail)
-                    THEN json_extract(merge_queue_detail, '$.confirmation_request_id') END
+                    THEN json_extract(merge_queue_detail, '$.confirmation_request_id') END,
+                    CASE WHEN json_valid(merge_queue_detail)
+                    THEN json_extract(merge_queue_detail, '$.refusal') END
              FROM tasks WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts'",
             [id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
-        .flatten();
+        .unwrap_or((None, None));
     let confirmation_request_id = match attached {
         Some(request) => Some(request),
         None => conn
@@ -84,6 +86,10 @@ pub(crate) fn start(conn: &Connection, id: &str, pr_url: &str, base: &str) -> Re
     });
     if let Some(request) = confirmation_request_id {
         detail["confirmation_request_id"] = serde_json::Value::String(request);
+    }
+    // GitHub's refusal belongs to the standing request, so a rebuild keeps it.
+    if let Some(refusal) = refusal {
+        detail["refusal"] = serde_json::Value::String(refusal);
     }
     let changed = conn.execute(
         "UPDATE tasks SET merge_queue_state = 'resolving_conflicts', merge_queue_detail = ?3
@@ -359,6 +365,23 @@ pub(crate) fn clear_stopped(conn: &Connection, id: &str) -> Result<bool> {
     )? > 0)
 }
 
+/// Reason recorded when a resolution halts for a person to approve deletions.
+pub(crate) const DELETION_SIGNOFF_REASON: &str = "Resolution needs approval for deleted files";
+
+/// Clear the stop explanation because the conflict itself lifted. A pending
+/// deletion sign-off is a separate cause that a lifted conflict does not end.
+pub(crate) fn clear_stopped_on_conflict_lift(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE tasks SET merge_queue_detail = NULL
+         WHERE id = ?1 AND merge_queue_state IS NULL
+           AND CASE WHEN json_valid(merge_queue_detail)
+               THEN json_extract(merge_queue_detail, '$.source') = 'conflict_resolution'
+                    AND COALESCE(json_extract(merge_queue_detail, '$.paused_label'), '') != ?2
+               ELSE 0 END",
+        params![id, format!("Merge paused: {DELETION_SIGNOFF_REASON}")],
+    )? > 0)
+}
+
 fn is_conflict_stop_detail(detail: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(detail)
         .ok()
@@ -424,6 +447,22 @@ impl WorkDb {
              WHERE id = ?1 AND merge_queue_state = 'resolving_conflicts' AND json_valid(merge_queue_detail)",
             params![id, message],
         )? > 0)
+    }
+
+    /// Drop a stale "Merge paused" explanation once the conflict has really
+    /// lifted, for retire paths that do not go through signal retirement
+    /// (the mechanical ladder rungs). Returns whether a label was cleared;
+    /// a clear is published as a board change.
+    pub fn clear_stopped_merge_label_on_conflict_lift(&self, id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut pending = crate::PendingEvents::new();
+        let cleared = clear_stopped_on_conflict_lift(&tx, id)?;
+        if cleared {
+            crate::board_notifications::stage_task_board_change(&mut pending, &tx, id)?;
+        }
+        crate::commit_and_publish(tx, pending, self.event_bus())?;
+        Ok(cleared)
     }
 
     pub fn stop_merge_conflict_resolution(&self, id: &str, reason: &str) -> Result<bool> {
@@ -1565,12 +1604,21 @@ mod tests {
 
     #[test]
     fn the_stopped_explanation_ends_with_its_cause() {
-        // A revision lands and the conflict lifts.
+        // A revision is handed the conflict, then the conflict lifts.
         let (db, product, id, attempt) = fixture(true);
         db.set_conflict_resolution_revision_task_id(&attempt, "revision")
             .unwrap();
         assert!(card(&db, &product, &id).merge_queue_detail.is_some());
+        // Handing the conflict to the revision keeps the reason on the card.
         db.clear_chore_blocked_merge_conflict(&id, PR).unwrap();
+        assert!(
+            card(&db, &product, &id)
+                .merge_queue_detail
+                .unwrap()
+                .contains("Merge paused")
+        );
+        // Retiring the signal once the conflict really lifts clears it.
+        db.clear_resolved_pr_signal(&id, PR, false).unwrap();
         assert_eq!(card(&db, &product, &id).merge_queue_detail, None);
 
         // A person approves the deletion sign-off by moving the card back to review.
@@ -1592,6 +1640,70 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(card(&db, &product, &id).merge_queue_detail, None);
+    }
+
+    #[test]
+    fn a_kept_refusal_survives_the_detail_being_rebuilt() {
+        // A released request is refused by GitHub, then the conflict returns and
+        // resolution is attempted and stops: the refusal must still be shown.
+        let (db, _product, id, attempt) = fixture(true);
+        db.mark_conflict_resolution_abandoned(&attempt, "manual_abandon")
+            .unwrap();
+        db.clear_chore_blocked_merge_conflict(&id, PR).unwrap();
+        db.clear_merge_conflict_signal_only(&id).unwrap();
+        // Release the deferred request back to a standing one.
+        assert!(db.start_merge_conflict_resolution(&id, PR, "main").unwrap());
+        assert!(db.note_merge_refusal(&id, "Pull request is not mergeable").unwrap());
+        // A new conflict: the block must really transition now.
+        assert!(
+            db.mark_chore_blocked_merge_conflict(&id, PR).unwrap().is_some(),
+            "the task must transition to blocked after the refusal is recorded"
+        );
+        let retry = db
+            .insert_conflict_resolution(
+                ConflictResolutionInsertInput::builder()
+                    .product_id(&_product)
+                    .work_item_id(&id)
+                    .pr_url(PR)
+                    .pr_number(42)
+                    .head_branch("feature")
+                    .base_branch("main")
+                    .base_sha_at_trigger("base2")
+                    .head_sha_before("new-head")
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(db.stop_merge_conflict_resolution(&id, "Merge failed: x").unwrap());
+        let detail: String = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT merge_queue_detail FROM tasks WHERE id = ?1", [&id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(detail.contains("Pull request is not mergeable"), "{detail}");
+        assert!(!retry.id.is_empty());
+    }
+
+    #[test]
+    fn a_mechanical_retire_clears_a_label_left_by_an_earlier_stop() {
+        let (db, product, id, attempt) = fixture(true);
+        db.mark_conflict_resolution_failed(&attempt, "Rebase failed").unwrap();
+        assert!(
+            card(&db, &product, &id)
+                .merge_queue_detail
+                .unwrap()
+                .contains("Merge paused")
+        );
+        // A new conflict re-blocks the card, then a mechanical rung retires it
+        // through the ladder's calls rather than signal retirement.
+        db.clear_chore_blocked_merge_conflict(&id, PR).unwrap();
+        db.mark_chore_blocked_merge_conflict(&id, PR).unwrap();
+        db.clear_chore_blocked_merge_conflict(&id, PR).unwrap();
+        db.clear_merge_conflict_signal_only(&id).unwrap();
+        assert!(db.clear_stopped_merge_label_on_conflict_lift(&id).unwrap());
         assert_eq!(card(&db, &product, &id).merge_queue_detail, None);
     }
 

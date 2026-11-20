@@ -1227,6 +1227,18 @@ async fn retire_attempt_at_rung(
         );
     }
 
+    // The conflict really lifted, so a "Merge paused" label left by an earlier
+    // stop no longer has a cause.
+    match work_db.clear_stopped_merge_label_on_conflict_lift(&candidate.work_item_id) {
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            rung,
+            ?err,
+            "conflict_ladder: failed to clear stale merge-paused label on retire",
+        ),
+    }
+
     if let Some(attempt) = marked {
         publisher
             .publish_frontend_event_on_product(

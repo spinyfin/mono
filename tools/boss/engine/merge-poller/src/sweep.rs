@@ -2397,13 +2397,7 @@ pub async fn update_pr_poll_state(
         // Re-assert `'queued'` so recovery does not depend on GitHub's
         // projection having materialized; preserve then keeps the restored
         // row (or the original queued detail) untouched.
-        let detail = serde_json::json!({
-            "position": null,
-            "state": null,
-            "enqueued_at": null,
-            "section_order": QUEUED_NO_POSITION_SECTION_ORDER,
-        })
-        .to_string();
+        let detail = boss_engine_storage_values::merge_queue_section::queued_no_position_detail();
         match work_db.reassert_github_merge_queue_if_cleared(&candidate.work_item_id, &detail) {
             Ok(true) => {
                 publisher
