@@ -5,6 +5,16 @@ struct NavigatorRowPresentation {
     let project: String?
     let width: CGFloat
 
+    var isWorkerActive = false
+
+    /// True when any of the row's activities maps (by run id, falling back
+    /// to execution id) to a live worker that is currently working.
+    static func isWorkerActive(row: NavigatorRow, liveStates: [String: WorkerLiveState]) -> Bool {
+        row.projection.activities.contains { activity in
+            liveStates[activity.runId ?? activity.executionId]?.activity == .working
+        }
+    }
+
     var showsSecondaryIndicators: Bool { width >= 340 }
     var health: (label: String, symbol: String)? {
         if row.task.prMergeableState == "conflicting" {
@@ -40,6 +50,7 @@ struct NavigatorRowPresentation {
     var accessibilityLabel: String {
         ([row.projection.knownSection?.title, row.task.kindLabel, row.task.name,
          row.projection.reasonLabel, project,
+         row.projection.knownSection == .working ? (isWorkerActive ? "Worker active" : "Worker idle") : nil,
          "\(row.projection.questionCount) questions or input requests",
          "\(row.projection.revisions.open) open revisions"].compactMap { $0 } + healthFacts)
             .joined(separator: ", ")
@@ -51,15 +62,18 @@ struct WorkNavigatorRow: View {
     let project: String?
     let width: CGFloat
     let isSelected: Bool
+    @ObservedObject var liveWorkers: LiveWorkerStateStore
     @Environment(\.dynamicTypeSize) private var textSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let presentation = NavigatorRowPresentation(row: row, project: project, width: width)
+        let isWorkerActive = NavigatorRowPresentation.isWorkerActive(row: row, liveStates: liveWorkers.byRunID)
+        let presentation = NavigatorRowPresentation(row: row, project: project, width: width, isWorkerActive: isWorkerActive)
         HStack(spacing: 6) {
             if row.projection.knownSection == .working {
                 Image(systemName: "circle.fill").font(.system(size: 5))
-                    .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
+                    .foregroundStyle(isWorkerActive ? Color.green : Color(nsColor: .tertiaryLabelColor))
+                    .symbolEffect(.pulse, options: .repeating, isActive: isWorkerActive && !reduceMotion)
             }
             Image(systemName: presentation.symbol).frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
