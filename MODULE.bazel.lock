@@ -1270,7 +1270,7 @@
           "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
-          "FILE:@@//Cargo.lock 28ee3534c6972c616b01e9577ec6d23028f7279fe06088a55b0cea6c5a9b810b",
+          "FILE:@@//Cargo.lock f5ccb6030885784aa66a78476aa512a03764440310886b1e04c84b83aeefd6c8",
           "FILE:@@//Cargo.toml f72ca2add0ae155ef8e7fcdaf9977a08b84cc244baad6bb8987298f2e25abdca",
           "FILE:@@//lib/rust/bazel_support/Cargo.toml 0cdec0a454a3df0c8cfae5aea35be567343f6b62464efa252c31d84f40fc2f77",
           "FILE:@@//lib/rust/broker-robinhood/Cargo.toml 283446ff4724eb01b6f89291264a15a3904596fb9df32f157c50f8f691c3ed23",
@@ -1404,7 +1404,7 @@
           "FILE:@@//tools/checkleft/checks/text/forbidden-pattern/Cargo.toml 58d1125d71cc741a02aa95754ca26e6621718d14f18520dfe7dac04eda5a60ec",
           "FILE:@@//tools/checkleft/preinstalled-bundle/Cargo.toml 2fd4ac78c377593f45d01f814cc786c2f09fc8b9338bb50bf9080ea4542faa65",
           "FILE:@@//tools/checkleft_package/Cargo.toml f8383dfa8115a2c2ab6301762d6c33cb3fb3f3c780216660f04706c7073168d2",
-          "FILE:@@//tools/cube/Cargo.toml 1f23cee732ef5f926374880c96f74dcf297db3e260effe2b6b9574883d21ee33",
+          "FILE:@@//tools/cube/Cargo.toml 16114deaab744ff0f3bb0826e17f4e261b63054778bb11629c697408ba6712d9",
           "FILE:@@//tools/repobin/Cargo.toml bdab8b4f060561374424f8f0be4fa9d32a7620ef6caaec22e7f85e57b78e2710",
           "FILE:@@//tools/release/Cargo.toml 7d1fa0d3f8e168a85f9add5afa36b635d9192e62afb7c1383c21d90994a1e439",
           "FILE:@@//tools/changelog/Cargo.toml 8cd4fc2abc0cf4091516dc7881a4853af708212e62ba9bac2f182224c6477842"

@@ -2,6 +2,13 @@
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 
+/// True for a Bazel output-base directory name: an MD5 hex digest, exactly 32
+/// lowercase hex characters. Bazel's per-user root also holds non-hash entries
+/// (`install/`, `cache/`) that must never be treated as an output base.
+pub fn is_output_base_dir_name(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Bazel cache parent, before Bazel appends its per-user component.
 pub fn cache_root(test_tmpdir: Option<&str>, home: Option<&str>, xdg: Option<&str>, macos: bool) -> Option<PathBuf> {
     if let Some(tmp) = test_tmpdir.filter(|v| !v.is_empty()) {
@@ -84,6 +91,14 @@ pub fn shell_split(line: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_base_dir_name_requires_32_lowercase_hex() {
+        assert!(super::is_output_base_dir_name("1eb7f20eb66e1385f89492d4801636bf"));
+        assert!(!super::is_output_base_dir_name("install"));
+        assert!(!super::is_output_base_dir_name("1EB7F20EB66E1385F89492D4801636BF"));
+        assert!(!super::is_output_base_dir_name("1eb7f20eb66e1385f89492d4801636b"));
+    }
+
     use super::*;
 
     #[test]

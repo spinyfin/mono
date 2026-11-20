@@ -1,5 +1,5 @@
 //! Resolve a narrow Bazel output grant for local autonomous workers.
-use bazel_support::{cache_root, logical_bazelrc_lines, shell_split};
+use bazel_support::{cache_root, is_output_base_dir_name, logical_bazelrc_lines, shell_split};
 use std::path::{Component, Path, PathBuf};
 
 const MAX_IMPORT_DEPTH: usize = 8;
@@ -78,7 +78,7 @@ fn output_base_from_target(target: &Path) -> Option<PathBuf> {
     let is_hash = base
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|name| name.len() == 32 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        .is_some_and(is_output_base_dir_name);
     if is_hash
         && let Some(parent) = base.parent()
         && parent

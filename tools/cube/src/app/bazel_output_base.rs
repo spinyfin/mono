@@ -48,6 +48,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use bazel_support::is_output_base_dir_name;
 use md5::{Digest, Md5};
 
 use crate::command_runner::{CommandRunner, RealCommandRunner};
@@ -67,13 +68,6 @@ const DISCOVER_ROOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// probe before giving up. One is normally enough; more than one guards
 /// against a candidate whose bazel setup is itself broken.
 const MAX_PROBE_CANDIDATES: usize = 5;
-
-/// MD5 hex digests are exactly 32 lowercase hex characters. Bazel's own
-/// per-user root also holds non-hash entries (`install/`, `cache/` on this
-/// host) that must never be treated as a candidate output base.
-fn is_output_base_dir_name(name: &str) -> bool {
-    name.len() == 32 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
 
 /// The directory name bazel would use for a workspace at `workspace_path`.
 pub(super) fn hash_workspace_path(workspace_path: &Path) -> String {
@@ -415,15 +409,6 @@ mod tests {
             )),
             "1eb7f20eb66e1385f89492d4801636bf"
         );
-    }
-
-    #[test]
-    fn output_base_dir_name_accepts_only_32_lowercase_hex() {
-        assert!(is_output_base_dir_name("1eb7f20eb66e1385f89492d4801636bf"));
-        assert!(!is_output_base_dir_name("install"));
-        assert!(!is_output_base_dir_name("cache"));
-        assert!(!is_output_base_dir_name("1EB7F20EB66E1385F89492D4801636B")); // uppercase
-        assert!(!is_output_base_dir_name("1eb7f20eb66e1385f89492d4801636b")); // 31 chars
     }
 
     /// Reproduces the exact failure mode described in the task: a populated
