@@ -413,6 +413,9 @@ mod tests {
             let lock = GROK_HOMES_ENV_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Keep concurrent registry/transcript lookups isolated even while
+            // this fixture temporarily removes Bazel's TEST_TMPDIR.
+            boss_log_files::default_state_root().expect("Bazel supplies an isolated state root");
             let mut prior = Vec::new();
             for (key, value) in pairs {
                 prior.push((*key, std::env::var_os(key)));
@@ -476,6 +479,10 @@ mod tests {
         )
         .unwrap();
         let directives = env.directives();
+
+        // Registry construction must remain safe with TEST_TMPDIR cleared,
+        // including when this fixture is the first test in the process.
+        assert!(crate::registry::DriverRegistry::default().require("codex").is_ok());
 
         for (key, expected) in [
             ("GH_CONFIG_DIR", host_home.join(".config/gh")),
