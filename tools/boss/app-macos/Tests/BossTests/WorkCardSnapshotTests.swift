@@ -1473,6 +1473,24 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertTrue(stopped.hasLiveStatus)
     }
 
+    func testDisarmFailureOutranksLiveStatusAndEndedIntent() {
+        var task = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/4")
+        let warning = "Merge not paused: couldn't turn off auto-merge on GitHub"
+        task.mergeQueueDetail = #"{"status_label":"Merge not paused: couldn't turn off auto-merge on GitHub","disarm_error":"GitHub unavailable"}"#
+        for ended in [false, true] {
+            task.mergeIntent = ended
+                ? WorkMergeIntent(status: "invalidated", detail: "Merge request ended: a revision started.")
+                : nil
+            for liveStatus in [nil, "Next up"] as [String?] {
+                let snapshot = WorkCardSnapshot.build(
+                    task: task,
+                    context: WorkCardSnapshotContext(column: .review, liveStatus: liveStatus)
+                )
+                XCTAssertEqual(snapshot.liveStatus, warning)
+            }
+        }
+    }
+
     // MARK: - Live status + activity
 
     func testLiveStatusFromContext() {

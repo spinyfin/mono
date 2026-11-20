@@ -388,6 +388,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: merge_evidence::migrate,
         },
         Migration {
+            id: "20261120_0657_merge_intent_dequeues".into(),
+            legacy_version: None,
+            apply: merge_intent::migrate_dequeue_tracking,
+        },
+        Migration {
             id: merge_intent::MIGRATION_ID.into(),
             legacy_version: None,
             apply: merge_intent::migrate,

@@ -308,6 +308,9 @@ struct WorkCardSnapshot: Equatable {
                     ?? context.liveStatus
                     ?? standingMergeRequest
             }
+            if MergeQueueDetail.parse(task.mergeQueueDetail)?.disarmError != nil {
+                return queueLabel ?? context.liveStatus ?? endedMergeRequest
+            }
             return context.liveStatus
                 ?? endedMergeRequest
                 ?? queueLabel

@@ -149,7 +149,13 @@ async fn a_conflicted_pr_nobody_asked_to_merge_is_recorded_but_not_resolved() {
 /// resolution vehicle.
 #[tokio::test]
 async fn a_deferred_conflict_is_resolved_when_a_merge_is_requested() {
-    for signal in ["auto_merge", "merge_queue", "github_intent", "trunk_intent"] {
+    for signal in [
+        "auto_merge",
+        "merge_queue",
+        "github_intent",
+        "trunk_intent",
+        "merge_intent",
+    ] {
         let dir = tempdir().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let pr = "https://github.com/foo/bar/pull/3559";
@@ -175,6 +181,13 @@ async fn a_deferred_conflict_is_resolved_when_a_merge_is_requested() {
         match signal {
             "auto_merge" => ready.auto_merge_enabled = true,
             "merge_queue" => ready.in_merge_queue = true,
+            "merge_intent" => {
+                db.record_merge_intent(&chore, pr, Some("head456")).unwrap();
+                assert_eq!(
+                    crate::conflict_deferral::merge_requested(&db, &candidate(&product, &chore, pr), &ready),
+                    Some("merge_intent")
+                );
+            }
             "github_intent" => {
                 db.record_github_merge_intent(
                     crate::work::GithubMergeIntentInsertInput::builder()

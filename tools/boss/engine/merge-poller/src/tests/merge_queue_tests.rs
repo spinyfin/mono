@@ -1314,68 +1314,82 @@ async fn observed_github_dequeue_retires_intent_and_clears_merging() {
 /// ends it and tells the app, even when the Merging lane was already clear.
 #[tokio::test]
 async fn observed_github_dequeue_keeps_or_ends_the_standing_merge_request_by_reason() {
-    for (reason, stands) in [("FAILED_CHECKS", true), ("manual_removal", false)] {
-        let (_dir, db) = open_db();
-        let product = create_test_product_with_repo(&db, "StandingRequestDequeue", Some("git@github.com:foo/bar.git"));
-        let pr_url = "https://github.com/foo/bar/pull/5";
-        let task = chore_in_review_for_product(&db, &product.id, "T", pr_url);
-        db.record_github_merge_intent(
-            crate::work::GithubMergeIntentInsertInput::builder()
-                .work_item_id(task.clone())
-                .pr_url(pr_url)
-                .head_sha("head-5")
-                .build(),
-            "{}",
-        )
-        .unwrap();
-        let requested = db.record_merge_intent(&task, pr_url, Some("head-5")).unwrap();
-        // The lane was already demoted, as under a red auto-merge.
-        db.set_task_merge_queue_state(&task, None, None).unwrap();
-        let candidate = PendingMergeCheck {
-            work_item_id: task.clone(),
-            product_id: product.id.clone(),
-            pr_url: pr_url.to_owned(),
-        };
-        let event_created_at =
-            chrono::DateTime::from_timestamp(boss_engine_utils::epoch_time::now_epoch_secs() + 3600, 0)
+    for recorded_submission in [true, false] {
+        for (reason, stands) in [("FAILED_CHECKS", true), ("manual_removal", false)] {
+            let (_dir, db) = open_db();
+            let product =
+                create_test_product_with_repo(&db, "StandingRequestDequeue", Some("git@github.com:foo/bar.git"));
+            let pr_url = "https://github.com/foo/bar/pull/5";
+            let task = chore_in_review_for_product(&db, &product.id, "T", pr_url);
+            if recorded_submission {
+                db.record_github_merge_intent(
+                    crate::work::GithubMergeIntentInsertInput::builder()
+                        .work_item_id(task.clone())
+                        .pr_url(pr_url)
+                        .head_sha("head-5")
+                        .build(),
+                    "{}",
+                )
+                .unwrap();
+            }
+            db.connect()
                 .unwrap()
-                .to_rfc3339();
-        let mut events = HashMap::new();
-        events.insert(
-            candidate.pr_url.clone(),
-            vec![MergeQueueDequeueEvent {
-                queue_base_oid: None,
-                reason: reason.to_owned(),
-                created_at: Some(event_created_at),
-                pr_head_oid: Some("head-5".to_owned()),
-                before_commit_oid: None,
-            }],
-        );
-        let publisher = RecordingPublisher::default();
-        clear_github_merge_intent_on_observed_dequeue(&db, &publisher, &candidate, &events).await;
-
-        assert!(
-            db.get_active_github_merge_intent(&task, pr_url).unwrap().is_none(),
-            "{reason}: the submission is retired either way"
-        );
-        let standing = db.active_merge_intent(&task, pr_url).unwrap();
-        assert_eq!(
-            standing.map(|intent| intent.id),
-            stands.then(|| requested.id.clone()),
-            "{reason}"
-        );
-        let notified = publisher
-            .events
-            .lock()
-            .await
-            .iter()
-            .any(|(_, item_id, _)| item_id == &task);
-        assert_eq!(notified, !stands, "{reason}: only an ended request changes the card");
-        if stands {
-            assert!(
-                db.merge_intent_remediation(&requested).unwrap().fix_owed,
-                "a CI fix is owed for the failed checks"
+                .execute("UPDATE tasks SET pr_head_sha = 'head-5' WHERE id = ?1", [&task])
+                .unwrap();
+            let approved = if recorded_submission {
+                "head-5"
+            } else {
+                "head-before-fix"
+            };
+            let requested = db.record_merge_intent(&task, pr_url, Some(approved)).unwrap();
+            // The lane was already demoted, as under a red auto-merge.
+            db.set_task_merge_queue_state(&task, None, None).unwrap();
+            let candidate = PendingMergeCheck {
+                work_item_id: task.clone(),
+                product_id: product.id.clone(),
+                pr_url: pr_url.to_owned(),
+            };
+            let event_created_at =
+                chrono::DateTime::from_timestamp(boss_engine_utils::epoch_time::now_epoch_secs() + 3600, 0)
+                    .unwrap()
+                    .to_rfc3339();
+            let mut events = HashMap::new();
+            events.insert(
+                candidate.pr_url.clone(),
+                vec![MergeQueueDequeueEvent {
+                    queue_base_oid: None,
+                    reason: reason.to_owned(),
+                    created_at: Some(event_created_at),
+                    pr_head_oid: Some("head-5".to_owned()),
+                    before_commit_oid: None,
+                }],
             );
+            let publisher = RecordingPublisher::default();
+            clear_github_merge_intent_on_observed_dequeue(&db, &publisher, &candidate, &events).await;
+
+            assert!(
+                db.get_active_github_merge_intent(&task, pr_url).unwrap().is_none(),
+                "{reason}: the submission is retired either way"
+            );
+            let standing = db.active_merge_intent(&task, pr_url).unwrap();
+            assert_eq!(
+                standing.map(|intent| intent.id),
+                stands.then(|| requested.id.clone()),
+                "{reason}"
+            );
+            let notified = publisher
+                .events
+                .lock()
+                .await
+                .iter()
+                .any(|(_, item_id, _)| item_id == &task);
+            assert_eq!(notified, !stands, "{reason}: only an ended request changes the card");
+            if stands {
+                assert!(
+                    db.merge_intent_remediation(&requested).unwrap().fix_owed,
+                    "a CI fix is owed for the failed checks"
+                );
+            }
         }
     }
 }
