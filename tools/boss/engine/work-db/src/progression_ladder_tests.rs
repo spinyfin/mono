@@ -1185,6 +1185,7 @@ fn keep_trying_waives_the_grace_when_a_second_ticks_over_during_the_restore() {
 
     fx.answer(&question, KEEP_TRYING);
 
+    // Replace the blocking hook on the shared connection with the production observer.
     crate::db_diagnostics::install_update_observer(&fx.db.connect().unwrap());
     let clauses = fx.db.progression_clauses(&id).unwrap().unwrap();
     assert!(clauses.grace_waived, "{clauses:?}");
