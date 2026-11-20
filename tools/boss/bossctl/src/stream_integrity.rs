@@ -182,14 +182,14 @@ impl IntegrityReport {
         }
     }
 
-    /// Prominent block that belongs *before* any timeline or finding, so damage
-    /// is read before the conclusions it undermines.
+    /// Prominent block before any timeline or finding when records were lost,
+    /// so missing evidence is read before the conclusions it undermines.
     ///
     /// Rendered rather than printed so a test can assert its content; every
     /// renderer here returns the empty string for an intact stream, which is
     /// what makes the call sites unconditional.
     pub fn render_banner(&self) -> String {
-        if self.is_intact() {
+        if self.is_intact() || self.lost_lines().next().is_none() {
             return String::new();
         }
         let lost = self.lost_lines().count();
@@ -205,35 +205,11 @@ impl IntegrityReport {
             self.recovered_records(),
             lost,
         );
-        if lost > 0 {
-            let _ = writeln!(
-                out,
-                "!! Records are missing from the timeline below. The ABSENCE of an event"
-            );
-            let _ = writeln!(out, "!! in this report is NOT evidence that it never happened.");
-        } else if self.all_damage_in_rotated_segments() {
-            let _ = writeln!(
-                out,
-                "!! Every dispatch record was recovered, so the timeline below is complete —"
-            );
-            let _ = writeln!(
-                out,
-                "!! the interleaving is confined to rotated segment(s), i.e. history the current"
-            );
-            let _ = writeln!(
-                out,
-                "!! writer stopped appending to a while ago. Nothing here implicates the live writer."
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "!! Every dispatch record was recovered, so the timeline below is complete —"
-            );
-            let _ = writeln!(
-                out,
-                "!! but the stream interleaved in the LIVE segment, which means the writer needs attention."
-            );
-        }
+        let _ = writeln!(
+            out,
+            "!! Records are missing from the timeline below. The ABSENCE of an event"
+        );
+        let _ = writeln!(out, "!! in this report is NOT evidence that it never happened.");
         let _ = writeln!(
             out,
             "!! ─────────────────────────────────────────────────────────────────"
@@ -241,14 +217,18 @@ impl IntegrityReport {
         out
     }
 
-    pub fn print_banner(&self) {
-        print!("{}", self.render_banner());
-    }
-
-    /// Full per-line accounting, for after the findings.
+    /// One recovery summary after the findings, or full per-line accounting when records were lost.
     pub fn render_footer(&self) -> String {
         if self.is_intact() {
             return String::new();
+        }
+        if self.lost_lines().next().is_none() {
+            let location = if self.all_damage_in_rotated_segments() {
+                "rotated segments only"
+            } else {
+                "live segment or execution mirror; writer needs attention"
+            };
+            return format!("{} ({location})\n", self.render_notice().trim_end());
         }
         let mut out = String::new();
         let _ = writeln!(out, "\nstream integrity: {} unreadable line(s)", self.damage.len());
@@ -271,10 +251,6 @@ impl IntegrityReport {
             );
         }
         out
-    }
-
-    pub fn print_footer(&self) {
-        print!("{}", self.render_footer());
     }
 
     /// One-line notice for verbs that print a listing rather than a timeline
@@ -466,6 +442,8 @@ mod tests {
     #[test]
     fn unrecoverable_damage_drives_the_distinct_exit_code() {
         let report = IntegrityReport::new(vec![damaged(1, DamageShape::Unrecoverable, Some(10), Some(20))]);
+        assert!(report.render_banner().contains("Records are missing"));
+        assert!(report.render_footer().contains("current.jsonl:1"));
         assert_eq!(report.lost_lines().count(), 1);
         assert_eq!(report.to_json()["exit_code"], json!(EXIT_UNRECOVERED_RECORDS));
         assert_eq!(exit_code(), ExitCode::from(EXIT_UNRECOVERED_RECORDS));
@@ -511,7 +489,8 @@ mod tests {
             damaged_rotated(2, DamageShape::Concatenated, Some(30), Some(40)),
         ]);
         assert!(report.all_damage_in_rotated_segments());
-        let banner = report.render_banner();
+        assert!(report.render_banner().is_empty());
+        let banner = report.render_footer();
         assert!(
             banner.contains("rotated segment"),
             "banner should name rotated segments as the source: {banner}"
@@ -527,7 +506,10 @@ mod tests {
     fn damage_in_the_live_segment_still_implicates_the_writer() {
         let report = IntegrityReport::new(vec![damaged(1, DamageShape::Concatenated, Some(10), Some(20))]);
         assert!(!report.all_damage_in_rotated_segments());
-        let banner = report.render_banner();
+        assert!(report.render_banner().is_empty());
+        let banner = report.render_footer();
+        assert_eq!(banner.lines().count(), 1);
+        assert!(banner.contains("all 2 record(s) recovered"), "{banner}");
         assert!(
             banner.contains("writer needs attention"),
             "live-segment damage is a genuine live-writer signal: {banner}"
@@ -545,7 +527,8 @@ mod tests {
             !report.all_damage_in_rotated_segments(),
             "even one live-segment line means the boundary is not confirmed-historical"
         );
-        let banner = report.render_banner();
+        assert!(report.render_banner().is_empty());
+        let banner = report.render_footer();
         assert!(banner.contains("writer needs attention"), "{banner}");
     }
 
@@ -567,7 +550,8 @@ mod tests {
             !report.all_damage_in_rotated_segments(),
             "an unrecognised (non-rotated) path must be treated as live, not as settled history"
         );
-        let banner = report.render_banner();
+        assert!(report.render_banner().is_empty());
+        let banner = report.render_footer();
         assert!(banner.contains("writer needs attention"), "{banner}");
     }
 
@@ -584,7 +568,8 @@ mod tests {
             Some(20),
         )]);
         assert!(!report.all_damage_in_rotated_segments());
-        let banner = report.render_banner();
+        assert!(report.render_banner().is_empty());
+        let banner = report.render_footer();
         assert!(banner.contains("writer needs attention"), "{banner}");
     }
 

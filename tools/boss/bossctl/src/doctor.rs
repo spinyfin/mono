@@ -1903,7 +1903,11 @@ pub fn run_diagnose(
     db: Option<&boss_engine::work::WorkDb>,
 ) -> Result<()> {
     if let Some(payload) = diagnose_report(root, id, json, signatures_only, now_ms, db)? {
-        println!("{payload}");
+        if let Some(output) = payload.as_str() {
+            print!("{output}");
+        } else {
+            println!("{payload}");
+        }
     }
     Ok(())
 }
@@ -2130,9 +2134,26 @@ fn diagnose_report(
         return Ok(Some(Value::Object(payload)));
     }
 
+    use std::fmt::Write;
+    let mut out = String::new();
+    for exec_id in &scope.execution_ids {
+        match db {
+            Some(db) => {
+                let _ = write!(out, "{}", render_execution_state(db, exec_id));
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "execution {exec_id}: current state unavailable (state database unavailable)"
+                );
+            }
+        }
+    }
+
     match scope.resolved_as {
         ResolvedAs::Execution => {
-            println!(
+            let _ = writeln!(
+                out,
                 "dispatch diagnose for execution {}{}",
                 scope.input_id,
                 scope
@@ -2143,7 +2164,8 @@ fn diagnose_report(
             );
         }
         ResolvedAs::WorkItem => {
-            println!(
+            let _ = writeln!(
+                out,
                 "dispatch diagnose for work item {} ({} execution(s))",
                 scope.input_id,
                 scope.execution_ids.len()
@@ -2151,38 +2173,37 @@ fn diagnose_report(
         }
     }
 
-    // Before the timeline, not after: an operator who reads a timeline and then
-    // learns it had holes has already formed the conclusion this is meant to
-    // prevent.
-    integrity.print_banner();
+    // Warn about lost records before the timeline. Fully recovered damage is
+    // summarized after the findings because it leaves no holes in the evidence.
+    out.push_str(&integrity.render_banner());
 
     if let Some(focus) = focus_diagnosis.as_ref().filter(|f| f.focus.is_active()) {
         for line in focus.lines() {
-            println!("{line}");
+            let _ = writeln!(out, "{line}");
         }
     }
 
     if let Some(progression) = &progression_diagnosis {
         for line in progression.lines(i64::try_from(now_ms / 1000).unwrap_or(i64::MAX)) {
-            println!("{line}");
+            let _ = writeln!(out, "{line}");
         }
     }
 
     if let Some(wait) = &wait_diagnosis {
-        println!("{}", dispatch_wait_line(wait));
+        let _ = writeln!(out, "{}", dispatch_wait_line(wait));
     }
 
     if events.is_empty() && findings.is_empty() {
         // "Nothing here" is precisely the conclusion damage invalidates, so it
         // is the one case that must never be stated bare.
         if integrity.is_intact() {
-            println!("no dispatch events or signature matches for {id}");
+            let _ = writeln!(out, "no dispatch events or signature matches for {id}");
         } else {
-            println!("no READABLE dispatch events or signature matches for {id}");
-            println!("  {}", crate::stream_integrity::NO_EVENTS_CAVEAT);
+            let _ = writeln!(out, "no READABLE dispatch events or signature matches for {id}");
+            let _ = writeln!(out, "  {}", crate::stream_integrity::NO_EVENTS_CAVEAT);
         }
-        integrity.print_footer();
-        return Ok(None);
+        out.push_str(&integrity.render_footer());
+        return Ok(Some(Value::String(out)));
     }
 
     if !signatures_only {
@@ -2193,18 +2214,38 @@ fn diagnose_report(
             if exec_events.is_empty() && damage.is_empty() {
                 continue;
             }
-            println!("\ntimeline for execution {exec_id}");
-            print!("{}", render_timeline(&exec_events, &damage, now_ms));
+            let _ = writeln!(out, "\ntimeline for execution {exec_id}");
+            let _ = write!(out, "{}", render_timeline(&exec_events, &damage, now_ms));
         }
         if events.is_empty() {
-            println!("\n(no dispatch events recorded for this id)");
+            let _ = writeln!(out, "\n(no dispatch events recorded for this id)");
         }
     }
 
-    println!();
-    print!("{}", render_findings(&findings, &integrity));
-    integrity.print_footer();
-    Ok(None)
+    let _ = writeln!(out);
+    let _ = write!(out, "{}", render_findings(&findings, &integrity));
+    out.push_str(&integrity.render_footer());
+    Ok(Some(Value::String(out)))
+}
+
+/// Snapshot the requested execution, never the item's newer execution.
+fn render_execution_state(db: &boss_engine::work::WorkDb, id: &str) -> String {
+    let state = (|| -> Result<String> {
+        let exec = db.get_execution(id)?;
+        let wait = db.dispatch_wait_snapshot(id)?;
+        let attempt = db.dispatch_attempt_number(&exec)?;
+        Ok(format!(
+            "execution {}: status={} work_item={} attempt={}\n  dispatch_wait_reason={} dispatch_wait_blocker_id={} dispatch_wait_since={}\n",
+            exec.id,
+            exec.status,
+            exec.work_item_id,
+            attempt,
+            wait.reason.as_deref().unwrap_or("(none)"),
+            wait.blocker_id.as_deref().unwrap_or("(none)"),
+            wait.since.as_deref().unwrap_or("(none)"),
+        ))
+    })();
+    state.unwrap_or_else(|err| format!("execution {id}: current state unavailable ({err:#})\n"))
 }
 
 /// Render one execution's timeline with its unreadable regions marked in place.

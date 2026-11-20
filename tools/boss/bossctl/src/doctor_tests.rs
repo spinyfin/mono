@@ -1207,3 +1207,102 @@ fn diagnose_resolves_items_without_execution_or_event_history() {
         assert!(report["timelines"].as_object().unwrap().is_empty(), "{report}");
     }
 }
+
+#[test]
+fn diagnose_header_reports_current_execution_state() {
+    use boss_protocol::{CreateChoreInput, CreateExecutionInput, CreateProductInput, ExecutionKind, ExecutionStatus};
+
+    let db = boss_engine::work::WorkDb::open(":memory:".into()).unwrap();
+    let product = db
+        .create_product(
+            CreateProductInput::builder()
+                .name("Diagnose wait")
+                .repo_remote_url("git@example.com:diagnose/wait.git")
+                .build(),
+        )
+        .unwrap();
+    let chore = |name: &str| {
+        db.create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(name)
+                .build(),
+        )
+        .unwrap()
+    };
+    let execution = |work_item_id: &str, status| {
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(status)
+                .build(),
+        )
+        .unwrap()
+    };
+    let held = chore("header state");
+    let held_execution = execution(&held.id, ExecutionStatus::Ready);
+    let header = render_execution_state(&db, &held_execution.id);
+    assert!(header.contains("dispatch_wait_reason=(none) dispatch_wait_blocker_id=(none) dispatch_wait_since=(none)"));
+    assert!(render_execution_state(&db, "exec_missing").contains("current state unavailable"));
+    db.set_dispatch_wait_reason(&held_execution.id, "pool_exhausted")
+        .unwrap();
+    let header = render_execution_state(&db, &held_execution.id);
+    assert!(
+        header.starts_with(&format!(
+            "execution {}: status=ready work_item={} attempt=1\n",
+            held_execution.id, held.id
+        )),
+        "{header}"
+    );
+    assert!(header.contains("dispatch_wait_reason=pool_exhausted"), "{header}");
+    assert!(header.contains("dispatch_wait_blocker_id=(none)"), "{header}");
+    assert!(
+        header.contains(&format!(
+            "dispatch_wait_since={}",
+            db.get_execution(&held_execution.id)
+                .unwrap()
+                .dispatch_wait_since
+                .unwrap()
+        )),
+        "{header}"
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET dispatch_wait_blocker_id = 'exec_blocker' WHERE id = ?1",
+            [&held_execution.id],
+        )
+        .unwrap();
+    assert!(render_execution_state(&db, &held_execution.id).contains("dispatch_wait_blocker_id=exec_blocker"));
+}
+
+#[test]
+fn diagnose_human_report_orders_state_timeline_findings_and_recovery() {
+    let exec_id = "exec_report_order";
+    let root = damaged_mirror_root("report-order", exec_id);
+    // Keep just the fully recovered concatenated line and the surrounding events.
+    let mirror = root.join("executions").join(exec_id).join("dispatch.jsonl");
+    let contents = std::fs::read_to_string(&mirror).unwrap();
+    let recovered = contents
+        .lines()
+        .filter(|line| !line.contains("cube_workspace_lea"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&mirror, recovered).unwrap();
+    let report = diagnose_report(&root, exec_id, false, false, 10_000, None)
+        .unwrap()
+        .unwrap();
+    let output = report.as_str().unwrap();
+    assert!(
+        output.starts_with(&format!("execution {exec_id}: current state unavailable")),
+        "{output}"
+    );
+    let timeline = output.find("timeline for execution").unwrap();
+    let findings = output.find("signatures:").unwrap();
+    let footer = output.find("stream integrity:").unwrap();
+    assert!(timeline < findings && findings < footer, "{output}");
+    assert!(!output.contains("STREAM INTEGRITY"), "{output}");
+    assert_eq!(output[footer..].lines().count(), 1, "{output}");
+    let _ = std::fs::remove_dir_all(root);
+}
