@@ -48,13 +48,3 @@ pub async fn advancing(mut ready: impl FnMut() -> bool) {
         tokio::task::yield_now().await;
     }
 }
-
-/// Run `operation` on the held clock while advancing virtual time, for phases
-/// where every command is deliberately left unanswered or its outcome does not
-/// depend on a reply arriving in time.
-pub async fn advancing_during<T>(operation: impl Future<Output = T>) -> T {
-    tokio::select! {
-        result = operation => result,
-        () = advancing(|| false) => unreachable!(),
-    }
-}

@@ -1,5 +1,6 @@
 //! A real hub (stream manager over mTLS gRPC, work database, command outbox)
 //! and a scripted spoke on the other end of a real stream.
+mod observed_outbox;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -340,6 +341,7 @@ impl SpawnComposer for Composer {
 pub struct Fixture {
     pub db: Arc<WorkDb>,
     pub signals: Arc<PromptSignals>,
+    pub stop_submissions: Arc<AtomicU64>,
     pub provider: Arc<SpokeHostAdapterProvider>,
     pub manager: StreamManager,
     legacy: Arc<Legacy>,
@@ -405,7 +407,11 @@ impl Fixture {
             db: Arc::clone(&db),
             state: Mutex::new(HashMap::new()),
         });
-        let outbox = WorkDbOutbox::new(Arc::clone(&db));
+        let stop_submissions = Arc::new(AtomicU64::new(0));
+        let outbox = observed_outbox::ObservedOutbox {
+            inner: WorkDbOutbox::new(Arc::clone(&db)),
+            stops: Arc::clone(&stop_submissions),
+        };
         let manager = StreamManager::new(
             Config::builder()
                 .hub_id("hub")
@@ -447,7 +453,10 @@ impl Fixture {
             .tls_config(tls)
             .unwrap();
         let legacy = Arc::new(Legacy::default());
-        let signals = Arc::new(PromptSignals(std::sync::atomic::AtomicBool::new(true)));
+        let signals = Arc::new(PromptSignals(
+            std::sync::atomic::AtomicBool::new(true),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
         let provider = SpokeHostAdapterProvider::new(
             Arc::new(LegacyProvider(Arc::clone(&legacy))),
             manager.clone(),
@@ -458,6 +467,7 @@ impl Fixture {
         );
         Self::builder()
             .signals(signals)
+            .stop_submissions(stop_submissions)
             .db(db)
             .provider(Arc::new(provider))
             .manager(manager)
@@ -891,7 +901,7 @@ pub fn work_item() -> WorkItem {
     )
 }
 
-pub struct PromptSignals(pub std::sync::atomic::AtomicBool);
+pub struct PromptSignals(pub std::sync::atomic::AtomicBool, pub std::sync::atomic::AtomicUsize);
 impl boss_execution_contracts::DriverSignals for PromptSignals {
     fn has_driver_signal_for_run(&self, _: &str) -> bool {
         true
@@ -900,6 +910,7 @@ impl boss_execution_contracts::DriverSignals for PromptSignals {
         Some("session_start".into())
     }
     fn has_prompt_accepted_for_run(&self, _: &str) -> bool {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn commit_never_started_reap(&self, _: u8, _: &str) -> boss_execution_contracts::NeverStartedReap {
