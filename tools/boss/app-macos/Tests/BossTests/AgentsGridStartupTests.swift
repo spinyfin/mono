@@ -17,7 +17,6 @@ final class AgentsGridStartupTests: XCTestCase {
             if !areaFirst { grid.noteArea(width: 1400, height: 900, inLiveResize: false) }
             XCTAssertEqual(grid.layout.capacity, 6)
             XCTAssertEqual(grid.layout.pages.map(\.occupiedCount), [6, 6, 2])
-            XCTAssertTrue(grid.unplacedViewers.isEmpty)
 
             // A later real terminal measurement is an ordinary geometry boundary.
             grid.noteCellSize(width: 8, height: 16)
@@ -62,6 +61,6 @@ final class AgentsGridStartupTests: XCTestCase {
             )
         }
         grid.apply(states: states, viewers: [:], interactivePoolSize: 16,
-                   automationPoolSize: 8, reviewPoolSize: 16, feedUnavailable: false)
+                   automationPoolSize: 8, reviewPoolSize: 16)
     }
 }
