@@ -396,11 +396,9 @@ async fn codex_applied_no_op_with_changed_description_releases_the_live_slot() {
 /// Stack the Stop dispatch path may have in use when it calls out to GitHub:
 /// an eighth of the 2 MiB a test thread or a tokio worker gets by default.
 ///
-/// The route below measured 118 KiB deep at that call when this budget was
-/// set, in an unoptimised arm64 build. Before the fan-out and the Stop handler
-/// stopped building their callees' futures in their own stack frames, the same
-/// route used 1.9 MiB of the thread's 2 MiB, and the first test in this file
-/// overflowed its thread on Linux CI.
+/// The route uses roughly 120 KiB in an unoptimised arm64 build. This leaves
+/// room for platform differences while detecting a callee future built in a
+/// caller frame, which can add hundreds of KiB.
 const STOP_DISPATCH_STACK_BUDGET: usize = 256 * 1024;
 
 /// Size the dispatch future itself may have. It holds two references and a
@@ -412,6 +410,7 @@ const STOP_DISPATCH_FUTURE_BUDGET: usize = 256;
 /// asks GitHub about a PR.
 struct StackAtGithubCalls {
     dispatch_thread: std::thread::ThreadId,
+    start: std::sync::atomic::AtomicUsize,
     deepest: std::sync::atomic::AtomicUsize,
 }
 
@@ -419,6 +418,7 @@ impl StackAtGithubCalls {
     fn on_this_thread() -> Self {
         Self {
             dispatch_thread: std::thread::current().id(),
+            start: std::sync::atomic::AtomicUsize::new(0),
             deepest: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
@@ -427,10 +427,19 @@ impl StackAtGithubCalls {
     /// thread's stack.
     fn record(&self) {
         if std::thread::current().id() == self.dispatch_thread {
-            self.deepest.fetch_min(
-                boss_engine_utils::heap_future::stack_position(),
-                std::sync::atomic::Ordering::Relaxed,
+            let position = boss_engine_utils::heap_future::stack_position();
+            let start = self.start.load(std::sync::atomic::Ordering::Relaxed);
+            assert_ne!(start, 0, "capture the stack baseline before dispatch");
+            let depth = start.saturating_sub(position);
+            assert!(
+                depth <= STOP_DISPATCH_STACK_BUDGET,
+                "the Stop dispatch path was {depth} bytes of stack deep when it probed GitHub; the budget is \
+                 {STOP_DISPATCH_STACK_BUDGET}. A function between `dispatch_worker_event_fanout` and the \
+                 mergeability probe is building the futures it awaits in its own stack frame again. Await \
+                 them through `boss_engine_utils::heap_future::on_heap`; `Box::pin(..).await` does not \
+                 keep them out of the frame.",
             );
+            self.deepest.fetch_min(position, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -440,6 +449,14 @@ impl StackAtGithubCalls {
         let deepest = self.deepest.load(std::sync::atomic::Ordering::Relaxed);
         (deepest != usize::MAX).then(|| start.saturating_sub(deepest))
     }
+}
+
+#[test]
+#[should_panic(expected = "the Stop dispatch path was")]
+fn github_probe_rejects_excess_stack_depth_synchronously() {
+    let calls = StackAtGithubCalls::on_this_thread();
+    calls.start.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+    calls.record();
 }
 
 /// Fails every mergeability probe, like [`UnreachableBranchVerifier`], and
@@ -496,7 +513,14 @@ async fn stop_dispatch_reaches_github_within_its_stack_budget() {
 
     let dispatch = dispatch_worker_event_fanout(&server_state, &stop);
     let dispatch_future_size = std::mem::size_of_val(&dispatch);
+    assert!(
+        dispatch_future_size <= STOP_DISPATCH_FUTURE_BUDGET,
+        "the Stop dispatch future is {dispatch_future_size} bytes; the budget is \
+         {STOP_DISPATCH_FUTURE_BUDGET}. Something it awaits is stored inline in it. Await it through \
+         `boss_engine_utils::heap_future::on_heap`.",
+    );
     let start = boss_engine_utils::heap_future::stack_position();
+    github_calls.start.store(start, std::sync::atomic::Ordering::Relaxed);
     dispatch.await;
 
     assert_eq!(
@@ -507,18 +531,15 @@ async fn stop_dispatch_reaches_github_within_its_stack_budget() {
     let depth = github_calls
         .deepest_below(start)
         .expect("the fail-closed route asks GitHub whether the PR is mergeable");
-    assert!(
-        depth <= STOP_DISPATCH_STACK_BUDGET,
-        "the Stop dispatch path was {depth} bytes of stack deep when it probed GitHub; the budget is \
-         {STOP_DISPATCH_STACK_BUDGET}. A function between `dispatch_worker_event_fanout` and the \
-         mergeability probe is building the futures it awaits in its own stack frame again. Await \
-         them through `boss_engine_utils::heap_future::on_heap`; `Box::pin(..).await` does not \
-         keep them out of the frame.",
-    );
-    assert!(
-        dispatch_future_size <= STOP_DISPATCH_FUTURE_BUDGET,
-        "the Stop dispatch future is {dispatch_future_size} bytes; the budget is \
-         {STOP_DISPATCH_FUTURE_BUDGET}. Something it awaits is stored inline in it. Await it through \
-         `boss_engine_utils::heap_future::on_heap`.",
-    );
+    // Write directly so successful CI runs retain the platform measurement.
+    use std::io::Write as _;
+    writeln!(
+        std::io::stderr(),
+        "Stop dispatch on {}-{}: probe depth {depth}/{STOP_DISPATCH_STACK_BUDGET} bytes \
+         ({} bytes headroom); future {dispatch_future_size}/{STOP_DISPATCH_FUTURE_BUDGET} bytes",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        STOP_DISPATCH_STACK_BUDGET - depth,
+    )
+    .unwrap();
 }

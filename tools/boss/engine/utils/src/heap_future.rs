@@ -10,10 +10,8 @@
 //!
 //! `Box::pin(child()).await` removes one of the two: the parent's state now
 //! holds a pointer, but `child()` is still returned into the caller's frame
-//! before `Box::pin` moves it to the heap. Measured with ten awaits of a 20 KB
-//! future in a debug build, the stack below the caller was 420 KB awaited
-//! inline, 201 KB with `Box::pin(child()).await`, and under 1 KB with
-//! [`on_heap`].
+//! before `Box::pin` moves it to the heap. Large callees can therefore consume
+//! most of a thread's stack even when the parent stores only boxed futures.
 //!
 //! [`on_heap`] takes a closure that makes the future, so the future is built
 //! in a frame that has returned before anything is polled.
@@ -41,8 +39,8 @@ where
     Box::pin(make())
 }
 
-/// Address of a local in the caller's caller, as a stand-in for the stack
-/// pointer.
+/// Address of a local in this helper's own frame, as a stand-in for the
+/// stack pointer in tests and diagnostics.
 ///
 /// Two readings on one thread differ by the stack in use between the two
 /// calls (the stack grows down, so the deeper reading is the smaller one).

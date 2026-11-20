@@ -511,9 +511,9 @@ impl WorkerCompletionHandler {
     /// about sixty await points and a call takes one route through them, but
     /// an unoptimised build reserves stack for all of them at once: each
     /// future awaited in place gets its own slots in this function's frame.
-    /// That made the frame 1.3 MB on every Stop, most of a 2 MiB thread stack
-    /// before any callee ran. `Box::pin(..).await` only halves it; see
-    /// [`boss_engine_utils::heap_future`]. Await new callees the same way.
+    /// Large callees can exhaust the thread stack before any callee runs.
+    /// `Box::pin(child()).await` still builds the child in this frame; see
+    /// [`boss_engine_utils::heap_future`]. Await new callees through `on_heap`.
     pub(super) async fn on_stop_inner(
         &self,
         execution_id: &str,
