@@ -400,29 +400,44 @@ else:
 # good, a healthy one keeps running against a build that is over, and the
 # private root is never removed.
 #
-# So a watchdog holds the read end of a FIFO whose only write end is this
-# shell's descriptor 8. The kernel closes that descriptor however this shell
-# dies. A line on the FIFO says cleanup already happened; end-of-file says the
-# shell is gone, and the watchdog does the cleanup in its place. The FIFO is
-# unlinked once both ends are open, so nothing else can open it.
+# Two FIFOs: the lifeline (this shell holds the only write end on fd 8) tells
+# the watchdog whether cleanup already happened, and the announce FIFO (fd 10)
+# carries the test's pid. Both are unlinked once the ends are open. The
+# watchdog starts first and publishes watchdog-ready before the test can run,
+# so a kill of this group cannot leave a test with no cleanup owner. The
+# kernel closes the write ends however this shell dies. A line on the lifeline
+# says cleanup already happened; end-of-file says the shell is gone, and the
+# watchdog does the cleanup in its place.
 lifeline="${TEST_TMPDIR}/wrapper-lifeline"
-"${runtime_bin}/mkfifo" "${lifeline}"
+announce="${TEST_TMPDIR}/wrapper-announce"
+"${runtime_bin}/mkfifo" "${lifeline}" "${announce}"
 exec 8<>"${lifeline}" 9<"${lifeline}"
-"${runtime_bin}/rm" -f "${lifeline}"
+exec 10<>"${announce}" 11<"${announce}"
+"${runtime_bin}/rm" -f "${lifeline}" "${announce}"
 
-# Monitor mode gives sandbox-exec and all descendants a dedicated process
-# group, allowing timeout/interrupt traps to forward the original signal to
-# the complete test tree before removing the private root. The watchdog gets
-# a group of its own for the same reason the test does: a kill aimed at this
-# shell's group must not take it too. Neither end of the FIFO reaches the
-# test, where a surviving descendant would hold the write end open.
+# The watchdog gets a group of its own so a kill aimed at this shell's group
+# cannot take it too. It is listening before the test starts. Record this
+# shell's pid, not the watchdog's PPID, so a Bazel sh_binary stub that
+# remains the parent still matches the outer test's $!.
+wrapper_pid=$$
 set -m
-/usr/bin/sandbox-exec -f "${profile}" "$@" 8<&- 9<&- &
-child_pid=$!
 (
   set +m
   trap - EXIT INT TERM HUP
-  exec 8<&- </dev/null >/dev/null 2>&1
+  exec 8<&- 10<&- </dev/null >/dev/null 2>&1
+  printf '%s\n' "${wrapper_pid}" >"${TEST_TMPDIR}/watchdog-ready"
+  if ! IFS= read -r child_pid <&11; then
+    child_pid=""
+  fi
+  exec 11<&-
+  if [[ -z "${child_pid}" ]]; then
+    # The wrapper died before the test announced a pid. The launcher stays in
+    # the wrapper's group until that announce, so it died with the wrapper.
+    if [[ "${owns_test_tmpdir}" == "1" ]]; then
+      "${runtime_bin}/rm" -rf "${test_tmpdir}"
+    fi
+    exit 0
+  fi
   if IFS= read -r _ <&9; then
     exit 0
   fi
@@ -433,7 +448,38 @@ child_pid=$!
 ) &
 watchdog_pid=$!
 set +m
-exec 9<&-
+exec 9<&- 11<&-
+
+for _ in {1..200}; do
+  if [[ -f "${TEST_TMPDIR}/watchdog-ready" ]]; then
+    break
+  fi
+  "${runtime_bin}/sleep" 0.01
+done
+if [[ ! -f "${TEST_TMPDIR}/watchdog-ready" ]]; then
+  printf '%s\n' "watchdog did not start" >&2
+  exit 126
+fi
+
+# The launcher stays in this shell's group, writes its pid, then setpgid's
+# into its own group and execs sandbox-exec. Until the pid reaches the
+# watchdog, a kill of this group still takes the launcher with it. Neither
+# FIFO end is passed through the exec, so a surviving test descendant cannot
+# hold them open.
+"${runtime_bin}/python3" -c \
+  'import os, sys
+os.write(10, ("%d\n" % os.getpid()).encode())
+for fd in (8, 9, 10, 11):
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+os.setpgid(0, 0)
+os.execvp(sys.argv[1], sys.argv[1:])
+os._exit(127)' \
+  /usr/bin/sandbox-exec -f "${profile}" "$@" 8<&- 9<&- 11<&- &
+child_pid=$!
+exec 10<&-
 
 set +e
 wait "${child_pid}"
