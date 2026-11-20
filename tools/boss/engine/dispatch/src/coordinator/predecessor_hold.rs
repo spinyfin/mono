@@ -2,6 +2,7 @@
 //! workspace lease. Part of the `coordinator` module split.
 
 use super::*;
+use boss_execution_contracts::PredecessorRelease;
 
 /// How long a kept-lease problem may persist before a recovery successor is
 /// failed instead of held. The lease sweeps run every minute and
@@ -19,6 +20,8 @@ pub(super) enum PredecessorHold {
 pub(super) struct Recheck {
     pub(super) completed: Option<std::time::Instant>,
     at_bound: bool,
+    own_pending: bool,
+    release: PredecessorRelease,
 }
 
 impl ExecutionCoordinator {
@@ -159,6 +162,10 @@ impl ExecutionCoordinator {
     /// the new holder's workspace. Absent leases are cleared only after
     /// owning-host preservation succeeds. Returns true while a refresh is in flight;
     /// callers must keep waiting, including at the bound, until it completes.
+    ///
+    /// This only repeats a release that an earlier attempt kept. A
+    /// predecessor's first release belongs to the path that ended it; see
+    /// [`Self::release_abandoned_run`] for the one this coordinator owns.
     pub(super) fn refresh_predecessor_lease(self: &Arc<Self>, execution: &WorkExecution) -> bool {
         let Ok(Some(predecessor)) = self.work_db.recovery_predecessor_holding_lease(execution) else {
             return false;
@@ -183,36 +190,126 @@ impl ExecutionCoordinator {
                 Recheck {
                     completed: None,
                     at_bound,
+                    own_pending: false,
+                    release: PredecessorRelease::RetryKept,
                 },
             );
         }
+        self.spawn_predecessor_release(predecessor, at_bound, PredecessorRelease::RetryKept);
+        true
+    }
+
+    /// Start the release of a run that an explicit start has just abandoned
+    /// as stale.
+    ///
+    /// Abandoning a stale run is a database write. Unlike every other path
+    /// that ends a run, it tears nothing down, so the row keeps its cube
+    /// lease and its successor is held behind it. The request that abandoned
+    /// the run is the path that ended it, and it established that the
+    /// registry has no live pane for the run and that no dispatch or spawn of
+    /// it is in flight, so that request owns the first release. It goes
+    /// through the same gates as any inferred death: the lease is returned
+    /// only once the registry lists no pane for the run in any state, a
+    /// recorded worker shell is confirmed dead and the workspace is empty,
+    /// and the work is preserved first. Without that proof nothing is
+    /// released and the successor stays held.
+    ///
+    /// Registered as the run's in-flight re-check, so a dispatch of the
+    /// successor waits for it (the drain as a hold, a forced launch inside
+    /// its own call) and the scheduler is woken when it completes.
+    pub(super) fn release_abandoned_run(self: &Arc<Self>, execution_id: &str) {
+        let abandoned = match self.work_db.get_execution(execution_id) {
+            Ok(execution) => execution,
+            Err(err) => {
+                tracing::warn!(execution_id, error = %format!("{err:#}"), "could not read a run abandoned as stale");
+                return;
+            }
+        };
+        // A stale `ci_remediation` run is re-queued in place rather than abandoned.
+        if abandoned.status != ExecutionStatus::Abandoned || abandoned.cube_lease_id.is_none() {
+            return;
+        }
+        {
+            let mut attempts = self.predecessor_rechecks.lock().expect("predecessor recheck lock");
+            if let Some(check) = attempts.get_mut(&abandoned.id)
+                && check.completed.is_none()
+            {
+                // Keep the first-release obligation behind a retry that the
+                // scheduler started after the successor became visible.
+                check.own_pending = check.release == PredecessorRelease::RetryKept;
+                return;
+            }
+            attempts.insert(
+                abandoned.id.clone(),
+                Recheck {
+                    completed: None,
+                    at_bound: false,
+                    own_pending: false,
+                    release: PredecessorRelease::Own,
+                },
+            );
+        }
+        tracing::info!(
+            execution_id = %abandoned.id,
+            work_item_id = %abandoned.work_item_id,
+            cube_lease_id = abandoned.cube_lease_id.as_deref().unwrap_or(""),
+            "run abandoned as stale by an explicit start still holds its cube lease; \
+             preserving its work and releasing the lease if its worker is confirmed gone",
+        );
+        self.spawn_predecessor_release(abandoned, false, PredecessorRelease::Own);
+    }
+
+    /// Run one predecessor lease re-check off the caller's task. The caller
+    /// has already registered it in [`Self::predecessor_rechecks`].
+    fn spawn_predecessor_release(
+        self: &Arc<Self>,
+        predecessor: WorkExecution,
+        at_bound: bool,
+        release: PredecessorRelease,
+    ) {
         let coordinator = Arc::clone(self);
         boss_task_scope::spawn(async move {
-            coordinator
-                .lifecycle
-                .refresh_predecessor_lease(
-                    &predecessor,
-                    coordinator.live_worker_states(),
-                    coordinator.host_adapter_provider.as_ref(),
-                    coordinator.host_adapter(),
-                    at_bound,
-                )
-                .await;
-            coordinator
-                .predecessor_rechecks
-                .lock()
-                .expect("predecessor recheck lock")
-                .insert(
-                    predecessor.id,
-                    Recheck {
-                        completed: Some(std::time::Instant::now()),
-                        at_bound,
-                    },
-                );
+            let mut release = release;
+            loop {
+                // A preceding retry can already have returned the lease.
+                // Read its current binding before performing a queued release.
+                match coordinator.work_db.get_execution(&predecessor.id) {
+                    Ok(current) => {
+                        coordinator
+                            .lifecycle
+                            .refresh_predecessor_lease(
+                                &current,
+                                coordinator.live_worker_states(),
+                                coordinator.host_adapter_provider.as_ref(),
+                                coordinator.host_adapter(),
+                                at_bound,
+                                release,
+                            )
+                            .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(execution_id = %predecessor.id, %err, "could not refresh predecessor for release")
+                    }
+                }
+                let mut attempts = coordinator
+                    .predecessor_rechecks
+                    .lock()
+                    .expect("predecessor recheck lock");
+                let check = attempts
+                    .get_mut(&predecessor.id)
+                    .expect("registered predecessor recheck");
+                if std::mem::take(&mut check.own_pending) {
+                    // Serialize release attempts for the same workspace.
+                    release = PredecessorRelease::Own;
+                    check.release = release;
+                    continue;
+                }
+                check.completed = Some(std::time::Instant::now());
+                break;
+            }
             coordinator.predecessor_recheck_done.notify_waiters();
             coordinator.kick();
         });
-        true
     }
 
     /// Explicit dispatch can await its own predecessor without holding the drain.

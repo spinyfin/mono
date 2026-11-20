@@ -1249,8 +1249,15 @@ pub(super) async fn apply_work_item_patch_from(
                             .audit_actor(actor)
                             .audit_basis(start_basis.clone())
                             .build();
-                        match work_db
-                            .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))
+                        // Through the coordinator rather than the store, so
+                        // this start shares the liveness test of every other
+                        // explicit start. The run it weighs can be an older
+                        // `running` row behind the terminal one that made
+                        // `needs_dispatch` true, and the registry alone does
+                        // not know about a run the engine is still starting.
+                        match server_state
+                            .execution_coordinator
+                            .request_execution_via_db(dispatch_input, live_states)
                         {
                             Ok(execution) => {
                                 server_state.execution_coordinator.kick();

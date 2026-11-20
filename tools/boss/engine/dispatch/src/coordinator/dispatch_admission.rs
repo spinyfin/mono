@@ -483,11 +483,60 @@ impl ExecutionCoordinator {
         Ok(execution)
     }
 
+    /// Non-blocking, in-transaction check that the engine is still starting
+    /// `execution_id`'s worker: its dispatch reservation is held, or
+    /// `run_execution` is still driving its spawn.
+    ///
+    /// The live-worker registry cannot answer this: a pane is registered only
+    /// seconds after the row turns `running` and commits its run. This runs
+    /// from the store predicate while the DB connection is held, and the
+    /// reservation table lock is held across DB calls elsewhere, so it must
+    /// never block: a busy lock reads as "starting" (fail safe toward not
+    /// abandoning the run).
+    fn starting_worker_nonblocking(&self, execution_id: &str) -> bool {
+        self.inflight_dispatches
+            .try_is_execution_dispatching(execution_id)
+            .unwrap_or(true)
+            || self.try_is_driving_run(execution_id).unwrap_or(true)
+    }
+
+    /// Create or reuse the work item's execution for an explicit request
+    /// (`bossctl work start`, `bossctl agents launch`, a kanban drag).
+    ///
+    /// An existing run counts as live when the registry has its pane, when it
+    /// is in the starting-set snapshot taken before the transaction, or when
+    /// the non-blocking in-transaction read ([`Self::starting_worker_nonblocking`])
+    /// says the engine is still bringing it up. The in-transaction read closes
+    /// the window in which a dispatch reserves and commits the run after the
+    /// snapshot but before the transaction begins.
+    /// Only a run that is neither is treated as stale and replaced, so a
+    /// request that arrives right behind a dispatch returns the run that
+    /// dispatch started instead of abandoning it.
+    ///
+    /// A run this request does replace is abandoned with its cube lease still
+    /// recorded. The request starts that run's release before returning (see
+    /// [`Self::release_abandoned_run`]), so the successor it just queued is
+    /// not left waiting for a sweep to notice.
     pub fn request_execution_via_db(
-        &self,
+        self: &Arc<Self>,
         mut input: RequestExecutionInput,
         live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
+        // Reservation conflict checks take the table lock before querying the DB.
+        // Never acquire it from the store predicate, which holds the DB lock.
+        // Read reservations before driving runs: the driver takes ownership
+        // before the reservation is dropped, so a handoff stays in this union.
+        let mut starting = self.inflight_dispatches.execution_ids();
+        starting.extend(
+            self.driving_runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .ids
+                .iter()
+                .cloned(),
+        );
+        let has_worker =
+            |id: &str| live_states.is_run_live(id) || starting.contains(id) || self.starting_worker_nonblocking(id);
         if let Some(host_id) = input.requested_host_id.clone() {
             // `request_execution_with_live_check` (called below) resolves
             // friendly short ids (a `T`-prefixed short id, `#42`, ...) to a
@@ -515,7 +564,7 @@ impl ExecutionCoordinator {
                 .find(|execution| {
                     execution.work_item_id == input.work_item_id
                         && !execution.status.is_terminal()
-                        && live_states.is_run_live(&execution.id)
+                        && has_worker(&execution.id)
                 });
             if let Some(execution) = live_execution {
                 bail!(
@@ -527,9 +576,19 @@ impl ExecutionCoordinator {
             self.validate_requested_host(&input.work_item_id, &host_id)?;
         }
         let requested_host_id = input.requested_host_id.clone();
-        let execution = self
-            .work_db
-            .request_execution_with_live_check(input, move |run_id| live_states.is_run_live(run_id))?;
+        // The store asks about one run at most: the started run that governs
+        // this work item. Answering "no worker" is what makes it stale.
+        let mut judged_stale = None;
+        let execution = self.work_db.request_execution_with_live_check(input, |id| {
+            let live = has_worker(id);
+            if !live {
+                judged_stale = Some(id.to_owned());
+            }
+            live
+        })?;
+        if let Some(stale) = judged_stale {
+            self.release_abandoned_run(&stale);
+        }
         if let Some(host_id) = requested_host_id {
             if execution.status != ExecutionStatus::Ready {
                 // Reached only after the live-execution pre-check above has

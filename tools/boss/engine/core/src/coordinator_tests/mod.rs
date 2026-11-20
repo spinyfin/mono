@@ -13,6 +13,7 @@ mod execution_bookmarks;
 mod execution_contracts;
 mod focus_mode;
 mod helpers;
+mod launch_during_dispatch;
 mod lease_pending;
 mod lease_retry;
 mod live_writer_deferral;

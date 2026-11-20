@@ -151,6 +151,35 @@ impl InflightDispatches {
             .any(|e| e.work_item_id == work_item_id)
     }
 
+    /// Non-blocking: whether this exact execution holds a reservation (its
+    /// dispatch has been handed off and has not yet returned). `None` when the
+    /// table lock is busy. Safe to call while the DB connection is held, which
+    /// a blocking read is not: the lock is held across DB calls elsewhere.
+    pub fn try_is_execution_dispatching(&self, execution_id: &str) -> Option<bool> {
+        match self.table.try_lock() {
+            Ok(table) => Some(table.contains_key(execution_id)),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner().contains_key(execution_id)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Snapshot reservation ownership before entering a database transaction.
+    pub(crate) fn execution_ids(&self) -> std::collections::HashSet<String> {
+        self.table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Park a reservation operation at its DB boundary for lock-order tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_table_locked_for_test(&self, operation: impl FnOnce()) {
+        let _table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        operation();
+    }
+
     /// In-flight dispatches on work items in `member_ids`, excluding
     /// `exclude_execution_id` (the caller itself) and excluding
     /// `exclude_work_item_id`.
@@ -317,6 +346,30 @@ mod tests {
         );
         assert!(inflight.is_work_item_dispatching("T1"));
         assert!(!inflight.is_work_item_dispatching("T2"));
+    }
+
+    /// The per-execution answer names only the row that holds the
+    /// reservation, and stops naming it once the dispatch returns.
+    #[test]
+    fn only_the_reserved_execution_reads_as_dispatching() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let inflight = InflightDispatches::new();
+
+        let reservation = inflight
+            .try_reserve(&execution("exec_a", "T1"), &db)
+            .expect("first reservation");
+
+        assert_eq!(inflight.try_is_execution_dispatching("exec_a"), Some(true));
+        assert_eq!(inflight.try_is_execution_dispatching("exec_b"), Some(false));
+
+        // A busy table reads as unknown, never blocks.
+        inflight.with_table_locked_for_test(|| {
+            assert_eq!(inflight.try_is_execution_dispatching("exec_a"), None);
+        });
+
+        drop(reservation);
+        assert_eq!(inflight.try_is_execution_dispatching("exec_a"), Some(false));
     }
 
     /// `try_reserve` is the atomic claim. A `contains`-then-`reserve` pair
