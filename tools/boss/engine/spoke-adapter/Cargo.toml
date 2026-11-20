@@ -32,6 +32,6 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
