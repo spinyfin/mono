@@ -1,7 +1,8 @@
+use crate::bazel_support::{logical_bazelrc_lines, shell_split};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::input::SourceTree;
 
@@ -121,72 +122,6 @@ fn parse_bazelrc_file(path: &Path, contents: &str) -> Result<Vec<BazelrcEntry>> 
     }
 
     Ok(entries)
-}
-
-fn logical_bazelrc_lines(contents: &str) -> Result<Vec<(u32, String)>> {
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut current_start_line = 1u32;
-
-    for (index, line) in contents.lines().enumerate() {
-        let line_number = (index + 1) as u32;
-        if current.is_empty() {
-            current_start_line = line_number;
-        } else {
-            current.push(' ');
-        }
-
-        let continued = line.ends_with('\\');
-        if continued {
-            current.push_str(line.trim_end_matches('\\'));
-            continue;
-        }
-
-        current.push_str(line);
-        result.push((current_start_line, current.clone()));
-        current.clear();
-    }
-
-    if !current.is_empty() {
-        bail!("unterminated bazelrc line continuation");
-    }
-
-    Ok(result)
-}
-
-fn shell_split(line: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = line.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '\\' if !in_single => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            ch if ch.is_whitespace() && !in_single && !in_double => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            other => current.push(other),
-        }
-    }
-
-    if in_single || in_double {
-        bail!("unterminated quoted string");
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    Ok(tokens)
 }
 
 fn resolve_import_path(current_path: &Path, raw_import: &str) -> Option<PathBuf> {

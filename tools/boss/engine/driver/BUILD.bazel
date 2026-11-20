@@ -43,6 +43,7 @@ rust_library(
         "//tools/boss/engine/work-db:__pkg__",
     ],
     deps = [
+        "//lib/rust/bazel_support",
         "//tools/boss/codex_auth",
         "//tools/boss/command-runner",
         "//tools/boss/engine/codex-hook-trust",

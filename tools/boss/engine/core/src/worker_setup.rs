@@ -423,11 +423,9 @@ fn grant_bazel_output_root(permissions: &mut serde_json::Value, input: &WorkerSe
     if permissions["defaultMode"] != "auto" {
         return;
     }
-    let dirs = bazel_output::bazel_output_directories(&input.workspace_path);
-    if dirs.is_empty() {
-        return;
+    if let Some(dir) = bazel_output::bazel_output_directory(&input.workspace_path) {
+        permissions["additionalDirectories"] = serde_json::json!([dir.display().to_string()]);
     }
-    permissions["additionalDirectories"] = dirs.iter().map(|d| d.display().to_string()).collect();
 }
 
 /// Build the `permissions` object for the worker settings file.

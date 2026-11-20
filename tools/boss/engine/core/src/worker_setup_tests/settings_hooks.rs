@@ -437,3 +437,27 @@ fn settings_omit_additional_directories_for_non_bazel_workspaces() {
     let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     assert!(parsed["permissions"].get("additionalDirectories").is_none());
 }
+
+#[test]
+fn settings_restrict_bazel_grants_to_auto_worker_kinds() {
+    let ws = TempDir::new().unwrap();
+    std::fs::write(ws.path().join(".bazelrc"), "startup --output_base=/opt/bazel-base\n").unwrap();
+    for kind in [
+        WorkerKind::AnswerAgent,
+        WorkerKind::Progression,
+        WorkerKind::ReviewGuide,
+        WorkerKind::Standard,
+        WorkerKind::Reviewer,
+        WorkerKind::Triage,
+    ] {
+        let mut input = sample_input();
+        input.workspace_path = ws.path().to_path_buf();
+        input.worker_kind = kind.clone();
+        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+        assert_eq!(
+            parsed["permissions"].get("additionalDirectories").is_some(),
+            matches!(kind, WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage),
+            "{kind:?}"
+        );
+    }
+}

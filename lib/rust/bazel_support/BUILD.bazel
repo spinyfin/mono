@@ -1,0 +1,25 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "bazel_support",
+    # Keep the canonical source in checkleft's published source tree so its
+    # crates.io package needs no unpublished local dependency.
+    srcs = ["//tools/checkleft:src/bazel_support.rs"],
+    crate_root = "//tools/checkleft:src/bazel_support.rs",
+    edition = "2024",
+    visibility = [
+        "//tools/boss/engine/core:__pkg__",
+        "//tools/boss/engine/driver:__pkg__",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "bazel_support_test",
+    size = "small",
+    crate = ":bazel_support",
+    edition = "2024",
+)

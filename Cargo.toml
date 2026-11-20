@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "lib/rust/bazel_support",
   "lib/rust/broker-robinhood",
   "lib/rust/git_utils",
   "lib/rust/process_runner",
