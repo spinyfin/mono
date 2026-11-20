@@ -5,6 +5,7 @@ mod coordinator;
 mod regressions;
 mod routing;
 mod support;
+mod timing;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -214,7 +215,7 @@ fn peer_command(id: &str) -> Command {
 
 #[tokio::test]
 async fn a_spawn_timeout_is_uncertain_and_a_retry_never_starts_a_second_worker() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(500)).await;
     fx.ready(HOST);
     fx.ready("other");
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -273,7 +274,7 @@ fn standard_without_spawn(command: &Command) -> Option<CommandResult> {
 
 #[tokio::test]
 async fn a_result_that_arrives_after_a_reconnect_answers_the_stored_spawn() {
-    let fx = Fixture::with(short(500)).await;
+    let fx = Fixture::with(workspace_slack(500)).await;
     fx.ready(HOST);
     let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
     let first = fx.spoke(Box::new(standard_without_spawn), None, 0).await;
@@ -375,111 +376,129 @@ async fn runs_keep_their_transport_and_a_spoke_lease_is_never_sent_over_ssh() {
 
 #[tokio::test]
 async fn control_requests_name_the_run_and_keep_receipt_delivery_and_uncertainty_apart() {
-    let fx = Fixture::with(short(600)).await;
-    fx.ready(HOST);
-    let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
-    let gone = Arc::new(AtomicBool::new(false));
-    let script_gone = Arc::clone(&gone);
-    let peer = fx
-        .spoke(
-            Box::new(move |c| match &c.body {
-                Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Interrupt as i32 => Some(refused(
-                    c,
-                    ResultCode::Rejected,
-                    "worker is not running; input not sent",
-                )),
-                // A probe is accepted by the spoke but never answered.
-                Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Probe as i32 => None,
-                Some(command::Body::Deliver(_) | command::Body::Stop(_)) => Some(ok(c, Some(pane(PaneLife::Alive)))),
-                Some(command::Body::Adopt(_)) => Some(ok(
-                    c,
-                    Some(pane(if script_gone.load(Ordering::SeqCst) {
-                        PaneLife::Missing
-                    } else {
-                        PaneLife::Alive
-                    })),
-                )),
-                _ => standard(c),
-            }),
-            None,
-            0,
-        )
+    timing::frozen(async {
+        let fx = Fixture::with(short(600)).await;
+        fx.ready(HOST);
+        let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
+        let gone = Arc::new(AtomicBool::new(false));
+        let script_gone = Arc::clone(&gone);
+        let peer = fx
+            .spoke(
+                Box::new(move |c| match &c.body {
+                    Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Interrupt as i32 => Some(refused(
+                        c,
+                        ResultCode::Rejected,
+                        "worker is not running; input not sent",
+                    )),
+                    // A probe is accepted by the spoke but never answered.
+                    Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Probe as i32 => None,
+                    Some(command::Body::Deliver(_) | command::Body::Stop(_)) => {
+                        Some(ok(c, Some(pane(PaneLife::Alive))))
+                    }
+                    Some(command::Body::Adopt(_)) => Some(ok(
+                        c,
+                        Some(pane(if script_gone.load(Ordering::SeqCst) {
+                            PaneLife::Missing
+                        } else {
+                            PaneLife::Alive
+                        })),
+                    )),
+                    _ => standard(c),
+                }),
+                None,
+                0,
+            )
+            .await;
+        // Nothing is controllable before the worker exists.
+        assert!(matches!(
+            adapter
+                .deliver_worker_input("nobody", WorkerInputKind::Nudge, "hi")
+                .await
+                .unwrap(),
+            ControlOutcome::NotSubmitted(_)
+        ));
+        lease(&adapter).await;
+        spawn(&adapter).await.unwrap();
+        let held = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
+
+        let ControlOutcome::Delivered(pane) = adapter
+            .deliver_worker_input("exec_1", WorkerInputKind::Nudge, "hi")
+            .await
+            .unwrap()
+        else {
+            panic!("delivered")
+        };
+        assert_eq!(pane.life, WorkerLife::Alive);
+        assert!(matches!(
+            adapter.interrupt_worker("exec_1").await.unwrap(),
+            ControlOutcome::Rejected { ref reason, .. } if reason.contains("not running")
+        ));
+        let probe = {
+            let adapter = Arc::clone(&adapter);
+            tokio::spawn(async move {
+                adapter
+                    .deliver_worker_input("exec_1", WorkerInputKind::Probe, "p")
+                    .await
+            })
+        };
+        timing::condition(|| {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(&c.body, Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Probe as i32))
+        })
         .await;
-    // Nothing is controllable before the worker exists.
-    assert!(matches!(
-        adapter
-            .deliver_worker_input("nobody", WorkerInputKind::Nudge, "hi")
-            .await
-            .unwrap(),
-        ControlOutcome::NotSubmitted(_)
-    ));
-    lease(&adapter).await;
-    spawn(&adapter).await.unwrap();
-    let held = fx.db.spoke_assignment_for_execution("exec_1").unwrap().unwrap();
+        // Only the deliberately unanswered probe consumes its deadline.
+        // Cross the timer wheel millisecond boundary as well as the deadline.
+        tokio::time::advance(Duration::from_millis(601)).await;
+        assert!(matches!(probe.await.unwrap().unwrap(), ControlOutcome::Uncertain(_)));
+        assert!(matches!(
+            adapter.stop_worker("exec_1", Duration::from_secs(5)).await.unwrap(),
+            ControlOutcome::Delivered(_)
+        ));
 
-    let ControlOutcome::Delivered(pane) = adapter
-        .deliver_worker_input("exec_1", WorkerInputKind::Nudge, "hi")
-        .await
-        .unwrap()
-    else {
-        panic!("delivered")
-    };
-    assert_eq!(pane.life, WorkerLife::Alive);
-    assert!(matches!(
-        adapter.interrupt_worker("exec_1").await.unwrap(),
-        ControlOutcome::Rejected { ref reason, .. } if reason.contains("not running")
-    ));
-    assert!(matches!(
-        adapter
-            .deliver_worker_input("exec_1", WorkerInputKind::Probe, "p")
-            .await
-            .unwrap(),
-        ControlOutcome::Uncertain(_)
-    ));
-    assert!(matches!(
-        adapter.stop_worker("exec_1", Duration::from_secs(5)).await.unwrap(),
-        ControlOutcome::Delivered(_)
-    ));
+        let seen = peer.commands();
+        let delivery = seen.iter().find_map(|c| match &c.body {
+            Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Nudge as i32 => Some((c, d)),
+            _ => None,
+        });
+        let (command, deliver) = delivery.expect("the nudge reached the spoke");
+        assert_eq!(deliver.input_utf8, b"hi");
+        assert_eq!(command.run.as_ref().unwrap().spawn_token, held.spawn_token);
+        let stop = seen.iter().find_map(|c| match &c.body {
+            Some(command::Body::Stop(stop)) => Some(stop.grace_ms),
+            _ => None,
+        });
+        assert_eq!(stop, Some(5000));
 
-    let seen = peer.commands();
-    let delivery = seen.iter().find_map(|c| match &c.body {
-        Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Nudge as i32 => Some((c, d)),
-        _ => None,
-    });
-    let (command, deliver) = delivery.expect("the nudge reached the spoke");
-    assert_eq!(deliver.input_utf8, b"hi");
-    assert_eq!(command.run.as_ref().unwrap().spawn_token, held.spawn_token);
-    let stop = seen.iter().find_map(|c| match &c.body {
-        Some(command::Body::Stop(stop)) => Some(stop.grace_ms),
-        _ => None,
-    });
-    assert_eq!(stop, Some(5000));
+        // Liveness is read from the token's session, keyed by the recorded pid.
+        assert_eq!(adapter.probe_remote_worker_alive(4242).await.unwrap(), Some(true));
+        gone.store(true, Ordering::SeqCst);
+        assert_eq!(adapter.probe_remote_worker_alive(4242).await.unwrap(), Some(false));
+        assert_eq!(
+            adapter.probe_remote_worker_alive(1).await.unwrap(),
+            None,
+            "an unknown pid proves nothing"
+        );
+        assert_eq!(
+            adapter.observe_worker("exec_1").await.unwrap().unwrap().life,
+            WorkerLife::Missing
+        );
 
-    // Liveness is read from the token's session, keyed by the recorded pid.
-    assert_eq!(adapter.probe_remote_worker_alive(4242).await.unwrap(), Some(true));
-    gone.store(true, Ordering::SeqCst);
-    assert_eq!(adapter.probe_remote_worker_alive(4242).await.unwrap(), Some(false));
-    assert_eq!(
-        adapter.probe_remote_worker_alive(1).await.unwrap(),
-        None,
-        "an unknown pid proves nothing"
-    );
-    assert_eq!(
-        adapter.observe_worker("exec_1").await.unwrap().unwrap().life,
-        WorkerLife::Missing
-    );
-
-    // With the stream gone nothing is sent, and the answer says so.
-    peer.disconnect();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(matches!(
-        adapter.interrupt_worker("exec_1").await.unwrap(),
-        ControlOutcome::NotSubmitted(_)
-    ));
-    assert!(
-        adapter.probe_remote_worker_alive(4242).await.is_err(),
-        "an unreachable host is not a dead worker"
-    );
+        // With the stream gone nothing is sent, and the answer says so.
+        peer.disconnect();
+        while fx.manager.host_supports(HOST, "workspace/1").await.is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            adapter.interrupt_worker("exec_1").await.unwrap(),
+            ControlOutcome::NotSubmitted(_)
+        ));
+        assert!(
+            adapter.probe_remote_worker_alive(4242).await.is_err(),
+            "an unreachable host is not a dead worker"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
