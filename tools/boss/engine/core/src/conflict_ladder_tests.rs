@@ -26,6 +26,8 @@ enum Script {
     EnsureRepoErrors,
     RebaseErrors,
     GotoDivergence,
+    GotoRetryable,
+    GotoUnclassified,
 }
 
 /// Configurable [`CubeClient`] double for the rung-1 harness. Records the
@@ -147,10 +149,22 @@ crate::stub_cube_client! { ScriptCube {
     }
     async fn goto_workspace(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<()> {
         self.gotos.lock().await.push(pr);
+        if matches!(self.script, Script::GotoRetryable) {
+            return Err(boss_host_execution::cube::CubeCliError {
+                host: "local".into(), exit_code: Some(75), stdout: String::new(),
+                stderr: r#"{"error":"maintenance busy","error_kind":"maintenance_busy","retryable":true}"#.into(),
+            }.into());
+        }
+        if matches!(self.script, Script::GotoUnclassified) {
+            return Err(boss_host_execution::cube::CubeCliError {
+                host: "local".into(), exit_code: Some(2), stdout: String::new(),
+                stderr: r#"{"error":"failed to resolve PR 42 in owner/repo: gh: connection reset"}"#.into(),
+            }.into());
+        }
         if matches!(self.script, Script::GotoDivergence) {
             return Err(boss_host_execution::cube::CubeCliError {
-                host: "local".into(), exit_code: Some(1), stdout: String::new(),
-                stderr: "cube will not pick a side with unique content; inspect with jj log; resolve with jj bookmark set pr/42 -r head --allow-backwards".into(),
+                host: "local".into(), exit_code: Some(2), stdout: String::new(),
+                stderr: r#"{"error":"cube will not pick a side with unique content; inspect with jj log; resolve with jj bookmark set pr/42 -r head --allow-backwards","error_kind":"workspace_positioning_refused","retryable":false}"#.into(),
             }.into());
         }
         Ok(())
@@ -172,7 +186,7 @@ crate::stub_cube_client! { ScriptCube {
                 Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: files.clone(), linearized_commits: 0, linearize_decline: None })
             }
             Script::RebaseErrors => anyhow::bail!("rebase boom"),
-            Script::GotoDivergence => unreachable!("goto must refuse before rebase"),
+            Script::GotoDivergence | Script::GotoRetryable | Script::GotoUnclassified => unreachable!("goto must refuse before rebase"),
             Script::EnsureRepoErrors => unreachable!("ensure_repo already errored"),
         }
     }

@@ -2595,11 +2595,8 @@ impl ExecutionCoordinator {
             .unwrap_or_else(|| error_text.clone());
         // A typed Cube failure during preparation cannot be repaired by
         // replacing the conflict revision. Preserve it on the owning attempt.
-        // A structured positioning refusal is not such a failure: its
-        // attention kind was replaced above, so it keeps the durable
-        // positioning-refused hold and that hold's own recheck sweep.
         let conflict_workspace = if matches!(
-            attention_kind,
+            attention.0,
             "cube_workspace_positioning_failed" | "cube_workspace_lease_failed"
         ) && error.is::<crate::cube_commands::CubeCliError>()
         {
@@ -2612,21 +2609,31 @@ impl ExecutionCoordinator {
         } else {
             None
         };
-        // A goto/positioning refusal is deterministic, so it fails the attempt
+        // A non-retryable positioning failure fails the attempt
         // at once. A lease-stage Cube error can be transient (unreachable
         // remote, clone or fetch failure), so it follows the ordinary retry
         // schedule and fails the attempt only on the final failure. Either way
         // the attempt fails before the execution failure commits, so no
         // detection pass can observe the dead revision while its attempt still
         // looks live.
-        let positioning = attention_kind == "cube_workspace_positioning_failed";
+        let positioning = attention.0 == "cube_workspace_positioning_failed"
+            && error
+                .downcast_ref::<crate::cube_commands::CubeCliError>()
+                .is_some_and(|error| !error.retryable());
         let final_failure = execution.pre_start_failure_count >= self.pre_start_retry_delays.len() as i64;
         if let Some(attempt) = &conflict_workspace
             && (positioning || final_failure)
         {
             let host = self.work_db.execution_host_id(&execution.id).ok().flatten();
-            self.work_db
-                .fail_conflict_workspace_on_host(&attempt.id, &error_text, host.as_deref())?;
+            self.work_db.fail_conflict_workspace_on_host(
+                &attempt.id,
+                if positioning_refused {
+                    &refusal_message
+                } else {
+                    &error_text
+                },
+                host.as_deref(),
+            )?;
         }
         // A structured refusal never retries: its hold has its own recheck sweep.
         let retry_delays: &[std::time::Duration] =
@@ -2721,44 +2728,12 @@ impl ExecutionCoordinator {
                 });
             }
             PreStartFailureOutcome::PermanentFail => {
-                if let Some(attempt) = conflict_workspace {
+                if let Some(attempt) = &conflict_workspace {
                     for item in [&attempt.work_item_id, &execution.work_item_id] {
                         self.publisher
                             .publish_work_item_changed(&attempt.product_id, item, "conflict_workspace_failed")
                             .await;
                     }
-                    self.publisher
-                        .publish(
-                            &execution.id,
-                            &execution.work_item_id,
-                            execution.status.as_str(),
-                            "execution_start_failed",
-                        )
-                        .await;
-                    // The revision keeps the ordinary "Failed to start"
-                    // bookkeeping; only the duplicate generic attention is
-                    // suppressed because the attempt's own stop is surfaced.
-                    let bounced = self
-                        .work_db
-                        .bounce_dispatch_failed_to_backlog(&execution.work_item_id, attention_kind, &error_text)
-                        .unwrap_or_else(|bounce_err| {
-                            tracing::error!(?bounce_err, work_item_id = %execution.work_item_id, "failed to record conflict revision dispatch failure");
-                            false
-                        });
-                    self.dispatch_events
-                        .emit(
-                            DispatchEvent::new(Stage::PreStartRetriesExhausted, DispatchOutcome::Error, &execution.id)
-                                .with_work_item(&execution.work_item_id)
-                                .with_worker(worker_id)
-                                .with_error(error)
-                                .with_details(serde_json::json!({
-                                    "reason": attention_kind,
-                                    "pre_start_failure_count": execution.pre_start_failure_count,
-                                    "bounced_to_backlog": bounced,
-                                })),
-                        )
-                        .await;
-                    return Ok(());
                 }
                 self.surface_permanent_start_failure(PermanentStartFailure {
                     execution: &execution,
@@ -2772,6 +2747,7 @@ impl ExecutionCoordinator {
                     },
                     attention: StartFailureAttention {
                         kind: attention_kind,
+                        suppress: conflict_workspace.is_some(),
                         title: attention_title,
                         body: None,
                     },

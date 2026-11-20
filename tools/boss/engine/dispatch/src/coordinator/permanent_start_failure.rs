@@ -18,6 +18,10 @@ pub(super) struct StartFailureAttention<'a> {
     pub title: &'a str,
     /// Replaces the generic "could not start on worker" body.
     pub body: Option<String>,
+    /// Skip filing a start-failure attention item. A conflict-revision
+    /// workspace failure already surfaces through the owning attempt's stop
+    /// attention, so a second start-failure item would duplicate it.
+    pub suppress: bool,
 }
 
 /// Everything [`ExecutionCoordinator::surface_permanent_start_failure`] needs
@@ -48,6 +52,7 @@ impl ExecutionCoordinator {
                     kind: attention_kind,
                     title: attention_title,
                     body: attention_body,
+                    suppress: suppress_attention,
                 },
         } = surface;
         let execution = execution.clone();
@@ -104,7 +109,10 @@ impl ExecutionCoordinator {
                 attempts = execution.pre_start_failure_count,
             )
         });
-        let attention_result = if positioning_refused && execution.work_item_id.starts_with("task_") {
+        let attention_result = if suppress_attention {
+            // The owning attempt's conflict-stop attention is the surface.
+            Ok(())
+        } else if positioning_refused && execution.work_item_id.starts_with("task_") {
             // The durable hold and deduplicated attention were committed together.
             Ok(())
         } else {

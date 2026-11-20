@@ -142,6 +142,9 @@ pub(super) struct FakeCubeClient {
     pub(super) fail_goto: bool,
     pub(super) positioning_refused: AtomicBool,
     pub(super) goto_cube_error: Option<String>,
+    /// Exit code for [`Self::goto_cube_error`]. Cube's unclassified PR
+    /// lookup and head-fetch failures exit 2; defaults to 1.
+    pub(super) goto_cube_exit_code: Option<i32>,
     /// Fail the first N `goto_workspace` calls, then succeed.
     pub(super) fail_first_n_goto: usize,
     /// Fail the first N `release_workspace` calls, then succeed.
@@ -389,7 +392,10 @@ crate::stub_cube_client! { FakeCubeClient {
     async fn goto_workspace(&self, workspace_path: &std::path::Path, pr: u64) -> Result<()> {
         if let Some(stderr) = &self.goto_cube_error {
             return Err(crate::cube_commands::CubeCliError {
-                host: "local".into(), exit_code: Some(1), stderr: stderr.clone(), stdout: String::new(),
+                host: "local".into(),
+                exit_code: Some(self.goto_cube_exit_code.unwrap_or(1)),
+                stderr: stderr.clone(),
+                stdout: String::new(),
             }.into());
         }
         let call_index = {

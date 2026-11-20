@@ -538,10 +538,6 @@ pub(crate) async fn try_mechanical_rungs_with(
         }
     };
 
-    if let Err(err) = work_db.clear_rung1_lease_failures(&attempt.id) {
-        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: could not reset rung-1 lease failure count");
-    }
-
     // Persist that a mechanical rung is now in flight against this attempt,
     // stamping the lease/workspace, so a restart mid-rung is recoverable
     // rather than silently stranded (the 2026-07-18 incident). Cleared
@@ -662,6 +658,25 @@ pub(crate) async fn run_rung1_in_lease_with(
 ) -> LadderOutcome {
     let lease = workspace.lease;
     if let Err(err) = cube_client.goto_workspace(&lease.workspace_path, pr_number).await {
+        if err
+            .downcast_ref::<boss_host_execution::cube::CubeCliError>()
+            .is_some_and(|error| error.retryable())
+        {
+            let failures = work_db.record_rung1_lease_failure(&attempt.id).unwrap_or_else(|error| {
+                tracing::error!(?error, "could not count transient rung-1 goto failure");
+                0
+            });
+            if failures < boss_work_db::MAX_RUNG1_LEASE_FAILURES {
+                record_tier(
+                    work_db,
+                    attempt,
+                    "engine_rebase",
+                    "unavailable",
+                    &format!("transient goto failure: {err:#}"),
+                );
+                return LadderOutcome::MechanicalRungsUnavailable;
+            }
+        }
         if err.is::<boss_host_execution::cube::CubeCliError>() || crate::work::conflict_workspace_failed(attempt) {
             halt_workspace_failure(work_db, publisher, candidate, attempt, &err).await;
             return LadderOutcome::WorkspacePreparationFailed;
@@ -685,6 +700,10 @@ pub(crate) async fn run_rung1_in_lease_with(
             residual_conflict_files: None,
             reason,
         };
+    }
+
+    if let Err(err) = work_db.clear_rung1_lease_failures(&attempt.id) {
+        tracing::warn!(attempt_id = %attempt.id, ?err, "conflict_ladder: could not reset rung-1 lease failure count");
     }
 
     let rebase = match cube_client.rebase_workspace(&lease.workspace_path, pr_number).await {

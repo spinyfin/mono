@@ -210,6 +210,13 @@ async fn clean_pr_clears_workspace_failure_without_another_cube_call() {
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (candidate, attempt, chore) = blocked_with_attempt(&db);
     db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
+    rusqlite::Connection::open(dir.path().join("boss.db"))
+        .unwrap()
+        .execute(
+            "UPDATE conflict_resolutions SET finished_at = '946684800' WHERE id = ?1",
+            [&attempt.id],
+        )
+        .unwrap();
     on_resolved(
         &db,
         &RecordingPublisher::default(),
@@ -228,10 +235,11 @@ async fn clean_pr_clears_workspace_failure_without_another_cube_call() {
         db.list_attention_items_for_work_item(&chore).unwrap()[0].status,
         "resolved"
     );
-    assert_eq!(
-        db.get_conflict_resolution(&attempt.id).unwrap().unwrap().status,
-        "succeeded"
-    );
+    let retired = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
+    assert_eq!(retired.status, "succeeded");
+    assert!(retired.failure_reason.is_none());
+    assert_ne!(retired.finished_at.as_deref(), Some("946684800"));
+    assert!(retired.finished_at.is_some());
 }
 
 #[tokio::test]
@@ -697,7 +705,7 @@ fn only_a_changed_host_head_or_base_reopens_the_resume_budget() {
 }
 
 #[test]
-fn an_unchanged_episode_stays_paused_however_long_it_has_been() {
+fn an_unchanged_episode_reopens_after_the_hourly_cooldown() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
     let (_, attempt, _) = blocked_with_attempt(&db);
@@ -706,8 +714,16 @@ fn an_unchanged_episode_stays_paused_however_long_it_has_been() {
         assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
     }
     db.fail_conflict_workspace(&attempt.id, "cube divergence").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_none());
+    assert!(db.workspace_resume_paused(&attempt.id, None, None).unwrap());
+    rusqlite::Connection::open(dir.path().join("boss.db"))
+        .unwrap()
+        .execute(
+            "UPDATE conflict_resolutions SET finished_at = '946684800' WHERE id = ?1",
+            [&attempt.id],
+        )
+        .unwrap();
+    assert!(!db.workspace_resume_paused(&attempt.id, None, None).unwrap());
+    assert!(db.resume_conflict_workspace(&attempt.id, None, None).unwrap().is_some());
 }
 
 #[test]
@@ -937,4 +953,62 @@ fn legacy_churn_reclassification_records_the_failing_host() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn retryable_goto_uses_the_bounded_mechanical_retry_budget() {
+    use crate::conflict_ladder::{LadderOutcome, try_mechanical_rungs};
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let cube = ScriptCube::new(Script::GotoRetryable);
+    for _ in 1..crate::work::MAX_RUNG1_LEASE_FAILURES {
+        assert_eq!(
+            try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt).await,
+            LadderOutcome::MechanicalRungsUnavailable
+        );
+        assert!(db.list_attention_items_for_work_item(&chore).unwrap().is_empty());
+    }
+    assert_eq!(
+        try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt).await,
+        LadderOutcome::WorkspacePreparationFailed
+    );
+    assert!(
+        db.get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap()
+            .failure_reason
+            .unwrap()
+            .contains("maintenance busy")
+    );
+}
+
+#[tokio::test]
+async fn unclassified_goto_uses_the_bounded_mechanical_retry_budget() {
+    use crate::conflict_ladder::{LadderOutcome, try_mechanical_rungs};
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let (candidate, attempt, chore) = blocked_with_attempt(&db);
+    let publisher = RecordingPublisher::default();
+    let cube = ScriptCube::new(Script::GotoUnclassified);
+    for _ in 1..crate::work::MAX_RUNG1_LEASE_FAILURES {
+        assert_eq!(
+            try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt).await,
+            LadderOutcome::MechanicalRungsUnavailable
+        );
+        assert!(db.list_attention_items_for_work_item(&chore).unwrap().is_empty());
+    }
+    assert_eq!(
+        try_mechanical_rungs(&db, &publisher, &cube, &candidate, &attempt).await,
+        LadderOutcome::WorkspacePreparationFailed
+    );
+    assert!(
+        db.get_conflict_resolution(&attempt.id)
+            .unwrap()
+            .unwrap()
+            .failure_reason
+            .unwrap()
+            .contains("failed to resolve PR 42")
+    );
 }

@@ -63,6 +63,7 @@ impl ExecutionCoordinator {
                 positioning_refused: false,
             },
             attention: StartFailureAttention {
+                suppress: false,
                 kind: crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND,
                 title: "No funded driver can run this work",
                 body: Some(attention_body),

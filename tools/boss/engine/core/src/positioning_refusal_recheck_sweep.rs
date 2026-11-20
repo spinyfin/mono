@@ -16,6 +16,12 @@
 //! keeps the same check. Items with no PR to probe stay held until an explicit
 //! launch.
 //!
+//! A hold whose item is the revision of a workspace-failed conflict attempt is
+//! left alone. Recovery for that attempt is the attempt's Cube probe (resume
+//! budget, cooldown, and host), not this sweep: minting a fresh execution here
+//! would respawn the same revision outside that budget and race the probe,
+//! which archives the revision as moot once Cube accepts it.
+//!
 //! Terminal rows (`done`, `archived`, deleted) are a resolve-only pass: the PR
 //! that refused positioning is often the one that just merged, so probing it
 //! would never clear the hold. The attention is lowered without minting work.
@@ -117,6 +123,21 @@ pub async fn run_one_pass(
                 }
             }
             continue;
+        }
+        // A workspace-failed conflict attempt recovers through its own probe.
+        // Clearing this hold would mint a replacement execution for the same
+        // revision, outside that attempt's resume budget and cooldown.
+        match work_db.conflict_resolution_for_revision(&hold.work_item_id) {
+            Ok(Some(attempt)) if crate::work::conflict_workspace_failed(&attempt) => continue,
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %hold.work_item_id,
+                    ?err,
+                    "positioning-refusal recheck sweep: could not look up conflict attempt; keeping hold"
+                );
+                continue;
+            }
         }
         let Some(pr_url) = hold.pr_url.clone() else {
             continue;

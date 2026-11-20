@@ -1651,13 +1651,20 @@ pub(crate) fn mark_conflict_resolution_succeeded_at_rung_in_tx(
         "UPDATE conflict_resolutions
             SET status                    = 'succeeded',
                 head_sha_after            = COALESCE(?2, head_sha_after),
-                finished_at               = COALESCE(finished_at, ?3),
+                finished_at               = CASE WHEN status = 'failed' THEN ?3 ELSE COALESCE(finished_at, ?3) END,
+                failure_reason            = CASE WHEN status = 'failed' THEN NULL ELSE failure_reason END,
                 resolved_by_rung          = COALESCE(resolved_by_rung, ?4),
                 mechanical_rung_in_flight = NULL
           WHERE id = ?1
             AND (status IN ('pending', 'running')
-                 OR (status = 'failed' AND failure_reason LIKE 'workspace_preparation_failed: %'))",
-        params![attempt_id, head_sha_after, now, rung],
+                 OR (status = 'failed' AND failure_reason LIKE ?5))",
+        params![
+            attempt_id,
+            head_sha_after,
+            now,
+            rung,
+            format!("{}%", crate::conflict_stop::CONFLICT_WORKSPACE_FAILURE)
+        ],
     )?;
     if rows == 0 {
         return Ok(None);

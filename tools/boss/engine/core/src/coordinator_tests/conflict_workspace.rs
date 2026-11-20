@@ -5,6 +5,15 @@ use crate::work::{PendingMergeCheck, PrOpenState, StaticPrStateChecker};
 
 #[tokio::test]
 async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
+    scheduling_refusal_survives(false).await;
+}
+
+#[tokio::test]
+async fn structured_scheduling_refusal_survives_watcher_probes_and_recovers() {
+    scheduling_refusal_survives(true).await;
+}
+
+async fn scheduling_refusal_survives(structured: bool) {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     seed_local_claude_driver(&db);
@@ -64,7 +73,12 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
         .unwrap();
     let diagnostic = "cube cannot move pr/42: cube will not pick a side with unique content; inspect jj log; jj bookmark set pr/42 -r head --allow-backwards";
     let cube = Arc::new(FakeCubeClient {
-        goto_cube_error: Some(diagnostic.into()),
+        goto_cube_error: Some(if structured {
+            serde_json::json!({"error": diagnostic, "error_kind": "workspace_positioning_refused", "retryable": false})
+                .to_string()
+        } else {
+            diagnostic.into()
+        }),
         ..Default::default()
     });
     let coordinator = Arc::new(
@@ -74,7 +88,12 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
             cube.clone(),
             Arc::new(FakeExecutionRunner::default()),
         )
-        .with_pre_start_retry_delays(vec![Duration::from_secs(60); 3]),
+        .with_pre_start_retry_delays(if structured {
+            vec![Duration::from_secs(60); 3]
+        } else {
+            // Unclassified Cube envelopes retry through the pre-start budget.
+            Vec::new()
+        }),
     );
     let worker = coordinator.worker_pool().claim_worker(&exec.id, None).await.unwrap();
     let result = coordinator
@@ -93,20 +112,40 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
     let WorkItem::Task(retained) = db.get_work_item(&revision).unwrap() else {
         panic!()
     };
-    assert_eq!(retained.status, TaskStatus::Todo);
-    assert_eq!(
-        retained.dispatch_failed_reason.as_deref(),
-        Some("cube_workspace_positioning_failed")
-    );
-    assert!(retained.dispatch_failed_error.unwrap().contains(diagnostic));
+    if structured {
+        assert_eq!(retained.status, TaskStatus::Blocked);
+        assert_eq!(
+            retained.blocked_reason.as_deref(),
+            Some("workspace_positioning_refused")
+        );
+    } else {
+        assert_eq!(retained.status, TaskStatus::Todo);
+        assert_eq!(
+            retained.dispatch_failed_reason.as_deref(),
+            Some("cube_workspace_positioning_failed")
+        );
+        assert!(retained.dispatch_failed_error.unwrap().contains(diagnostic));
+    }
     assert!(retained.deleted_at.is_none());
     let WorkItem::Chore(blocked) = db.get_work_item(&parent.id).unwrap() else {
         panic!()
     };
-    assert!(blocked.blocked_detail.unwrap().contains(diagnostic));
+    let detail = blocked.blocked_detail.unwrap();
+    assert!(detail.contains(diagnostic), "{detail}");
+    if structured {
+        assert!(!detail.contains("error_kind"), "{detail}");
+        assert!(!detail.contains("\"retryable\""), "{detail}");
+    }
     let items = db.list_attention_items_for_work_item(&parent.id).unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].body_markdown.contains(diagnostic));
+    if structured {
+        assert!(
+            !items[0].body_markdown.contains("error_kind"),
+            "{}",
+            items[0].body_markdown
+        );
+    }
     assert_eq!(
         db.list_conflict_resolutions(None, &[], Some(&parent.id), None)
             .unwrap()
@@ -150,6 +189,63 @@ async fn scheduling_cube_refusal_survives_watcher_probes_and_recovers() {
         db.list_attention_items_for_work_item(&parent.id).unwrap()[0].status,
         "resolved"
     );
+}
+
+/// A structured refusal on a conflict revision fails the attempt and holds the
+/// revision. The recheck sweep must not mint a replacement while that attempt
+/// still owns recovery.
+#[tokio::test]
+async fn recheck_sweep_does_not_mint_a_conflict_revision_after_structured_refusal() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let (_parent, attempt, revision, exec_id) = conflict_revision_fixture(&db, None).await;
+    let exec = db.get_execution(&exec_id).unwrap();
+    let diagnostic = "cube will not pick a side with unique content";
+    let cube = Arc::new(FakeCubeClient {
+        goto_cube_error: Some(
+            serde_json::json!({
+                "error": diagnostic,
+                "error_kind": "workspace_positioning_refused",
+                "retryable": false
+            })
+            .to_string(),
+        ),
+        ..Default::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube,
+            Arc::new(FakeExecutionRunner::default()),
+        )
+        .with_pre_start_retry_delays(vec![Duration::from_secs(60); 3]),
+    );
+    let worker = coordinator.worker_pool().claim_worker(&exec.id, None).await.unwrap();
+    assert!(
+        coordinator
+            .schedule_execution_for_test(&exec, &worker, DispatchAdmission::Queued)
+            .await
+            .is_err()
+    );
+    assert!(crate::work::conflict_workspace_failed(
+        &db.get_conflict_resolution(&attempt).unwrap().unwrap()
+    ));
+    let after_refusal = db.list_executions(Some(&revision)).unwrap().len();
+
+    let checker: Arc<dyn crate::work::PrStateChecker> = Arc::new(
+        crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open)
+            .with_head_sha("a".repeat(40))
+            .with_head_ref_name("feature"),
+    );
+    let outcome = crate::positioning_refusal_recheck_sweep::run_one_pass(&db, &coordinator, &checker).await;
+    assert_eq!(outcome.restarted, 0, "sweep must not mint a replacement execution");
+    assert_eq!(db.list_executions(Some(&revision)).unwrap().len(), after_refusal);
+    let WorkItem::Task(held) = db.get_work_item(&revision).unwrap() else {
+        panic!()
+    };
+    assert_eq!(held.status, TaskStatus::Blocked);
+    assert_eq!(held.blocked_reason.as_deref(), Some("workspace_positioning_refused"));
 }
 
 const PR_URL: &str = "https://github.com/foo/bar/pull/42";
@@ -240,7 +336,7 @@ async fn scheduling_refusal_under_a_foreign_blocker_keeps_the_blocker_and_shows_
                 }),
                 Arc::new(FakeExecutionRunner::default()),
             )
-            .with_pre_start_retry_delays(vec![Duration::from_secs(60); 3]),
+            .with_pre_start_retry_delays(Vec::new()),
         );
         let worker = coordinator.worker_pool().claim_worker(&exec.id, None).await.unwrap();
         assert!(
@@ -275,13 +371,46 @@ async fn scheduling_refusal_under_a_foreign_blocker_keeps_the_blocker_and_shows_
 
 #[tokio::test]
 async fn lease_stage_cube_error_retries_and_fails_the_attempt_only_when_retries_are_exhausted() {
+    preparation_retries_until_exhausted(PreparationFailure::Lease).await;
+}
+
+#[tokio::test]
+async fn retryable_goto_envelope_retries_before_stopping_the_attempt() {
+    preparation_retries_until_exhausted(PreparationFailure::RetryableGoto).await;
+}
+
+#[tokio::test]
+async fn unclassified_goto_envelope_retries_before_stopping_the_attempt() {
+    preparation_retries_until_exhausted(PreparationFailure::UnclassifiedGoto).await;
+}
+
+enum PreparationFailure {
+    Lease,
+    RetryableGoto,
+    UnclassifiedGoto,
+}
+
+async fn preparation_retries_until_exhausted(kind: PreparationFailure) {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let (parent, attempt, _revision, exec_id) = conflict_revision_fixture(&db, None).await;
     let exec = db.get_execution(&exec_id).unwrap();
-    let cube = Arc::new(FakeCubeClient {
-        fail_lease_with_cube_cli_error: true,
-        ..Default::default()
+    let cube = Arc::new(match kind {
+        PreparationFailure::Lease => FakeCubeClient {
+            fail_lease_with_cube_cli_error: true,
+            ..Default::default()
+        },
+        PreparationFailure::RetryableGoto => FakeCubeClient {
+            goto_cube_error: Some(
+                r#"{"error":"maintenance busy","error_kind":"maintenance_busy","retryable":true}"#.into(),
+            ),
+            ..Default::default()
+        },
+        PreparationFailure::UnclassifiedGoto => FakeCubeClient {
+            goto_cube_error: Some(r#"{"error":"failed to resolve PR 42 in owner/repo: gh: connection reset"}"#.into()),
+            goto_cube_exit_code: Some(2),
+            ..Default::default()
+        },
     });
     let build = |delays: Vec<Duration>| {
         Arc::new(
@@ -384,7 +513,7 @@ async fn refusal_after_a_retry_moves_hosts_is_attributed_to_the_latest_host() {
             }),
             Arc::new(FakeExecutionRunner::default()),
         )
-        .with_pre_start_retry_delays(vec![Duration::from_secs(60)]),
+        .with_pre_start_retry_delays(Vec::new()),
     );
     let worker = coordinator.worker_pool().claim_worker(&exec.id, None).await.unwrap();
     assert!(
