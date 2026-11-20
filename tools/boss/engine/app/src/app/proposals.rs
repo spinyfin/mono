@@ -624,7 +624,7 @@ pub(super) async fn submit_for_caller(
         let verdict = boss_work_db::bounded_base_verdict(
             Arc::clone(&server_state.pr_state_checker),
             &payload.pr_url,
-            boss_work_db::PR_BASE_CHECK_BUDGET,
+            boss_work_db::PR_QUERY_TIMEOUT,
         )
         .await
         .map_err(|err| {

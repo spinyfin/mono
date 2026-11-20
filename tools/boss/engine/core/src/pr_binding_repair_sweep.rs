@@ -47,6 +47,8 @@
 //! 3. No PR on any primary execution branch: the wrong binding is cleared and
 //!    the row is parked `blocked:pr_binding_unresolved` with a detail naming
 //!    the searched branches and rejected PR. It never keeps a foreign binding.
+//!    The same parking applies when the PR found on the branch targets a
+//!    non-default base: it cannot be adopted until retargeted.
 //!
 //! A PR already bound to a different work item is never adopted (step 2
 //! checks [`WorkDb::other_work_item_bound_to_pr`]); that case parks the row
@@ -105,17 +107,23 @@ impl DocPointerRefresher for DesignDetectorDocPointerRefresher {
 #[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
 pub struct PrBindingRepairOutcome {
     /// Rows re-bound to the PR on their execution's branch.
+    #[builder(default)]
     pub rebound: usize,
     /// Rows whose binding was right and only the doc pointer was refreshed.
+    #[builder(default)]
     pub doc_repaired: usize,
     /// Rows parked `blocked:pr_binding_unresolved`.
+    #[builder(default)]
     pub unresolved: usize,
     /// Rows whose suspect binding turned out to be correct (no doc issue).
+    #[builder(default)]
     pub confirmed_ok: usize,
     /// Rows skipped this pass because GitHub could not be consulted.
+    #[builder(default)]
     pub inconclusive: usize,
     /// Rows left untouched because the PR on their branch targets a
     /// non-default base.
+    #[builder(default)]
     pub base_refused: usize,
 }
 
@@ -386,9 +394,7 @@ async fn repair_candidate(
             return park_unresolved(work_db, candidate, &detail, outcome);
         }
     };
-    match crate::work::bounded_base_verdict(Arc::clone(&pr_checker), &own_pr_url, crate::work::PR_BASE_CHECK_BUDGET)
-        .await
-    {
+    match crate::work::bounded_base_verdict(Arc::clone(&pr_checker), &own_pr_url, crate::work::PR_QUERY_TIMEOUT).await {
         Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
             if let Err(err) = work_db.resolve_external_tracker_attention(
                 &candidate.task_id,
@@ -412,22 +418,17 @@ async fn repair_candidate(
                 task_id = %candidate.task_id,
                 own_pr_url,
                 %reason,
-                "pr-binding-repair sweep: PR on the execution's branch targets a non-default base; leaving the binding untouched",
+                "pr-binding-repair sweep: PR on the execution's branch targets a non-default base; clearing the foreign binding",
             );
-            upsert_attention(
-                work_db,
-                candidate,
-                "PR on this work item's branch targets a non-default base",
-                &format!(
-                    "This row is bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its \
-                     branch `{expected_branch}`, {own_pr_url}, cannot replace that binding because {reason}. \
-                     Nothing was changed. Retarget {own_pr_url} to the default branch; the next sweep pass then \
-                     re-binds this row to it, or re-bind by hand with `boss task update --pr-url`.",
-                    bound = candidate.bound_pr_url,
-                    exec = candidate.execution_id,
-                ),
+            let detail = format!(
+                "This row was bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its \
+                 branch `{expected_branch}`, {own_pr_url}, cannot replace that binding because {reason}. The engine \
+                 cleared the wrong binding. Retarget {own_pr_url} to the default branch and re-bind by hand with \
+                 `boss task update --pr-url`, or let the abandoned-branch sweep bind it once it is retargeted.",
+                bound = candidate.bound_pr_url,
+                exec = candidate.execution_id,
             );
-            return Ok(());
+            return park_unresolved(work_db, candidate, &detail, outcome);
         }
         Err(err) => return Err(Inconclusive::GitHub(format!("checking PR base: {err:#}"))),
     }
@@ -465,6 +466,12 @@ async fn repair_candidate(
         }
     }
     outcome.rebound += 1;
+    if let Err(err) = work_db.resolve_attention_kind_for_execution(
+        &candidate.execution_id,
+        boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+    ) {
+        tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: failed to resolve base-refusal attention");
+    }
     tracing::info!(
         task_id = %candidate.task_id,
         execution_id = %candidate.execution_id,
@@ -696,7 +703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_default_base_preserves_the_existing_binding_and_doc() {
+    async fn non_default_base_clears_the_foreign_binding_and_parks_the_row() {
         let (_dir, db) = open_db();
         let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);
         let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_foreign".into())]));
@@ -713,17 +720,13 @@ mod tests {
         .await;
         assert_eq!(outcome.rebound, 0);
         assert_eq!(outcome.base_refused, 1);
-        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
-        assert_eq!(
-            db.task_doc_path(&task_id).unwrap().as_deref(),
-            Some("docs/designs/origin.md")
-        );
+        assert_eq!(outcome.unresolved, 1);
+        assert_eq!(task(&db, &task_id).pr_url, None);
         let items = db.list_attention_items_for_work_item(&task_id).unwrap();
         let item = items
             .iter()
             .find(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR)
             .expect("refusal is surfaced");
-        assert_eq!(item.title, "PR on this work item's branch targets a non-default base");
         assert!(item.body_markdown.contains(OWN) && item.body_markdown.contains(ORIGIN));
         assert!(item.body_markdown.contains("feature base") && item.body_markdown.contains("Retarget"));
     }
@@ -788,7 +791,7 @@ mod tests {
             ),
             async {
                 tokio::task::yield_now().await;
-                tokio::time::advance(crate::work::PR_BASE_CHECK_BUDGET + Duration::from_secs(1)).await;
+                tokio::time::advance(crate::work::PR_QUERY_TIMEOUT + Duration::from_secs(1)).await;
             }
         );
         drop(release);

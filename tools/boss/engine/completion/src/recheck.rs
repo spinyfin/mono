@@ -448,7 +448,7 @@ impl WorkerCompletionHandler {
         match crate::work::bounded_base_verdict(
             Arc::clone(&self.pr_state_checker),
             &pr_url,
-            crate::work::PR_BASE_CHECK_BUDGET,
+            crate::work::PR_QUERY_TIMEOUT,
         )
         .await
         {

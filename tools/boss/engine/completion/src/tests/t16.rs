@@ -909,7 +909,7 @@ async fn base_refusal_blocks_delivery_and_only_explicit_refusal_files_attention(
                 .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::InReview, "test")
                 .await
         };
-        assert!(matches!(outcome, StopOutcome::DetectorFailed), "{outcome:?}");
+        assert!(matches!(outcome, StopOutcome::PrBaseRefused { .. }), "{outcome:?}");
         assert!(task_row(&db, &chore_id).pr_url.is_none());
         assert_eq!(
             db.list_attention_items(&execution_id)
@@ -941,8 +941,8 @@ async fn base_refusal_blocks_delivery_and_only_explicit_refusal_files_attention(
             handler.guard_pr_base(&execution, OWN_PR),
             handler.guard_pr_base(&execution, OWN_PR),
         );
-        assert!(matches!(first, Some(StopOutcome::DetectorFailed)));
-        assert!(matches!(second, Some(StopOutcome::DetectorFailed)));
+        assert!(matches!(first, Some(StopOutcome::PrBaseRefused { .. })));
+        assert!(matches!(second, Some(StopOutcome::PrBaseRefused { .. })));
         assert_eq!(open_refusals(&db), 1);
         let assert_original_open = || {
             let items = db.list_attention_items(&execution_id).unwrap();
@@ -1060,20 +1060,28 @@ async fn declared_state_resolution_distinguishes_base_refusal_from_network_failu
     use crate::run_done_declaration::DeclaredPrResolution;
     use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
     let workspace = tempdir().unwrap();
-    let (_dir, db, _, _, _) = followup_fixture(workspace.path());
+    let (_dir, db, _, _, execution_id) = followup_fixture(workspace.path());
+    let execution = db.get_execution(&execution_id).unwrap();
     let handler = TestHarness::new(db, StubPrDetector::ok(Some(OWN_PR)))
         .handler
         .with_pr_state_checker(Arc::new(
-            FakePrStateChecker::always(PrOpenState::Merged).with_base(PrBaseVerdict::Refused("feature/parent".into())),
+            FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature/parent".into())),
         ));
     assert!(matches!(
-        handler.resolve_verified_pr_state(OWN_PR.into()).await,
+        handler.resolve_verified_pr_state(&execution, OWN_PR.into()).await,
         DeclaredPrResolution::BaseRefused { pr_url, reason }
             if pr_url == OWN_PR && reason == "feature/parent"
     ));
+    let handler = handler.with_pr_state_checker(Arc::new(
+        FakePrStateChecker::always(PrOpenState::Merged).with_base(PrBaseVerdict::Refused("feature/parent".into())),
+    ));
+    assert!(matches!(
+        handler.resolve_verified_pr_state(&execution, OWN_PR.into()).await,
+        DeclaredPrResolution::Bound { merged: true, .. }
+    ));
     let handler = handler.with_pr_state_checker(Arc::new(UnavailableBaseChecker));
     assert!(matches!(
-        handler.resolve_verified_pr_state(OWN_PR.into()).await,
+        handler.resolve_verified_pr_state(&execution, OWN_PR.into()).await,
         DeclaredPrResolution::Transient { detail } if detail.contains("GitHub unavailable")
     ));
 }
@@ -1178,6 +1186,76 @@ async fn declared_delivery_checks_base_once_for_detected_and_stored_urls() {
         handler
             .finalize_declared_delivery(&db.get_execution(&execution_id).unwrap())
             .await;
-        assert_eq!(checker.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Already-bound PRs skip the default-branch policy; a new bind still
+        // checks exactly once.
+        assert_eq!(
+            checker.0.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(!stored)
+        );
     }
+}
+
+/// A confirmed refusal is a parked outcome, not a retryable lookup failure:
+/// `finalize_resolved` stops the hot retry loop and no stuck-finalize
+/// attention is raised for it.
+#[test]
+fn base_refusal_is_not_retried_hot() {
+    let refused = StopOutcome::PrBaseRefused {
+        pr_url: OWN_PR.into(),
+        detail: "feature base".into(),
+    };
+    assert!(crate::pending_finalize::finalize_resolved(&refused));
+    assert!(!crate::pending_finalize::finalize_resolved(
+        &StopOutcome::DetectorFailed
+    ));
+}
+
+/// A merged PR can no longer be retargeted, so a `Done` completion on a
+/// non-default base is not refused.
+#[tokio::test]
+async fn merged_pr_on_non_default_base_is_not_refused() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = followup_fixture(workspace.path());
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+        .handler
+        .with_branch_verifier(two_pr_verifier(&execution_id))
+        .with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Merged).with_base(PrBaseVerdict::Refused("feature base".into())),
+        ));
+    let outcome = handler
+        .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::Done, "test")
+        .await;
+    assert!(!matches!(outcome, StopOutcome::PrBaseRefused { .. }), "{outcome:?}");
+    assert!(
+        db.list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+    );
+}
+
+/// The base policy applies to a PR the execution is about to bind; a PR the
+/// work item already holds (a CI-fix or conflict-fix of a stacked PR) is not
+/// re-checked.
+#[tokio::test]
+async fn already_bound_pr_skips_the_base_guard() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![chore_id, OWN_PR],
+        )
+        .unwrap();
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+        .handler
+        .with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature base".into())),
+        ));
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(handler.guard_pr_base(&execution, OWN_PR).await.is_none());
+    assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
 }

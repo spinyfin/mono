@@ -155,8 +155,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         PR_BASE_REFUSED,
-        ClearedBy::ProducerReconciles,
-        "Completion and merge polling clear the refusal only after a fresh GitHub observation verifies the repository default branch; unrelated worker progress cannot clear it.",
+        ClearedBy::WorkResumed,
+        "The completion guard parks the execution until the PR is retargeted and resolves the item once it observes \
+         the default branch. It is also resolved by both recovery sweeps when they bind a PR, and a later run of the \
+         same work item (the execution ended another way) contradicts the parked state, so the generic reconciler \
+         clears it rather than leaving a finished condition open.",
     ),
     entry(
         WORKSPACE_POSITIONING_REFUSED,

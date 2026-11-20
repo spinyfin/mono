@@ -62,7 +62,11 @@ pub struct PendingFinalizeSweepOutcome {
 
 /// Whether a finalize attempt ended the declaration's life: anything except a
 /// DB failure or an inconclusive GitHub answer (both leave the execution live
-/// with its stamp) or a deferred no-op.
+/// with its stamp) or a deferred no-op. A confirmed base-policy refusal
+/// ([`StopOutcome::PrBaseRefused`]) counts as resolved for retry purposes: the
+/// answer will not change until a human retargets the PR, so hot retries only
+/// burn GraphQL calls and raise a misleading "stuck finalize" attention. The
+/// execution stays live; the pending-finalize sweep re-evaluates it.
 pub fn finalize_resolved(outcome: &StopOutcome) -> bool {
     !matches!(
         outcome,
@@ -168,7 +172,10 @@ impl WorkerCompletionHandler {
                             continue;
                         }
                         let result = self.finalize_declared_run_done(&execution_id, declared).await;
-                        if finalize_resolved(&result) {
+                        if matches!(result, StopOutcome::PrBaseRefused { .. }) {
+                            // Parked awaiting a retarget; the sweep tick is the retry cadence.
+                            outcome.still_pending += 1;
+                        } else if finalize_resolved(&result) {
                             outcome.finalized += 1;
                             tracing::info!(%execution_id, ?result, "run_done finalize sweep: recovered a stamped declaration");
                         } else {

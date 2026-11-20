@@ -1153,7 +1153,7 @@ pub use pr_flow::QueuedMergeQueueMember;
 #[doc(hidden)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;
-pub use pr_state::PR_BASE_CHECK_BUDGET;
+pub use pr_state::PR_QUERY_TIMEOUT;
 pub use pr_state::PrBaseVerdict;
 pub use pr_state::PrInspect;
 pub use pr_state::PrMergeClass;

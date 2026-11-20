@@ -29,7 +29,36 @@ pub(super) struct ForeignPrConflict {
 }
 
 impl WorkerCompletionHandler {
-    /// Policy refusal is actionable; unavailable GitHub evidence is retryable.
+    /// Whether `pr_url` is a PR this execution is about to bind for the first
+    /// time, which is the only case the default-branch policy applies to.
+    /// A revision's deliverable is its chain root's PR, and a CI-fix or
+    /// conflict-fix execution works on the PR the work item already holds;
+    /// neither binds anything new, and retargeting a stacked PR would break
+    /// its stack. A lookup failure treats the PR as new, so the policy fails
+    /// closed.
+    pub(super) fn binds_new_pr(&self, execution: &crate::work::WorkExecution, pr_url: &str) -> bool {
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            return false;
+        }
+        match self.work_db.task_pr_url(&execution.work_item_id) {
+            Ok(Some(bound)) => bound != pr_url,
+            Ok(None) => true,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "PR base guard: bound-PR lookup failed; applying the base policy",
+                );
+                true
+            }
+        }
+    }
+
+    /// Policy refusal is actionable and parks for a human
+    /// ([`StopOutcome::PrBaseRefused`]); unavailable GitHub evidence is
+    /// retryable ([`StopOutcome::DetectorFailed`]). Only a primary execution
+    /// binding a new PR is checked; callers skip PRs that are already merged
+    /// or closed, which can no longer be retargeted.
     pub(super) async fn guard_pr_base(
         &self,
         execution: &crate::work::WorkExecution,
@@ -37,6 +66,9 @@ impl WorkerCompletionHandler {
     ) -> Option<StopOutcome> {
         use crate::work::PrBaseVerdict;
         use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+        if !self.binds_new_pr(execution, pr_url) {
+            return None;
+        }
         match crate::work::bounded_base_verdict(
             Arc::clone(&self.pr_state_checker),
             pr_url,
@@ -57,7 +89,10 @@ impl WorkerCompletionHandler {
             Ok(PrBaseVerdict::NotChecked) => None,
             Ok(PrBaseVerdict::Refused(reason)) => {
                 self.record_pr_base_refusal(execution, pr_url, &reason).await;
-                Some(StopOutcome::DetectorFailed)
+                Some(StopOutcome::PrBaseRefused {
+                    pr_url: pr_url.to_owned(),
+                    detail: format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
+                })
             }
             result => {
                 tracing::warn!(?result, pr_url, "PR base check unavailable; retrying delivery");

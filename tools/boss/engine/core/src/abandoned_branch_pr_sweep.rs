@@ -701,7 +701,7 @@ async fn bind_and_record(
     failure_counts: &mut HashMap<String, u32>,
 ) {
     let (BindAction::Bound(pr_url) | BindAction::Created(pr_url)) = action;
-    match crate::work::bounded_base_verdict(pr_checker, pr_url, crate::work::PR_BASE_CHECK_BUDGET).await {
+    match crate::work::bounded_base_verdict(pr_checker, pr_url, crate::work::PR_QUERY_TIMEOUT).await {
         Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
             if let Err(err) = work_db.resolve_external_tracker_attention(
                 &candidate.work_item_id,
@@ -722,6 +722,40 @@ async fn bind_and_record(
                 tracing::warn!(?err, "could not surface recovered PR base refusal");
             }
             outcome.base_refused += 1;
+            let body = format!(
+                "Execution `{execution_id}` finished without a Stop, and its branch has a PR that the engine \
+                 will not bind: {pr_url}: {reason}.\n\n\
+                 Retarget the PR to the repository default branch. The engine re-checks on its normal sweep \
+                 interval and binds the PR (resolving this item) once the base is the default branch.",
+                execution_id = candidate.execution_id,
+            );
+            if let Err(err) = work_db.upsert_external_tracker_attention(
+                &candidate.work_item_id,
+                ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
+                "PR exists but does not target the default branch",
+                &body,
+            ) {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "abandoned-branch-pr sweep: failed to file base-refusal attention item",
+                );
+            }
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(
+                        Stage::AbandonedBranchPrRecovery,
+                        Outcome::Skipped,
+                        &candidate.execution_id,
+                    )
+                    .with_work_item(&candidate.work_item_id)
+                    .with_details(serde_json::json!({
+                        "action": "base_refused",
+                        "pr_url": pr_url,
+                        "reason": reason,
+                    })),
+                )
+                .await;
             return;
         }
         result => {
@@ -731,12 +765,38 @@ async fn bind_and_record(
                 "abandoned PR base not accepted; leaving binding untouched"
             );
             outcome.failed += 1;
+            let count = {
+                let entry = failure_counts.entry(candidate.execution_id.clone()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            if count >= ESCALATE_AFTER_CONSECUTIVE_FAILURES {
+                file_attention(
+                    work_db,
+                    candidate,
+                    pr_url,
+                    true,
+                    "the PR base-branch lookup keeps failing",
+                    count,
+                );
+                outcome.escalated += 1;
+            }
             return;
         }
     }
     match work_db.bind_pr_to_task_from_terminal_execution(&candidate.work_item_id, pr_url) {
         Ok(true) => {
             failure_counts.remove(&candidate.execution_id);
+            if let Err(err) = work_db.resolve_attention_kind_for_execution(
+                &candidate.execution_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+            ) {
+                tracing::warn!(
+                    execution_id = %candidate.execution_id,
+                    ?err,
+                    "abandoned-branch-pr sweep: failed to resolve base-refusal attention (non-fatal)",
+                );
+            }
             if let Err(err) = work_db
                 .resolve_external_tracker_attention(&candidate.work_item_id, ATTENTION_KIND_ABANDONED_BRANCH_NO_PR)
             {
@@ -1216,7 +1276,7 @@ mod tests {
             ),
             async {
                 tokio::task::yield_now().await;
-                tokio::time::advance(crate::work::PR_BASE_CHECK_BUDGET + Duration::from_secs(1)).await;
+                tokio::time::advance(crate::work::PR_QUERY_TIMEOUT + Duration::from_secs(1)).await;
             }
         );
         drop(release);

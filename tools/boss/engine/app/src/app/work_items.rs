@@ -923,7 +923,7 @@ pub(super) async fn apply_work_item_patch_from(
         match boss_work_db::bounded_base_verdict(
             Arc::clone(&server_state.pr_state_checker),
             pr_url,
-            boss_work_db::PR_BASE_CHECK_BUDGET,
+            boss_work_db::PR_QUERY_TIMEOUT,
         )
         .await
         {
