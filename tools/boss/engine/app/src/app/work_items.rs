@@ -306,10 +306,7 @@ pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
                     task.name.to_lowercase().contains(term) || task.description.to_lowercase().contains(term)
                 }) && (query.kinds.is_empty() || query.kinds.contains(&task.kind))
                     && query.created_since.is_none_or(|since| {
-                        task.created_at
-                            .parse::<i64>()
-                            .ok()
-                            .or_else(|| boss_engine_utils::iso8601::parse_iso8601_lenient(&task.created_at))
+                        boss_engine_utils::iso8601::parse_stored_timestamp(&task.created_at)
                             .is_some_and(|created| created >= since)
                     })
             });

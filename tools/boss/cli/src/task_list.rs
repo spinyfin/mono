@@ -25,10 +25,8 @@ pub(crate) async fn run(client: &mut BossClient, ctx: &RunContext, args: TaskLis
         || (args.product.is_none() && args.project.is_none() && (args.match_term.is_some() || !args.ids.is_empty()));
     let scope = if cross_product {
         None
-    } else if let Some(selector) = &args.product {
-        Some(match_products(&products, selector)?)
     } else {
-        Some(resolve_product_inferable(client, None, args.project.as_deref(), ctx).await?)
+        Some(resolve_product_inferable(client, args.product.clone(), args.project.as_deref(), ctx).await?)
     };
     let project = match args.project.clone() {
         Some(selector) => Some(resolve_project(client, &scope.as_ref().unwrap().id, Some(selector), ctx).await?),
@@ -111,12 +109,7 @@ pub(crate) async fn run(client: &mut BossClient, ctx: &RunContext, args: TaskLis
     }
     if cross_product {
         tasks.sort_by(|a, b| {
-            let stamp = |task: &Task| {
-                task.created_at
-                    .parse::<i64>()
-                    .ok()
-                    .or_else(|| boss_engine_utils::iso8601::parse_iso8601_lenient(&task.created_at))
-            };
+            let stamp = |task: &Task| boss_engine_utils::iso8601::parse_stored_timestamp(&task.created_at);
             (stamp(b), &b.id).cmp(&(stamp(a), &a.id))
         });
     }
@@ -199,7 +192,9 @@ async fn resolve_selected(
                         ..Default::default()
                     },
                 )
-                .await?,
+                .await?
+                .into_iter()
+                .filter(|task| matches_selector(task, &wire_selector)),
             );
             if primary_id && !matches.is_empty() {
                 break;
@@ -229,9 +224,38 @@ async fn resolve_selected(
     Ok(tasks)
 }
 
+fn matches_selector(task: &Task, selector: &str) -> bool {
+    task.id == selector || selector.parse::<i64>().ok().is_some_and(|n| task.short_id == Some(n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_filters_rows_from_engines_that_ignore_query_predicates() {
+        let task = Task::builder()
+            .id("task_selected")
+            .short_id(42)
+            .product_id("prod_test")
+            .kind(boss_protocol::TaskKind::Chore)
+            .name("Example")
+            .description("")
+            .status(boss_protocol::TaskStatus::Todo)
+            .created_at("100")
+            .updated_at("100")
+            .created_via("cli")
+            .build();
+        assert!(matches_selector(&task, "task_selected"));
+        assert!(matches_selector(&task, "42"));
+        for selector in ["task_other", "43", "invalid"] {
+            assert!(!matches_selector(&task, selector), "{selector}");
+        }
+        let mut without_short_id = task.clone();
+        without_short_id.short_id = None;
+        assert!(!matches_selector(&without_short_id, "42"));
+        assert!(!matches_selector(&without_short_id, "invalid"));
+    }
 
     #[test]
     fn created_since_is_inclusive_and_handles_stored_timestamp_formats() {

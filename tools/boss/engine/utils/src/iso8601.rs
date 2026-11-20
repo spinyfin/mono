@@ -124,9 +124,25 @@ pub fn parse_iso8601_lenient(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
 }
 
+/// Parse a stored timestamp in either Unix seconds or RFC 3339 format.
+pub fn parse_stored_timestamp(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok().or_else(|| parse_iso8601_lenient(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_timestamps_accept_epochs_and_rfc3339() {
+        for value in ["100", "1970-01-01T00:01:40Z", "1970-01-01T01:01:40.999+01:00"] {
+            assert_eq!(parse_stored_timestamp(value), Some(100));
+        }
+        assert_eq!(parse_stored_timestamp("-1"), Some(-1));
+        for value in ["", "invalid", "9223372036854775808"] {
+            assert_eq!(parse_stored_timestamp(value), None);
+        }
+    }
 
     // ── format_epoch_iso8601 ────────────────────────────────────────────────
     //

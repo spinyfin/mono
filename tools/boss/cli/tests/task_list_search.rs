@@ -73,6 +73,11 @@ async fn searches_products_and_composes_filters() -> Result<()> {
             .iter()
             .all(|r| r["product_slug"] == beta.slug)
     );
+    let mismatch = run_boss_expect_failure(
+        engine.socket_str(),
+        &["task", "list", "--product", &beta.slug, "--project", &project.id],
+    )?;
+    assert!(mismatch.contains("belongs to"), "{mismatch}");
     for flags in [
         vec!["--all-products", "--product", &alpha.slug],
         vec!["--all-products", "--kind", "bogus"],
@@ -128,6 +133,20 @@ async fn batch_ids_span_products_validate_existence_and_deduplicate() -> Result<
     )?;
     assert!(error.contains("ambig"), "{error}");
     run_boss(engine.socket_str(), &["task", "delete", &b.id])?;
+    let error = run_boss_expect_failure(
+        engine.socket_str(),
+        &[
+            "task",
+            "list",
+            "--all-products",
+            "--ids",
+            &a.short_id.unwrap().to_string(),
+        ],
+    )?;
+    assert!(
+        error.contains("ambig") && error.contains(&a.id) && error.contains(&b.id),
+        "{error}"
+    );
     let error = run_boss_expect_failure(
         engine.socket_str(),
         &[

@@ -2353,7 +2353,8 @@ pub(crate) struct TaskListArgs {
     /// (`T<n>`, `n`, `#n`), primary ids (`task_…`), and the
     /// cross-product form (`boss/42`). An id that names no row in the
     /// selected scope errors rather than being silently dropped. Without
-    /// --product, ids may span products; bare numbers must be unambiguous.
+    /// --product, ids may span products; bare numbers must be unambiguous
+    /// across live and soft-deleted rows, even without --deleted.
     /// An explicit --product restricts every id to that product. Composes with
     /// the other filters below as an AND — a row excluded by e.g.
     /// `--status` is not an error, only an id that doesn't exist at

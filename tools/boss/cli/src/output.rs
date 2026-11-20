@@ -153,11 +153,7 @@ pub(crate) fn apply_task_list_filters(
                 return false;
             }
             if let Some(since) = criteria.created_since {
-                let created = task
-                    .created_at
-                    .parse::<i64>()
-                    .ok()
-                    .or_else(|| boss_engine_utils::iso8601::parse_iso8601_lenient(&task.created_at));
+                let created = boss_engine_utils::iso8601::parse_stored_timestamp(&task.created_at);
                 if !created.is_some_and(|created| created >= since) {
                     return false;
                 }
