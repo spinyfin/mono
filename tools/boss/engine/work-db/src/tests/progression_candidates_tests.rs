@@ -370,9 +370,8 @@ fn clause_1_worker_failed_is_admitted_on_both_primary_and_revision_items() {
     // The revision is the stuck item.
     f.assert_candidate(&revision, true);
     assert_eq!(f.clauses(&revision).stuck_kind.as_deref(), Some("S13_revision_chain"));
-    // A later revision queued behind the dead one is pending work on the PR
-    // family (design 2.1 counts `waiting_dependency` everywhere), so the item is
-    // not nominated while that gate row exists.
+    // A later revision waiting behind the dead one is inert, so the failed
+    // revision remains nominated while that gate row exists.
     let later = f.revision_of(&primary, "Later revision");
     f.sql(&format!(
         "UPDATE tasks SET status = 'blocked', blocked_reason = 'dependency' WHERE id = '{later}'"
@@ -382,8 +381,8 @@ fn clause_1_worker_failed_is_admitted_on_both_primary_and_revision_items() {
         ExecutionKind::RevisionImplementation,
         ExecutionStatus::WaitingDependency,
     );
-    f.assert_candidate(&revision, false);
-    assert!(!f.clauses(&revision).no_live_work);
+    f.assert_candidate(&revision, true);
+    assert!(f.clauses(&revision).no_live_work);
     f.sql(&format!(
         "UPDATE work_executions SET status = 'cancelled' WHERE id = '{gate}'"
     ));
@@ -419,7 +418,19 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     ));
     f.assert_candidate(&item, true);
 
-    // `waiting_dependency` on the item itself is pending work.
+    // A dependency wait backed by a running prerequisite is pending work.
+    let prerequisite = f.chore("Running prerequisite");
+    f.execution(
+        &prerequisite,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Running,
+    );
+    for dependent in [&item, &sharing] {
+        f.sql(&format!(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{dependent}', '{prerequisite}', 'blocks', '1')"
+        ));
+    }
     let gated = f.execution(
         &item,
         ExecutionKind::ChoreImplementation,
@@ -468,6 +479,7 @@ fn clause_2_live_work_on_the_item_its_revisions_or_its_pr_excludes_it() {
     // `waiting_dependency` on a revision of the primary item counts, whether the
     // revision waits behind an earlier revision or behind an unrelated item.
     let unrelated = f.chore("Unrelated prerequisite");
+    f.execution(&unrelated, ExecutionKind::ChoreImplementation, ExecutionStatus::Running);
     f.db.add_dependency(AddDependencyInput {
         dependent: revision.clone(),
         prerequisite: unrelated,
@@ -525,7 +537,7 @@ fn clause_2_an_inflight_ci_or_conflict_attempt_excludes_the_item() {
         f.clauses(&item).failing_clauses()
     );
 
-    // Running, revision non-terminal, still no live execution.
+    // An open revision with a queued execution still holds the family.
     f.sql(&format!(
         "UPDATE ci_remediations SET status = 'running' WHERE id = '{ci}'"
     ));
@@ -534,11 +546,15 @@ fn clause_2_an_inflight_ci_or_conflict_attempt_excludes_the_item() {
         "UPDATE ci_remediations SET revision_task_id = '{fixer}' WHERE id = '{ci}'"
     ));
     f.stick(&fixer, "status = 'blocked', blocked_reason = 'worker_failed'", 3);
+    let fix_run = f.execution(&fixer, ExecutionKind::RevisionImplementation, ExecutionStatus::Ready);
     f.assert_candidate(&item, false);
     assert!(!f.clauses(&item).no_inflight_ladder);
 
     // The revision going terminal admits the item again.
-    f.sql(&format!("UPDATE tasks SET status = 'done' WHERE id = '{fixer}'"));
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'done' WHERE id = '{fixer}';
+         UPDATE work_executions SET status = 'completed' WHERE id = '{fix_run}'"
+    ));
     f.assert_candidate(&item, true);
     assert!(f.clauses(&item).no_inflight_ladder);
 
@@ -564,8 +580,12 @@ fn clause_2_an_inflight_ci_or_conflict_attempt_excludes_the_item() {
         "UPDATE conflict_resolutions SET revision_task_id = '{resolver}' WHERE id = '{conflict}'"
     ));
     f.stick(&resolver, "status = 'todo'", 0);
+    let resolve_run = f.execution(&resolver, ExecutionKind::RevisionImplementation, ExecutionStatus::Ready);
     f.assert_candidate(&item, false);
-    f.sql(&format!("UPDATE tasks SET status = 'archived' WHERE id = '{resolver}'"));
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'archived' WHERE id = '{resolver}';
+         UPDATE work_executions SET status = 'cancelled' WHERE id = '{resolve_run}'"
+    ));
     f.assert_candidate(&item, true);
     f.sql(&format!(
         "UPDATE conflict_resolutions SET status = 'pending', revision_task_id = NULL WHERE id = '{conflict}'"
@@ -576,6 +596,9 @@ fn clause_2_an_inflight_ci_or_conflict_attempt_excludes_the_item() {
     ));
     f.assert_candidate(&item, true);
 }
+
+#[path = "progression_inert_holds_tests.rs"]
+mod inert_holds;
 
 // ── Clause 3: not waiting on capacity ─────────────────────────────────────
 
