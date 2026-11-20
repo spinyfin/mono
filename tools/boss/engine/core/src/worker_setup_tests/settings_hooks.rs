@@ -407,3 +407,33 @@ mod git_store_guard_tests {
         assert!(s.contains("realpath"), "must compare the symlink-resolved spelling too");
     }
 }
+
+#[test]
+fn settings_grant_bazel_output_root_for_bazel_workspaces() {
+    let ws = TempDir::new().unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel"), "").unwrap();
+    std::fs::write(
+        ws.path().join(".bazelrc"),
+        "startup --output_user_root=/opt/bazel-out-root\n",
+    )
+    .unwrap();
+    let mut input = sample_input();
+    input.workspace_path = ws.path().to_path_buf();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+    assert_eq!(
+        parsed["permissions"]["additionalDirectories"],
+        serde_json::json!(["/opt/bazel-out-root"]),
+    );
+    // Remote settings carry a local path that means nothing off-host.
+    let remote: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
+    assert!(remote["permissions"].get("additionalDirectories").is_none());
+}
+
+#[test]
+fn settings_omit_additional_directories_for_non_bazel_workspaces() {
+    let ws = TempDir::new().unwrap();
+    let mut input = sample_input();
+    input.workspace_path = ws.path().to_path_buf();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
+    assert!(parsed["permissions"].get("additionalDirectories").is_none());
+}
