@@ -351,6 +351,10 @@ struct WorkBoardCardItem: View {
                 WorkDispatchFailureBanner(reason: dispatchFailedReason, errorText: task.dispatchFailedError)
             }
 
+            if let notice = AutoStopNotice.visibleNotice(on: task) {
+                WorkAutoStopBanner(notice: notice) { model.acknowledgeAutoStopNotice(for: task) }
+            }
+
             if let dragRefusal {
                 WorkDragRefusalBanner(
                     message: dragRefusal.message,

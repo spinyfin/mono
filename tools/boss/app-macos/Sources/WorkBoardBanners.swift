@@ -102,6 +102,119 @@ struct WorkDispatchFailureBanner: View {
     }
 }
 
+/// An engine-initiated stop that no human has acknowledged: the engine
+/// turned autostart off, or withdrew a queued execution without replacing
+/// it. Mirrors `AutoStopNotice` on the wire, which the engine derives from
+/// the same audit rows `boss task show` lists.
+struct AutoStopNotice: Hashable {
+    /// Highest audit row the notice covers; sent back to acknowledge it.
+    let auditId: Int64
+    /// Stable code of the engine path behind the latest stop.
+    let reasonCode: String
+    let detail: String?
+    /// Unix epoch seconds of the latest stop, as the engine sends it.
+    let changedAt: String
+    let autostartDisabled: Bool
+    let executionAbandoned: Bool
+
+    /// Patch sent on Acknowledge. The key must stay
+    /// `acknowledge_auto_stop_through`; serde ignores unknown fields, so a
+    /// typo would make the button a silent no-op.
+    var acknowledgePatch: [String: Any] {
+        ["acknowledge_auto_stop_through": auditId]
+    }
+
+    /// A dispatch-failure banner already explains why autostart is off, so
+    /// the engine-stop banner stays hidden while that reason is set.
+    static func visibleNotice(on task: WorkTask) -> AutoStopNotice? {
+        guard task.dispatchFailedReason == nil else { return nil }
+        return task.autoStopNotice
+    }
+
+    static func parse(_ value: Any?) -> AutoStopNotice? {
+        guard let payload = value as? [String: Any],
+              let auditId = (payload["audit_id"] as? NSNumber)?.int64Value,
+              let reasonCode = payload["reason_code"] as? String
+        else { return nil }
+        return AutoStopNotice(
+            auditId: auditId,
+            reasonCode: reasonCode,
+            detail: payload["detail"] as? String,
+            changedAt: payload["changed_at"] as? String ?? "",
+            autostartDisabled: payload["autostart_disabled"] as? Bool ?? false,
+            executionAbandoned: payload["execution_abandoned"] as? Bool ?? false
+        )
+    }
+
+    var headline: String {
+        switch (autostartDisabled, executionAbandoned) {
+        case (true, true): return "Engine stopped this — autostart off, queued run withdrawn"
+        case (false, true): return "Engine withdrew this item's queued run"
+        default: return "Engine turned off autostart"
+        }
+    }
+
+    var reasonLabel: String {
+        reasonCode.replacingOccurrences(of: "_", with: " ")
+    }
+
+    var summary: String {
+        var parts = ["Reason: \(reasonLabel)"]
+        if let seconds = TimeInterval(changedAt) {
+            let when = Date(timeIntervalSince1970: seconds)
+            parts.append(when.formatted(date: .abbreviated, time: .shortened))
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// Rendered on a kanban card while `task.autoStopNotice` is set. Persists
+/// across status changes and reconnects (the engine re-sends it on every read)
+/// and comes down when the user acknowledges it or the item starts a run.
+struct WorkAutoStopBanner: View {
+    let notice: AutoStopNotice
+    let onAcknowledge: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "pause.circle.fill")
+                .foregroundStyle(.orange)
+                .font(.caption)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notice.headline)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(notice.summary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 4)
+            Button(action: onAcknowledge) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+            .help("Acknowledge")
+            .accessibilityLabel("Acknowledge engine stop")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.orange.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.orange.opacity(0.4), lineWidth: 1)
+                )
+        )
+        .help(notice.detail ?? notice.reasonLabel)
+    }
+}
+
 struct WorkDragRefusalBanner: View {
     let message: String
     /// Title of the engine-suggested next step; nil hides the button.

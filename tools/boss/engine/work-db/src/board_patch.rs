@@ -134,6 +134,7 @@ pub(super) fn attach_board_derivations(
     // `TaskStatus::can_still_change_pr`.
     attach_in_progress_revision_flag(&mut tasks, chores);
     attach_conflict_deferral(conn, &mut tasks, chores, caller);
+    super::auto_stop_notice::attach(conn, &mut tasks, chores, caller);
     // Compute ready_for_review for every Review-lane task that is
     // waiting on the operator and nothing else (no block, no
     // in-progress revision, CI green, no merge conflict). Must run

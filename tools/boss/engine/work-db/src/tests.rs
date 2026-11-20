@@ -525,6 +525,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         merge_intent: None,
         pr_mergeable_state: None,
         conflict_resolution_deferred: false,
+        auto_stop_notice: None,
         reasoning: None,
         external_ref: None,
         parent_task_id: parent.map(str::to_owned),
@@ -660,6 +661,8 @@ mod board_projection_tests;
 mod navigator_projection_tests;
 
 mod task_status_audit_tests;
+
+mod auto_stop_notice_tests;
 
 mod stuck_report_progress_tests;
 mod stuck_report_tests;
