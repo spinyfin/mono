@@ -1,5 +1,5 @@
 //! The real dispatch coordinator against the authenticated scripted spoke.
-use super::{short, support::*, workspace_slack};
+use super::{short, support::*, timing, workspace_slack};
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
     lifecycle_adapter::CoreLifecycleServices,
@@ -514,11 +514,16 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
 /// dispatch passes than the pre-start retry budget allows, and optionally a
 /// second host that every later pass would rank higher.
 async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: bool) {
-    let fx = Fixture::with(workspace_slack(300)).await;
-    let env = env(&fx, 1).await;
-    if other_host {
-        fx.db.add_host("other", "worker@other", 8, &[]).unwrap();
-        fx.db
+    let (fx, env, execution, peer, events) = timing::frozen(async {
+        let fx = Fixture::with(workspace_slack(300)).await;
+        let mut env = env(&fx, 1).await;
+        let events = Arc::new(boss_engine_runtime::dispatch_events::RecordingDispatchEventSink::new());
+        Arc::get_mut(&mut env.coordinator)
+            .unwrap()
+            .set_dispatch_events(events.clone());
+        if other_host {
+            fx.db.add_host("other", "worker@other", 8, &[]).unwrap();
+            fx.db
             .connect()
             .unwrap()
             .execute(
@@ -526,49 +531,80 @@ async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: 
                 [],
             )
             .unwrap();
-        fx.db.set_host_enabled("other", false).unwrap();
-        fx.serve_legacy();
-    }
-    let execution = triage(&fx, &env, "disconnected host");
-    let peer = fx
-        .spoke(
-            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
-            None,
-            0,
-        )
-        .await;
-    env.coordinator.kick();
-    until("the lease to be parked", || attention_open(&fx, &execution.id)).await;
-    let seen = peer.commands();
-    let cursor = Cursor {
-        journal_id: peer.journal.clone(),
-        through: seen.iter().map(|c| c.sequence).max().unwrap_or(0),
-    };
-    let lease = seen.iter().find(|c| is_lease(c)).cloned().unwrap();
-    let answered = seen.iter().filter(|c| !is_lease(c)).count() as u64;
-    peer.disconnect();
-    if other_host {
-        // Every later pass now ranks the other host first.
-        fx.db.set_host_enabled("other", true).unwrap();
-    }
-
-    // Far more passes than the pre-start budget, with the host gone.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_never_failed(&fx, &execution.id);
-    assert!(fx.legacy_calls().is_empty(), "{:?}", fx.legacy_calls());
-
-    // The host returns and answers the stored lease: the same command settles.
-    let peer = fx.spoke(Box::new(answer), Some(cursor), answered).await;
-    peer.answer_late(&lease, answer(&lease).unwrap()).await;
-    until("the run to spawn on the same host", || {
-        peer.commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+            fx.db.set_host_enabled("other", false).unwrap();
+            fx.serve_legacy();
+        }
+        let execution = triage(&fx, &env, "disconnected host");
+        let peer = fx
+            .spoke(
+                Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+                None,
+                0,
+            )
+            .await;
+        env.coordinator.kick();
+        timing::condition(|| peer.commands().iter().any(is_lease)).await;
+        (fx, env, execution, peer, events)
     })
     .await;
-    assert_never_failed(&fx, &execution.id);
-    assert!(fx.legacy_calls().is_empty());
-    assert!(!released(&peer.commands()));
+    // Only the intentionally unanswered lease runs against the real clock.
+    timing::guarded(timing::condition(|| attention_open(&fx, &execution.id))).await;
+    timing::frozen(async {
+        let seen = peer.commands();
+        let cursor = Cursor {
+            journal_id: peer.journal.clone(),
+            through: seen.iter().map(|c| c.sequence).max().unwrap_or(0),
+        };
+        let lease = seen.iter().find(|c| is_lease(c)).cloned().unwrap();
+        let answered = seen.iter().filter(|c| !is_lease(c)).count() as u64;
+        peer.disconnect();
+        if other_host {
+            // Every later pass now ranks the other host first.
+            fx.db.set_host_enabled("other", true).unwrap();
+        }
+
+        while fx.manager.host_supports(HOST, "workspace/1").await.is_some() {
+            tokio::task::yield_now().await;
+        }
+        // Exercise more completed dispatch passes than the pre-start retry budget,
+        // without assuming how many passes fit into a wall-clock interval.
+        for _ in 0..6 {
+            let before = events.events_for(&execution.id).await.len();
+            env.coordinator.kick();
+            loop {
+                let requested = events
+                    .events_for(&execution.id)
+                    .await
+                    .into_iter()
+                    .skip(before)
+                    .any(|e| e.stage == "request_recorded");
+                if requested
+                    && fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Ready
+                    && env.pool.busy_count().await == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_never_failed(&fx, &execution.id);
+        assert!(fx.legacy_calls().is_empty(), "{:?}", fx.legacy_calls());
+
+        // The host returns and answers the stored lease: the same command settles.
+        let peer = fx.spoke(Box::new(answer), Some(cursor), answered).await;
+        peer.answer_late(&lease, answer(&lease).unwrap()).await;
+        env.coordinator.kick();
+        timing::condition(|| {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        })
+        .await;
+        assert_never_failed(&fx, &execution.id);
+        assert!(fx.legacy_calls().is_empty());
+        assert!(!released(&peer.commands()));
+    })
+    .await;
 }
 
 #[tokio::test]
