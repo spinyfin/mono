@@ -1239,7 +1239,8 @@ if __name__ == "__main__":
 /// only once a cheap `repobin exec checkleft --version` probe confirms the
 /// dispatch actually works (see `probe_repobin_checkleft` below);
 /// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
-/// bare `checkleft` on `PATH`.
+/// bare `checkleft` on `PATH` only for repositories that do not declare
+/// checkleft in REPOBIN.toml.
 ///
 /// repobin is preferred over a direct `checkleft` lookup because a bare
 /// `checkleft` on `PATH` can silently resolve to an unrelated, stale build —
@@ -1828,10 +1829,12 @@ pub fn write_workspace_files(
     }
     let gitignore_path = config_dir.join(".gitignore");
 
-    let preamble = driver.agent_rules_preamble();
+    let checkleft_pinned =
+        boss_engine_worker_bin::environment::workspace_declares_repo_tool(&input.workspace_path, "checkleft");
+    let preamble = driver.agent_rules_preamble(checkleft_pinned);
     std::fs::write(
         &agent_rules_path,
-        render_claude_md(input, preamble, descriptor.config_dir),
+        render_claude_md(input, &preamble, descriptor.config_dir),
     )?;
     std::fs::write(&gitignore_path, driver.config_dir_gitignore())?;
 
