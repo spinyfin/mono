@@ -5,14 +5,97 @@
 //! exists. Between pickup and that point the row is `claimed`, then `running`
 //! with its run committed, and the registry has nothing to say about it. A
 //! failed spawn has the mirror-image window while its workspace is torn down.
-//! An explicit start that trusted the registry alone treated all of these as
-//! "worker gone", abandoned the run that had just been dispatched, and left a
-//! successor waiting on the abandoned run's workspace lease.
+//! An explicit start that consulted the registry alone would read these as
+//! "worker gone", abandon the run being dispatched, and leave a successor
+//! waiting on that run's workspace lease.
 //!
 //! Shared fixtures live in [`super::helpers`].
 
 use super::helpers::*;
 use crate::live_worker_state::LiveWorkerStateRegistry;
+
+struct PausedLiveness {
+    inside: std::sync::mpsc::Sender<()>,
+    table_held: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl boss_execution_contracts::LiveWorkerLiveness for PausedLiveness {
+    fn is_run_live(&self, _: &str) -> bool {
+        self.inside.send(()).unwrap();
+        self.table_held
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap();
+        false
+    }
+    fn snapshot(&self) -> Vec<boss_protocol::LiveWorkerState> {
+        vec![]
+    }
+    fn release_slot_for_run(&self, _: &str) -> Option<u8> {
+        None
+    }
+    fn release_persona_for_run(&self, _: &str) {}
+    fn last_event_at_for_run(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn current_tool_for_run(&self, _: &str) -> Option<String> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn explicit_live_check_and_reservation_db_lookup_do_not_deadlock() {
+    let s = Dispatched::new(FakeCubeClient::default(), FakeExecutionRunner::default());
+    let db = s.coordinator.work_db();
+    db.start_execution_run(&s.queued.id, "worker", "mono", "lease", "workspace", "/tmp/workspace")
+        .unwrap();
+    let inflight = s.coordinator.inflight_dispatches_for_test();
+    let _reservation = inflight.try_reserve(&s.queued, db).unwrap();
+    let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+    let (table_tx, table_rx) = std::sync::mpsc::channel();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel();
+    let coordinator = s.coordinator.clone();
+    let work_item = s.queued.work_item_id.clone();
+    let request = std::thread::spawn(move || {
+        let result = coordinator.request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(work_item)
+                .explicit_start(true)
+                .build(),
+            Arc::new(PausedLiveness {
+                inside: inside_tx,
+                table_held: std::sync::Mutex::new(table_rx),
+            }),
+        );
+        request_tx.send(result.unwrap().id).unwrap();
+    });
+    let wait = std::time::Duration::from_secs(20);
+    inside_rx
+        .recv_timeout(wait)
+        .expect("live check must hold the DB connection");
+    let id = s.queued.id.clone();
+    let lookup_coordinator = s.coordinator.clone();
+    let lookup = std::thread::spawn(move || {
+        inflight.with_table_locked_for_test(|| {
+            table_tx.send(()).unwrap();
+            // This is the table -> DB order used by review-batch reservations.
+            lookup_coordinator
+                .work_db()
+                .are_admissible_concurrent_review_batch_pair(&id, "other-execution")
+                .unwrap();
+        });
+        lookup_tx.send(()).unwrap();
+    });
+    assert_eq!(
+        request_rx.recv_timeout(wait).expect("explicit start deadlocked"),
+        s.queued.id
+    );
+    lookup_rx.recv_timeout(wait).expect("reservation lookup deadlocked");
+    request.join().unwrap();
+    lookup.join().unwrap();
+}
 
 /// What `RequestExecution { force: true }` (`bossctl agents launch`) does once
 /// it has named a work item: create or reuse the execution, force-dispatch it

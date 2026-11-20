@@ -20,6 +20,8 @@ pub(super) enum PredecessorHold {
 pub(super) struct Recheck {
     pub(super) completed: Option<std::time::Instant>,
     at_bound: bool,
+    own_pending: bool,
+    release: PredecessorRelease,
 }
 
 impl ExecutionCoordinator {
@@ -188,6 +190,8 @@ impl ExecutionCoordinator {
                 Recheck {
                     completed: None,
                     at_bound,
+                    own_pending: false,
+                    release: PredecessorRelease::RetryKept,
                 },
             );
         }
@@ -227,10 +231,12 @@ impl ExecutionCoordinator {
         }
         {
             let mut attempts = self.predecessor_rechecks.lock().expect("predecessor recheck lock");
-            if attempts
-                .get(&abandoned.id)
-                .is_some_and(|check| check.completed.is_none())
+            if let Some(check) = attempts.get_mut(&abandoned.id)
+                && check.completed.is_none()
             {
+                // Keep the first-release obligation behind a retry that the
+                // scheduler started after the successor became visible.
+                check.own_pending = check.release == PredecessorRelease::RetryKept;
                 return;
             }
             attempts.insert(
@@ -238,6 +244,8 @@ impl ExecutionCoordinator {
                 Recheck {
                     completed: None,
                     at_bound: false,
+                    own_pending: false,
+                    release: PredecessorRelease::Own,
                 },
             );
         }
@@ -261,28 +269,44 @@ impl ExecutionCoordinator {
     ) {
         let coordinator = Arc::clone(self);
         boss_task_scope::spawn(async move {
-            coordinator
-                .lifecycle
-                .refresh_predecessor_lease(
-                    &predecessor,
-                    coordinator.live_worker_states(),
-                    coordinator.host_adapter_provider.as_ref(),
-                    coordinator.host_adapter(),
-                    at_bound,
-                    release,
-                )
-                .await;
-            coordinator
-                .predecessor_rechecks
-                .lock()
-                .expect("predecessor recheck lock")
-                .insert(
-                    predecessor.id,
-                    Recheck {
-                        completed: Some(std::time::Instant::now()),
-                        at_bound,
-                    },
-                );
+            let mut release = release;
+            loop {
+                // A preceding retry can already have returned the lease.
+                // Read its current binding before performing a queued release.
+                match coordinator.work_db.get_execution(&predecessor.id) {
+                    Ok(current) => {
+                        coordinator
+                            .lifecycle
+                            .refresh_predecessor_lease(
+                                &current,
+                                coordinator.live_worker_states(),
+                                coordinator.host_adapter_provider.as_ref(),
+                                coordinator.host_adapter(),
+                                at_bound,
+                                release,
+                            )
+                            .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(execution_id = %predecessor.id, %err, "could not refresh predecessor for release")
+                    }
+                }
+                let mut attempts = coordinator
+                    .predecessor_rechecks
+                    .lock()
+                    .expect("predecessor recheck lock");
+                let check = attempts
+                    .get_mut(&predecessor.id)
+                    .expect("registered predecessor recheck");
+                if std::mem::take(&mut check.own_pending) {
+                    // Serialize release attempts for the same workspace.
+                    release = PredecessorRelease::Own;
+                    check.release = release;
+                    continue;
+                }
+                check.completed = Some(std::time::Instant::now());
+                break;
+            }
             coordinator.predecessor_recheck_done.notify_waiters();
             coordinator.kick();
         });
