@@ -68,7 +68,7 @@ fn existing_bazel_out_symlink_names_the_root() {
 
 #[test]
 fn custom_symlink_layout_keeps_output_base() {
-    // These layouts previously yielded the home directory or filesystem root.
+    // Custom output bases directly under home or / grant only the base, never its parent.
     for (target, expected) in [
         ("/home/u/bazel-base/execroot/_main/bazel-out", "/home/u/bazel-base"),
         ("/bazel-base/execroot/_main/bazel-out", "/bazel-base"),
@@ -83,9 +83,18 @@ fn custom_symlink_layout_keeps_output_base() {
 #[test]
 fn broad_roots_are_rejected_after_normalization() {
     let ws = tempfile::tempdir().unwrap();
-    for root in ["/", "/home/u", "/home/u/sub/..", "/nonexistent-bazel-root/../"] {
-        std::fs::write(ws.path().join(".bazelrc"), format!("startup --output_base={root}")).unwrap();
-        assert_eq!(with_user(ws.path()), None, "{root}");
+    for root in [
+        "/",
+        "/home",
+        "/home/u",
+        "~/..",
+        "/home/u/sub/..",
+        "/nonexistent-bazel-root/../",
+    ] {
+        for flag in ["--output_base", "--output_user_root"] {
+            std::fs::write(ws.path().join(".bazelrc"), format!("startup {flag}={root}")).unwrap();
+            assert_eq!(with_user(ws.path()), None, "{flag}={root}");
+        }
     }
 }
 
@@ -190,6 +199,49 @@ fn symlink_and_default_branches_reject_whole_home() {
     std::os::unix::fs::symlink(home.path(), cache.path().join("_bazel_u")).unwrap();
     assert_eq!(
         bazel_output_directory_with(ws.path(), home.path().to_str(), Some("u"), cache.path().to_str(), None),
+        None
+    );
+}
+
+#[test]
+fn standard_symlink_layout_grants_user_root() {
+    let ws = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(storage.path()).unwrap().join("_bazel_u");
+    let out = root.join("0123456789abcdef0123456789abcdef/execroot/_main/bazel-out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel"), "").unwrap();
+    std::os::unix::fs::symlink(&out, ws.path().join("bazel-out")).unwrap();
+    assert_eq!(with_user(ws.path()), Some(root));
+}
+
+#[test]
+fn nonstandard_hash_layouts_keep_output_base() {
+    for base in [
+        "/cache/custom/0123456789abcdef0123456789abcdef",
+        "/cache/_bazel_u/0123456789ABCDEF0123456789ABCDEF",
+        "/cache/_bazel_u/0123456789abcdef",
+        "/cache/_bazel_u/0123456789abcdef0123456789abcdeg",
+    ] {
+        assert_eq!(
+            output_base_from_target(&Path::new(base).join("execroot/_main/bazel-out")),
+            Some(PathBuf::from(base))
+        );
+    }
+}
+
+#[test]
+fn symlink_base_cannot_grant_ancestor_of_home() {
+    let ws = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let home = storage.path().join("user");
+    let out = storage.path().join("execroot/_main/bazel-out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(ws.path().join("MODULE.bazel"), "").unwrap();
+    std::os::unix::fs::symlink(&out, ws.path().join("bazel-out")).unwrap();
+    assert_eq!(
+        bazel_output_directory_with(ws.path(), home.to_str(), Some("u"), None, None),
         None
     );
 }

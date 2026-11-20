@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 const MAX_IMPORT_DEPTH: usize = 8;
 
 /// Return at most one grant: explicit base, explicit user root, existing
-/// output base, then the environment-aware per-user default.
+/// output user root (or custom base), then the environment-aware per-user default.
 pub(crate) fn bazel_output_directory(workspace: &Path) -> Option<PathBuf> {
     bazel_output_directory_with(
         workspace,
@@ -40,7 +40,7 @@ fn bazel_output_directory_with(
         })?;
     let root = normalize(&root)?;
     let home = home.and_then(|h| normalize(Path::new(h)));
-    (root.parent().is_some() && home.as_ref() != Some(&root)).then_some(root)
+    (root.parent().is_some() && !home.as_ref().is_some_and(|h| h.starts_with(&root))).then_some(root)
 }
 
 /// Resolve existing ancestors too, so a missing leaf below a symlink cannot
@@ -74,7 +74,21 @@ fn output_base_from_target(target: &Path) -> Option<PathBuf> {
     let execroot = target
         .ancestors()
         .find(|a| a.file_name().is_some_and(|n| n == "execroot"))?;
-    Some(execroot.parent()?.to_path_buf())
+    let base = execroot.parent()?;
+    let is_hash = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.len() == 32 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    if is_hash
+        && let Some(parent) = base.parent()
+        && parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("_bazel_"))
+    {
+        return Some(parent.to_path_buf());
+    }
+    Some(base.to_path_buf())
 }
 
 #[derive(Default)]
