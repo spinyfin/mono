@@ -213,6 +213,48 @@ def signal_writes(group, args):
             names.update(SIG_IDENT.findall(' '.join(rest)))
     return names
 
+def signal_decode(text, operand=False, fallback=None):
+    out, index = [], 0
+    escapes = dict(zip('abefnrtv', map(chr, (7, 8, 27, 12, 10, 13, 9, 11))))
+    escapes[SIG_BS] = SIG_BS
+    while index < len(text):
+        char = text[index]
+        index += 1
+        if char != SIG_BS or index == len(text):
+            out.append(char)
+            continue
+        char = text[index]
+        index += 1
+        if char == 'c':
+            return ''.join(out), True
+        if char in escapes:
+            out.append(escapes[char])
+            continue
+        digits, base, limit = '', 8, 3
+        if char == 'x':
+            base, limit = 16, 2
+        elif char in '01234567':
+            digits = '' if operand and char == '0' else char
+            limit -= len(digits)
+        else:
+            # Unknown shell-specific escapes cannot hide a signalling word.
+            if SIG_KILL_WORD.search(text if fallback is None else fallback):
+                return 'pkill' + SIG_NL, False
+            out.extend((SIG_BS, char))
+            continue
+        alphabet = '0123456789abcdef'[:base]
+        while limit and index < len(text) and text[index].lower() in alphabet:
+            digits += text[index]
+            index += 1
+            limit -= 1
+        if digits:
+            out.append(chr(int(digits, base)))
+        elif SIG_KILL_WORD.search(text if fallback is None else fallback):
+            return 'pkill' + SIG_NL, False
+        else:
+            out.extend((SIG_BS, char))
+    return ''.join(out), False
+
 def signal_output(group):
     content = getattr(group, 'body', '')
     if content:
@@ -225,21 +267,32 @@ def signal_output(group):
     _, base = signal_program(args[0])
     if base == 'echo':
         words = args[1:]
-        expanding, newline = False, SIG_NL
+        expanding, newline = True, SIG_NL
         while words and re.fullmatch('-[neE]+', words[0]):
-            expanding = expanding or 'e' in words[0]
+            if 'E' in words[0]:
+                expanding = False
+            if 'e' in words[0]:
+                expanding = True
             newline = '' if 'n' in words[0] else newline
             words = words[1:]
         text = ' '.join(words)
-        return 'pkill' if expanding and SIG_KILL_WORD.search(text) else text + newline
+        decoded, stopped = signal_decode(text, True) if expanding else (text, False)
+        return decoded + ('' if stopped else newline)
     if base == 'printf' and len(args) > 1:
-        if args[1] in ('%s', '%b'):
-            # These formats write their arguments back to back.
+        if args[1] == '%s':
             return ''.join(args[2:])
+        if args[1] == '%b':
+            out = []
+            for item in args[2:]:
+                decoded, stopped = signal_decode(item, True, ''.join(args[2:]))
+                out.append(decoded)
+                if stopped:
+                    break
+            return ''.join(out)
         if args[1] == '%s' + SIG_BS + 'n':
             return ''.join(item + SIG_NL for item in args[2:])
         if '%' not in args[1]:
-            return args[1]
+            return signal_decode(args[1])[0]
     if SIG_KILL_WORD.search(signal_chain_text(group)):
         return 'pkill' + SIG_NL
     return ''
@@ -464,8 +517,8 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
 
     def inspect_written(path):
         key = os.path.normpath(path)
-        if key in written:
-            inspect(written[key])
+        for content in tuple(written.get(key, set())):
+            inspect(content)
 
     for index, group in enumerate(groups):
         args, indirect, strings, _ = parsed[index]
@@ -486,7 +539,13 @@ def signal_check(source, depth=0, inherited=None, unknown=None, holders=None, sc
                 content = 'pkill' + SIG_NL
         for target, append in targets:
             key = os.path.normpath(target)
-            written[key] = (written.get(key, '') if append else '') + content
+            variants = written.setdefault(key, set())
+            additions = {prior + content for prior in variants | {''}} if append else {content}
+            variants.update(additions)
+
+    # Deferred actions and conditional writes can observe any recorded variant.
+    for index, group in enumerate(groups):
+        args, indirect, strings, _ = parsed[index]
         for string in strings:
             inspect(string)
         captures = {name for name in qualified if first[name] < index}

@@ -137,15 +137,6 @@ def heredoc_ops(line):
     return found
 
 
-def heredoc_delim(line):
-    # First heredoc only: (word, quoted), None when there is none, False when
-    # the syntax cannot be parsed.
-    ops = heredoc_ops(line)
-    if ops is False:
-        return False
-    return ops[0][1:] if ops else None
-
-
 
 class CommandGroup(list):
     def __init__(self, tokens, body='', boundary=None, error=None, literal_chars=None, quote_segments=None):
@@ -175,12 +166,13 @@ def split_punct_word(word, mask, segs):
     return [word], [mask], [segs]
 
 
-def quote_provenance(text, tokens):
+def quote_provenance(text, tokens, spans=None):
     # Mirror shlex boundaries while retaining each literal character and the
     # quote/escape run it came from. Adjacent quoted strings concatenate into
     # one shlex word ("$A""B" -> $AB) but must not share a segment id.
     words, masks, segs, word, mask, segm = [], [], [], [], [], []
     quote, index, active, segment = None, 0, False, 0
+    word_start = 0
     def new_segment():
         nonlocal segment
         segment += 1
@@ -188,12 +180,16 @@ def quote_provenance(text, tokens):
         nonlocal word, mask, segm, active
         if active:
             parts, part_masks, part_segs = split_punct_word(''.join(word), mask, segm)
+            if spans is not None:
+                spans.extend([(word_start, index)] * len(parts))
             words.extend(parts)
             masks.extend(part_masks)
             segs.extend(part_segs)
         word, mask, segm, active = [], [], [], False
     while index < len(text):
         char = text[index]
+        if not active and char not in SHLEX_WS:
+            word_start = index
         if quote == ANSI:
             if char == chr(92) and index + 1 < len(text):
                 word.append(text[index + 1])
@@ -252,6 +248,9 @@ def quote_provenance(text, tokens):
                 end += 1
             for part in re.findall(r'[()]|[;&|]+', text[index:end]):
                 words.append(part)
+                if spans is not None:
+                    spans.append((index, index + len(part)))
+                    index += len(part)
                 masks.append([False] * len(part))
                 segs.append([segment] * len(part))
             index = end
@@ -354,6 +353,7 @@ def strip_line_continuations(text):
     lines = text.split(chr(10))
     out, current, pending, carry = [], '', '', ''
     heredoc_end, expanding = None, False
+    heredocs = []
     for number, line in enumerate(lines):
         last = number == len(lines) - 1
         if heredoc_end is not None:
@@ -364,7 +364,11 @@ def strip_line_continuations(text):
             carry = ''
             out.append(joined)
             if joined.lstrip(chr(9)) == heredoc_end:
-                heredoc_end = None
+                if heredocs:
+                    heredoc_end, quoted = heredocs.pop(0)
+                    expanding = not quoted
+                else:
+                    heredoc_end = None
             continue
         shaped = shell_text(pending + line + chr(10))
         body = shaped[:-1]
@@ -378,9 +382,11 @@ def strip_line_continuations(text):
             pending = shaped
             continue
         pending = ''
-        delim = heredoc_delim(shaped)
-        if delim:
-            heredoc_end, expanding = delim[0], not delim[1]
+        ops = heredoc_ops(shaped)
+        if ops:
+            heredocs = [op[1:] for op in ops]
+            heredoc_end, quoted = heredocs.pop(0)
+            expanding = not quoted
     return chr(10).join(out + ([current] if current else []))
 
 
@@ -451,36 +457,6 @@ def shell_text(text):
     return ''.join(out)
 
 
-def heredoc_candidates(groups):
-    # (group, delimiter word) for every unquoted << token, in source order.
-    found = []
-    for group in groups:
-        masks = getattr(group, 'literal_chars', None) or []
-        for i, word in enumerate(group):
-            at = word.find('<<')
-            while at != -1:
-                mask = masks[i] if i < len(masks) else [False] * len(word)
-                if not any(mask[at:at + 2]) and word[at + 2:at + 3] != '<' and word[at - 1:at] != '<':
-                    attached = word[at + 2:]
-                    base = at + 2
-                    if attached.startswith('-'):
-                        attached, base = attached[1:], base + 1
-                    source, offset = word, base
-                    if not attached and i + 1 < len(group):
-                        source, offset = group[i + 1], 0
-                        mask = masks[i + 1] if i + 1 < len(masks) else [False] * len(source)
-                        attached = source
-                    end = len(source)
-                    for k in range(offset, len(source)):
-                        if source[k] in '<>' and not mask[k]:
-                            end = k
-                            break
-                    text = source[offset:end]
-                    if text:
-                        found.append((group, text))
-                at = word.find('<<', at + 2)
-    return found
-
 
 def command_records(command, stripped=False):
     groups = []
@@ -531,8 +507,9 @@ def command_records(command, stripped=False):
         line_group_start = len(groups)
         current = []
         tokens = [part for token in tokens for part in (re.findall(r'[()]|[;&|]+', token) if token and all(c in '();&|' for c in token) else [token])]
+        spans = []
         try:
-            literal, segments = quote_provenance(logical_line, tokens)
+            literal, segments = quote_provenance(logical_line, tokens, spans)
         except Exception:
             literal = [[False] * len(token) for token in tokens]
             segments = None
@@ -541,8 +518,11 @@ def command_records(command, stripped=False):
             segments = None
         elif segments is not None and len(segments) != len(tokens):
             segments = None
+        if segments is None:
+            spans = []
         current_literal = []
         current_segments = [] if segments is not None else None
+        token_owners = {}
         for index, token in enumerate(tokens):
             if token in DELIMS or token in ('(', ')') or (token in ('{', '}') and not current and not any(literal[index])):
                 if current:
@@ -552,6 +532,7 @@ def command_records(command, stripped=False):
                 current_segments = [] if segments is not None else None
                 groups.append(CommandGroup([], boundary=token))
             else:
+                token_owners[index] = len(groups)
                 current.append(token)
                 current_literal.append(literal[index])
                 if current_segments is not None:
@@ -565,17 +546,15 @@ def command_records(command, stripped=False):
             owners = [g for g in groups[line_group_start:] if g] or [g for g in groups if g]
             if not owners:
                 owners = [CommandGroup([])]
-            candidates = heredoc_candidates(groups[line_group_start:])
-            for _, word, quoted in ops:
-                # Each real heredoc belongs to the token that declares it;
-                # arithmetic shifts never reach this list, and an unmatched
-                # operator falls back to the last command on the line.
-                owner = owners[-1]
-                for k, (group, cand) in enumerate(candidates):
-                    if cand == word:
-                        owner = group
-                        del candidates[k]
+            for source_offset, word, quoted in ops:
+                owner = None
+                for i, (start, end) in enumerate(spans):
+                    if start <= source_offset < end and i in token_owners:
+                        owner = groups[token_owners[i]]
                         break
+                if owner is None:
+                    groups.append(CommandGroup([], error='cannot locate heredoc owner'))
+                    owner = owners[-1]
                 heredocs.append((owner, word, quoted))
             if heredocs:
                 receiver, heredoc_end, quoted = heredocs.pop(0)
@@ -1072,7 +1051,7 @@ assert not any(g.error for g in command_records("echo $'a\\nb' x"))
 import os, re, shlex
 # COMMAND_TOKENIZER_FRAGMENT
 line = "echo $'\\' <<X #'"
-assert heredoc_delim(shell_text(line)) is None, heredoc_delim(shell_text(line))
+assert heredoc_ops(shell_text(line)) == [], heredoc_ops(shell_text(line))
 assert open_quote(line) is None
 command = line + chr(10) + "cat /etc/passwd" + chr(10) + "X"
 records = [list(g) for g in command_records(command) if list(g)]
@@ -1097,6 +1076,15 @@ def token_segs(command, index=1):
     groups = [g for g in command_records(command) if list(g)]
     assert groups, command
     return groups[0][index], groups[0].quote_segments[index]
+records = command_records('((1 << 3)); bash <<3\npkill -f foo\n3')
+assert not any(g.error for g in records)
+assert next(g for g in records if g and g[0] == 'bash').body == 'pkill -f foo\n'
+assert all(not g.body for g in records if g and g[0] != 'bash')
+command = "cat <<A; cat <<'B'\na\nA\nb" + chr(92) + "\nB\npkill -f foo"
+assert strip_line_continuations(command) == command
+records = command_records(command)
+assert not any(g.error for g in records)
+assert any(g and g[0] == 'pkill' for g in records)
 word, segs = token_segs('echo "$A""B"')
 assert word == '$AB', word
 assert segs[0] == segs[1] != segs[2], segs

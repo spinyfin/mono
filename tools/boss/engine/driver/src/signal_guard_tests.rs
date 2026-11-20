@@ -5,6 +5,18 @@ use std::process::{Command, Stdio};
 
 pub(crate) fn denied() -> Vec<String> {
     let mut commands = [
+        "((1 << 3)); bash <<3\npkill -f foo\n3",
+        "cat <<A; cat <<'B'\na\nA\nb\\\nB\npkill -f foo",
+        "printf '#!/bin/sh\\npkill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf 'cd /tmp\\npkill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf '%b' 'echo safe\\npkill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "echo 'echo safe\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf '%b' '\\0160kill -f foo\\n' > /tmp/k.sh; sh /tmp/k.sh",
+        "printf 'pkill -f foo\\n\\c' > /tmp/k.sh; sh /tmp/k.sh",
+        "trap 'sh /tmp/k.sh' EXIT; echo 'pkill -f foo' > /tmp/k.sh",
+        "f() { sh /tmp/k.sh; }; echo 'pkill -f foo' > /tmp/k.sh; f",
+        "echo 'pkill -f foo' > /tmp/k.sh; false && echo safe > /tmp/k.sh; sh /tmp/k.sh",
+        "echo 'pkill -f foo' > /tmp/k.sh; out=$(sh /tmp/k.sh); echo 'echo safe' > /tmp/k.sh",
         "echo -n 'pkill foo' > k.sh; sh ./k.sh",
         "echo 'pkill -f foo' > /tmp/k.sh; bash -c 'sh /tmp/k.sh'",
         "echo 'pkill -f foo' > /tmp/k.sh; eval 'sh /tmp/k.sh'",
@@ -246,6 +258,14 @@ pub(crate) fn denied() -> Vec<String> {
 }
 
 pub(crate) const ALLOWED: &[&str] = &[
+    "printf '#!/bin/sh\\necho safe\\n' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%s' 'echo safe\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%b' 'echo safe\\c' 'pkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf 'echo safe\\c\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '#!/bin/sh\\necho safe\\n' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%s' '# literal\\npkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "printf '%b' 'echo safe\\c' 'pkill -f foo' > /tmp/k.sh; sh /tmp/k.sh",
+    "echo 'echo safe' > /tmp/k.sh; false && echo 'echo fine' > /tmp/k.sh; sh /tmp/k.sh",
     "cat <<EOF>out.txt\nuse pkill carefully\nEOF",
     "cat<<'EOF' > notes.md\nit's fine to mention pkill here\nEOF",
     "echo 'echo hi' > /tmp/k.sh; bash -c 'sh /tmp/k.sh'",
