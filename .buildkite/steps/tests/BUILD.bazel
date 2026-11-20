@@ -30,3 +30,15 @@ sh_test(
         "//tools/remote-execution:remote-status.sh",
     ],
 )
+
+# Script-level test that ci-env.sh's bazel_verify_only selects the `ci-strip`
+# config .ci.bazelrc defines, and that no release path does.
+sh_test(
+    name = "ci_strip_config_test",
+    size = "small",
+    srcs = ["ci_strip_config_test.sh"],
+    data = [
+        "//:.ci.bazelrc",
+        "//.buildkite/steps:ci-env.sh",
+    ],
+)
