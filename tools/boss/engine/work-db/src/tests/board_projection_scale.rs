@@ -6,18 +6,9 @@ use boss_metrics::population_timing::PopulationTrace;
 use std::time::Instant;
 
 fn resources() -> (f64, i64) {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    // SAFETY: getrusage initializes the supplied rusage on success.
-    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
-    let usage = unsafe { usage.assume_init() };
-    let cpu = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64 * 1000.0
-        + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1000.0;
-    let rss_bytes = if cfg!(target_os = "macos") {
-        usage.ru_maxrss
-    } else {
-        usage.ru_maxrss * 1024
-    };
-    (cpu, rss_bytes)
+    let (user_s, sys_s) = crate::test_support::rusage_cpu_seconds(libc::RUSAGE_SELF);
+    let rss_bytes = crate::test_support::rusage_max_rss(libc::RUSAGE_SELF);
+    ((user_s + sys_s) * 1000.0, rss_bytes)
 }
 
 #[test]

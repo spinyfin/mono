@@ -2,6 +2,10 @@
 use super::{CiRemediation, WorkDb};
 use boss_protocol::QueueCiEvidence;
 
+#[path = "test_resources.rs"]
+mod resources;
+pub use resources::{install_peak_memory_report, rusage_cpu_seconds, rusage_max_rss};
+
 #[path = "test_db_template.rs"]
 mod db_template;
 pub(crate) use db_template::{open_memory_db, seed_new_file_db};
@@ -109,6 +113,7 @@ mod db_helpers {
     pub const TEST_REPO_REMOTE_URL: &str = "git@github.com:spinyfin/mono.git";
 
     pub fn open_db() -> (TempDir, WorkDb) {
+        super::install_peak_memory_report();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.db");
         super::db_template::copy_to(&path);
