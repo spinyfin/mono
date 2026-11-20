@@ -1751,6 +1751,18 @@ impl WorkDb {
         dep_filter: Option<&DependencyFilter>,
         include_deleted: bool,
     ) -> Result<Vec<Task>> {
+        self.list_tasks_selected(product_id, project_id, dep_filter, include_deleted, None)
+    }
+
+    /// List one canonical or product-local short id, including tombstones when requested.
+    pub fn list_tasks_selected(
+        &self,
+        product_id: &str,
+        project_id: Option<&str>,
+        dep_filter: Option<&DependencyFilter>,
+        include_deleted: bool,
+        selector: Option<&str>,
+    ) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
@@ -1772,19 +1784,35 @@ impl WorkDb {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
-                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause}
+                 WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause} AND (?3 IS NULL OR id = ?3 OR short_id = ?4)
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             ))?;
-            let rows = stmt.query_map(params![product_id, project_id], map_task_with_tags)?;
+            let rows = stmt.query_map(
+                params![
+                    product_id,
+                    project_id,
+                    selector,
+                    selector.and_then(|s| s.parse::<i64>().ok())
+                ],
+                map_task_with_tags,
+            )?;
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, review_cycle, last_reviewed_sha, parent_task_id, tags, parked_at, parked_by, parked_reason, parked_via, (SELECT view_json FROM open_operator_questions WHERE work_item_id = tasks.id) AS operator_question
                  FROM tasks
-                 WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause}
+                 WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause} AND (?3 IS NULL OR id = ?3 OR short_id = ?4)
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             ))?;
-            let rows = stmt.query_map([product_id], map_task_with_tags)?;
+            let rows = stmt.query_map(
+                params![
+                    product_id,
+                    rusqlite::types::Null,
+                    selector,
+                    selector.and_then(|s| s.parse::<i64>().ok())
+                ],
+                map_task_with_tags,
+            )?;
             collect_rows(rows)?
         };
 

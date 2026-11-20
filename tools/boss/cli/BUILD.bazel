@@ -699,6 +699,7 @@ rust_test(
         ":common",
         ":harness",
         "//tools/boss/client",
+        "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

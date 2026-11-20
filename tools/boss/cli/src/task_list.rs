@@ -75,12 +75,18 @@ pub(crate) async fn run(client: &mut BossClient, ctx: &RunContext, args: TaskLis
             });
             rows
         } else {
-            list_tasks(
+            list_tasks_query(
                 client,
                 &product.id,
                 project.as_ref().map(|p| p.id.as_str()),
                 dep_filter.clone(),
                 args.include_deleted,
+                boss_protocol::TaskListQuery {
+                    selector: None,
+                    match_term: args.match_term.clone(),
+                    kinds: args.kind.clone(),
+                    created_since,
+                },
             )
             .await?
         };
@@ -102,6 +108,17 @@ pub(crate) async fn run(client: &mut BossClient, ctx: &RunContext, args: TaskLis
             repo.as_ref(),
             product.repo_remote_url.as_deref(),
         ));
+    }
+    if cross_product {
+        tasks.sort_by(|a, b| {
+            let stamp = |task: &Task| {
+                task.created_at
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| boss_engine_utils::iso8601::parse_iso8601_lenient(&task.created_at))
+            };
+            (stamp(b), &b.id).cmp(&(stamp(a), &a.id))
+        });
     }
     tasks.truncate(args.limit.unwrap_or(usize::MAX));
     let tasks: Vec<_> = tasks.into_iter().map(with_display_status).collect();
@@ -135,9 +152,9 @@ async fn resolve_selected(
     let mut tasks = Vec::new();
     let mut unknown = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut tombstone_lists = HashMap::new();
     for selector in selectors {
-        let mut item = match parse_work_item_selector(selector) {
+        let parsed = parse_work_item_selector(selector);
+        let (mut product_scope, wire_selector) = match parsed {
             WorkItemSelector::ProductShortId { product_slug, n } => {
                 let product = match_products(products, &product_slug).map_err(|err| {
                     let message = format!("--ids: could not resolve {selector}: {err}");
@@ -146,33 +163,61 @@ async fn resolve_selected(
                         _ => CliError::not_found(message),
                     }
                 })?;
-                get_work_item_by_short_id_rpc(client, &product.id, n).await
+                (Some(product.id), n.to_string())
             }
-            WorkItemSelector::ShortId(n) => match scope {
-                Some(product) => get_work_item_by_short_id_rpc(client, &product.id, n).await,
-                None => get_work_item(client, &boss_protocol::short_id_wire_form(n)).await,
-            },
-            WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => get_work_item(client, &id).await,
+            WorkItemSelector::ShortId(n) => (scope.map(|p| p.id.clone()), n.to_string()),
+            WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => (scope.map(|p| p.id.clone()), id),
         };
-        if matches!(item, Err(CliError::Application(_))) {
-            // Single-item reads hide non-archived tombstones. Only on a
-            // failed lookup, consult the include-deleted list to distinguish
-            // a filtered-out row from a nonexistent selector.
-            if let Some(task) = find_tombstone(client, selector, products, scope, &mut tombstone_lists).await? {
-                item = Ok(WorkItem::Task(task));
+        let primary_id = wire_selector.starts_with("task_");
+        if primary_id && product_scope.is_none() {
+            // Use the direct read to locate live primary ids, then fetch the
+            // list projection from that product so JSON rows stay identical.
+            match get_work_item(client, &wire_selector).await {
+                Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => product_scope = Some(task.product_id),
+                Err(CliError::Application(_)) => {} // Tombstones use targeted list reads below.
+                Err(err) => return Err(err),
+                Ok(_) => {
+                    unknown.push(selector.to_owned());
+                    continue;
+                }
             }
         }
-        match item {
-            Ok(WorkItem::Task(task) | WorkItem::Chore(task))
-                if scope.is_none_or(|product| product.id == task.product_id) =>
-            {
+        let mut matches = Vec::new();
+        for product in products
+            .iter()
+            .filter(|p| product_scope.as_ref().is_none_or(|id| *id == p.id))
+        {
+            matches.extend(
+                list_tasks_query(
+                    client,
+                    &product.id,
+                    None,
+                    None,
+                    true,
+                    boss_protocol::TaskListQuery {
+                        selector: Some(wire_selector.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?,
+            );
+            if primary_id && !matches.is_empty() {
+                break;
+            }
+        }
+        if matches.len() > 1 {
+            return Err(CliError::conflict(format!(
+                "--ids: ambiguous selector {selector}: {}",
+                matches.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+        match matches.pop() {
+            Some(task) if scope.is_none_or(|product| product.id == task.product_id) => {
                 if seen.insert(task.id.clone()) {
                     tasks.push(task);
                 }
             }
-            Ok(_) => unknown.push(selector.to_owned()),
-            Err(CliError::Application(message)) => unknown.push(format!("{selector} ({message})")),
-            Err(err) => return Err(err),
+            _ => unknown.push(selector.to_owned()),
         }
     }
     if !unknown.is_empty() {
@@ -182,51 +227,6 @@ async fn resolve_selected(
         )));
     }
     Ok(tasks)
-}
-
-async fn find_tombstone(
-    client: &mut BossClient,
-    selector: &str,
-    products: &[Product],
-    scope: Option<&Product>,
-    lists: &mut HashMap<String, Vec<Task>>,
-) -> Result<Option<Task>, CliError> {
-    let parsed = parse_work_item_selector(selector);
-    let product = match &parsed {
-        WorkItemSelector::ProductShortId { product_slug, .. } => Some(match_products(products, product_slug)?.id),
-        _ => scope.map(|p| p.id.clone()),
-    };
-    let mut matches = Vec::new();
-    for p in products
-        .iter()
-        .filter(|p| product.as_ref().is_none_or(|id| *id == p.id))
-    {
-        if !lists.contains_key(&p.id) {
-            lists.insert(p.id.clone(), list_tasks(client, &p.id, None, None, true).await?);
-        }
-        matches.extend(
-            lists[&p.id]
-                .iter()
-                .filter(|task| match &parsed {
-                    WorkItemSelector::ShortId(n) | WorkItemSelector::ProductShortId { n, .. } => {
-                        task.short_id == Some(*n)
-                    }
-                    WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => task.id == *id,
-                })
-                .cloned(),
-        );
-    }
-    if matches.len() > 1 {
-        let candidates: Vec<_> = matches.iter().map(|task| task.id.as_str()).collect();
-        return Err(CliError::conflict(format!(
-            "--ids: ambiguous selector {selector}: {}",
-            candidates.join(", ")
-        )));
-    }
-    Ok(matches
-        .first()
-        .filter(|task| task.deleted_at.is_some())
-        .map(|task| (*task).clone()))
 }
 
 #[cfg(test)]

@@ -836,6 +836,7 @@ async fn list_tasks_filtered(
 ) -> Result<Vec<Task>> {
     match client
         .send_request(&FrontendRequest::ListTasks {
+            query: Default::default(),
             product_id: product_id.to_owned(),
             project_id: project_id.map(str::to_owned),
             dep_filter,

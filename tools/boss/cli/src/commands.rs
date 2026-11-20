@@ -2344,13 +2344,13 @@ pub(crate) struct TaskListArgs {
     #[arg(long = "match")]
     pub(crate) match_term: Option<String>,
 
-    /// Cap the number of returned rows (applied after filtering).
+    /// Cap rows after filtering; cross-product results are newest first, then descending primary id.
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
     /// Filter to specific id(s). Comma-separated, or repeat the flag.
     /// Accepts the same forms as `boss task show`: friendly short ids
-    /// (`T42`, `42`, `#42`), primary ids (`task_…`), and the
+    /// (`T<n>`, `n`, `#n`), primary ids (`task_…`), and the
     /// cross-product form (`boss/42`). An id that names no row in the
     /// selected scope errors rather than being silently dropped. Without
     /// --product, ids may span products; bare numbers must be unambiguous.

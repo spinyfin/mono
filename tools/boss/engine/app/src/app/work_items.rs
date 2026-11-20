@@ -285,14 +285,34 @@ pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
     let FrontendRequest::ListTasks {
         product_id,
         project_id,
+        query,
         dep_filter,
         include_deleted,
     } = req
     else {
         unreachable!()
     };
-    match work_db.list_tasks(&product_id, project_id.as_deref(), dep_filter.as_ref(), include_deleted) {
-        Ok(tasks) => {
+    match work_db.list_tasks_selected(
+        &product_id,
+        project_id.as_deref(),
+        dep_filter.as_ref(),
+        include_deleted,
+        query.selector.as_deref(),
+    ) {
+        Ok(mut tasks) => {
+            let term = query.match_term.as_deref().map(str::to_lowercase);
+            tasks.retain(|task| {
+                term.as_ref().is_none_or(|term| {
+                    task.name.to_lowercase().contains(term) || task.description.to_lowercase().contains(term)
+                }) && (query.kinds.is_empty() || query.kinds.contains(&task.kind))
+                    && query.created_since.is_none_or(|since| {
+                        task.created_at
+                            .parse::<i64>()
+                            .ok()
+                            .or_else(|| boss_engine_utils::iso8601::parse_iso8601_lenient(&task.created_at))
+                            .is_some_and(|created| created >= since)
+                    })
+            });
             send_response_with_revision(
                 &sink,
                 &request_id,
