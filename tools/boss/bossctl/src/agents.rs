@@ -1319,19 +1319,34 @@ pub(crate) async fn agents_launch(
     work_item_id: String,
     preferred_workspace_id: Option<String>,
     host: Option<String>,
+    // `Some(timeout)` = `--wait-for-slot` (inner `None` = no timeout):
+    // retry while the engine refuses at the pool's hard cap.
+    wait_for_slot: Option<Option<std::time::Duration>>,
 ) -> Result<()> {
     let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .maybe_preferred_workspace_id(preferred_workspace_id)
-                .maybe_requested_host_id(host)
-                .force(true)
-                .build(),
-        })
-        .await
-        .context("sending RequestExecution (force)")?;
+    let deadline = wait_for_slot.flatten().map(|t| std::time::Instant::now() + t);
+    let response = loop {
+        let response = client
+            .send_request(&FrontendRequest::RequestExecution {
+                input: RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .maybe_preferred_workspace_id(preferred_workspace_id.clone())
+                    .maybe_requested_host_id(host.clone())
+                    .force(true)
+                    .build(),
+            })
+            .await
+            .context("sending RequestExecution (force)")?;
+        let at_cap = matches!(
+            &response,
+            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message }
+                if crate::work_wait::is_hard_cap_refusal(message)
+        );
+        if wait_for_slot.is_none() || !at_cap || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break response;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    };
     match response {
         FrontendEvent::ExecutionRequested { execution }
         | FrontendEvent::ExecutionCreated { execution }

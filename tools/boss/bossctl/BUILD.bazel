@@ -29,6 +29,7 @@ rust_binary(
         "src/stuck_report.rs",
         "src/tests.rs",
         "src/traffic_split.rs",
+        "src/work_wait.rs",
     ],
     compile_data = [
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
