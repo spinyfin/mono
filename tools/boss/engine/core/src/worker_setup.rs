@@ -348,8 +348,7 @@ fn settings_value(
     let fence = data_dir_fence(sandbox, layer_into_settings, path_guard_hook_installed);
 
     let mut permissions = permissions_value(input, fence);
-    // Local workers only: the output root is a path on this host, so it
-    // means nothing to a remote (SSH) worker's settings file.
+    // Output paths refer to this host and only belong in local worker settings.
     if sandbox == EngineDataDirSandbox::Enabled {
         grant_bazel_output_root(&mut permissions, input);
     }
