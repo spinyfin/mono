@@ -263,19 +263,27 @@ impl DriverRegistry {
 
 #[cfg(test)]
 mod tests {
+    // Scoped-home fixtures temporarily clear TEST_TMPDIR. Registry construction
+    // resolves transcript storage, so preserve the wrapper root while it reads.
+    fn default_registry() -> DriverRegistry {
+        let _home = crate::scoped_home::SCOPED_HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        DriverRegistry::default()
+    }
     use super::*;
     use crate::test_support::{StubDriver, stub_descriptor};
     use crate::{Capability, CapabilitySet, SpawnRequest};
 
     #[test]
     fn default_registry_contains_claude() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         assert!(reg.get("claude").is_some(), "default registry must contain 'claude'");
     }
 
     #[test]
     fn default_registry_contains_codex() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let driver = reg.require("codex").expect("default registry must contain 'codex'");
         assert_eq!(driver.descriptor().name, "codex");
         assert_eq!(driver.descriptor().config_dir, ".codex");
@@ -284,7 +292,7 @@ mod tests {
 
     #[test]
     fn default_registry_contains_grok() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let driver = reg.require("grok").expect("default registry must contain 'grok'");
         assert_eq!(driver.descriptor().name, "grok");
         assert_eq!(driver.descriptor().config_dir, ".grok");
@@ -295,7 +303,7 @@ mod tests {
 
     #[test]
     fn default_registry_contains_agy() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let driver = reg.require("agy").expect("default registry must contain 'agy'");
         assert_eq!(driver.descriptor().name, "agy");
         assert_eq!(driver.descriptor().config_dir, ".agy");
@@ -312,7 +320,7 @@ mod tests {
     fn codex_dispatch_gate_uses_declared_capability_set() {
         use boss_protocol::TaskKind;
 
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let resolver = reg.resolver("codex").expect("codex is registered");
         // Chore is phase-1 eligible; gate must succeed (no Refuse) against
         // Codex's declared set.
@@ -352,7 +360,7 @@ mod tests {
     fn grok_dispatch_gate_uses_declared_capability_set() {
         use boss_protocol::TaskKind;
 
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let resolver = reg.resolver("grok").expect("grok is registered");
         // Chore is phase-1 eligible; gate must succeed (no Refuse) against
         // Grok's declared set.
@@ -391,7 +399,7 @@ mod tests {
     fn agy_dispatch_gate_uses_declared_capability_set() {
         use boss_protocol::TaskKind;
 
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let resolver = reg.resolver("agy").expect("agy is registered");
         let plan = resolver
             .check_dispatch(&TaskKind::Chore, None)
@@ -433,7 +441,7 @@ mod tests {
     fn grok_dispatch_gate_covers_all_document_producing_kinds() {
         use boss_protocol::TaskKind;
 
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let resolver = reg.resolver("grok").expect("grok is registered");
         for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
             let plan = resolver
@@ -472,7 +480,7 @@ mod tests {
             stub_descriptor(),
             CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]),
         ));
-        let reg = DriverRegistry::default().with_driver("incomplete", incomplete);
+        let reg = default_registry().with_driver("incomplete", incomplete);
         let resolver = reg.resolver("incomplete").expect("incomplete is registered");
         for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
             let err = resolver
@@ -518,7 +526,7 @@ mod tests {
     fn eligible_drivers_for_kind_agrees_with_the_dispatch_gate() {
         use boss_protocol::TaskKind;
 
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let candidates: Vec<&'static str> = {
             let mut slugs: Vec<&'static str> = reg.slugs().collect();
             slugs.sort_unstable();
@@ -543,7 +551,7 @@ mod tests {
     fn eligible_drivers_for_kind_fails_closed_on_an_unknown_slug() {
         use boss_protocol::TaskKind;
 
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         assert_eq!(
             reg.eligible_drivers_for_kind(&TaskKind::Chore, None, &["copilot", "claude"]),
             vec!["claude"],
@@ -577,7 +585,7 @@ mod tests {
                 Capability::PromptComposition,
             ]),
         ));
-        let reg = DriverRegistry::default().with_driver("thin", thin);
+        let reg = default_registry().with_driver("thin", thin);
 
         assert!(
             reg.eligible_drivers_for_kind(&TaskKind::Chore, None, &["thin"])
@@ -603,7 +611,7 @@ mod tests {
     fn eligible_drivers_for_kind_excludes_codex_and_grok_from_conflict_resolution_and_ci_remediation() {
         use boss_protocol::{ExecutionKind, TaskKind};
 
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let candidates = ["codex", "claude", "grok", "agy"];
         for execution_kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
             // The underlying task row can be any ordinary implementation
@@ -631,7 +639,7 @@ mod tests {
 
     #[test]
     fn slugs_enumerates_every_registered_driver() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         let mut slugs: Vec<&str> = reg.slugs().collect();
         slugs.sort_unstable();
         assert_eq!(slugs, vec!["agy", "claude", "codex", "grok"]);
@@ -642,7 +650,7 @@ mod tests {
 
     #[test]
     fn unknown_slug_returns_none() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         assert!(reg.get("copilot").is_none());
         assert!(reg.resolver("not-a-driver").is_none());
         assert!(reg.require("not-a-driver").is_err());
@@ -650,28 +658,28 @@ mod tests {
 
     #[test]
     fn resolver_for_claude_succeeds() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         assert!(reg.resolver("claude").is_some());
         assert!(reg.require("claude").is_ok());
     }
 
     #[test]
     fn resolver_for_codex_succeeds() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         assert!(reg.resolver("codex").is_some());
         assert!(reg.require("codex").is_ok());
     }
 
     #[test]
     fn resolver_for_grok_succeeds() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         assert!(reg.resolver("grok").is_some());
         assert!(reg.require("grok").is_ok());
     }
 
     #[test]
     fn resolver_for_agy_succeeds() {
-        let reg = DriverRegistry::default();
+        let reg = default_registry();
         assert!(reg.resolver("agy").is_some());
         assert!(reg.require("agy").is_ok());
     }
@@ -687,7 +695,7 @@ mod tests {
         descriptor.binary = "tracking-cli";
         let tracking: Arc<dyn AgentDriver> =
             Arc::new(StubDriver::new(descriptor, CapabilitySet::new([Capability::Spawn])));
-        let reg = DriverRegistry::default().with_driver("tracking", Arc::clone(&tracking));
+        let reg = default_registry().with_driver("tracking", Arc::clone(&tracking));
         let resolved = reg.require("tracking").expect("tracking is registered");
 
         assert!(
@@ -732,7 +740,7 @@ mod tests {
     #[test]
     fn with_driver_registers_stub_for_lookup() {
         let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([Capability::Spawn]));
-        let reg = DriverRegistry::default().with_driver("stub", Arc::new(driver));
+        let reg = default_registry().with_driver("stub", Arc::new(driver));
         assert_eq!(reg.require("stub").unwrap().descriptor().name, "stub");
     }
 
