@@ -206,12 +206,21 @@ _ci_run_bazel() {
   local tmplog="$1" subcommand="$2"
   shift 2
   if [[ "$CI_REMOTE_EXECUTION" != "on" ]]; then
-    command bazel \
-      $BAZEL_STARTUP_FLAGS \
-      "$subcommand" \
-      $CI_BAZEL_FLAGS \
-      "$@" 2>&1 | tee "$tmplog"
-    return $?
+    # bazel's exit status travels through a file: a plain pipeline into tee
+    # reports tee's status, or under pipefail ends the caller early.
+    local plain_rc
+    {
+      command bazel \
+        $BAZEL_STARTUP_FLAGS \
+        "$subcommand" \
+        $CI_BAZEL_FLAGS \
+        "$@" \
+        && echo 0 > "${tmplog}.rc" \
+        || echo "$?" > "${tmplog}.rc"
+    } 2>&1 | tee "$tmplog"
+    plain_rc="$(cat "${tmplog}.rc" 2> /dev/null || echo 1)"
+    rm -f "${tmplog}.rc"
+    return "$plain_rc"
   fi
 
   local fifo bazel_pid tee_pid wd_pid rc=0

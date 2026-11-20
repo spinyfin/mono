@@ -102,7 +102,14 @@ fi
 # the producer": it records that and puts the blob in the remote cache. With
 # FAKE_ALWAYS_FAIL set it fails the same way regardless of the cache, which
 # models a dangling reference the disk cache does not hold.
+# bazel() runs the command through _ci_run_bazel, and with remote execution off
+# that is a plain pipeline into tee (no watchdog).
+CI_REMOTE_EXECUTION=off
+eval "$(sed -n '/^_ci_note_remote_failure() {/,/^}/p' "${workspace}/.buildkite/steps/ci-env.sh")"
+eval "$(sed -n '/^_ci_note_watchdog_failure() {/,/^}/p' "${workspace}/.buildkite/steps/ci-env.sh")"
+eval "$(sed -n '/^_ci_run_bazel() {/,/^}/p' "${workspace}/.buildkite/steps/ci-env.sh")"
 eval "$(sed -n '/^bazel() {/,/^}/p' "${workspace}/.buildkite/steps/ci-env.sh")"
+[[ "$(type -t _ci_run_bazel)" == "function" ]] || fail "could not extract _ci_run_bazel() from ci-env.sh"
 [[ "$(type -t bazel)" == "function" ]] || fail "could not extract bazel() from ci-env.sh"
 
 fakebin="${tmp}/bin"
