@@ -32,3 +32,29 @@ pub async fn condition(mut ready: impl FnMut() -> bool) {
         tokio::task::yield_now().await;
     }
 }
+
+/// Hold the Tokio clock paused for the rest of the test. Pair with a fixture
+/// whose stream liveness timers cannot fire (`Fixture::with_frozen_liveness`)
+/// so only the explicit advances below can expire a command deadline.
+pub fn hold() {
+    tokio::time::pause();
+}
+
+/// Advance the held clock in small steps until `ready` holds. Use it only
+/// after the command that is deliberately left unanswered has been observed.
+pub async fn advancing(mut ready: impl FnMut() -> bool) {
+    while !ready() {
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Run `operation` on the held clock while advancing virtual time, for phases
+/// where every command is deliberately left unanswered or its outcome does not
+/// depend on a reply arriving in time.
+pub async fn advancing_during<T>(operation: impl Future<Output = T>) -> T {
+    tokio::select! {
+        result = operation => result,
+        () = advancing(|| false) => unreachable!(),
+    }
+}

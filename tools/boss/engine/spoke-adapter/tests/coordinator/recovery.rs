@@ -2,9 +2,12 @@ use super::*;
 
 #[tokio::test]
 async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
+    // The clock stays held for the whole test and the fixture's liveness pulse
+    // cannot fire, so only the explicit advances below expire a command.
+    timing::hold();
     for shape in ["unknown", "indeterminate", "late_ok", "unconfirmed_stop"] {
-        let (fx, env, execution, peer) = timing::frozen(async {
-            let fx = Fixture::with(short(300)).await;
+        let (fx, env, execution, peer) = timing::guarded(async {
+            let fx = Fixture::with_frozen_liveness(short(300)).await;
             let env = env(&fx, 1).await;
             let execution = triage(&fx, &env, shape);
             if shape == "unconfirmed_stop" {
@@ -46,10 +49,10 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
             (fx, env, execution, peer)
         })
         .await;
-        timing::guarded(timing::condition(|| attention_open(&fx, &execution.id))).await;
-        env.coordinator.abort_driving_runs();
-        let pool = WorkerPool::new_automation(1);
-        let next = coordinator_over(&fx, 1, &pool).await;
+        // Only the unanswered `late_ok` spawn and the unconfirmed stop still
+        // owe a deadline; advance virtual time just for those.
+        timing::guarded(timing::advancing(|| attention_open(&fx, &execution.id))).await;
+        let (next, pool) = restarted_with_pool(&fx, &env.coordinator, 1).await;
         if shape == "late_ok" {
             timing::guarded(timing::condition(|| {
                 peer.commands()
@@ -89,10 +92,12 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
             }
         };
         if shape == "unconfirmed_stop" {
-            // Prompt evidence and the Stop reply are deliberately absent.
-            timing::guarded(reconcile).await;
+            // Prompt evidence and the Stop reply are deliberately absent, so the
+            // restarted driver's deadlines must be allowed to expire. No
+            // command in this shape needs an in-time reply.
+            timing::guarded(timing::advancing_during(reconcile)).await;
         } else {
-            timing::frozen(reconcile).await;
+            timing::guarded(reconcile).await;
         }
         assert_never_failed(&fx, &execution.id);
         next.abort_driving_runs();
