@@ -1286,6 +1286,11 @@ impl DispatchEvent {
 #[async_trait]
 pub trait DispatchEventSink: Send + Sync {
     async fn emit(&self, event: DispatchEvent);
+    /// Record `event` on the calling thread. Used after a durable cancel
+    /// commit so provenance is not queued on a bounded, lossy mailbox.
+    /// Existing sinks keep the historical async emit path; a no-op default
+    /// lets them compile until they implement a synchronous write.
+    fn emit_sync(&self, _event: DispatchEvent) {}
 }
 
 /// Default sink for tests and any caller that doesn't want the
@@ -1297,13 +1302,17 @@ pub struct NoopDispatchEventSink;
 #[async_trait]
 impl DispatchEventSink for NoopDispatchEventSink {
     async fn emit(&self, _event: DispatchEvent) {}
+    fn emit_sync(&self, _event: DispatchEvent) {}
 }
 
 /// Test double: records every event in memory so assertions can
 /// inspect the stage timeline without scanning a tracing log.
+///
+/// Uses a std mutex so [`DispatchEventSink::emit_sync`] is safe on the
+/// commit thread, including from inside a tokio test runtime.
 #[derive(Default, Debug, Clone)]
 pub struct RecordingDispatchEventSink {
-    events: Arc<Mutex<Vec<DispatchEvent>>>,
+    events: Arc<std::sync::Mutex<Vec<DispatchEvent>>>,
 }
 
 impl RecordingDispatchEventSink {
@@ -1312,13 +1321,16 @@ impl RecordingDispatchEventSink {
     }
 
     pub async fn events(&self) -> Vec<DispatchEvent> {
-        self.events.lock().await.clone()
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub async fn events_for(&self, execution_id: &str) -> Vec<DispatchEvent> {
         self.events
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|event| event.execution_id == execution_id)
             .cloned()
@@ -1329,7 +1341,14 @@ impl RecordingDispatchEventSink {
 #[async_trait]
 impl DispatchEventSink for RecordingDispatchEventSink {
     async fn emit(&self, event: DispatchEvent) {
-        self.events.lock().await.push(event);
+        self.emit_sync(event);
+    }
+
+    fn emit_sync(&self, event: DispatchEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
     }
 }
 

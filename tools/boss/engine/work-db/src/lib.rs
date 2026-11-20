@@ -775,6 +775,11 @@ pub struct WorkDb {
     /// it via [`Self::with_event_bus`] so every clone shares the one
     /// instance subscribers attach to.
     event_bus: Arc<EventBus>,
+    /// Decision provenance is written to this sink after commit so it is
+    /// not lost when the in-process bus mailbox fills. Defaults to a no-op;
+    /// tests and production inject a sink via [`Self::with_dispatch_events`].
+    #[builder(default = default_dispatch_events())]
+    dispatch_events: Arc<dyn boss_dispatch_events::DispatchEventSink>,
     persona_metrics: Arc<boss_metrics::Registry>,
     /// Produces coordinator handoff write ids and tmux spawn authorizations.
     /// Defaults to the shared utility generator; callers can inject a fixture
@@ -794,10 +799,15 @@ impl Clone for WorkDb {
             boothby_action: Arc::clone(&self.boothby_action),
             engine_rebase_holds: Arc::clone(&self.engine_rebase_holds),
             event_bus: Arc::clone(&self.event_bus),
+            dispatch_events: Arc::clone(&self.dispatch_events),
             persona_metrics: Arc::clone(&self.persona_metrics),
             token_generator: Arc::clone(&self.token_generator),
         }
     }
+}
+
+pub(crate) fn default_dispatch_events() -> Arc<dyn boss_dispatch_events::DispatchEventSink> {
+    Arc::new(boss_dispatch_events::NoopDispatchEventSink)
 }
 
 fn default_token_generator() -> Arc<dyn Fn() -> String + Send + Sync> {
@@ -818,6 +828,17 @@ impl WorkDb {
     /// than threading a second `Arc<Registry>` through every spawn signature.
     pub fn metrics_registry(&self) -> &boss_metrics::Registry {
         &self.persona_metrics
+    }
+
+    /// Commit `tx` and publish staged bus events plus decision provenance.
+    pub(crate) fn commit_pending(&self, tx: rusqlite::Transaction<'_>, pending: PendingEvents) -> rusqlite::Result<()> {
+        crate::event_publish::commit_and_publish_with_sink(tx, pending, &self.event_bus, self.dispatch_events.as_ref())
+    }
+
+    /// Flush staged bus events and decision provenance after a write that
+    /// already auto-committed (no enclosing `Transaction`).
+    pub(crate) fn flush_pending(&self, pending: PendingEvents) {
+        pending.flush(&self.event_bus, self.dispatch_events.as_ref());
     }
 }
 
@@ -868,6 +889,7 @@ mod cost_report_db;
 mod create_entities;
 mod critical_priority;
 mod critical_requests;
+mod decision_terminal;
 mod decisions;
 pub mod deferred_scope;
 mod dep_helpers;
@@ -1091,6 +1113,9 @@ pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use board_patch::WorkRuntimePatch;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use decision_terminal::DecisionAuditContext;
+pub(crate) use decision_terminal::{DoomedExecution, stage_decision_terminal, stage_doomed_audit_only};
+pub use event_publish::set_engine_audit_sink;
 pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,

@@ -1791,6 +1791,70 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Like [`Self::mark_execution_redundant`], and stamps cancellation source,
+    /// actor, and reason on the same `UPDATE`. Existing callers keep writing
+    /// unattributed rows until they migrate.
+    pub fn mark_execution_redundant_with_provenance(
+        &self,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let existing = query_execution(&conn, execution_id)?;
+        let now = now_string();
+        let updated = match &existing {
+            Some(existing) if !existing.status.is_terminal() => crate::task_status_audit::abandon(
+                &conn,
+                crate::task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
+                "UPDATE work_executions
+                 SET status = 'abandoned',
+                     finished_at = COALESCE(finished_at, ?2),
+                     cancel_source = ?3,
+                     cancel_actor = ?4,
+                     cancel_reason = ?5
+                 WHERE id = ?1",
+                rusqlite::params![
+                    execution_id,
+                    now,
+                    provenance.source.as_str(),
+                    provenance.actor,
+                    provenance.reason
+                ],
+            )?,
+            _ => 0,
+        };
+        if updated > 0 {
+            let existing = existing.expect("updated > 0 implies existing was Some and non-terminal");
+            tracing::warn!(
+                execution_id = %execution_id,
+                work_item_id = %existing.work_item_id,
+                from_status = %existing.status,
+                to_status = "abandoned",
+                source = %provenance.source,
+                actor = %provenance.actor,
+                reason = %provenance.reason,
+                "execution terminalized: mark redundant",
+            );
+            let mut pending = PendingEvents::new();
+            stage_doomed_audit_only(
+                &mut pending,
+                &[DoomedExecution::new(
+                    execution_id,
+                    &existing.work_item_id,
+                    existing.status.as_str(),
+                )],
+                &ExecutionStatus::Abandoned,
+                &provenance,
+            );
+            self.flush_pending(pending);
+            // No open `Transaction` here — `conn` auto-commits each
+            // statement, so the UPDATE above is already durable and this
+            // publish carries no rollback risk.
+            publish_execution_terminal(&self.event_bus, &conn, execution_id, &existing.work_item_id)?;
+        }
+        Ok(())
+    }
+
     /// Atomically move a `ready` or `claimed` execution back to
     /// `waiting_dependency` when the dispatcher discovers at dispatch time
     /// that the work item is still gated by an unmet prereq. A no-op
