@@ -103,6 +103,19 @@ fi
 # once (roughly doubling its memory footprint) instead of one.
 export CI_BAZEL_STARTUP_FLAGS="$BAZEL_STARTUP_FLAGS"
 
+# A command left on this agent's bazel server by an earlier job would make
+# every bazel call below wait on the lock until the step timeout (see
+# bazel-server-lock.sh, tested by //.buildkite/steps/tests). Stop that server
+# now; fail the step, rather than wait, if that is not possible.
+# shellcheck source=bazel-server-lock.sh
+source "$(dirname "${BASH_SOURCE[0]}")/bazel-server-lock.sh"
+# shellcheck disable=SC2086 # BAZEL_STARTUP_FLAGS is a word list by design.
+if ! ci_bazel_release_stale_lock "$STARTUP_RC" "$(pwd -P)" $BAZEL_STARTUP_FLAGS; then
+  echo "^^^ +++"
+  echo "[ci-env] error: this agent's bazel server is held by an earlier command that could not be stopped (see above)." >&2
+  exit 1
+fi
+
 # On macOS, detect Xcode version changes and expunge the stale Bazel output
 # base. The apple_cc_configure module extension caches Xcode paths in the
 # output base; if Xcode is updated without a clean, subsequent builds fail

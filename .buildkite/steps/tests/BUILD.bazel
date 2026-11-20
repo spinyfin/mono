@@ -42,3 +42,15 @@ sh_test(
         "//.buildkite/steps:ci-env.sh",
     ],
 )
+
+# Script-level test for the recovery ci-env.sh runs before its first bazel
+# call: a bazel server still held by an earlier job's command is located from
+# the output base's own records and stopped (SIGTERM, then SIGKILL), a free
+# server is left alone, and an unlocatable, unrelated or unkillable holder
+# fails the step instead of being waited on or signalled.
+sh_test(
+    name = "bazel_server_lock_test",
+    size = "small",
+    srcs = ["bazel_server_lock_test.sh"],
+    data = ["//.buildkite/steps:bazel-server-lock.sh"],
+)
