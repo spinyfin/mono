@@ -116,23 +116,24 @@ Two honest caveats on that table:
 
 Linux needs nothing here: the PID namespace ends every process of the action when its command exits. macOS has no such thing, so the wrapper owns the lifetime of whatever the test starts.
 
-The wrapper runs the test in a process group of its own (`set -m`), so that it can signal the whole test tree and nothing else. Its `INT`/`TERM`/`HUP` traps forward the signal to that group, and its `EXIT` trap ends the group and removes the private root. That covers a Bazel test timeout, which arrives as `SIGTERM`.
+The wrapper runs the test in a process group of its own, so that it can signal the whole test tree and nothing else. Its `INT`/`TERM`/`HUP` traps forward the signal to that group, and its `EXIT` trap ends the group and removes the private root. That covers a Bazel test timeout, which arrives as `SIGTERM`.
 
 It does not cover `SIGKILL`, and that is how a test action is abandoned. When a build is interrupted, Bazel's `process-wrapper` kills the group of `test-setup.sh`. `test-setup.sh` runs its child (this wrapper) in another group again and leaves a helper behind for exactly this case; the helper then sends `SIGKILL` to the wrapper's group. A remote executor that kills an action outright has the same effect; that path was not measured. The wrapper cannot run a trap, and the test's group is in neither group that was killed.
 
 Measured on a laptop before the watchdog existed, by sending `SIGINT` to `bazel test --runs_per_test=2` of `work_db_test`, `engine_lib_test`, `completion_test` and `driver_test` fifteen seconds into the tests: 12 test binaries were still running 45 seconds after Bazel had returned, each with parent pid 1 and leading its own process group, and 12 private roots were left in `/private/tmp`. A healthy test in that state runs to its end against a build that is over. A test that is hung never leaves: the same laptop had five such processes between 2 and 20 days old, each blocked in one deadlocked test.
 
-So the wrapper starts a watchdog next to the test. The two share a FIFO: the wrapper holds the only write end, the watchdog blocks reading the other. The kernel closes the write end however the wrapper dies. A line on the FIFO means the wrapper finished its own cleanup, and the watchdog exits. End-of-file means the wrapper is gone, and the watchdog does the cleanup in its place: `SIGTERM` to the test's group, `SIGKILL` a second later, then the private root. With it, the same interrupted run left one wrapper and no test two seconds after Bazel returned, and 0 processes and 0 private roots at 20 seconds (the helper in `test-setup.sh` looks every ten seconds).
+So the wrapper starts a watchdog **before** the test, in a process group of its own. Two FIFOs connect them: the wrapper holds the only write end of the lifeline, and the test launcher writes its pid on the announce FIFO while it is still in the wrapper's group, then `setpgid`s and execs `sandbox-exec`. The kernel closes the write ends however the wrapper dies. A line on the lifeline means the wrapper finished its own cleanup, and the watchdog exits. End-of-file means the wrapper is gone, and the watchdog does the cleanup in its place: `SIGTERM` to the test's group, `SIGKILL` a second later, then the private root. If the wrapper dies before a pid is announced, the launcher was still in the wrapper's group and died with it; the watchdog only has to remove the private root. With it, the same interrupted run left one wrapper and no test two seconds after Bazel returned, and 0 processes and 0 private roots at 20 seconds (the helper in `test-setup.sh` looks every ten seconds).
 
-Three details carry the weight:
+Four details carry the weight:
 
+- **The watchdog is listening before the test can run.** It writes `watchdog-ready` and the wrapper waits for that file. The fixture asserts the file exists, so a test cannot start unsupervised.
 - **The watchdog has a process group of its own.** A kill aimed at the wrapper's group would otherwise take it too.
-- **Neither end of the FIFO reaches the test.** A test descendant holding the write end would keep the watchdog waiting for as long as it lived, which is the case the watchdog exists for.
+- **Neither FIFO end reaches the test.** A test descendant holding a write end would keep the watchdog waiting for as long as it lived, which is the case the watchdog exists for.
 - **The wrapper reaps the watchdog before it exits.** A test that ends normally leaves no process behind, not even briefly.
 
-What this does not reach is a process that left the test's group on purpose (`setsid`, `setpgid`). A test that starts one owns its lifetime: kill it when the test is done, and give it a bounded life of its own (a `sleep` with a limit, or an exit when the pipe from its parent closes) for the run where the test never gets that far.
+What this does not reach is a process that left the test's group on purpose (`setsid`, `setpgid`). A test that starts one owns its lifetime through an owning guard (`spawn_group_leader_sleeper` / `spawn_setsid_sleeper`): Drop kills the group, and the child also exits if the pipe from the test closes, so a killed test binary still reaps it.
 
-`cleanup_guard_test.sh` runs the wrapper around a fixture that ignores `SIGTERM`, then asserts that nothing of the run is left after a normal exit, after `TERM` and `HUP` to the wrapper, and after `SIGKILL` to the wrapper's whole group.
+`cleanup_guard_test.sh` runs the wrapper around a fixture that ignores `SIGTERM`, then asserts that nothing of the run is left after a normal exit, after `TERM` and `HUP` to the wrapper, after `SIGKILL` to the wrapper's whole group once the fixture is running, and after `SIGKILL` as soon as the watchdog is listening.
 
 ## The `SUN_LEN` problem, and why the two Linux lines are coupled
 

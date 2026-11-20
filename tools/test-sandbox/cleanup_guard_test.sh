@@ -115,7 +115,59 @@ run_completion_case() {
   assert_no_marker_process "${marker}" "a normal exit"
 }
 
+# Kill the wrapper's group as soon as the watchdog is listening, without
+# waiting for the fixture to publish its marker. That is the old window
+# where the test could run with no cleanup owner.
+run_startup_kill_case() {
+  local inner_pid=""
+  local inner_root=""
+  local marker="cleanup-$$-STARTUP"
+  local owner=""
+
+  set -m
+  "${wrapper}" "${child}" "${marker}" &
+  inner_pid=$!
+  set +m
+
+  for _ in {1..400}; do
+    for candidate in /private/tmp/mono-test.*; do
+      if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/watchdog-ready" ]]; then
+        read -r owner <"${candidate}/watchdog-ready"
+        owner_pgid="$(ps -o pgid= -p "${owner}" 2>/dev/null | tr -d ' ')"
+        if [[ "${owner}" == "${inner_pid}" || "${owner_pgid}" == "${inner_pid}" ]]; then
+          inner_root="${candidate}"
+          break 2
+        fi
+      fi
+    done
+    sleep 0.05
+  done
+
+  if [[ -z "${inner_root}" ]]; then
+    kill -TERM "${inner_pid}" 2>/dev/null || true
+    wait "${inner_pid}" 2>/dev/null || true
+    printf '%s\n' "watchdog did not become ready" >&2
+    return 1
+  fi
+
+  kill -KILL -- "-${inner_pid}"
+  wait "${inner_pid}" 2>/dev/null || true
+  for _ in {1..200}; do
+    if [[ ! -e "${inner_root}" ]] && [[ -z "$(marker_processes "${marker}")" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+
+  [[ ! -e "${inner_root}" ]] || {
+    printf 'sandbox root survived startup KILL: %s\n' "${inner_root}" >&2
+    return 1
+  }
+  assert_no_marker_process "${marker}" "startup KILL"
+}
+
 run_completion_case
 run_interruption_case TERM
 run_interruption_case HUP
 run_interruption_case KILL
+run_startup_kill_case

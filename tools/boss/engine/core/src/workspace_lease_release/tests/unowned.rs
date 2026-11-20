@@ -2,30 +2,14 @@
 
 use super::*;
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
-use std::io::BufRead;
 
-fn spawn_detached(dir: &Path, run_id: Option<&str>) -> std::process::Child {
-    let mut command = std::process::Command::new("python3");
-    command
-        .args([
-            "-u",
-            "-c",
-            "import os,time; os.setsid(); print('ready'); time.sleep(600)",
-        ])
-        .current_dir(dir)
-        .env_remove("BOSS_RUN_ID")
-        .env_remove("BOSS_SPAWN_TOKEN")
-        .stdout(std::process::Stdio::piped());
-    if let Some(run_id) = run_id {
-        command.env("BOSS_RUN_ID", run_id);
-    }
-    let mut child = command.spawn().unwrap();
-    let mut ready = String::new();
-    std::io::BufReader::new(child.stdout.as_mut().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
-    assert_eq!(ready.trim(), "ready");
-    child
+fn spawn_detached(dir: &Path, run_id: Option<&str>) -> crate::test_support::ProcessGroupChild {
+    crate::test_support::spawn_setsid_sleeper(dir, |command| {
+        command.env_remove("BOSS_RUN_ID").env_remove("BOSS_SPAWN_TOKEN");
+        if let Some(run_id) = run_id {
+            command.env("BOSS_RUN_ID", run_id);
+        }
+    })
 }
 
 fn orphaned(db: &WorkDb, workspace: &Path, lease: &str) -> WorkExecution {
