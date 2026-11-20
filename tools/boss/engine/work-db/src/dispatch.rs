@@ -41,6 +41,10 @@ impl WorkDb {
     /// covers both; the sweeps pass the pool's claims, which span the
     /// whole dispatch.
     ///
+    /// `is_live` runs while the DB connection is held, so it must not block
+    /// on coordinator locks (reservation table, driving runs) that are ever
+    /// held across a DB call; use `try_lock` and treat a busy lock as live.
+    ///
     /// Idempotency contract:
     /// - existing execution terminal or absent → insert new `ready`,
     /// - existing non-terminal AND predicate returns `true` → no-op

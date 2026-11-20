@@ -448,6 +448,15 @@ impl ExecutionCoordinator {
             .contains(execution_id)
     }
 
+    /// Non-blocking [`Self::is_driving_run`]; `None` when the lock is busy.
+    pub(super) fn try_is_driving_run(&self, execution_id: &str) -> Option<bool> {
+        match self.driving_runs.try_lock() {
+            Ok(runs) => Some(runs.ids.contains(execution_id)),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner().ids.contains(execution_id)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Stop every in-flight `run_execution` task. Tests use this to simulate an
     /// engine restart: the next coordinator has an empty driving set.
     pub fn abort_driving_runs(&self) {

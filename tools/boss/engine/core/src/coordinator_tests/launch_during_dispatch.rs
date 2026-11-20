@@ -97,6 +97,48 @@ async fn explicit_live_check_and_reservation_db_lookup_do_not_deadlock() {
     lookup.join().unwrap();
 }
 
+/// A dispatch that reserves and commits its run after the request took its
+/// starting-set snapshot but before the request's transaction judged the run
+/// must still read as starting: the in-transaction read sees the reservation.
+#[tokio::test]
+async fn a_dispatch_reserved_after_the_admission_snapshot_is_not_abandoned() {
+    let s = Dispatched::new(FakeCubeClient::default(), FakeExecutionRunner::default());
+    let db = s.coordinator.work_db();
+    db.start_execution_run(&s.queued.id, "worker", "mono", "lease", "workspace", "/tmp/workspace")
+        .unwrap();
+    let inflight = s.coordinator.inflight_dispatches_for_test();
+    let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let coordinator = s.coordinator.clone();
+    let work_item = s.queued.work_item_id.clone();
+    let request = std::thread::spawn(move || {
+        let result = coordinator.request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(work_item)
+                .explicit_start(true)
+                .build(),
+            Arc::new(PausedLiveness {
+                inside: inside_tx,
+                table_held: std::sync::Mutex::new(resume_rx),
+            }),
+        );
+        request_tx.send(result.unwrap()).unwrap();
+    });
+    let wait = std::time::Duration::from_secs(20);
+    // Admission has taken its snapshot (empty) and is judging the run.
+    inside_rx
+        .recv_timeout(wait)
+        .expect("admission must reach its live check");
+    let _reservation = inflight.try_reserve(&s.queued, db).expect("reserve after the snapshot");
+    resume_tx.send(()).unwrap();
+    let existing = request_rx.recv_timeout(wait).expect("admission did not finish");
+    request.join().unwrap();
+    assert_eq!(existing.id, s.queued.id, "the run being started is returned unchanged");
+    assert_eq!(s.run().status, ExecutionStatus::Running);
+    assert_eq!(s.executions().len(), 1);
+}
+
 /// What `RequestExecution { force: true }` (`bossctl agents launch`) does once
 /// it has named a work item: create or reuse the execution, force-dispatch it
 /// only when that left a `ready` row, and answer with the row as it now is.

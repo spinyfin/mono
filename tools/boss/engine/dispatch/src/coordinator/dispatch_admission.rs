@@ -483,29 +483,32 @@ impl ExecutionCoordinator {
         Ok(execution)
     }
 
-    /// Whether the engine itself is still starting `execution_id`'s worker:
-    /// its dispatch has been handed off and has not returned (the row is
-    /// `claimed`, or `running` with the handoff still finishing), or the
-    /// spawn that follows is still being driven (pane creation, spawn
-    /// confirmation, or the teardown of a spawn that failed).
+    /// Non-blocking, in-transaction check that the engine is still starting
+    /// `execution_id`'s worker: its dispatch reservation is held, or
+    /// `run_execution` is still driving its spawn.
     ///
-    /// The live-worker registry cannot answer this. A pane is registered only
-    /// once its shell exists, which is seconds after the row turns `running`
-    /// and commits its run; and a spawn that fails is taken back out of the
-    /// registry before its row is finished. In both windows the registry says
-    /// "no worker" about a run the engine is in the middle of starting or
-    /// tearing down. The reservation is dropped only after the driver has
-    /// taken over, so the two together leave no gap between pickup and a
-    /// registered pane.
-    pub fn is_starting_worker(&self, execution_id: &str) -> bool {
-        self.inflight_dispatches.is_execution_dispatching(execution_id) || self.is_driving_run(execution_id)
+    /// The live-worker registry cannot answer this: a pane is registered only
+    /// seconds after the row turns `running` and commits its run. This runs
+    /// from the store predicate while the DB connection is held, and the
+    /// reservation table lock is held across DB calls elsewhere, so it must
+    /// never block: a busy lock reads as "starting" (fail safe toward not
+    /// abandoning the run).
+    fn starting_worker_nonblocking(&self, execution_id: &str) -> bool {
+        self.inflight_dispatches
+            .try_is_execution_dispatching(execution_id)
+            .unwrap_or(true)
+            || self.try_is_driving_run(execution_id).unwrap_or(true)
     }
 
     /// Create or reuse the work item's execution for an explicit request
     /// (`bossctl work start`, `bossctl agents launch`, a kanban drag).
     ///
-    /// An existing run counts as live when the registry has its pane or when
-    /// [`Self::is_starting_worker`] says the engine is still bringing it up.
+    /// An existing run counts as live when the registry has its pane, when it
+    /// is in the starting-set snapshot taken before the transaction, or when
+    /// the non-blocking in-transaction read ([`Self::starting_worker_nonblocking`])
+    /// says the engine is still bringing it up. The in-transaction read closes
+    /// the window in which a dispatch reserves and commits the run after the
+    /// snapshot but before the transaction begins.
     /// Only a run that is neither is treated as stale and replaced, so a
     /// request that arrives right behind a dispatch returns the run that
     /// dispatch started instead of abandoning it.
@@ -532,7 +535,8 @@ impl ExecutionCoordinator {
                 .iter()
                 .cloned(),
         );
-        let has_worker = |id: &str| live_states.is_run_live(id) || starting.contains(id);
+        let has_worker =
+            |id: &str| live_states.is_run_live(id) || starting.contains(id) || self.starting_worker_nonblocking(id);
         if let Some(host_id) = input.requested_host_id.clone() {
             // `request_execution_with_live_check` (called below) resolves
             // friendly short ids (a `T`-prefixed short id, `#42`, ...) to a

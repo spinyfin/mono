@@ -151,16 +151,16 @@ impl InflightDispatches {
             .any(|e| e.work_item_id == work_item_id)
     }
 
-    /// Whether this exact execution holds a reservation: its dispatch has been
-    /// handed off and has not yet returned. Unlike
-    /// [`Self::is_work_item_dispatching`] this answers for one row, so a
-    /// caller asking "is anything still starting this execution?" is not
-    /// told yes because of a sibling row on the same work item.
-    pub fn is_execution_dispatching(&self, execution_id: &str) -> bool {
-        self.table
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(execution_id)
+    /// Non-blocking: whether this exact execution holds a reservation (its
+    /// dispatch has been handed off and has not yet returned). `None` when the
+    /// table lock is busy. Safe to call while the DB connection is held, which
+    /// a blocking read is not: the lock is held across DB calls elsewhere.
+    pub fn try_is_execution_dispatching(&self, execution_id: &str) -> Option<bool> {
+        match self.table.try_lock() {
+            Ok(table) => Some(table.contains_key(execution_id)),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner().contains_key(execution_id)),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     /// Snapshot reservation ownership before entering a database transaction.
@@ -360,14 +360,16 @@ mod tests {
             .try_reserve(&execution("exec_a", "T1"), &db)
             .expect("first reservation");
 
-        assert!(inflight.is_execution_dispatching("exec_a"));
-        assert!(
-            !inflight.is_execution_dispatching("exec_b"),
-            "a sibling row on the same work item is not itself being dispatched",
-        );
+        assert_eq!(inflight.try_is_execution_dispatching("exec_a"), Some(true));
+        assert_eq!(inflight.try_is_execution_dispatching("exec_b"), Some(false));
+
+        // A busy table reads as unknown, never blocks.
+        inflight.with_table_locked_for_test(|| {
+            assert_eq!(inflight.try_is_execution_dispatching("exec_a"), None);
+        });
 
         drop(reservation);
-        assert!(!inflight.is_execution_dispatching("exec_a"));
+        assert_eq!(inflight.try_is_execution_dispatching("exec_a"), Some(false));
     }
 
     /// `try_reserve` is the atomic claim. A `contains`-then-`reserve` pair
