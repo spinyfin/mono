@@ -1753,6 +1753,17 @@ mod compose_worker_spawn_tests {
         .expect("review-guide spawn must compose");
         assert_bazel_caching_rule(&composed.prompt_text);
         assert!(composed.prompt_text.starts_with(&template));
+        // Review guides currently resolve to Codex; exercise the same final
+        // normalization with Grok without changing the production model policy.
+        let grok_prompt =
+            super::prompt_with_boss_invocation(composed.prompt_text.clone(), "grok", &ExecutionKind::PrReviewGuide);
+        assert!(!grok_prompt.contains(boss_engine_worker_bin::WORKER_BOSS_INVOCATION));
+        assert!(grok_prompt.contains("boss propose"));
+        assert!(
+            composed
+                .prompt_text
+                .contains(boss_engine_worker_bin::WORKER_BOSS_INVOCATION)
+        );
         assert!(
             !composed.prompt_text.contains("jj bookmark set"),
             "review-guide workers cannot run jj bookmark commands: {}",
