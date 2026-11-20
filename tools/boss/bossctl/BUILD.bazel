@@ -47,6 +47,7 @@ rust_binary(
     },
     visibility = ["//visibility:public"],
     deps = [
+        "//tools/boss/backoff",
         "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/command-runner",
@@ -69,6 +70,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/backoff",
         "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/command-runner",

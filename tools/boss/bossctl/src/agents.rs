@@ -1307,41 +1307,66 @@ pub(crate) async fn agents_interrupt(socket_path: &Option<String>, json: bool, a
     }
 }
 
-/// Retry capacity refusals until the deadline, preserving the last refusal.
-async fn launch_with_retry<F, Fut>(
+/// Retry capacity refusals until the deadline. The interval doubles after
+/// each refusal up to `max_interval`, and the waiting notice is printed once.
+/// When the deadline passes, the last refusal is returned as a timeout error.
+async fn launch_with_retry<F, Fut, N>(
     mut send: F,
     wait: bool,
     deadline: Option<tokio::time::Instant>,
     interval: std::time::Duration,
+    max_interval: std::time::Duration,
+    mut notice: N,
 ) -> Result<FrontendEvent>
 where
     F: FnMut() -> Fut,
+    N: FnMut(&str),
     Fut: std::future::Future<Output = Result<FrontendEvent>>,
 {
-    let mut last = None;
+    let mut last: Option<String> = None;
+    let mut doublings: u32 = 0;
+    let started = tokio::time::Instant::now();
     loop {
         // Never cancel an in-flight mutation: its result may already have
         // committed. The deadline gates submission of every new request.
         if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
-            return last.ok_or_else(|| anyhow::anyhow!("timed out before requesting execution"));
+            let Some(message) = last else {
+                bail!("timed out before requesting execution");
+            };
+            bail!(
+                "timed out after {}s waiting for a worker slot: {message}",
+                started.elapsed().as_secs()
+            );
         }
         let response = send().await?;
         let at_cap = matches!(
             &response,
             FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message }
-                if crate::work_wait::is_hard_cap_refusal(message)
+                if boss_protocol::is_pool_hard_cap_refusal(message)
         );
         if !wait || !at_cap {
             return Ok(response);
         }
-        eprintln!("waiting for a worker slot (pool at hard cap)");
-        last = Some(response);
-        let wake = tokio::time::Instant::now() + interval;
+        if last.is_none() {
+            notice("waiting for a worker slot (pool at hard cap)");
+        }
+        if let FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } = response {
+            last = Some(message);
+        }
+        let delay = boss_backoff::exponential_delay(interval, max_interval, doublings);
+        let wake = tokio::time::Instant::now() + delay;
         tokio::time::sleep_until(deadline.map_or(wake, |d| d.min(wake))).await;
+        doublings = doublings.saturating_add(1);
     }
 }
 
-/// Force-dispatch a work item, optionally waiting for capacity at the hard cap.
+/// Skip-the-queue spawn for `bossctl agents launch <work-item-id>`. Maps to
+/// `RequestExecution { force: true, .. }`: the engine grows the worker pool by
+/// one slot up to the hard cap when every configured slot is busy and
+/// dispatches the work item immediately, rather than letting the
+/// auto-dispatcher defer until a slot frees up. With `wait_for_slot`, a
+/// refusal at the hard cap is retried until a slot frees or the timeout
+/// expires; the cap itself is never bypassed.
 pub(crate) async fn agents_launch(
     socket_path: &Option<String>,
     json: bool,
@@ -1380,6 +1405,8 @@ pub(crate) async fn agents_launch(
         wait_for_slot.is_some(),
         deadline,
         std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(60),
+        |message| eprintln!("{message}"),
     )
     .await?;
     match response {

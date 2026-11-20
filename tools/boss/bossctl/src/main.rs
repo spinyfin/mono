@@ -996,7 +996,8 @@ enum WorkAction {
         /// Execution id (`exec_…`) or work item id.
         reference: String,
         /// Keep waiting while the execution is in any of these statuses.
-        #[arg(long, value_delimiter = ',', default_values_t = work_wait::DEFAULT_UNTIL_NOT.iter().map(|s| s.to_string()))]
+        /// Default: every pre-run status.
+        #[arg(long, value_delimiter = ',')]
         until_not: Vec<String>,
         /// Give up after this many seconds (exit status 3). Default: wait forever.
         #[arg(long)]

@@ -1,8 +1,6 @@
 //! `bossctl work wait` — block until an execution leaves its pre-run
 //! states, so callers stop hand-rolling loops that poll the engine DB after
 //! `work start` / `agents launch`.
-//!
-//! Also home to the retry predicate behind `agents launch --wait-for-slot`.
 
 use super::*;
 
@@ -24,8 +22,15 @@ pub(crate) const EXIT_NOT_STARTED: i32 = 5;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Default `--until-not` set: the pre-run states.
-pub(crate) const DEFAULT_UNTIL_NOT: &[&str] = &["queued", "ready", "waiting_dependency", "claimed"];
+/// Default `--until-not` set: the pre-run states, as defined by
+/// [`ExecutionStatus::is_pre_run`].
+pub(crate) fn default_until_not() -> Vec<ExecutionStatus> {
+    ExecutionStatus::ALL
+        .iter()
+        .filter(|s| s.is_pre_run())
+        .cloned()
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitVerdict {
@@ -61,7 +66,11 @@ pub(crate) struct WaitOutcome {
 }
 
 /// Parse `--until-not ready,claimed` (already split by clap) into statuses.
+/// An empty list selects [`default_until_not`].
 pub(crate) fn parse_until_not(values: &[String]) -> Result<Vec<ExecutionStatus>> {
+    if values.is_empty() {
+        return Ok(default_until_not());
+    }
     let mut out = Vec::new();
     for value in values {
         let status = value
@@ -71,9 +80,6 @@ pub(crate) fn parse_until_not(values: &[String]) -> Result<Vec<ExecutionStatus>>
         if !out.contains(&status) {
             out.push(status);
         }
-    }
-    if out.is_empty() {
-        bail!("--until-not needs at least one status");
     }
     Ok(out)
 }
@@ -158,17 +164,15 @@ where
     }
 }
 
-/// Newest execution (by creation time) in `executions`.
-pub(crate) fn latest_execution(executions: Vec<WorkExecution>) -> Option<WorkExecution> {
+/// Newest execution (by creation time) in `executions` that belongs to
+/// `work_item_id`. `ListExecutions` also returns review-guide executions
+/// keyed to a different work item (they only carry the task as
+/// `owning_task_id`); those are not the item's own runs.
+pub(crate) fn latest_execution(executions: Vec<WorkExecution>, work_item_id: &str) -> Option<WorkExecution> {
     executions
         .into_iter()
+        .filter(|e| e.work_item_id == work_item_id)
         .max_by_key(|e| (e.created_epoch().unwrap_or(0), e.created_at.clone()))
-}
-
-/// Whether an engine refusal is the "worker pool is full" error that
-/// `agents launch --wait-for-slot` retries instead of reporting.
-pub(crate) fn is_hard_cap_refusal(message: &str) -> bool {
-    message.contains("hard cap")
 }
 
 pub(crate) fn outcome_lines(outcome: &WaitOutcome) -> Vec<String> {
@@ -221,8 +225,12 @@ async fn fetch_by_ref(
             .await
             .context("sending ListExecutions")?;
         return match response {
-            FrontendEvent::ExecutionsList { executions, .. } => {
-                latest_execution(executions).ok_or_else(|| anyhow::anyhow!("no executions for {reference}"))
+            FrontendEvent::ExecutionsList {
+                work_item_id: resolved,
+                executions,
+            } => {
+                let resolved = resolved.as_deref().unwrap_or(work_item_id);
+                latest_execution(executions, resolved).ok_or_else(|| anyhow::anyhow!("no executions for {reference}"))
             }
             FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
                 bail!("engine rejected list executions: {message}")

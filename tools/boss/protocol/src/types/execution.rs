@@ -1157,3 +1157,32 @@ pub struct ExecutionWorkLabel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_item_title: Option<String>,
 }
+
+/// Wording shared by the engine's force-dispatch refusal and the CLI's
+/// `--wait-for-slot` retry predicate, so the two cannot drift apart.
+pub const POOL_HARD_CAP_REFUSAL: &str = "pool already at hard cap";
+
+/// Error text for a force-dispatch refused because `pool_label`'s pool is at
+/// its hard cap of `cap` slots.
+pub fn pool_hard_cap_refusal_message(pool_label: &str, cap: usize, execution_id: &str) -> String {
+    format!("{pool_label} {POOL_HARD_CAP_REFUSAL} ({cap}); cannot force-dispatch {execution_id}")
+}
+
+/// Whether an engine error message is the pool-at-hard-cap refusal built by
+/// [`pool_hard_cap_refusal_message`].
+pub fn is_pool_hard_cap_refusal(message: &str) -> bool {
+    message.contains(POOL_HARD_CAP_REFUSAL)
+}
+
+#[cfg(test)]
+mod pool_hard_cap_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn built_message_is_recognised() {
+        let message = pool_hard_cap_refusal_message("main", 16, "exec_1");
+        assert!(message.contains("cannot force-dispatch exec_1"));
+        assert!(is_pool_hard_cap_refusal(&message));
+        assert!(!is_pool_hard_cap_refusal("unmet dependency"));
+    }
+}

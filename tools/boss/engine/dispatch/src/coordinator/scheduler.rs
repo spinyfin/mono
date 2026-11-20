@@ -450,10 +450,11 @@ impl ExecutionCoordinator {
             .claim_worker_force(&execution.id, preferred_workspace_id.as_deref())
             .await
             .ok_or_else(|| {
-                anyhow!(
-                    "{pool_label} pool already at hard cap ({cap}); cannot force-dispatch {execution_id}",
-                    cap = pool.hard_cap(),
-                )
+                anyhow!(boss_protocol::pool_hard_cap_refusal_message(
+                    pool_label,
+                    pool.hard_cap(),
+                    execution_id,
+                ))
             })?;
         let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
         if let Err(err) = self.schedule_execution(&execution, &worker_id, admission).await {

@@ -1019,10 +1019,7 @@ fn all_spawns_mutation_requires_explicit_operator_acknowledgment() {
 #[test]
 fn work_wait_parses_default_and_custom_status_lists() {
     for (args, expected) in [
-        (
-            vec!["bossctl", "work", "wait", "exec_example"],
-            vec!["queued", "ready", "waiting_dependency", "claimed"],
-        ),
+        (vec!["bossctl", "work", "wait", "exec_example"], Vec::<&str>::new()),
         (
             vec![
                 "bossctl",
@@ -1051,7 +1048,7 @@ fn work_wait_parses_default_and_custom_status_lists() {
         };
         assert_eq!(reference, "exec_example");
         assert_eq!(until_not, expected);
-        assert_eq!(timeout, (expected.len() == 2).then_some(1));
+        assert_eq!(timeout, (!expected.is_empty()).then_some(1));
     }
 }
 
