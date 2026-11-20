@@ -205,9 +205,19 @@ fn persona_held(fx: &Fixture, execution_id: &str) -> bool {
 /// have been aborted, with a fresh automation pool so a held slot cannot block
 /// resume.
 async fn restarted(fx: &Fixture, previous: &Arc<ExecutionCoordinator>, slots: usize) -> Arc<ExecutionCoordinator> {
+    restarted_with_pool(fx, previous, slots).await.0
+}
+
+/// [`restarted`], also returning the fresh pool for tests that watch its slots.
+async fn restarted_with_pool(
+    fx: &Fixture,
+    previous: &Arc<ExecutionCoordinator>,
+    slots: usize,
+) -> (Arc<ExecutionCoordinator>, WorkerPool) {
     previous.abort_driving_runs();
     let pool = WorkerPool::new_automation(slots);
-    coordinator_over(fx, slots, &pool).await
+    let coordinator = coordinator_over(fx, slots, &pool).await;
+    (coordinator, pool)
 }
 
 #[tokio::test]
@@ -514,8 +524,9 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
 /// dispatch passes than the pre-start retry budget allows, and optionally a
 /// second host that every later pass would rank higher.
 async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: bool) {
-    let (fx, env, execution, peer, events) = timing::frozen(async {
-        let fx = Fixture::with(workspace_slack(300)).await;
+    timing::hold();
+    let (fx, env, execution, peer, events) = timing::guarded(async {
+        let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
         let mut env = env(&fx, 1).await;
         let events = Arc::new(boss_engine_runtime::dispatch_events::RecordingDispatchEventSink::new());
         Arc::get_mut(&mut env.coordinator)
@@ -547,9 +558,10 @@ async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: 
         (fx, env, execution, peer, events)
     })
     .await;
-    // Only the intentionally unanswered lease runs against the real clock.
-    timing::guarded(timing::condition(|| attention_open(&fx, &execution.id))).await;
-    timing::frozen(async {
+    // The clock stays held: only the intentionally unanswered lease's command
+    // deadline is advanced, and stream liveness timers cannot fire.
+    timing::guarded(timing::advancing(|| attention_open(&fx, &execution.id))).await;
+    timing::guarded(async {
         let seen = peer.commands();
         let cursor = Cursor {
             journal_id: peer.journal.clone(),

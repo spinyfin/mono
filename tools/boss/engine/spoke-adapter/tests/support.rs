@@ -368,6 +368,17 @@ impl Fixture {
 
     /// A hub that offers `contracts` instead of the first-release set.
     pub async fn with_hub_contracts(config: SpokeAdapterConfig, contracts: Contracts) -> Self {
+        Self::build(config, contracts, Duration::from_secs(2)).await
+    }
+
+    /// A fixture whose stream liveness pulse never fires within a test, so a
+    /// paused clock can expire command deadlines without also racing the
+    /// scripted peer's pulse replies. The pulse timeout is unchanged.
+    pub async fn with_frozen_liveness(config: SpokeAdapterConfig) -> Self {
+        Self::build(config, Contracts::first_release(), Duration::from_secs(3600)).await
+    }
+
+    async fn build(config: SpokeAdapterConfig, contracts: Contracts, pulse_interval: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("work.db")).unwrap());
         let mut params = CertificateParams::default();
@@ -403,7 +414,7 @@ impl Fixture {
                 .max_hosts(4)
                 .max_pending(8)
                 .hello_timeout(Duration::from_secs(2))
-                .pulse_interval(Duration::from_secs(2))
+                .pulse_interval(pulse_interval)
                 .pulse_timeout(Duration::from_secs(1))
                 .contracts(contracts)
                 .build(),
