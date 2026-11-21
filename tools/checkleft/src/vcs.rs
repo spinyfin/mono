@@ -7,8 +7,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::github_http::{GithubGetOutcome, github_get};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use tracing::{info, warn};
+
+pub use crate::github_http::GithubRetryPolicy;
 
 mod patch_line_deltas;
 
@@ -21,21 +24,38 @@ const GITHUB_API_TIMEOUT_SECS: u64 = 30;
 /// Settings for best-effort GitHub API lookups.
 ///
 /// The base URL supports GitHub Enterprise and mock servers in tests. The
-/// timeout remains explicit so callers cannot accidentally make these lookups
-/// unbounded.
+/// per-request timeout remains explicit so callers cannot accidentally make
+/// these lookups unbounded. Transient failures (timeouts, connection errors,
+/// HTTP 5xx and 429) are retried under [`Self::retry`]; a dead GitHub still
+/// fails inside that policy's budget.
 #[derive(Clone, Copy)]
 pub struct GithubApiContext<'a> {
     pub base_url: &'a str,
     pub timeout: Duration,
+    pub retry: GithubRetryPolicy,
 }
 
 impl<'a> GithubApiContext<'a> {
     pub fn new(base_url: &'a str, timeout: Duration) -> Self {
-        Self { base_url, timeout }
+        Self {
+            base_url,
+            timeout,
+            retry: GithubRetryPolicy::production(),
+        }
     }
 
     pub fn production(base_url: &'a str) -> Self {
         Self::new(base_url, Duration::from_secs(GITHUB_API_TIMEOUT_SECS))
+    }
+
+    pub fn with_retry(mut self, retry: GithubRetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Same as [`Self::new`] but with short, unjittered retry delays for tests.
+    pub fn testing(base_url: &'a str, timeout: Duration) -> Self {
+        Self::new(base_url, timeout).with_retry(GithubRetryPolicy::for_tests())
     }
 }
 
@@ -44,19 +64,29 @@ impl<'a> GithubApiContext<'a> {
 #[derive(Debug)]
 pub struct GithubApiTimeout {
     operation: &'static str,
+    attempts: u32,
 }
 
 impl GithubApiTimeout {
     pub fn new(operation: &'static str) -> Self {
-        Self { operation }
+        Self::after_attempts(operation, 1)
+    }
+
+    pub fn after_attempts(operation: &'static str, attempts: u32) -> Self {
+        Self {
+            operation,
+            attempts: attempts.max(1),
+        }
     }
 }
 
 impl std::fmt::Display for GithubApiTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let attempts = self.attempts;
+        let attempt_word = if attempts == 1 { "attempt" } else { "attempts" };
         write!(
             f,
-            "GitHub API call timed out after {GITHUB_API_TIMEOUT_SECS} seconds while {}",
+            "GitHub API call timed out after {GITHUB_API_TIMEOUT_SECS} seconds while {} (after {attempts} {attempt_word})",
             self.operation
         )
     }
@@ -64,8 +94,8 @@ impl std::fmt::Display for GithubApiTimeout {
 
 impl std::error::Error for GithubApiTimeout {}
 
-fn github_timeout(operation: &'static str) -> anyhow::Error {
-    GithubApiTimeout::new(operation).into()
+fn github_timeout(operation: &'static str, attempts: u32) -> anyhow::Error {
+    GithubApiTimeout::after_attempts(operation, attempts).into()
 }
 
 /// Install the process-wide rustls crypto provider exactly once, before the
@@ -334,46 +364,20 @@ pub async fn github_pull_request_description(
         "{}/repos/{repository}/pulls/{change_id}",
         github.base_url.trim_end_matches('/')
     );
-    ensure_rustls_provider();
-    let client = reqwest::Client::builder()
-        .timeout(github.timeout)
-        .build()
-        .context("failed to build GitHub API client for PR description lookup")?;
-    let mut request = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "checkleft-cli");
-
-    if let Some(token) = github_token.filter(|token| !token.trim().is_empty()) {
-        request = request.bearer_auth(token);
-    }
-
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) if error.is_timeout() => return Err(github_timeout("fetching PR description")),
-        Err(error) => {
-            warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — transport error");
-            return Ok(GithubPrDescription::LookupFailed {
-                reason: format!("GitHub API PR description lookup transport error: {error}"),
-            });
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        warn!(repository, %status, "checkleft: GitHub PR description lookup skipped — non-success status");
-        return Ok(GithubPrDescription::LookupFailed {
-            reason: format!("GitHub API PR description lookup returned HTTP {status}"),
-        });
-    }
-
-    let response_bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) if error.is_timeout() => return Err(github_timeout("fetching PR description")),
-        Err(error) => {
-            warn!(repository, error = %error, "checkleft: GitHub PR description lookup skipped — response body error");
-            return Ok(GithubPrDescription::LookupFailed {
-                reason: format!("GitHub API PR description lookup response body error: {error}"),
-            });
+    let response_bytes = match fetch_github_bytes(
+        github,
+        &url,
+        github_token,
+        "fetching PR description",
+        "PR description lookup",
+        "PR description lookup",
+        repository,
+    )
+    .await?
+    {
+        FetchedGithubBytes::Body(bytes) => bytes,
+        FetchedGithubBytes::LookupFailed(reason) => {
+            return Ok(GithubPrDescription::LookupFailed { reason });
         }
     };
     let payload: GithubPullRequestResponse = match serde_json::from_slice(&response_bytes) {
@@ -424,46 +428,20 @@ pub async fn github_pr_number_for_branch(
         "{}/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1",
         github.base_url.trim_end_matches('/')
     );
-    ensure_rustls_provider();
-    let client = reqwest::Client::builder()
-        .timeout(github.timeout)
-        .build()
-        .context("failed to build GitHub API client for branch PR lookup")?;
-    let mut request = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "checkleft-cli");
-
-    if let Some(token) = github_token.filter(|t| !t.trim().is_empty()) {
-        request = request.bearer_auth(token);
-    }
-
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) if error.is_timeout() => return Err(github_timeout("looking up the open PR for a branch")),
-        Err(error) => {
-            warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — transport error");
-            return Ok(BranchPrLookup::LookupFailed {
-                reason: format!("GitHub API branch lookup transport error: {error}"),
-            });
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        warn!(repository, %status, "checkleft: GitHub branch PR lookup skipped — non-success status");
-        return Ok(BranchPrLookup::LookupFailed {
-            reason: format!("GitHub API branch lookup returned HTTP {status}"),
-        });
-    }
-
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) if error.is_timeout() => return Err(github_timeout("looking up the open PR for a branch")),
-        Err(error) => {
-            warn!(repository, error = %error, "checkleft: GitHub branch PR lookup skipped — response body error");
-            return Ok(BranchPrLookup::LookupFailed {
-                reason: format!("GitHub API branch lookup response body error: {error}"),
-            });
+    let bytes = match fetch_github_bytes(
+        github,
+        &url,
+        github_token,
+        "looking up the open PR for a branch",
+        "branch lookup",
+        "branch PR lookup",
+        repository,
+    )
+    .await?
+    {
+        FetchedGithubBytes::Body(bytes) => bytes,
+        FetchedGithubBytes::LookupFailed(reason) => {
+            return Ok(BranchPrLookup::LookupFailed { reason });
         }
     };
     let prs: Vec<GithubPullRequestListItem> = match serde_json::from_slice(&bytes) {
@@ -480,6 +458,49 @@ pub async fn github_pr_number_for_branch(
         .next()
         .map(|pr| BranchPrLookup::Found(pr.number.to_string()))
         .unwrap_or(BranchPrLookup::NoOpenPr))
+}
+
+enum FetchedGithubBytes {
+    Body(Vec<u8>),
+    LookupFailed(String),
+}
+
+async fn fetch_github_bytes(
+    github: GithubApiContext<'_>,
+    url: &str,
+    github_token: Option<&str>,
+    operation: &'static str,
+    reason_name: &'static str,
+    skip_name: &'static str,
+    repository: &str,
+) -> Result<FetchedGithubBytes> {
+    ensure_rustls_provider();
+    let client = reqwest::Client::builder()
+        .timeout(github.timeout)
+        .build()
+        .with_context(|| format!("failed to build GitHub API client for {skip_name}"))?;
+    match github_get(&client, url, github_token, operation, github.timeout, github.retry).await {
+        GithubGetOutcome::Success(bytes) => Ok(FetchedGithubBytes::Body(bytes)),
+        GithubGetOutcome::Timeout { attempts } => Err(github_timeout(operation, attempts)),
+        GithubGetOutcome::Transport { error } => {
+            warn!(repository, error = %error, "checkleft: GitHub {skip_name} skipped — transport error");
+            Ok(FetchedGithubBytes::LookupFailed(format!(
+                "GitHub API {reason_name} transport error: {error}"
+            )))
+        }
+        GithubGetOutcome::Body { error } => {
+            warn!(repository, error = %error, "checkleft: GitHub {skip_name} skipped — response body error");
+            Ok(FetchedGithubBytes::LookupFailed(format!(
+                "GitHub API {reason_name} response body error: {error}"
+            )))
+        }
+        GithubGetOutcome::Http { status } => {
+            warn!(repository, %status, "checkleft: GitHub {skip_name} skipped — non-success status");
+            Ok(FetchedGithubBytes::LookupFailed(format!(
+                "GitHub API {reason_name} returned HTTP {status}"
+            )))
+        }
+    }
 }
 
 fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
@@ -862,23 +883,25 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        GithubApiContext, GithubApiTimeout, GithubPrDescription, github_pull_request_description,
-        parse_git_name_status, parse_git_status_porcelain_paths, parse_jj_diff_summary, parse_jj_remote_list_url,
-        parse_repo_root_output, parse_repo_slug_from_remote_url, parse_tracked_file_list,
-        resolve_jj_repo_slug_from_remote_list, try_expand_brace_notation,
+        BranchPrLookup, GithubApiContext, GithubApiTimeout, GithubPrDescription, github_pr_number_for_branch,
+        github_pull_request_description, parse_git_name_status, parse_git_status_porcelain_paths,
+        parse_jj_diff_summary, parse_jj_remote_list_url, parse_repo_root_output, parse_repo_slug_from_remote_url,
+        parse_tracked_file_list, resolve_jj_repo_slug_from_remote_list, try_expand_brace_notation,
     };
+    use crate::github_http::GITHUB_RETRY_MAX_ATTEMPTS;
 
     #[tokio::test]
     async fn pr_description_timeout_is_an_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/pulls/42"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(100)))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(80)))
+            .expect(u64::from(GITHUB_RETRY_MAX_ATTEMPTS))
             .mount(&server)
             .await;
 
         let error = github_pull_request_description(
-            GithubApiContext::new(&server.uri(), Duration::from_millis(10)),
+            GithubApiContext::testing(&server.uri(), Duration::from_millis(10)),
             "o/r",
             "42",
             None,
@@ -887,7 +910,12 @@ mod tests {
         .expect_err("a delayed GitHub response must not degrade to no description");
 
         assert!(error.downcast_ref::<GithubApiTimeout>().is_some());
-        assert!(error.to_string().contains("timed out"), "unexpected error: {error:#}");
+        let message = error.to_string();
+        assert!(message.contains("timed out"), "unexpected error: {error:#}");
+        assert!(
+            message.contains(&format!("after {GITHUB_RETRY_MAX_ATTEMPTS} attempts")),
+            "timeout must name the attempt count: {message}"
+        );
     }
 
     #[tokio::test]
@@ -896,11 +924,12 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/o/r/pulls/42"))
             .respond_with(ResponseTemplate::new(500))
+            .expect(u64::from(GITHUB_RETRY_MAX_ATTEMPTS))
             .mount(&server)
             .await;
 
         let description = github_pull_request_description(
-            GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+            GithubApiContext::testing(&server.uri(), Duration::from_secs(1)),
             "o/r",
             "42",
             None,
@@ -909,6 +938,57 @@ mod tests {
         .expect("non-timeout GitHub failures return a typed result");
 
         assert!(matches!(description, GithubPrDescription::LookupFailed { ref reason } if reason.contains("HTTP 500")));
+    }
+
+    #[tokio::test]
+    async fn branch_lookup_timeout_then_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(80)))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"[{"number":9}]"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let lookup = github_pr_number_for_branch(
+            GithubApiContext::testing(&server.uri(), Duration::from_millis(10)),
+            "o/r",
+            "feature",
+            Some("token"),
+        )
+        .await
+        .expect("timeout then success must not fail the lookup");
+
+        assert_eq!(lookup, BranchPrLookup::Found("9".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn branch_lookup_does_not_retry_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let lookup = github_pr_number_for_branch(
+            GithubApiContext::testing(&server.uri(), Duration::from_secs(1)),
+            "o/r",
+            "feature",
+            Some("token"),
+        )
+        .await
+        .expect("404 is a lookup failure, not a timeout");
+
+        assert!(matches!(lookup, BranchPrLookup::LookupFailed { ref reason } if reason.contains("HTTP 404")));
     }
 
     #[test]
