@@ -20,6 +20,23 @@ if [[ "$#" -gt 0 && -x "${cleanup_supervisor}" && "$1" -ef "${cleanup_supervisor
   exec "$@"
 fi
 
+# Test-only pause hooks, used by cleanup_guard_test to hold the wrapper at an
+# exact point. They run outside the Seatbelt profile, so a hook is honoured
+# only when its path is inside the TEST_TMPDIR this wrapper was started with
+# (the supervisor's own private directory, captured before it is replaced
+# below). A test target's `env` attribute cannot point one at anywhere else.
+supervisor_tmpdir="${TEST_TMPDIR:-}"
+bound_hook() {
+  local value="$1"
+  if [[ -n "${value}" && -n "${supervisor_tmpdir}" &&
+    "${value}" == "${supervisor_tmpdir%/}"/* && "${value}" != *..* ]]; then
+    printf '%s' "${value}"
+  fi
+}
+hold_before_ready="$(bound_hook "${MONO_WRAPPER_TEST_HOLD_BEFORE_READY:-}")"
+hold_before_setpgid="$(bound_hook "${MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID:-}")"
+unset MONO_WRAPPER_TEST_HOLD_BEFORE_READY MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID
+
 runtime_root="${TEST_SRCDIR:?}/+test_runtime_repository+test_runtime_tools"
 runtime_bin="${runtime_root}/bin"
 runtime_manifest="${runtime_root}/manifest"
@@ -83,9 +100,21 @@ unset \
 
 child_pid=""
 watchdog_pid=""
+cancelled=""
 
+# The launcher announces its pid before it calls setpgid, so for a short
+# interval the pid is live while its group does not exist yet. Ownership of
+# the test therefore covers both: the group, and the launcher pid itself.
 process_group_is_alive() {
-  [[ -n "${child_pid}" ]] && kill -0 -- "-${child_pid}" 2>/dev/null
+  [[ -n "${child_pid}" ]] &&
+    { kill -0 -- "-${child_pid}" 2>/dev/null || kill -0 -- "${child_pid}" 2>/dev/null; }
+}
+
+# Signals the group and the launcher pid. Either may not exist yet (the group
+# before setpgid) or any more; a missing target is not an error.
+signal_child() {
+  kill "-$1" -- "-${child_pid}" 2>/dev/null || true
+  kill "-$1" -- "${child_pid}" 2>/dev/null || true
 }
 
 terminate_child_group() {
@@ -93,7 +122,7 @@ terminate_child_group() {
     return 0
   fi
 
-  kill -TERM -- "-${child_pid}" 2>/dev/null || true
+  signal_child TERM
   for _ in {1..20}; do
     if ! process_group_is_alive; then
       wait "${child_pid}" 2>/dev/null || true
@@ -102,9 +131,11 @@ terminate_child_group() {
     "${runtime_bin}/sleep" 0.05
   done
 
-  kill -KILL -- "-${child_pid}" 2>/dev/null || true
-  wait "${child_pid}" 2>/dev/null || true
+  # Repeat the kill: a launcher caught before setpgid can create its group
+  # between two signals.
   for _ in {1..20}; do
+    signal_child KILL
+    wait "${child_pid}" 2>/dev/null || true
     if ! process_group_is_alive; then
       return 0
     fi
@@ -120,6 +151,11 @@ terminate_child_group() {
 # to finish the job.
 release_watchdog() {
   if [[ -n "${watchdog_pid}" ]]; then
+    # The watchdog may still be blocked reading the announce FIFO, whose write
+    # end this shell holds; closing it ends that read when no test was
+    # launched. Once a launcher has inherited the descriptor it closes its own
+    # copy after announcing, so this never takes a pid away from the watchdog.
+    exec 10<&- 12<&-
     printf 'done\n' >&8 2>/dev/null || true
     wait "${watchdog_pid}" 2>/dev/null || true
     watchdog_pid=""
@@ -139,11 +175,25 @@ cleanup() {
   exit "${status}"
 }
 
+# A signal that arrives before the launcher exists has nothing to forward to.
+# Record it instead, so the readiness wait and the launch step see the
+# cancellation and the test is never started.
 forward_signal() {
   local signal="$1"
   if [[ -n "${child_pid}" ]]; then
-    kill "-${signal}" -- "-${child_pid}" 2>/dev/null || true
+    signal_child "${signal}"
+  else
+    cancelled="${signal}"
   fi
+}
+
+exit_if_cancelled() {
+  case "${cancelled}" in
+    "") ;;
+    HUP) exit 129 ;;
+    INT) exit 130 ;;
+    *) exit 143 ;;
+  esac
 }
 
 trap cleanup EXIT
@@ -410,10 +460,12 @@ else:
 # watchdog does the cleanup in its place.
 lifeline="${TEST_TMPDIR}/wrapper-lifeline"
 announce="${TEST_TMPDIR}/wrapper-announce"
-"${runtime_bin}/mkfifo" "${lifeline}" "${announce}"
+ready_fifo="${TEST_TMPDIR}/wrapper-ready"
+"${runtime_bin}/mkfifo" "${lifeline}" "${announce}" "${ready_fifo}"
 exec 8<>"${lifeline}" 9<"${lifeline}"
 exec 10<>"${announce}" 11<"${announce}"
-"${runtime_bin}/rm" -f "${lifeline}" "${announce}"
+exec 12<>"${ready_fifo}"
+"${runtime_bin}/rm" -f "${lifeline}" "${announce}" "${ready_fifo}"
 
 # The watchdog gets a group of its own so a kill aimed at this shell's group
 # cannot take it too. It is listening before the test starts. Record this
@@ -426,13 +478,23 @@ set -m
   trap - EXIT INT TERM HUP
   exec 8<&- 10<&- </dev/null >/dev/null 2>&1
   printf '%s\n' "${wrapper_pid}" >"${TEST_TMPDIR}/watchdog-ready"
+  if [[ -n "${hold_before_ready}" ]]; then
+    : >"${hold_before_ready}.paused"
+    while [[ -e "${hold_before_ready}" ]]; do
+      "${runtime_bin}/sleep" 0.05
+    done
+  fi
+  printf 'ready\n' >&12
+  exec 12<&-
   if ! IFS= read -r child_pid <&11; then
     child_pid=""
   fi
   exec 11<&-
   if [[ -z "${child_pid}" ]]; then
-    # The wrapper died before the test announced a pid. The launcher stays in
-    # the wrapper's group until that announce, so it died with the wrapper.
+    # End-of-file on the announce FIFO: no process holds its write end any
+    # more, so no launcher was started or it exited without announcing. (A
+    # launcher that is merely slow to announce still holds the write end, and
+    # takes the branch below once it does.) Only the private root is left.
     if [[ "${owns_test_tmpdir}" == "1" ]]; then
       "${runtime_bin}/rm" -rf "${test_tmpdir}"
     fi
@@ -448,38 +510,59 @@ set -m
 ) &
 watchdog_pid=$!
 set +m
+if [[ -n "${hold_before_ready}" ]]; then
+  printf '%s %s\n' "${watchdog_pid}" "${test_tmpdir}" >"${hold_before_ready}.watchdog"
+fi
 exec 9<&- 11<&-
 
-for _ in {1..200}; do
-  if [[ -f "${TEST_TMPDIR}/watchdog-ready" ]]; then
-    break
+# Block until the watchdog says it is listening. There is no give-up bound,
+# because a watchdog that is merely slow to be scheduled on a loaded host is
+# healthy; the wait ends in failure only if the watchdog process has died.
+until IFS= read -r -t 1 _ <&12; do
+  exit_if_cancelled
+  if ! kill -0 "${watchdog_pid}" 2>/dev/null; then
+    printf '%s\n' "watchdog did not start" >&2
+    exit 126
   fi
-  "${runtime_bin}/sleep" 0.01
 done
-if [[ ! -f "${TEST_TMPDIR}/watchdog-ready" ]]; then
-  printf '%s\n' "watchdog did not start" >&2
-  exit 126
-fi
+exec 12<&-
+exit_if_cancelled
 
 # The launcher stays in this shell's group, writes its pid, then setpgid's
 # into its own group and execs sandbox-exec. Until the pid reaches the
 # watchdog, a kill of this group still takes the launcher with it. Neither
 # FIFO end is passed through the exec, so a surviving test descendant cannot
 # hold them open.
-"${runtime_bin}/python3" -c \
-  'import os, sys
+MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID="${hold_before_setpgid}" "${runtime_bin}/python3" -c \
+  'import os, signal, sys
+# A non-interactive shell starts an asynchronous command with SIGINT and
+# SIGQUIT ignored, and an ignored disposition survives exec. Restore the
+# defaults so the test sees what it would outside the wrapper.
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
 os.write(10, ("%d\n" % os.getpid()).encode())
-for fd in (8, 9, 10, 11):
+for fd in (8, 9, 10, 11, 12):
     try:
         os.close(fd)
     except OSError:
         pass
+# Test hook: park between the announce and setpgid so a test can deliver a
+# signal in that interval deterministically. The wrapper only passes a path
+# bound to the cleanup_guard_test private directory; it is empty otherwise.
+hold = os.environ.pop("MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID", "")
+if hold:
+    import time
+    with open(hold + ".paused", "w") as marker:
+        marker.write("%d\n" % os.getpid())
+    while os.path.exists(hold):
+        time.sleep(0.01)
 os.setpgid(0, 0)
 os.execvp(sys.argv[1], sys.argv[1:])
 os._exit(127)' \
-  /usr/bin/sandbox-exec -f "${profile}" "$@" 8<&- 9<&- 11<&- &
+  /usr/bin/sandbox-exec -f "${profile}" "$@" 0<&0 8<&- 9<&- 11<&- 12<&- &
 child_pid=$!
 exec 10<&-
+exit_if_cancelled
 
 set +e
 wait "${child_pid}"

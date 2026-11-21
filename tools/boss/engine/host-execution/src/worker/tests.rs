@@ -1330,45 +1330,20 @@ async fn failed_reclaim_is_recorded_and_retried() {
 /// shell carries only the run id. Stop must still signal it.
 #[tokio::test]
 async fn stop_signals_a_reparented_shell_that_carries_only_the_run_id() {
-    use std::io::BufRead;
     let root = tempfile::tempdir().unwrap();
     let fake = Arc::new(FakeTmux::default());
     live(&fake);
     fake.manage_processes.store(true, std::sync::atomic::Ordering::Relaxed);
     let supervisor = supervisor(root.path(), fake).await;
     seed(&supervisor.store, Phase::Alive);
-    struct SessionChild(std::process::Child);
-    impl Drop for SessionChild {
-        fn drop(&mut self) {
-            let pid = self.0.id() as i32;
-            // SAFETY: this child called `os.setsid()`; `-pid` is its session.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = self.0.wait();
-        }
-    }
-    let mut shell = SessionChild(
-        std::process::Command::new("python3")
-            .args([
-                "-u",
-                "-c",
-                "import os,select,sys; os.setsid(); print('ready', flush=True); select.select([sys.stdin],[],[],600)",
-            ])
-            .current_dir(root.path().join("worker"))
-            .env("BOSS_RUN_ID", "exec_test")
-            .env_remove("BOSS_SPAWN_TOKEN")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let mut ready = String::new();
-    std::io::BufReader::new(shell.0.stdout.as_mut().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
+    // The shared guard kills the session on drop and waits, so an early
+    // panic cannot leave the sleeper behind. It lives in `boss-engine-test-process`
+    // because `boss-engine-completion`, which depends on this crate, shares it.
+    let mut shell = boss_engine_test_process::spawn_setsid_sleeper(root.path().join("worker"), |command| {
+        command.env("BOSS_RUN_ID", "exec_test").env_remove("BOSS_SPAWN_TOKEN");
+    });
     let result = supervisor.execute(&stop_command(), false, 1).await;
-    let exited = shell.0.try_wait().unwrap().is_some();
+    let exited = shell.try_wait().unwrap().is_some();
     assert_eq!(result.code, ResultCode::Ok as i32, "{}", result.reason);
     assert!(exited, "the run-id-only shell was signalled by stop");
 }
