@@ -465,26 +465,18 @@ impl ExecutionCoordinator {
         }
         spawn_claim.disarm();
         self.consume_operator_forced_if_admitted(execution_id, admission);
-        // Durable record that an operator force launch admitted this run, so
-        // a resume after an answered question can bypass an operator pause
-        // (see `work_executions.force_launched`). Best-effort: the run is
-        // already started, and a lost stamp only means the resume queues.
-        if matches!(admission, DispatchAdmission::OperatorForced)
-            && let Err(err) = self.work_db.mark_execution_force_launched(&execution.id)
-        {
-            tracing::warn!(execution_id = %execution.id, ?err, "failed to record force launch on execution");
-        }
         Ok(worker_id)
     }
 
-    /// Launch the ready execution an operator's answer just created for
-    /// `work_item_id`, the way `bossctl agents launch` would.
+    /// Launch the ready execution an operator's answer just created or resumed
+    /// for `work_item_id`, the way `bossctl agents launch` would.
     ///
-    /// Answering is an explicit human decision, so the work it creates must not
-    /// be re-queued behind the global dispatch pause or the focus set. The
-    /// answer transaction already marked the latest non-terminal execution
-    /// operator-forced, so a writer wait, pool cap, preflight, or drain race
-    /// keeps the admission until the work is admitted or cancelled. This path
+    /// Answering is an explicit human decision, so the work it creates or the
+    /// force-launched run it resumes must not be re-queued behind the global
+    /// dispatch pause or the focus set. The answer transaction already marked
+    /// the latest non-terminal execution operator-forced, so a writer wait,
+    /// pool cap, preflight, predecessor lease, or drain race keeps the
+    /// admission until the work is admitted or cancelled. This path
     /// does not re-mark: a post-commit re-mark can flag an execution the drain
     /// has already admitted. A `ready` execution is handed to
     /// [`Self::force_dispatch`] as [`DispatchAdmission::OperatorForced`].
@@ -529,6 +521,17 @@ impl ExecutionCoordinator {
                 execution_id,
                 error = %format!("{err:#}"),
                 "failed to clear operator-forced admission after dispatch",
+            );
+        }
+        // Durable lineage: every OperatorForced admission records that this
+        // run, or a later answered-question resume of it, may bypass an
+        // operator pause. Best-effort: the run is already started, and a
+        // lost stamp only means a later resume queues.
+        if let Err(err) = self.work_db.mark_execution_force_launched(execution_id) {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "failed to record force launch on execution",
             );
         }
     }

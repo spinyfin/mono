@@ -1341,16 +1341,19 @@ impl WorkDb {
         query_execution(&conn, id).require("execution", id)
     }
 
-    /// Stamp `work_executions.force_launched`: the engine accepted this
-    /// execution through an operator force launch (`bossctl agents launch`),
-    /// which bypasses the dispatch pause. Idempotent.
+    /// Stamp `work_executions.force_launched`: this execution, or the run
+    /// whose answered question minted it, was admitted by an explicit
+    /// OperatorForced launch (`bossctl agents launch`, an answered-question
+    /// launch, or the drain admitting persisted operator-forced admission).
+    /// Answered-question resumes of a stamped run may bypass an operator
+    /// pause. Idempotent.
     pub fn mark_execution_force_launched(&self, execution_id: &str) -> Result<()> {
         let conn = self.connect()?;
         mark_execution_force_launched_in(&conn, execution_id)?;
         Ok(())
     }
 
-    /// Whether `execution_id` was admitted by an operator force launch; see
+    /// Whether `execution_id` carries force-launch lineage; see
     /// [`Self::mark_execution_force_launched`]. `false` for an unknown id.
     pub fn execution_force_launched(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
