@@ -917,6 +917,31 @@ pub(super) async fn apply_work_item_patch_from(
         send_work_error(&sink, &request_id, &err);
         return;
     }
+    if server_state.classify_peer(peer_pid).is_worker()
+        && let Some(pr_url) = patch.pr_url.as_ref().filter(|url| !url.is_empty())
+    {
+        match boss_work_db::bounded_base_verdict(
+            Arc::clone(&server_state.pr_state_checker),
+            pr_url,
+            boss_work_db::PR_BASE_CHECK_BUDGET,
+        )
+        .await
+        {
+            Ok(boss_work_db::PrBaseVerdict::Refused(reason)) => {
+                send_work_error(&sink, &request_id, format!("PR binding refused: {reason}"));
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                send_work_error(
+                    &sink,
+                    &request_id,
+                    format!("PR binding refused: base check failed: {err}"),
+                );
+                return;
+            }
+        }
+    }
     let id = match server_state.resolve_work_item_id(&id).await {
         Ok(id) => id,
         Err(err) => {

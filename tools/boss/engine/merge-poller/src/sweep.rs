@@ -2,6 +2,7 @@ use super::deferred_review_admission::sweep_deferred_review_admission_with;
 use super::host::{ConflictCleared, ConflictResponse, PopulationRequest, SweepHost};
 use super::post_merge_review::maybe_trigger_post_merge_review;
 use super::*;
+use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
 
 /// The engine services one sweep step may call. Each is absent when the sweep
 /// runs bare — a pass that only observes and promotes.
@@ -710,6 +711,55 @@ pub(crate) async fn sweep_one(
             return;
         }
     };
+    let base_attentions = match work_db.list_attention_items_for_work_item(&candidate.work_item_id) {
+        Ok(items) => items
+            .into_iter()
+            .filter(|item| item.kind == PR_BASE_REFUSED && item.status == "open")
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: could not read PR base refusals");
+            return;
+        }
+    };
+    if let Some(reason) = &probe_result.base_branch_error {
+        let detail = format!(
+            "{} was observed as {:?} with base `{}`. It cannot complete this work item or release dependents. {reason}",
+            candidate.pr_url,
+            probe_result.state,
+            probe_result.base_ref_name.as_deref().unwrap_or("unknown"),
+        );
+        // Do not re-raise and republish an unchanged observation every pass.
+        if !base_attentions.iter().any(|item| item.body_markdown == detail) {
+            match work_db.upsert_refreshing_work_item_attention(
+                &candidate.work_item_id,
+                PR_BASE_REFUSED,
+                "PR has not landed in the default branch",
+                &detail,
+            ) {
+                Ok(()) => {
+                    publisher
+                        .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, PR_BASE_REFUSED)
+                        .await
+                }
+                Err(err) => tracing::warn!(?err, "merge poller: could not surface PR base refusal"),
+            }
+        }
+        update_pr_poll_state(work_db, publisher, candidate, &probe_result, None, caller).await;
+        return;
+    }
+    // A binding-repair refusal can describe a different PR. Only clear evidence
+    // about this probe, and avoid a write when there is nothing open to clear.
+    let belongs_to_probe = |body: &str| {
+        body.strip_prefix(&candidate.pr_url)
+            .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
+    };
+    if !matches!(probe_result.state, PrLifecycleState::ClosedUnmerged)
+        && !base_attentions.is_empty()
+        && base_attentions.iter().all(|item| belongs_to_probe(&item.body_markdown))
+        && let Err(err) = work_db.resolve_external_tracker_attention(&candidate.work_item_id, PR_BASE_REFUSED)
+    {
+        tracing::warn!(?err, "merge poller: could not clear PR base refusal");
+    }
     // Populated in the Open arm so the post-match poll-state write can
     // reuse the reaper's active-attempt snapshot instead of re-querying.
     // `None` outside Open (or if the reaper was not run); `Some(…)` is the

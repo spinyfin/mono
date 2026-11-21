@@ -692,7 +692,9 @@ struct WorkerFixture {
 
 impl WorkerFixture {
     fn new() -> Self {
-        Self::with_state(test_server_state())
+        Self::with_state(test_server_state_with_pr_state_checker(Arc::new(
+            boss_work_db::FakePrStateChecker::always(boss_work_db::PrOpenState::Open),
+        )))
     }
 
     fn with_state((server_state, dir): (Arc<ServerState>, tempfile::TempDir)) -> Self {

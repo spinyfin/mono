@@ -154,6 +154,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Conflict remediation clears the signal after workspace preparation succeeds, a retry resumes, or the PR becomes clean.",
     ),
     entry(
+        PR_BASE_REFUSED,
+        ClearedBy::ProducerReconciles,
+        "Completion and merge polling clear the refusal only after a fresh GitHub observation verifies the repository default branch; unrelated worker progress cannot clear it.",
+    ),
+    entry(
         WORKSPACE_POSITIONING_REFUSED,
         ClearedBy::ProducerReconciles,
         "The positioning-refusal recheck sweep probes the live PR state each pass and clears the hold with its attention once cube would accept it; an explicit launch also clears both.",
@@ -571,11 +576,6 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::HumanDecision,
         "Same audit-record reasoning as `codex_unobserved_command`, and the overflow variant additionally \
          records that further unobserved commands went uncounted — a gap no later run fills in.",
-    ),
-    entry(
-        PR_BASE_REFUSED,
-        ClearedBy::ProducerReconciles,
-        "The completion guard resolves this only after observing the repository default branch as the PR base.",
     ),
     entry(
         ATTENTION_KIND_RECOVERY_PERMANENT,

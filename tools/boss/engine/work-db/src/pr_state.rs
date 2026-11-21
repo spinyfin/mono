@@ -229,12 +229,9 @@ fn map_base_verdict(repository: &serde_json::Value) -> Result<PrBaseVerdict> {
         .context("PR query returned no base branch")?;
     let default = optional_trimmed_json_str(&repository["defaultBranchRef"], "name")
         .context("PR query returned no default branch")?;
-    Ok(if base == default {
-        PrBaseVerdict::DefaultBranch
-    } else {
-        PrBaseVerdict::Refused(format!(
-            "PR targets `{base}`, but the repository default branch is `{default}`"
-        ))
+    Ok(match boss_github::require_default_branch(Some(&base), Some(&default)) {
+        Ok(()) => PrBaseVerdict::DefaultBranch,
+        Err(reason) => PrBaseVerdict::Refused(reason),
     })
 }
 

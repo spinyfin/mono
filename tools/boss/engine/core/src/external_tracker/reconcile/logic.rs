@@ -451,8 +451,8 @@ pub(super) async fn process_product(
     }
 
     // ── 7. Retroactively attach `tracked` label (Behavior 7 retry) ───────────
-    // Items whose initial label-add failed (e.g. due to the T630 string-not-array
-    // bug) are re-attempted on every reconcile pass until the label is confirmed
+    // Items whose initial label-add failed (e.g. because the label payload was sent as
+    // a string instead of an array) are re-attempted on every reconcile pass until the label is confirmed
     // present in the upstream fetch. Cap at 20 to match other budgets.
     const LABEL_BUDGET: usize = 20;
     for candidate in candidates.label.into_iter().take(LABEL_BUDGET) {

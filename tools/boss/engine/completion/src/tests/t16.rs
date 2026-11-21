@@ -1054,3 +1054,130 @@ async fn base_lookup_timeout_leaves_delivery_retryable_without_attention() {
     assert_eq!(db.get_execution(&execution_id).unwrap().status, execution.status);
     assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn declared_state_resolution_distinguishes_base_refusal_from_network_failure() {
+    use crate::run_done_declaration::DeclaredPrResolution;
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, _) = followup_fixture(workspace.path());
+    let handler = TestHarness::new(db, StubPrDetector::ok(Some(OWN_PR)))
+        .handler
+        .with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Merged).with_base(PrBaseVerdict::Refused("feature/parent".into())),
+        ));
+    assert!(matches!(
+        handler.resolve_verified_pr_state(OWN_PR.into()).await,
+        DeclaredPrResolution::BaseRefused { pr_url, reason }
+            if pr_url == OWN_PR && reason == "feature/parent"
+    ));
+    let handler = handler.with_pr_state_checker(Arc::new(UnavailableBaseChecker));
+    assert!(matches!(
+        handler.resolve_verified_pr_state(OWN_PR.into()).await,
+        DeclaredPrResolution::Transient { detail } if detail.contains("GitHub unavailable")
+    ));
+}
+
+#[tokio::test]
+async fn late_recovery_checks_base_for_fresh_and_merged_prs() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    for merged in [false, true] {
+        for transient in [false, true] {
+            let (_dir, db, _, work_item_id, execution_id) = abandoned_execution_fixture();
+            let detected = if merged {
+                PrStatus::Merged { url: OWN_PR.into() }
+            } else {
+                PrStatus::Fresh { url: OWN_PR.into() }
+            };
+            let checker: Arc<dyn crate::work::PrStateChecker> = if transient {
+                Arc::new(UnavailableBaseChecker)
+            } else {
+                Arc::new(
+                    FakePrStateChecker::always(PrOpenState::Open)
+                        .with_base(PrBaseVerdict::Refused("feature/parent".into())),
+                )
+            };
+            let handler = TestHarness::new(db.clone(), StubPrDetector::ok_status(detected))
+                .handler
+                .with_pr_state_checker(checker);
+            let candidate = crate::work::LatePrCandidate {
+                execution_id: execution_id.clone(),
+                work_item_id: work_item_id.clone(),
+                repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+                branch_naming: BranchNaming::BossExecPrefix,
+                worker_branch_prefix: None,
+            };
+            assert!(matches!(
+                handler.recheck_for_pr_late(&candidate).await,
+                StopOutcome::DetectorFailed
+            ));
+            let WorkItem::Chore(task) = db.get_work_item(&work_item_id).unwrap() else {
+                panic!("expected chore")
+            };
+            assert_eq!(task.status, TaskStatus::Active);
+            assert!(task.pr_url.is_none());
+            let open = db
+                .list_attention_items_for_work_item(&work_item_id)
+                .unwrap()
+                .into_iter()
+                .filter(|item| {
+                    item.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED && item.status == "open"
+                })
+                .count();
+            assert_eq!(open, usize::from(!transient));
+            if !transient {
+                let handler = handler.with_pr_state_checker(Arc::new(
+                    FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::DefaultBranch),
+                ));
+                assert!(matches!(
+                    handler.recheck_for_pr_late(&candidate).await,
+                    StopOutcome::PrDetected { .. }
+                ));
+                assert!(
+                    db.list_attention_items_for_work_item(&work_item_id)
+                        .unwrap()
+                        .iter()
+                        .all(|item| item.status != "open")
+                );
+            }
+        }
+    }
+}
+
+struct CountingBaseChecker(std::sync::atomic::AtomicUsize);
+impl crate::work::PrStateChecker for CountingBaseChecker {
+    fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {
+        Ok(crate::work::PrOpenState::Open)
+    }
+    fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::work::PrBaseVerdict::DefaultBranch)
+    }
+}
+
+#[tokio::test]
+async fn declared_delivery_checks_base_once_for_detected_and_stored_urls() {
+    for stored in [false, true] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+        if stored {
+            db.update_work_item(
+                &chore_id,
+                crate::work::WorkItemPatch {
+                    pr_url: Some(OWN_PR.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let checker = Arc::new(CountingBaseChecker(std::sync::atomic::AtomicUsize::new(0)));
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+            .handler
+            .with_branch_verifier(two_pr_verifier(&execution_id))
+            .with_pr_state_checker(checker.clone());
+        handler
+            .finalize_declared_delivery(&db.get_execution(&execution_id).unwrap())
+            .await;
+        assert_eq!(checker.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}

@@ -152,6 +152,10 @@ pub async fn verify_mergeability_live(
                 }
             }
         };
+        if let Some(reason) = &result.base_branch_error {
+            tracing::warn!(pr_url, %reason, "conflict stop gate: unsupported PR base");
+            return ConflictClearance::Unavailable;
+        }
         let open = match result.state {
             PrLifecycleState::Open(ref open) => open,
             // Merged or closed: the conflict question is moot and the

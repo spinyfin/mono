@@ -1252,3 +1252,56 @@ fn progression_connection_allows_reads_and_denies_worker_only_writes() {
     assert_eq!(denial.reason, WorkerTierDenialReason::ProgressionScope);
     assert!(denial.use_instead.is_none());
 }
+
+struct ParentBranchChecker;
+
+impl boss_work_db::PrStateChecker for ParentBranchChecker {
+    fn check(&self, _: &str) -> anyhow::Result<boss_work_db::PrOpenState> {
+        Ok(boss_work_db::PrOpenState::Open)
+    }
+    fn base_verdict(&self, _: &str) -> anyhow::Result<boss_work_db::PrBaseVerdict> {
+        Ok(boss_work_db::PrBaseVerdict::Refused(
+            "PR targets `feature/parent`, but managed work must land in `main`".to_owned(),
+        ))
+    }
+}
+
+/// A worker `pr_url` patch against a PR on a non-default base is refused with
+/// the plain reason (not a Debug-printed `Result`), and the binding is not stored.
+#[tokio::test]
+async fn worker_pr_url_patch_refuses_non_default_base_with_a_readable_message() {
+    let (state, _dir) = test_server_state_with_pr_state_checker(Arc::new(ParentBranchChecker));
+    state.worker_registry.register(self_pid(), "worker");
+    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
+    let chore = boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, product.id, "Bind");
+    let sink = make_session_sink();
+    let dispatch = Dispatch::builder()
+        .server_state(state.clone())
+        .work_db(state.work_db.clone())
+        .sink(sink.clone())
+        .session_id("session-worker-pr")
+        .request_id("req-worker-pr")
+        .peer_pid(self_pid())
+        .recv_instant(std::time::Instant::now())
+        .decode_ms(0.0)
+        .build();
+    let patch = boss_protocol::WorkItemPatch {
+        pr_url: Some("https://github.com/example/repo/pull/9".into()),
+        ..Default::default()
+    };
+    crate::app::work_items::apply_work_item_patch(dispatch, chore.id.clone(), patch, None).await;
+    sink.close();
+    let FrontendEvent::WorkError { message } = sink.next().await.expect("the handler must answer").payload else {
+        panic!("expected WorkError")
+    };
+    assert!(
+        message.starts_with("PR binding refused: PR targets `feature/parent`"),
+        "{message}"
+    );
+    assert!(!message.contains("Ok(") && !message.contains("Err("), "{message}");
+    let WorkItem::Chore(task) = state.work_db.get_work_item(&chore.id).unwrap() else {
+        panic!("chore")
+    };
+    assert!(task.pr_url.is_none());
+    state.worker_registry.unregister(self_pid());
+}

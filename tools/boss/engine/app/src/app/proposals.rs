@@ -591,15 +591,55 @@ pub(super) async fn submit_for_caller(
         }
     }
 
-    // Serialise the whole wait submission per execution (replay lookup,
+    // Serialise wait and PR-created submissions per execution (replay lookup,
     // budget check, DB acceptance, grant commit) so concurrent declarations
     // cannot both pass the budget check and leave an accepted row with no
     // grant. Held until the end of the handler's wait handling.
-    let wait_lock = (kind == ProposalKind::Wait).then(|| server_state.wait_registry.submit_lock(&caller.execution_id));
+    let wait_lock = matches!(kind, ProposalKind::Wait | ProposalKind::PrCreated)
+        .then(|| server_state.wait_registry.submit_lock(&caller.execution_id));
     let _wait_guard = match &wait_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
+
+    if kind == ProposalKind::PrCreated {
+        match work_db.find_worker_proposal_by_idempotency_key(&caller.execution_id, idempotency_key) {
+            Ok(Some(proposal)) if proposal.kind == kind => return Ok(Submission::Replayed(proposal)),
+            Ok(Some(existing)) => {
+                return Err(ProposalSubmissionError::idempotency_key_kind_mismatch(
+                    idempotency_key,
+                    &existing,
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(ProposalSubmissionError::new(
+                    ProposalErrorCode::Internal,
+                    err.to_string(),
+                ));
+            }
+        }
+        let payload: boss_protocol::PrCreatedProposalPayload = serde_json::from_str(canonical_json)
+            .map_err(|err| ProposalSubmissionError::new(ProposalErrorCode::Internal, err.to_string()))?;
+        let verdict = boss_work_db::bounded_base_verdict(
+            Arc::clone(&server_state.pr_state_checker),
+            &payload.pr_url,
+            boss_work_db::PR_BASE_CHECK_BUDGET,
+        )
+        .await
+        .map_err(|err| {
+            ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                "pr_url",
+                format!("PR base could not be verified; try again shortly: {err}"),
+            )])
+        })?;
+        if let boss_work_db::PrBaseVerdict::Refused(reason) = verdict {
+            return Err(ProposalSubmissionError::validation(vec![ProposalFieldError::new(
+                "pr_url",
+                format!("PR binding refused: {reason}"),
+            )]));
+        }
+    }
 
     // Validate the wait read-only first so a duration/cap refusal never
     // leaves an `applied` audit row. The grant itself is committed only after

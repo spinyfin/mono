@@ -1063,3 +1063,70 @@ async fn link_question_for_an_unbound_pr_is_rejected() {
     assert!(reason.contains("no open task owns the pull request"), "{reason}");
     assert!(question_task(&state, &task_id).operator_question.is_none());
 }
+
+#[tokio::test]
+async fn worker_pr_created_refuses_non_default_base_without_binding() {
+    struct ParentBranch;
+    impl boss_work_db::PrStateChecker for ParentBranch {
+        fn check(&self, _: &str) -> anyhow::Result<boss_work_db::PrOpenState> {
+            Ok(boss_work_db::PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<boss_work_db::PrBaseVerdict> {
+            Ok(boss_work_db::PrBaseVerdict::Refused(
+                boss_github::require_default_branch(Some("feature/parent"), Some("main")).unwrap_err(),
+            ))
+        }
+    }
+    let fx = WorkerFixture::with_state(test_server_state_with_pr_state_checker(Arc::new(ParentBranch)));
+    let response = submit(
+        &fx,
+        ProposalKind::PrCreated,
+        json!({"pr_url":"https://github.com/o/r/pull/1"}),
+    )
+    .await;
+    let FrontendEvent::ProposalRejected { error } = response else {
+        panic!("{response:?}")
+    };
+    assert!(format!("{error:?}").contains("feature/parent"));
+    let item = fx.server_state.work_db.get_work_item(&fx.work_item_id).unwrap();
+    let boss_work_db::WorkItem::Chore(task) = item else {
+        panic!("expected chore")
+    };
+    assert!(task.pr_url.is_none());
+}
+
+#[tokio::test]
+async fn accepted_pr_created_replay_survives_base_lookup_outage() {
+    struct Once(std::sync::atomic::AtomicUsize);
+    impl boss_work_db::PrStateChecker for Once {
+        fn check(&self, _: &str) -> anyhow::Result<boss_work_db::PrOpenState> {
+            Ok(boss_work_db::PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<boss_work_db::PrBaseVerdict> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                anyhow::bail!("GitHub unavailable");
+            }
+            Ok(boss_work_db::PrBaseVerdict::DefaultBranch)
+        }
+    }
+    let checker = Arc::new(Once(std::sync::atomic::AtomicUsize::new(0)));
+    let fx = WorkerFixture::with_state(test_server_state_with_pr_state_checker(checker.clone()));
+    for _ in 0..2 {
+        let response = call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::PrCreated,
+                json!({"pr_url": "https://github.com/o/r/pull/42"}),
+                "published",
+            ),
+        )
+        .await;
+        assert!(
+            matches!(response, FrontendEvent::ProposalSubmitted { .. }),
+            "{response:?}"
+        );
+    }
+    assert_eq!(checker.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

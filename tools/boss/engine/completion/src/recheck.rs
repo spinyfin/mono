@@ -444,6 +444,46 @@ impl WorkerCompletionHandler {
             PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
             PrStatus::Fresh { url } | PrStatus::Merged { url } => url,
         };
+        use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+        match crate::work::bounded_base_verdict(
+            Arc::clone(&self.pr_state_checker),
+            &pr_url,
+            crate::work::PR_BASE_CHECK_BUDGET,
+        )
+        .await
+        {
+            Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
+                if let Err(err) = self
+                    .work_db
+                    .resolve_external_tracker_attention(&candidate.work_item_id, PR_BASE_REFUSED)
+                {
+                    tracing::warn!(?err, "late PR recovery: could not clear base refusal");
+                }
+            }
+            Ok(crate::work::PrBaseVerdict::NotChecked) => {}
+            Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+                match self.work_db.upsert_work_item_attention(
+                    &candidate.work_item_id,
+                    PR_BASE_REFUSED,
+                    "PR must target the default branch",
+                    &format!("{pr_url}: {reason}"),
+                ) {
+                    Ok(_) => {
+                        if let Ok(item) = self.work_db.get_work_item(&candidate.work_item_id) {
+                            self.publisher
+                                .publish_work_item_changed(item.product_id(), &candidate.work_item_id, PR_BASE_REFUSED)
+                                .await;
+                        }
+                    }
+                    Err(err) => tracing::warn!(?err, "late PR recovery: could not record base refusal"),
+                }
+                return StopOutcome::DetectorFailed;
+            }
+            Err(err) => {
+                tracing::warn!(?err, pr_url, "late PR recovery: base check unavailable");
+                return StopOutcome::DetectorFailed;
+            }
+        }
         match self
             .work_db
             .bind_pr_to_active_task_from_terminal_execution(&candidate.work_item_id, &pr_url)

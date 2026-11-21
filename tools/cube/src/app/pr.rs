@@ -260,6 +260,20 @@ fn gh_create_pr(
     runner: &dyn CommandRunner,
     body: &ResolvedPrBody,
 ) -> Result<String> {
+    let default_branch = runner
+        .run(&RealCommandRunner::invocation(
+            &ctx.cwd,
+            "gh",
+            &["api", &format!("repos/{}", ctx.owner_repo), "--jq", ".default_branch"],
+        ))
+        .map_err(|e| CubeError::InvalidArgument(format!("cannot resolve repository default branch: {e}")))?;
+    let default_branch = default_branch.trim();
+    if default_branch.is_empty() {
+        return Err(CubeError::InvalidArgument(format!(
+            "GitHub returned an empty default branch for {}; cannot choose the PR base",
+            ctx.owner_repo
+        )));
+    }
     let mut create_args: Vec<&str> = vec![
         "pr",
         "create",
@@ -268,7 +282,7 @@ fn gh_create_pr(
         "--head",
         &ctx.branch,
         "--base",
-        "main",
+        default_branch,
     ];
     let title_ref;
     if let Some(ref t) = args.title {

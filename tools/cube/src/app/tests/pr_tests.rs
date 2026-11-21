@@ -66,6 +66,12 @@ fn ensure_pr_uses_body_file_flag_not_body_flag() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
+            &["api", "repos/spinyfin/mono", "--jq", ".default_branch"],
+            "main",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
             &[
                 "pr",
                 "create",
@@ -148,6 +154,12 @@ fn ensure_pr_created_json_has_action_url_number() {
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
             "[]",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono", "--jq", ".default_branch"],
+            "main",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -255,6 +267,73 @@ fn ensure_pr_exists_json_has_action_url_number() {
     );
 }
 
+/// Cube supports stacked changes for humans; the default-branch rule for managed
+/// work is enforced by the engine where it binds PRs, not by `cube pr`.
+#[test]
+fn ensure_pr_for_a_stacked_pr_still_succeeds() {
+    let cwd = std::env::current_dir().expect("cwd");
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &[
+                "git",
+                "push",
+                "-b",
+                "my-feature",
+                "--remote",
+                "origin",
+                "--allow-new",
+                "--ignore-working-copy",
+            ],
+            "",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+            "abc123\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
+            "abc123\n",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
+            r#"[{"base":{"ref":"feature/parent","repo":{"default_branch":"main"}},"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+        ),
+    ]);
+
+    let cli = Cli::parse_from([
+        "cube",
+        "pr",
+        "ensure",
+        "--branch",
+        "my-feature",
+        "--title",
+        "Existing PR",
+    ]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
+    let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr exists");
+    runner.assert_exhausted();
+
+    assert_eq!(result.message, "https://github.com/spinyfin/mono/pull/7");
+    assert_eq!(result.payload["action"], "exists");
+    assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/7");
+    assert_eq!(result.payload["number"], 7);
+}
+
 #[test]
 fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
     // Regression for the "false push" trap: a cube workspace has a local
@@ -303,6 +382,12 @@ fn ensure_pr_pushes_to_github_remote_not_local_mirror() {
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
             "[]",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono", "--jq", ".default_branch"],
+            "main",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -454,6 +539,12 @@ fn ensure_pr_creates_no_pr_bookmark_on_create() {
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
             "[]",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
+            &["api", "repos/spinyfin/mono", "--jq", ".default_branch"],
+            "main",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -682,6 +773,12 @@ fn pr_create_opens_pr_when_none_exists() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
+            &["api", "repos/spinyfin/mono", "--jq", ".default_branch"],
+            "trunk",
+        ),
+        ExpectedCommand::ok(
+            cwd.clone(),
+            "gh",
             &[
                 "pr",
                 "create",
@@ -690,7 +787,7 @@ fn pr_create_opens_pr_when_none_exists() {
                 "--head",
                 "my-feature",
                 "--base",
-                "main",
+                "trunk",
                 "--title",
                 "New PR",
             ],
@@ -799,7 +896,7 @@ fn pr_create_existing_pr_with_new_local_commits_recommends_update() {
 }
 
 #[test]
-fn pr_update_pushes_when_pr_exists() {
+fn pr_update_pushes_when_stacked_pr_exists() {
     // `cube pr update` pushes new commits to the existing PR's branch and
     // never calls `gh pr create`.
     let cwd = std::env::current_dir().expect("cwd");
@@ -826,7 +923,7 @@ fn pr_update_pushes_when_pr_exists() {
             cwd.clone(),
             "gh",
             &["api", "repos/spinyfin/mono/pulls?head=spinyfin:my-feature&state=open"],
-            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            r#"[{"html_url":"https://github.com/spinyfin/mono/pull/7","base":{"ref":"feature/parent","repo":{"default_branch":"main"}}}]"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),

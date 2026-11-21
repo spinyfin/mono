@@ -42,6 +42,9 @@ pub struct PrLifecycleProbe {
     /// conflict-resolution attempt row (`base_branch` column); `None`
     /// when GitHub didn't report it.
     pub base_ref_name: Option<String>,
+    /// Refusal from checking the observed base against GitHub's default branch.
+    /// Production probes always check, including when metadata is missing.
+    pub base_branch_error: Option<String>,
     /// Labels currently applied to the PR. Carried so the
     /// conflict-watch / auto-rebase / ci-watch paths can honour the
     /// per-PR opt-out label (`boss/no-auto-rebase`) without a second

@@ -100,7 +100,11 @@ impl MergeProbe for CommandMergeProbe {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (owner, repo, _) = parse_pr_url_parts(pr_url).context("invalid GitHub PR URL")?;
+        let default_branch = cached_default_branch(owner, repo).await?;
+        let mut document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        document["defaultBranch"] = default_branch.into();
+        let stdout = document.to_string();
         // When `statusCheckRollup` is empty the GraphQL field omits
         // required-but-unstarted status contexts ("EXPECTED" in GitHub's
         // web UI). The legacy commit-status REST endpoint returns
@@ -123,6 +127,32 @@ impl MergeProbe for CommandMergeProbe {
     async fn probe_batch(&self, pr_urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
         self.probe_batch_via_graphql(pr_urls).await
     }
+}
+
+/// How long a repository's default branch is reused by the single-PR probe.
+/// The default branch almost never changes, so one REST call per repository
+/// per window replaces one per probe.
+const DEFAULT_BRANCH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+type DefaultBranchCache = std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>;
+
+/// The repository's default branch, cached per `owner/repo`. A failed lookup
+/// is never cached, so the probe retries on its next pass.
+async fn cached_default_branch(owner: &str, repo: &str) -> Result<String> {
+    static CACHE: std::sync::OnceLock<DefaultBranchCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = format!("{owner}/{repo}");
+    if let Ok(guard) = cache.lock()
+        && let Some((branch, fetched)) = guard.get(&key)
+        && fetched.elapsed() < DEFAULT_BRANCH_CACHE_TTL
+    {
+        return Ok(branch.clone());
+    }
+    let branch = boss_github::trees::fetch_default_branch(owner, repo).await?;
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, (branch.clone(), std::time::Instant::now()));
+    }
+    Ok(branch)
 }
 
 /// Shared GraphQL selection set for one PR's lifecycle fields, reused for
@@ -168,6 +198,7 @@ impl MergeProbe for CommandMergeProbe {
 /// roughly a 6x GraphQL-cost reduction with no behavioural loss for any
 /// realistically-shaped PR.
 pub(crate) const PR_PROBE_FIELDS: &str = concat!(
+    "repository { defaultBranchRef { name } } ",
     "state mergedAt closedAt mergeable mergeStateStatus baseRefOid headRefOid headRefName baseRefName ",
     "labels(first: 10) { nodes { name } } ",
     "reviewDecision reviews(last: 10) { nodes { author { login } state } } ",
@@ -691,6 +722,7 @@ pub(crate) fn flatten_batched_pr_node(node: &serde_json::Value) -> serde_json::V
         "headRefOid": node["headRefOid"],
         "headRefName": node["headRefName"],
         "baseRefName": node["baseRefName"],
+        "defaultBranch": node["repository"]["defaultBranchRef"]["name"],
         "labels": labels,
         "statusCheckRollup": rollup,
         "ciHeadOid": node["commits"]["nodes"][0]["commit"]["oid"],
@@ -1047,6 +1079,11 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
         base_ref_oid,
         head_ref_oid,
         head_ref_name,
+        base_branch_error: boss_github::require_default_branch(
+            base_ref_name.as_deref(),
+            root["defaultBranch"].as_str(),
+        )
+        .err(),
         base_ref_name,
         labels,
         review,

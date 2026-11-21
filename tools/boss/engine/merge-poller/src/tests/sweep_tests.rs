@@ -1550,3 +1550,150 @@ fn review_detail_json_serializes_logins() {
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
     assert_eq!(parsed, serde_json::json!(["alice", "bob"]));
 }
+
+#[tokio::test]
+async fn merge_into_parent_branch_preserves_dependency_hold() {
+    for (base, default) in [("feature/parent", "main"), ("main", "trunk"), ("", "main")] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/42";
+        let (product, parent) = make_chore_in_review(&db, "prerequisite", pr);
+        let dependent = db
+            .create_chore(
+                boss_protocol::CreateChoreInput::builder()
+                    .product_id(product)
+                    .name("dependent")
+                    .depends_on(vec![parent.clone()])
+                    .build(),
+            )
+            .unwrap();
+        assert_eq!(dependent.status, TaskStatus::Blocked);
+        let observed = crate::probe::parse_probe_json(
+            pr,
+            &serde_json::json!({
+                "state":"MERGED", "mergedAt":"2026-11-17T00:30:00Z",
+                "baseRefName":base, "defaultBranch":default,
+            })
+            .to_string(),
+            None,
+        )
+        .unwrap();
+        assert!(observed.base_branch_error.is_some());
+        let probe = StubProbe::new();
+        probe.states.lock().unwrap().insert(pr.into(), Ok(observed));
+        let publisher = RecordingPublisher::default();
+        for _ in 0..2 {
+            let result = run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await;
+            assert_eq!(result.merged, 0);
+        }
+        let events = publisher.events.lock().await;
+        let refusals = events
+            .iter()
+            .filter(|(_, _, reason)| reason == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+            .count();
+        assert_eq!(refusals, 1, "unchanged refusal publishes once");
+        drop(events);
+        assert!(db.get_merge_evidence(&parent).unwrap().is_none());
+        let WorkItem::Chore(task) = db.get_work_item(&parent).unwrap() else {
+            panic!("expected chore")
+        };
+        assert_eq!(task.status, TaskStatus::InReview);
+        assert!(!db.try_unblock_dependency_if_resolved(&dependent.id).unwrap());
+        let WorkItem::Chore(task) = db.get_work_item(&dependent.id).unwrap() else {
+            panic!("expected dependent")
+        };
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
+        assert_eq!(db.gating_prereqs_for(&dependent.id).unwrap(), vec![parent.clone()]);
+        let attentions = db.list_attention_items_for_work_item(&parent).unwrap();
+        let refusals: Vec<_> = attentions
+            .iter()
+            .filter(|a| a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+            .collect();
+        assert_eq!(refusals.len(), 1, "repeated polling deduplicates the attention");
+        assert!(refusals[0].body_markdown.contains(base));
+
+        // A separate observation proving delivery to the actual default can release the hold.
+        let landed = crate::probe::parse_probe_json(
+            pr,
+            &serde_json::json!({
+                "state":"MERGED", "baseRefName":default, "defaultBranch":default,
+            })
+            .to_string(),
+            None,
+        )
+        .unwrap();
+        probe.states.lock().unwrap().insert(pr.into(), Ok(landed));
+        assert_eq!(
+            run_one_pass(&db, probe.as_ref(), &publisher, None, None, None)
+                .await
+                .merged,
+            1
+        );
+        assert!(db.gating_prereqs_for(&dependent.id).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn batched_probe_preserves_default_branch_validation() {
+    assert!(crate::probe::PR_PROBE_FIELDS.contains("repository { defaultBranchRef { name } }"));
+    for base in ["trunk", "feature/parent"] {
+        let flat = crate::probe::flatten_batched_pr_node(&serde_json::json!({
+            "state":"MERGED", "baseRefName":base,
+            "repository":{"defaultBranchRef":{"name":"trunk"}},
+        }));
+        let probe =
+            crate::probe::parse_probe_json("https://github.com/foo/bar/pull/42", &flat.to_string(), None).unwrap();
+        assert_eq!(probe.base_branch_error.is_none(), base == "trunk");
+    }
+}
+
+#[tokio::test]
+async fn successful_probe_preserves_base_refusal_about_another_pr() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/42";
+    let (_, chore) = make_chore_in_review(&db, "binding repair", pr);
+    let kind = boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+    db.upsert_work_item_attention(
+        &chore,
+        kind,
+        "Wrong base",
+        "https://github.com/foo/bar/pull/99: refused feature/parent",
+    )
+    .unwrap();
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+    run_one_pass(&db, probe.as_ref(), &RecordingPublisher::default(), None, None, None).await;
+    assert!(
+        db.list_attention_items_for_work_item(&chore)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == kind && item.status == "open")
+    );
+}
+
+#[tokio::test]
+async fn refused_open_base_still_refreshes_poll_state() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/42";
+    let (_, chore) = make_chore_in_review(&db, "unsupported base", pr);
+    let observed = crate::probe::parse_probe_json(
+        pr,
+        &serde_json::json!({
+            "state": "OPEN", "baseRefName": "feature/parent", "defaultBranch": "main",
+        })
+        .to_string(),
+        None,
+    )
+    .unwrap();
+    let probe = StubProbe::new();
+    probe.states.lock().unwrap().insert(pr.into(), Ok(observed));
+    let publisher = RecordingPublisher::default();
+    run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await;
+    let WorkItem::Chore(task) = db.get_work_item(&chore).unwrap() else {
+        panic!("expected chore")
+    };
+    assert!(task.ci_required_state.is_some());
+}
