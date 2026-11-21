@@ -16,6 +16,9 @@ pub mod pool_policy;
 pub mod postmortem_brief;
 pub mod progression;
 
+/// Debounce for automatic reactions to an unchanged engine condition.
+pub const AUTOMATION_DEBOUNCE_SECS: u64 = 60;
+
 mod semantic_progress;
 pub use semantic_progress::{
     SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition, tool_condition_signal,

@@ -113,7 +113,7 @@ fn raw_sql_writes_are_recorded_and_unchanged_values_do_not_reset_age() {
         )
         .unwrap();
     assert_eq!(
-        initial, 5,
+        initial, 7,
         "insert records each tracked property, including NULL reasons"
     );
     conn.execute(
@@ -146,7 +146,7 @@ fn raw_sql_writes_are_recorded_and_unchanged_values_do_not_reset_age() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 6);
+    assert_eq!(count, 8);
 }
 
 #[test]
@@ -385,6 +385,8 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
             "dispatch_failed_reason",
             "autostart",
             "deferred",
+            "pr_mergeable_state",
+            "ci_required_state",
         ] {
             conn.execute_batch(&format!(
                 "DROP TRIGGER task_status_audit_insert_{property}; DROP TRIGGER task_status_audit_update_{property};"
@@ -422,11 +424,12 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
             .unwrap();
         } else {
             conn.execute(
-                "DELETE FROM schema_migrations WHERE id IN (?1, ?2, ?3)",
+                "DELETE FROM schema_migrations WHERE id IN (?1, ?2, ?3, ?4)",
                 [
                     task_status_audit::MIGRATION_ID,
                     task_status_audit::DEFERRED_MIGRATION_ID,
                     task_status_audit::EXECUTION_ABANDON_MIGRATION_ID,
+                    "20261121_1651_task_pr_observation_audit",
                 ],
             )
             .unwrap();
@@ -444,7 +447,7 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(count, 5, "one baseline row per tracked property");
+            assert_eq!(count, 7, "one baseline row per tracked property");
             let known: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM task_status_audit WHERE work_item_id = ?1 AND property = 'dispatch_failed_reason'
                  AND new_value = 'deliberate_park' AND basis = 'deliberate_park' AND changed_at = '12345' AND age_is_lower_bound = 0",
@@ -459,7 +462,7 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(unknown, 4);
+            assert_eq!(unknown, 6);
         }
     }
 }
@@ -912,8 +915,10 @@ fn production_creates_record_insert_trigger_rows_with_creator_basis() {
     let expected_properties = [
         "autostart",
         "blocked_reason",
+        "ci_required_state",
         "deferred",
         "dispatch_failed_reason",
+        "pr_mergeable_state",
         "status",
     ];
     for (id, basis) in [
@@ -1530,6 +1535,8 @@ fn upgrading_keeps_old_ledger_rows_unattributed_and_records_new_abandonments() {
         "dispatch_failed_reason",
         "autostart",
         "deferred",
+        "pr_mergeable_state",
+        "ci_required_state",
     ] {
         conn.execute_batch(&format!(
             "DROP TRIGGER task_status_audit_insert_{property}; DROP TRIGGER task_status_audit_update_{property};"
@@ -1538,6 +1545,7 @@ fn upgrading_keeps_old_ledger_rows_unattributed_and_records_new_abandonments() {
     }
     conn.execute_batch(
         "DROP TRIGGER task_status_audit_abandon_execution;
+         DELETE FROM task_status_audit WHERE property IN ('pr_mergeable_state', 'ci_required_state');
          DROP INDEX task_status_audit_operation_id;
          DROP TABLE task_status_audit_operation;
          ALTER TABLE task_status_audit DROP COLUMN operation_id;
@@ -1564,8 +1572,11 @@ fn upgrading_keeps_old_ledger_rows_unattributed_and_records_new_abandonments() {
     conn.execute("UPDATE tasks SET autostart = 1 WHERE id = ?1", [&chore.id])
         .unwrap();
     conn.execute(
-        "DELETE FROM schema_migrations WHERE id = ?1",
-        [task_status_audit::EXECUTION_ABANDON_MIGRATION_ID],
+        "DELETE FROM schema_migrations WHERE id IN (?1, ?2)",
+        [
+            task_status_audit::EXECUTION_ABANDON_MIGRATION_ID,
+            "20261121_1651_task_pr_observation_audit",
+        ],
     )
     .unwrap();
     drop(conn);

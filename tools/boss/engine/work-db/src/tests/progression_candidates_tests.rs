@@ -625,6 +625,114 @@ mod dependency_tests;
 
 // ── Clause 5: stuck long enough, and the grace waiver ─────────────────────
 
+/// Apply a real task transition and timestamp just the ledger rows it emits.
+fn transition_at(f: &Fixture, id: &str, assignments: &str, at: i64) {
+    let conn = f.db.connect().unwrap();
+    let last: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM task_status_audit", [], |r| r.get(0))
+        .unwrap();
+    conn.execute_batch(&format!("UPDATE tasks SET {assignments} WHERE id = '{id}'"))
+        .unwrap();
+    conn.execute(
+        "UPDATE task_status_audit SET changed_at = ?1 WHERE work_item_id = ?2 AND id > ?3",
+        params![at, id, last],
+    )
+    .unwrap();
+}
+
+#[test]
+fn conflicting_review_pr_ages_from_the_conflict_observation() {
+    let f = fixture();
+    let id = f.chore("Review conflict");
+    f.stick(&id, "status = 'in_review', autostart = 1", 5);
+    transition_at(&f, &id, "pr_mergeable_state = 'CONFLICTING'", now() - HOUR);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
+    f.assert_candidate(&id, false);
+    f.age(&id, 2 * HOUR);
+    let began = f.clauses(&id).stuck_since;
+    assert!((now() - began - 3 * HOUR).abs() < 5);
+    f.assert_candidate(&id, true);
+    // Flag changes and abandoned executions must not restart the episode.
+    f.sql(&format!("UPDATE tasks SET autostart = 0 WHERE id = '{id}'"));
+    f.execution(&id, ExecutionKind::ChoreImplementation, ExecutionStatus::Abandoned);
+    assert_eq!(f.clauses(&id).stuck_since, began);
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn repeated_merge_conflict_block_blips_preserve_the_review_episode() {
+    let f = fixture();
+    let id = f.chore("Flickering conflict block");
+    f.stick(&id, "status = 'in_review', pr_mergeable_state = 'CONFLICTING'", 3);
+    let began = f.clauses(&id).stuck_since;
+    for index in 0..9 {
+        let at = now() - 1800 + index * 120;
+        transition_at(&f, &id, "status = 'blocked', blocked_reason = 'merge_conflict'", at);
+        assert_eq!(f.clauses(&id).stuck_since, began);
+        transition_at(&f, &id, "status = 'in_review', blocked_reason = NULL", at + 10);
+        assert_eq!(f.clauses(&id).stuck_since, began);
+        f.assert_candidate(&id, true);
+    }
+}
+
+#[test]
+fn only_a_sustained_recovery_resets_the_current_conflict_episode() {
+    let debounce = boss_engine_storage_values::AUTOMATION_DEBOUNCE_SECS as i64;
+    for gap in [10, debounce - 1, debounce, debounce + 1] {
+        let f = fixture();
+        let id = f.chore("Conflict recovery");
+        f.stick(&id, "status = 'in_review', pr_mergeable_state = 'CONFLICTING'", 3);
+        let began = f.clauses(&id).stuck_since;
+        let recovered = now() - 300;
+        transition_at(&f, &id, "pr_mergeable_state = 'MERGEABLE'", recovered);
+        f.assert_candidate(&id, false);
+        let returned = recovered + gap;
+        transition_at(&f, &id, "pr_mergeable_state = 'CONFLICTING'", returned);
+        let short = gap < debounce;
+        assert_eq!(f.clauses(&id).stuck_since, if short { began } else { returned });
+        f.assert_candidate(&id, short);
+    }
+}
+
+#[test]
+fn transient_other_blockers_do_not_restart_a_conflict_clock() {
+    let f = fixture();
+    let id = f.stuck_chore("Conflict interrupted by another blocker");
+    let began = f.clauses(&id).stuck_since;
+    transition_at(&f, &id, "blocked_reason = 'ci_failure'", now() - 300);
+    transition_at(&f, &id, "blocked_reason = 'merge_conflict'", now() - 290);
+    assert_eq!(f.clauses(&id).stuck_since, began);
+    f.assert_candidate(&id, true);
+    transition_at(&f, &id, "blocked_reason = 'ci_failure'", now() - 200);
+    let returned = now() - 100;
+    transition_at(&f, &id, "blocked_reason = 'merge_conflict'", returned);
+    assert_eq!(f.clauses(&id).stuck_since, returned);
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn a_continuous_absence_ends_the_episode_even_if_the_other_kind_changes() {
+    let f = fixture();
+    let id = f.stuck_chore("Several intervening blockers");
+    transition_at(&f, &id, "blocked_reason = 'ci_failure'", now() - 300);
+    transition_at(&f, &id, "blocked_reason = 'worker_failed'", now() - 260);
+    let returned = now() - 220;
+    transition_at(&f, &id, "blocked_reason = 'merge_conflict'", returned);
+    assert_eq!(f.clauses(&id).stuck_since, returned);
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn review_ci_failure_clock_ignores_unrelated_ledger_rows() {
+    let f = fixture();
+    let id = f.chore("CI failure");
+    f.stick(&id, "status = 'in_review', ci_required_state = 'fail'", 3);
+    let began = f.clauses(&id).stuck_since;
+    f.sql(&format!("UPDATE tasks SET autostart = 1 WHERE id = '{id}'"));
+    assert_eq!(f.clauses(&id).stuck_since, began);
+    f.assert_candidate(&id, true);
+}
+
 #[test]
 fn clause_5_an_item_must_be_stuck_for_the_grace_unless_it_is_waived() {
     let f = fixture();

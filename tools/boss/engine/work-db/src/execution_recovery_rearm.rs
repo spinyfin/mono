@@ -678,6 +678,8 @@ mod tests {
             "dispatch_failed_reason",
             "autostart",
             "deferred",
+            "pr_mergeable_state",
+            "ci_required_state",
         ] {
             conn.execute_batch(&format!(
                 "DROP TRIGGER IF EXISTS task_status_audit_insert_{property};

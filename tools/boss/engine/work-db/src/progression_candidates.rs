@@ -62,9 +62,9 @@
 //!    `dependency_held`.
 //! 5. **Stuck long enough.** In one of the stuck states the enumeration marks as
 //!    progression-eligible ([`stuck_kind_sql`]) continuously for at least
-//!    `progression.stuck_after`, measured from the task status ledger exactly as
-//!    the stuck report ages it; or the grace was waived since the item entered
-//!    that state (`tasks.progression_grace_waived_at`).
+//!    `progression.stuck_after`, measured from relevant task status transitions,
+//!    ignoring excursions shorter than the engine automation debounce; or the
+//!    grace was waived since the item entered that state (`tasks.progression_grace_waived_at`).
 //! 6. **Cooldown and budget.** No progression run within the fallback
 //!    `progression.cooldown` (6 hours by default; four times that, capped at 24
 //!    hours, after a `no_changes_needed` run) unless that run has an event that
@@ -302,6 +302,7 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
            WHEN {trunk_queue} THEN NULL
            WHEN {a}.pr_url IS NULL AND {abandoned} THEN 'S22_abandoned_branch'
            WHEN {recovery} THEN 'S14_worker_recovery'
+           WHEN {a}.status = 'in_review' AND {a}.pr_mergeable_state = 'CONFLICTING' THEN 'S5_merge_conflict'
            WHEN {a}.status = 'in_review' AND {a}.ci_required_state = 'fail' THEN 'S6_ci_failure'
            WHEN {a}.status = 'in_review' AND {review_churn} THEN 'S16_review_churn'
            ELSE NULL
@@ -309,24 +310,66 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
     )
 }
 
-/// When the item's current stuck state began, read from the task status ledger
-/// the way the stuck report ages it: a failure from its own latest observation
-/// (an unrelated edit must not make a week-old blocker look new), anything else
-/// from the latest ledger event, and `updated_at` for a row the ledger has never
-/// seen.
+/// Reconstruct the current stuck episode from only the fields that determine
+/// its kind. Brief excursions outside that kind do not end an episode until
+/// they last as long as the engine's automation debounce. Ledger id breaks
+/// ties between changes made in the same second (including one UPDATE).
 fn stuck_since_sql(a: &str) -> String {
-    let age_property = format!(
-        "CASE WHEN {a}.dispatch_failed_reason IS NOT NULL THEN 'dispatch_failed_reason'
-              WHEN {a}.blocked_reason IS NOT NULL THEN 'blocked_reason' END"
-    );
+    let properties = [
+        "status",
+        "blocked_reason",
+        "dispatch_failed_reason",
+        "pr_mergeable_state",
+        "ci_required_state",
+    ];
+    let snapshots = properties
+        .iter()
+        .map(|property| {
+            format!(
+                "CASE WHEN EXISTS (SELECT 1 FROM task_status_audit h
+                          WHERE h.work_item_id = {a}.id AND h.property = '{property}' AND h.id <= event.id)
+              THEN (SELECT h.new_value FROM task_status_audit h
+                    WHERE h.work_item_id = {a}.id AND h.property = '{property}' AND h.id <= event.id
+                    ORDER BY h.id DESC LIMIT 1)
+              ELSE (SELECT h.old_value FROM task_status_audit h
+                    WHERE h.work_item_id = {a}.id AND h.property = '{property}' ORDER BY h.id LIMIT 1)
+         END AS {property}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let properties = properties
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let historical_kind = stuck_kind_sql("snapshot", "root");
+    let current_kind = stuck_kind_sql(a, "root");
+    let debounce = boss_engine_storage_values::AUTOMATION_DEBOUNCE_SECS;
     format!(
-        "COALESCE(
-           (SELECT CAST(la.changed_at AS INTEGER) FROM task_status_audit la
-            WHERE la.work_item_id = {a}.id
-              AND (la.property = ({age_property}) OR (({age_property}) IS NULL AND la.property <> 'deferred'))
-            ORDER BY la.id DESC LIMIT 1),
-           NULLIF(CAST({a}.updated_at AS INTEGER), 0),
-           {NOW})"
+        "COALESCE((WITH history AS MATERIALIZED (
+             SELECT id, property, old_value, new_value, CAST(changed_at AS INTEGER) AS changed_at
+             FROM task_status_audit WHERE work_item_id = {a}.id AND property IN ({properties})
+         ), snapshot AS (
+             SELECT event.id AS event_id, event.changed_at, {snapshots},
+                    {a}.id, {a}.kind, {a}.pr_url, {a}.deferred, {a}.autostart
+             FROM history event
+         ), kinds AS (
+             SELECT event_id, changed_at, ({historical_kind}) IS ({current_kind}) AS is_current FROM snapshot
+         ), changes AS (
+             SELECT *, is_current IS NOT LAG(is_current) OVER (ORDER BY event_id) AS changed FROM kinds
+         ), grouped AS (
+             SELECT *, SUM(changed) OVER (ORDER BY event_id) AS episode FROM changes
+         ), episodes AS (
+             SELECT episode, is_current, MIN(changed_at) AS began FROM grouped GROUP BY episode
+         ), durations AS (
+             SELECT *, LEAD(began, 1, {NOW}) OVER (ORDER BY episode) AS ended FROM episodes
+         )
+         SELECT MIN(began) FROM durations
+         WHERE is_current AND episode > COALESCE(
+             (SELECT MAX(episode) FROM durations
+              WHERE NOT is_current AND ended - began >= {debounce}), -1)),
+         NULLIF(CAST({a}.updated_at AS INTEGER), 0), {NOW})"
     )
 }
 

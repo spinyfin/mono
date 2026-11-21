@@ -372,6 +372,21 @@ pub(super) fn migrate_deferred(conn: &Connection) -> Result<()> {
     install_property_triggers(conn, "deferred")
 }
 
+/// Record PR observations so progression can age the condition itself rather
+/// than the last unrelated task edit. Existing observations have unknown age.
+pub(super) fn migrate_pr_observations(conn: &Connection) -> Result<()> {
+    for property in ["pr_mergeable_state", "ci_required_state"] {
+        conn.execute_batch(&format!(
+            "INSERT INTO task_status_audit
+                (work_item_id, property, new_value, actor, changed_at, basis, age_is_lower_bound)
+             SELECT id, '{property}', {property}, 'engine', strftime('%s','now'), 'unknown_legacy', 1
+             FROM tasks;"
+        ))?;
+        install_property_triggers(conn, property)?;
+    }
+    Ok(())
+}
+
 /// Columns this module adds to the ledger for enriched history.
 const ENRICHED_COLUMNS: [(&str, &str); 8] = [
     ("operation_id", "TEXT"),

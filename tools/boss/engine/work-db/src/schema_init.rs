@@ -1074,6 +1074,10 @@ mod floor_tests {
                 Box::new(|c| task_status_audit::migrate_execution_abandon(c).unwrap()),
             ),
             (
+                "20261121_1651_task_pr_observation_audit",
+                Box::new(|c| task_status_audit::migrate_pr_observations(c).unwrap()),
+            ),
+            (
                 super::super::merge_conflict_merging::CONFIRMED_REVISIONS_MIGRATION_ID,
                 Box::new(|c| super::super::merge_conflict_merging::migrate_confirmed_revisions(c).unwrap()),
             ),
