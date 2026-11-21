@@ -18,15 +18,25 @@ fn dead_pid() -> i64 {
     4_194_303
 }
 
-/// Seed a chore with a worker in the post-spawn shape, then terminalize its
-/// execution the way a mis-fired reap does — leaving the process alive.
+/// Seed a chore with a worker in the post-spawn shape, still running.
 /// Returns `(work_item_id, execution_id)`.
-fn stranded_live_worker(server_state: &ServerState, shell_pid: i64, reason: &str) -> (String, String) {
+fn live_worker(server_state: &ServerState, shell_pid: i64) -> (String, String) {
     let db = server_state.work_db.as_ref();
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "test chore");
     let execution_id = create_spawned_execution(db, &work_item_id, shell_pid);
-    db.mark_execution_orphaned(&execution_id, reason).unwrap();
+    (work_item_id, execution_id)
+}
+
+/// Seed a chore with a worker in the post-spawn shape, then terminalize its
+/// execution the way a mis-fired reap does — leaving the process alive.
+/// Returns `(work_item_id, execution_id)`.
+fn stranded_live_worker(server_state: &ServerState, shell_pid: i64, reason: &str) -> (String, String) {
+    let (work_item_id, execution_id) = live_worker(server_state, shell_pid);
+    server_state
+        .work_db
+        .mark_execution_orphaned(&execution_id, reason)
+        .unwrap();
     (work_item_id, execution_id)
 }
 
@@ -127,7 +137,9 @@ async fn a_hook_for_an_orphaned_execution_readopts_it() {
 async fn a_hook_for_an_orphaned_execution_with_a_dead_pane_does_not_readopt() {
     let (server_state, _dir) = test_server_state();
     let db = server_state.work_db.as_ref();
-    let (work_item_id, execution_id) = stranded_live_worker(&server_state, dead_pid(), "test: inferred death");
+    // The spawn-intent write refuses terminal executions, so the tmux identity
+    // is installed while the execution is still running, then it is orphaned.
+    let (work_item_id, execution_id) = live_worker(&server_state, dead_pid());
     assert!(
         db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-worker-1", "tok-dead")
             .unwrap()
@@ -136,6 +148,8 @@ async fn a_hook_for_an_orphaned_execution_with_a_dead_pane_does_not_readopt() {
         db.record_tmux_session_created_for_execution(&execution_id, "tok-dead", dead_pid())
             .unwrap()
     );
+    db.mark_execution_orphaned(&execution_id, "test: inferred death")
+        .unwrap();
     db.record_tmux_pane_observation(
         &execution_id,
         "tok-dead",

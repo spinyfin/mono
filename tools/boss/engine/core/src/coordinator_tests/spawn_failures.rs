@@ -1182,6 +1182,7 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
         cube.clone(),
         Arc::new(FakeExecutionRunner {
             viewer_abort_failed: true,
+            work_db: Some(db.clone()),
             ..FakeExecutionRunner::default()
         }),
     ));
@@ -1231,13 +1232,9 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
     );
 
     assert!(
-        db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-unreaped", "tok-unreaped")
-            .unwrap(),
-        "failed spawn still has a work_runs row to attach identity to"
-    );
-    assert!(
         db.record_tmux_session_created_for_execution(&execution_id, "tok-unreaped", 4242)
-            .unwrap()
+            .unwrap(),
+        "session confirmation is keyed by spawn token, not execution status"
     );
     {
         let conn = db.connect().unwrap();
