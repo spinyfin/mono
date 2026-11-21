@@ -72,6 +72,7 @@ const PANE_RELEASE_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
 mod agent_launch_guard;
 mod app_session;
+mod approval_prompt;
 pub(crate) mod attachments;
 mod attentions;
 mod automations;
@@ -799,6 +800,9 @@ struct ServerState {
     /// abandoned at their time budget; cleared by the next pass that finishes.
     #[builder(default = boss_engine_merge_poller::detection_stall_signal())]
     merge_detection_stall: Arc<boss_engine_merge_poller::DetectionStallSignal>,
+    /// Deny-by-default runs whose last approval prompt has not closed.
+    #[builder(default)]
+    outstanding_approval_prompts: StdMutex<HashMap<String, approval_prompt::RunApprovalWatch>>,
     /// What the startup pass that retries pre-start-failed review guides
     /// did. Set once, before the engine serves requests; empty until then.
     #[builder(default)]
@@ -2247,6 +2251,7 @@ impl ServerState {
             self.agent_jsonl_progress_manager.stop_run(run_id);
             self.transcript_path_cache.forget(run_id);
             self.run_cost_capture.forget(run_id);
+            self.forget_approval_watch(run_id);
             boss_engine_runtime::stale_worker_sweep::resolve_stale_worker_attention(&self.work_db, run_id);
             self.broadcast_live_worker_states().await;
             return PaneReleaseOutcome::Reaped;
@@ -2377,6 +2382,7 @@ impl ServerState {
         // durable source of truth — but a bounded cache is hygienic.
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
+        self.forget_approval_watch(run_id);
         self.broadcast_live_worker_states().await;
         // A slot was mapped, so a worker had finished spawning: its pane
         // was torn down and (above) its OS process tree signalled. Report
@@ -2432,6 +2438,7 @@ impl ServerState {
         }
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
+        self.forget_approval_watch(run_id);
         PaneReleaseOutcome::Reaped
     }
 

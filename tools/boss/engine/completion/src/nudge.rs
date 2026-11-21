@@ -904,8 +904,29 @@ impl WorkerCompletionHandler {
     }
 
     /// Fail a worker whose pane is owned by an approval or trust dialog.
+    ///
+    /// A `progression` run is failed on its own row and nothing else: the work
+    /// item it is bound to is the stuck item it was inspecting, which a
+    /// failure of the inspector must not block, annotate or raise attention
+    /// on. The failed run still counts toward that item's
+    /// infrastructure-failure cap, like any other progression failure.
     pub async fn fail_blocking_dialog(&self, run_id: &str, detail: &str) -> anyhow::Result<()> {
         let execution = self.work_db.get_execution(run_id)?;
+        if execution.kind == ExecutionKind::Progression {
+            if execution.status.is_terminal() {
+                return Ok(());
+            }
+            // A failed write returns before any teardown, so the caller still
+            // owns the worker and can retry the write before releasing it.
+            let outcome = self
+                .finalize_progression_run(&execution, Some(format!("progression: {detail}")), true)
+                .await;
+            anyhow::ensure!(
+                !matches!(outcome, StopOutcome::DbError) && self.work_db.get_execution(run_id)?.status.is_terminal(),
+                "could not persist blocking-dialog failure for progression run {run_id}"
+            );
+            return Ok(());
+        }
         anyhow::ensure!(
             self.finalize_worker_failure(&execution, detail, WorkerFailureBasis::BlockingDialogOnScreen)
                 .await,

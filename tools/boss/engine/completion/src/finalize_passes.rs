@@ -699,26 +699,37 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         driver_error: Option<&str>,
     ) -> StopOutcome {
-        self.finalize_progression_run(execution, driver_error, false).await
+        self.finalize_progression_run(
+            execution,
+            driver_error.map(|detail| format!("progression: driver error: {detail}")),
+            false,
+        )
+        .await
     }
 
-    /// [`Self::finalize_progression`], also reached at declaration time
-    /// (`declared`). A declaration's finalize reports a database failure as
-    /// [`StopOutcome::DbError`] before tearing anything down, so the pending
-    /// finalize retries with the declaration still stamped; the Stop path keeps
-    /// finalizing the pane whatever the write did.
+    /// [`Self::finalize_progression`], also reached at declaration time and
+    /// when the engine fails the run. `keep_worker_on_write_failure` says what
+    /// a failed terminalizing write does. A declaration's finalize and a
+    /// failure the engine is recording ([`Self::fail_blocking_dialog`]) pass
+    /// `true`: the database failure is reported as [`StopOutcome::DbError`]
+    /// before anything is torn down or published, so the caller retries the
+    /// write while it still owns the worker. The Stop path passes `false` and
+    /// finalizes the pane whatever the write did, because its turn is over.
+    ///
+    /// `failure` is the `error_text` of a run the engine is failing whatever
+    /// it declared: a fatal driver error, or a pane left on an approval
+    /// dialog ([`Self::fail_blocking_dialog`]).
     pub(super) async fn finalize_progression_run(
         &self,
         execution: &crate::work::WorkExecution,
-        driver_error: Option<&str>,
-        declared: bool,
+        failure: Option<String>,
+        keep_worker_on_write_failure: bool,
     ) -> StopOutcome {
         let workspace_path = execution.workspace_path.clone();
         let teardown = self.begin_teardown(&execution.id);
-        let (finished, failed) = match driver_error {
-            Some(detail) => (
-                self.work_db
-                    .fail_progression_execution(&execution.id, &format!("progression: driver error: {detail}")),
+        let (finished, failed) = match failure {
+            Some(error_text) => (
+                self.work_db.fail_progression_execution(&execution.id, &error_text),
                 true,
             ),
             None => match self.work_db.progression_disposition(&execution.id) {
@@ -743,7 +754,7 @@ impl WorkerCompletionHandler {
                     ?err,
                     "failed to finalise progression execution row",
                 );
-                if declared {
+                if keep_worker_on_write_failure {
                     return StopOutcome::DbError;
                 }
             }

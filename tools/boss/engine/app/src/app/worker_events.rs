@@ -241,6 +241,7 @@ pub(super) async fn dispatch_staged_worker_event_fanout(
     );
     on_heap(|| server_state.publish_hook_derived_events(incoming)).await;
     on_heap(|| dispatch_live_worker_state(server_state, incoming)).await;
+    server_state.watch_approval_prompt(incoming);
     // Codex guard-trace observation: record whether this turn's PreToolUse
     // guards ran and what they decided — and, when tool calls ran with no
     // guard invocation at all, that Boss's command guardrails were not

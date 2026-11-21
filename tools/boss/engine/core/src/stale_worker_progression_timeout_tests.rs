@@ -13,8 +13,9 @@ fn description_of(db: &WorkDb, id: &str) -> String {
 
 /// A live progression run started five minutes ago on an active chore, with
 /// the engine's published timeout set to `timeout_secs`.
-async fn progression_fixture(
+async fn progression_slot(
     timeout_secs: Option<i64>,
+    drive_working: bool,
 ) -> (
     tempfile::TempDir,
     Arc<WorkDb>,
@@ -46,10 +47,25 @@ async fn progression_fixture(
     }
     let live_states = Arc::new(LiveWorkerStateRegistry::new());
     register_slot(&live_states, 1, &execution_id, &work_item_id);
-    drive_to_working_idle(&live_states, 1);
+    if drive_working {
+        drive_to_working_idle(&live_states, 1);
+    }
     let coordinator = make_coordinator(db.clone(), 1);
     coordinator.worker_pool().claim_worker(&execution_id, None).await;
     (dir, db, work_item_id, execution_id, live_states, coordinator)
+}
+
+async fn progression_fixture(
+    timeout_secs: Option<i64>,
+) -> (
+    tempfile::TempDir,
+    Arc<WorkDb>,
+    String,
+    String,
+    Arc<LiveWorkerStateRegistry>,
+    Arc<ExecutionCoordinator>,
+) {
+    progression_slot(timeout_secs, true).await
 }
 
 async fn sweep(
@@ -105,6 +121,53 @@ async fn a_progression_run_past_its_timeout_is_reaped_orphaned_and_the_item_is_u
             .all(|item| item.kind != STALE_WORKER_ATTENTION_KIND),
         "no stale-worker attention on the item"
     );
+}
+
+/// After an engine restart an adopted pane starts as `Spawning`. The timeout
+/// still reaps it: Grok never reports `AwaitingInput`, so a restricted run
+/// left on an approval prompt stays Spawning for the whole wedge.
+#[tokio::test]
+async fn a_spawning_progression_run_past_its_timeout_is_reaped() {
+    let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_slot(Some(60), false).await;
+    let before = description_of(&db, &work_item_id);
+    let reaper = RecordingReaper::new(coordinator.clone());
+
+    let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
+
+    assert_eq!(outcome.reaped, 1);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned
+    );
+    assert_eq!(description_of(&db, &work_item_id), before, "no audit line on the item");
+}
+
+/// When `started_at` was never recorded, the timeout uses `created_at`.
+#[tokio::test]
+async fn a_progression_run_with_no_started_at_is_reaped_from_created_at() {
+    let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_fixture(Some(60)).await;
+    let created = boss_engine_utils::epoch_time::now_epoch_secs()
+        .saturating_sub(300)
+        .to_string();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET started_at = NULL, created_at = ?1 WHERE id = ?2",
+            [&created, &execution_id],
+        )
+        .unwrap();
+    assert!(db.get_execution(&execution_id).unwrap().started_epoch().is_none());
+    let before = description_of(&db, &work_item_id);
+    let reaper = RecordingReaper::new(coordinator.clone());
+
+    let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
+
+    assert_eq!(outcome.reaped, 1);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Orphaned
+    );
+    assert_eq!(description_of(&db, &work_item_id), before);
 }
 
 #[tokio::test]

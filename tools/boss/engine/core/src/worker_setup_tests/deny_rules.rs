@@ -385,6 +385,7 @@ fn claude_review_guide_settings_allow_only_submission_and_wire_the_exact_command
     let command = hook["hooks"][0]["command"].as_str().unwrap();
     for (tool, shell, expected) in [
         ("Bash", "\"$BOSS_BIN\" propose review-guide --body '# Guide'", "approve"),
+        ("Bash", "boss propose review-guide --body 'guide'", "approve"),
         (
             "Bash",
             "\"$BOSS_BIN\" propose review-guide --body '# Guide\nswift run\nboss engine start\n'",

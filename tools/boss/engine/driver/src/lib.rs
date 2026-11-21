@@ -2249,6 +2249,28 @@ pub trait AgentDriver: Send + Sync {
     /// Boss ships or plans needs it.
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd>;
 
+    /// Whether `event` is this driver reporting that it has put an
+    /// interactive approval prompt on the worker's pane: a dialog that only
+    /// a keypress dismisses.
+    ///
+    /// This is narrower than [`Capability::AwaitingInputSignal`] and is not
+    /// gated on it. That capability is about showing a person that a worker
+    /// is waiting on them. This answers a different question for a session
+    /// the engine launched to never ask (a kind with a forced permission
+    /// mode): did it ask anyway? There is nobody to answer such a prompt, so
+    /// the engine fails the run instead of letting it hold its slot.
+    ///
+    /// A driver may raise the same signal in a session launched to approve
+    /// everything and then answer it itself, so `true` on its own does not
+    /// mean the pane is stuck. Callers combine it with how the session was
+    /// launched and with nothing having followed the prompt.
+    ///
+    /// The default is `false`: a driver claims this only on a measured
+    /// mapping.
+    fn approval_prompt_reported(&self, _event: &WorkerEvent) -> bool {
+        false
+    }
+
     // ── ToolUseInterception capability ──────────────────────────────────────
 
     /// Build the PreToolUse hook entries for the `ToolUseInterception`
@@ -2697,6 +2719,15 @@ pub mod capability_rules {
             "Glob".to_owned(),
             format!("Bash({ANSWER_AGENT_THREAD_REPLY_COMMAND}:*)"),
         ]
+    }
+
+    /// Defense-in-depth deny belt for [`crate::WorkerKind::AnswerAgent`].
+    ///
+    /// The primary enforcement is the `dontAsk` allowlist
+    /// ([`answer_agent_allow_rules`]); deny always wins over allow. Same body
+    /// as other read-only workers: no file writes, no publish verbs, no `cube`.
+    pub fn answer_agent_deny_rules() -> Vec<String> {
+        read_only_worker_deny_rules()
     }
 
     /// The `permissions.allow` allowlist for `WorkerKind::Progression`.

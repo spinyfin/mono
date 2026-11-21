@@ -115,11 +115,55 @@ pub fn forwarder_hooks_map(config: &ProgressObservationConfig) -> serde_json::Ma
     hooks
 }
 
+/// `PreToolUse` guard armed for the deny-by-default kinds (those the engine
+/// launches with a forced permission mode; see
+/// [`super::permissions::render_restricted_claude_settings`]).
+///
+/// Restricted Grok kinds are taught the bare `boss` spelling, because an
+/// allow rule never matches a command whose program is a shell variable.
+/// This guard is a belt for a command that still contains `$BOSS_BIN` or
+/// `${BOSS_BIN}` anywhere (the taught form, an echo of the env, a chained
+/// discovery snippet). Measured on grok 1.0.70: that shape is refused as
+/// "not pre-approved" with no hint, and three attempts then end the turn.
+/// The bare `boss` on `PATH` (the same launcher `BOSS_BIN` names) matches.
+///
+/// A `PreToolUse` hook runs before the permission rules, so this guard gets
+/// to answer first and names the spelling to use; the worker's next call
+/// uses `boss` and is admitted. It only ever refuses a command the
+/// permission rules were about to refuse anyway, so it widens nothing, and
+/// a payload it cannot read is passed through to those rules rather than
+/// judged here.
+///
+/// Written without `"`, `$`, a backtick or a backslash-escape the shell
+/// would consume: the script travels inside a double-quoted `python3 -c`.
+pub(super) const VARIABLE_BOSS_PROGRAM_GUARD_COMMAND: &str = concat!(
+    "python3 -c \"\n",
+    "import json,re,sys\n",
+    "def emit(d):\n",
+    "    print(json.dumps(d))\n",
+    "    sys.exit(0)\n",
+    "try:\n",
+    "    cmd=json.load(sys.stdin)['tool_input']['command']\n",
+    "except Exception:\n",
+    "    emit({'decision':'approve'})\n",
+    "d=chr(36)\n",
+    "if not isinstance(cmd,str) or not re.search(re.escape(d)+r'(BOSS_BIN\\b|[{]BOSS_BIN[}])',cmd):\n",
+    "    emit({'decision':'approve'})\n",
+    "emit({'decision':'block','reason':'Blocked: this session runs only pre-approved commands, ",
+    "and a command that contains '+d+'BOSS_BIN or '+d+'{BOSS_BIN} cannot be matched against them. ",
+    "Run the same command again with the literal word boss in place of every '+d+'BOSS_BIN, ",
+    "without the quotes around it. boss is on PATH in this session and is the same CLI.'})\n",
+    "\""
+);
+
 /// Write the canonicalisation adapter script and the full hooks wiring
 /// (forwarder on every lifecycle event, adapter-wrapped guards on
 /// `PreToolUse`) into `$GROK_HOME/hooks/`. Overwrites the provisional canary
 /// [`super::home`] wrote at `provision_workspace` time. Returns the absolute
 /// paths written (for [`crate::PermissionArtifacts::config_files`]).
+///
+/// `deny_by_default` arms [`VARIABLE_BOSS_PROGRAM_GUARD_COMMAND`] after the
+/// shared guards, for the kinds launched without always-approve.
 ///
 /// Refuses (rather than silently arming zero guards) if `guard_commands`
 /// somehow returns empty — see [`Guard`]'s doc for why that should not
@@ -129,6 +173,7 @@ pub fn write_hooks(
     grok_home: &Path,
     obs_config: &ProgressObservationConfig,
     interception: &ToolUseInterceptionConfig,
+    deny_by_default: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let hooks_dir = grok_home.join("hooks");
     fs::create_dir_all(&hooks_dir).with_context(|| format!("creating {}", hooks_dir.display()))?;
@@ -136,9 +181,22 @@ pub fn write_hooks(
     let adapter_path = hooks_dir.join(ADAPTER_FILENAME);
     write_executable(&adapter_path, GROK_HOOK_ADAPTER_SCRIPT)?;
 
-    let guards = guard_commands(interception);
+    let mut guards = guard_commands(interception);
     if guards.is_empty() {
         bail!("GrokDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
+    }
+    if deny_by_default {
+        // The launch guard refuses a bare `boss` PATH lookup and tells the
+        // worker to name `"$BOSS_BIN"`. Under Grok that spelling is inert,
+        // and this session's allowlist already admits the bare form. Drop
+        // the launch guard so the redirect below is not immediately refused.
+        guards.retain(|guard| guard.command != crate::claude::BOSS_LAUNCH_GUARD_COMMAND);
+        guards.push(crate::hook_guards::Guard {
+            command: VARIABLE_BOSS_PROGRAM_GUARD_COMMAND.to_owned(),
+            matcher: "Bash",
+            timeout_sec: None,
+            run_once: false,
+        });
     }
 
     let mut hooks = forwarder_hooks_map(obs_config);
@@ -569,15 +627,23 @@ mod tests {
         }
         let tmp = tempfile::TempDir::new().unwrap();
         let adapter_path = write_adapter_script(tmp.path());
-        let approve = json!({
-            "hookEventName": "pre_tool_use",
-            "toolName": "run_terminal_command",
-            "toolInput": {"command": "\"$BOSS_BIN\" propose review-guide --body '# Guide'"},
-        });
-        let (code, stdout, _stderr) = run_adapter(&adapter_path, &guards[1].command, &approve, true);
-        assert_eq!(code, 0);
-        let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
-        assert_eq!(decision["decision"], "allow", "literal submission must pass: {stdout}");
+        for command in [
+            "\"$BOSS_BIN\" propose review-guide --body '# Guide'",
+            "boss propose review-guide --body '# Guide'",
+        ] {
+            let approve = json!({
+                "hookEventName": "pre_tool_use",
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": command},
+            });
+            let (code, stdout, _stderr) = run_adapter(&adapter_path, &guards[1].command, &approve, true);
+            assert_eq!(code, 0);
+            let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+            assert_eq!(
+                decision["decision"], "allow",
+                "literal submission must pass ({command}): {stdout}"
+            );
+        }
 
         let blocked = json!({
             "hookEventName": "pre_tool_use",
@@ -648,7 +714,7 @@ mod tests {
             c.is_standard_worker = false;
         });
 
-        let written = write_hooks(&grok_home, &obs_config, &interception).unwrap();
+        let written = write_hooks(&grok_home, &obs_config, &interception, false).unwrap();
         assert_eq!(written.len(), 2);
 
         let adapter_path = grok_home.join("hooks").join(ADAPTER_FILENAME);
@@ -700,7 +766,7 @@ mod tests {
         let interception = interception_config(|c| {
             c.checkleft_guard_script = Some(PathBuf::from("/tmp/settings/boss-checkleft-push-guard.py"));
         });
-        write_hooks(&grok_home, &obs_config, &interception).unwrap();
+        write_hooks(&grok_home, &obs_config, &interception, false).unwrap();
         let hooks_doc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(hooks_file_path(&grok_home)).unwrap()).unwrap();
         let pre_tool_use = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
@@ -776,6 +842,113 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
+    }
+
+    /// The variable-program guard, end to end through the adapter with raw
+    /// Grok payloads: the taught `"$BOSS_BIN"` spellings are refused with the
+    /// spelling to use instead, and everything else is left to the
+    /// permission rules.
+    #[test]
+    fn variable_boss_program_guard_redirects_to_the_bare_spelling_only() {
+        if !python3_available() {
+            eprintln!("python3 not available; skipping adapter acceptance test");
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let adapter_path = write_adapter_script(tmp.path());
+        let decide = |command: serde_json::Value| -> serde_json::Value {
+            let payload = json!({
+                "hookEventName": "pre_tool_use",
+                "toolName": "run_terminal_command",
+                "toolInput": {"command": command},
+            });
+            let (code, stdout, stderr) =
+                run_adapter(&adapter_path, VARIABLE_BOSS_PROGRAM_GUARD_COMMAND, &payload, true);
+            assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+            serde_json::from_str(&stdout).unwrap_or_else(|error| panic!("{error}: {stdout} {stderr}"))
+        };
+
+        for refused in [
+            "\"$BOSS_BIN\" task show abc",
+            "$BOSS_BIN propose done --outcome delivered --summary ok",
+            "${BOSS_BIN} pr status --json",
+            "echo \"BOSS_BIN=$BOSS_BIN\"; \"$BOSS_BIN\" --help 2>&1 | head -80",
+        ] {
+            let decision = decide(json!(refused));
+            assert_eq!(decision["decision"], "deny", "{refused}: {decision}");
+            let reason = decision["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason.contains("literal word boss in place of every $BOSS_BIN"),
+                "{refused}: the refusal must name the spelling to use: {reason}"
+            );
+            assert!(
+                reason.contains("contains $BOSS_BIN or ${BOSS_BIN}"),
+                "{refused}: the refusal must describe what the guard matches: {reason}"
+            );
+        }
+        for passed in [
+            "boss task show abc",
+            "boss propose done --outcome delivered --summary \"all good\"",
+            "gh pr view 12 --json state",
+            // A different variable is the permission rules' business.
+            "ls \"$BOSS_BIN_DIR\"",
+            "uname -a",
+        ] {
+            assert_eq!(decide(json!(passed)), json!({"decision": "allow"}), "{passed}");
+        }
+        // A payload this guard cannot read is not judged here.
+        assert_eq!(decide(json!(["not", "a", "string"])), json!({"decision": "allow"}));
+    }
+
+    #[test]
+    fn write_hooks_arms_the_variable_program_guard_only_for_deny_by_default_kinds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let obs_config = ProgressObservationConfig {
+            events_socket_path: PathBuf::from("/tmp/events.sock"),
+            lease_id: "lease-1".into(),
+            run_id: "run-1".into(),
+            workspace_path: PathBuf::from("/tmp/ws"),
+            forwarder_binary: PathBuf::from("/tmp/boss-event"),
+        };
+        let interception = interception_config(|c| c.is_standard_worker = false);
+        let guard_count = |deny_by_default: bool| {
+            let grok_home = tmp.path().join(format!("grok-home-{deny_by_default}"));
+            fs::create_dir_all(&grok_home).unwrap();
+            write_hooks(&grok_home, &obs_config, &interception, deny_by_default).unwrap();
+            let hooks_doc: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(hooks_file_path(&grok_home)).unwrap()).unwrap();
+            hooks_doc["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"][0]["command"]
+                        .as_str()
+                        .is_some_and(|command| command.contains("in place of"))
+                })
+                .map(|entry| entry["matcher"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(guard_count(true), vec!["Bash".to_owned()]);
+        assert!(guard_count(false).is_empty());
+
+        let grok_home = tmp.path().join("grok-home-deny-launch-guard");
+        fs::create_dir_all(&grok_home).unwrap();
+        write_hooks(&grok_home, &obs_config, &interception, true).unwrap();
+        let hooks_doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(hooks_file_path(&grok_home)).unwrap()).unwrap();
+        let commands: Vec<&str> = hooks_doc["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["hooks"][0]["command"].as_str())
+            .collect();
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command.contains("PROD='/tmp/boss-engine.sock'")),
+            "deny-by-default Grok must drop the launch guard so taught `boss` is admitted: {commands:?}"
+        );
     }
 
     fn write_adapter_script(dir: &Path) -> PathBuf {
