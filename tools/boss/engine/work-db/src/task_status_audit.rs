@@ -372,6 +372,9 @@ pub(super) fn migrate_deferred(conn: &Connection) -> Result<()> {
     install_property_triggers(conn, "deferred")
 }
 
+/// Owner deferral and PR polling do not change the report's task-state age.
+pub(crate) const REPORT_IGNORED_PROPERTIES: &str = "('deferred','pr_mergeable_state','ci_required_state')";
+
 /// Record PR observations so progression can age the condition itself rather
 /// than the last unrelated task edit. Existing observations have unknown age.
 pub(super) fn migrate_pr_observations(conn: &Connection) -> Result<()> {
@@ -380,7 +383,10 @@ pub(super) fn migrate_pr_observations(conn: &Connection) -> Result<()> {
             "INSERT INTO task_status_audit
                 (work_item_id, property, new_value, actor, changed_at, basis, age_is_lower_bound)
              SELECT id, '{property}', {property}, 'engine', strftime('%s','now'), 'unknown_legacy', 1
-             FROM tasks;"
+             FROM tasks t WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+               AND t.{property} IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM task_status_audit a
+                               WHERE a.work_item_id = t.id AND a.property = '{property}');"
         ))?;
         install_property_triggers(conn, property)?;
     }

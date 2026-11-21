@@ -63,7 +63,7 @@
 //! 5. **Stuck long enough.** In one of the stuck states the enumeration marks as
 //!    progression-eligible ([`stuck_kind_sql`]) continuously for at least
 //!    `progression.stuck_after`, measured from relevant task status transitions,
-//!    ignoring excursions shorter than the engine automation debounce; or the
+//!    ignoring excursions shorter than the progression recovery tolerance; or the
 //!    grace was waived since the item entered that state (`tasks.progression_grace_waived_at`).
 //! 6. **Cooldown and budget.** No progression run within the fallback
 //!    `progression.cooldown` (6 hours by default; four times that, capped at 24
@@ -267,8 +267,23 @@ fn human_held_sql(a: &str) -> String {
 /// mergeable (`S18`), or simply healthy. The branches follow the order of
 /// `stuck_report::classification` so the two never classify one item two ways.
 fn stuck_kind_sql(a: &str, root: &str) -> String {
+    classify_sql(a, root, true)
+}
+
+fn classify_sql(a: &str, root: &str, attention: bool) -> String {
+    let open_attention_sql = |a: &str, predicate: &str| {
+        if attention {
+            open_attention_sql(a, predicate)
+        } else {
+            "0".to_owned()
+        }
+    };
     let chain_root_ci = format!("{root}.ci_required_state");
-    let not_positioning_held = crate::dispatch_helpers::not_positioning_held_sql(a);
+    let not_positioning_held = if attention {
+        crate::dispatch_helpers::not_positioning_held_sql(a)
+    } else {
+        "1".to_owned()
+    };
     let trunk_queue = open_attention_sql(a, "wa.kind LIKE 'trunk_queue_%'");
     let abandoned = open_attention_sql(a, "wa.kind = 'abandoned_branch_no_pr'");
     let recovery = open_attention_sql(
@@ -302,7 +317,7 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
            WHEN {trunk_queue} THEN NULL
            WHEN {a}.pr_url IS NULL AND {abandoned} THEN 'S22_abandoned_branch'
            WHEN {recovery} THEN 'S14_worker_recovery'
-           WHEN {a}.status = 'in_review' AND {a}.pr_mergeable_state = 'CONFLICTING' THEN 'S5_merge_conflict'
+           WHEN {a}.status = 'in_review' AND {a}.pr_mergeable_state = 'conflicting' THEN 'S5_merge_conflict'
            WHEN {a}.status = 'in_review' AND {a}.ci_required_state = 'fail' THEN 'S6_ci_failure'
            WHEN {a}.status = 'in_review' AND {review_churn} THEN 'S16_review_churn'
            ELSE NULL
@@ -312,8 +327,10 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
 
 /// Reconstruct the current stuck episode from only the fields that determine
 /// its kind. Brief excursions outside that kind do not end an episode until
-/// they last as long as the engine's automation debounce. Ledger id breaks
+/// they last as long as the progression recovery tolerance. Ledger id breaks
 /// ties between changes made in the same second (including one UPDATE).
+/// Attention-driven conditions instead use the open lifecycle's entry time,
+/// bounded by the latest task-state transition for conservative ageing.
 fn stuck_since_sql(a: &str) -> String {
     let properties = [
         "status",
@@ -322,17 +339,29 @@ fn stuck_since_sql(a: &str) -> String {
         "pr_mergeable_state",
         "ci_required_state",
     ];
+    // Carry event ids rather than values: NULL is a real clear.
+    let carried = properties
+        .iter()
+        .map(|p| {
+            format!(
+                "MAX(CASE WHEN property = '{p}' THEN id END) OVER (ORDER BY id) AS {p}_id,
+             FIRST_VALUE(CASE WHEN property = '{p}' THEN old_value END)
+               OVER (ORDER BY (property = '{p}') DESC, id) AS initial_{p}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let joins = properties
+        .iter()
+        .map(|p| format!("LEFT JOIN task_status_audit v_{p} ON v_{p}.id = event.{p}_id"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let snapshots = properties
         .iter()
         .map(|property| {
             format!(
-                "CASE WHEN EXISTS (SELECT 1 FROM task_status_audit h
-                          WHERE h.work_item_id = {a}.id AND h.property = '{property}' AND h.id <= event.id)
-              THEN (SELECT h.new_value FROM task_status_audit h
-                    WHERE h.work_item_id = {a}.id AND h.property = '{property}' AND h.id <= event.id
-                    ORDER BY h.id DESC LIMIT 1)
-              ELSE (SELECT h.old_value FROM task_status_audit h
-                    WHERE h.work_item_id = {a}.id AND h.property = '{property}' ORDER BY h.id LIMIT 1)
+                "CASE WHEN event.{property}_id IS NOT NULL THEN v_{property}.new_value
+              ELSE event.initial_{property}
          END AS {property}"
             )
         })
@@ -343,19 +372,53 @@ fn stuck_since_sql(a: &str) -> String {
         .map(|p| format!("'{p}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    let historical_kind = stuck_kind_sql("snapshot", "root");
+    let historical_kind = classify_sql("snapshot", "root", false);
     let current_kind = stuck_kind_sql(a, "root");
-    let debounce = boss_engine_storage_values::AUTOMATION_DEBOUNCE_SECS;
+    let debounce = boss_engine_storage_values::progression::STUCK_EPISODE_RECOVERY_SECS;
+    // Open attention is present-day evidence, not a fact about old snapshots.
+    // Reopening creates a new row; refreshing an open row must not reset age.
+    // The latest task transition bounds entry into the eligible task state.
+    let positioning_hold = boss_engine_storage_values::attention_kinds::WORKSPACE_POSITIONING_REFUSED;
+    let attention_age = format!(
+        "MAX(COALESCE((SELECT MIN(CAST(wa.created_at AS INTEGER))
+          FROM work_attention_items wa WHERE wa.status = 'open'
+          AND (wa.work_item_id = {a}.id OR wa.execution_id IN
+               (SELECT id FROM work_executions WHERE work_item_id = {a}.id))
+          AND CASE ({current_kind})
+            WHEN 'S14_worker_recovery' THEN wa.kind IN ('worker_recovery_permanent_error','worker_recovery_exhausted')
+            WHEN 'S16_review_churn' THEN wa.kind = 'churn_guard_parked'
+            WHEN 'S22_abandoned_branch' THEN wa.kind = 'abandoned_branch_no_pr' ELSE 0 END), {NOW}),
+          COALESCE((SELECT MAX(CAST(changed_at AS INTEGER)) FROM task_status_audit
+                    WHERE work_item_id = {a}.id AND (property IN ('status','blocked_reason','dispatch_failed_reason')
+                      OR (({current_kind}) = 'S16_review_churn'
+                          AND property IN ('ci_required_state','pr_mergeable_state')))), 0),
+          COALESCE((SELECT MAX(CAST(wa.resolved_at AS INTEGER)) FROM work_attention_items wa
+                    WHERE wa.status <> 'open'
+                      AND (wa.work_item_id = {a}.id OR wa.execution_id IN
+                           (SELECT id FROM work_executions WHERE work_item_id = {a}.id))
+                      AND (wa.kind LIKE 'trunk_queue_%' OR wa.kind = '{positioning_hold}'
+                        OR (wa.kind = 'abandoned_branch_no_pr' AND {a}.pr_url IS NULL
+                            AND ({current_kind}) IN ('S14_worker_recovery','S16_review_churn'))
+                        OR (wa.kind IN ('worker_recovery_permanent_error','worker_recovery_exhausted')
+                            AND ({current_kind}) = 'S16_review_churn'))), 0))"
+    );
     format!(
-        "COALESCE((WITH history AS MATERIALIZED (
+        "CASE WHEN ({current_kind}) IS NULL THEN COALESCE(CAST({a}.updated_at AS INTEGER), {NOW})
+         WHEN ({current_kind}) IN ('S14_worker_recovery','S16_review_churn','S22_abandoned_branch') THEN {attention_age}
+         ELSE COALESCE((WITH current AS MATERIALIZED (
+             SELECT ({current_kind}) AS kind
+         ), history AS MATERIALIZED (
              SELECT id, property, old_value, new_value, CAST(changed_at AS INTEGER) AS changed_at
              FROM task_status_audit WHERE work_item_id = {a}.id AND property IN ({properties})
-         ), snapshot AS (
+         ), carried AS (
+             SELECT *, {carried} FROM history
+         ), snapshot AS MATERIALIZED (
              SELECT event.id AS event_id, event.changed_at, {snapshots},
                     {a}.id, {a}.kind, {a}.pr_url, {a}.deferred, {a}.autostart
-             FROM history event
+             FROM carried event {joins}
          ), kinds AS (
-             SELECT event_id, changed_at, ({historical_kind}) IS ({current_kind}) AS is_current FROM snapshot
+             SELECT event_id, changed_at, ({historical_kind}) IS current.kind AS is_current
+             FROM current CROSS JOIN snapshot
          ), changes AS (
              SELECT *, is_current IS NOT LAG(is_current) OVER (ORDER BY event_id) AS changed FROM kinds
          ), grouped AS (
@@ -364,12 +427,13 @@ fn stuck_since_sql(a: &str) -> String {
              SELECT episode, is_current, MIN(changed_at) AS began FROM grouped GROUP BY episode
          ), durations AS (
              SELECT *, LEAD(began, 1, {NOW}) OVER (ORDER BY episode) AS ended FROM episodes
+         ), marked AS (
+             SELECT *, MAX(CASE WHEN NOT is_current AND ended - began >= {debounce} THEN episode END)
+                       OVER () AS reset_episode FROM durations
          )
-         SELECT MIN(began) FROM durations
-         WHERE is_current AND episode > COALESCE(
-             (SELECT MAX(episode) FROM durations
-              WHERE NOT is_current AND ended - began >= {debounce}), -1)),
-         NULLIF(CAST({a}.updated_at AS INTEGER), 0), {NOW})"
+         SELECT MIN(began) FROM marked
+         WHERE is_current AND episode > COALESCE(reset_episode, -1)),
+         NULLIF(CAST({a}.updated_at AS INTEGER), 0), {NOW}) END"
     )
 }
 

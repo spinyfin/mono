@@ -627,17 +627,36 @@ mod dependency_tests;
 
 /// Apply a real task transition and timestamp just the ledger rows it emits.
 fn transition_at(f: &Fixture, id: &str, assignments: &str, at: i64) {
-    let conn = f.db.connect().unwrap();
-    let last: i64 = conn
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM task_status_audit", [], |r| r.get(0))
+    let last: i64 = {
+        let conn = f.db.connect().unwrap();
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM task_status_audit", [], |r| r.get(0))
+            .unwrap()
+    };
+    if let Some(value) = assignments
+        .strip_prefix("pr_mergeable_state = '")
+        .and_then(|v| v.strip_suffix("'"))
+    {
+        f.db.update_task_pr_poll_state(
+            id,
+            PrPollStateInput {
+                pr_mergeable_state: value,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    conn.execute_batch(&format!("UPDATE tasks SET {assignments} WHERE id = '{id}'"))
+    } else {
+        f.db.connect()
+            .unwrap()
+            .execute_batch(&format!("UPDATE tasks SET {assignments} WHERE id = '{id}'"))
+            .unwrap();
+    }
+    f.db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE task_status_audit SET changed_at = ?1 WHERE work_item_id = ?2 AND id > ?3",
+            params![at, id, last],
+        )
         .unwrap();
-    conn.execute(
-        "UPDATE task_status_audit SET changed_at = ?1 WHERE work_item_id = ?2 AND id > ?3",
-        params![at, id, last],
-    )
-    .unwrap();
 }
 
 #[test]
@@ -645,7 +664,7 @@ fn conflicting_review_pr_ages_from_the_conflict_observation() {
     let f = fixture();
     let id = f.chore("Review conflict");
     f.stick(&id, "status = 'in_review', autostart = 1", 5);
-    transition_at(&f, &id, "pr_mergeable_state = 'CONFLICTING'", now() - HOUR);
+    transition_at(&f, &id, "pr_mergeable_state = 'conflicting'", now() - HOUR);
     assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
     f.assert_candidate(&id, false);
     f.age(&id, 2 * HOUR);
@@ -663,7 +682,8 @@ fn conflicting_review_pr_ages_from_the_conflict_observation() {
 fn repeated_merge_conflict_block_blips_preserve_the_review_episode() {
     let f = fixture();
     let id = f.chore("Flickering conflict block");
-    f.stick(&id, "status = 'in_review', pr_mergeable_state = 'CONFLICTING'", 3);
+    f.stick(&id, "status = 'in_review'", 3);
+    transition_at(&f, &id, "pr_mergeable_state = 'conflicting'", now() - 3 * HOUR);
     let began = f.clauses(&id).stuck_since;
     for index in 0..9 {
         let at = now() - 1800 + index * 120;
@@ -677,17 +697,18 @@ fn repeated_merge_conflict_block_blips_preserve_the_review_episode() {
 
 #[test]
 fn only_a_sustained_recovery_resets_the_current_conflict_episode() {
-    let debounce = boss_engine_storage_values::AUTOMATION_DEBOUNCE_SECS as i64;
+    let debounce = boss_engine_storage_values::progression::STUCK_EPISODE_RECOVERY_SECS;
     for gap in [10, debounce - 1, debounce, debounce + 1] {
         let f = fixture();
         let id = f.chore("Conflict recovery");
-        f.stick(&id, "status = 'in_review', pr_mergeable_state = 'CONFLICTING'", 3);
+        f.stick(&id, "status = 'in_review'", 3);
+        transition_at(&f, &id, "pr_mergeable_state = 'conflicting'", now() - 3 * HOUR);
         let began = f.clauses(&id).stuck_since;
         let recovered = now() - 300;
-        transition_at(&f, &id, "pr_mergeable_state = 'MERGEABLE'", recovered);
+        transition_at(&f, &id, "pr_mergeable_state = 'mergeable'", recovered);
         f.assert_candidate(&id, false);
         let returned = recovered + gap;
-        transition_at(&f, &id, "pr_mergeable_state = 'CONFLICTING'", returned);
+        transition_at(&f, &id, "pr_mergeable_state = 'conflicting'", returned);
         let short = gap < debounce;
         assert_eq!(f.clauses(&id).stuck_since, if short { began } else { returned });
         f.assert_candidate(&id, short);
@@ -1824,3 +1845,6 @@ fn torn_down_driver_failures_count_toward_the_cap_without_launch_backoff() {
         f.assert_candidate(&id, false);
     }
 }
+
+#[path = "progression_episode_tests.rs"]
+mod episode_tests;

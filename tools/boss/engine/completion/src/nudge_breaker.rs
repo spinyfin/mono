@@ -83,7 +83,7 @@ pub const ABSOLUTE_MAX_NUDGES: u32 = 12;
 /// budget can be spent, so a worker that is genuinely stuck is still
 /// nudged (and eventually parked) at the same total count, just not
 /// faster than external state could plausibly have changed.
-pub const MIN_RENUDGE_INTERVAL: Duration = Duration::from_secs(boss_engine_storage_values::AUTOMATION_DEBOUNCE_SECS);
+pub const MIN_RENUDGE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Time since issue after which an unwritten nudge may be withdrawn when
 /// the worker is idle. Time spent busy also counts toward this deadline.

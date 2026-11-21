@@ -827,7 +827,7 @@ mod tests {
                 .unwrap();
         };
         set("review_required_state = 'approved', ci_required_state = 'success', pr_mergeable_state = 'conflicting'");
-        assert_eq!(classify(), "awaiting_merge");
+        assert_eq!(classify(), "S5_merge_conflict");
         assert_eq!(card_wait(), "waiting for its pull request to merge");
 
         recorded(db.record_conflict_deferral(input(&product, &item, "h1")).unwrap());
@@ -840,12 +840,12 @@ mod tests {
             no_inflight_ladder(),
             "a deferred conflict is not a resolution in flight"
         );
-        assert_eq!(classify(), "awaiting_merge:conflict_deferred");
+        assert_eq!(classify(), "S5_merge_conflict:conflict_deferred");
 
-        // A review that is not finished is still reported as such, with the
-        // deferral named beside it.
+        // The report names the conflict and its deferral while the card
+        // explains the remaining review decision.
         set("review_required_state = 'required'");
-        assert_eq!(classify(), "review_without_live_work:conflict_deferred");
+        assert_eq!(classify(), "S5_merge_conflict:conflict_deferred");
         assert_eq!(card_wait(), "waiting for a human review decision");
         set("review_required_state = 'approved'");
 
@@ -856,7 +856,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!no_inflight_ladder());
-        assert_eq!(classify(), "awaiting_merge");
+        assert_eq!(classify(), "S5_merge_conflict");
         assert_eq!(card_wait(), "waiting for its pull request to merge");
     }
 }

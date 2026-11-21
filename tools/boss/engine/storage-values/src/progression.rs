@@ -167,6 +167,10 @@ pub const DEFAULT_POOL_SIZE: usize = 1;
 pub const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 300;
 /// Placeholder `progression.stuck_after` (2 hours).
 pub const DEFAULT_STUCK_AFTER_SECS: i64 = 2 * 60 * 60;
+
+/// Recovery must persist this long before progression starts a new stuck episode.
+/// This tolerance is independent of worker nudge pacing.
+pub const STUCK_EPISODE_RECOVERY_SECS: i64 = 60;
 /// Default `progression.cooldown` (6 hours): the fallback re-check interval.
 pub const DEFAULT_COOLDOWN_SECS: i64 = 6 * 60 * 60;
 /// Placeholder `progression.max_creates_per_item_window` (3 per window).

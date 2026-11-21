@@ -373,6 +373,15 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
         let db = WorkDb::open(path.clone()).unwrap();
         let product = create_test_product_named(&db, "Upgrade");
         let task = create_test_chore_manual(&db, &product.id, "Existing task");
+        db.update_task_pr_poll_state(
+            &task.id,
+            PrPollStateInput {
+                ci_required_state: "success",
+                pr_mergeable_state: "mergeable",
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         conn.execute(
             "UPDATE tasks SET dispatch_failed_reason = 'deliberate_park', dispatch_failed_at = '12345' WHERE id = ?1",
@@ -448,6 +457,17 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
                 )
                 .unwrap();
             assert_eq!(count, 7, "one baseline row per tracked property");
+            let observations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_status_audit WHERE work_item_id = ?1
+                 AND ((property = 'pr_mergeable_state' AND new_value = 'mergeable')
+                      OR (property = 'ci_required_state' AND new_value = 'success'))
+                 AND age_is_lower_bound = 1 AND basis = 'unknown_legacy'",
+                    [&task.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(observations, 2, "known PR observations get conservative baselines");
             let known: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM task_status_audit WHERE work_item_id = ?1 AND property = 'dispatch_failed_reason'
                  AND new_value = 'deliberate_park' AND basis = 'deliberate_park' AND changed_at = '12345' AND age_is_lower_bound = 0",
