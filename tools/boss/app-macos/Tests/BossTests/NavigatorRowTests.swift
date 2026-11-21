@@ -124,6 +124,42 @@ final class NavigatorRowTests: XCTestCase {
         XCTAssertTrue(active.accessibilityLabel.contains("Worker active"))
     }
 
+    func testRevealRepublishesNavigatorChromeWhenSelectionIsAlreadyVisible() {
+        let model = NavigatorTestFixture.model([NavigatorTestFixture.task()])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        model.revealNavigatorSelection()
+        model.presentationUpdates.flush()
+        XCTAssertEqual(model.navigator.selectedRootID, "root")
+        XCTAssertFalse(model.navigatorCollapsed.contains(.working))
+        XCTAssertTrue(model.workSearchText.isEmpty)
+
+        let chrome = WorkPresentationValue(updates: model.presentationUpdates) {
+            NavigatorChromeValue(model: model)
+        }
+        var publications = 0
+        let subscription = chrome.objectWillChange.sink { publications += 1 }
+        for action in 0..<3 {
+            let before = chrome.value
+            if action == 0 {
+                model.revealNavigatorSelection()
+            } else {
+                model.moveNavigatorSelection(by: action == 1 ? -1 : 1, edge: true)
+            }
+            model.presentationUpdates.flush()
+            XCTAssertEqual(publications, action + 1, "Each reveal must reach the scroll observer")
+            XCTAssertNotEqual(chrome.value.revealGeneration, before.revealGeneration)
+            XCTAssertEqual(chrome.value.revealGeneration, model.navigator.revealGeneration)
+            XCTAssertEqual(chrome.value.selectedRootID, before.selectedRootID)
+            XCTAssertEqual(chrome.value.collapsed, before.collapsed)
+            XCTAssertEqual(chrome.value.searchText, before.searchText)
+            XCTAssertEqual(chrome.value.sections, before.sections)
+        }
+        model.presentationUpdates.flush()
+        XCTAssertEqual(publications, 3, "A completed reveal must not replay on a later flush")
+        withExtendedLifetime(subscription) {}
+    }
+
     func testWorkerTicksDoNotInvalidateNavigatorChromeOrUnrelatedRows() throws {
         let task = NavigatorTestFixture.task("root", section: "working")
         let model = NavigatorTestFixture.model([task])

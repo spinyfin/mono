@@ -12,6 +12,7 @@ struct NavigatorChromeValue: Equatable {
     let sections: [NavigatorSectionRows]
     let collapsed: Set<NavigatorSection>
     let selectedRootID: String?
+    let revealGeneration: UUID
     let isSearchActive: Bool
     let searchText: String
     /// Row id → project name; empty when the scope is a single project.
@@ -31,6 +32,7 @@ struct NavigatorChromeValue: Equatable {
         sections = model.navigatorSections
         collapsed = model.navigatorCollapsed
         selectedRootID = model.navigator.selectedRootID
+        revealGeneration = model.navigator.revealGeneration
         isSearchActive = model.isWorkSearchActive
         searchText = model.workSearchText
         let visible = model.visibleSelectedProjectFilterIDs

@@ -108,7 +108,7 @@ struct WorkNavigatorView: View, @MainActor Equatable {
                             model.confirmNavigatorReveal(rootID: id)
                         }
                     }
-                    .onChange(of: model.navigator.revealGeneration) { _, _ in
+                    .onChange(of: value.revealGeneration) { _, _ in
                         if let id = model.navigator.selectedRootID {
                             proxy.scrollTo(id)
                             model.confirmNavigatorReveal(rootID: id)
