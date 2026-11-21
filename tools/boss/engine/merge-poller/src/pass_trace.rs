@@ -491,7 +491,10 @@ pub(crate) fn record_pass_result(
     budget: Duration,
     now_epoch_secs: i64,
 ) {
-    if timings.interrupted || (completed && !timings.open_walk_truncated()) {
+    if timings.interrupted {
+        return;
+    }
+    if completed && !timings.open_walk_truncated() {
         record_completed_pass(signal);
     } else {
         record_abandoned_pass(signal, budget, timings.clone(), now_epoch_secs);

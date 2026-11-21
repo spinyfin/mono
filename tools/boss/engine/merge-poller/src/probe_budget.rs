@@ -206,8 +206,7 @@ pub(crate) async fn bounded<T>(deadline: Instant, work: impl Future<Output = T>)
     if Instant::now() >= deadline {
         return Err("probe deadline exhausted; retrying next pass".to_owned());
     }
-    tokio::time::timeout_at(deadline, work).await.map_err(|_| {
-        boss_github::availability::transport_timeout();
-        "probe deadline exhausted; retrying next pass".to_owned()
-    })
+    tokio::time::timeout_at(deadline, work)
+        .await
+        .map_err(|_| "probe deadline exhausted; retrying next pass".to_owned())
 }
