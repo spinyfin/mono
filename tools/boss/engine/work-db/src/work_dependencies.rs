@@ -399,7 +399,8 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
                 // actually land before the revision runs.
                 if dependent_kind.as_deref() == Some("revision")
                     && s == "in_review"
-                    && !same_revision_chain(conn, work_item_id, &prerequisite_id)?
+                    && (!same_revision_chain(conn, work_item_id, &prerequisite_id)?
+                        || crate::is_live_chain_writer(conn, &prerequisite_id)?)
                 {
                     gating.push(prerequisite_id);
                 }

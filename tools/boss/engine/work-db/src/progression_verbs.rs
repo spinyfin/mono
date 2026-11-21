@@ -139,7 +139,7 @@ pub enum ProgressionVerbRefusal {
     )]
     CreateBudgetExhausted { item: String, used: i64, max: i64 },
     #[error(
-        "{revision} is already an open progression revision on this item's PR; wait for it to land or ask the owner"
+        "{revision} is already an open progression revision on this item's PR; wait for its implementation to finish or ask the owner"
     )]
     OpenProgressionRevision { revision: String },
     #[error(
@@ -396,14 +396,24 @@ fn recorded_episode(conn: &Connection, execution_id: &str) -> Result<Option<(Str
 
 /// The newest non-progression execution of `item` that is live or pending.
 pub(crate) fn live_or_pending_execution(conn: &Connection, item: &str) -> Result<Option<(String, String)>> {
+    live_or_pending_execution_except(conn, item, Some("progression"))
+}
+
+/// Verbs acting on their own item exclude the calling progression execution.
+/// Archiving another item must protect every execution, including progression.
+fn live_or_pending_execution_except(
+    conn: &Connection,
+    item: &str,
+    excluded_kind: Option<&str>,
+) -> Result<Option<(String, String)>> {
     Ok(conn
         .query_row(
             &format!(
                 "SELECT id, status FROM work_executions
-                 WHERE work_item_id = ?1 AND kind <> 'progression' AND status IN {LIVE_OR_PENDING_SQL}
+                 WHERE work_item_id = ?1 AND (?2 IS NULL OR kind <> ?2) AND status IN {LIVE_OR_PENDING_SQL}
                  ORDER BY created_at DESC, id DESC LIMIT 1"
             ),
-            [item],
+            params![item, excluded_kind],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)

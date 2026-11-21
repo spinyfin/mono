@@ -105,8 +105,8 @@ impl WorkDb {
 /// execution is skipped — gating a later revision on it queues forever.
 /// Parent PR CI is not part of the predicate; a dead halt holds no branch
 /// state whether the head is green, red, or unknown.
-/// `in_review` is **not** live: that worker already pushed and stopped, so
-/// gating a conflict- or CI-fix revision on it waits for the parent PR to
+/// `in_review` without a pending or live implementation is **not** live:
+/// that worker already pushed and stopped. Gating a new fix on it waits for the parent PR to
 /// merge, which a conflicting PR cannot do. `done` / `archived` are finished.
 ///
 /// The recursive CTE walks `parent_task_id` links one level at a time,

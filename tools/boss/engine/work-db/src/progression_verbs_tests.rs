@@ -16,6 +16,9 @@ const STUCK: &str = "S7_worker_failed";
 #[path = "progression_redispatch_pr_tests.rs"]
 mod redispatch_pr;
 
+#[path = "progression_finished_revision_tests.rs"]
+mod finished_revisions;
+
 struct Fx {
     db: WorkDb,
     product: String,

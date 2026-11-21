@@ -45,17 +45,20 @@ fn stamp_progression_actor(conn: &Connection, id: &str) -> Result<()> {
 // ── revise ───────────────────────────────────────────────────────────────────
 
 /// The open progression revision on the PR the chain rooted at `root` owns.
-/// Revisions are always parented on their chain root. "Open" is anything not yet
-/// `done`/`archived`, an `in_review` revision included: it has pushed, but the
-/// PR has not landed, and a second progression revision beside it would be a
-/// second attempt at a PR whose first has not been judged.
+/// Revisions are always parented on their chain root. An `in_review` revision
+/// has delivered and no longer blocks a new attempt, unless its implementation
+/// has been restarted. The PR may need another fix before it can merge.
 fn open_progression_revision(conn: &Connection, root: &str) -> Result<Option<String>> {
+    let writer = live_chain_writer_sql("t");
     Ok(conn
         .query_row(
-            "SELECT id FROM tasks
+            &format!(
+                "SELECT id FROM tasks t
              WHERE kind = 'revision' AND parent_task_id = ?1 AND created_via LIKE 'progression:%'
                AND deleted_at IS NULL AND status NOT IN ('done', 'archived')
-             ORDER BY created_at, id LIMIT 1",
+               AND (status <> 'in_review' OR {writer})
+             ORDER BY created_at, id LIMIT 1"
+            ),
             [root],
             |row| row.get(0),
         )
@@ -629,7 +632,7 @@ pub(super) fn archive_revision(
     if revision.deleted_at.is_some() || revision.status.is_terminal() {
         return Err(precondition(format!("{target} is already `{}`", revision.status)));
     }
-    if let Some((execution, status)) = live_or_pending_execution(conn, &revision.id)? {
+    if let Some((execution, status)) = live_or_pending_execution_except(conn, &revision.id, None)? {
         return Err(ProgressionVerbRefusal::LiveExecution {
             verb: verb.to_string(),
             item: revision.id,
@@ -640,7 +643,9 @@ pub(super) fn archive_revision(
     }
     let parent_green =
         query_task(conn, &root)?.is_some_and(|root| root.ci_required_state.as_deref() == Some("success"));
-    if !parent_green {
+    let finished = revision.status == TaskStatus::InReview
+        || crate::dispatch_admission::revision_implementation_completed(conn, &revision.id)?;
+    if !parent_green && !finished {
         return Err(precondition(format!(
             "the parent PR ({root}) is not green, so {target} may still be doing needed work"
         )));
