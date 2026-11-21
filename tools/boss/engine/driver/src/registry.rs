@@ -164,6 +164,17 @@ fn refuse_inconsistent_interrupt_declaration(slug: &str, driver: &dyn AgentDrive
 }
 
 impl DriverRegistry {
+    /// Process-wide default registry, built once on first use.
+    ///
+    /// Per-event call sites (hook handling, transcript lookup) use this
+    /// instead of rebuilding [`Self::default`] and re-running its
+    /// registration guards on every call. Callers that need to extend the
+    /// registry with [`Self::with_driver`] still build their own.
+    pub fn shared() -> &'static DriverRegistry {
+        static SHARED: std::sync::OnceLock<DriverRegistry> = std::sync::OnceLock::new();
+        SHARED.get_or_init(DriverRegistry::default)
+    }
+
     /// Register (or replace) the driver for `slug`. Chainable.
     ///
     /// Lets a caller extend the default registry — e.g. tests that need a
@@ -286,6 +297,42 @@ mod tests {
                 "driver '{slug}'"
             );
         }
+    }
+
+    /// Minimal subscriber that records whether any ERROR event fired.
+    struct ErrorCapture(Arc<std::sync::atomic::AtomicBool>);
+
+    impl tracing::Subscriber for ErrorCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Building the registry must not probe drivers with a placeholder
+    /// config: agy's wiring logs an ERROR for a config it cannot honour.
+    #[test]
+    fn building_registry_logs_no_error() {
+        let saw_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let subscriber = ErrorCapture(saw_error.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = DriverRegistry::default();
+        });
+        assert!(
+            !saw_error.load(std::sync::atomic::Ordering::SeqCst),
+            "DriverRegistry::default() emitted an ERROR-level event"
+        );
     }
 
     #[test]
