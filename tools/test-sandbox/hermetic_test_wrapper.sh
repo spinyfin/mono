@@ -98,6 +98,11 @@ unset \
   BOSS_SHAKE_INSTALLATION_ID \
   BOSS_SHAKE_PRIVATE_KEY_PEM
 
+# Resolve cleanup executables while runfiles still exist. The watchdog may
+# outlive the executor's removal of the action input tree.
+cleanup_sleep="$("${runtime_bin}/python3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${runtime_bin}/sleep")"
+cleanup_rm="$("${runtime_bin}/python3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${runtime_bin}/rm")"
+
 child_pid=""
 watchdog_pid=""
 cancelled=""
@@ -128,7 +133,7 @@ terminate_child_group() {
       wait "${child_pid}" 2>/dev/null || true
       return 0
     fi
-    "${runtime_bin}/sleep" 0.05
+    "${cleanup_sleep}" 0.05
   done
 
   # Repeat the kill: a launcher caught before setpgid can create its group
@@ -139,7 +144,7 @@ terminate_child_group() {
     if ! process_group_is_alive; then
       return 0
     fi
-    "${runtime_bin}/sleep" 0.05
+    "${cleanup_sleep}" 0.05
   done
 
   printf 'test process group survived SIGKILL: %s\n' "${child_pid}" >&2
@@ -151,10 +156,7 @@ terminate_child_group() {
 # to finish the job.
 release_watchdog() {
   if [[ -n "${watchdog_pid}" ]]; then
-    # The watchdog may still be in its readiness handshake (fd 12) or polling
-    # for the pid file; closing the leftover descriptor cannot steal a pid
-    # the launcher has already written.
-    exec 12<&-
+    # A line on the lifeline acknowledges that cleanup is complete.
     printf 'done\n' >&8 2>/dev/null || true
     wait "${watchdog_pid}" 2>/dev/null || true
     watchdog_pid=""
@@ -168,7 +170,7 @@ cleanup() {
     status=1
   fi
   if [[ "${owns_test_tmpdir}" == "1" ]]; then
-    "${runtime_bin}/rm" -rf "${test_tmpdir}"
+    "${cleanup_rm}" -rf "${test_tmpdir}"
   fi
   release_watchdog
   exit "${status}"
@@ -451,9 +453,7 @@ else:
 #
 # The lifeline FIFO (this shell holds the only write end on fd 8) tells the
 # watchdog whether cleanup already happened. The launcher writes its pid to a
-# regular file rather than a FIFO: Darwin write(2) on a FIFO opened O_RDWR
-# returns EINVAL when no reader is blocked in read yet, which raced the
-# watchdog and failed macOS tests in the merge queue. The watchdog starts
+# regular file so publishing it never depends on a FIFO reader. The watchdog starts
 # first and publishes watchdog-ready before the test can run, so a kill of
 # this group cannot leave a test with no cleanup owner. The kernel closes the
 # lifeline write end however this shell dies. A line on the lifeline says
@@ -461,11 +461,10 @@ else:
 # watchdog does the cleanup in its place.
 lifeline="${TEST_TMPDIR}/wrapper-lifeline"
 announce="${TEST_TMPDIR}/wrapper-child-pid"
-ready_fifo="${TEST_TMPDIR}/wrapper-ready"
-"${runtime_bin}/mkfifo" "${lifeline}" "${ready_fifo}"
+ready_file="${TEST_TMPDIR}/watchdog-ready"
+"${runtime_bin}/mkfifo" "${lifeline}"
 exec 8<>"${lifeline}" 9<"${lifeline}"
-exec 12<>"${ready_fifo}"
-"${runtime_bin}/rm" -f "${lifeline}" "${ready_fifo}"
+"${runtime_bin}/rm" -f "${lifeline}"
 
 # The watchdog gets a group of its own so a kill aimed at this shell's group
 # cannot take it too. It is listening before the test starts. Record this
@@ -477,15 +476,13 @@ set -m
   set +m
   trap - EXIT INT TERM HUP
   exec 8<&- </dev/null >/dev/null 2>&1
-  printf '%s\n' "${wrapper_pid}" >"${TEST_TMPDIR}/watchdog-ready"
   if [[ -n "${hold_before_ready}" ]]; then
     : >"${hold_before_ready}.paused"
     while [[ -e "${hold_before_ready}" ]]; do
-      "${runtime_bin}/sleep" 0.05
+      "${cleanup_sleep}" 0.05
     done
   fi
-  printf 'ready\n' >&12
-  exec 12<&-
+  printf '%s\n' "${wrapper_pid}" >"${ready_file}"
   child_pid=""
   while true; do
     if [[ -s "${announce}" ]]; then
@@ -508,7 +505,7 @@ set -m
     # The wrapper is gone and no launcher pid was published, so no test was
     # started or it exited without announcing. Only the private root is left.
     if [[ "${owns_test_tmpdir}" == "1" ]]; then
-      "${runtime_bin}/rm" -rf "${test_tmpdir}"
+      "${cleanup_rm}" -rf "${test_tmpdir}"
     fi
     exit 0
   fi
@@ -517,7 +514,7 @@ set -m
   fi
   terminate_child_group || true
   if [[ "${owns_test_tmpdir}" == "1" ]]; then
-    "${runtime_bin}/rm" -rf "${test_tmpdir}"
+    "${cleanup_rm}" -rf "${test_tmpdir}"
   fi
 ) &
 watchdog_pid=$!
@@ -530,14 +527,14 @@ exec 9<&-
 # Block until the watchdog says it is listening. There is no give-up bound,
 # because a watchdog that is merely slow to be scheduled on a loaded host is
 # healthy; the wait ends in failure only if the watchdog process has died.
-until IFS= read -r -t 1 _ <&12; do
+until [[ -s "${ready_file}" ]]; do
   exit_if_cancelled
   if ! kill -0 "${watchdog_pid}" 2>/dev/null; then
     printf '%s\n' "watchdog did not start" >&2
     exit 126
   fi
+  "${cleanup_sleep}" 0.05
 done
-exec 12<&-
 exit_if_cancelled
 
 # The launcher stays in this shell's group, writes its pid, then setpgid's
@@ -563,7 +560,7 @@ with open(announce, "w") as pidfile:
         os.fsync(pidfile.fileno())
     except OSError:
         pass
-for fd in (8, 9, 12):
+for fd in (8, 9):
     try:
         os.close(fd)
     except OSError:
@@ -581,7 +578,7 @@ if hold:
 os.setpgid(0, 0)
 os.execvp(sys.argv[1], sys.argv[1:])
 os._exit(127)' \
-  /usr/bin/sandbox-exec -f "${profile}" "$@" 0<&0 8<&- 9<&- 12<&- &
+  /usr/bin/sandbox-exec -f "${profile}" "$@" 0<&0 8<&- 9<&- &
 child_pid=$!
 exit_if_cancelled
 

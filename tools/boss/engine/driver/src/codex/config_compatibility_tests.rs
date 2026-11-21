@@ -290,22 +290,6 @@ impl SymlinkedProgressionRun {
     }
 }
 
-/// Kills the launcher's process group on drop. The launcher's supervisor
-/// kills the driver's own session once the launcher is gone.
-struct LaunchedPane(std::process::Child);
-
-impl Drop for LaunchedPane {
-    fn drop(&mut self) {
-        // A reaped child's group id may already belong to something else.
-        if matches!(self.0.try_wait(), Ok(None)) {
-            // SAFETY: plain signal delivery to the process group this test
-            // created, whose leader has not been reaped.
-            unsafe { libc::killpg(self.0.id() as libc::pid_t, libc::SIGKILL) };
-            let _ = self.0.wait();
-        }
-    }
-}
-
 /// The cause of the failure this file's next test fixes, pinned against the
 /// real CLI: a workspace trusted only under the engine's spelling makes Codex
 /// open its folder-trust dialog. The dialog is watched through the production
@@ -314,8 +298,6 @@ impl Drop for LaunchedPane {
 /// dialog is on screen.
 #[test]
 fn codex_asks_to_trust_a_folder_stamped_only_under_the_engines_spelling() {
-    use std::os::unix::process::CommandExt;
-
     let run = symlinked_progression_run("progression-untrusted-symlink");
     let config_path = run.home.join("config.toml");
     let rendered = fs::read_to_string(&config_path).unwrap();
@@ -364,30 +346,28 @@ except Exception as error:
 (root / "outcome.txt").write_text(outcome)
 "#;
     let config_dir = run.workspace().join(".codex");
-    let mut command = Command::new("python3");
-    command
-        .args(["-I", "-c", harness])
-        .arg(&config_dir)
-        .arg(CODEX_FOLDER_TRUST_DIALOG_MARKER)
-        .args([
-            "codex",
-            "--strict-config",
-            "--no-alt-screen",
-            "-a",
-            "never",
-            "-m",
-            ASTRA_MODEL,
-        ])
-        .current_dir(run.workspace())
-        .env("CODEX_HOME", &run.home)
-        .env("PATH", run.path_with_pinned_codex())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0);
-    let mut pane = LaunchedPane(command.spawn().expect("start the launcher"));
+    let mut pane = boss_engine_test_process::spawn_supervised("python3", |command| {
+        command
+            .args(["-I", "-c", harness])
+            .arg(&config_dir)
+            .arg(CODEX_FOLDER_TRUST_DIALOG_MARKER)
+            .args([
+                "codex",
+                "--strict-config",
+                "--no-alt-screen",
+                "-a",
+                "never",
+                "-m",
+                ASTRA_MODEL,
+            ])
+            .current_dir(run.workspace())
+            .env("CODEX_HOME", &run.home)
+            .env("PATH", run.path_with_pinned_codex())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while pane.0.try_wait().unwrap().is_none() {
+    while pane.try_wait().unwrap().is_none() {
         assert!(
             std::time::Instant::now() < deadline,
             "the CLI showed neither the dialog nor an error"
@@ -421,8 +401,6 @@ except Exception as error:
 /// prompt delivery" for every Codex progression spawn on macOS.
 #[test]
 fn a_progression_launch_in_a_symlinked_workspace_attaches_its_rollout() {
-    use std::os::unix::process::CommandExt;
-
     let run = symlinked_progression_run("progression-symlinked-attach");
     let driver = CodexDriver::default();
     let plan = driver.spawn_invocation(SpawnRequest {
@@ -440,22 +418,20 @@ fn a_progression_launch_in_a_symlinked_workspace_attaches_its_rollout() {
         "{} -c 'openai_base_url=\"http://127.0.0.1:1/v1\"'",
         crate::apply_permission_extra_args(&plan.command, &extra_args).trim_end()
     );
-    let mut pane_command = Command::new("sh");
-    pane_command
-        .args(["-c", &command])
-        .current_dir(run.workspace())
-        .env("PATH", run.path_with_pinned_codex())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(fs::File::create(run.root.join("pane.err")).unwrap())
-        .process_group(0);
-    for directive in &plan.env {
-        match directive {
-            EnvDirective::Set(key, value) => pane_command.env(key, value),
-            EnvDirective::Unset(key) => pane_command.env_remove(key),
-        };
-    }
-    let mut pane = LaunchedPane(pane_command.spawn().expect("start the pane command"));
+    let mut pane = boss_engine_test_process::spawn_supervised("sh", |pane_command| {
+        pane_command
+            .args(["-c", &command])
+            .current_dir(run.workspace())
+            .env("PATH", run.path_with_pinned_codex())
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(run.root.join("pane.err")).unwrap());
+        for directive in &plan.env {
+            match directive {
+                EnvDirective::Set(key, value) => pane_command.env(key, value),
+                EnvDirective::Unset(key) => pane_command.env_remove(key),
+            };
+        }
+    });
 
     let home = crate::initial_prompt::delivery_home(&run.workspace().join(".codex"));
     let deadline = std::time::Instant::now() + Duration::from_secs(45);
@@ -466,7 +442,7 @@ fn a_progression_launch_in_a_symlinked_workspace_attaches_its_rollout() {
         {
             break candidate;
         }
-        let exited = pane.0.try_wait().unwrap();
+        let exited = pane.try_wait().unwrap();
         assert!(
             exited.is_none() && std::time::Instant::now() < deadline,
             "no rollout attached (pane exit {exited:?}); launcher steps {:?}; launcher stderr {:?}",

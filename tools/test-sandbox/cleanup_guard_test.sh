@@ -36,10 +36,18 @@ run_interruption_case() {
   local signal="$1"
   local inner_pid=""
   local inner_root=""
-  local marker="cleanup-$$-${signal}"
+  local marker="cleanup-$$-${signal}-${2:-normal}"
+  local inner_runfiles="${TEST_SRCDIR}"
+  if [[ "${2:-}" == "remove-runfiles" ]]; then
+    inner_runfiles="${TEST_TMPDIR}/disposable-runfiles"
+    mkdir -p "${inner_runfiles}"
+    ln -s "${TEST_SRCDIR}/${TEST_WORKSPACE}" "${inner_runfiles}/${TEST_WORKSPACE}"
+    mkdir -p "${inner_runfiles}/+test_runtime_repository+test_runtime_tools"
+    cp -R "${TEST_SRCDIR}/+test_runtime_repository+test_runtime_tools/." "${inner_runfiles}/+test_runtime_repository+test_runtime_tools/"
+  fi
 
   set -m
-  "${wrapper}" "${child}" "${marker}" &
+  TEST_SRCDIR="${inner_runfiles}" "${wrapper}" "${child}" "${marker}" &
   inner_pid=$!
   set +m
 
@@ -67,6 +75,9 @@ run_interruption_case() {
   fi
 
   read -r child_pid descendant_pid <"${inner_root}/cleanup-child-pids"
+  if [[ "${2:-}" == "remove-runfiles" ]]; then
+    rm -rf "${inner_runfiles}"
+  fi
   if [[ "${signal}" == "KILL" ]]; then
     kill -KILL -- "-${inner_pid}"
     wait "${inner_pid}" 2>/dev/null || true
@@ -263,8 +274,8 @@ wait_bounded() {
   return 1
 }
 
-# A healthy watchdog that is slow to become ready (longer than the old fixed
-# two-second bound) must still end with the test running and succeeding.
+# A healthy watchdog that is slow to become ready must still let the test
+# run and succeed; readiness has a liveness check, not a time limit.
 run_slow_watchdog_case() {
   local marker="cleanup-$$-SLOWREADY"
   local status=0
@@ -374,6 +385,7 @@ run_completion_case
 run_interruption_case TERM
 run_interruption_case HUP
 run_interruption_case KILL
+run_interruption_case KILL remove-runfiles
 run_startup_kill_case
 run_pre_setpgid_case TERM
 run_pre_setpgid_case HUP
