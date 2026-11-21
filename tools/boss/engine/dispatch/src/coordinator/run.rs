@@ -35,6 +35,7 @@ fn pane_spawn_failed_attention_body(
     err: &anyhow::Error,
     released: bool,
     abort_unconfirmed: bool,
+    precondition_line: &str,
 ) -> String {
     let release_state = if released {
         "released back to cube"
@@ -75,8 +76,8 @@ fn pane_spawn_failed_attention_body(
         }
     };
     format!(
-        "{lead}\n\n**Error:** {err_detail}\n\nThe lease was {release_state}. Inspect \
-         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline."
+        "{lead}\n\n**Error:** {err_detail}\n\n{precondition_line}The lease was {release_state}. Inspect \
+         `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline, or run `bossctl dispatch diagnose {exec_id}`."
     )
 }
 
@@ -518,6 +519,10 @@ impl ExecutionCoordinator {
                 // spawn step (prompt composition, driver provision, permission
                 // config, the initial-input script, or tmux session creation).
                 let err_detail = format!("{err:#}");
+                let spawn_failure = self
+                    .lifecycle
+                    .spawn_failure_classification(&err)
+                    .map(|(class, cause)| serde_json::json!({ "class": class, "cause": cause }));
                 let slot_id = slot_id_from_worker_id(&worker_id);
                 // Reconciliation already retried stale occupants. A remaining
                 // rejection must be recorded as a spawn failure.
@@ -545,6 +550,7 @@ impl ExecutionCoordinator {
                             .with_error(&err)
                             .with_details(serde_json::json!({
                                 "run_id": run.id,
+                                "spawn_failure": spawn_failure,
                                 "slot_id": slot_id,
                                 "page": slot_id.and_then(worker_page_label),
                             })),
@@ -656,6 +662,11 @@ impl ExecutionCoordinator {
                 // turns up in the kanban "Attention" lane and via
                 // `ListAttentionItems`. The structured event below
                 // gives tooling a parallel signal.
+                let precondition_line = spawn_failure
+                    .as_ref()
+                    .and_then(|failure| Some((failure.get("class")?.as_str()?, failure.get("cause")?.as_str()?)))
+                    .map(|(class, cause)| format!("**Rejected precondition** (`{class}`): {cause}\n\n"))
+                    .unwrap_or_default();
                 let attention = Some(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
                     work_item_id: None,
@@ -668,6 +679,7 @@ impl ExecutionCoordinator {
                         &err,
                         released,
                         abort_unconfirmed,
+                        &precondition_line,
                     ),
                     resolved_at: None,
                 });
@@ -721,6 +733,7 @@ impl ExecutionCoordinator {
                         let mut error_details = serde_json::json!({
                             "run_id": run.id,
                             "attention_item_id": attention_item_id,
+                            "spawn_failure": spawn_failure,
                             "released_workspace": released,
                             "slot_id": slot_id,
                             "page": slot_id.and_then(worker_page_label),
@@ -1507,7 +1520,7 @@ mod pane_spawn_failed_attention_body_tests {
             (unsubmitted, "Return re-sent 2 time(s)"),
             (undelivered, "the launcher reported a failure"),
         ] {
-            let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+            let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false, "");
             assert!(body.contains("never began working on its prompt"), "{body}");
             assert!(body.contains("the pane was reaped"), "{body}");
             assert!(!body.contains("never came up"), "{body}");
@@ -1518,7 +1531,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn composer_timeout_uses_neutral_wording() {
         let err = composer_not_ready_error("claude", "exec-1", Duration::from_secs(20));
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false, "");
         assert!(
             body.contains("spawn confirmation failed and the pane was reaped"),
             "{body}"
@@ -1531,7 +1544,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn turn_start_timeout_says_the_driver_started() {
         let err = turn_did_not_start_error("claude", "exec-1", Duration::from_secs(45));
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false, "");
         assert!(body.contains("the driver started"), "{body}");
         assert!(body.contains("the pane was reaped"), "{body}");
         assert!(!body.contains("never came up"), "{body}");
@@ -1541,7 +1554,7 @@ mod pane_spawn_failed_attention_body_tests {
     #[test]
     fn other_spawn_failure_says_the_pane_never_came_up() {
         let err = anyhow::anyhow!("worker prompt failed");
-        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false);
+        let body = pane_spawn_failed_attention_body("exec-1", "ws-1", &err, true, false, "");
         assert!(body.contains("worker pane never came up"), "{body}");
         assert!(!body.contains("the driver started"), "{body}");
     }
@@ -1666,6 +1679,10 @@ mod conflict_diagnosis_for_attempt_tests {
                 .push((product_id.to_owned(), conflict_class.to_owned()));
         }
         async fn notify_review_guide_changed(&self, _: &Arc<dyn ExecutionPublisher>, _: &str, _: &str) {}
+        fn spawn_failure_classification(&self, _: &anyhow::Error) -> Option<(&'static str, String)> {
+            None
+        }
+
         fn is_unconfirmed_spawn_abort(&self, _: &anyhow::Error) -> bool {
             false
         }

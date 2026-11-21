@@ -32,6 +32,10 @@ Nothing is deleted, either. Resolution stamps `status = 'resolved'` and `resolve
 
 A signal can be re-raised onto an already-open row instead of getting a fresh one — the dedup contract every filer implements is one open row per (scope, kind). When that happens, `last_raised_at` is stamped forward to the re-raise time while `created_at` keeps recording when the row was first opened, so the boundary check above compares evidence against `COALESCE(last_raised_at, created_at)`, not bare `created_at`. Otherwise evidence from between the original raise and the re-raise would look postdating when it is really stale. For `ExecutionKindCompleted`, the completing execution must also not be the one the attention was filed against — an execution cannot supply the evidence that clears a signal about itself.
 
+## Where a spawn failure surfaces
+
+Execution-scoped `pane_spawn_failed` items appear on the owning work item through `list_attention_items_for_work_item`; review-guide executions resolve to their root task. Other execution-only signals retain their existing scope. Dispatch events also carry `details.spawn_failure` with the rejected step and cause, and the failed run retains the full error chain.
+
 ## Where it runs
 
 - **Inline, on the producing path.** The fastest clear, and the one an operator actually sees: `finalize_pr_review_pass` resolves the dead-review attention as it completes, `dispatch_claimed_execution` resolves the stall attention on slot claim, `start_execution_run_on_host` clears the dispatch-failure columns in the same transaction that flips the execution to `running`.
