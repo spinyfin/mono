@@ -1617,7 +1617,7 @@ fn auto_create_workspace_attaches_real_shared_store() {
     };
 
     let candidate =
-        crate::app::provision::auto_create_workspace(&runner, None, &repo_record, &[]).expect("auto-create");
+        crate::app::provision::auto_create_workspace(&runner, None, &repo_record, &[], &mut None).expect("auto-create");
     assert_eq!(candidate.workspace_id, "mono-agent-001");
     let ws = candidate.workspace_path.clone();
 

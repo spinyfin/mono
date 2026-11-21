@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use fs4::fs_std::FileExt;
 
 use crate::app::CubeError;
+use crate::lock::RepoLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandInvocation {
@@ -159,7 +160,7 @@ const REFRESH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// maintenance pass covers those with its process-table probes and head
 /// checks.
 pub struct JjGate {
-    _file: File,
+    _file: RepoLock,
     quarantine: PathBuf,
 }
 
@@ -383,6 +384,7 @@ impl JjGate {
             }
             .map_err(io_error)?;
             if got {
+                let file = RepoLock::from_locked_file(file);
                 let quarantine = Self::quarantine_path(lock_path);
                 if !exclusive && quarantine.try_exists().map_err(CubeError::Io)? {
                     return Err(CubeError::MaintenanceQuarantined(
@@ -848,6 +850,23 @@ fn unmatched_name_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jj_gate_releases_even_with_a_duplicated_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = JjGate::path(dir.path());
+        let held = JjGate::shared(&path, Duration::ZERO).unwrap();
+        let file = held._file.into_file();
+        let inherited = file.try_clone().unwrap();
+        let held = JjGate {
+            _file: RepoLock::from_locked_file(file),
+            quarantine: held.quarantine,
+        };
+        drop(held);
+        let exclusive = JjGate::exclusive(&path, Duration::ZERO).unwrap();
+        drop(exclusive);
+        drop(inherited);
+    }
 
     #[test]
     fn run_with_timeout_returns_output_for_fast_command() {

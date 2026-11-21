@@ -122,7 +122,7 @@ use crate::app::store_gc_integrity::{GcIndex, collector_version, oldest_shared_c
 
 #[path = "store_gc_rewrite.rs"]
 mod rewrite;
-pub(crate) use rewrite::recover_refresh;
+pub(crate) use rewrite::{recover_refresh, recover_stale_primary};
 
 /// How many times a staged rewrite is prepared again because live operations
 /// advanced while it was being prepared. Each preparation takes minutes on a
@@ -393,6 +393,9 @@ fn op_heads(source: &Path) -> Result<Vec<String>> {
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()
         .map_err(CubeError::Io)?;
+    // jj holds a transient `lock` file here while publishing operation heads.
+    // It is coordination metadata, never an operation to traverse or collect.
+    heads.retain(|head| head != "lock");
     // Directory order is arbitrary; sorted heads give a stable verification order.
     heads.sort();
     Ok(heads)
@@ -774,8 +777,7 @@ pub(super) fn gc_repo_store_with_deadline(
                 .is_some_and(super::store_gc_integrity::uses_staged_rewrite)
         });
         let prepare = |cut: &str| -> Result<Option<rewrite::PreparedRewrite>> {
-            let _reader = JjGate::shared_for_database(database_path)?;
-            rewrite::PreparedRewrite::prepare(runner, &source, cut)
+            rewrite::prepare_with_recovery(runner, database_path, &source, cut)
         };
         let mut staged = match staged_cut.as_deref() {
             Some(cut) => Some(prepare(cut)?),
