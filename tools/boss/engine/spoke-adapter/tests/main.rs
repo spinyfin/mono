@@ -26,6 +26,8 @@ use boss_spoke_adapter::{HostCallError, SpokeAdapterConfig};
 use serde_json::json;
 use support::*;
 
+pub(crate) use support::{elapse, freeze_clock, thaw_clock, until};
+
 const PATH: &str = "/hosts/workspaces/worker";
 
 fn workspace_kind(command: &Command) -> Option<Kind> {
@@ -58,10 +60,10 @@ fn short(deadline_ms: u64) -> SpokeAdapterConfig {
 /// Workspace/lease commands get a load-tolerant deadline; spawn still times
 /// out in `spawn_deadline_ms` so unanswered-spawn tests park quickly.
 ///
-/// Coordinator tests that share this process with dozens of siblings miss a
-/// 200–300ms lease deadline under CI contention, and that miss is recorded as
-/// a pre-start failure (`dispatch_not_before` + count) before the spawn the
-/// test is actually exercising.
+/// Short spawn deadlines are fired with virtual time after the command is
+/// stored, so sibling-test CPU contention cannot expire them before persist.
+/// `command_deadline` stays long so an answered lease cannot miss its window
+/// before the spawn the test is exercising.
 pub(crate) fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
     SpokeAdapterConfig::builder()
         .command_deadline(Duration::from_secs(5))
@@ -72,9 +74,10 @@ pub(crate) fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
 
 /// Spawn is answered; a later control command (Stop) is left unanswered so
 /// `command_deadline` must fire. `spawn_deadline` is load-tolerant so a slow
-/// Spawn reply under CI contention is not an unsettled timeout before Stop is
-/// even sent. `workspace_slack` would raise the Stop deadline to 5s and break
-/// tests that assert the unanswered Stop parks in a few hundred milliseconds.
+/// Spawn reply cannot be an unsettled timeout before Stop is even sent.
+/// `workspace_slack` would raise the Stop deadline to 5s. The unanswered Stop
+/// is expired with virtual time so the retry assertion stays a few hundred
+/// milliseconds of tokio time, independent of sibling-test contention.
 pub(crate) fn answered_spawn_short_stop(command_deadline_ms: u64) -> SpokeAdapterConfig {
     SpokeAdapterConfig::builder()
         .command_deadline(Duration::from_millis(command_deadline_ms))
@@ -181,15 +184,27 @@ async fn a_command_naming_a_run_the_hub_does_not_hold_is_never_stored_or_sent() 
     let mut genuine = genuine;
     genuine.run.as_mut().unwrap().spawn_token = held.spawn_token;
     genuine.run.as_mut().unwrap().run_id = held.run_id;
-    let stored = fx
-        .manager
-        .command(
-            HOST,
-            boss_spoke_stream::store::CommandAdmission::Recovery,
-            genuine,
-            Duration::from_millis(300),
-        )
-        .await;
+    freeze_clock();
+    let waiting = {
+        let manager = fx.manager.clone();
+        tokio::spawn(async move {
+            manager
+                .command(
+                    HOST,
+                    boss_spoke_stream::store::CommandAdmission::Recovery,
+                    genuine,
+                    Duration::from_millis(300),
+                )
+                .await
+        })
+    };
+    until("genuine command stored", || {
+        fx.db.host_command_wire(HOST, "genuine").unwrap().is_some()
+    })
+    .await;
+    elapse(Duration::from_millis(300)).await;
+    thaw_clock();
+    let stored = waiting.await.unwrap();
     assert_eq!(
         stored,
         Err(boss_spoke_stream::CommandOutcome::OutcomeUncertain),
@@ -223,7 +238,20 @@ async fn a_spawn_timeout_is_uncertain_and_a_retry_never_starts_a_second_worker()
     let peer = fx.spoke(Box::new(standard_without_spawn), None, 0).await;
     lease(&adapter).await;
 
-    let error = spawn(&adapter).await.unwrap_err();
+    freeze_clock();
+    let waiting = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { spawn(&adapter).await })
+    };
+    until("unanswered spawn stored", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+    })
+    .await;
+    elapse(Duration::from_millis(500)).await;
+    thaw_clock();
+    let error = waiting.await.unwrap().unwrap_err();
     assert!(error.downcast_ref::<SpawnOutcomeUncertain>().is_some(), "{error:#}");
 
     // The execution stays with this host, and its workspace is not released

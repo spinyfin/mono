@@ -2,6 +2,7 @@
 //! and a scripted spoke on the other end of a real stream.
 mod liveness;
 mod observed_outbox;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +42,166 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server,
 
 pub const STEP: Duration = Duration::from_secs(10);
 pub const HOST: &str = "host";
+
+/// Wall-clock bound for event waits. Virtual time (`tokio::time::timeout`) does
+/// not move while the clock is paused, so a hang must be detected on `Instant`.
+const WAIT: Duration = Duration::from_secs(20);
+const TICK: Duration = Duration::from_millis(20);
+
+thread_local! {
+    static CLOCK_FROZEN: Cell<bool> = const { Cell::new(false) };
+}
+
+fn clock_frozen() -> bool {
+    CLOCK_FROZEN.with(Cell::get)
+}
+
+/// Pause tokio timers on this test thread. gRPC I/O still progresses.
+pub(crate) fn freeze_clock() {
+    CLOCK_FROZEN.with(|frozen| {
+        assert!(!frozen.get(), "tokio clock is already frozen on this thread");
+        frozen.set(true);
+    });
+    tokio::time::pause();
+}
+
+/// Resume tokio timers on this test thread.
+pub(crate) fn thaw_clock() {
+    CLOCK_FROZEN.with(|frozen| {
+        assert!(frozen.get(), "tokio clock is not frozen on this thread");
+        frozen.set(false);
+    });
+    tokio::time::resume();
+}
+
+/// Wait until `ready`. Works while tokio's clock is paused: gRPC I/O still
+/// progresses, and the loop yields instead of sleeping on a frozen timer.
+pub(crate) async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if ready() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if !clock_frozen() {
+            tokio::time::sleep(TICK).await;
+        }
+    }
+}
+
+/// Like [`until`], for async predicates (pool occupancy, and similar).
+pub(crate) async fn until_async<F, Fut>(what: &str, mut ready: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if ready().await {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if !clock_frozen() {
+            tokio::time::sleep(TICK).await;
+        }
+    }
+}
+
+async fn advance_in_steps(by: Duration) {
+    let mut left = by;
+    while !left.is_zero() {
+        let step = left.min(TICK);
+        tokio::time::advance(step).await;
+        tokio::task::yield_now().await;
+        left -= step;
+    }
+}
+
+/// Advance virtual time by `by` in small steps so pulse I/O can run between
+/// ticks. Pauses if needed and resumes only if this call paused.
+pub(crate) async fn elapse(by: Duration) {
+    if clock_frozen() {
+        advance_in_steps(by).await;
+        return;
+    }
+    freeze_clock();
+    advance_in_steps(by).await;
+    thaw_clock();
+}
+
+/// Advance virtual time until `ready`. The clock must already be paused, and
+/// the unanswered command must already be stored: advancing before persist
+/// would fire the deadline as `OutcomeUncertain` without a durable command.
+pub(crate) async fn until_elapsed(what: &str, mut ready: impl FnMut() -> bool) {
+    debug_assert!(clock_frozen());
+    let deadline = std::time::Instant::now() + WAIT;
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if ready() {
+            return;
+        }
+        tokio::time::advance(TICK).await;
+    }
+}
+
+/// Freeze timers until `stored` (command on the wire), then advance virtual
+/// time until `ready` (retries exhausted, parked, attention). Use when `ready`
+/// is driven by tokio timers, not wall-clock assignment age.
+pub(crate) async fn until_ready_after_stored(
+    stored_what: &str,
+    stored: impl FnMut() -> bool,
+    ready_what: &str,
+    ready: impl FnMut() -> bool,
+) {
+    freeze_clock();
+    until(stored_what, stored).await;
+    until_elapsed(ready_what, ready).await;
+    thaw_clock();
+}
+
+/// Freeze timers until `stored`, fire `deadline` once, then thaw. Use when the
+/// next wait is wall-clock (lease `attention_after` is assignment age).
+pub(crate) async fn fire_after_stored(stored_what: &str, stored: impl FnMut() -> bool, deadline: Duration) {
+    freeze_clock();
+    until(stored_what, stored).await;
+    elapse(deadline).await;
+    thaw_clock();
+}
+
+/// Wall-clock grace for a later persist when earlier commands may still be
+/// in flight in parallel. Longer than the 200–300 ms persist stalls that
+/// used to miss real-time deadlines, short of [`WAIT`].
+const PARALLEL_PERSIST: Duration = Duration::from_secs(2);
+
+/// Freeze until `count` commands are persisted, then fire `deadline`. If
+/// dispatch serializes attempts on a slot, fire `deadline` once to release
+/// it rather than advancing while a later persist is in flight (that would
+/// record a pre-start failure).
+pub(crate) async fn fire_after_all_stored(
+    first_what: &str,
+    mut stored_count: impl FnMut() -> usize,
+    count: usize,
+    deadline: Duration,
+) {
+    freeze_clock();
+    until(first_what, || stored_count() >= 1).await;
+    while stored_count() < count {
+        let target = stored_count() + 1;
+        let grace = std::time::Instant::now() + PARALLEL_PERSIST;
+        while stored_count() < target && std::time::Instant::now() < grace {
+            tokio::task::yield_now().await;
+        }
+        if stored_count() < target {
+            elapse(deadline).await;
+            until("a later unanswered command to be stored", || stored_count() >= target).await;
+        }
+    }
+    elapse(deadline).await;
+    thaw_clock();
+}
 
 struct Authority {
     events: broadcast::Sender<CredentialEvent>,
@@ -803,19 +964,11 @@ impl Peer {
     }
 
     pub async fn wait_for_command(&self, count: usize) -> Vec<Command> {
-        let deadline = tokio::time::Instant::now() + STEP;
-        loop {
-            let seen = self.commands();
-            if seen.len() >= count {
-                return seen;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "spoke saw {} of {count} commands",
-                seen.len()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        until(&format!("spoke saw {count} commands"), || {
+            self.commands().len() >= count
+        })
+        .await;
+        self.commands()
     }
 
     /// Answer a command the spoke chose not to answer in time.

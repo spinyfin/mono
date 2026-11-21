@@ -119,6 +119,63 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
     }
 }
 
+/// Spawn is answered, the prompt wait is a tokio timer, and Stop is unanswered.
+/// Freeze until the pane pid is recorded (spawn settled), thaw so the prompt
+/// wait can run, freeze again once Stop is stored, then fire its deadline.
+#[tokio::test]
+async fn restarted_unconfirmed_stop_launch_keeps_reconciling() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "unconfirmed_stop");
+    fx.signals.0.store(false, Ordering::SeqCst);
+    let peer = fx
+        .spoke(
+            Box::new(|c| match &c.body {
+                Some(command::Body::Spawn(_)) => answer(c),
+                Some(command::Body::Adopt(_)) => Some(refused(c, ResultCode::OutcomeUncertain, "cannot observe")),
+                Some(command::Body::Stop(_)) => None,
+                _ => answer(c),
+            }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    freeze_clock();
+    until("spawn command stored", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+    })
+    .await;
+    until("pane pid recorded before prompt wait", || {
+        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
+    })
+    .await;
+    thaw_clock();
+    until("unconfirmed stop stored", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Stop(_))))
+    })
+    .await;
+    freeze_clock();
+    elapse(Duration::from_millis(300)).await;
+    until("launch attention", || attention_open(&fx, &execution.id)).await;
+    thaw_clock();
+    let next = restarted(&fx, &env.coordinator, 1).await;
+    assert!(fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap());
+    next.reconcile_ended_in_doubt_spokes().await;
+    elapse(Duration::from_millis(400)).await;
+    assert!(attention_open(&fx, &execution.id), "unconfirmed_stop");
+    assert!(
+        fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap(),
+        "unconfirmed_stop"
+    );
+    assert_never_failed(&fx, &execution.id);
+    next.abort_driving_runs();
+}
+
 #[tokio::test]
 async fn terminal_release_in_flight_is_retried_without_a_stop() {
     let fx = Fixture::with(short(300)).await;
@@ -141,12 +198,14 @@ async fn terminal_release_in_flight_is_retried_without_a_stop() {
             0,
         )
         .await;
+    freeze_clock();
     env.coordinator.kick();
     until("launch finalized", || {
         fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
             && fx.db.active_run_ids_for_execution(&execution.id).unwrap().is_empty()
     })
     .await;
+    thaw_clock();
     fx.db
         .connect()
         .unwrap()
@@ -156,8 +215,11 @@ async fn terminal_release_in_flight_is_retried_without_a_stop() {
         )
         .unwrap();
     let adapter = fx.adapter(HOST, &execution.id).await.unwrap();
+    freeze_clock();
     let release = tokio::spawn(async move { adapter.release_workspace("lease-1").await });
     until("release command stored", || released(&peer.commands())).await;
+    elapse(Duration::from_millis(300)).await;
+    thaw_clock();
     env.coordinator.reconcile_ended_in_doubt_spokes().await;
     assert!(!stopped(&peer.commands()), "sweep must not stop during normal release");
     assert!(release.await.unwrap().is_err(), "unanswered release stays pending");

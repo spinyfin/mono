@@ -1,5 +1,9 @@
 //! The real dispatch coordinator against the authenticated scripted spoke.
 use super::{short, support::*, timing, workspace_slack};
+
+pub(crate) use super::support::{
+    elapse, fire_after_all_stored, freeze_clock, thaw_clock, until, until_elapsed, until_ready_after_stored,
+};
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
     lifecycle_adapter::CoreLifecycleServices,
@@ -141,16 +145,6 @@ fn triage(fx: &Fixture, env: &Env, name: &str) -> WorkExecution {
     fx.db.create_automation_triage_execution(&automation.id, REPO).unwrap()
 }
 
-async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while !ready() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
-}
-
 fn attention_open(fx: &Fixture, execution_id: &str) -> bool {
     fx.db
         .list_attention_items(execution_id)
@@ -239,9 +233,16 @@ async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconc
         )
         .await;
     env.coordinator.kick();
-    until("the unanswered spawn to be parked", || {
-        attention_open(&fx, &execution.id)
-    })
+    until_ready_after_stored(
+        "the unanswered spawn to be stored",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        "the unanswered spawn to be parked",
+        || attention_open(&fx, &execution.id),
+    )
     .await;
 
     // Parked, not failed: the execution is still running, still has its
@@ -252,14 +253,12 @@ async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconc
         ExecutionStatus::Running
     );
     assert!(fx.db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while env.pool.busy_count().await != 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the pool slot must be handed back while the spawn is in doubt");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    until_async(
+        "the pool slot must be handed back while the spawn is in doubt",
+        || async { env.pool.busy_count().await == 0 },
+    )
+    .await;
+    elapse(Duration::from_millis(600)).await;
     assert_never_failed(&fx, &execution.id);
     assert!(!released(&peer.commands()));
 
@@ -312,11 +311,18 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
         )
         .await;
     env.coordinator.kick();
-    until("the indeterminate spawn to be parked", || {
-        attention_open(&fx, &execution.id)
-    })
+    until_ready_after_stored(
+        "the indeterminate spawn to be stored",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        "the indeterminate spawn to be parked",
+        || attention_open(&fx, &execution.id),
+    )
     .await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    elapse(Duration::from_millis(600)).await;
     assert_never_failed(&fx, &execution.id);
     assert!(fx.db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
     assert!(!released(&peer.commands()));
@@ -357,9 +363,16 @@ async fn a_settled_uncertain_spawn_the_host_then_reports_absent_fails_and_releas
         )
         .await;
     env.coordinator.kick();
-    until("definitive evidence to fail the execution", || {
-        fx.db.get_execution(&execution.id).unwrap().status.is_terminal()
-    })
+    until_ready_after_stored(
+        "the uncertain spawn to be stored",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        "definitive evidence to fail the execution",
+        || fx.db.get_execution(&execution.id).unwrap().status.is_terminal(),
+    )
     .await;
     assert_eq!(
         fx.db.get_execution(&execution.id).unwrap().status,
@@ -397,7 +410,17 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
         )
         .await;
     env.coordinator.kick();
-    until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    until_ready_after_stored(
+        "the in-doubt spawn to be stored",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        "the spawn to be parked",
+        || attention_open(&fx, &execution.id),
+    )
+    .await;
     fx.db.lease_persona_for_execution(&execution.id).unwrap();
     assert!(persona_held(&fx, &execution.id));
     fx.db
@@ -410,7 +433,7 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
             },
         )
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    elapse(Duration::from_secs(1)).await;
     assert_eq!(
         fx.db.get_execution(&execution.id).unwrap().status,
         ExecutionStatus::Cancelled
@@ -660,8 +683,8 @@ async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty
             0,
         )
         .await;
+    freeze_clock();
     env.coordinator.kick();
-    peer.wait_for_command(1).await;
     until("the spawn to be sent", || {
         peer.commands()
             .iter()
@@ -678,8 +701,9 @@ async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty
             [],
         )
         .unwrap();
-    until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    until_elapsed("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    elapse(Duration::from_secs(1)).await;
+    thaw_clock();
     assert_never_failed(&fx, &execution.id);
     assert_eq!(
         fx.db.get_execution(&execution.id).unwrap().status,
@@ -712,14 +736,17 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_for_the_repo_from_leas
         )
         .await;
     env.coordinator.kick();
-    until("both unanswered leases to be parked", || {
-        executions[..2].iter().all(|e| attention_open(&fx, &e.id))
-    })
-    .await;
+    // Lease deadline is 5s (`workspace_slack`); freeze is not required. The
+    // scheduler may serialize the unanswered leases, so the third spawn can
+    // land only after those 5s waits park — still well inside `until`.
     until("the third execution to lease and spawn", || {
         peer.commands()
             .iter()
             .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == executions[2].id)
+    })
+    .await;
+    until("both unanswered leases to be parked", || {
+        executions[..2].iter().all(|e| attention_open(&fx, &e.id))
     })
     .await;
     for execution in &executions[..2] {
@@ -762,6 +789,7 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
             0,
         )
         .await;
+    freeze_clock();
     env.coordinator.kick();
     // Cancel as soon as the spawn is out, possibly before it is parked.
     until("the spawn to be sent", || {
@@ -770,6 +798,7 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
             .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
     })
     .await;
+    thaw_clock();
     fx.db.lease_persona_for_execution(&execution.id).unwrap();
     assert!(persona_held(&fx, &execution.id));
     fx.db
@@ -789,7 +818,7 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
     // session does not exist, but the spawn is unanswered and still deliverable.
     let restarted = restarted(&fx, &env.coordinator, 1).await;
     restarted.reconcile_ended_in_doubt_spokes().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    elapse(Duration::from_millis(500)).await;
     restarted.reconcile_ended_in_doubt_spokes().await;
     assert!(!released(&peer.commands()), "no release while the spawn is unanswered");
     assert!(attention_open(&fx, &execution.id));
@@ -836,7 +865,17 @@ async fn a_parked_running_spawn_is_reconciled_from_stored_state_after_a_restart(
         )
         .await;
     env.coordinator.kick();
-    until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
+    until_ready_after_stored(
+        "the unanswered spawn to be stored",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        "the spawn to be parked",
+        || attention_open(&fx, &execution.id),
+    )
+    .await;
     assert_eq!(
         fx.db.get_execution(&execution.id).unwrap().status,
         ExecutionStatus::Running
@@ -899,12 +938,16 @@ async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
         )
         .await;
     env.coordinator.kick();
-    until("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
-    until("the spawn command to reach the spoke", || {
-        peer.commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
-    })
+    until_ready_after_stored(
+        "the spawn command to reach the spoke",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        "the spawn to be parked",
+        || attention_open(&fx, &execution.id),
+    )
     .await;
     let spawn = peer
         .commands()
@@ -951,7 +994,7 @@ async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
     restarted.reconcile_ended_in_doubt_spokes().await;
     assert!(!fx.db.spoke_execution_in_doubt(&execution.id).unwrap());
     assert!(!attention_open(&fx, &execution.id));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    elapse(Duration::from_millis(300)).await;
     assert_eq!(
         count(&peer, |c| matches!(c.body, Some(command::Body::Spawn(_)))),
         spawns
@@ -989,6 +1032,7 @@ async fn an_unanswered_spawn_still_in_pre_attention_retries_is_reconciled_after_
             0,
         )
         .await;
+    freeze_clock();
     env.coordinator.kick();
     until("the spawn to be sent", || {
         peer.commands()
@@ -1005,6 +1049,7 @@ async fn an_unanswered_spawn_still_in_pre_attention_retries_is_reconciled_after_
     restarted.reconcile_ended_in_doubt_spokes().await;
     assert!(!attention_open(&fx, &execution.id));
     assert_never_failed(&fx, &execution.id);
+    thaw_clock();
 
     let spawn = peer
         .commands()
@@ -1061,6 +1106,12 @@ async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released(
         )
         .await;
     env.coordinator.kick();
+    fire_after_stored(
+        "the unanswered lease to be stored",
+        || peer.commands().iter().any(is_lease),
+        Duration::from_secs(5),
+    )
+    .await;
     until("the lease to be parked", || attention_open(&fx, &execution.id)).await;
     fx.db
         .cancel_execution_with(
@@ -1107,6 +1158,13 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         )
         .await;
     env.coordinator.kick();
+    fire_after_all_stored(
+        "an unanswered lease to be stored",
+        || peer.commands().iter().filter(|c| is_lease(c)).count(),
+        2,
+        Duration::from_secs(5),
+    )
+    .await;
     until("both unanswered leases to be parked", || {
         parked.iter().all(|e| attention_open(&fx, &e.id))
     })
@@ -1172,25 +1230,30 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     fx.add_spoke_host("other", 8);
     let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
     let second = triage(&fx, &env, "stranded ready");
+    // Freeze the unanswered Adopt's command deadline so a kick that only
+    // happens when that deadline fires cannot satisfy the assertion. Fire one
+    // heartbeat interval (the stagger), thaw, then wait on I/O. Spawn must
+    // land well before the remaining ~5s Adopt deadline.
+    freeze_clock();
     let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
-    // The first beat is staggered by one 80 ms interval; the second host then
-    // has to Hello, lease and spawn. 3 s covers many beats under a loaded
-    // integration binary and stays below the 5 s command deadline, so a kick
-    // that only happens when that deadline fires still fails the test.
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if other
+    elapse(Duration::from_millis(80)).await;
+    thaw_clock();
+    let kicked = std::time::Instant::now();
+    until(
+        "a stranded ready row is re-kicked by the heartbeat while Adopt is unanswered",
+        || {
+            other
                 .commands()
                 .iter()
                 .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == second.id)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("a stranded ready row is re-kicked by the heartbeat while Adopt is unanswered");
+        },
+    )
+    .await;
+    assert!(
+        kicked.elapsed() < Duration::from_secs(2),
+        "spawn must come from the heartbeat, not the Adopt deadline ({:?})",
+        kicked.elapsed()
+    );
 }
 
 mod recovery;
