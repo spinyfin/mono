@@ -210,10 +210,10 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             // Driven from the runs that ended inside the window, which the
             // partial expression index `work_runs_local_shell_ended_idx`
-            // finds directly. The earlier shape walked every terminal
-            // execution and probed its latest run, so each pass read all of
-            // `work_executions` and `work_runs`. A run is at most one
-            // execution's latest, so the join returns each execution once.
+            // finds directly. Starting from every terminal execution and
+            // probing its latest run would read all of `work_executions` and
+            // `work_runs` on each pass. A run is at most one execution's
+            // latest, so the join returns each execution once.
             "SELECT e.id, e.work_item_id, e.status
              FROM work_runs r
              CROSS JOIN work_executions e ON e.id = r.execution_id

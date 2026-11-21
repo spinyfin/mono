@@ -438,6 +438,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking::migrate_membership,
         },
         Migration {
+            id: project_postmortem::TASK_CHANGED_TRIGGER_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: project_postmortem::migrate_task_changed_trigger_project_index,
+        },
+        Migration {
             id: "20261109_1930_preserved_archive_cleanup".into(),
             legacy_version: None,
             apply: preserved_cleanup::migrate_archive_cleanup,

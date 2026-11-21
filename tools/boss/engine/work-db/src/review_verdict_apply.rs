@@ -655,10 +655,9 @@ impl WorkDb {
         Ok(remediating_task_id.is_some().then_some(applied_ref))
     }
 
-    /// `list_worker_proposals` orders newest-first (its `bossctl` callers
-    /// want that); this applier processes oldest-first so proposals apply in
-    /// the order the batches were decided, so the result is reversed here
-    /// rather than by adding a second `ORDER BY` variant of the same query.
+    /// Undecided review verdicts, oldest first, so they apply in the order
+    /// the batches were decided. `list_undecided_proposals` already returns
+    /// that order (`ORDER BY created_at ASC, id ASC`).
     ///
     /// This runs every ten seconds, so it reads only undecided rows:
     /// `state = 'proposed'` is spelled as a literal so the statement is

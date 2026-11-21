@@ -41,6 +41,18 @@ UPDATE work_executions SET pr_body_before = (SELECT k1 || k1 || k1 FROM fill) WH
 UPDATE work_runs SET result_summary = (SELECT substr(k1, 1, 800) FROM fill),
                      tmux_pane_observation = (SELECT substr(k1, 1, 500) FROM fill);
 UPDATE tasks SET description = description || (SELECT k1 || k1 || k1 || k1 || k1 || k1 FROM fill) WHERE rowid % 3 = 0;
+UPDATE work_runs SET host_id = 'anaplian', remote_pid = 1000 + rowid
+WHERE execution_id IN (SELECT id FROM work_executions WHERE status IN ('completed', 'failed'));
+UPDATE work_runs SET host_id = 'anaplian', remote_pid = 2000 + rowid
+WHERE execution_id IN (SELECT id FROM work_executions WHERE status = 'running');
+UPDATE work_executions SET cube_lease_id = 'lease_' || id
+WHERE id IN (
+    SELECT id FROM work_executions
+    WHERE status = 'completed' AND id IN (SELECT execution_id FROM work_runs WHERE host_id = 'anaplian')
+    LIMIT 3
+);
+UPDATE work_runs SET persona_lease_active = 1, persona = 'Data' || rowid
+WHERE execution_id IN (SELECT id FROM work_executions WHERE cube_lease_id IS NOT NULL);
 WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < 1999)
 INSERT INTO work_comments(id, artifact_kind, artifact_id, doc_version, anchor_json, body, author, status,
                           plain_text_projection_version, created_at, updated_at)
@@ -256,6 +268,54 @@ fn report(label: &str, fixture: &Fixture, results: &[(&'static str, &'static str
     println!("sweep_read_budget {label}: one pass of every read = {total} pages");
 }
 
+fn assert_remote_reconcile_covers_history_and_live_tail(label: &str, db: &WorkDb) {
+    let conn = db.connect().unwrap();
+    let remote_runs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM work_runs WHERE host_id != 'local'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let running: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM work_executions WHERE status = 'running'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let cleanup_holders: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM work_executions WHERE cube_lease_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    assert!(
+        remote_runs > 1000,
+        "{label}: fixture must hold a large settled remote history, got {remote_runs} remote runs"
+    );
+    assert!(
+        running > 0 && running < 200,
+        "{label}: fixture must hold a small live remote tail, got {running} running executions"
+    );
+    let live = db.list_live_remote_runs().unwrap();
+    assert_eq!(
+        live.len(),
+        running as usize,
+        "{label}: live remote reconcile must return the running tail, not settled history ({remote_runs} remote runs)"
+    );
+    assert!(
+        live.iter().all(|handle| handle.host_id != "local"),
+        "{label}: live remote handles must all be remote"
+    );
+    let cleanup = db.terminal_remote_cleanup_runs().unwrap();
+    assert_eq!(
+        cleanup.len(),
+        cleanup_holders as usize,
+        "{label}: terminal remote cleanup must return the resource-holding tail"
+    );
+}
+
 fn assert_within_budget(label: &str, results: &[(&'static str, &'static str, Measured)]) {
     let over: Vec<String> = results
         .iter()
@@ -289,6 +349,8 @@ fn sweep_read_budget_holds_with_fresh_statistics() {
         );
     }
     assert_within_budget("fresh", &results);
+    assert_remote_reconcile_covers_history_and_live_tail("fresh", &fixture.db);
+    assert_postmortem_plans("fresh", &fixture.db);
 }
 
 #[test]
@@ -297,6 +359,8 @@ fn sweep_read_budget_holds_without_statistics() {
     let results = measure_all(&fixture);
     report("none", &fixture, &results);
     assert_within_budget("none", &results);
+    assert_remote_reconcile_covers_history_and_live_tail("none", &fixture.db);
+    assert_postmortem_plans("none", &fixture.db);
 }
 
 #[test]
@@ -305,6 +369,8 @@ fn sweep_read_budget_holds_with_average_only_statistics() {
     let results = measure_all(&fixture);
     report("averages", &fixture, &results);
     assert_within_budget("averages", &results);
+    assert_remote_reconcile_covers_history_and_live_tail("averages", &fixture.db);
+    assert_postmortem_plans("averages", &fixture.db);
 }
 
 #[test]
@@ -313,4 +379,47 @@ fn sweep_read_budget_holds_with_statistics_from_before_the_upgrade() {
     let results = measure_all(&fixture);
     report("upgraded", &fixture, &results);
     assert_within_budget("upgraded", &results);
+    assert_remote_reconcile_covers_history_and_live_tail("upgraded", &fixture.db);
+    assert_postmortem_plans("upgraded", &fixture.db);
+}
+
+fn plan_of(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let bindings: Vec<&str> = if sql.contains("?2") {
+        vec!["proj_ws000", "0"]
+    } else {
+        vec!["proj_ws000"]
+    };
+    stmt.query_map(rusqlite::params_from_iter(bindings), |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// Project-scoped postmortem reads must seek `tasks_project_idx` under every
+/// statistics regime. `tasks_status_idx` would otherwise be a candidate for
+/// `status = 'done'` and walk every done task instead of one project.
+fn assert_postmortem_plans(label: &str, db: &WorkDb) {
+    let conn = db.connect().unwrap();
+    for (name, sql) in [
+        ("latest", crate::project_postmortem::POSTMORTEM_LATEST_SQL),
+        ("live open", crate::project_postmortem::POSTMORTEM_LIVE_OPEN_SQL),
+        ("open count", crate::project_postmortem::POSTMORTEM_OPEN_COUNT_SQL),
+        ("done work", crate::project_postmortem::POSTMORTEM_DONE_WORK_SQL),
+        (
+            "trigger exists",
+            crate::project_postmortem::POSTMORTEM_TRIGGER_DONE_EXISTS_SQL,
+        ),
+    ] {
+        let plan = plan_of(&conn, sql);
+        println!("postmortem plan {name} ({label}): {plan:?}");
+        assert!(
+            plan.iter().any(|step| step.contains("tasks_project_idx")),
+            "{name} ({label}) must seek tasks_project_idx: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.contains("tasks_status_idx")),
+            "{name} ({label}) must not use tasks_status_idx: {plan:#?}"
+        );
+    }
 }

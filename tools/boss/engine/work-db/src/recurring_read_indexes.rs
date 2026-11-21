@@ -4,11 +4,11 @@
 //! look for a handful of live rows: tasks in one open status, executions
 //! that have not finished, undecided proposals, runs on a remote host.
 //! Without an index on the column that says "live", each of those reads
-//! walked its whole table on every tick, and for `tasks` and
-//! `worker_proposals` followed every row's overflow chain as well, because
+//! walks its whole table on every tick, and for `tasks` and
+//! `worker_proposals` follows every row's overflow chain as well, because
 //! the columns being tested are stored after the description or payload.
-//! Summed over the timers, an idle engine re-read its database several times
-//! a minute.
+//! Summed over the timers, an idle engine would re-read its database several
+//! times a minute.
 //!
 //! Six of the eight are partial: they hold only the live rows, so they stay
 //! a few pages however much history accumulates. A partial index can only

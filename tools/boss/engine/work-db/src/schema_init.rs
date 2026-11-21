@@ -1003,6 +1003,10 @@ mod floor_tests {
                 Box::new(|c| super::super::parking::migrate_membership(c).unwrap()),
             ),
             (
+                super::super::project_postmortem::TASK_CHANGED_TRIGGER_MIGRATION_ID,
+                Box::new(|c| super::super::project_postmortem::migrate_task_changed_trigger_project_index(c).unwrap()),
+            ),
+            (
                 "20261109_1930_preserved_archive_cleanup",
                 Box::new(|c| preserved_cleanup::migrate_archive_cleanup(c).unwrap()),
             ),

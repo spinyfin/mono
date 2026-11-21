@@ -46,7 +46,7 @@ Each of these reads looks for a handful of live rows: tasks in one open status, 
 | Orphan sweep, review recovery                                                  | 60 s  |         12,003, 12,003 | no index on `tasks.status`                                                                      |
 | Pane-death sweep: recent terminal executions                                   | 60 s  |                 20,602 | visited every finished execution and its latest run                                             |
 | Pane-death, lease release, lost workspace, answer-agent completion             | 60 s  |             7,844 each | no index covering unfinished executions                                                         |
-| Remote lease reconcile (two reads)                                             | 60 s  |             7,468 each | no index on `work_runs.host_id`                                                                 |
+| Remote lease reconcile (two reads)                                             | 60 s  |             7,468 each | started from every remote run; execution status applied after visiting history                  |
 
 Measured by the engine's own heavy-read log on the fixture. The fixture's `tasks` table is 12,192 pages, `work_executions` 7,836, `work_runs` 7,467 and `worker_proposals` 18,757.
 
@@ -72,6 +72,7 @@ Several statements were rewritten or pinned so the plan does not depend on plann
 - The verdict applier reads undecided proposals through a dedicated statement with `state = 'proposed'` as a literal.
 - The pane-death sweep's terminal read starts from the runs that ended inside its window instead of from every finished execution.
 - Unfinished executions are sought through the existing status index with the list of non-terminal statuses, generated from the `ExecutionStatus` enum. A partial index on `status NOT IN (<terminal>)` was tried first and rejected: it took over the plan of the in-flight workspace read from the index built for it.
+- Remote lease reconcile starts from unfinished executions (live runs) and from executions or runs that still hold a cube or persona lease (terminal cleanup). It does not walk historical remote runs.
 - The scheduler beat's two reads name the status index and start from pending executions. `queued_displays` returns "still on the board" as a result column rather than a `WHERE` term, which is what stops the Bloom filter.
 - Joins whose order matters use `CROSS JOIN`, and statements that depend on one partial index name it with `INDEXED BY`.
 

@@ -1164,24 +1164,26 @@ impl WorkDb {
     /// yields its current run rather than an ancient one.
     pub fn list_live_remote_runs(&self) -> Result<Vec<RemoteRunHandle>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        // Driven from unfinished executions through the status index, then
+        // the preferred run of each. Starting from `host_id != 'local'`
+        // would visit every historical remote run, settled or live.
+        let unfinished = super::recurring_read_indexes::unfinished_execution_statuses_sql();
+        let mut stmt = conn.prepare(&format!(
             "SELECT r.id, r.execution_id, r.host_id, r.remote_pid
-             FROM work_runs r
-             CROSS JOIN work_executions e ON e.id = r.execution_id
-             WHERE r.host_id != 'local'
-               AND e.status NOT IN
-                   ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
-               AND r.id = (
+             FROM work_executions e INDEXED BY work_executions_ready_idx
+             CROSS JOIN work_runs r ON r.id = (
                    SELECT r2.id FROM work_runs r2
-                   WHERE r2.execution_id = r.execution_id
+                   WHERE r2.execution_id = e.id
                    ORDER BY
                      CASE WHEN r2.finished_at IS NULL THEN 0 ELSE 1 END,
                      r2.created_at DESC,
                      r2.id DESC
                    LIMIT 1
                )
+             WHERE e.status IN ({unfinished})
+               AND r.host_id != 'local'
              ORDER BY r.created_at ASC, r.id ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(RemoteRunHandle {
                 run_id: row.get(0)?,
@@ -1232,14 +1234,26 @@ impl WorkDb {
     /// persona release. Tmux-owned executions are excluded.
     pub fn terminal_remote_cleanup_runs(&self) -> Result<Vec<RemoteRunHandle>> {
         let conn = self.connect()?;
+        // Driven from the rows that still hold a resource: finished
+        // executions with a cube lease, and runs with an active persona.
+        // Starting from every remote run would visit settled history that
+        // holds neither.
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT r.execution_id FROM work_runs r
-             CROSS JOIN work_executions e ON e.id = r.execution_id
-             WHERE r.host_id != 'local'
-               AND r.id = (SELECT latest.id FROM work_runs latest
+            "SELECT DISTINCT r.execution_id FROM (
+                   SELECT id FROM work_executions INDEXED BY work_executions_terminal_lease_idx
+                   WHERE status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+                     AND cube_lease_id IS NOT NULL
+                   UNION
+                   SELECT execution_id FROM work_runs INDEXED BY work_runs_execution_persona_lease
+                   WHERE persona_lease_active = 1
+               ) candidates
+             CROSS JOIN work_executions e ON e.id = candidates.id
+             CROSS JOIN work_runs r ON r.id = (
+                   SELECT latest.id FROM work_runs latest
                    WHERE latest.execution_id = e.id
                    ORDER BY CASE WHEN latest.finished_at IS NULL THEN 0 ELSE 1 END,
                        latest.created_at DESC, latest.id DESC LIMIT 1)
+             WHERE r.host_id != 'local'
                AND e.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND (r.persona_lease_active = 1 OR (e.cube_lease_id IS NOT NULL AND r.remote_pid IS NOT NULL))
                AND NOT EXISTS (SELECT 1 FROM work_runs t
