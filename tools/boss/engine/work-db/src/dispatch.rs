@@ -715,20 +715,14 @@ impl WorkDb {
                 }
             }
             // When the predecessor was orphaned by the startup reaper
-            // (worker pane died across the engine restart), default
-            // the new ready row's `preferred_workspace_id` to the
-            // orphan's `cube_workspace_id`. The orphan's workspace
-            // typically still holds in-flight commits the human wants
-            // resumed — without this hint the dispatcher would lease
-            // any free workspace and the fresh worker would start
-            // against `main` on an unrelated branch. This hint covers
-            // orphaned predecessors. The shared request helper separately
-            // restores the durable preference of a deliberately blocked run.
-            // When the predecessor was orphaned, carry forward both its
-            // workspace and the allow_dirty flag so the recovering worker
-            // reclaims the dirty workspace in place (uncommitted WIP
-            // intact) rather than cube resetting it or falling back to
-            // a fresh workspace that has no patch.
+            // (worker pane died across the engine restart), copy its
+            // `cube_workspace_id` onto the new ready row as
+            // `preferred_workspace_id` and set `allow_dirty`. The
+            // shared request helper separately restores the durable
+            // preference of a deliberately blocked run. Unpublished
+            // work is restaged from the engine-owned
+            // `preserved/<execution>` bookmark after a clean cube
+            // lease, not by reclaiming the dead worker's workspace.
             let OrphanHandoff {
                 is_orphaned_predecessor,
                 preferred_workspace_id,
@@ -845,9 +839,10 @@ impl WorkDb {
                 }
             }
             // The on-free rescan is the normal redispatch path after a
-            // dead-worker reap. Keep its orphan handoff identical to the
-            // startup reconcile so recovery gets the same dirty workspace
-            // first and can restage preserved work into it.
+            // dead-worker reap that went through `release_worker_and_kick`.
+            // Keep its orphan handoff identical to the startup reconcile
+            // so the successor row carries the same workspace hint, then
+            // restage preserved work from the engine-owned bookmark.
             let OrphanHandoff {
                 is_orphaned_predecessor,
                 preferred_workspace_id,

@@ -2366,8 +2366,9 @@ async fn does_not_reopen_a_retired_spawning_attempt() {
 /// it never touches `tasks.autostart` or calls `release_worker_and_kick`,
 /// so this sweep's periodic pass (not `rescan_active_dispatch`) is what
 /// mints the successor. The successor must inherit the dead worker's
-/// workspace and `allow_dirty`, exactly like the other two redispatch
-/// paths, so a reaped item's preserved work can be restaged into it.
+/// workspace hint and `allow_dirty`, exactly like the other two redispatch
+/// paths, so restaging from the preserved bookmark has the same dispatch
+/// row the startup reconcile would have written.
 #[tokio::test]
 async fn redispatch_inherits_dirty_workspace_from_orphaned_predecessor() {
     let (_dir, db) = open_db();
@@ -2397,10 +2398,10 @@ async fn redispatch_inherits_dirty_workspace_from_orphaned_predecessor() {
     assert_eq!(
         successor.preferred_workspace_id.as_deref(),
         Some("ws-1"),
-        "successor must inherit the reaped execution's workspace so cube can re-lease it dirty",
+        "successor must inherit the reaped execution's workspace as preferred_workspace_id",
     );
     assert!(
         successor.allow_dirty,
-        "successor must carry allow_dirty so cube does not reset the recovered workspace",
+        "successor must carry the same allow_dirty flag as startup reconcile",
     );
 }

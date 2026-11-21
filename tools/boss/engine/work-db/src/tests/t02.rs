@@ -1055,8 +1055,9 @@ fn reconcile_inherits_workspace_id_from_orphaned_predecessor() {
 
 /// The steady-state on-free rescan is the redispatch path reached by
 /// `release_worker_and_kick` after a dead-worker reap. It must retain the
-/// same orphan handoff as startup reconcile so the successor can lease the
-/// prior workspace with `--allow-dirty` and restage preserved work.
+/// same orphan handoff as startup reconcile so the successor row names
+/// the prior workspace; unpublished work is restaged from the preserved
+/// bookmark after a clean cube lease.
 #[test]
 fn rescan_inherits_dirty_workspace_from_orphaned_predecessor() {
     let path = temp_db_path("rescan-orphan-workspace");
@@ -1103,7 +1104,7 @@ fn rescan_inherits_dirty_workspace_from_orphaned_predecessor() {
     assert_eq!(fresh.preferred_workspace_id.as_deref(), Some("mono-agent-005"));
     assert!(
         fresh.allow_dirty,
-        "rescan successor must permit dirty workspace recovery"
+        "rescan successor must carry the same allow_dirty flag as startup reconcile"
     );
 
     let _ = std::fs::remove_file(path);

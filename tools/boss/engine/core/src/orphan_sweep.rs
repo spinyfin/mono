@@ -945,9 +945,9 @@ async fn run_one_pass_filtered(
         // This is the redispatch path a dead-pid reap actually lands on
         // (`dead_pid_sweep::reap_dead_execution` marks the execution
         // `orphaned` and releases the slot; it does not itself mint a
-        // successor). Mirror `rescan_active_dispatch`'s orphan handoff here
-        // so a reaped item's successor inherits the dead worker's dirty
-        // workspace instead of starting clean and losing preserved work.
+        // successor). Mirror `rescan_active_dispatch`'s orphan handoff
+        // here so the successor row carries the same workspace hint,
+        // then restage preserved work from the engine-owned bookmark.
         let latest_execution = work_db.latest_execution_for_work_item(&work_item_id).ok().flatten();
         let OrphanHandoff {
             is_orphaned_predecessor,

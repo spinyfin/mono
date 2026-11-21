@@ -2522,17 +2522,19 @@ pub struct OrphanHandoff {
 
 /// When the predecessor execution was orphaned (the worker pane died
 /// without the DB being updated — e.g. across an engine restart, or a
-/// dead-pid reap), the successor should inherit its `cube_workspace_id`
-/// and `allow_dirty` so the recovering worker reclaims the dirty
-/// workspace in place instead of cube resetting it or the dispatcher
-/// leasing an unrelated free workspace. Abandoned / failed / cancelled
-/// predecessors are intentional throwaways and don't carry forward.
+/// dead-pid reap), the successor inherits its `cube_workspace_id` as
+/// `preferred_workspace_id` and `allow_dirty` on the row. Abandoned /
+/// failed / cancelled predecessors are intentional throwaways and do
+/// not carry forward.
 ///
 /// Shared by every automatic redispatch path so they agree on orphan
 /// inheritance: [`super::WorkDb::reconcile_active_dispatch`],
 /// [`super::WorkDb::rescan_active_dispatch`], and
-/// `orphan_sweep::run_one_pass_filtered`. Recovered work itself is
-/// restaged from the engine-owned `preserved/<execution>` bookmark.
+/// `orphan_sweep::run_one_pass_filtered`. These fields are the same
+/// dispatch hint startup reconcile already writes (worker-pool slot
+/// affinity). Unpublished work is restaged from the engine-owned
+/// `preserved/<execution>` bookmark after a clean cube lease — not by
+/// reclaiming the dead worker's workspace in place (see #2977).
 pub fn orphan_handoff_for(existing: Option<&WorkExecution>) -> OrphanHandoff {
     let is_orphaned_predecessor = existing.is_some_and(|prev| prev.status == ExecutionStatus::Orphaned);
     let preferred_workspace_id = existing

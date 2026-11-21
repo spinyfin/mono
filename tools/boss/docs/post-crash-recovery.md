@@ -157,9 +157,11 @@ not yet expired; the verdict is one of:
 - `Dead` — cube says the workspace is free, the lease id has changed,
   or the lease has logically expired (TTL passed). The engine marks
   the execution `orphaned` immediately. The next automatic resume
-  dispatch inherits both the workspace_id into
-  `preferred_workspace_id` and `allow_dirty = true`, so cube can
-  re-lease the same branch without resetting it.
+  dispatch inherits the workspace_id into `preferred_workspace_id`
+  and sets `allow_dirty` on the successor row, matching the other
+  automatic redispatch paths. Unpublished work is restaged from the
+  `preserved/<execution>` bookmark after the predecessor's lease is
+  released; cube lease itself is clean scratch.
 - `Unknown` — the probe couldn't decide (cube call failed, workspace
   not in the snapshot, sparse persisted state). The row is left
   alone; a loud `tracing::warn!` is emitted so the operator can
@@ -178,12 +180,14 @@ predecessor was released:
   the work item for the periodic orphan-active sweep
   (`orphan_sweep::run_one_pass_filtered`) to pick back up on its next
   pass. That sweep looks up the work item's latest execution, and when
-  it is the just-reaped `orphaned` row, inherits its
-  `cube_workspace_id`/`allow_dirty` the same way `rescan_active_dispatch`
-  does.
+  it is the just-reaped `orphaned` row, copies the same workspace
+  handoff `rescan_active_dispatch` writes.
 
-All three redispatch paths preserve the same workspace-recovery
-handoff.
+All three redispatch paths write the same successor-row handoff.
+Unpublished work is restaged from the engine-owned
+`preserved/<execution>` bookmark (see
+[execution-recovery-pointers.md](execution-recovery-pointers.md) and
+#2977), not from a leftover workspace recovery-report marker.
 
 ### Manual escape hatch: `bossctl agents reap <run-id>`
 
@@ -238,20 +242,22 @@ Once the predecessor is `orphaned`:
    `ready`. All three redispatch paths — startup reconcile, the
    steady-state on-free rescan, and the periodic `orphan_sweep` pass
    that picks up a dead-pid reap — set its `preferred_workspace_id` to
-   the orphan's `cube_workspace_id` and carry `allow_dirty = true`, so
-   cube can re-lease the same workspace without resetting it when one
-   is free. A dead-pid reap in particular does not go through the
-   on-free rescan at all — `dead_pid_sweep::reap_dead_execution`
+   the orphan's `cube_workspace_id` and carry `allow_dirty` on the
+   row, matching startup reconcile. A dead-pid reap in particular does
+   not go through the on-free rescan at all — `dead_pid_sweep::reap_dead_execution`
    releases the slot directly and leaves the item for `orphan_sweep`
    to pick back up on its next pass, so that sweep is the path an
-   actual dead-pid reap takes.
-3. The fresh worker spawns into that workspace. Inside the lease,
-   `jj git fetch && jj edit <bookmark>` brings it back to the branch
-   the orphan was working on; from there it can push and open / update
-   the PR as if no crash had happened. Recovered work is keyed from the
-   engine-owned `preserved/<execution>` bookmark (see
-   [execution-recovery-pointers.md](execution-recovery-pointers.md)), not
-   from a leftover workspace recovery-report marker.
+   actual dead-pid reap takes. The successor stays held with
+   `awaiting_predecessor_preservation` until that predecessor's lease
+   is released and unpublished work is preserved.
+3. Dispatch leases clean scratch space. `recover_execution_bookmark`
+   restages unpublished work from the engine-owned
+   `preserved/<execution>` bookmark (see
+   [execution-recovery-pointers.md](execution-recovery-pointers.md)
+   and #2977). It does not re-lease the dead worker's workspace dirty
+   and does not follow a leftover workspace recovery-report marker or
+   a GitHub-derived prior-branch `jj edit`. From there the worker can
+   push and open / update the PR as if no crash had happened.
 
 ## Review-guide attempts across a restart
 
