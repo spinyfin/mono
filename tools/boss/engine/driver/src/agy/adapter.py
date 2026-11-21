@@ -815,8 +815,9 @@ CONVERSATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
 
 def conversation_scratch_dir(policy):
-    # The one directory under the protected agy home this run may use freely:
-    # `<brain>/<this run's conversation id>`, where agy keeps the scratch files
+    # The conversation under the protected agy home whose scratch/steps
+    # subtrees this run may use: `<brain>/<this run's conversation id>`.
+    # This is where agy keeps the scratch files
     # it hands the model and the full output of a command whose output it
     # truncated. The id is the one agy stamped on this hook payload, checked
     # against a strict pattern, so no other conversation, sibling directory or
@@ -839,11 +840,11 @@ def within_conversation_scratch(resolved, policy):
     base = conversation_scratch_dir(policy)
     if base is None:
         return False
-    if resolved != base and not resolved.startswith(base + os.sep):
-        return False
-    # The transcript the engine reads back stays out of the worker's reach.
-    logs = os.path.join(base, ".system_generated", "logs")
-    return resolved != logs and not resolved.startswith(logs + os.sep)
+    # Ancestors also contain the engine transcript: never allow them as
+    # operands of a move, deletion or recursive walk.
+    return any(resolved == root or resolved.startswith(root + os.sep)
+               for root in (os.path.join(base, "scratch"),
+                            os.path.join(base, ".system_generated", "steps")))
 
 
 def path_is_protected(path, policy, cwd=None, pre_expanded=False):

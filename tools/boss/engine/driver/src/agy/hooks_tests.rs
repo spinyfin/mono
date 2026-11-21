@@ -37,7 +37,7 @@ impl Fixture {
         let forwarder = tmp.path().join("boss-event");
         write_exec(&forwarder, "#!/bin/sh\ncat >/dev/null\n");
         let path_guard = tmp.path().join("boss-path-guard.py");
-        write_exec(&path_guard, approve_guard());
+        write_exec(&path_guard, crate::path_guard::PATH_GUARD_SCRIPT);
         write_exec(&tmp.path().join("boss-checkleft-push-guard.py"), approve_guard());
         write_exec(&tmp.path().join("boss-git-store-guard.py"), approve_guard());
         Self {

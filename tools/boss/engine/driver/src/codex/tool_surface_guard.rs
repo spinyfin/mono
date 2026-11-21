@@ -222,20 +222,27 @@ def stdin_comes_from_redirect(group):
     terminal session `write_stdin` writes into, so it is not a command channel.
     A quoted `<` is an ordinary argument and does not count.
     """
+    redirects = []
     for index, token in enumerate(group):
         literal = group.literal_chars[index] if index < len(group.literal_chars) else []
         if literal and literal[0]:
             continue
-        match = STDIN_REDIRECT.match(token)
-        if not match:
-            continue
-        if token[match.end():].startswith("<"):
-            return True  # heredoc or here-string
-        target = token[match.end():] or (group[index + 1] if index + 1 < len(group) else "")
-        # A terminal or process device is still a live channel.
-        if not target.startswith(("/dev/", "/proc/")):
-            return True
-    return False
+        # Fail closed on multiple fd-0 redirects and descriptor duplication:
+        # a later redirect can restore the terminal saved in another fd.
+        if re.match(r"^(?:[0-9]+)?[<>]&|^(?:[0-9]+)?<>|^0>", token):
+            return False
+        if re.match(r"^0?<", token):
+            redirects.append((index, token))
+    if len(redirects) != 1:
+        return False
+    index, token = redirects[0]
+    match = STDIN_REDIRECT.match(token)
+    if not match:
+        return False
+    if token[match.end():].startswith("<"):
+        return True  # heredoc or here-string
+    target = token[match.end():] or (group[index + 1] if index + 1 < len(group) else "")
+    return bool(target) and not target.startswith(("/dev/", "/proc/"))
 
 
 def stdin_channel_detail(group):
@@ -523,6 +530,7 @@ mod tests {
             "python3 - <<-'PY'\nprint(1)\nPY",
             "python3 <<'PY'\nprint(1)\nPY",
             "python3 - < script.py",
+            "python3 - < script.py 2>/dev/null",
             "python3 - <<<'print(1)'",
             "sqlite3 db.sqlite < script.sql",
             "node - <<'JS'\nconsole.log(1)\nJS",
@@ -542,6 +550,10 @@ mod tests {
             "python3 - \\<x",
             // Not a file or heredoc feeding stdin.
             "python3 - <&3",
+            "python3 - < script.py < /dev/tty",
+            "python3 - 3<&0 < script.py <&3",
+            "python3 - 3>&0 < script.py 0>&3",
+            "python3 - <<'PY' < /dev/tty\nprint(1)\nPY",
             "python3 - <>f",
             "python3 - >out",
             // A terminal or process device is a live channel, not a file.

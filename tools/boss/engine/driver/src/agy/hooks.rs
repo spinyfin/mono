@@ -303,7 +303,16 @@ pub(super) fn expected_authorization_policy(
     obs: &ProgressObservationConfig,
     interception: &ToolUseInterceptionConfig,
 ) -> anyhow::Result<Value> {
-    let guards = authorization_guards(worker_kind, interception);
+    let mut guards = authorization_guards(worker_kind, interception);
+    if interception.data_dir.is_some() && interception.path_guard_script.is_some() {
+        // Only agy supplies this trusted root; the shared guard validates the
+        // conversation id and permits only scratch and command-output steps.
+        guards[0].command = format!(
+            "BOSS_AGY_SCRATCH_ROOT={} {}",
+            shell_quote(&brain_link(process_home).display().to_string()),
+            guards[0].command
+        );
+    }
     if guards.is_empty() {
         bail!("AgyDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
     }
@@ -325,8 +334,8 @@ pub(super) fn expected_authorization_policy(
         "process_home": process_home.display().to_string(),
         "protected_paths": protected_paths(process_home, interception),
         // Where agy keeps per-conversation scratch and truncated-output files.
-        // The adapter exempts only `<this>/<the hook payload's conversation id>`
-        // from `protected_paths`, never the directory itself or a sibling.
+        // The adapter exempts only scratch/steps under the payload's validated
+        // conversation id, never the conversation directory or a sibling.
         "conversation_scratch_root": brain_link(process_home).display().to_string(),
         "artifact_write_paths": artifact_write_paths_json(worker_kind, &obs.run_id),
         "forwarder": obs.forwarder_binary.display().to_string(),

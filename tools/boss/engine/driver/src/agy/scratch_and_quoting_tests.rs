@@ -122,7 +122,7 @@ fn own_conversation_scratch_and_spill_files_are_usable() {
 }
 
 #[test]
-fn own_conversation_scratch_is_usable_by_every_kind_for_reading() {
+fn own_conversation_reads_preserve_each_kinds_approval_posture() {
     for kind in [
         WorkerKind::Standard,
         WorkerKind::Reviewer,
@@ -137,12 +137,77 @@ fn own_conversation_scratch_is_usable_by_every_kind_for_reading() {
         let spill = conversation_dir(&fx).join(".system_generated/steps/3/output.txt");
         let payload = command_in(&fx, Some(CONVERSATION), &format!("cat {}", spill.display()));
         let (_, body, stderr) = authorize(&fx.process_home, &payload);
-        assert_ne!(decision(&body), "deny", "{kind:?}: {body} {stderr}");
+        let expected = match kind {
+            WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => "auto_approve",
+            WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => "deny_unless_prior_grant",
+        };
+        assert_eq!(decision(&body), expected, "{kind:?}: {body} {stderr}");
         let (read, detail) = verdict(
             &fx,
             &payload_for(Some(CONVERSATION), "read_file", json!({"Path": spill})),
         );
-        assert_ne!(read, "deny", "{kind:?} read_file: {detail}");
+        assert_eq!(read, expected, "{kind:?} read_file: {detail}");
+    }
+}
+
+#[test]
+fn real_data_guard_allows_durable_scratch_but_fences_transcripts_and_state() {
+    let fx = Fixture::new("run-durable-scratch");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    let sessions = fs::canonicalize(brain(&fx)).unwrap();
+    // Use the real provisioned durable brain link, with its store protected
+    // by BOSS_DATA_DIR just as the executions store is in production.
+    assert!(sessions.starts_with(fs::canonicalize(&data).unwrap()));
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    for dir in [conversation_dir(&fx), sessions.join(CONVERSATION)] {
+        let script = dir.join("scratch/split_modules.py");
+        let spill = dir.join(".system_generated/steps/3/output.txt");
+        for (tool, args) in [
+            ("write_file", json!({"Path": script, "Contents": "print('split')\n"})),
+            ("read_file", json!({"Path": script})),
+            ("read_file", json!({"Path": spill})),
+        ] {
+            assert_allowed(&fx, &payload_for(Some(CONVERSATION), tool, args), tool);
+        }
+        for command in [
+            format!("python3 '{}'", script.display()),
+            format!("cat '{}'", spill.display()),
+        ] {
+            assert_command_allowed(&fx, &command);
+            let output = Command::new("/bin/sh").args(["-c", &command]).output().unwrap();
+            assert!(output.status.success(), "{command}: {output:?}");
+            assert!(!output.stdout.is_empty(), "{command}");
+        }
+        for ancestor in [dir.clone(), dir.join(".system_generated")] {
+            for command in [
+                format!("mv '{}' /tmp/moved", ancestor.display()),
+                format!("rm -rf '{}'", ancestor.display()),
+                format!("cp -r '{}' /tmp/copied", ancestor.display()),
+                format!("grep -r secret '{}'", ancestor.display()),
+            ] {
+                assert_command_denied(&fx, &command);
+            }
+        }
+    }
+    for path in [
+        data.join("state.db"),
+        sessions.join("c2/scratch/helper.py"),
+        sessions.join("c1/.system_generated/logs/transcript_full.jsonl"),
+        fx.process_home.join(".gemini/antigravity-cli/settings.json"),
+    ] {
+        for tool in ["write_file", "read_file"] {
+            assert_denied(&fx, &payload_for(Some(CONVERSATION), tool, json!({"Path": path})), tool);
+        }
+        assert_command_denied(&fx, &format!("cat '{}'", path.display()));
+        assert_command_denied(
+            &fx,
+            &format!(
+                "cat '{}' '{}'",
+                sessions.join("c1/scratch/split_modules.py").display(),
+                path.display()
+            ),
+        );
     }
 }
 
@@ -171,6 +236,8 @@ fn everything_else_under_the_agy_home_stays_protected() {
         control.join("session-settings.json"),
         transcript.clone(),
         dir.join(".system_generated/logs"),
+        dir.clone(),
+        dir.join(".system_generated"),
     ] {
         let what = path.display().to_string();
         assert_denied(
@@ -187,6 +254,14 @@ fn everything_else_under_the_agy_home_stays_protected() {
         assert_command_denied(&fx, &format!("echo x > {what}"));
     }
     for command in [
+        format!("mv {}/.system_generated {}/sg", dir.display(), dir.display()),
+        format!("rm -rf {}/.system_generated", dir.display()),
+        format!("cp -r {} /tmp/conversation-copy", dir.display()),
+        format!("grep -r secret {}", dir.display()),
+        format!("mv {} /tmp/conversation-moved", dir.display()),
+        format!("rm -rf {}", dir.display()),
+        format!("cp -r {}/.system_generated /tmp/generated-copy", dir.display()),
+        format!("grep -r secret {}/.system_generated", dir.display()),
         format!("python3 {}", other.join("scratch/x.py").display()),
         format!("cat {}/*/scratch/x.py", brain(&fx).display()),
         format!("cat {}/c?/scratch/x.py", brain(&fx).display()),
