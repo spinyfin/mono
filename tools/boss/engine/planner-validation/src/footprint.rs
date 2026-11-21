@@ -103,36 +103,10 @@ pub fn parse_task_footprint(body: &str) -> Result<TaskFootprint, String> {
     if files.is_empty() {
         return Err("missing Likely changed files list".to_owned());
     }
-    let mut listed_files = 0usize;
-    for item in &files {
-        let (path, rest) = if let Some(quoted) = item.strip_prefix('`') {
-            quoted.split_once('`').ok_or("unclosed backtick in file path")?
-        } else {
-            item.split_once(' ').unwrap_or((item, ""))
-        };
-        if path.is_empty()
-            || path.chars().any(char::is_whitespace)
-            || (!item.starts_with('`') && !path.contains('/') && !path.contains('.'))
-        {
-            return Err(format!("expected explicit file path or glob, got {item}"));
-        }
-        let count = if path.contains(['*', '?', '[']) {
-            let count = rest.trim().trim_start_matches('(').split(')').next().unwrap_or("");
-            parse_count(count.strip_suffix(" files").ok_or("file glob needs (~N files)")?)?
-        } else {
-            1
-        };
-        listed_files = listed_files.checked_add(count).ok_or("file count overflow")?;
-    }
     let (file_count, changed_lines) = estimate.ok_or("missing Estimated size: ~N files / ~M changed lines")?;
     if file_count > 25 || changed_lines > 1_500 {
         return Err(format!(
             "estimated {file_count} files / {changed_lines} changed lines exceeds limit of 25 files / 1,500 changed lines"
-        ));
-    }
-    if listed_files > file_count {
-        return Err(format!(
-            "file list covers ~{listed_files} files but estimate states ~{file_count}"
         ));
     }
     Ok(TaskFootprint {

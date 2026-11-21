@@ -38,8 +38,6 @@ fn missing_and_invalid_fields_fail_closed() {
         (ENTRY.replace("~400 changed", "~1,501 changed"), "exceeds limit"),
         (ENTRY.replace("2. Cover", "3. Extra capability\n4. Another capability\n2. Cover"), "major deliverables exceeds"),
         (ENTRY.replace("~400", "unknown"), "positive integers"),
-        (ENTRY.replace("(~2 files)", ""), "glob needs"),
-        (ENTRY.replace("~3 files /", "~2 files /"), "file list covers"),
         (format!("{ENTRY}\nEstimated size: ~99 files / ~9000 changed lines"), "duplicate estimated size"),
     ] {
         let error = parse_task_footprint(&doc).unwrap_err();
@@ -86,4 +84,18 @@ fn prose_between_deliverables_cannot_hide_an_oversized_list() {
         "   Note: preserve compatibility.\n3. Extra capability\n4. Another capability\n2. Cover",
     );
     assert!(parse_task_footprint(&doc).unwrap_err().contains("4 major deliverables"));
+}
+
+#[test]
+fn likely_changed_files_prose_is_not_parsed() {
+    let with = |list: &str| ENTRY.replace("- `src/handler.rs`\n- `tests/handler_*.rs` (~2 files)", list);
+    for list in [
+        "- `packages/contracts/test/*.test.ts` (~3 files that copy and mutate the release)\n- `packages/server/test/*.ts` (~7 files that copy the release)",
+        "- `tools/math-generation/*.test.ts` (~4 files that copy the release)\n- `packages/web/test/browser/*.spec.ts` (~3 files that write screenshots to environment-named directories)",
+        "- `docs/*.md` and `tools/book-import/README.md` (~5 files that give npm validation commands)",
+        "- `tests/*.rs` with no count at all",
+        "- anything, in any prose form",
+    ] {
+        assert!(parse_task_footprint(&with(list)).is_ok(), "{list}");
+    }
 }

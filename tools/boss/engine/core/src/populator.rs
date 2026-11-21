@@ -823,8 +823,7 @@ impl Populator {
             *title = "Auto-populate rejected: revise design breakdown";
             *body = format!(
                 "Return the design doc to its author. No tasks were created. Fix these entries:\n{reason}\n\n\
-                 Add numbered Major deliverables, Likely changed files (explicit paths or globs with \
-                 approximate counts), and Estimated size: ~N files / ~M changed lines. Split entries \
+                 Add numbered Major deliverables, a Likely changed files list, and Estimated size: ~N files / ~M changed lines. Split entries \
                  exceeding 3 deliverables, 25 files, or 1,500 changed lines along capability boundaries, \
                  then re-run `boss project plan <project>`. The planner never splits entries."
             );
