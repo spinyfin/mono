@@ -170,7 +170,8 @@ pub(crate) enum ProposeCommand {
     Wait(WaitArgs),
     /// Progression agents only: create a revision on this item's own open PR,
     /// with a diagnosis-bearing brief. Counts against the item's create budget;
-    /// at most one open progression revision per PR; refused if the PR is closed.
+    /// at most one unfinished progression revision per PR. Delivered revisions
+    /// in review do not count. Refused if the PR is closed.
     ///
     /// Example: `boss propose revise --brief "Fix the diagnosed failure"`
     Revise(ReviseArgs),
@@ -205,8 +206,9 @@ pub(crate) enum ProposeCommand {
     /// Example: `boss propose clear-signal --reason merge_conflict`
     ClearSignal(ClearSignalArgs),
     /// Progression agents only: archive a dead revision of this item's PR chain
-    /// that has no live execution, when the parent PR is green. Never the item
-    /// itself.
+    /// that has no live or pending execution, when it has delivered (in review
+    /// or its latest implementation completed) or the parent PR is green.
+    /// Never the item itself.
     ///
     /// Example: `boss propose archive-revision task_0123abcd --reason "dead; parent is green"`
     ArchiveRevision(ArchiveRevisionArgs),

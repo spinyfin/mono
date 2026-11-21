@@ -908,6 +908,14 @@ async fn stranded_blocked_parent_with_dirty_pr_regains_signal_and_respawns_revis
                 db.reset_ci_attempts_used(&chore).unwrap();
             }
         }
+        rusqlite::Connection::open(dir.path().join("boss.db"))
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'completed'
+                 WHERE work_item_id = ?1 AND kind = 'revision_implementation'",
+                [&prior_rev_id],
+            )
+            .unwrap();
         db.update_work_item(
             &prior_rev_id,
             WorkItemPatch {

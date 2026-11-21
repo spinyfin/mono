@@ -55,6 +55,9 @@ pub struct InFlightCiFixRevision {
 /// parent in Review ▸ Blocked via `classify_review_section`; that is the
 /// CI failure itself, not this gate.
 ///
+/// An `in_review` revision is finished unless a restarted implementation is
+/// pending or live. Read-only reviews do not own the branch.
+///
 /// `alias` is a compile-time table alias from callers (`t`, `next`);
 /// never user input.
 pub fn live_chain_writer_sql(alias: &str) -> String {
@@ -64,6 +67,12 @@ pub fn live_chain_writer_sql(alias: &str) -> String {
     );
     format!(
         "({alias}.status IN ('todo', 'active')
+          OR ({alias}.status = 'in_review' AND EXISTS (
+              SELECT 1 FROM work_executions e
+               WHERE e.work_item_id = {alias}.id
+                 AND e.kind = 'revision_implementation'
+                 AND e.status IN ('queued', 'ready', 'waiting_dependency', 'claimed', 'running', 'waiting_human')
+          ))
           OR (
               {alias}.status = 'blocked'
               AND (

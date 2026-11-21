@@ -109,6 +109,14 @@ fn queued_wait_payload_names_the_actual_revision_prerequisite() {
     let from_tree = tree.task_runtimes.iter().find(|r| r.work_item_id == second.id).unwrap();
     assert_eq!(serde_json::to_value(from_tree).unwrap(), json);
 
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed'
+             WHERE work_item_id = ?1 AND kind = 'revision_implementation'",
+            [&first.id],
+        )
+        .unwrap();
     db.update_work_item(
         &first.id,
         WorkItemPatch {

@@ -391,6 +391,14 @@ async fn detection_allowed_after_prior_revision_pushes() {
     // Step 2: R1 pushes a commit (moves to in_review) and the
     // ci_remediations row is marked succeeded (CI went green momentarily,
     // then a new failure emerged on head-2).
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed'
+             WHERE work_item_id = ?1 AND kind = 'revision_implementation'",
+            [&rev_id],
+        )
+        .unwrap();
     db.update_work_item(
         &rev_id,
         crate::work::WorkItemPatch {

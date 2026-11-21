@@ -33,6 +33,87 @@ fn finish(db: &WorkDb, task: &Task) {
         .unwrap();
 }
 
+// Regression for mono#3742: old conflict fixes are delivered but their review
+// siblings still have persisted dependency blocks. A new conflict fix must run
+// first, then release the existing review queue without waiting for PR merge.
+#[test]
+fn finished_conflict_chain_releases_new_fix_then_blocked_reviews() {
+    let (db, root) = setup();
+    let first = revision(&db, &root, true);
+    finish(&db, &first);
+    let second = revision(&db, &root, true);
+    finish(&db, &second);
+    let review = revision(&db, &root, false);
+    let later = revision(&db, &root, false);
+    let conn = db.connect().unwrap();
+    for old in [&first, &second] {
+        deps::insert_edge(&conn, &review.id, &old.id, RELATION_BLOCKS, &now_string()).unwrap();
+    }
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'dependency' WHERE id = ?1",
+        [&review.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'waiting_dependency' WHERE work_item_id = ?1",
+        [&review.id],
+    )
+    .unwrap();
+    drop(conn);
+    let fix = revision(&db, &root, true);
+    assert_eq!(execution(&db, &fix).status, ExecutionStatus::Ready);
+    assert_eq!(
+        db.claim_execution_for_dispatch(&execution(&db, &fix).id).unwrap(),
+        DispatchClaimOutcome::Won
+    );
+    assert_eq!(execution(&db, &review).status, ExecutionStatus::WaitingDependency);
+    assert_eq!(execution(&db, &later).status, ExecutionStatus::WaitingDependency);
+    finish(&db, &fix);
+    assert!(db.try_unblock_dependency_if_resolved(&review.id).unwrap());
+    assert_eq!(
+        db.claim_execution_for_dispatch(&execution(&db, &review).id).unwrap(),
+        DispatchClaimOutcome::Won
+    );
+    assert!(!db.try_unblock_dependency_if_resolved(&later.id).unwrap());
+    finish(&db, &review);
+    assert!(db.try_unblock_dependency_if_resolved(&later.id).unwrap());
+}
+
+#[test]
+fn ci_fix_after_finished_revision_dispatches_but_waits_for_restarted_writer() {
+    for status in ["completed", "ready", "claimed", "running", "waiting_human"] {
+        let (db, root) = setup();
+        let earlier = revision(&db, &root, false);
+        finish(&db, &earlier);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = ?2 WHERE work_item_id = ?1",
+                params![earlier.id, status],
+            )
+            .unwrap();
+        let mut input = revision_input(&root);
+        input.created_via = Some(format!("{CREATED_VIA_CI_FIX_PREFIX}test"));
+        let fix = db
+            .create_revision(input, &FakePrStateChecker::always(PrOpenState::Open))
+            .unwrap();
+        if status != "completed" {
+            assert_eq!(execution(&db, &fix).status, ExecutionStatus::WaitingDependency);
+            assert_eq!(
+                db.claim_execution_for_dispatch(&execution(&db, &fix).id).unwrap(),
+                DispatchClaimOutcome::Rejected
+            );
+            finish(&db, &earlier);
+            assert!(db.try_unblock_dependency_if_resolved(&fix.id).unwrap());
+        }
+        assert_eq!(execution(&db, &fix).status, ExecutionStatus::Ready);
+        assert_eq!(
+            db.claim_execution_for_dispatch(&execution(&db, &fix).id).unwrap(),
+            DispatchClaimOutcome::Won
+        );
+    }
+}
+
 #[test]
 fn conflict_revision_precedes_queued_reviews_and_preserves_remaining_order() {
     let (db, root) = setup();

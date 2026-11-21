@@ -20,12 +20,12 @@ pub fn render_verb_catalogue(budget: &VerbBudget) -> String {
          \n\
          You mutate only through `boss propose`. Direct taxonomy requests are refused.\n\
          \n\
-         - `revise --brief '<text>'` — create a revision on this item's open PR. Counts against the create budget. One open progression revision per PR. Refused if the PR is closed.\n\
+         - `revise --brief '<text>'` — create a revision on this item's open PR. Counts against the create budget. One unfinished progression revision per PR; delivered revisions in review do not count. Refused if the PR is closed.\n\
          - `precursor --name … --brief '<text>'` — create a chore in the same product and make this item depend on it. Canonical use: a red required check that is unrelated to this PR or flaky. Counts against the create budget. At most one open progression-created precursor per item.\n\
          - `depend --on <id>` / `undepend --on <id>` — add or remove a dependency edge in the neighbourhood. `undepend` only when the prerequisite is terminal, archived, or a hidden revision with no live execution and a green parent PR.\n\
          - `redispatch [--brief-addendum '<text>']` — explicit start. Clears `churn_guard`, `deliberate_park` (and its attention), and non-operator-No `worker_failed`. Refused with a live execution, `awaiting_operator_answer`, `question_dismissed`, or operator-No `worker_failed`.\n\
          - `clear-signal --reason <r>` — clear a `blocked_reason` whose probe is already clear (for example `merge_conflict` while GitHub reports MERGEABLE). Refused when the probe disagrees.\n\
-         - `archive-revision <id> --reason …` — archive a hidden revision of this chain that has no live execution and whose parent PR is green. Never the item itself.\n\
+         - `archive-revision <id> --reason …` — archive a hidden revision of this chain with no live or pending execution when it has delivered (in review or its latest implementation completed), or its parent PR is green. Never the item itself.\n\
          - `unblock` — move the item `blocked → todo`, or `in_review` when it already owns a bound PR, after its block reason is cleared.\n\
          - `followup-task --name … --description '<text>' --rationale '<why>'` — existing non-blocking follow-up.\n\
          - `done --outcome blocked --question …` — ask the owner. Required `--criterion`. A bare `blocked` without a question is refused. Ends the run as `asked`.\n\
