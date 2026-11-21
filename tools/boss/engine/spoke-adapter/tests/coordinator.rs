@@ -2,7 +2,9 @@
 use super::{short, support::*, timing, workspace_slack};
 
 pub(crate) use super::support::{
-    elapse, fire_after_all_stored, freeze_clock, thaw_clock, until, until_elapsed, until_ready_after_stored,
+    FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, elapse, fire_after_all_stored,
+    fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_elapsed,
+    until_ready_after_stored,
 };
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
@@ -62,6 +64,11 @@ fn answer_as(command: &Command, lease: serde_json::Value) -> Option<CommandResul
 
 const REPO: &str = "https://github.com/acme/widget";
 const IN_DOUBT: &str = "spoke_assignment_in_doubt";
+/// Pre-start retry budget is 3 delays. One extra pass proves a spent budget
+/// would have failed the execution.
+const MORE_THAN_PRE_START_BUDGET: usize = 4;
+/// Host `pool_size` in [`env`]: attempts on that host share one slot.
+const HOST_SLOTS: usize = 1;
 
 fn quick() -> SpokeInDoubtTiming {
     SpokeInDoubtTiming {
@@ -183,6 +190,14 @@ fn assert_never_failed(fx: &Fixture, execution_id: &str) {
     assert_eq!(fx.db.list_executions(None).unwrap().len(), 1, "no second execution");
 }
 
+fn command_waiting(fx: &Fixture) -> bool {
+    fx.provider.command_waits() >= 1
+}
+
+fn command_idle(fx: &Fixture) -> bool {
+    fx.provider.command_waits() == 0 && fx.provider.stable_callers() == 0
+}
+
 fn persona_held(fx: &Fixture, execution_id: &str) -> bool {
     fx.db
         .connect()
@@ -258,7 +273,15 @@ async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconc
         || async { env.pool.busy_count().await == 0 },
     )
     .await;
-    elapse(Duration::from_millis(600)).await;
+    let retries = drive_poll_deadline_passes(
+        Duration::from_millis(100),
+        || command_waiting(&fx),
+        || command_idle(&fx),
+        Duration::from_millis(300),
+        MORE_THAN_PRE_START_BUDGET,
+    )
+    .await;
+    assert!(retries > 0, "parked spawn retries must have asked the host");
     assert_never_failed(&fx, &execution.id);
     assert!(!released(&peer.commands()));
 
@@ -322,7 +345,15 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
         || attention_open(&fx, &execution.id),
     )
     .await;
-    elapse(Duration::from_millis(600)).await;
+    let retries = drive_poll_deadline_passes(
+        Duration::from_millis(100),
+        || command_waiting(&fx),
+        || command_idle(&fx),
+        Duration::from_secs(5),
+        MORE_THAN_PRE_START_BUDGET,
+    )
+    .await;
+    assert!(retries > 0, "parked spawn retries must have asked the host");
     assert_never_failed(&fx, &execution.id);
     assert!(fx.db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
     assert!(!released(&peer.commands()));
@@ -485,7 +516,7 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
     // raise the lease deadline to 5 s and hide that path. The clock is held so
     // that only the explicit advances below expire the deliberately unanswered
     // leases, never CI contention while a reply is crossing the socket.
-    timing::hold();
+    freeze_clock();
     let (fx, env, executions, peer) = timing::guarded(async {
         let fx = Fixture::with_frozen_liveness(short(300)).await;
         let env = env(&fx, 2).await;
@@ -499,11 +530,14 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
             .await;
         env.coordinator.kick();
         // Observe both lease commands before any virtual time passes.
-        timing::condition(|| peer.commands().iter().filter(|c| is_lease(c)).count() == 2).await;
+        until("an unanswered lease to be stored", || {
+            peer.commands().iter().filter(|c| is_lease(c)).count() == 2
+        })
+        .await;
         (fx, env, executions, peer)
     })
     .await;
-    timing::guarded(timing::advancing(|| {
+    timing::guarded(until_elapsed("both leases to be parked with attention", || {
         executions.iter().all(|e| attention_open(&fx, &e.id))
     }))
     .await;
@@ -511,10 +545,21 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
     // Several dispatch passes later (more than the pre-start retry budget),
     // nothing has failed and nothing holds capacity.
     timing::guarded(async {
-        for _ in 0..60 {
-            tokio::time::advance(Duration::from_millis(50)).await;
-            tokio::task::yield_now().await;
-        }
+        let lease_ids: std::collections::BTreeSet<_> = peer
+            .commands()
+            .iter()
+            .filter(|c| is_lease(c))
+            .map(|c| c.command_id.clone())
+            .collect();
+        drive_kicked_deadline_passes(
+            || env.coordinator.kick(),
+            || fx.provider.command_sends(),
+            || command_waiting(&fx),
+            || command_idle(&fx),
+            Duration::from_millis(300),
+            MORE_THAN_PRE_START_BUDGET * executions.len(),
+        )
+        .await;
         for execution in &executions {
             let row = fx.db.get_execution(&execution.id).unwrap();
             assert!(!row.status.is_terminal(), "{row:?}");
@@ -527,11 +572,13 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
             "no pool slot is held while a lease is in doubt"
         );
         assert_eq!(env.coordinator.repo_lease_limiter().in_flight(REPO), 0);
-        assert_eq!(
-            peer.commands().iter().filter(|c| is_lease(c)).count(),
-            2,
-            "each pass reuses the stored lease command"
-        );
+        let later_ids: std::collections::BTreeSet<_> = peer
+            .commands()
+            .iter()
+            .filter(|c| is_lease(c))
+            .map(|c| c.command_id.clone())
+            .collect();
+        assert_eq!(later_ids, lease_ids, "each pass reuses the stored lease command");
 
         // The hosts answer late: both executions proceed to spawn.
         for (n, lease) in peer.commands().into_iter().filter(is_lease).enumerate() {
@@ -702,7 +749,10 @@ async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty
         )
         .unwrap();
     until_elapsed("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
-    elapse(Duration::from_secs(1)).await;
+    for _ in 0..MORE_THAN_PRE_START_BUDGET {
+        elapse(Duration::from_millis(100)).await;
+        until("a local spawn retry finished", || command_idle(&fx)).await;
+    }
     thaw_clock();
     assert_never_failed(&fx, &execution.id);
     assert_eq!(
@@ -1163,6 +1213,7 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         || peer.commands().iter().filter(|c| is_lease(c)).count(),
         2,
         Duration::from_secs(5),
+        HOST_SLOTS,
     )
     .await;
     until("both unanswered leases to be parked", || {
@@ -1230,30 +1281,43 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     fx.add_spoke_host("other", 8);
     let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
     let second = triage(&fx, &env, "stranded ready");
-    // Freeze the unanswered Adopt's command deadline so a kick that only
-    // happens when that deadline fires cannot satisfy the assertion. Fire one
-    // heartbeat interval (the stagger), thaw, then wait on I/O. Spawn must
-    // land well before the remaining ~5s Adopt deadline.
-    freeze_clock();
-    let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
-    elapse(Duration::from_millis(80)).await;
-    thaw_clock();
-    let kicked = std::time::Instant::now();
-    until(
-        "a stranded ready row is re-kicked by the heartbeat while Adopt is unanswered",
-        || {
-            other
-                .commands()
-                .iter()
-                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == second.id)
-        },
-    )
+    // Keep the clock frozen so the unanswered Adopt deadline cannot kick the
+    // stranded row. Advance one heartbeat interval at a time and wait on I/O
+    // between beats; spawn must land after a few beats, well under the ~5s
+    // Adopt command deadline.
+    let _clock = FrozenClock::new();
+    until("the unanswered adopt is stored", || {
+        _peer
+            .commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Adopt(_))) && run_of(c) == first.id)
+    })
     .await;
-    assert!(
-        kicked.elapsed() < Duration::from_secs(2),
-        "spawn must come from the heartbeat, not the Adopt deadline ({:?})",
-        kicked.elapsed()
-    );
+    let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
+    let spawned = || {
+        other
+            .commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == second.id)
+    };
+    let mut advanced = Duration::ZERO;
+    let watchdog = std::time::Instant::now();
+    while !spawned() {
+        assert!(
+            watchdog.elapsed() < Duration::from_secs(20),
+            "timed out waiting for a stranded ready row to be re-kicked by the heartbeat"
+        );
+        elapse(Duration::from_millis(80)).await;
+        advanced += Duration::from_millis(80);
+        assert!(
+            advanced < Duration::from_secs(2),
+            "spawn must come from the heartbeat, not the Adopt deadline (advanced {advanced:?})"
+        );
+        let io = std::time::Instant::now();
+        while !spawned() && io.elapsed() < Duration::from_millis(500) {
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 mod recovery;

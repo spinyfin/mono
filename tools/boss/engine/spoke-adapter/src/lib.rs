@@ -29,7 +29,7 @@ mod workspace;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -122,6 +122,12 @@ pub(crate) struct Hub {
     /// decide nothing was stored.
     #[builder(skip)]
     stable_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// In-flight [`Hub::send_command`] calls, including the command timer.
+    #[builder(skip)]
+    command_waits: AtomicUsize,
+    /// [`Hub::send_command`] entries, including ones that have already returned.
+    #[builder(skip)]
+    command_sends: AtomicU64,
 }
 
 impl Hub {
@@ -381,6 +387,15 @@ impl Hub {
         command: Command,
         deadline: Duration,
     ) -> Result<CommandResult, HostCallError> {
+        self.command_sends.fetch_add(1, Ordering::SeqCst);
+        self.command_waits.fetch_add(1, Ordering::SeqCst);
+        struct CommandWait<'a>(&'a AtomicUsize);
+        impl Drop for CommandWait<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _wait = CommandWait(&self.command_waits);
         let command_id = command.command_id.clone();
         match self
             .streams
@@ -400,6 +415,14 @@ impl Hub {
                 reason: other.to_string(),
             }),
         }
+    }
+
+    pub(crate) fn command_waits(&self) -> usize {
+        self.command_waits.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn command_sends(&self) -> u64 {
+        self.command_sends.load(Ordering::SeqCst)
     }
 }
 
@@ -1121,6 +1144,18 @@ impl SpokeHostAdapterProvider {
     #[doc(hidden)]
     pub fn stable_callers(&self) -> usize {
         self.hub.stable_callers()
+    }
+
+    /// How many [`Hub::send_command`] calls are waiting on the command timer.
+    #[doc(hidden)]
+    pub fn command_waits(&self) -> usize {
+        self.hub.command_waits()
+    }
+
+    /// How many [`Hub::send_command`] calls have started, including finished ones.
+    #[doc(hidden)]
+    pub fn command_sends(&self) -> u64 {
+        self.hub.command_sends()
     }
 
     fn adapter(&self, host: &Host, bound: Option<SpokeAssignment>, legacy: bool) -> Arc<dyn HostAdapter> {

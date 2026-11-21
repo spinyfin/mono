@@ -120,8 +120,6 @@ async fn restarted_unfinished_launches_keep_reconciling_every_reply_shape() {
 }
 
 /// Spawn is answered, the prompt wait is a tokio timer, and Stop is unanswered.
-/// Freeze until the pane pid is recorded (spawn settled), thaw so the prompt
-/// wait can run, freeze again once Stop is stored, then fire its deadline.
 #[tokio::test]
 async fn restarted_unconfirmed_stop_launch_keeps_reconciling() {
     let fx = Fixture::with(short(300)).await;
@@ -141,28 +139,23 @@ async fn restarted_unconfirmed_stop_launch_keeps_reconciling() {
         )
         .await;
     env.coordinator.kick();
-    freeze_clock();
-    until("spawn command stored", || {
-        peer.commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
-    })
+    let clock = fire_unconfirmed_stop_after_answered_spawn(
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        || fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some(),
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        },
+        Duration::from_millis(300),
+    )
     .await;
-    until("pane pid recorded before prompt wait", || {
-        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
-    })
-    .await;
-    thaw_clock();
-    until("unconfirmed stop stored", || {
-        peer.commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Stop(_))))
-    })
-    .await;
-    freeze_clock();
-    elapse(Duration::from_millis(300)).await;
     until("launch attention", || attention_open(&fx, &execution.id)).await;
-    thaw_clock();
+    drop(clock);
     let next = restarted(&fx, &env.coordinator, 1).await;
     assert!(fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap());
     next.reconcile_ended_in_doubt_spokes().await;

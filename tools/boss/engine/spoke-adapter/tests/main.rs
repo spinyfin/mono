@@ -26,7 +26,7 @@ use boss_spoke_adapter::{HostCallError, SpokeAdapterConfig};
 use serde_json::json;
 use support::*;
 
-pub(crate) use support::{elapse, freeze_clock, thaw_clock, until};
+pub(crate) use support::{elapse, fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until};
 
 const PATH: &str = "/hosts/workspaces/worker";
 

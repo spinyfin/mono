@@ -669,57 +669,51 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
         )
         .await;
     lease(&adapter).await;
-    freeze_clock();
     let first_waiting = {
         let adapter = Arc::clone(&adapter);
         tokio::spawn(async move { spawn(&adapter).await })
     };
-    until("spawn stored before unanswered stop", || {
-        peer.commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
-    })
+    let clock = fire_unconfirmed_stop_after_answered_spawn(
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
+        },
+        || fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some(),
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Stop(_))))
+        },
+        Duration::from_millis(300),
+    )
     .await;
-    until("pane pid recorded before prompt wait", || {
-        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
-    })
-    .await;
-    thaw_clock();
-    until("unconfirmed stop stored", || {
-        peer.commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Stop(_))))
-    })
-    .await;
-    freeze_clock();
-    elapse(Duration::from_millis(300)).await;
     let first = first_waiting.await.unwrap().unwrap_err();
     let uncertain = first.downcast_ref::<SpawnOutcomeUncertain>().expect("stop unconfirmed");
     assert!(uncertain.settled, "{first:#}");
-    // A later attempt asks only about the stop: it waits for the stop's
-    // answer only, not for the prompt a second time as well. Wait until the
-    // retry is in the stable Stop call, then fire that deadline.
+    // A later attempt asks only about the stop: wait until that Stop's
+    // command timer is armed, fire the deadline once, then wait for the
+    // result without advancing more virtual time.
+    let sends_before = fx.provider.command_sends();
     let second_waiting = {
         let adapter = Arc::clone(&adapter);
         tokio::spawn(async move { spawn(&adapter).await })
     };
-    until("retry is waiting on the stored stop", || {
-        second_waiting.is_finished() || fx.provider.stable_callers() >= 1
+    until("retry Stop command timer is armed", || {
+        second_waiting.is_finished()
+            || (fx.provider.command_waits() >= 1 && fx.provider.command_sends() > sends_before + 1)
     })
     .await;
-    let mut advanced = Duration::ZERO;
-    while !second_waiting.is_finished() {
-        assert!(
-            advanced < Duration::from_millis(450),
-            "retry waited {advanced:?} of virtual time after the Stop call started"
-        );
-        tokio::time::advance(Duration::from_millis(20)).await;
-        tokio::task::yield_now().await;
-        advanced += Duration::from_millis(20);
+    if !second_waiting.is_finished() {
+        elapse(Duration::from_millis(320)).await;
+        until("retry finished after the Stop deadline", || {
+            second_waiting.is_finished()
+        })
+        .await;
     }
     let second = second_waiting.await.unwrap().unwrap_err();
     assert!(second.downcast_ref::<SpawnOutcomeUncertain>().is_some(), "{second:#}");
-    thaw_clock();
+    drop(clock);
     let stop = peer
         .commands()
         .into_iter()

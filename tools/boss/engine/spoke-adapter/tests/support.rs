@@ -74,6 +74,38 @@ pub(crate) fn thaw_clock() {
     tokio::time::resume();
 }
 
+/// Pauses the tokio clock for a scope and thaws it on drop, including unwind.
+pub(crate) struct FrozenClock {
+    frozen: bool,
+}
+
+impl FrozenClock {
+    pub(crate) fn new() -> Self {
+        freeze_clock();
+        Self { frozen: true }
+    }
+
+    pub(crate) fn thaw(&mut self) {
+        if self.frozen {
+            thaw_clock();
+            self.frozen = false;
+        }
+    }
+
+    pub(crate) fn freeze(&mut self) {
+        if !self.frozen {
+            freeze_clock();
+            self.frozen = true;
+        }
+    }
+}
+
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        self.thaw();
+    }
+}
+
 /// Wait until `ready`. Works while tokio's clock is paused: gRPC I/O still
 /// progresses, and the loop yields instead of sleeping on a frozen timer.
 pub(crate) async fn until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -171,36 +203,109 @@ pub(crate) async fn fire_after_stored(stored_what: &str, stored: impl FnMut() ->
     thaw_clock();
 }
 
-/// Wall-clock grace for a later persist when earlier commands may still be
-/// in flight in parallel. Longer than the 200–300 ms persist stalls that
-/// used to miss real-time deadlines, short of [`WAIT`].
-const PARALLEL_PERSIST: Duration = Duration::from_secs(2);
-
-/// Freeze until `count` commands are persisted, then fire `deadline`. If
-/// dispatch serializes attempts on a slot, fire `deadline` once to release
-/// it rather than advancing while a later persist is in flight (that would
-/// record a pre-start failure).
+/// Freeze until `count` commands are persisted, then fire `deadline`.
+///
+/// `host_slots` is the host's concurrent assignment capacity. When it is
+/// less than `count`, attempts share a slot: fire `deadline` after each
+/// stored command so the next persist can start. When it is at least
+/// `count`, wait for every persist before firing, so a shared deadline
+/// cannot expire an in-flight append.
 pub(crate) async fn fire_after_all_stored(
     first_what: &str,
     mut stored_count: impl FnMut() -> usize,
     count: usize,
     deadline: Duration,
+    host_slots: usize,
 ) {
     freeze_clock();
     until(first_what, || stored_count() >= 1).await;
-    while stored_count() < count {
-        let target = stored_count() + 1;
-        let grace = std::time::Instant::now() + PARALLEL_PERSIST;
-        while stored_count() < target && std::time::Instant::now() < grace {
-            tokio::task::yield_now().await;
-        }
-        if stored_count() < target {
+    if host_slots >= count {
+        until("every unanswered command to be stored", || stored_count() >= count).await;
+    } else {
+        while stored_count() < count {
+            let target = stored_count() + 1;
             elapse(deadline).await;
             until("a later unanswered command to be stored", || stored_count() >= target).await;
         }
     }
     elapse(deadline).await;
     thaw_clock();
+}
+
+/// Freeze until spawn is stored and the pane pid is recorded, thaw so the
+/// prompt wait can complete, freeze once Stop is stored, then fire `deadline`.
+/// The returned guard keeps the clock frozen and thaws on drop.
+pub(crate) async fn fire_unconfirmed_stop_after_answered_spawn(
+    mut spawn_stored: impl FnMut() -> bool,
+    mut pane_pid: impl FnMut() -> bool,
+    mut stop_stored: impl FnMut() -> bool,
+    deadline: Duration,
+) -> FrozenClock {
+    let mut clock = FrozenClock::new();
+    until("spawn command stored", &mut spawn_stored).await;
+    until("pane pid recorded before prompt wait", &mut pane_pid).await;
+    clock.thaw();
+    until("unconfirmed stop stored", &mut stop_stored).await;
+    clock.freeze();
+    elapse(deadline).await;
+    clock
+}
+
+/// Kick, wait until a new command wait is armed, fire `deadline`, then wait
+/// until those waits finish. Repeats `passes` times so a no-budget-spend
+/// assertion cannot pass without the retry path having run.
+pub(crate) async fn drive_kicked_deadline_passes(
+    kick: impl Fn(),
+    sends: impl Fn() -> u64,
+    mut waiting: impl FnMut() -> bool,
+    mut idle: impl FnMut() -> bool,
+    deadline: Duration,
+    passes: usize,
+) {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    for _ in 0..passes {
+        let before = sends();
+        kick();
+        until("a dispatch pass started a command wait", || {
+            sends() > before || waiting()
+        })
+        .await;
+        while waiting() {
+            elapse(deadline + TICK).await;
+        }
+        until("the dispatch pass finished its command wait", &mut idle).await;
+    }
+}
+
+/// Advance `interval`, fire any armed command wait, and repeat `passes` times.
+/// For parked-spawn poll loops that are not kick-driven. Returns how many
+/// times a command wait was observed, so the caller can require that retries
+/// actually ran.
+pub(crate) async fn drive_poll_deadline_passes(
+    interval: Duration,
+    mut waiting: impl FnMut() -> bool,
+    mut idle: impl FnMut() -> bool,
+    deadline: Duration,
+    passes: usize,
+) -> usize {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    let mut seen = 0;
+    for _ in 0..passes {
+        while waiting() {
+            seen += 1;
+            elapse(deadline + TICK).await;
+        }
+        until("the poll finished its command wait", &mut idle).await;
+        elapse(interval).await;
+        if waiting() {
+            seen += 1;
+            while waiting() {
+                elapse(deadline + TICK).await;
+            }
+            until("the poll finished its command wait", &mut idle).await;
+        }
+    }
+    seen
 }
 
 struct Authority {
