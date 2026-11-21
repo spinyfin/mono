@@ -394,6 +394,8 @@ fn quoted_heredoc_and_single_quoted_python_bodies_are_data() {
         "node - <<'JS' >&2\nconsole.log(1)\nJS".to_owned(),
         "python3 - < script.py 2>&1".to_owned(),
         "python3 - < script.py >&2".to_owned(),
+        "python3 - < script.py &>/dev/null".to_owned(),
+        "python3 - <<'PY' &>>log\nprint(1)\nPY".to_owned(),
         "python3 - < 'script<name.py'".to_owned(),
         format!("python3 - <<\"PY\"\n{body}PY"),
         format!("python3 - <<-'PY'\n{body}PY"),
@@ -468,6 +470,12 @@ fn substitutions_that_really_run_are_still_denied() {
     for command in [
         "bash 2>/dev/null",
         "python3 - </dev/tty",
+        "python3 - < //dev/tty",
+        "python3 - < /./dev/tty",
+        "python3 - < ../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../dev/tty",
+        "cd /dev && python3 - < tty",
+        "python3 - < script.py &>log</dev/tty",
+        "python3 - <<'PY' &>>log</dev/tty\nprint(1)\nPY",
         "python3 - <script.py</dev/tty",
         "python3 - < script.py</dev/tty",
         "python3 - <<'PY' | python3 -\nprint(1)\nPY",
@@ -483,6 +491,27 @@ fn substitutions_that_really_run_are_still_denied() {
     ] {
         assert_command_denied(&fx, &command);
     }
+}
+
+#[test]
+fn stdin_redirects_resolve_workspace_symlinks_and_reject_special_files() {
+    let fx = Fixture::new("run-stdin-paths");
+    fx.install(WorkerKind::Standard);
+    std::os::unix::fs::symlink("/dev/tty", fx.workspace().join("terminal")).unwrap();
+    fs::write(fx.workspace().join("regular.py"), "print(1)\n").unwrap();
+    std::os::unix::fs::symlink("regular.py", fx.workspace().join("script-link")).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(fx.workspace().join("fifo"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    for target in ["terminal", "fifo", "."] {
+        let reason = assert_command_denied(&fx, &format!("python3 - < {target}"));
+        assert!(reason.contains("stdin"), "{target}: {reason}");
+    }
+    assert_command_allowed(&fx, "python3 - < script-link");
 }
 
 #[test]

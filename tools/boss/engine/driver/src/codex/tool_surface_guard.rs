@@ -68,6 +68,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import sys
 
 MALFORMED = (
@@ -210,7 +211,7 @@ def has_inline_program(program, arguments):
     return False
 
 
-def stdin_comes_from_redirect(group):
+def stdin_comes_from_redirect(group, cwd):
     """Accept one fixed fd-0 source, preserving quote provenance.
 
     Adjacent operators inside shlex words fail closed: they are shell syntax,
@@ -222,7 +223,7 @@ def stdin_comes_from_redirect(group):
         angles = [i for i, char in enumerate(token) if char in '<>' and not literal[i]]
         if not angles:
             continue
-        match = re.match(r"([0-9]*)(<<<|<<-|<<|<>|[<>]&|>>|[<>])", token)
+        match = re.match(r"([0-9]*)(&>>|&>|<<<|<<-|<<|<>|[<>]&|>>|[<>])", token)
         if not match or any(literal[:match.end()]):
             return False
         fd, operator = match.groups()
@@ -238,10 +239,31 @@ def stdin_comes_from_redirect(group):
     if len(redirects) != 1:
         return False
     operator, target = redirects[0]
-    return bool(target) and (operator != '<' or not target.startswith(('/dev/', '/proc/')))
+    if operator != '<':
+        return bool(target)
+    # Expansions and preceding directory changes prevent proving which file
+    # will be opened. Resolve symlinks before checking device roots and type.
+    if not target or any(char in target for char in '$~*?[]`'):
+        return False
+    if not os.path.isabs(target):
+        if cwd is None:
+            return False
+        target = os.path.join(cwd, target)
+    try:
+        resolved = os.path.realpath(target)
+        if any(resolved == root or resolved.startswith(root + '/')
+               for root in ('/dev', '/private/dev', '/proc')):
+            return False
+        try:
+            return stat.S_ISREG(os.stat(resolved).st_mode)
+        except FileNotFoundError:
+            # A missing file cannot supply live stdin; the shell fails open().
+            return True
+    except (OSError, ValueError):
+        return False
 
 
-def stdin_channel_detail(group):
+def stdin_channel_detail(group, cwd):
     """Why this argv opens a stdin-driven session, or None if it does not."""
     rest = strip_prefixes(group)
     if not rest:
@@ -259,7 +281,7 @@ def stdin_channel_detail(group):
     # `python3 - <<'PY'` and `sqlite3 db < script.sql` read a heredoc or file,
     # not a live session. A shell is excluded: the body it would read is a
     # script the other guards cannot attribute to a command of its own.
-    if program not in SHELLS and stdin_comes_from_redirect(group):
+    if program not in SHELLS and stdin_comes_from_redirect(group, cwd):
         return None
 
     for argument in arguments:
@@ -313,8 +335,14 @@ def main():
     masked = review_guide_masked_command(command)
     if masked is not None:
         command = masked
+    cwd = payload.get("cwd", tool_input.get("cwd", tool_input.get("workdir", os.getcwd())))
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        cwd = None
     for group in command_groups(command):
-        detail = stdin_channel_detail(group)
+        rest = strip_prefixes(group)
+        if rest and os.path.basename(rest[0]) in ('cd', 'pushd', 'popd'):
+            cwd = None
+        detail = stdin_channel_detail(group, cwd)
         if detail:
             emit("block", STDIN_CHANNEL_BLOCK.format(detail=detail))
 
@@ -529,6 +557,8 @@ mod tests {
             "python3 - < 'script<name.py'",
             "python3 - < script.py 2>&1",
             "python3 - < script.py >&2",
+            "python3 - < script.py &>/dev/null",
+            "python3 - <<'PY' &>>log\nprint(1)\nPY",
             "python3 - <<'PY' 2>&1\nprint(1)\nPY",
             "node - <<'JS' >&2\nconsole.log(1)\nJS",
             "python3 - < script.py 2>/dev/null",
@@ -563,6 +593,16 @@ mod tests {
             "python3 - >out",
             // A terminal or process device is a live channel, not a file.
             "python3 - < /dev/tty",
+            "python3 - < //dev/tty",
+            "python3 - < /./dev/tty",
+            "python3 - < /private/dev/tty",
+            "python3 - < ../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../dev/tty",
+            "cd /dev && python3 - < tty",
+            "python3 - < $INPUT",
+            "python3 - < ~/input",
+            "python3 - < *.py",
+            "python3 - < script.py &>log</dev/tty",
+            "python3 - <<'PY' &>>log</dev/tty\nprint(1)\nPY",
             "python3 -</dev/stdin",
             "python3 - 0< /proc/self/fd/0",
             // A shell reading a heredoc stays blocked.
@@ -574,6 +614,32 @@ mod tests {
         ] {
             let (decision, reason) = bash(command);
             assert_eq!(decision, "block", "{command:?} still opens a stdin channel: {reason}");
+        }
+    }
+
+    #[test]
+    fn redirect_sources_resolve_against_payload_cwd_and_reject_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/tty", dir.path().join("terminal")).unwrap();
+        std::fs::write(dir.path().join("regular.py"), "print(1)\n").unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(dir.path().join("fifo"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (target, expected) in [
+            ("terminal", "block"),
+            ("fifo", "block"),
+            (".", "block"),
+            ("regular.py", "approve"),
+        ] {
+            let (decision, reason) = decide(serde_json::json!({
+                "tool_name": "Bash", "cwd": dir.path(),
+                "tool_input": {"command": format!("python3 - < {target}")}
+            }));
+            assert_eq!(decision, expected, "{target}: {reason}");
         }
     }
 
