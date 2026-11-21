@@ -162,7 +162,11 @@ pub struct TeardownRetries {
 }
 
 impl TeardownRetries {
-    fn failed(&mut self, db: &WorkDb, execution_id: &str, reason: &str) {
+    pub(crate) fn succeeded(&mut self, execution_id: &str) {
+        self.failures.remove(execution_id);
+    }
+
+    pub(crate) fn failed(&mut self, db: &WorkDb, execution_id: &str, reason: &str) {
         tracing::warn!(
             execution_id,
             reason,

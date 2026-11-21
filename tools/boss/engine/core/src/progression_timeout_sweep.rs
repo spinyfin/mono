@@ -9,7 +9,7 @@ use boss_protocol::ExecutionKind;
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::pool_claim_sweep::WorkerViewerDetach;
+use crate::pool_claim_sweep::{TeardownRetries, WorkerViewerDetach};
 use crate::work::WorkDb;
 
 #[derive(bon::Builder)]
@@ -22,7 +22,9 @@ pub struct ProgressionTimeoutSweep {
     pub hold_registry: Arc<crate::hold_registry::HoldRegistry>,
     pub dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink>,
     #[builder(default)]
-    pub unstarted_claims: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    unstarted_claims: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    #[builder(default)]
+    teardown_retries: std::sync::Mutex<TeardownRetries>,
     pub viewers: Arc<dyn WorkerViewerDetach>,
 }
 
@@ -79,6 +81,7 @@ impl ProgressionTimeoutSweep {
             let result = self.reconcile(&claim.execution_id, now, timeout_secs).await;
             match result {
                 Ok(true) => {
+                    self.teardown_retries.lock().unwrap().succeeded(&claim.execution_id);
                     // Teardown may already have handed this slot to a new run.
                     self.live_states.release_slot_for_run(&claim.execution_id);
                     self.coordinator
@@ -87,8 +90,15 @@ impl ProgressionTimeoutSweep {
                     released += 1;
                 }
                 Ok(false) => {}
-                Err(err) => tracing::warn!(execution_id = %claim.execution_id, %err,
-                    "progression deadline cleanup pending; retaining claim for retry"),
+                Err(err) => {
+                    // Escalates to the same attention item as the pool-claim
+                    // sweep after repeated unconfirmed teardowns.
+                    self.teardown_retries.lock().unwrap().failed(
+                        &self.work_db,
+                        &claim.execution_id,
+                        &format!("{err:#}"),
+                    );
+                }
             }
         }
         released
@@ -147,11 +157,30 @@ impl ProgressionTimeoutSweep {
                     .await;
             }
             tracing::warn!(execution_id, elapsed_secs, timeout_secs, "progression deadline reached");
-        } else if execution
-            .finished_epoch()
-            .is_some_and(|finished| now.saturating_sub(finished) < crate::pool_claim_sweep::LEAK_GRACE_SECS)
-        {
-            return Ok(false);
+        } else {
+            // An inferred-orphaned run that a live worker still backs may be
+            // re-adopted by a late hook (see the worker liveness contract), so
+            // it keeps the full run timeout instead of the short terminal grace.
+            let live_backed = self
+                .live_states
+                .snapshot()
+                .iter()
+                .any(|state| state.run_id == execution_id);
+            if live_backed && execution.status == boss_protocol::ExecutionStatus::Orphaned {
+                let started = execution
+                    .started_epoch()
+                    .or_else(|| execution.created_epoch())
+                    .ok_or_else(|| anyhow::anyhow!("progression run has no valid start time"))?;
+                if now.saturating_sub(started) < timeout_secs {
+                    return Ok(false);
+                }
+            }
+            if execution
+                .finished_epoch()
+                .is_some_and(|finished| now.saturating_sub(finished) < crate::pool_claim_sweep::LEAK_GRACE_SECS)
+            {
+                return Ok(false);
+            }
         }
 
         // Terminal rows still owning claims (including orphaned runs) retry
@@ -179,5 +208,5 @@ impl ProgressionTimeoutSweep {
 }
 
 #[cfg(test)]
-#[path = "stale_worker_progression_timeout_tests.rs"]
+#[path = "progression_timeout_sweep_tests.rs"]
 mod tests;

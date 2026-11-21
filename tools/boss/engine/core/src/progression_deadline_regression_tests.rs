@@ -5,16 +5,15 @@ fn deadline_sweep(
     states: &Arc<LiveWorkerStateRegistry>,
     coordinator: &Arc<ExecutionCoordinator>,
 ) -> ProgressionTimeoutSweep {
-    ProgressionTimeoutSweep {
-        work_db: db.clone(),
-        live_states: states.clone(),
-        coordinator: coordinator.clone(),
-        pane_releaser: Arc::new(RecordingReaper::new(coordinator.clone(), db.clone())),
-        viewers: Arc::new(NoViewers),
-        hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
-        dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
-        unstarted_claims: Default::default(),
-    }
+    ProgressionTimeoutSweep::builder()
+        .work_db(db.clone())
+        .live_states(states.clone())
+        .coordinator(coordinator.clone())
+        .pane_releaser(Arc::new(RecordingReaper::new(coordinator.clone(), db.clone())))
+        .viewers(Arc::new(NoViewers))
+        .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+        .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+        .build()
 }
 
 #[tokio::test]

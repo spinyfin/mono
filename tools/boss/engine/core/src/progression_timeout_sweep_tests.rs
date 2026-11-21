@@ -149,18 +149,17 @@ async fn sweep(
     coordinator: &Arc<ExecutionCoordinator>,
     reaper: &RecordingReaper,
 ) -> usize {
-    ProgressionTimeoutSweep {
-        work_db: db.clone(),
-        live_states: live_states.clone(),
-        coordinator: coordinator.clone(),
-        pane_releaser: Arc::new(reaper.clone()),
-        hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
-        dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
-        unstarted_claims: Default::default(),
-        viewers: Arc::new(NoViewers),
-    }
-    .run_one_pass(boss_engine_utils::epoch_time::now_epoch_secs())
-    .await
+    ProgressionTimeoutSweep::builder()
+        .work_db(db.clone())
+        .live_states(live_states.clone())
+        .coordinator(coordinator.clone())
+        .pane_releaser(Arc::new(reaper.clone()))
+        .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+        .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+        .viewers(Arc::new(NoViewers))
+        .build()
+        .run_one_pass(boss_engine_utils::epoch_time::now_epoch_secs())
+        .await
 }
 
 #[tokio::test]
@@ -298,8 +297,20 @@ async fn spawning_and_missing_live_state_cannot_hide_an_expired_claim() {
 }
 
 #[tokio::test]
-async fn an_orphaned_claim_is_reaped_even_with_live_state_and_preserves_its_outcome() {
-    let (_dir, db, item, execution, states, coordinator) = progression_fixture(Some(3_600)).await;
+async fn a_live_backed_orphan_within_its_timeout_is_not_reaped() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(3_600)).await;
+    db.mark_execution_orphaned(&execution, "worker lost").unwrap();
+    age_terminal(&db, &execution);
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
+    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 0);
+    assert!(reaper.reaped().is_empty());
+    assert!(states.get(SLOT).is_some());
+    assert_eq!(coordinator.progression_worker_pool().claims().await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_orphaned_claim_is_reaped_past_its_timeout_and_preserves_its_outcome() {
+    let (_dir, db, item, execution, states, coordinator) = progression_fixture(Some(60)).await;
     let before = description_of(&db, &item);
     db.mark_execution_orphaned(&execution, "worker lost").unwrap();
     age_terminal(&db, &execution);
@@ -315,6 +326,16 @@ async fn an_orphaned_claim_is_reaped_even_with_live_state_and_preserves_its_outc
     assert!(coordinator.progression_worker_pool().claims().await.is_empty());
     assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 0);
     assert_eq!(reaper.reaped().len(), 1);
+}
+
+#[tokio::test]
+async fn an_orphan_without_live_backing_is_reaped_after_the_terminal_grace() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(3_600)).await;
+    db.mark_execution_orphaned(&execution, "worker lost").unwrap();
+    age_terminal(&db, &execution);
+    states.release_slot_for_run(&execution);
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
+    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
 }
 
 #[tokio::test]
@@ -362,24 +383,25 @@ async fn failed_teardown_retains_the_claim_and_retries_the_recorded_terminal_out
     for process_failed in [true, false] {
         let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
         let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
-        let pending = ProgressionTimeoutSweep {
-            work_db: db.clone(),
-            live_states: states.clone(),
-            coordinator: coordinator.clone(),
-            pane_releaser: if process_failed {
-                Arc::new(UnconfirmedProcess)
-            } else {
-                Arc::new(reaper.clone())
-            },
-            hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
-            dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
-            unstarted_claims: Default::default(),
-            viewers: if process_failed {
-                Arc::new(NoViewers)
-            } else {
-                Arc::new(UnconfirmedViewer)
-            },
+        let releaser: Arc<dyn WorkerPaneReleaser> = if process_failed {
+            Arc::new(UnconfirmedProcess)
+        } else {
+            Arc::new(reaper.clone())
         };
+        let viewers: Arc<dyn WorkerViewerDetach> = if process_failed {
+            Arc::new(NoViewers)
+        } else {
+            Arc::new(UnconfirmedViewer)
+        };
+        let pending = ProgressionTimeoutSweep::builder()
+            .work_db(db.clone())
+            .live_states(states.clone())
+            .coordinator(coordinator.clone())
+            .pane_releaser(releaser)
+            .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+            .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+            .viewers(viewers)
+            .build();
         assert_eq!(
             pending
                 .run_one_pass(boss_engine_utils::epoch_time::now_epoch_secs())
@@ -409,16 +431,15 @@ async fn exact_deadline_and_missing_start_time_use_the_published_limit() {
             [&execution],
         )
         .unwrap();
-    let sweep = ProgressionTimeoutSweep {
-        work_db: db.clone(),
-        live_states: states,
-        coordinator: coordinator.clone(),
-        pane_releaser: Arc::new(RecordingReaper::new(coordinator, db.clone())),
-        hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
-        dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
-        unstarted_claims: Default::default(),
-        viewers: Arc::new(NoViewers),
-    };
+    let sweep = ProgressionTimeoutSweep::builder()
+        .work_db(db.clone())
+        .live_states(states)
+        .coordinator(coordinator.clone())
+        .pane_releaser(Arc::new(RecordingReaper::new(coordinator, db.clone())))
+        .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+        .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+        .viewers(Arc::new(NoViewers))
+        .build();
     assert_eq!(sweep.run_one_pass(1059).await, 0);
     assert_eq!(sweep.run_one_pass(1060).await, 1);
     assert!(
