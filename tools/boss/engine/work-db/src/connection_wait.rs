@@ -18,9 +18,35 @@
 //!   spurious failure of a caller that has no retry path. A wait or hold of
 //!   at least 100 ms is logged with the caller's location instead.
 //!
-//! Synchronous callers and current-thread runtimes lock normally.
+//! Synchronous callers and current-thread runtimes lock normally. Re-entering
+//! a connection held by the same thread is an error, since it cannot progress.
 use super::{Connection, Mutex, PooledConnection, Result};
+use std::cell::RefCell;
+use std::panic::Location;
 use std::sync::TryLockError;
+
+thread_local! {
+    // MutexGuard is !Send: ownership stays on this thread through Drop. Key
+    // the mutex, not WorkDb, so clones share an identity and independent DBs
+    // can still be used together. No process-wide lock on the fast path.
+    static HELD: RefCell<Vec<(usize, &'static Location<'static>)>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ConnectionOwner(usize);
+
+impl ConnectionOwner {
+    fn register(connection: &Mutex<Connection>, caller: &'static Location<'static>) -> Self {
+        let id = std::ptr::from_ref(connection) as usize;
+        HELD.with_borrow_mut(|held| held.push((id, caller)));
+        Self(id)
+    }
+}
+
+impl Drop for ConnectionOwner {
+    fn drop(&mut self) {
+        HELD.with_borrow_mut(|held| held.retain(|(id, _)| *id != self.0));
+    }
+}
 
 // Lock acquisition cannot return SQLite errors. Keep this outside the result
 // boundary so track_caller forwards the original call site without a closure.
@@ -30,8 +56,8 @@ impl super::WorkDb {
     /// guard over the one connection this `WorkDb` (and every clone of it)
     /// shares — see the docs on `WorkDb::conn`. A function that already
     /// holds a `connect()` guard must drop it (e.g. scope it in a block)
-    /// before calling anything that connects again, or it deadlocks against
-    /// itself.
+    /// before calling anything that connects again. Re-entry fails with both
+    /// call sites rather than waiting on a lock this thread cannot release.
     #[track_caller]
     pub fn connect(&self) -> Result<PooledConnection<'_>> {
         super::connection_wait::acquire(&self.conn, &self.persona_metrics)
@@ -41,6 +67,7 @@ impl super::WorkDb {
 #[derive(bon::Builder)]
 #[builder(on(String, into), builder_type(vis = "pub(self)"), start_fn(vis = "pub(self)"))]
 pub struct ConnectionGuard<'a> {
+    owner: Option<ConnectionOwner>,
     guard: Option<std::sync::MutexGuard<'a, Connection>>,
     caller: &'static std::panic::Location<'static>,
     acquired: std::time::Instant,
@@ -51,6 +78,7 @@ pub struct ConnectionGuard<'a> {
 
 impl<'a> ConnectionGuard<'a> {
     fn new(
+        connection: &Mutex<Connection>,
         guard: std::sync::MutexGuard<'a, Connection>,
         caller: &'static std::panic::Location<'static>,
         waited: std::time::Duration,
@@ -58,6 +86,7 @@ impl<'a> ConnectionGuard<'a> {
     ) -> Self {
         let (connection_id, observation) = super::db_diagnostics::start(&guard, caller, metrics);
         Self::builder()
+            .owner(ConnectionOwner::register(connection, caller))
             .connection_id(connection_id)
             .observation(observation)
             .guard(guard)
@@ -88,6 +117,7 @@ impl Drop for ConnectionGuard<'_> {
         let query_ms = self.observation.query_time().as_secs_f64() * 1000.0;
         super::db_diagnostics::finish(self.connection_id);
         drop(self.guard.take());
+        drop(self.owner.take());
         if held.max(self.waited) >= std::time::Duration::from_millis(100) {
             tracing::warn!(query_ms, verb = %self.observation.attribution.verb, request_id = %self.observation.attribution.request_id, session_id = %self.observation.attribution.session_id, background = %self.observation.attribution.background, wait_ms = self.waited.as_millis() as u64, held_ms = held.as_millis() as u64, caller = %self.caller,
                 "work DB connection lock timing");
@@ -102,9 +132,16 @@ pub(super) fn acquire<'a>(
     metrics: &std::sync::Arc<boss_metrics::Registry>,
 ) -> Result<PooledConnection<'a>> {
     let caller = std::panic::Location::caller();
+    let id = std::ptr::from_ref(connection) as usize;
+    if let Some(holder) = HELD.with_borrow(|held| held.iter().find(|(key, _)| *key == id).map(|(_, site)| *site)) {
+        anyhow::bail!(
+            "work db connection re-entry at {caller}: this thread already holds it from {holder}; release the connection guard before calling a WorkDb method"
+        );
+    }
     match connection.try_lock() {
         Ok(guard) => {
             return Ok(ConnectionGuard::new(
+                connection,
                 guard,
                 caller,
                 std::time::Duration::ZERO,
@@ -130,8 +167,12 @@ pub(super) fn acquire<'a>(
         _ => lock(),
     };
     let waited = start.elapsed();
-    guard.map(|guard| ConnectionGuard::new(guard, caller, waited, metrics.clone()))
+    guard.map(|guard| ConnectionGuard::new(connection, guard, caller, waited, metrics.clone()))
 }
+
+#[cfg(test)]
+#[path = "connection_reentry_tests.rs"]
+mod reentry_tests;
 
 #[cfg(test)]
 mod tests {

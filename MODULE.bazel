@@ -70,7 +70,10 @@ test_runtime_repository = use_repo_rule(
     "test_runtime_repository",
 )
 
-test_runtime_repository(name = "test_runtime_tools")
+test_runtime_repository(
+    name = "test_runtime_tools",
+    tools_by_os = {"mac os x": ["sample"]},
+)
 
 # The driver signature contract test reads an Apple-signed fixture with codesign.
 # Keep this tool out of the shared runtime and declare it only for driver tests.

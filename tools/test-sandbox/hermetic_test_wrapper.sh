@@ -102,6 +102,14 @@ child_pid=""
 watchdog_pid=""
 cancelled=""
 
+capture_child_stacks() {
+  if [[ -n "${child_pid}" && -n "${TEST_UNDECLARED_OUTPUTS_DIR:-}" ]]; then
+    "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
+      "${child_pid}" "${runtime_bin}" || \
+      printf 'could not capture test thread backtraces for %s\n' "${child_pid}" >&2
+  fi
+}
+
 # The launcher announces its pid before it calls setpgid, so for a short
 # interval the pid is live while its group does not exist yet. Ownership of
 # the test therefore covers both: the group, and the launcher pid itself.
@@ -122,6 +130,8 @@ terminate_child_group() {
     return 0
   fi
 
+  # Diagnose surviving children before cleanup's first signal.
+  capture_child_stacks
   signal_child TERM
   for _ in {1..20}; do
     if ! process_group_is_alive; then
@@ -180,6 +190,11 @@ cleanup() {
 forward_signal() {
   local signal="$1"
   if [[ -n "${child_pid}" ]]; then
+    # The child has its own process group. Capture its still-live threads
+    # before forwarding Bazel's timeout signal; the outputs survive cleanup.
+    if [[ "${signal}" == "TERM" ]]; then
+      capture_child_stacks
+    fi
     signal_child "${signal}"
   else
     cancelled="${signal}"

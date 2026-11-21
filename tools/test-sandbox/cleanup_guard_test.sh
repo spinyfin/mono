@@ -1,6 +1,7 @@
 #!/bin/bash
 
-set -euo pipefail
+set -eEuo pipefail
+trap 'printf "cleanup assertion failed at line %s: %s\n" "${LINENO}" "${BASH_COMMAND}" >&2' ERR
 
 if [[ "${OSTYPE:-}" != darwin* ]]; then
   exit 0
@@ -49,7 +50,7 @@ run_interruption_case() {
   for _ in {1..400}; do
     for candidate in /private/tmp/mono-test.*; do
       if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/cleanup-child-marker" ]]; then
-        read -r candidate_marker <"${candidate}/cleanup-child-marker"
+        read -r candidate_marker <"${candidate}/cleanup-child-marker" || continue
         if [[ "${candidate_marker}" == "${marker}" ]]; then
           inner_root="${candidate}"
           break 2
@@ -84,6 +85,17 @@ run_interruption_case() {
   else
     kill "-${signal}" "${inner_pid}"
     wait "${inner_pid}" 2>/dev/null || true
+  fi
+
+  if [[ "${signal}" == "TERM" || "${signal}" == "KILL" ]]; then
+    local pid report
+    for pid in "${child_pid}" "${descendant_pid}"; do
+      report="${TEST_UNDECLARED_OUTPUTS_DIR:?}/timeout-${child_pid}/threads-${pid}.txt"
+      [[ -s "${report}" ]] || { printf 'missing thread backtraces: %s\n' "${report}" >&2; return 1; }
+      grep -q 'Call graph:' "${report}"
+      grep -q 'Thread_' "${report}"
+      grep -q 'stack capture exit=0' "${report}"
+    done
   fi
 
   [[ ! -e "${inner_root}" ]] || {
@@ -132,8 +144,12 @@ run_startup_kill_case() {
   for _ in {1..400}; do
     for candidate in /private/tmp/mono-test.*; do
       if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/watchdog-ready" ]]; then
-        read -r owner <"${candidate}/watchdog-ready"
-        owner_pgid="$(ps -o pgid= -p "${owner}" 2>/dev/null | tr -d ' ')"
+        # Another run can remove its root or exit while it is being inspected.
+        # Keep looking for this run; a vanished discovery candidate is not its owner.
+        read -r owner <"${candidate}/watchdog-ready" || continue
+        owner_pgid="$(ps -o pgid= -p "${owner}" 2>/dev/null || true)"
+        owner_pgid="${owner_pgid// /}"
+        [[ -n "${owner_pgid}" ]] || continue
         if [[ "${owner}" == "${inner_pid}" || "${owner_pgid}" == "${inner_pid}" ]]; then
           inner_root="${candidate}"
           break 2
@@ -330,14 +346,19 @@ run_sigint_forwarding_case() {
   local inner_pid=""
   : >"${out}"
   set -m
-  "${wrapper}" /bin/sh -c 'trap "echo got-int" INT; trap "" TERM; while :; do :; done' "${marker}" >"${out}" 2>&1 &
+  "${wrapper}" /bin/sh -c 'trap "echo got-int" INT; trap "" TERM; echo ready; while :; do :; done' "${marker}" >"${out}" 2>&1 &
   inner_pid=$!
   set +m
   for _ in {1..400}; do
-    [[ -n "$(marker_processes "${marker}" | grep -F -- 'while :')" ]] && break
+    grep -q '^ready$' "${out}" && break
     sleep 0.05
   done
-  sleep 0.5
+  grep -q '^ready$' "${out}" || {
+    printf '%s\n' "fixture did not install its SIGINT handler" >&2
+    kill -TERM "${inner_pid}" 2>/dev/null || true
+    wait_bounded "${inner_pid}" "SIGINT readiness" || return 1
+    return 1
+  }
   kill -INT "${inner_pid}"
   wait_bounded "${inner_pid}" "INT forwarding" || return 1
   grep -q got-int "${out}" || {

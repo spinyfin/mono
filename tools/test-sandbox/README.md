@@ -135,6 +135,14 @@ What this does not reach is a process that left the test's group on purpose (`se
 
 `cleanup_guard_test.sh` runs the wrapper around a fixture that ignores `SIGTERM`, then asserts that nothing of the run is left after a normal exit, after `TERM` and `HUP` to the wrapper, after `SIGKILL` to the wrapper's whole group once the fixture is running, and after `SIGKILL` as soon as the watchdog is listening, for `TERM`/`HUP`/`KILL` while the launcher is parked before `setpgid`, for a watchdog that is slow to become ready (the test still runs), a watchdog that dies before readiness and `TERM`/`HUP` while waiting for readiness (bounded exit, the test never starts), that `SIGINT` reaches a test that handles it (the launcher restores the default `SIGINT`/`SIGQUIT` dispositions, which a background shell command would otherwise start ignored), and that the test-only pause hooks are ignored for any path outside the supervisor's own `TEST_TMPDIR`.
 
+## macOS timeout backtraces
+
+Before forwarding SIGTERM, the wrapper runs the audited host `sample` tool on each member of the test's process group. Every report includes all threads, so Rust's test-thread name and the blocked call stack survive a timeout. Reports live in `TEST_UNDECLARED_OUTPUTS_DIR/timeout-<process-group>/threads-<pid>.txt`, alongside `processes.txt` identifying the target and commands. Bazel preserves that directory as test outputs; it is outside the private root removed by cleanup.
+
+Sampling also runs before `terminate_child_group` sends its first signal, covering cleanup of a surviving test tree and the same termination function used by the wrapper-loss watchdog in PR #3792. An atomic output-directory claim makes the TERM and cleanup paths capture only once. Successful tests with no surviving children do not start a sampler. Captures run concurrently at ten samples per second for one second, with a five-second bound on each diagnostic command, and record unavailable tools, attachment failures, or partial output without preventing cleanup. This bound does not change the test deadline.
+
+`cleanup_guard_test` checks real thread reports for both the fixture and its descendant after TERM and after killing the wrapper's group with SIGKILL, and verifies both child cleanup and output retention. `capture_stacks_test` covers process-group selection, duplicate capture, and sampler failures. Linux continues to use Bazel's native action lifecycle; this macOS capture path does not run there. SIGKILL cannot be trapped: the independent watchdog captures the surviving test group through the shared termination function.
+
 ## The `SUN_LEN` problem, and why the two Linux lines are coupled
 
 This is the least obvious thing in the directory, and the thing most likely to be "cleaned up" by someone who does not know why it is there.
