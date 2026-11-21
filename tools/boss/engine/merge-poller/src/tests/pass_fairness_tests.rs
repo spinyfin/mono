@@ -380,6 +380,7 @@ fn every_phase_has_a_distinct_name_and_gauge() {
 
 fn cut_off_in_open_walk() -> PassTimings {
     PassTimings {
+        interrupted: false,
         total: BUDGET,
         probe_work: Default::default(),
         phases: vec![PhaseTiming {

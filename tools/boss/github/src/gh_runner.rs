@@ -127,6 +127,7 @@ pub async fn gh_output(args: &[&str]) -> std::io::Result<Output> {
         .kill_on_drop(true)
         .output()
         .await;
+    crate::availability::observe_output(&result);
     timer.finish_process(&result);
     result
 }
@@ -154,6 +155,7 @@ pub fn gh_output_blocking(args: &[&str]) -> std::io::Result<Output> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
+    crate::availability::observe_output(&result);
     timer.finish_process(&result);
     result
 }
@@ -169,6 +171,7 @@ pub fn gh_output_blocking_timeout(args: &[&str], timeout: Duration) -> std::io::
     let mut command = std::process::Command::new("gh");
     command.args(args).stdin(Stdio::null());
     let result = boss_command_runner::output_blocking_timeout(&mut command, timeout);
+    crate::availability::observe_output(&result);
     timer.finish_process(&result);
     result
 }
@@ -364,6 +367,7 @@ async fn execute_gh(args: &[String], token: Option<&str>) -> std::result::Result
         .kill_on_drop(true)
         .output()
         .await;
+    crate::availability::observe_output(&result);
     timer.finish_process(&result);
 
     let output = result.map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
@@ -455,6 +459,7 @@ impl GhRunner for CommandGhRunner {
             return Err(GhRunnerError::transient(format!("failed to write POST body: {e}")));
         }
         let result = child.wait_with_output().await;
+        crate::availability::observe_output(&result);
         timer.finish_process(&result);
         let output = result.map_err(|e| GhRunnerError::transient(format!("failed to wait for gh: {e}")))?;
 

@@ -437,7 +437,7 @@ where
     // production, but it tracks the same clock as the `timeout` below, so
     // the overrun accounting is testable under a paused runtime clock.
     let started = tokio::time::Instant::now();
-    match tokio::time::timeout(budget, pass).await {
+    match crate::pass_environment::observe(trace, cadence, tokio::time::timeout(budget, pass)).await {
         Ok(outcome) => {
             let elapsed = started.elapsed();
             let timings = trace.timings();

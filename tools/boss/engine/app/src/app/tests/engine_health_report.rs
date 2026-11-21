@@ -109,6 +109,7 @@ async fn abandoned_merge_detection_pass_is_on_the_health_report_until_a_pass_fin
         latest_abandoned_epoch_s: now,
         budget: Duration::from_secs(180),
         timings: PassTimings {
+            interrupted: false,
             probe_work: Default::default(),
             total: Duration::from_secs(180),
             phases: Vec::new(),
