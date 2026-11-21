@@ -7,7 +7,7 @@
 //! | `revise` | `assert_parent_revisable_and_insert_as_actor`, the path `create_revision` runs |
 //! | `precursor` | `insert_chore_in_tx_as_actor` plus `add_dependency_edge_in_tx` |
 //! | `depend` / `undepend` | `add_dependency_edge_in_tx` / `delete_edge` plus the dependency unblock |
-//! | `redispatch` | `request_execution_in_tx_with_live_check` (an explicit start), or the review restart for an `in_review` item |
+//! | `redispatch` | explicit start, a revision for a blocked PR owner, or review restart for an `in_review` item |
 //! | `clear-signal` | the merge poller's retire writes (`clear_blocked_*_in_tx`) |
 //! | `archive-revision` | `archive_revision_task_as_actor` plus the dependent cascade |
 //! | `unblock` | the `blocked -> todo` (or `in_review`, when the item already owns a bound PR or is a completed revision) move |
@@ -303,7 +303,7 @@ pub(super) fn undepend(
 // ── redispatch ───────────────────────────────────────────────────────────────
 
 /// The redispatch bound (design 2.5): at most one progression `redispatch` per
-/// `(item, stuck kind)` until a non-progression work run on the item completes.
+/// `(item, stuck kind)` until work on the item or its restart revision completes.
 /// A changed fingerprint, a failed run, a new terminal execution id, a changed
 /// PR head, and a park or un-park all leave the bound standing; only a completed
 /// work run *after* the redispatch's execution resets it. Returns the run that
@@ -337,7 +337,8 @@ fn redispatch_bound(conn: &Connection, item: &str, stuck_kind: &str) -> Result<O
     let (since, anchor_id) = anchor.unwrap_or((acted_at, String::new()));
     let reset: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM work_executions x
-                       WHERE x.work_item_id = ?1 AND x.kind <> 'progression' AND x.status = 'completed'
+                       WHERE (x.work_item_id = ?1 OR x.id = ?3)
+                         AND x.kind <> 'progression' AND x.status = 'completed'
                          AND (CAST(x.created_at AS INTEGER) > CAST(?2 AS INTEGER)
                               OR (CAST(x.created_at AS INTEGER) = CAST(?2 AS INTEGER) AND x.id >= ?3)))",
         params![item, since, anchor_id],
@@ -421,6 +422,48 @@ pub(super) fn redispatch(
         // attention that parked it, as an explicit start does.
         resolve_attention_kind_in_tx(conn, &item.id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
         via_engine_path(verb, request_pr_review_in_tx(conn, &item.id, pr_checker))?
+    } else if item.status == TaskStatus::Blocked && crate::dispatch_admission::primary_pr_awaits_review(conn, &item.id)?
+    {
+        // Revision dispatch positions the worker on the bound PR and requires
+        // updates to it. Keep the root's binding rather than minting a new PR.
+        ctx.refuse_over_budget(conn)?;
+        if !deps::gating_prereqs_for(conn, &item.id)?.is_empty()
+            || work_item_is_human_driven(conn, &item.id)?
+            || parking::unpark_first_refusal(conn, &item.id)?.is_some()
+        {
+            return Err(ProgressionVerbRefusal::Precondition {
+                verb: verb.to_string(),
+                message: "the PR owner is gated, human-driven, or parked".into(),
+            }
+            .into());
+        }
+        let revision = via_engine_path(
+            verb,
+            assert_parent_revisable_and_insert_as_actor(
+                pending,
+                conn,
+                CreateRevisionInput::builder()
+                    .parent_task_id(item.id.clone())
+                    .name(format!("Restart: {}", truncated(&item.name)))
+                    .description(format!(
+                        "Continue work on the existing PR for: {}\n\n{}",
+                        item.name,
+                        query_task(conn, &item.id)?
+                            .context("redispatch item disappeared")?
+                            .description,
+                    ))
+                    .created_via(ctx.created_via.clone())
+                    .reasoning(ReasoningMode::Standard)
+                    .force_duplicate(true)
+                    .build(),
+                pr_checker,
+                PROGRESSION,
+            ),
+        )?;
+        stamp_progression_actor(conn, &revision.id)?;
+        stage_task_board_change(pending, conn, &revision.id)?;
+        crate::dispatch_helpers::query_latest_execution_for_work_item(conn, &revision.id)?
+            .context("redispatch revision has no execution")?
     } else {
         // An explicit start: it clears `churn_guard`, resolves a `deliberate_park`
         // attention, and lifts a non-refusal `worker_failed` block, all in this
