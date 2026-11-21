@@ -2823,6 +2823,11 @@ impl ExecutionCoordinator {
                         )
                         .await;
                     coordinator.recover_failed_dispatch(&execution, &worker_id, &err).await;
+                    // The freed slot can serve other rows now; a deferred row is
+                    // held by `dispatch_not_before`, so this cannot re-claim it.
+                    if err.downcast_ref::<super::spoke_in_doubt::DispatchDeferred>().is_some() {
+                        coordinator.kick();
+                    }
                 }
             }
         });
@@ -2858,8 +2863,11 @@ impl ExecutionCoordinator {
         }
         // Park already returned the row to ready without spending the retry
         // budget. A drain that re-claims before this runs must not count the
-        // same unanswered lease as a start failure.
+        // same unanswered lease or a budget deferral as a start failure.
         if waitable_spoke_lease(err).is_some() {
+            return;
+        }
+        if super::spoke_in_doubt::release_budget_deferred_claim(&self.work_db, err, &current) {
             return;
         }
         if current.status != ExecutionStatus::Claimed {

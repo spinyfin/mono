@@ -117,6 +117,31 @@ fn decode_result(bytes: &[u8]) -> Result<CommandResult, StoreError> {
 
 #[tonic::async_trait]
 impl SpokeObservationSink for WorkDbSink {
+    async fn pulse(&self, session: &Session, stamp: &boss_protocol_spoke::v1::Stamp) -> Result<(), StoreError> {
+        let session = session.clone();
+        let stamp = stamp.clone();
+        blocking(&self.db, move |db| {
+            db.host_capacity_pulse(
+                &session.host_id,
+                session.generation,
+                &stamp.boot_id,
+                stamp.awake_ns,
+                now_ms(),
+            )
+            .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn disconnected(&self, session: &Session) -> Result<(), StoreError> {
+        let session = session.clone();
+        blocking(&self.db, move |db| {
+            db.host_capacity_disconnected(&session.host_id, session.generation, now_ms())
+                .map_err(store_error)
+        })
+        .await
+    }
+
     async fn open(&self, hello: &Hello, _: &Selection) -> Result<Admission, StoreError> {
         let host_id = hello.host_id.clone();
         let journal_id = hello.journal_id.clone();
@@ -125,6 +150,8 @@ impl SpokeObservationSink for WorkDbSink {
         blocking(&self.db, move |db| {
             let admission = db
                 .open_spoke_journal(&host_id, &journal_id, last_record, first_retained)
+                .map_err(store_error)?;
+            db.open_host_capacity(&host_id, admission.generation, last_record, now_ms())
                 .map_err(store_error)?;
             Ok(Admission {
                 generation: admission.generation,
@@ -160,6 +187,7 @@ impl SpokeObservationSink for WorkDbSink {
         // advance, but do not keep the bytes against the host's quota.
         let retain = !matches!(record.body, Some(record::Body::Capture(_)));
         let urgent = matches!(record.body, Some(record::Body::Proposal(_)));
+        let observation = record.clone();
         let cursor = blocking(&self.db, move |db| {
             let result_run = result.as_ref().and_then(|(_, run, _)| run.as_ref());
             let result_ref = result.as_ref().map(|(command_id, _, bytes)| SpokeIngressResult {
@@ -185,6 +213,38 @@ impl SpokeObservationSink for WorkDbSink {
                         .build(),
                 )
                 .map_err(store_error)?;
+            match &observation.body {
+                Some(record::Body::Capacity(capacity)) => {
+                    if let Some(stamp) = &observation.observed {
+                        let mut report = boss_work_db::HostCapacityReport::builder()
+                            .generation(capacity.generation)
+                            .sequence(sequence)
+                            .boot_id(&stamp.boot_id)
+                            .awake_ns(stamp.awake_ns)
+                            .total(capacity.total_slots)
+                            .occupied(capacity.active_slots.saturating_add(capacity.reserved_slots))
+                            .resources(Default::default())
+                            .applied_command_through(capacity.applied_command_through)
+                            .preflights_ok(
+                                capacity
+                                    .inventory
+                                    .as_ref()
+                                    .is_some_and(|i| i.failed_preflights.is_empty()),
+                            )
+                            .build();
+                        report.resources.cpu_millis = u64::from(capacity.available_cpu_millis);
+                        report.resources.memory_bytes = capacity.available_memory_bytes;
+                        report.resources.disk_bytes = capacity.free_disk_bytes;
+                        db.record_host_capacity(&host_id, generation, &report, now_ms())
+                            .map_err(store_error)?;
+                    }
+                }
+                Some(record::Body::Inventory(inventory)) if inventory.last_page => {
+                    db.host_capacity_inventory(&host_id, generation, sequence, inventory.through_record)
+                        .map_err(store_error)?;
+                }
+                _ => {}
+            }
             Ok(Cursor { journal_id, through })
         })
         .await?;
@@ -193,6 +253,12 @@ impl SpokeObservationSink for WorkDbSink {
         }
         Ok(cursor)
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
 #[tonic::async_trait]

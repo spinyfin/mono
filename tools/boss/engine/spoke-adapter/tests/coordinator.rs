@@ -1,13 +1,19 @@
 //! The real dispatch coordinator against the authenticated scripted spoke.
 use super::{short, support::*, workspace_slack};
+use async_trait::async_trait;
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
+    dispatch_events::{DispatchEventSink, RecordingDispatchEventSink},
     lifecycle_adapter::CoreLifecycleServices,
 };
-use boss_execution_contracts::{NoopExecutionPublisher, WorkerPool};
-use boss_protocol::{AutomationTrigger, CreateProductInput, ExecutionStatus, WorkExecution};
+use boss_execution_contracts::LiveWorkerLiveness;
+use boss_execution_contracts::{HostAdapter, HostAdapterProvider, NoopExecutionPublisher, WorkerPool};
+use boss_protocol::{
+    AutomationTrigger, CreateChoreInput, CreateProductInput, ExecutionStatus, LiveWorkerState, RequestExecutionInput,
+    WorkExecution,
+};
 use boss_protocol_spoke::v1::{Command, CommandResult, Cursor, PaneLife, ResultCode, WorkspaceKind, command};
-use boss_work_db::{CancelExecutionOpts, CreateAutomationInput};
+use boss_work_db::{CancelExecutionOpts, CreateAutomationInput, Host};
 use serde_json::json;
 use std::{
     sync::{
@@ -76,7 +82,9 @@ struct Env {
 }
 
 async fn env(fx: &Fixture, slots: usize) -> Env {
-    fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
+    // An unanswered lease keeps its assignment open, and an open assignment is
+    // a reservation against the host's seats, so the host needs one per slot.
+    fx.db.add_host(HOST, "worker@host", slots as i64, &[]).unwrap();
     fx.db
         .connect()
         .unwrap()
@@ -444,7 +452,7 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
 }
 
 #[tokio::test]
-async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_retry_budget() {
+async fn unanswered_spoke_leases_park_without_spending_the_retry_budget() {
     // 300 ms is well under the 3 s observation window, so later dispatch
     // passes re-send the stored lease and hit the command deadline again.
     // Those re-sends must stay `LeaseOutcomeUncertain` (parked, retry
@@ -478,7 +486,7 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
     assert_eq!(
         env.pool.busy_count().await,
         0,
-        "no pool slot is held while a lease is in doubt"
+        "no worker-pool slot is held while a lease is in doubt"
     );
     assert_eq!(env.coordinator.repo_lease_limiter().in_flight(REPO), 0);
     assert_eq!(
@@ -508,6 +516,403 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
         executions.iter().all(|e| !attention_open(&fx, &e.id))
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_parked_lease_holds_a_host_seat_until_its_assignment_resolves() {
+    let fx = Fixture::with(short(300)).await;
+    let env = env(&fx, 1).await;
+    let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
+    let peer = fx
+        .spoke(
+            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+            None,
+            0,
+        )
+        .await;
+    env.coordinator.kick();
+    until("one lease to be parked with attention", || {
+        executions.iter().any(|e| attention_open(&fx, &e.id))
+    })
+    .await;
+
+    // The single seat is taken: the other execution is not admitted.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let held: Vec<_> = executions
+        .iter()
+        .filter_map(|e| fx.db.spoke_assignment_for_execution(&e.id).unwrap().map(|a| (e, a)))
+        .collect();
+    assert_eq!(held.len(), 1, "only one execution holds the host's one seat");
+    assert_eq!(peer.commands().iter().filter(|c| is_lease(c)).count(), 1);
+    assert_eq!(fx.db.available_host_budget(HOST).unwrap(), 0);
+    // Losing the race for the seat defers the work; it is not a pre-start failure.
+    for execution in &executions {
+        let row = fx.db.get_execution(&execution.id).unwrap();
+        assert!(!row.status.is_terminal(), "{row:?}");
+        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    }
+
+    // Resolving the assignment frees the seat.
+    let (execution, assignment) = &held[0];
+    let waiting = executions
+        .iter()
+        .find(|e| e.id != execution.id)
+        .expect("the other execution");
+    // Cancel the parked execution first so a concurrent drain cannot reclaim
+    // the seat after the reservation lifts.
+    fx.db.cancel_execution(&execution.id).unwrap();
+    assert!(
+        fx.db
+            .resolve_spoke_assignment(&execution.id, assignment.assignment_generation, "never_started")
+            .unwrap()
+    );
+    assert_eq!(fx.db.available_host_budget(HOST).unwrap(), 1);
+    until(
+        "the waiting execution to be admitted after the parked seat frees",
+        || {
+            // The parked attempt may still hold the automation-pool slot until its
+            // unanswered lease times out; keep the budget fresh and wake dispatch
+            // so the waiting row is claimed as soon as that slot is free.
+            fx.refresh_budget(HOST);
+            env.coordinator.kick();
+            fx.db.spoke_assignment_for_execution(&waiting.id).unwrap().is_some()
+        },
+    )
+    .await;
+    let waiting_row = fx.db.get_execution(&waiting.id).unwrap();
+    assert!(!waiting_row.status.is_terminal(), "{waiting_row:?}");
+    assert_eq!(waiting_row.pre_start_failure_count, 0, "{waiting_row:?}");
+}
+
+/// Steals the last host seat after selection and before admission, once.
+struct SeatStealer {
+    inner: Arc<dyn HostAdapterProvider>,
+    db: Arc<boss_work_db::WorkDb>,
+    stolen: AtomicBool,
+}
+
+#[async_trait]
+impl HostAdapterProvider for SeatStealer {
+    async fn adapter_for(&self, host: &Host) -> anyhow::Result<Arc<dyn HostAdapter>> {
+        self.inner.adapter_for(host).await
+    }
+
+    async fn adapter_for_execution(&self, host: &Host, execution_id: &str) -> anyhow::Result<Arc<dyn HostAdapter>> {
+        if !self.stolen.swap(true, Ordering::SeqCst) {
+            let db = Arc::clone(&self.db);
+            let host_id = host.id.clone();
+            tokio::task::spawn_blocking(move || db.admit_spoke_assignment("seat-thief", &host_id))
+                .await
+                .unwrap()
+                .expect("the seat thief takes the last budgeted seat");
+        }
+        self.inner.adapter_for_execution(host, execution_id).await
+    }
+}
+
+fn start_failure_attention(fx: &Fixture, execution_id: &str) -> bool {
+    fx.db
+        .list_attention_items(execution_id)
+        .unwrap()
+        .iter()
+        .any(|item| item.kind == "no_eligible_host" || item.kind == "schedule_execution_error")
+}
+
+#[tokio::test]
+async fn losing_the_seat_between_selection_and_admission_defers_then_retries() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
+            [HOST],
+        )
+        .unwrap();
+    fx.ready(HOST);
+    let product = fx
+        .db
+        .create_product(
+            CreateProductInput::builder()
+                .name("spoke dispatch")
+                .repo_remote_url(REPO)
+                .build(),
+        )
+        .unwrap();
+    let pool = WorkerPool::new_automation(1);
+    let events = Arc::new(RecordingDispatchEventSink::new());
+    let local = fx.provider_adapter(HOST).await;
+    let mut coordinator = ExecutionCoordinator::with_host_adapter_and_publisher(
+        fx.db.clone(),
+        WorkerPool::new(1),
+        local,
+        Arc::new(NoopExecutionPublisher),
+        CoreLifecycleServices::new(fx.db.clone()),
+    );
+    coordinator.set_host_adapter_provider(Arc::new(SeatStealer {
+        inner: fx.provider.clone(),
+        db: fx.db.clone(),
+        stolen: AtomicBool::new(false),
+    }));
+    coordinator.set_automation_pool(pool);
+    coordinator.set_spoke_in_doubt_timing(quick());
+    coordinator.set_dispatch_events(events.clone() as Arc<dyn DispatchEventSink>);
+    let coordinator = Arc::new(coordinator);
+    let env = Env {
+        coordinator: coordinator.clone(),
+        pool: WorkerPool::new_automation(1),
+        product_id: product.id,
+    };
+    let execution = triage(&fx, &env, "admission race");
+    let peer = fx.spoke(Box::new(answer), None, 0).await;
+    env.coordinator.kick();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let seen = events.events_for(&execution.id).await;
+            if seen.iter().any(|event| {
+                event.stage == "host_selected"
+                    && event.outcome == "error"
+                    && event.details.get("reason").and_then(|v| v.as_str()) == Some("host_budget_exhausted")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for a terminal host_selected event that names the spent budget");
+    let row = fx.db.get_execution(&execution.id).unwrap();
+    assert_eq!(row.status, ExecutionStatus::Ready, "{row:?}");
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    assert!(
+        !start_failure_attention(&fx, &execution.id),
+        "{:?}",
+        fx.db.list_attention_items(&execution.id).unwrap()
+    );
+    assert!(
+        peer.commands()
+            .iter()
+            .all(|c| !matches!(c.body, Some(command::Body::Spawn(_)))),
+        "admission must not proceed while the thief holds the seat"
+    );
+
+    let thief = fx.db.spoke_assignment_for_execution("seat-thief").unwrap().unwrap();
+    assert!(
+        fx.db
+            .resolve_spoke_assignment("seat-thief", thief.assignment_generation, "never_started")
+            .unwrap()
+    );
+    env.coordinator.kick();
+    until(
+        "the deferred execution to spawn after the thief releases the seat",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == execution.id)
+        },
+    )
+    .await;
+    let row = fx.db.get_execution(&execution.id).unwrap();
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    assert!(!start_failure_attention(&fx, &execution.id));
+}
+
+#[tokio::test]
+async fn a_stale_pinned_spoke_host_defers_until_its_budget_is_fresh() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    let execution = triage(&fx, &env, "stale requested host");
+    fx.db.set_execution_pinned_host(&execution.id, Some(HOST)).unwrap();
+    let peer = fx.spoke(Box::new(answer), None, 0).await;
+    let generation = fx.db.spoke_journal(HOST).unwrap().unwrap().generation;
+    fx.db
+        .host_capacity_disconnected(HOST, generation, now_ms_for_capacity())
+        .unwrap();
+    assert_eq!(fx.db.available_host_budget(HOST).unwrap(), 0);
+    env.coordinator.kick();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let row = fx.db.get_execution(&execution.id).unwrap();
+    assert_eq!(row.status, ExecutionStatus::Ready, "{row:?}");
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    assert!(!row.status.is_terminal(), "{row:?}");
+    assert!(!start_failure_attention(&fx, &execution.id));
+    assert!(
+        peer.commands()
+            .iter()
+            .all(|c| !matches!(c.body, Some(command::Body::Spawn(_)))),
+        "a stale budget must not dispatch"
+    );
+
+    fx.refresh_budget(HOST);
+    assert!(fx.db.available_host_budget(HOST).unwrap() > 0);
+    env.coordinator.kick();
+    until(
+        "the execution to spawn once the requested host's budget is fresh",
+        || {
+            peer.commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == execution.id)
+        },
+    )
+    .await;
+    let row = fx.db.get_execution(&execution.id).unwrap();
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    assert!(!start_failure_attention(&fx, &execution.id));
+}
+
+#[tokio::test]
+async fn a_stale_request_scoped_spoke_host_defers_without_cancelling() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    let chore = fx
+        .db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(env.product_id.clone())
+                .name("stale request-scoped host")
+                .autostart(true)
+                .build(),
+        )
+        .unwrap();
+    let peer = fx.spoke(Box::new(answer), None, 0).await;
+    // Validated while the budget is fresh, so the request is accepted and the
+    // routing constraint is held for the dispatch (it is not a durable pin).
+    let execution = env
+        .coordinator
+        .request_execution_via_db(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .requested_host_id(HOST)
+                .build(),
+            Arc::new(NoLiveWorkers),
+        )
+        .unwrap();
+    let generation = fx.db.spoke_journal(HOST).unwrap().unwrap().generation;
+    fx.db
+        .host_capacity_disconnected(HOST, generation, now_ms_for_capacity())
+        .unwrap();
+    env.coordinator.kick();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Neither cancelled ("requested host became ineligible") nor charged a failure.
+    let row = fx.db.get_execution(&execution.id).unwrap();
+    assert_eq!(row.status, ExecutionStatus::Ready, "{row:?}");
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    assert!(!start_failure_attention(&fx, &execution.id));
+
+    fx.refresh_budget(HOST);
+    env.coordinator.kick();
+    until("the request-scoped execution to spawn once its budget is fresh", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == execution.id)
+    })
+    .await;
+    assert_eq!(fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count, 0);
+}
+
+#[tokio::test]
+async fn a_full_legacy_host_still_records_no_eligible_host() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    fx.db.add_host("legacy", "worker@legacy", 0, &[]).unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO host_capabilities (host_id, capability, source) VALUES ('legacy', 'driver=claude', 'auto')",
+            [],
+        )
+        .unwrap();
+    let execution = triage(&fx, &env, "full legacy host");
+    fx.db.set_execution_pinned_host(&execution.id, Some("legacy")).unwrap();
+    env.coordinator.kick();
+    until("the full legacy host to record a start failure", || {
+        fx.db.get_execution(&execution.id).unwrap().pre_start_failure_count > 0
+            || fx
+                .db
+                .list_attention_items(&execution.id)
+                .unwrap()
+                .iter()
+                .any(|item| item.kind == "no_eligible_host")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_deferred_stale_host_does_not_starve_work_for_a_healthy_host() {
+    let fx = Fixture::with(workspace_slack(300)).await;
+    let env = env(&fx, 1).await;
+    let coordinator = {
+        let local = fx.provider_adapter(HOST).await;
+        let mut c = ExecutionCoordinator::with_host_adapter_and_publisher(
+            fx.db.clone(),
+            WorkerPool::new(1),
+            local,
+            Arc::new(NoopExecutionPublisher),
+            CoreLifecycleServices::new(fx.db.clone()),
+        );
+        c.set_host_adapter_provider(fx.provider.clone());
+        c.set_automation_pool(env.pool.clone());
+        c.set_spoke_in_doubt_timing(quick());
+        Arc::new(c)
+    };
+    fx.db.add_host("healthy", "worker@healthy", 8, &[]).unwrap();
+    fx.db
+        .connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO host_capabilities (host_id, capability, source) VALUES ('healthy', 'driver=claude', 'auto')",
+            [],
+        )
+        .unwrap();
+    fx.serve_legacy();
+    let stale = triage(&fx, &env, "stale host first");
+    fx.db.set_execution_pinned_host(&stale.id, Some(HOST)).unwrap();
+    let healthy = triage(&fx, &env, "healthy host second");
+    fx.db.set_execution_pinned_host(&healthy.id, Some("healthy")).unwrap();
+    let _peer = fx.spoke(Box::new(answer), None, 0).await;
+    let generation = fx.db.spoke_journal(HOST).unwrap().unwrap().generation;
+    fx.db
+        .host_capacity_disconnected(HOST, generation, now_ms_for_capacity())
+        .unwrap();
+    coordinator.kick();
+    until(
+        "the healthy host's execution to be dispatched while the stale one waits",
+        || !fx.legacy_calls().is_empty(),
+    )
+    .await;
+    let row = fx.db.get_execution(&stale.id).unwrap();
+    assert_eq!(row.status, ExecutionStatus::Ready, "{row:?}");
+    assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+}
+
+struct NoLiveWorkers;
+
+impl LiveWorkerLiveness for NoLiveWorkers {
+    fn is_run_live(&self, _run_id: &str) -> bool {
+        false
+    }
+    fn snapshot(&self) -> Vec<LiveWorkerState> {
+        Vec::new()
+    }
+    fn release_slot_for_run(&self, _run_id: &str) -> Option<u8> {
+        None
+    }
+    fn release_persona_for_run(&self, _run_id: &str) {}
+    fn last_event_at_for_run(&self, _run_id: &str) -> Option<String> {
+        None
+    }
+    fn current_tool_for_run(&self, _run_id: &str) -> Option<String> {
+        None
+    }
+}
+
+fn now_ms_for_capacity() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// A host that stops answering after its lease was admitted, across more

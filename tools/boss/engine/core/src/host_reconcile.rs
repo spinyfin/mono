@@ -43,6 +43,15 @@
 //! so a dropped/missed event, a duplicate event, or the subscription's
 //! mailbox closing are all harmless — the next tick (or the immediate
 //! boot-time pass) still finds and drains the offline-host binding.
+//!
+//! **Spoke hosts.** The disable drain above is the legacy-transport contract.
+//! A host on the ready spoke transport is drained only when removed: disabling it
+//! stops dispatch, and losing contact with it never abandons a worker that may
+//! still be running. A `spoke_pending` host still launches over SSH and is
+//! treated like a legacy host. Each pass instead calls
+//! [`WorkDb::reconcile_unreachable_hosts`], which raises one deduplicated
+//! `host_unreachable` attention item per unresolved run after six hours
+//! without a fresh challenge reply and clears it when the host answers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,12 +175,23 @@ async fn one_pass(
 
 /// Run a single host-reconcile pass: drain every non-terminal execution
 /// bound to an offline host. Returns a summary; callers may log it.
+///
+/// A host on the ready spoke transport is offline only when removed; the pass
+/// also reconciles `host_unreachable` attention for silent ready spoke hosts.
+/// A `spoke_pending` host still launches over SSH and is treated like a legacy
+/// host.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
 ) -> HostReconcileOutcome {
     let mut outcome = HostReconcileOutcome::default();
+
+    // Surface prolonged spoke silence before draining. Silence only ever
+    // raises attention: it never terminalizes a run or releases its lease.
+    if let Err(error) = work_db.reconcile_unreachable_hosts(boss_engine_utils::epoch_time::now_epoch_ms() as i64) {
+        tracing::warn!(%error, "host reachability reconciliation failed");
+    }
 
     let bound = match work_db.list_nonterminal_executions_on_offline_hosts() {
         Ok(rows) => rows,
@@ -569,6 +589,176 @@ mod tests {
     }
 
     // ─── the sweep ───────────────────────────────────────────────────────────
+
+    /// A spoke host that is disabled and silent for longer than the attention
+    /// horizon keeps its run, assignment and lease; one attention
+    /// item is raised, and it clears when the host answers a fresh challenge.
+    #[tokio::test]
+    async fn silence_and_disable_preserve_spoke_runs_and_leases_with_deduplicated_attention() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        add_remote_host(&db, "spoke");
+        db.set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
+            .unwrap();
+        let wi = create_test_chore(&db, &product, "silent worker").id;
+        let exec = ready_execution(&db, &wi);
+        let assignment = db.reserve_spoke_assignment(&exec, "spoke").unwrap();
+        db.bind_spoke_lease(
+            &exec,
+            assignment.assignment_generation,
+            "workspace",
+            "lease",
+            "/tmp/workspace",
+        )
+        .unwrap();
+        db.start_execution_run_on_host(&exec, "worker", "repo", "lease", "workspace", "/tmp/workspace", "spoke")
+            .unwrap();
+        let now = boss_engine_utils::epoch_time::now_epoch_ms() as i64;
+        db.open_host_capacity("spoke", 1, 0, now - boss_work_db::HOST_UNREACHABLE_ATTENTION_MS - 1)
+            .unwrap();
+        db.set_host_enabled("spoke", false).unwrap();
+        let cube = FakeCube::default();
+        let events = RecordingDispatchEventSink::new();
+        for _ in 0..2 {
+            assert_eq!(run_one_pass(&db, &cube, &events).await.reaped, 0);
+        }
+        assert_eq!(db.get_execution(&exec).unwrap().status, ExecutionStatus::Running);
+        assert_eq!(db.get_execution(&exec).unwrap().cube_lease_id.as_deref(), Some("lease"));
+        assert!(!db.spoke_assignment_for_execution(&exec).unwrap().unwrap().resolved);
+        assert!(!db.execution_bound_host_offline(&exec).unwrap());
+        assert_eq!(
+            db.list_open_attention_items_of_kind("host_unreachable").unwrap().len(),
+            1,
+            "one deduplicated attention item for the silent run"
+        );
+        db.host_capacity_pulse("spoke", 1, "boot", 10, now).unwrap();
+        db.reconcile_unreachable_hosts(now).unwrap();
+        assert!(
+            db.list_open_attention_items_of_kind("host_unreachable")
+                .unwrap()
+                .is_empty(),
+            "a fresh challenge reply clears the attention"
+        );
+        assert!(!db.get_host("spoke").unwrap().unwrap().enabled);
+        assert_eq!(db.get_execution(&exec).unwrap().status, ExecutionStatus::Running);
+
+        // Explicit removal authorizes recovery, so it still drains.
+        db.remove_host("spoke").unwrap();
+        assert_eq!(run_one_pass(&db, &cube, &events).await.reaped, 1);
+        assert_eq!(db.get_execution(&exec).unwrap().status, ExecutionStatus::Orphaned);
+    }
+
+    fn eligibility_coordinator(db: &Arc<WorkDb>) -> ExecutionCoordinator {
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCube::default()),
+            Arc::new(NoopRunner),
+        )
+    }
+
+    /// A host whose readiness is unproven still launches new work over SSH, so
+    /// it keeps pool-size accounting of work runs rather than the spoke budget;
+    /// a ready spoke host with no fresh report has no budget and admits nothing.
+    #[test]
+    fn only_ready_spoke_hosts_are_scheduled_by_budget() {
+        let (_dir, db) = open_db();
+        let db = Arc::new(db);
+        let product = create_product(&db);
+        let work = create_test_chore(&db, &product, "placement").id;
+        for (host, transport) in [
+            ("pending", boss_work_db::HostTransport::SpokePending),
+            ("ready", boss_work_db::HostTransport::SpokeReady),
+        ] {
+            add_remote_host(&db, host);
+            db.set_host_transport(host, transport).unwrap();
+            db.connect()
+                .unwrap()
+                .execute(
+                    "INSERT OR IGNORE INTO host_capabilities (host_id, capability, source) VALUES (?1, 'driver=claude', 'auto')",
+                    [host],
+                )
+                .unwrap();
+        }
+        let coordinator = eligibility_coordinator(&db);
+        coordinator
+            .validate_requested_host_for_test(&work, "pending")
+            .expect("a pending host with free pool seats is eligible");
+        coordinator
+            .validate_requested_host_for_test(&work, "ready")
+            .expect_err("a ready host without a fresh report has no budget");
+    }
+
+    /// A run on a spoke host with no post-upgrade connection has no capacity
+    /// row. Tracking starts when the reconciler first sees it.
+    #[tokio::test]
+    async fn a_host_that_never_reconnects_still_raises_unreachable_attention() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        add_remote_host(&db, "spoke");
+        db.set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
+            .unwrap();
+        let wi = create_test_chore(&db, &product, "orphan of an upgrade").id;
+        let exec = ready_execution(&db, &wi);
+        db.reserve_spoke_assignment(&exec, "spoke").unwrap();
+        let now = boss_engine_utils::epoch_time::now_epoch_ms() as i64;
+        db.reconcile_unreachable_hosts(now).unwrap();
+        assert!(
+            db.list_open_attention_items_of_kind("host_unreachable")
+                .unwrap()
+                .is_empty()
+        );
+        db.reconcile_unreachable_hosts(now + boss_work_db::HOST_UNREACHABLE_ATTENTION_MS + 1)
+            .unwrap();
+        db.reconcile_unreachable_hosts(now + boss_work_db::HOST_UNREACHABLE_ATTENTION_MS + 2)
+            .unwrap();
+        assert_eq!(
+            db.list_open_attention_items_of_kind("host_unreachable").unwrap().len(),
+            1
+        );
+    }
+
+    /// Removing a silent host drains its run; the attention raised for the
+    /// silence must clear with it, since the host will never answer again.
+    #[tokio::test]
+    async fn removing_a_silent_host_clears_its_unreachable_attention() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        add_remote_host(&db, "spoke");
+        db.set_host_transport("spoke", boss_work_db::HostTransport::SpokeReady)
+            .unwrap();
+        let wi = create_test_chore(&db, &product, "silent worker").id;
+        let exec = ready_execution(&db, &wi);
+        let assignment = db.reserve_spoke_assignment(&exec, "spoke").unwrap();
+        db.bind_spoke_lease(
+            &exec,
+            assignment.assignment_generation,
+            "workspace",
+            "lease",
+            "/tmp/workspace",
+        )
+        .unwrap();
+        db.start_execution_run_on_host(&exec, "worker", "repo", "lease", "workspace", "/tmp/workspace", "spoke")
+            .unwrap();
+        let now = boss_engine_utils::epoch_time::now_epoch_ms() as i64;
+        db.open_host_capacity("spoke", 1, 0, now - boss_work_db::HOST_UNREACHABLE_ATTENTION_MS - 1)
+            .unwrap();
+        db.reconcile_unreachable_hosts(now).unwrap();
+        assert_eq!(
+            db.list_open_attention_items_of_kind("host_unreachable").unwrap().len(),
+            1
+        );
+        db.remove_host("spoke").unwrap();
+        let cube = FakeCube::default();
+        let events = RecordingDispatchEventSink::new();
+        assert_eq!(run_one_pass(&db, &cube, &events).await.reaped, 1);
+        db.reconcile_unreachable_hosts(now).unwrap();
+        assert!(
+            db.list_open_attention_items_of_kind("host_unreachable")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// The core drain: two non-terminal executions bound to a disabled host
     /// are both orphaned, their leases best-effort released, and a

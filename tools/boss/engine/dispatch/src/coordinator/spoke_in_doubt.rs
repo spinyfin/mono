@@ -1,10 +1,106 @@
 //! What dispatch does while a spoke host has not said whether it granted a
 //! lease or started a worker: park the attempt, raise a deduplicated attention
 //! item once the wait exceeds its bound, and resolve it when the host answers.
+//! Also holds the typed budget deferral: a spoke host with no fresh seat sends
+//! the claimed row back to `ready` behind a short hold, with no pre-start
+//! failure, attention item or requested-host cancel.
 use super::*;
 use boss_execution_contracts::WorkerLife;
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+/// How long a budget-deferred dispatch is held before it is claimed again:
+/// about one challenge period, so a stale host has a chance to refresh while
+/// the pool slot serves other rows.
+const BUDGET_DEFER_HOLD: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(super) struct HostSelectionFailure {
+    pub report: Vec<Eligibility>,
+    pub message: String,
+    /// Hosts whose seat count came from a spoke resource budget (a
+    /// `SpokeReady` host). Only these can miss a seat for a reason that
+    /// clears on its own; legacy SSH, `spoke_pending` and local hosts keep
+    /// their static pool accounting and their `no_eligible_host` handling.
+    pub budget_gated_hosts: BTreeSet<String>,
+}
+
+impl HostSelectionFailure {
+    /// At least one spoke-budgeted host could run this work except that it has
+    /// no free seats or fresh budget. Capability, enablement and pin
+    /// mismatches, and full legacy or local hosts, are not budget deferrals.
+    pub(super) fn is_budget_only(&self) -> bool {
+        self.report.iter().any(|row| {
+            self.budget_gated_hosts.contains(&row.host_id)
+                && !row.reasons.is_empty()
+                && row
+                    .reasons
+                    .iter()
+                    .all(|reason| matches!(reason, IneligibilityReason::NoFreeSlots))
+        })
+    }
+}
+
+/// Claimed dispatch that must be retried without a pre-start failure. Kept in
+/// the error chain so [`super::ExecutionCoordinator::recover_failed_dispatch`]
+/// can ignore a drain that re-claims the row first.
+#[derive(Debug, thiserror::Error)]
+#[error("dispatch deferred: {reason}")]
+pub(super) struct DispatchDeferred {
+    pub reason: &'static str,
+}
 
 impl ExecutionCoordinator {
+    /// Return the claimed row to `ready` behind a bounded hold, without a
+    /// pre-start failure or requested-host cancel. The hold keeps a drain from
+    /// re-claiming the row first on every pass while the host stays stale,
+    /// which would take a worker-pool slot from work for healthy hosts; a
+    /// delayed kick resumes it. Emits a terminal `host_selected` event so the
+    /// stall watchdog does not treat `worker_claimed/ok` as stalled.
+    pub(super) async fn defer_claimed_dispatch(
+        self: &Arc<Self>,
+        execution: &WorkExecution,
+        worker_id: &str,
+        err: anyhow::Error,
+        details: serde_json::Value,
+    ) -> anyhow::Error {
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_error(&err)
+                    .with_details(details),
+            )
+            .await;
+        let delay = BUDGET_DEFER_HOLD;
+        let note = format!("host budget unavailable; deferred for {}s: {err:#}", delay.as_secs());
+        match self.work_db.park_pre_start_attempt(&execution.id, delay, &note) {
+            Ok(true) => {
+                let coordinator = Arc::clone(self);
+                boss_task_scope::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    coordinator.kick();
+                });
+            }
+            Ok(false) => {}
+            Err(park_err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    error = %format!("{park_err:#}"),
+                    "failed to hold execution after budget deferral; releasing the claim",
+                );
+                // `recover_failed_dispatch` retries the release if this fails too.
+                if let Err(release_err) = self.work_db.release_dispatch_claim(&execution.id) {
+                    tracing::error!(execution_id = %execution.id, ?release_err, "failed to release dispatch claim");
+                }
+            }
+        }
+        self.repo_lease_limiter.release(&execution.id);
+        err
+    }
+
     /// Park an attempt whose spoke lease the host has not answered: back to
     /// `ready` behind `dispatch_not_before`, with the failure count untouched,
     /// so nothing is held while the host is silent and the retry budget is not
@@ -508,4 +604,29 @@ pub(super) fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeU
 /// release state a worker may still be using.
 pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str) -> Result<bool> {
     Ok(work_db.get_execution(execution_id)?.status.is_terminal())
+}
+
+/// For a budget deferral, release a dispatch claim a transient DB error left
+/// behind (the deferral already held the row) instead of waiting for the boot
+/// sweep. Returns whether `err` was a budget deferral.
+pub(super) fn release_budget_deferred_claim(
+    work_db: &boss_work_db::WorkDb,
+    err: &anyhow::Error,
+    current: &boss_protocol::WorkExecution,
+) -> bool {
+    if err.downcast_ref::<boss_work_db::HostBudgetExhausted>().is_none()
+        && err.downcast_ref::<DispatchDeferred>().is_none()
+    {
+        return false;
+    }
+    if current.status == ExecutionStatus::Claimed
+        && let Err(release_err) = work_db.release_dispatch_claim(&current.id)
+    {
+        tracing::error!(
+            execution_id = %current.id,
+            ?release_err,
+            "budget deferral: failed to release a still-claimed dispatch"
+        );
+    }
+    true
 }
