@@ -980,9 +980,7 @@ impl WorkerCompletionHandler {
         if execution.kind != ExecutionKind::RevisionImplementation
             && !self.primary_staged_url_may_finalize(&execution.id)
         {
-            return StaleNoPr::Handled(Some(
-                self.await_run_done_declaration(execution, &pr_url, false).await,
-            ));
+            return StaleNoPr::Handled(Some(self.await_run_done_declaration(execution, &pr_url, false).await));
         }
         // Declaration already present, or the proposal seam is off:
         // finalization belongs to `recheck_for_pr`. Do not replay.
