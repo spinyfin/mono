@@ -1413,9 +1413,20 @@ pub async fn compose_worker_spawn(
         None => prompt_text,
     };
 
+    // Normalize after every fragment, including the hash-pinned review-guide template.
+    let prompt_text = prompt_with_boss_invocation(prompt_text, &spawn_config.driver, &execution.kind);
+
     Ok(ComposedWorkerSpawn {
         prompt_text,
         spawn_config,
         embedded_output_path,
     })
+}
+
+fn prompt_with_boss_invocation(prompt: String, driver: &str, kind: &ExecutionKind) -> String {
+    let kind = crate::worker_setup::worker_kind_for_execution(kind);
+    prompt.replace(
+        boss_engine_worker_bin::WORKER_BOSS_INVOCATION,
+        crate::worker_setup::worker_boss_invocation(driver, &kind),
+    )
 }

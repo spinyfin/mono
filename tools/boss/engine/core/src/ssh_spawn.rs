@@ -1103,6 +1103,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_grok_restricted_rules_use_bare_boss() {
+        use crate::driver::{AgentDriver, GrokDriver};
+        use crate::worker_setup::{WorkerKind, WorkerSetupInput};
+
+        let driver = GrokDriver::default();
+        for kind in [
+            WorkerKind::AnswerAgent,
+            WorkerKind::ReviewGuide,
+            WorkerKind::Progression,
+        ] {
+            let exec = FakeExec::new(0, "");
+            let submission = if kind == WorkerKind::AnswerAgent {
+                "boss comment reply"
+            } else {
+                "boss propose"
+            };
+            let input = WorkerSetupInput::builder()
+                .run_id("run-remote-restricted")
+                .lease_id("lease-remote-restricted")
+                .workspace_path(std::path::PathBuf::from("/remote/work space"))
+                .events_socket_path(std::path::PathBuf::from("/tmp/remote-events.sock"))
+                .boss_event_path(std::path::PathBuf::from("/remote/bin/boss-event"))
+                .execution_kind("restricted")
+                .worker_kind(kind)
+                .build();
+            crate::host_adapter::stage_remote_agent_rules(&exec, &input, &driver)
+                .await
+                .unwrap();
+            let destination = driver.agent_rules_destination(&input.workspace_path, &input.run_id);
+            let calls = exec.calls();
+            let rules = calls
+                .iter()
+                .find_map(|call| match call {
+                    Call::Push(path, body) if path == &destination.to_string_lossy() => Some(body),
+                    _ => None,
+                })
+                .expect("rules must be shipped to the driver's destination");
+            assert!(!rules.contains(boss_engine_worker_bin::WORKER_BOSS_INVOCATION));
+            assert!(rules.contains(submission));
+        }
+    }
+
+    #[tokio::test]
     async fn remote_initial_input_is_private_and_uses_an_absolute_launcher() {
         use crate::driver::AgentDriver;
         let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n");
