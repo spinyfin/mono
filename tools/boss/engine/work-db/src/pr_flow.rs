@@ -2665,7 +2665,6 @@ impl WorkDb {
         let mut touched_work_item_ids = Vec::new();
         let mut dispatch_work_item_id = None;
         let mut archive_work_item_id = None;
-        let mut force_resume_execution_id = None;
         let ladder_question = crate::progression_ladder::is_ladder_question(&tx, &question.question.id)?;
         let mismatch_attempt = super::conflict_mismatch::attempt_for_question(&tx, &question.question.id)?;
         match (answer, &question.question.answer_type) {
@@ -2747,7 +2746,7 @@ impl WorkDb {
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
                 minted_execution = restart.minted;
-                force_resume_execution_id = restart.force_resume_execution_id;
+                dispatch_work_item_id = restart.dispatch_work_item_id;
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -2762,7 +2761,7 @@ impl WorkDb {
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
                 minted_execution = restart.minted;
-                force_resume_execution_id = restart.force_resume_execution_id;
+                dispatch_work_item_id = restart.dispatch_work_item_id;
             }
             (
                 OperatorAnswer::YesNo { value: false },
@@ -2783,7 +2782,7 @@ impl WorkDb {
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
                 minted_execution = restart.minted;
-                force_resume_execution_id = restart.force_resume_execution_id;
+                dispatch_work_item_id = restart.dispatch_work_item_id;
             }
             (OperatorAnswer::YesNo { value: false }, _) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -2798,7 +2797,7 @@ impl WorkDb {
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
                 minted_execution = restart.minted;
-                force_resume_execution_id = restart.force_resume_execution_id;
+                dispatch_work_item_id = restart.dispatch_work_item_id;
             }
             // `check_answer` above refuses every other pairing.
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
@@ -2815,7 +2814,6 @@ impl WorkDb {
             .touched_work_item_ids(touched_work_item_ids)
             .maybe_dispatch_work_item_id(dispatch_work_item_id)
             .maybe_archive_work_item_id(archive_work_item_id)
-            .maybe_force_resume_execution_id(force_resume_execution_id)
             .build())
     }
 }

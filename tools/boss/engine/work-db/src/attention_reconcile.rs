@@ -106,9 +106,10 @@ fn work_resumed_evidence() -> String {
     // completed spawn run, not merely another attempt (active or failed).
     // Other WorkResumed signals retain their run-start clearing contract,
     // including the generic self-exclusion: a later run of the *same*
-    // execution does not clear those kinds. `question_resume_dispatch_failed`
-    // is filed against the resume that could not start, so that execution's
-    // own later start is the clearing evidence.
+    // execution does not clear those kinds. The retired
+    // `question_resume_dispatch_failed` kind (no producer remains; rows from
+    // earlier builds may persist) was filed against the resume that could
+    // not start, so that execution's own later start is its clearing evidence.
     format!(
         "EXISTS (
              SELECT 1

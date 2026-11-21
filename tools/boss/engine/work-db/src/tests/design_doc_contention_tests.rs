@@ -265,3 +265,38 @@ fn open_kind_probe_uses_partial_index_over_large_resolved_history() {
         "{plan:?}"
     );
 }
+
+#[test]
+fn retired_question_resume_warning_clears_when_that_resume_starts() {
+    let db = WorkDb::open(temp_db_path("retired-question-resume-warning")).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        "INSERT INTO work_executions(id,work_item_id,kind,status,repo_remote_url,created_at)
+         VALUES ('resume','work','chore_implementation','ready','repo','1');
+         INSERT INTO work_attention_items(id,execution_id,kind,status,title,body_markdown,created_at)
+         VALUES ('warn','resume','question_resume_dispatch_failed','open','legacy','','1')",
+    )
+    .unwrap();
+    drop(conn);
+    assert!(db.reconcile_stale_attention_signals().unwrap().is_empty());
+    let open_status = |db: &WorkDb| -> String {
+        db.connect()
+            .unwrap()
+            .query_row("SELECT status FROM work_attention_items WHERE id = 'warn'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(open_status(&db), "open", "no run has started yet");
+
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "UPDATE work_executions SET status = 'running', started_at = '2' WHERE id = 'resume';
+             INSERT INTO work_runs(id,execution_id,agent_id,status,created_at,started_at)
+             VALUES ('run','resume','worker','running','2','2')",
+        )
+        .unwrap();
+    assert_eq!(db.reconcile_stale_attention_signals().unwrap().attentions_resolved, 1);
+    assert_eq!(open_status(&db), "resolved");
+}

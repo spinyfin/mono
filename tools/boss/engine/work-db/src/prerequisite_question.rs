@@ -447,10 +447,43 @@ pub(crate) fn stamp_answered_waiting(conn: &Connection, task_id: &str) -> Result
     Ok(())
 }
 
+/// Copy force-launch lineage onto the latest continuation of `task_id`.
+/// When start is not suppressed, persist operator-forced admission so the
+/// drain can admit it through an operator pause, and report the task for
+/// `launch_answered_work`; returns `None` when no continuation exists to mark.
+///
+/// This is deliberately lineage-driven, not hold-driven: a run admitted by an
+/// operator force launch keeps operator-forced standing through every
+/// answered-question resume, the same as `bossctl agents launch`, whether or
+/// not a pause is active when the answer arrives. That way the resume cannot
+/// be stranded by a pause or focus change between answer and drain. The
+/// hard pool cap and the writer/preflight/predecessor-lease holds still apply.
+pub(super) fn inherit_force_launch_continuation(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    asking_execution_id: &str,
+    suppress_start: bool,
+) -> Result<Option<String>> {
+    if !super::dispatch::execution_force_launched_in(tx, asking_execution_id)? {
+        return Ok(None);
+    }
+    // Resolve the continuation once so the lineage stamp and the operator-forced
+    // mark always land on the same row.
+    let Some(execution) = query_latest_execution_for_work_item(tx, task_id)?.filter(|e| !e.status.is_terminal()) else {
+        return Ok(None);
+    };
+    super::dispatch::mark_execution_force_launched_in(tx, &execution.id)?;
+    if suppress_start {
+        return Ok(None);
+    }
+    super::conflict_mismatch::mark_execution_operator_forced_admission_in_tx(tx, &execution.id)?;
+    Ok(Some(task_id.to_string()))
+}
+
 /// After an answer on an ungated, eligible task: leave a schedulable
 /// continuation, then (unless `suppress_start`) try an explicit start.
 /// Reports whether an explicit start minted the execution and, when the asking
-/// run was force-launched, the resume to admit the same way.
+/// run was force-launched, the work item to launch through the pause.
 pub(super) fn continue_after_answer(
     pending: &mut PendingEvents,
     tx: &rusqlite::Transaction<'_>,
@@ -469,7 +502,6 @@ pub(super) fn continue_after_answer(
     let task = query_task(tx, &task.id).require("task", &task.id)?;
     if !suppress_start {
         let asking = query_execution(tx, &question.execution_id).require("execution", &question.execution_id)?;
-        let asked_under_force_launch = super::dispatch::execution_force_launched_in(tx, &asking.id)?;
         tx.execute_batch("SAVEPOINT answer_explicit_start")?;
         let started = request_execution_in_tx_with_live_check(
             pending,
@@ -487,15 +519,13 @@ pub(super) fn continue_after_answer(
             |_| true,
         );
         match started {
-            Ok(resume) => {
+            Ok(_) => {
                 tx.execute_batch("RELEASE answer_explicit_start")?;
-                if asked_under_force_launch {
-                    super::dispatch::mark_execution_force_launched_in(tx, &resume.id)?;
-                }
+                let dispatch_work_item_id =
+                    inherit_force_launch_continuation(tx, &task.id, &question.execution_id, false)?;
                 return Ok(RestartAfterAnswer {
                     minted: true,
-                    force_resume_execution_id: (asked_under_force_launch && resume.status == ExecutionStatus::Ready)
-                        .then_some(resume.id),
+                    dispatch_work_item_id,
                 });
             }
             Err(error) => {
@@ -510,8 +540,10 @@ pub(super) fn continue_after_answer(
     }
     // No start happened (suppressed or refused): leave a schedulable
     // continuation, since the asking run has ended and nothing else mints a
-    // replacement after a terminal run. The scheduler admits it under the
-    // normal pause and capacity rules.
+    // replacement after a terminal run. A force-launched asker stamps
+    // operator-forced admission on that continuation so the drain can admit
+    // it through an operator pause; otherwise the scheduler applies the
+    // ordinary pause and capacity rules.
     if task.kind == TaskKind::Revision {
         // A revision whose spawning attempt retired unsuccessfully is settled by
         // the reconciler's retired-attempt gate (blocked, cascading to its
@@ -524,7 +556,12 @@ pub(super) fn continue_after_answer(
     } else {
         super::prerequisite_question::queue_ready_execution(tx, &task, question)?;
     }
-    Ok(RestartAfterAnswer::none())
+    let dispatch_work_item_id =
+        inherit_force_launch_continuation(tx, &task.id, &question.execution_id, suppress_start)?;
+    Ok(RestartAfterAnswer {
+        minted: false,
+        dispatch_work_item_id,
+    })
 }
 
 /// Drop the answered-waiting marker from `task_id`'s `blocked_detail`, leaving

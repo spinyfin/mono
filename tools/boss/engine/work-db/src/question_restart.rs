@@ -29,17 +29,18 @@ pub(crate) fn restart_after_answer(
 }
 
 /// Result of [`restart_after_answer_from`]: whether a ready execution was
-/// minted, and the resume id when the asking run was force-launched.
+/// minted, and the work item to launch through the pause when the asking
+/// run was force-launched.
 pub(crate) struct RestartAfterAnswer {
     pub minted: bool,
-    pub force_resume_execution_id: Option<String>,
+    pub dispatch_work_item_id: Option<String>,
 }
 
 impl RestartAfterAnswer {
     pub(crate) fn none() -> Self {
         Self {
             minted: false,
-            force_resume_execution_id: None,
+            dispatch_work_item_id: None,
         }
     }
 }
@@ -50,8 +51,8 @@ impl RestartAfterAnswer {
 /// Progression questions instead restore the stuck state for the next progression run.
 ///
 /// When the asking run was admitted by an operator force launch (see
-/// `work_executions.force_launched`), `force_resume_execution_id` is the
-/// minted resume so the caller can bypass an operator-originated pause.
+/// `work_executions.force_launched`), `dispatch_work_item_id` is the answered
+/// task so the caller can launch it through `ExecutionCoordinator::launch_answered_work`.
 ///
 /// A task still gated by prerequisites (a conflict revision queued behind
 /// another writer on the same PR is the common case) cannot be started
@@ -144,7 +145,16 @@ pub(crate) fn restart_after_answer_from(
             super::super::prerequisite_question::queue_gated_execution(tx, &task, question)?;
         }
         super::super::prerequisite_question::stamp_answered_waiting(tx, &task.id)?;
-        return Ok(RestartAfterAnswer::none());
+        let dispatch_work_item_id = super::super::prerequisite_question::inherit_force_launch_continuation(
+            tx,
+            &task.id,
+            &question.execution_id,
+            suppress_start,
+        )?;
+        return Ok(RestartAfterAnswer {
+            minted: false,
+            dispatch_work_item_id,
+        });
     }
     super::super::prerequisite_question::continue_after_answer(pending, tx, task, question, suppress_start, attribution)
 }

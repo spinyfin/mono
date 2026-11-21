@@ -185,39 +185,6 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 }
             }
             let product_id = item.product_id().to_string();
-            // Queueing this resume behind an operator pause would require
-            // a second explicit force launch. Other holds remain.
-            if let Some(execution_id) = outcome.force_resume_execution_id {
-                let coordinator = &server_state.execution_coordinator;
-                let held_by_operator = work_db.get_execution(&execution_id).ok().is_some_and(|execution| {
-                    coordinator
-                        .dispatch_hold_for(&execution, boss_execution_contracts::DispatchAdmission::Queued)
-                        .is_some_and(|hold| {
-                            hold.pause.origin == boss_engine_dispatch::coordinator::DispatchPauseOrigin::Operator
-                        })
-                });
-                if held_by_operator
-                    && let Err(err) = coordinator
-                        .force_dispatch(
-                            &execution_id,
-                            boss_execution_contracts::DispatchAdmission::PauseBypassOverride,
-                        )
-                        .await
-                {
-                    if let Err(attention_err) = work_db.create_attention_item(boss_protocol::CreateAttentionItemInput {
-                        execution_id: Some(execution_id.clone()),
-                        work_item_id: None,
-                        kind: boss_engine_storage_values::attention_kinds::QUESTION_RESUME_DISPATCH_FAILED.into(),
-                        status: None,
-                        title: "Answered question could not resume work".into(),
-                        body_markdown: format!("Resume `{execution_id}` could not start: {err:#}. Inspect dispatch diagnostics and retry the launch after resolving the hold."),
-                        resolved_at: None,
-                    }) {
-                        tracing::warn!(%execution_id, %attention_err, "failed to record resume dispatch attention");
-                    }
-                    tracing::warn!(%execution_id, "answered run resume stays queued: {err:#}");
-                }
-            }
             // A Yes on a prerequisite proposal also created (or linked) a
             // task; the board must refresh that card too.
             let mut changed = vec![work_item_id(&item)];
@@ -238,12 +205,12 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             )
             .await;
             if let Some(dispatch_id) = outcome.dispatch_work_item_id {
-                // The answer is committed and the execution it created is
-                // marked operator-forced. Launching is best-effort: when it
-                // cannot launch now (a writer is live on the PR, the pool is
-                // at its hard cap, preflight) the flag stays until the work
-                // is admitted or cancelled, and the drain dispatches it as
-                // operator-forced once it is ready.
+                // The answer is committed and the execution it created or
+                // resumed is marked operator-forced. Launching is best-effort:
+                // when it cannot launch now (a writer is live on the PR, the
+                // pool is at its hard cap, preflight, a predecessor lease)
+                // the flag stays until the work is admitted or cancelled, and
+                // the drain dispatches it as operator-forced once it is ready.
                 match server_state
                     .execution_coordinator
                     .launch_answered_work(&dispatch_id)
