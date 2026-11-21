@@ -62,13 +62,19 @@ pub trait HandoffDelivery: Send + Sync {
     ) -> Result<PendingConfirmation> {
         self.deliver(tmux, record, prompt).await?;
         drop(guard);
-        Ok(Box::pin(std::future::ready(Ok(()))))
+        Ok(Box::pin(std::future::ready(Ok(
+            Box::pin(std::future::pending()) as PendingTurnEnd
+        ))))
     }
 }
 
 /// Confirmation of a delivery whose frame the coordinator's inbox has already
 /// accepted; see [`HandoffDelivery::deliver_accepted`].
-pub type PendingConfirmation = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>>;
+pub type PendingConfirmation =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<PendingTurnEnd>> + Send + 'static>>;
+
+/// End of the turn started by a confirmed inbox delivery.
+pub type PendingTurnEnd = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 /// Bound on registration lookup, connect and delivery confirmation. Delivery
 /// has its own deadline and never consumes the handoff grace period. It is
@@ -83,9 +89,11 @@ pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// blindly.
 pub const AUTHORIZATION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// `--settings` JSON the production coordinator launches with. Delivery
-/// confirms only when the coordinator accepts cross-session input, so this is
-/// set explicitly rather than inherited from user or default configuration.
+/// `--settings` JSON the production coordinator launches with. Claude Code's
+/// inbound values are `accept`, `hold`, and `refuse`. Delivery confirms only
+/// when the coordinator accepts cross-session input (`hold` needs an
+/// interactive dialog; `refuse` drops the request), so this is set to
+/// `accept` rather than inherited from user or default configuration.
 pub const COORDINATOR_INBOUND_SETTINGS: &str = r#"{"crossSessionInbound":"accept"}"#;
 
 /// Shared production command. The brief is never part of it: the terminal
@@ -276,7 +284,12 @@ impl HandoffDelivery for ClaudeInbox {
             Ok(result) => result?,
             Err(_) => return Err(stages.expiry_error()),
         };
-        Ok(Box::pin(async move { injected.confirm().await.map(|_| ()) }))
+        Ok(Box::pin(async move {
+            injected
+                .confirm()
+                .await
+                .map(|observer| Box::pin(observer.wait()) as PendingTurnEnd)
+        }))
     }
 }
 

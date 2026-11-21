@@ -18,6 +18,7 @@ use boss_protocol::CoordinatorRecreateReason;
 
 const TOKEN: &str = "token";
 
+mod authorization;
 mod latency;
 
 /// Models a live coordinator tmux server: answers the read-only probes,
@@ -32,7 +33,8 @@ struct LiveCoordinatorRunner {
 }
 
 /// Inbox delivery failure modes the runner can be told to simulate.
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
 struct DeliveryFaults {
     /// Every inbox delivery fails with this reason, the way a missing
     /// registration or an expired delivery deadline would.
@@ -40,8 +42,12 @@ struct DeliveryFaults {
     /// `deliver_accepted` accepts the frame but its confirmation never
     /// resolves, the way a held or lost frame would.
     hold_confirmation: bool,
+    authorization_turn_end: Arc<tokio::sync::Notify>,
+    confirmation_failure: bool,
     /// How long any command addressed to the retired `-L boss` server hangs.
     legacy_delay: Duration,
+    legacy_absent: bool,
+    socket_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl Default for LiveCoordinatorRunner {
@@ -60,6 +66,7 @@ impl Default for LiveCoordinatorRunner {
 impl CommandRunner for LiveCoordinatorRunner {
     async fn run(&self, _: &Path, args: &[OsString], _: Option<&Path>) -> std::io::Result<CommandOutput> {
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        self.calls.lock().unwrap().push(args.clone());
         let mut success = true;
         let mut stderr = String::new();
         if args.first().map(String::as_str) == Some("-L") {
@@ -67,6 +74,23 @@ impl CommandRunner for LiveCoordinatorRunner {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+        }
+        if args.first().map(String::as_str) == Some("-L") && self.faults.lock().unwrap().legacy_absent {
+            return Ok(CommandOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "no server running".into(),
+            });
+        }
+        let gate = if args.first().map(String::as_str) == Some("-S") {
+            self.faults.lock().unwrap().socket_gate.take()
+        } else {
+            None
+        };
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
         }
         let stdout = match args.get(2).map(String::as_str) {
             Some("list-sessions") => "boss-coordinator\t\n".to_owned(),
@@ -122,7 +146,6 @@ impl CommandRunner for LiveCoordinatorRunner {
             }
             _ => String::new(),
         };
-        self.calls.lock().unwrap().push(args);
         Ok(CommandOutput {
             success,
             code: Some(if success { 0 } else { 1 }),
@@ -171,7 +194,15 @@ impl boss_engine_runtime::coordinator_tmux::inbox::HandoffDelivery for LiveCoord
         if self.faults.lock().unwrap().hold_confirmation {
             return Ok(Box::pin(std::future::pending()));
         }
-        Ok(Box::pin(std::future::ready(Ok(()))))
+        let faults = self.faults.lock().unwrap();
+        if faults.confirmation_failure {
+            return Ok(Box::pin(async { anyhow::bail!("inbox refused delivery") }));
+        }
+        let ended = faults.authorization_turn_end.clone();
+        Ok(Box::pin(async move {
+            Ok(Box::pin(async move { ended.notified().await })
+                as boss_engine_runtime::coordinator_tmux::inbox::PendingTurnEnd)
+        }))
     }
 }
 
@@ -193,7 +224,7 @@ impl LiveCoordinatorRunner {
 
     /// The handoff write credential reached the coordinator's inbox.
     fn credential_prompted(&self) -> bool {
-        !self.inbox_prompts("[Boss handoff authorization]").is_empty()
+        !self.inbox_prompts("[Boss handoff authorization").is_empty()
     }
 
     fn calls(&self) -> Vec<Vec<String>> {
@@ -363,6 +394,45 @@ async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
             .iter()
             .any(|call| call.first().is_some_and(|v| v == "inbox") && call[1].contains(&authorization))
     );
+    let prompt = &f.runner.inbox_prompts("[Boss handoff authorization")[0];
+    let id = authorization_id_from_prompt(prompt).to_owned();
+    assert!(
+        authorization::verify(&f.state, &id, true).await,
+        "delivered authorization id must verify"
+    );
+    assert!(!verify_pending(&f.state, "forged").await);
+}
+
+fn authorization_id_from_prompt(prompt: &str) -> &str {
+    prompt
+        .strip_prefix("[Boss handoff authorization id=")
+        .and_then(|rest| rest.split(']').next())
+        .expect("authorization prompt must carry an id")
+}
+
+fn request_id_from_reset_prompt(prompt: &str) -> &str {
+    prompt
+        .strip_prefix("[Boss reset request id=")
+        .and_then(|rest| rest.split(']').next())
+        .expect("reset request prompt must carry an id")
+}
+
+async fn verify_pending(state: &Arc<ServerState>, pending_id: &str) -> bool {
+    let sink = make_session_sink();
+    let mut ctx = dispatch(state, &sink, "verify");
+    ctx.peer_pid = Some(std::process::id() as libc::pid_t);
+    coordinator_handoff::handle_verify_coordinator_reset_request(
+        ctx,
+        FrontendRequest::VerifyCoordinatorResetRequest {
+            authorization: false,
+            request_id: pending_id.to_owned(),
+        },
+    )
+    .await;
+    match next_event(&sink).await.1 {
+        FrontendEvent::CoordinatorResetRequestStatus { pending } => pending,
+        other => panic!("expected CoordinatorResetRequestStatus, got {other:?}"),
+    }
 }
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
@@ -964,7 +1034,7 @@ async fn adopted_coordinator_from_before_authorization_receives_its_credential_a
         .coordinator_handoff_authorization()
         .unwrap()
         .expect("adoption must mint a credential for a pre-authorization session");
-    let credential_prompts = runner.inbox_prompts("[Boss handoff authorization]");
+    let credential_prompts = runner.inbox_prompts("[Boss handoff authorization");
     assert_eq!(credential_prompts.len(), 1, "{credential_prompts:?}");
     assert!(credential_prompts[0].contains(&authorization));
     assert!(
@@ -985,7 +1055,7 @@ async fn adopted_coordinator_from_before_authorization_receives_its_credential_a
     assert_eq!(acknowledge_attach(&state, &sink).await, TOKEN);
     attach.await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(runner.inbox_prompts("[Boss handoff authorization]").len(), 1);
+    assert_eq!(runner.inbox_prompts("[Boss handoff authorization").len(), 1);
 
     // A reset is requested: the request carries the credential the session already holds.
     sessions::handle_recreate_coordinator(dispatch(&state, &sink, "reset-1"), reset_request()).await;
@@ -996,6 +1066,9 @@ async fn adopted_coordinator_from_before_authorization_receives_its_credential_a
         reset_prompts[0].contains(&format!("--authorization {authorization} -")),
         "{reset_prompts:?}"
     );
+    let reset_id = request_id_from_reset_prompt(&reset_prompts[0]).to_owned();
+    assert!(verify_pending(&state, &reset_id).await, "pending reset id must verify");
+    assert!(!verify_pending(&state, "forged").await);
     assert_eq!(
         state.work_db.coordinator_handoff_authorization().unwrap().unwrap(),
         authorization,
@@ -1194,7 +1267,7 @@ async fn a_pending_delivery_to_a_replaced_session_does_not_suppress_its_replacem
     };
     show("show-a").await;
     next_event(&f.sink).await;
-    assert_eq!(f.runner.inbox_prompts("[Boss handoff authorization]").len(), 1);
+    assert_eq!(f.runner.inbox_prompts("[Boss handoff authorization").len(), 1);
 
     // A repeat for the same session within the window coalesces.
     show("show-a-again").await;
@@ -1210,7 +1283,7 @@ async fn a_pending_delivery_to_a_replaced_session_does_not_suppress_its_replacem
         delivery.requested && delivery.detail.contains("already pending"),
         "{delivery:?}"
     );
-    assert_eq!(f.runner.inbox_prompts("[Boss handoff authorization]").len(), 1);
+    assert_eq!(f.runner.inbox_prompts("[Boss handoff authorization").len(), 1);
 
     // Session A is replaced by B while A's confirmation is still outstanding.
     const REPLACEMENT: &str = "token-b";
@@ -1236,7 +1309,7 @@ async fn a_pending_delivery_to_a_replaced_session_does_not_suppress_its_replacem
         delivery.requested && !delivery.detail.contains("already pending"),
         "{delivery:?}"
     );
-    let prompts = f.runner.inbox_prompts("[Boss handoff authorization]");
+    let prompts = f.runner.inbox_prompts("[Boss handoff authorization");
     assert_eq!(prompts.len(), 2, "{prompts:?}");
     let credential_b = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
     assert!(prompts[1].contains(&credential_b), "{prompts:?}");

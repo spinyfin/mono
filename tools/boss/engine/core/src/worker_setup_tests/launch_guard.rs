@@ -68,6 +68,7 @@ fn launch_guard_blocks_all_handoff_subcommands() {
     for command in [
         "boss handoff write -",
         "boss handoff show",
+        "boss handoff verify abc",
         "boss handoff clear",
         "/opt/bin/boss --json handoff show",
         "env X=y /opt/bin/boss handoff write /tmp/brief",

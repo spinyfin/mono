@@ -1205,6 +1205,9 @@ pub enum FrontendEvent {
     /// as persisted, stamped with the write time and writer session.
     #[worker(passthrough)]
     CoordinatorHandoffSet { handoff: CoordinatorHandoffView },
+    /// Reply for [`FrontendRequest::VerifyCoordinatorResetRequest`].
+    #[worker(passthrough)]
+    CoordinatorResetRequestStatus { pending: bool },
     /// Reply for [`FrontendRequest::ListCoordinatorGuidance`]: one entry
     /// per product asked about, each carrying the explicit state of its
     /// `BOSS_COORDINATOR.md` and the commit sha it was resolved at.

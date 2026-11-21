@@ -730,10 +730,11 @@ async fn session_exists(tmux: &Tmux, name: &str) -> Result<bool> {
 /// indefinitely; timeout is treated as "not there".
 const LEGACY_SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Resolve which tmux server currently hosts the coordinator session:
-/// `socket_tmux` (the durable `-S` socket) unless a live
-/// [`COORDINATOR_SESSION_NAME`] session survives on the pre-move `-L boss`
-/// server, in which case `legacy_tmux`.
+/// Returns `socket_tmux` when it hosts the coordinator; otherwise
+/// `legacy_tmux` if the pre-move server has one (probe bounded by
+/// `LEGACY_SESSION_PROBE_TIMEOUT`, timeout treated as absent), else
+/// `socket_tmux`. A duplicate session on the legacy server is ignored
+/// when the durable socket already has the coordinator.
 ///
 /// Every coordinator lifecycle entry point (`ensure_for_attach`,
 /// `restart_if_dead`, `recreate_after_confirmation`) takes a single `&Tmux`

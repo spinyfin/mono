@@ -142,6 +142,10 @@ fn is_non_work_item_surface(surface: &str) -> bool {
     if surface.contains("probe") || surface.ends_with(" host_id") {
         return true;
     }
+    // Engine-held reset / authorization-delivery id, not a work-item selector.
+    if surface == "handoff verify id" {
+        return true;
+    }
     false
 }
 
