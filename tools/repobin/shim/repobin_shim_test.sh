@@ -17,8 +17,9 @@ set -euo pipefail
 
 shim_src="$1"
 installer_src="$2"
+policy_src="${3:-}"
 [[ -f "$shim_src" && -f "$installer_src" ]] || {
-  echo "usage: $0 <repobin-shim.sh> <install-workspace-shims.sh>" >&2
+  echo "usage: $0 <repobin-shim.sh> <install-workspace-shims.sh> [workspace-shim-policy]" >&2
   exit 1
 }
 
@@ -117,11 +118,12 @@ chmod +x "$fake_dir/bazel"
 export PATH="$fake_dir:$decoy_dir:/usr/bin:/bin"
 export FAKE_REPOBIN_LOG="$repobin_log"
 export REPOBIN_SHIM_QUIET=
-# The installer's skip/require lists are generic and read from the
-# environment (see its header); the rest of this suite exercises them set
-# to mono's actual `.cube/setup.yaml` values, and a dedicated section below
-# (see "default: nothing skipped, nothing required") covers the unset
-# default for a repobin-using checkout with no such policy of its own.
+# The installer's skip/require lists come from workspace-shim-policy when
+# that file sits next to the installer, with env vars as an override. The
+# rest of this suite sets the env vars to this checkout's policy values so
+# workspaces that do not copy the policy file still skip engine-owned
+# names. A dedicated section below covers the unset default (no policy
+# file, env unset) and another copies the policy file and unsets the env.
 export REPOBIN_SHIM_SKIP='boss boss-event bossctl cube'
 export REPOBIN_SHIM_REQUIRE='checkleft'
 
@@ -291,5 +293,43 @@ rm -f "$default_ws/bin/checkleft"
 run_in "$default_ws" env -u REPOBIN_SHIM_SKIP -u REPOBIN_SHIM_REQUIRE bash tools/repobin/shim/install-workspace-shims.sh
 [[ $rc -eq 0 ]] || fail "default installer with no bin/checkleft exited $rc: $(cat "$tmp/stderr")"
 pass "default (unset REQUIRE): a repo with no checkleft gate installs cleanly"
+
+# 14. Policy file next to the installer supplies skip/require without env vars.
+#     This is the command AGENTS.md, .cube/setup.yaml and the push-guard
+#     repair all invoke.
+[[ -n "$policy_src" && -f "$policy_src" ]] || fail "workspace-shim-policy was not passed to the test"
+policy_ws="$tmp/policy-ws"
+make_workspace "$policy_ws"
+cp "$policy_src" "$policy_ws/tools/repobin/shim/workspace-shim-policy"
+run_in "$policy_ws" env -u REPOBIN_SHIM_SKIP -u REPOBIN_SHIM_REQUIRE bash tools/repobin/shim/install-workspace-shims.sh
+[[ $rc -eq 0 ]] || fail "policy installer exited $rc: $(cat "$tmp/stderr")"
+for name in repobin checkleft hood; do
+  [[ -L "$policy_ws/bin/$name" ]] || fail "policy install: bin/$name is not a symlink"
+done
+for name in boss bossctl cube; do
+  [[ ! -e "$policy_ws/bin/$name" ]] || fail "policy install: bin/$name must remain engine-owned"
+done
+pass "policy file without env vars: same skip/require as the lease"
+
+# 15. A leftover shim for a skipped name (from an unscoped install) is
+#     removed on the next run, including names not in the current TOML
+#     (boss-event). A regular file at a skipped name is left alone.
+#     default_ws still has boss/bossctl/cube shims from case 13.
+ln -s ../tools/repobin/shim/repobin-shim.sh "$default_ws/bin/boss-event"
+echo "engine-owned launcher" > "$default_ws/bin/not-a-skip"
+cp "$policy_src" "$default_ws/tools/repobin/shim/workspace-shim-policy"
+run_in "$default_ws" env -u REPOBIN_SHIM_SKIP -u REPOBIN_SHIM_REQUIRE bash tools/repobin/shim/install-workspace-shims.sh
+[[ $rc -eq 0 ]] || fail "convergence install exited $rc: $(cat "$tmp/stderr")"
+for name in boss boss-event bossctl cube; do
+  [[ ! -e "$default_ws/bin/$name" ]] || fail "convergence: leftover shim bin/$name was not removed"
+done
+[[ -L "$default_ws/bin/checkleft" ]] || fail "convergence: bin/checkleft was removed"
+[[ "$(cat "$default_ws/bin/not-a-skip")" == "engine-owned launcher" ]] || fail "convergence: unrelated file was touched"
+# A regular file at a skipped name must not be deleted.
+echo "not a shim" > "$default_ws/bin/boss"
+run_in "$default_ws" env -u REPOBIN_SHIM_SKIP -u REPOBIN_SHIM_REQUIRE bash tools/repobin/shim/install-workspace-shims.sh
+[[ $rc -eq 0 ]] || fail "regular-file skip install exited $rc: $(cat "$tmp/stderr")"
+[[ "$(cat "$default_ws/bin/boss")" == "not a shim" ]] || fail "convergence: regular file at skipped name was clobbered"
+pass "skipped leftover shims are removed; regular files at skipped names stay"
 
 echo "all repobin shim checks passed"
