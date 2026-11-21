@@ -1480,6 +1480,11 @@ pub struct WorkerCompletionHandler {
     /// reaches a terminal state; see [`pending_finalize`].
     #[builder(skip)]
     pending_no_op_completions: std::sync::Mutex<std::collections::HashMap<String, PendingNoOpCompletion>>,
+    /// Wall-clock deadline before a confirmed PR-base refusal is re-probed.
+    /// The 30s pending-finalize sweep consults this so a parked run does not
+    /// re-query GitHub or re-publish attention on every tick.
+    #[builder(skip)]
+    pr_base_refusal_next_check: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
     /// Verifies the worker's recorded workspace is genuinely empty before a

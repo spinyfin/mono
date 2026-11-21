@@ -477,12 +477,7 @@ impl WorkerCompletionHandler {
 
         // Successful resolution has already verified the base, or skipped it
         // for a merged, closed, or already-bound PR.
-        if let Err(err) = self.work_db.resolve_attention_kind_for_execution(
-            &execution.id,
-            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
-        ) {
-            tracing::warn!(?err, "failed to resolve PR base refusal attention");
-        }
+        self.resolve_pr_base_refusal_attention(&execution.id);
 
         if !merged && !closed_unmerged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {

@@ -36,7 +36,7 @@
 //!
 //! A signal comes down when, and only when, there is positive evidence that
 //! the condition it describes is over. Not on a timer, not on a lane change,
-//! not on operator hand-dismissal. [`ClearedBy`] enumerates the four shapes
+//! not on operator hand-dismissal. [`ClearedBy`] enumerates the five shapes
 //! that evidence can take, and every kind below declares one — including
 //! the kinds whose honest answer is "a human has to decide this", which are
 //! marked [`ClearedBy::HumanDecision`] rather than left silently blank.
@@ -64,9 +64,9 @@ use boss_protocol::ExecutionKind;
 /// What lowers a raised signal.
 ///
 /// The variants are ordered from "the engine can prove this itself" to "only
-/// a human can". [`Self::WorkResumed`] and [`Self::ExecutionKindCompleted`]
-/// are the two the generic reconciler acts on; the other two are declarations
-/// that no generic rule applies, and why.
+/// a human can". [`Self::WorkResumed`], [`Self::ExecutionKindCompleted`] and
+/// [`Self::OwningExecutionTerminal`] are the three the generic reconciler
+/// acts on; the other two are declarations that no generic rule applies, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClearedBy {
     /// The signal asserts that the engine could not get work moving on this
@@ -88,6 +88,11 @@ pub enum ClearedBy {
     /// Scoped to the kind on purpose: a churned `chore_implementation`
     /// retry must never mask a still-dead `pr_review`.
     ExecutionKindCompleted(ExecutionKind),
+    /// The signal describes a condition of one specific execution (it is
+    /// execution-scoped). That execution reaching a terminal status — cancelled,
+    /// failed, abandoned, completed, or orphaned — ends the condition, even
+    /// when no later run of the same work item starts.
+    OwningExecutionTerminal,
     /// The kind's own producer re-evaluates the live condition on every one
     /// of its passes and resolves the item itself when the condition clears
     /// (the external-tracker reconcile loop on a successful fetch, the
@@ -114,7 +119,10 @@ impl ClearedBy {
     /// the generic reconciler (its producer owns resolution, or a human
     /// does).
     pub fn is_automatic(&self) -> bool {
-        matches!(self, Self::WorkResumed | Self::ExecutionKindCompleted(_))
+        matches!(
+            self,
+            Self::WorkResumed | Self::ExecutionKindCompleted(_) | Self::OwningExecutionTerminal
+        )
     }
 }
 
@@ -155,11 +163,11 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         PR_BASE_REFUSED,
-        ClearedBy::WorkResumed,
-        "The completion guard parks the execution until the PR is retargeted and resolves the item once it observes \
-         the default branch. It is also resolved by both recovery sweeps when they bind a PR, and a later run of the \
-         same work item (the execution ended another way) contradicts the parked state, so the generic reconciler \
-         clears it rather than leaving a finished condition open.",
+        ClearedBy::OwningExecutionTerminal,
+        "The completion guard parks a live execution until the PR is retargeted. Once that execution is cancelled, \
+         failed, reaped, or completed (including via the merged/closed or already-bound bypass), the parked condition \
+         is over and the retarget remedy no longer applies. Producers also resolve it on a successful default-branch \
+         observation or a later bind.",
     ),
     entry(
         WORKSPACE_POSITIONING_REFUSED,
@@ -437,6 +445,12 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::ProducerReconciles,
         "The sweep re-checks the branch every pass and resolves the item itself once a PR appears \
          — a direct read of the condition, strictly better than any run-start proxy.",
+    ),
+    entry(
+        ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+        ClearedBy::ProducerReconciles,
+        "The abandoned-branch sweep re-reads the PR base every pass and resolves this itself once \
+         the lookup succeeds (and binds, or files the more accurate wrong-base diagnosis).",
     ),
     entry(
         REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND,
@@ -744,9 +758,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_two_evidence_variants_are_automatic() {
+    fn only_the_evidence_variants_are_automatic() {
         assert!(ClearedBy::WorkResumed.is_automatic());
         assert!(ClearedBy::ExecutionKindCompleted(ExecutionKind::PrReview).is_automatic());
+        assert!(ClearedBy::OwningExecutionTerminal.is_automatic());
         assert!(!ClearedBy::ProducerReconciles.is_automatic());
         assert!(!ClearedBy::HumanDecision.is_automatic());
     }

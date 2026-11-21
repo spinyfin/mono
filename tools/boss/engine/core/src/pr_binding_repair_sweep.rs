@@ -890,6 +890,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebind_resolves_an_open_pr_base_refusal() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.upsert_execution_attention(
+            &exec_id,
+            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+            "PR must target the default branch",
+            "pending retarget",
+        )
+        .unwrap();
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+        let outcome = run_one_pass(
+            &db,
+            &FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default()),
+            &verifier,
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
+            &RecordingDocRefresher::default(),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert_eq!(outcome.rebound, 1, "{outcome:?}");
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(OWN));
+        assert!(db.list_attention_items(&exec_id).unwrap().iter().all(|item| item.kind
+            != boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+            || item.status != "open"));
+    }
+
+    #[tokio::test]
     async fn no_pr_on_the_execution_branch_parks_the_row_visibly() {
         let (_dir, db) = open_db();
         let (_product, task_id, exec_id) = mis_bound_followup(&db, ORIGIN);

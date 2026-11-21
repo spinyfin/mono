@@ -362,6 +362,33 @@ async fn execution_scoped_attentions_resolve_through_their_execution_s_work_item
 }
 
 #[tokio::test]
+async fn pr_base_refused_resolves_when_its_execution_ends_without_a_later_run() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Parked then cancelled");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
+    db.start_execution_run(&execution.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    let attention = open_attention_for_execution(
+        &db,
+        &execution.id,
+        boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+        1000,
+    );
+    assert_eq!(
+        lifecycle_for(boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+            .unwrap()
+            .cleared_by,
+        ClearedBy::OwningExecutionTerminal,
+    );
+    assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
+    assert_eq!(attention_status(&db, &attention).0, "open");
+    db.cancel_execution(&execution.id).unwrap();
+    assert_eq!(run_one_pass(&db).await.attentions_resolved, 1);
+    assert_eq!(attention_status(&db, &attention).0, "resolved");
+}
+
+#[tokio::test]
 async fn execution_kind_completed_resolves_only_for_the_declared_kind() {
     let (_dir, db) = open_db();
     let product = create_test_product(&db);

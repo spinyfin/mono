@@ -438,50 +438,83 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DetectorFailed;
             }
         };
-        let pr_url = match pr_status {
+        let pr_url = match &pr_status {
             PrStatus::None | PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
-            PrStatus::Stale { url, reason } => return StopOutcome::StalePr { pr_url: url, reason },
-            PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
-            PrStatus::Fresh { url } | PrStatus::Merged { url } => url,
+            PrStatus::Stale { url, reason } => {
+                return StopOutcome::StalePr {
+                    pr_url: url.clone(),
+                    reason: reason.clone(),
+                };
+            }
+            PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url.clone() },
+            PrStatus::Fresh { url } | PrStatus::Merged { url } => url.clone(),
         };
         use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
-        match crate::work::bounded_base_verdict(
-            Arc::clone(&self.pr_state_checker),
-            &pr_url,
-            crate::work::PR_QUERY_TIMEOUT,
-        )
-        .await
-        {
-            Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
-                if let Err(err) = self
-                    .work_db
-                    .resolve_external_tracker_attention(&candidate.work_item_id, PR_BASE_REFUSED)
-                {
-                    tracing::warn!(?err, "late PR recovery: could not clear base refusal");
-                }
+        // Merged PRs can no longer be retargeted. An open PR on a non-default
+        // base is refused here, the same policy `finalize_declared_delivery`
+        // and the abandoned-branch sweep apply before a new bind.
+        if matches!(pr_status, PrStatus::Merged { .. }) {
+            if let Err(err) = self
+                .work_db
+                .resolve_external_tracker_attention(&candidate.work_item_id, PR_BASE_REFUSED)
+            {
+                tracing::warn!(?err, "late PR recovery: could not clear base refusal");
             }
-            Ok(crate::work::PrBaseVerdict::NotChecked) => {}
-            Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
-                match self.work_db.upsert_work_item_attention(
-                    &candidate.work_item_id,
-                    PR_BASE_REFUSED,
-                    "PR must target the default branch",
-                    &format!("{pr_url}: {reason}"),
-                ) {
-                    Ok(_) => {
-                        if let Ok(item) = self.work_db.get_work_item(&candidate.work_item_id) {
-                            self.publisher
-                                .publish_work_item_changed(item.product_id(), &candidate.work_item_id, PR_BASE_REFUSED)
-                                .await;
-                        }
+        } else {
+            match crate::work::bounded_base_verdict(
+                Arc::clone(&self.pr_state_checker),
+                &pr_url,
+                crate::work::PR_QUERY_TIMEOUT,
+            )
+            .await
+            {
+                Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
+                    if let Err(err) = self
+                        .work_db
+                        .resolve_external_tracker_attention(&candidate.work_item_id, PR_BASE_REFUSED)
+                    {
+                        tracing::warn!(?err, "late PR recovery: could not clear base refusal");
                     }
-                    Err(err) => tracing::warn!(?err, "late PR recovery: could not record base refusal"),
                 }
-                return StopOutcome::DetectorFailed;
-            }
-            Err(err) => {
-                tracing::warn!(?err, pr_url, "late PR recovery: base check unavailable");
-                return StopOutcome::DetectorFailed;
+                Ok(crate::work::PrBaseVerdict::NotChecked) => {}
+                Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
+                    let detail = format!("{pr_url}: {reason}. Retarget the PR before binding it.");
+                    tracing::info!(
+                        execution_id = %candidate.execution_id,
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %pr_url,
+                        %reason,
+                        "pr-recheck-late: PR does not target the default branch; leaving the task unbound",
+                    );
+                    match self.work_db.upsert_work_item_attention(
+                        &candidate.work_item_id,
+                        PR_BASE_REFUSED,
+                        "PR must target the default branch",
+                        &format!("{pr_url}: {reason}"),
+                    ) {
+                        Ok(_) => {
+                            if let Ok(item) = self.work_db.get_work_item(&candidate.work_item_id) {
+                                self.publisher
+                                    .publish_work_item_changed(
+                                        item.product_id(),
+                                        &candidate.work_item_id,
+                                        PR_BASE_REFUSED,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(err) => tracing::warn!(?err, "late PR recovery: could not record base refusal"),
+                    }
+                    return StopOutcome::PrBaseRefused { pr_url, detail };
+                }
+                result => {
+                    tracing::debug!(
+                        execution_id = %candidate.execution_id,
+                        ?result,
+                        "pr-recheck-late: PR base check unavailable; will retry next sweep"
+                    );
+                    return StopOutcome::DetectorFailed;
+                }
             }
         }
         match self

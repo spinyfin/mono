@@ -1130,7 +1130,15 @@ impl Accepted {
                             .finalize_declared_run_done(&execution_id, run_done_payload.outcome),
                     )
                     .await;
-                    if boss_engine_completion::finalize_resolved(&stop_outcome)
+                    if matches!(&stop_outcome, boss_engine_completion::StopOutcome::PrBaseRefused { .. }) {
+                        tracing::info!(
+                            execution_id = %execution_id,
+                            outcome = %run_done_payload.outcome,
+                            delivered = matches!(delivery_outcome, Ok(Ok(true))),
+                            ?stop_outcome,
+                            "run_done proposal accepted: delivery parked — PR must be retargeted to the default branch",
+                        );
+                    } else if boss_engine_completion::finalize_resolved(&stop_outcome)
                         || run_done_payload.outcome == boss_protocol::RunDoneOutcome::NoChangesNeeded
                     {
                         tracing::info!(

@@ -67,6 +67,7 @@ impl WorkerCompletionHandler {
         use crate::work::PrBaseVerdict;
         use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
         if !self.binds_new_pr(execution, pr_url) {
+            self.resolve_pr_base_refusal_attention(&execution.id);
             return None;
         }
         match crate::work::bounded_base_verdict(
@@ -77,13 +78,7 @@ impl WorkerCompletionHandler {
         .await
         {
             Ok(PrBaseVerdict::DefaultBranch) => {
-                // Filed execution-scoped, so it must be resolved by execution.
-                if let Err(err) = self
-                    .work_db
-                    .resolve_attention_kind_for_execution(&execution.id, PR_BASE_REFUSED)
-                {
-                    tracing::warn!(?err, "failed to resolve PR base refusal attention");
-                }
+                self.resolve_pr_base_refusal_attention(&execution.id);
                 None
             }
             Ok(PrBaseVerdict::NotChecked) => None,
@@ -108,18 +103,41 @@ impl WorkerCompletionHandler {
         reason: &str,
     ) {
         use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
-        if let Err(err) = self
-            .upsert_execution_attention(
-                execution,
-                PR_BASE_REFUSED,
-                "PR must target the default branch",
-                &format!("{pr_url}: {reason}. Retarget the PR before completing delivery."),
-            )
-            .await
+        let title = "PR must target the default branch";
+        let detail = format!("{pr_url}: {reason}. Retarget the PR before completing delivery.");
+        let already_open = self
+            .work_db
+            .list_attention_items(&execution.id)
+            .ok()
+            .into_iter()
+            .flatten()
+            .any(|item| {
+                item.kind == PR_BASE_REFUSED
+                    && item.status == "open"
+                    && item.title == title
+                    && item.body_markdown == detail
+            });
+        if !already_open
+            && let Err(err) = self
+                .upsert_execution_attention(execution, PR_BASE_REFUSED, title, &detail)
+                .await
         {
             tracing::warn!(?err, "failed to record PR base refusal");
         }
+        self.park_pr_base_refusal(&execution.id);
     }
+
+    pub(super) fn resolve_pr_base_refusal_attention(&self, execution_id: &str) {
+        use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+        self.unpark_pr_base_refusal(execution_id);
+        if let Err(err) = self
+            .work_db
+            .resolve_attention_kind_for_execution(execution_id, PR_BASE_REFUSED)
+        {
+            tracing::warn!(?err, "failed to resolve PR base refusal attention");
+        }
+    }
+
 
     /// Expected branches of every primary implementation execution of
     /// `execution`'s work item, this execution's own first. A PR whose head

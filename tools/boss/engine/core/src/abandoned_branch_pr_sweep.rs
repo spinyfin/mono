@@ -145,7 +145,9 @@ pub const MAX_LOOKBACK_SECS: i64 = 24 * 60 * 60;
 /// same execution before the sweep files an attention item.
 pub const ESCALATE_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
 
-pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR;
+pub use boss_engine_storage_values::attention_kinds::{
+    ATTENTION_KIND_ABANDONED_BRANCH_NO_PR, ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+};
 
 /// Outcome of one auto-create attempt for a single candidate.
 #[derive(Debug)]
@@ -709,8 +711,19 @@ async fn bind_and_record(
             ) {
                 tracing::warn!(?err, "could not clear recovered PR base refusal");
             }
+            resolve_work_item_attention(
+                work_db,
+                &candidate.work_item_id,
+                ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+            );
         }
-        Ok(crate::work::PrBaseVerdict::NotChecked) => {}
+        Ok(crate::work::PrBaseVerdict::NotChecked) => {
+            resolve_work_item_attention(
+                work_db,
+                &candidate.work_item_id,
+                ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+            );
+        }
         Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
             tracing::warn!(%reason, pr_url, "abandoned PR base refused; leaving binding untouched");
             if let Err(err) = work_db.upsert_work_item_attention(
@@ -722,45 +735,49 @@ async fn bind_and_record(
                 tracing::warn!(?err, "could not surface recovered PR base refusal");
             }
             outcome.base_refused += 1;
+            resolve_work_item_attention(
+                work_db,
+                &candidate.work_item_id,
+                ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+            );
             let body = format!(
                 "Execution `{execution_id}` finished without a Stop, and its branch has a PR that the engine \
                  will not bind: {pr_url}: {reason}.\n\n\
-                 Retarget the PR to the repository default branch. The engine re-checks on its normal sweep \
-                 interval and binds the PR (resolving this item) once the base is the default branch.",
+                 Retarget the PR to the repository default branch, then bind it by hand with \
+                 `boss task update --pr-url`. The engine re-checks this branch for up to 24 hours after \
+                 the execution finished; after that window the candidate leaves the sweep and this item \
+                 stays until a human binds the PR.",
                 execution_id = candidate.execution_id,
             );
-            if let Err(err) = work_db.upsert_external_tracker_attention(
+            let title = "PR exists but does not target the default branch";
+            if upsert_work_item_attention_if_changed(
+                work_db,
                 &candidate.work_item_id,
                 ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
-                "PR exists but does not target the default branch",
+                title,
                 &body,
             ) {
-                tracing::warn!(
-                    work_item_id = %candidate.work_item_id,
-                    ?err,
-                    "abandoned-branch-pr sweep: failed to file base-refusal attention item",
-                );
-            }
-            dispatch_events
-                .emit(
-                    DispatchEvent::new(
-                        Stage::AbandonedBranchPrRecovery,
-                        Outcome::Skipped,
-                        &candidate.execution_id,
+                dispatch_events
+                    .emit(
+                        DispatchEvent::new(
+                            Stage::AbandonedBranchPrRecovery,
+                            Outcome::Skipped,
+                            &candidate.execution_id,
+                        )
+                        .with_work_item(&candidate.work_item_id)
+                        .with_details(serde_json::json!({
+                            "action": "base_refused",
+                            "pr_url": pr_url,
+                            "reason": reason,
+                        })),
                     )
-                    .with_work_item(&candidate.work_item_id)
-                    .with_details(serde_json::json!({
-                        "action": "base_refused",
-                        "pr_url": pr_url,
-                        "reason": reason,
-                    })),
-                )
-                .await;
+                    .await;
+            }
             return;
         }
-        result => {
+        Err(err) => {
             tracing::warn!(
-                ?result,
+                ?err,
                 pr_url,
                 "abandoned PR base not accepted; leaving binding untouched"
             );
@@ -771,14 +788,7 @@ async fn bind_and_record(
                 *entry
             };
             if count >= ESCALATE_AFTER_CONSECUTIVE_FAILURES {
-                file_attention(
-                    work_db,
-                    candidate,
-                    pr_url,
-                    true,
-                    "the PR base-branch lookup keeps failing",
-                    count,
-                );
+                file_base_lookup_attention(work_db, candidate, pr_url, &format!("{err:#}"), count);
                 outcome.escalated += 1;
             }
             return;
@@ -797,15 +807,12 @@ async fn bind_and_record(
                     "abandoned-branch-pr sweep: failed to resolve base-refusal attention (non-fatal)",
                 );
             }
-            if let Err(err) = work_db
-                .resolve_external_tracker_attention(&candidate.work_item_id, ATTENTION_KIND_ABANDONED_BRANCH_NO_PR)
-            {
-                tracing::warn!(
-                    work_item_id = %candidate.work_item_id,
-                    ?err,
-                    "abandoned-branch-pr sweep: failed to resolve attention item on recovery (non-fatal)",
-                );
-            }
+            resolve_work_item_attention(work_db, &candidate.work_item_id, ATTENTION_KIND_ABANDONED_BRANCH_NO_PR);
+            resolve_work_item_attention(
+                work_db,
+                &candidate.work_item_id,
+                ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+            );
             match action {
                 BindAction::Created(_) => outcome.created += 1,
                 BindAction::Bound(_) => outcome.recovered += 1,
@@ -838,6 +845,75 @@ async fn bind_and_record(
             );
         }
     }
+}
+
+fn upsert_work_item_attention_if_changed(
+    work_db: &WorkDb,
+    work_item_id: &str,
+    kind: &str,
+    title: &str,
+    body: &str,
+) -> bool {
+    let already_open = work_db
+        .list_attention_items_for_work_item(work_item_id)
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|item| item.kind == kind && item.status == "open" && item.title == title && item.body_markdown == body);
+    if already_open {
+        return false;
+    }
+    if let Err(err) = work_db.upsert_external_tracker_attention(work_item_id, kind, title, body) {
+        tracing::warn!(
+            work_item_id,
+            kind,
+            ?err,
+            "abandoned-branch-pr sweep: failed to file attention item",
+        );
+        return false;
+    }
+    true
+}
+
+fn resolve_work_item_attention(work_db: &WorkDb, work_item_id: &str, kind: &str) {
+    if let Err(err) = work_db.resolve_external_tracker_attention(work_item_id, kind) {
+        tracing::warn!(
+            work_item_id,
+            kind,
+            ?err,
+            "abandoned-branch-pr sweep: failed to resolve attention item (non-fatal)",
+        );
+    }
+}
+
+/// File a dedicated diagnosis when the PR exists but its base branch cannot
+/// be read. Uses its own kind so it cannot overwrite a more accurate
+/// wrong-base refusal sharing the work item.
+fn file_base_lookup_attention(
+    work_db: &WorkDb,
+    candidate: &LatePrCandidate,
+    pr_url: &str,
+    last_error: &str,
+    attempts: u32,
+) {
+    let title = "Could not read the PR's base branch";
+    let body = format!(
+        "Execution `{execution_id}` finished without a Stop, and its branch has a pull request \
+         ({pr_url}), but the engine has failed {attempts} time(s) to read which branch that PR \
+         targets.\n\n\
+         **Last error:** {last_error}\n\n\
+         The engine keeps retrying on its normal sweep interval. If GitHub is reachable, check \
+         that the engine's GitHub credentials can read this repository, then retarget or bind \
+         the PR by hand with `boss task update --pr-url`.",
+        execution_id = candidate.execution_id,
+    );
+    let _ = upsert_work_item_attention_if_changed(
+        work_db,
+        &candidate.work_item_id,
+        ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+        title,
+        &body,
+    );
 }
 
 /// File (idempotently) the attention item raised once a
@@ -1214,6 +1290,95 @@ mod tests {
             assert_eq!(result.recovered + result.created, 0);
             assert!(!work_item_pr_url_already_set(&db, &chore_id));
         }
+    }
+
+    #[tokio::test]
+    async fn refused_base_files_attention_emits_once_and_resolves_on_later_bind() {
+        use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+        let url = "https://github.com/foo/bar/pull/7";
+        let (_dir, db) = open_db();
+        let (chore_id, _) = make_candidate_chore(&db, "refused-then-bound");
+        let detector = FixedPrDetector(PrStatus::Fresh { url: url.into() });
+        let creator = QueuePrAutoCreator::new(vec![]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut failures = HashMap::new();
+        let refused: Arc<dyn crate::work::PrStateChecker> = Arc::new(
+            FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature base".into())),
+        );
+        let first = run_one_pass(&db, &detector, &creator, Arc::clone(&refused), &sink, &mut failures).await;
+        assert_eq!(first.base_refused, 1);
+        let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.kind == ATTENTION_KIND_ABANDONED_BRANCH_NO_PR && i.status == "open")
+            .expect("refusal attention");
+        assert!(item.title.contains("does not target the default branch"));
+        assert!(item.body_markdown.contains("24 hours"));
+        assert!(item.body_markdown.contains("boss task update --pr-url"));
+        let events = sink.events().await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].details["action"], "base_refused");
+
+        let second = run_one_pass(&db, &detector, &creator, refused, &sink, &mut failures).await;
+        assert_eq!(second.base_refused, 1);
+        assert_eq!(
+            sink.events().await.len(),
+            1,
+            "the same refusal reason must not re-emit a dispatch event"
+        );
+
+        let accepted = Arc::new(FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::DefaultBranch));
+        let recovered = run_one_pass(&db, &detector, &creator, accepted, &sink, &mut failures).await;
+        assert_eq!(recovered.recovered, 1);
+        assert!(
+            db.list_attention_items_for_work_item(&chore_id)
+                .unwrap()
+                .iter()
+                .all(|i| i.status != "open"),
+            "binding the PR must resolve the refusal attention"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_base_lookup_failures_escalate_with_a_lookup_diagnosis() {
+        let url = "https://github.com/foo/bar/pull/7";
+        let (_dir, db) = open_db();
+        let (chore_id, _) = make_candidate_chore(&db, "base-lookup-escalate");
+        let detector = FixedPrDetector(PrStatus::Fresh { url: url.into() });
+        let creator = QueuePrAutoCreator::new(vec![]);
+        let sink = NoopDispatchEventSink;
+        let mut failures = HashMap::new();
+        for _ in 0..(ESCALATE_AFTER_CONSECUTIVE_FAILURES - 1) {
+            let outcome = run_one_pass(
+                &db,
+                &detector,
+                &creator,
+                Arc::new(FailingBaseChecker),
+                &sink,
+                &mut failures,
+            )
+            .await;
+            assert_eq!(outcome.failed, 1);
+            assert_eq!(outcome.escalated, 0);
+        }
+        assert!(db.list_attention_items_for_work_item(&chore_id).unwrap().is_empty());
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(FailingBaseChecker),
+            &sink,
+            &mut failures,
+        )
+        .await;
+        assert_eq!(outcome.escalated, 1);
+        let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE);
+        assert!(items[0].title.contains("Could not read the PR's base branch"));
+        assert!(items[0].body_markdown.contains(url));
+        assert!(items[0].body_markdown.contains("GitHub unavailable"));
+        assert!(!items[0].title.contains("no PR"));
     }
 
     struct FailingBaseChecker;

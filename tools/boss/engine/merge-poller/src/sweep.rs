@@ -681,9 +681,17 @@ pub(crate) async fn sweep_late_pr(
         // The late-PR recheck binds through `bind_pr_to_active_task_from_terminal_execution`,
         // never through `finalize_pr_transition`, so the foreign-PR guard's
         // refusal cannot surface here — covered for exhaustiveness.
-        | StopOutcome::ForeignPrRefused { .. }
-        // Same: the base guard only runs inside `finalize_pr_transition`.
-        | StopOutcome::PrBaseRefused { .. } => {}
+        | StopOutcome::ForeignPrRefused { .. } => {}
+        // Late-PR recheck applies the base policy before binding. A refused
+        // PR stays unbound for a later pass (or the abandoned-branch sweep).
+        StopOutcome::PrBaseRefused { pr_url, .. } => {
+            tracing::info!(
+                execution_id = %candidate.execution_id,
+                work_item_id = %candidate.work_item_id,
+                pr_url = %pr_url,
+                "merge poller: late-PR recheck refused by the base policy — PR must be retargeted to the default branch",
+            );
+        }
     }
 }
 
