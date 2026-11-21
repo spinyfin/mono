@@ -1075,17 +1075,25 @@ impl WorkDb {
         // preferring the `pr_url` index over the ids. With no named set,
         // admit all eligible active/in_review PR rows; the outer WHERE
         // narrows them to marker and readmission cases.
-        let seed = if scoped {
-            "AND +t.pr_url IS NOT NULL
+        let (status, seed) = if scoped {
+            (
+                // Same reason as `pr_url`: the status index must not be
+                // preferred over the ids either.
+                "+t.status",
+                "AND +t.pr_url IS NOT NULL
                  AND +t.pr_url != ''
-                 AND t.id IN (SELECT value FROM json_each(?2))"
+                 AND t.id IN (SELECT value FROM json_each(?2))",
+            )
         } else {
-            "AND t.pr_url IS NOT NULL
-                 AND t.pr_url != ''"
+            (
+                "t.status",
+                "AND t.pr_url IS NOT NULL
+                 AND t.pr_url != ''",
+            )
         };
         let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let walk = super::cycle_root_walk_cte(&format!(
-            "t.status IN ('active', 'in_review')
+            "{status} IN ('active', 'in_review')
                  {seed}
                  AND t.deleted_at IS NULL
                  AND {upkeep}",
@@ -1399,8 +1407,8 @@ impl WorkDb {
         let upkeep = super::parking::upkeep_eligible_task_sql("t");
         let mut stmt = conn.prepare(&format!(
             "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
-             FROM work_executions we
-             JOIN tasks t ON t.id = we.work_item_id
+             FROM work_executions we INDEXED BY work_executions_finished_at_idx
+             CROSS JOIN tasks t ON t.id = we.work_item_id
              WHERE we.status IN ('orphaned', 'abandoned', 'failed', 'completed')
                AND we.workspace_path IS NOT NULL
                AND we.workspace_path != ''

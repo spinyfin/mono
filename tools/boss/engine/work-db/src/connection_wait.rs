@@ -123,11 +123,23 @@ impl Drop for ConnectionGuard<'_> {
         let held = self.acquired.elapsed();
         // Logging must not extend the critical section being measured.
         let query_ms = self.observation.query_time().as_secs_f64() * 1000.0;
+        let reads = self
+            .guard
+            .as_deref()
+            .map(|conn| self.observation.finish_reads(conn))
+            .unwrap_or_default();
         super::db_diagnostics::finish(self.connection_id);
         drop(self.guard.take());
         drop(self.owner.take());
+        super::db_diagnostics::read_volume::record(
+            self.caller,
+            &self.observation.attribution,
+            held,
+            &reads,
+            super::db_diagnostics::read_volume::Scope::Query,
+        );
         if held.max(self.waited) >= std::time::Duration::from_millis(100) {
-            tracing::warn!(query_ms, verb = %self.observation.attribution.verb, request_id = %self.observation.attribution.request_id, session_id = %self.observation.attribution.session_id, background = %self.observation.attribution.background, wait_ms = self.waited.as_millis() as u64, held_ms = held.as_millis() as u64, caller = %self.caller,
+            tracing::warn!(query_ms, pages_read = reads.pages, verb = %self.observation.attribution.verb, request_id = %self.observation.attribution.request_id, session_id = %self.observation.attribution.session_id, background = %self.observation.attribution.background, wait_ms = self.waited.as_millis() as u64, held_ms = held.as_millis() as u64, caller = %self.caller,
                 "work DB connection lock timing");
             super::lock_stats::global().record_timing(self.caller, held);
         }

@@ -226,20 +226,33 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let items = {
             let mut stmt = tx.prepare(
-                "SELECT DISTINCT t.product_id, t.id, COALESCE(ep.epoch, 0)
-                 FROM tasks t
-                 JOIN work_executions e ON e.work_item_id = t.id
+                // Driven from the pending executions, which are few, through
+                // the status index. Left to choose, the planner starts from
+                // `tasks` and reads every non-deleted task on each beat.
+                //
+                // Whether the task is still on the board is a result column,
+                // not a `WHERE` term: a condition on `tasks` alone lets the
+                // planner pre-filter the join with a Bloom filter, and it
+                // builds one by reading every task.
+                "SELECT DISTINCT t.product_id, t.id, COALESCE(ep.epoch, 0),
+                        t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+                 FROM work_executions e INDEXED BY work_executions_ready_idx
+                 CROSS JOIN tasks t ON t.id = e.work_item_id
                  LEFT JOIN board_runtime_epoch ep ON ep.work_item_id = t.id
-                 WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
-                   AND e.status IN ('queued', 'ready', 'waiting_dependency')",
+                 WHERE e.status IN ('queued', 'ready', 'waiting_dependency')",
             )?;
-            collect_rows(stmt.query_map([], |row| {
+            let rows: Vec<(String, String, i64, bool)> = collect_rows(stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
-            })?)?
+            })?)?;
+            rows.into_iter()
+                .filter(|(_, _, _, on_board)| *on_board)
+                .map(|(product_id, id, epoch, _)| (product_id, id, epoch))
+                .collect::<Vec<_>>()
         };
         let mut displays = HashMap::new();
         for (product_id, id, epoch) in items {

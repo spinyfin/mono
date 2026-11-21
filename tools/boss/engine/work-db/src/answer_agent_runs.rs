@@ -417,11 +417,14 @@ impl WorkDb {
     /// most a handful of live executions at a time, capped by the worker pools.
     pub fn list_live_answer_agent_executions(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM work_executions
-             WHERE kind = ?1 AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+        // Read once a minute: unfinished executions are sought through the
+        // status index rather than found by walking every execution.
+        let unfinished = super::recurring_read_indexes::unfinished_execution_statuses_sql();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM work_executions INDEXED BY work_executions_ready_idx
+             WHERE kind = ?1 AND status IN ({unfinished})
              ORDER BY created_at ASC, id ASC",
-        )?;
+        ))?;
         let ids: Vec<String> =
             collect_rows(stmt.query_map(params![boss_protocol::EXECUTION_KIND_ANSWER_AGENT], |row| row.get(0))?)?;
         let mut executions = Vec::with_capacity(ids.len());

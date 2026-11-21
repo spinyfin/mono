@@ -208,21 +208,24 @@ impl WorkDb {
         let conn = self.connect()?;
         let cutoff = now_epoch_secs - max_age_secs;
         let mut stmt = conn.prepare(
+            // Driven from the runs that ended inside the window, which the
+            // partial expression index `work_runs_local_shell_ended_idx`
+            // finds directly. The earlier shape walked every terminal
+            // execution and probed its latest run, so each pass read all of
+            // `work_executions` and `work_runs`. A run is at most one
+            // execution's latest, so the join returns each execution once.
             "SELECT e.id, e.work_item_id, e.status
-             FROM work_executions e
-             WHERE e.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
-               AND EXISTS (
-                   SELECT 1 FROM work_runs r
-                   WHERE r.id = (
-                       SELECT latest.id FROM work_runs latest
-                       WHERE latest.execution_id = e.id
-                       ORDER BY latest.created_at DESC, latest.id DESC
-                       LIMIT 1
-                   )
-                     AND r.host_id = 'local'
-                     AND r.shell_pid IS NOT NULL
-                     AND r.shell_pid > 0
-                     AND CAST(COALESCE(r.finished_at, r.created_at) AS INTEGER) >= ?1
+             FROM work_runs r
+             CROSS JOIN work_executions e ON e.id = r.execution_id
+             WHERE r.host_id = 'local'
+               AND r.shell_pid > 0
+               AND CAST(COALESCE(r.finished_at, r.created_at) AS INTEGER) >= ?1
+               AND e.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+               AND r.id = (
+                   SELECT latest.id FROM work_runs latest
+                   WHERE latest.execution_id = e.id
+                   ORDER BY latest.created_at DESC, latest.id DESC
+                   LIMIT 1
                )
              ORDER BY e.created_at ASC, e.id ASC",
         )?;

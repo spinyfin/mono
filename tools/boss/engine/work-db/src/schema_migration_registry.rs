@@ -493,6 +493,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: execution_recovery_rearm::migrate_fresh_start,
         },
         Migration {
+            id: recurring_read_indexes::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: recurring_read_indexes::migrate,
+        },
+        Migration {
             id: "20261114_1800_refresh_blocked_reason_audit_trigger".into(),
             legacy_version: None,
             apply: |conn| {

@@ -1167,7 +1167,7 @@ impl WorkDb {
         let mut stmt = conn.prepare(
             "SELECT r.id, r.execution_id, r.host_id, r.remote_pid
              FROM work_runs r
-             JOIN work_executions e ON e.id = r.execution_id
+             CROSS JOIN work_executions e ON e.id = r.execution_id
              WHERE r.host_id != 'local'
                AND e.status NOT IN
                    ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
@@ -1234,7 +1234,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT r.execution_id FROM work_runs r
-             JOIN work_executions e ON e.id = r.execution_id
+             CROSS JOIN work_executions e ON e.id = r.execution_id
              WHERE r.host_id != 'local'
                AND r.id = (SELECT latest.id FROM work_runs latest
                    WHERE latest.execution_id = e.id

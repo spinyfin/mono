@@ -149,6 +149,21 @@ pub(super) fn find_worker_proposal_by_id(conn: &Connection, id: &str) -> Result<
         .map_err(Into::into)
 }
 
+/// Undecided proposals of one kind, oldest first. `state = 'proposed'` is a
+/// literal so the partial index `worker_proposals_undecided_idx` serves the
+/// statement and supplies its order: the read costs what is undecided, not
+/// what the ledger has accumulated.
+pub(super) fn list_undecided_proposals(conn: &Connection, kind: ProposalKind) -> Result<Vec<WorkerProposal>> {
+    let sql = format!(
+        "{SELECT_WORKER_PROPOSAL}
+         WHERE state = 'proposed' AND kind = ?1
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![kind.as_str()], map_worker_proposal)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
 // ---- WorkDb accessors ----
 
 #[work_db_boundary::instrument]

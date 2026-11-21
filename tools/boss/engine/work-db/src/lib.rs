@@ -909,6 +909,7 @@ pub mod parking;
 pub mod parking_reconcile;
 pub mod personas;
 mod pre_start_failure;
+mod recurring_read_indexes;
 pub use pre_start_failure::PositioningHold;
 mod progression_candidates;
 mod progression_done;

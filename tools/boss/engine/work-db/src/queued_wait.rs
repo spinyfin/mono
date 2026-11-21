@@ -652,7 +652,10 @@ impl WorkDb {
 
         let pending: Vec<WorkExecution> = {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {} FROM work_executions we
+                // The status index is named: with the statistics an upgraded
+                // database carries, the planner otherwise walks every
+                // execution ever recorded on each scheduler beat.
+                "SELECT {} FROM work_executions we INDEXED BY work_executions_ready_idx
                  WHERE we.status IN ('queued', 'ready', 'claimed', 'waiting_dependency', 'waiting_review', 'waiting_merge')
                  ORDER BY we.created_at ASC, we.id ASC",
                 super::executions_runs::EXECUTION_COLUMNS

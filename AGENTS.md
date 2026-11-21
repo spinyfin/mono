@@ -89,6 +89,11 @@ root-cause rule as the section below.
   intervals for the two singleton sweeps, and what each one's cost scales
   with):
   [`tools/boss/docs/background-sweep-telemetry.md`](tools/boss/docs/background-sweep-telemetry.md)
+- Work DB read volume (how the engine attributes `state.db` page reads to
+  a caller and statement, the `work DB heavy read` / `db read summary` /
+  `database size report` log lines, and the rules and read-budget test that
+  keep a timer-driven read from walking a table):
+  [`tools/boss/docs/work-db-read-volume.md`](tools/boss/docs/work-db-read-volume.md)
 - Merge poller detection pass (the order a pass works in, what an abandoned
   pass does and does not lose, the `merge_detection_stalled` health issue,
   and the per-phase timing to read when a pass is slow):

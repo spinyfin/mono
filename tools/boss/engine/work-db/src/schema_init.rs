@@ -210,6 +210,7 @@ impl WorkDb {
         let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening existing database {} for inspection", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        super::db_diagnostics::install_read_observer(&conn);
         Ok(Self {
             ingress_writer: Default::default(),
             path,
@@ -878,6 +879,13 @@ mod floor_tests {
             (
                 "00000000_0000_v060_bookmark_prune",
                 Box::new(|c| c.execute_batch(EXECUTION_BOOKMARK_PRUNE_COLUMNS_60).unwrap()),
+            ),
+            (
+                super::super::recurring_read_indexes::MIGRATION_ID,
+                Box::new(|c| {
+                    c.execute_batch(super::super::recurring_read_indexes::INDEXES_SQL)
+                        .unwrap();
+                }),
             ),
             (
                 cancel_provenance::MIGRATION_ID,

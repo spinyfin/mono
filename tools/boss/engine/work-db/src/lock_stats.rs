@@ -162,6 +162,8 @@ pub fn spawn_summary_task(registry: Arc<Registry>) -> tokio::task::JoinHandle<()
         loop {
             ticker.tick().await;
             flush(global(), &registry);
+            // The same minute's read volume, by caller.
+            super::db_diagnostics::read_volume::flush(&registry, SUMMARY_INTERVAL);
         }
     })
 }

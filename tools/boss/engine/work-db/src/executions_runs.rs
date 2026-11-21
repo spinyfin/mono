@@ -993,6 +993,10 @@ impl WorkDb {
 
     /// Local leftovers, including leases older than cube's TTL: expiry does
     /// not prove that work was preserved. Remote leases belong to their host.
+    ///
+    /// Read once a minute. The partial index holds only finished executions
+    /// that still hold a lease, in the order returned; it is named because
+    /// the planner otherwise fetches every finished execution by status.
     pub fn list_terminal_executions_holding_lease(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1000,7 +1004,7 @@ impl WorkDb {
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
                     pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
-             FROM work_executions
+             FROM work_executions INDEXED BY work_executions_terminal_lease_idx
              WHERE status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
                AND COALESCE(host_id, 'local') = 'local'
@@ -1046,17 +1050,20 @@ impl WorkDb {
     /// but whose `workspace_path` lingers is still a valid candidate.
     pub fn list_non_terminal_executions_with_workspace(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        // Read once a minute: unfinished executions are sought through the
+        // status index rather than found by walking every execution.
+        let unfinished = super::recurring_read_indexes::unfinished_execution_statuses_sql();
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
                     pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
-             FROM work_executions
-             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             FROM work_executions INDEXED BY work_executions_ready_idx
+             WHERE status IN ({unfinished})
                AND workspace_path IS NOT NULL
                AND workspace_path != ''
              ORDER BY created_at ASC, id ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
     }
@@ -1075,13 +1082,16 @@ impl WorkDb {
     /// its workspace columns.
     pub fn list_non_terminal_executions_with_local_shell_pid(&self) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        // Read once a minute, through the status index: see
+        // `list_non_terminal_executions_with_workspace`.
+        let unfinished = super::recurring_read_indexes::unfinished_execution_statuses_sql();
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
                     pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
-             FROM work_executions
-             WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             FROM work_executions INDEXED BY work_executions_ready_idx
+             WHERE status IN ({unfinished})
                AND EXISTS (
                    SELECT 1 FROM work_runs r
                    WHERE r.id = (
@@ -1095,7 +1105,7 @@ impl WorkDb {
                      AND r.shell_pid > 0
                )
              ORDER BY created_at ASC, id ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], map_execution)?;
         collect_rows(rows)
     }

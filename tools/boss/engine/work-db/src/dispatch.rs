@@ -317,8 +317,8 @@ impl WorkDb {
         let candidates: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT we.id, we.work_item_id
-                 FROM work_executions we
-                 JOIN tasks t ON t.id = we.work_item_id
+                 FROM work_executions we INDEXED BY work_executions_ready_idx
+                 CROSS JOIN tasks t ON t.id = we.work_item_id
                  WHERE we.status IN ('queued', 'ready', 'waiting_dependency', 'claimed')
                    AND (
                      t.deleted_at IS NOT NULL
@@ -996,9 +996,12 @@ impl WorkDb {
         // their membership rows. The deferred marker routes those roots back
         // through batch admission rather than minting a legacy reviewer.
         let sql = format!(
+            // Read once a minute. Open tasks come from the partial index
+            // `tasks_open_idx`, then each one's reviews; left to itself the
+            // planner walks every task in the product, closed ones included.
             "SELECT t.id, we.id, we.status
-             FROM tasks t
-             JOIN work_executions we ON we.work_item_id = t.id
+             FROM tasks t INDEXED BY tasks_open_idx
+             CROSS JOIN work_executions we ON we.work_item_id = t.id
              WHERE t.deleted_at IS NULL
                AND t.status NOT IN ('done', 'archived')
                AND {upkeep}
@@ -2225,14 +2228,16 @@ pub(crate) fn orphan_active_candidates_sql(scoped: bool) -> String {
     // A named set is an `IN` over the ids so the walk seeks each row by
     // primary key. Folded into one statement with `?2 IS NULL OR ...` it
     // left SQLite no usable term and the walk scanned every task.
-    let scope = if scoped {
-        "AND t.id IN (SELECT value FROM json_each(?2))"
+    // The unary `+` keeps a named set seeking by id: the status index would
+    // otherwise be preferred and read every active item to find the few named.
+    let (status, scope) = if scoped {
+        ("+t.status", "AND t.id IN (SELECT value FROM json_each(?2))")
     } else {
-        ""
+        ("t.status", "")
     };
     format!(
         "SELECT t.id FROM tasks t
-         WHERE t.status = 'active'
+         WHERE {status} = 'active'
            AND t.deleted_at IS NULL
            AND {upkeep}
            AND CAST(t.updated_at AS INTEGER) < ?1
