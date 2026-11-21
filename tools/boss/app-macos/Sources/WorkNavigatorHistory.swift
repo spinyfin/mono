@@ -8,6 +8,13 @@ struct WorkNavigatorHistory: View {
     private var root: WorkTask { context.root }
     private var family: [WorkTask] { model.navigatorFamily(of: root) }
 
+    // History stays mounted with the selected detail. Keep its consumer alive
+    // while another tab is visible: prefetch once, retain rows, and continue
+    // receiving invalidations until the detail closes or changes selection.
+    var executionsList: WorkExecutionsList {
+        WorkExecutionsList(model: model, taskIDs: family.map(\.id), transcriptTaskID: root.id)
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -19,12 +26,7 @@ struct WorkNavigatorHistory: View {
                 WorkDependenciesSection(model: model, taskID: root.id) { row in
                     model.navigateNavigatorDependency(row)
                 }
-                WorkExecutionsList(
-                    model: model,
-                    taskIDs: family.map(\.id),
-                    transcriptTaskID: root.id,
-                    isActive: model.navigator.tab == .history
-                )
+                executionsList
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, 4)

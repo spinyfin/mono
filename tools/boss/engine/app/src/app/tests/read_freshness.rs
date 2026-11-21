@@ -1,6 +1,58 @@
 use super::*;
 
 #[tokio::test]
+async fn execution_history_uses_its_admitted_connection() {
+    let (state, _dir) = test_server_state();
+    let product = boss_engine_runtime::test_support::create_test_product_named(&state.work_db, "history");
+    let task = create_test_chore_manual(&state.work_db, product.id.clone(), "history");
+    let execution = state
+        .work_db
+        .create_execution(
+            boss_work_db::CreateExecutionInput::builder()
+                .work_item_id(task.id.clone())
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let sink = make_session_sink();
+    let ctx = context(&state, &sink, "history");
+    let db = state.work_db.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _connection = db.connect().unwrap();
+        locked_tx.send(()).unwrap();
+        // A broken handler eventually returns instead of deadlocking the
+        // suite. Assert ordering, not a machine-dependent latency threshold.
+        release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    });
+    locked_rx.recv().unwrap();
+    let started = Instant::now();
+    dispatch::dispatch_request(
+        ctx,
+        FrontendRequest::ListExecutions {
+            work_item_id: Some(task.id.clone()),
+            include_revision_chain: true,
+        },
+        true,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let reply = sink.next().await.unwrap();
+    let _ = release_tx.send(());
+    assert!(
+        holder.join().unwrap(),
+        "History must reply before the shared connection is released"
+    );
+    eprintln!("execution history while shared connection remains held: {elapsed:?}");
+    assert_eq!(reply.request_id.as_deref(), Some("history"));
+    assert!(
+        matches!(reply.payload, FrontendEvent::ExecutionsList { work_item_id: Some(id), executions } if id == task.id && executions.len() == 1 && executions[0].id == execution.id)
+    );
+}
+
+#[tokio::test]
 async fn newer_domain_failures_do_not_replace_successful_snapshots() {
     use boss_protocol::{DesignDocContent, DesignDocTreeState};
     let failures = [

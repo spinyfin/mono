@@ -298,6 +298,9 @@ final class EngineClient: @unchecked Sendable {
     @discardableResult
     func sendLine(_ payload: [String: Any], queueIfDisconnected: Bool = false, reportIfDisconnected: Bool = true, envelopeRequestId: String = UUID().uuidString) -> String? {
         outboundRecorder?(payload)
+        if payload["type"] as? String == "list_executions" {
+            ExecutionHistoryTiming.record("requested", taskID: payload["work_item_id"] as? String ?? "", requestID: envelopeRequestId)
+        }
         if payload["type"] as? String == "merge_when_ready" {
             Self.log.info("merge RPC scheduled: request=\(envelopeRequestId, privacy: .public)")
         }
@@ -606,6 +609,9 @@ final class EngineClient: @unchecked Sendable {
             }
 
             beforeWriteHook.withLock { $0 }?(envelopeRequestId, connectionGeneration)
+            if payload["type"] as? String == "list_executions" {
+                ExecutionHistoryTiming.record("socket_write", taskID: payload["work_item_id"] as? String ?? "", requestID: envelopeRequestId)
+            }
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if let error {
@@ -773,6 +779,10 @@ final class EngineClient: @unchecked Sendable {
             workTreeCache.resetBase()
         }
         let envelopeRequestId = envelope["request_id"] as? String
+        if type == "executions_list" {
+            ExecutionHistoryTiming.record("received", taskID: payload["work_item_id"] as? String ?? "",
+                                          requestID: envelopeRequestId ?? "", nanos: lineRecvNanos)
+        }
         let isAdmissionReply = type == "dispatch_admission_evaluated"
         // The request this reply answers, as the ledger recorded it when it was
         // written (under the id it actually carried, so a Retry's fresh id
@@ -1617,6 +1627,7 @@ final class EngineClient: @unchecked Sendable {
             let taskId = payload["work_item_id"] as? String ?? ""
             let raw = payload["executions"] as? [[String: Any]] ?? []
             let executions = raw.compactMap(parseExecutionVM)
+            ExecutionHistoryTiming.record("decoded", taskID: taskId, requestID: envelopeRequestId ?? "")
             if !taskId.isEmpty {
                 emit(.executionsList(taskId: taskId, executions: executions))
             }

@@ -131,6 +131,35 @@ final class NavigatorLifecycleTests: XCTestCase {
         XCTAssertTrue(model.executionsConsumerTokensByTaskID.isEmpty)
     }
 
+    func testHistoryPrefetchSurvivesTabSwitchAndSharedConsumer() {
+        let model = NavigatorTestFixture.model([root()])
+        model.selectWorkCard("root")
+        model.navigator.tab = .activity
+        var requests = 0
+        model.engine.outboundRecorder = { payload in
+            if payload["type"] as? String == "list_executions" { requests += 1 }
+        }
+        let history = WorkNavigatorHistory(context: NavigatorDetailContext(
+            model: model, root: model.navigatorSelectedTask!, ask: nil, isReadOnly: false
+        ))
+        let consumer = WorkExecutionsConsumer()
+        history.executionsList.updateConsumer(consumer)
+        XCTAssertEqual(requests, 1, "Prefetch before History is selected")
+        let viewer = UUID()
+        model.beginExecutionsConsumer(taskID: "root", token: viewer)
+        XCTAssertEqual(requests, 1, "Share the pending request")
+        model.applyEventForTest(.executionsList(taskId: "root", executions: []))
+        for tab in [NavigatorDetailSlot.history, .activity, .history] {
+            model.navigator.tab = tab
+            history.executionsList.updateConsumer(consumer)
+            XCTAssertNotNil(model.executionsByTaskID["root"])
+        }
+        XCTAssertEqual(requests, 1, "Switching tabs must retain the loaded result")
+        model.endExecutionsConsumer(taskID: "root", token: viewer)
+        consumer.update(taskIDs: [], model: model)
+        XCTAssertNil(model.executionsByTaskID["root"], "Closing the detail releases its cache")
+    }
+
     func testRejectedStartAndRetryNeverQueueExecution() {
         for kind in ["start", "retry"] {
             let model = NavigatorTestFixture.model([root()])

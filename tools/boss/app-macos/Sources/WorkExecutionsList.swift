@@ -87,6 +87,9 @@ struct WorkExecutionsList: View {
         .onChange(of: taskIDs) { _, _ in updateConsumer(consumer) }
         .onChange(of: isActive) { _, _ in updateConsumer(consumer) }
         .onDisappear { consumer.update(taskIDs: [], model: model) }
+        .onChange(of: taskIDs.map { model.executionsByTaskID[$0]?.map(\.id) }) { _, _ in
+            for id in taskIDs { ExecutionHistoryTiming.record("view_update", taskID: id) }
+        }
     }
 }
 

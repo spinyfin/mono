@@ -205,7 +205,9 @@ extension ChatViewModel {
     /// views on one task don't evict each other.
     func beginExecutionsConsumer(taskID: String, token: UUID) {
         executionsConsumerTokensByTaskID[taskID, default: []].insert(token)
-        loadExecutions(taskId: taskID)
+        if executionsByTaskID[taskID] == nil, !executionsInFlightTaskIDs.contains(taskID) {
+            loadExecutions(taskId: taskID)
+        }
     }
 
     /// The view registered under `token` went away. The last consumer of a

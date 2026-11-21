@@ -702,6 +702,7 @@ extension ChatViewModel {
             // subsection observes `gitHubAuthState` and re-renders.
             gitHubAuthState = state
         case .executionsList(let taskId, let executions):
+            ExecutionHistoryTiming.record("apply", taskID: taskId)
             // A reply that lands after its last consumer closed must not
             // re-create the entry that closing evicted.
             if hasOpenExecutionsConsumer(taskID: taskId) {
