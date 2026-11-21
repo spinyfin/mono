@@ -1,7 +1,7 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
-load("//tools/test-sandbox:defs.bzl", "network_enabled_rust_test")
+load("//tools/test-sandbox:defs.bzl", "network_enabled_rust_test", "twin_test")
 load(":engine_binary.bzl", "ENGINE_BINARY_NAME")
 load(":runtime.bzl", "TEST_ALIASES", "TEST_DEPS", "runtime_libraries")
 
@@ -122,60 +122,66 @@ rust_binary(
 # --test_filter=path::to::test_name.
 
 # The same suite against the oldest and the newest supported jj (see
-# //tools/cube/docs/jj-compatibility.md).
-[
-    rust_test(
-        name = name,
-        size = "small",
-        timeout = "moderate",
-        # crate inheritance keeps the production dependency; compile this test
-        # against the fixture variant under its usual Rust name instead.
-        aliases = TEST_ALIASES,
-        crate = ":runtime",
-        data = [
-            "//tools/boss/event-shim:boss-event",
-            # Config loading requires an engine-owned cube, just like the engine.
-            "//tools/cube",
-            # The checksum-pinned Codex release (codex_test_archives.bzl) that the
-            # conformance live pins (version_pin, guard_conformance) exercise; the
-            # hermetic wrapper strips PATH, so without it they could only skip.
-            "//tools/boss/engine/driver:codex_test_binary",
-            "//tools/repobin",
-            jj,
-        ],
-        edition = "2024",
-        env = {
-            "BOSS_TEST_EVENT_SHIM": "$(rootpath //tools/boss/event-shim:boss-event)",
-            "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
-            "BOSS_JJ_BIN": "$(rootpath {})".format(jj),
-            "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
-            "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
-            "HOME": "/tmp",
-        },
-        experimental_enable_sharding = True,
-        proc_macro_deps = all_crate_deps(
-            package_name = "tools/boss/engine/core/runtime",
-            proc_macro = True,
-            proc_macro_dev = True,
-        ),
-        shard_count = 7,
-        deps = TEST_DEPS + [
-            "//tools/boss/engine/pane-summary",
-            "//tools/boss/engine/prose-vocabulary",
-            "//tools/boss/engine/recovery-fixtures",
-            "//tools/boss/engine/task-scope",
-            "//tools/boss/engine/test-git",
-        ] + all_crate_deps(
-            package_name = "tools/boss/engine/core/runtime",
-            normal = True,
-            normal_dev = True,
-        ),
-    )
-    for name, jj in [
-        ("engine_lib_test", "@jj_test_tools//:jj"),
-        ("engine_lib_jj_046_test", "@jj_upgrade_test_tools//:jj"),
-    ]
-]
+# //tools/cube/docs/jj-compatibility.md): one compile, two test targets.
+rust_test(
+    name = "engine_lib_test",
+    size = "small",
+    timeout = "moderate",
+    # crate inheritance keeps the production dependency; compile this test
+    # against the fixture variant under its usual Rust name instead.
+    aliases = TEST_ALIASES,
+    crate = ":runtime",
+    data = [
+        "//tools/boss/event-shim:boss-event",
+        # Config loading requires an engine-owned cube, just like the engine.
+        "//tools/cube",
+        # The checksum-pinned Codex release (codex_test_archives.bzl) that the
+        # conformance live pins (version_pin, guard_conformance) exercise; the
+        # hermetic wrapper strips PATH, so without it they could only skip.
+        "//tools/boss/engine/driver:codex_test_binary",
+        "//tools/repobin",
+        "@jj_test_tools//:jj",
+    ],
+    edition = "2024",
+    env = {
+        "BOSS_TEST_EVENT_SHIM": "$(rootpath //tools/boss/event-shim:boss-event)",
+        "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+        "BOSS_JJ_BIN": "$(rootpath @jj_test_tools//:jj)",
+        "BOSS_TEST_CODEX": "$(rootpath //tools/boss/engine/driver:codex_test_binary)",
+        "BOSS_TEST_REPOBIN": "$(rootpath //tools/repobin)",
+        "HOME": "/tmp",
+    },
+    experimental_enable_sharding = True,
+    proc_macro_deps = all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    shard_count = 7,
+    deps = TEST_DEPS + [
+        "//tools/boss/engine/pane-summary",
+        "//tools/boss/engine/prose-vocabulary",
+        "//tools/boss/engine/recovery-fixtures",
+        "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/test-git",
+    ] + all_crate_deps(
+        package_name = "tools/boss/engine/core/runtime",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# The jj 0.46 twin reruns the binary compiled above (no second rustc action),
+# with the 0.46 jj in data and BOSS_JJ_BIN pointing at it.
+twin_test(
+    name = "engine_lib_jj_046_test",
+    size = "small",
+    timeout = "moderate",
+    binary = ":engine_lib_test",
+    data = ["@jj_upgrade_test_tools//:jj"],
+    env = {"BOSS_JJ_BIN": "$(rootpath @jj_upgrade_test_tools//:jj)"},
+    shard_count = 7,
+)
 
 network_enabled_rust_test(
     name = "codex_guard_live_test",
