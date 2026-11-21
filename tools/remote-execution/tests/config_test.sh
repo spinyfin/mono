@@ -20,7 +20,7 @@ health_unit="${dir}/nativelink/nativelink-macos-hub-health.service"
 health_timer="${dir}/nativelink/nativelink-macos-hub-health.timer"
 health="${dir}/nativelink/hub-health.sh"
 build="${dir}/nativelink/build-worker.sh"
-patch="${dir}/nativelink/patches/macos-clonefile-executables.patch"
+patches_dir="${dir}/nativelink/patches"
 readme="${dir}/README.md"
 dev_watchdog="${dir}/dev-remote-workspace-status.sh"
 remote_status="${dir}/remote-status.sh"
@@ -180,21 +180,51 @@ if cat "$health_unit" "$hub_unit" "$health_timer" | grep -v -E '^[[:space:]]*#' 
 fi
 
 # ---------------------------------------------------------------------------
-# One NativeLink version: the build script, the patch and the runbook agree.
+# One NativeLink version: the build script, the patches and the runbook agree.
 # ---------------------------------------------------------------------------
 
 version="$(sed -n -E 's/^NATIVELINK_VERSION="([0-9.]+)"$/\1/p' "$build")"
 commit="$(sed -n -E 's/^NATIVELINK_COMMIT="([0-9a-f]{40})"$/\1/p' "$build")"
-marker="$(sed -n -E 's/^PATCH_MARKER="([a-z-]+)"$/\1/p' "$build")"
-if [[ -z "$version" || -z "$commit" || -z "$marker" ]]; then
-  fail "build-worker.sh must pin NATIVELINK_VERSION, NATIVELINK_COMMIT and PATCH_MARKER"
+if [[ -z "$version" || -z "$commit" ]]; then
+  fail "build-worker.sh must pin NATIVELINK_VERSION and NATIVELINK_COMMIT"
 fi
-grep -q -x "Applies to NativeLink v${version} (${commit})." "$patch" ||
-  fail "the patch does not say it applies to v${version} (${commit})"
-grep -q -x "+    version = \"${version}+${marker}\"," "$patch" ||
-  fail "the patch does not give the binary the version ${version}+${marker} that build-worker.sh checks for"
-grep -q -F "nativelink ${version}+${marker}" "$readme" ||
-  fail "README.md does not name the version a worker reports (nativelink ${version}+${marker})"
+
+# The lines of build-worker.sh's PATCHES list: "<file> <marker> <platforms>".
+# In a file: the test sandbox does not let bash create the temporary file a
+# here-string needs.
+patch_list="${TEST_TMPDIR:?}/patches.list"
+sed -n -E 's/^  "([a-z0-9-]+\.patch) ([a-z-]+) ((Darwin|Linux)(,(Darwin|Linux))*)"$/\1 \2 \3/p' "$build" > "$patch_list"
+# reported_version <platform>: what a worker binary built on it reports, which
+# is the release and the marker of every patch the platform takes.
+reported_version() {
+  local markers
+  markers="$(awk -v p="$1" '("," $3 ",") ~ ("," p ",") { s = s (s == "" ? "" : ".") $2 } END { print s }' "$patch_list")"
+  [[ -n "$markers" ]] && echo "${version}+${markers}"
+}
+
+[[ -s "$patch_list" ]] || fail "build-worker.sh lists no patches"
+for patch in "$patches_dir"/*.patch; do
+  name="$(basename "$patch")"
+  grep -q "^${name} " "$patch_list" ||
+    fail "${name} is in patches/ but not in build-worker.sh's PATCHES, so no worker is built with it"
+  grep -q -x "Applies to NativeLink v${version} (${commit})." "$patch" ||
+    fail "${name} does not say it applies to v${version} (${commit})"
+  # The version depends on which patches a platform takes, so build-worker.sh
+  # stamps it. A patch that set it would not apply next to another that did.
+  if grep -q '^diff --git a/BUILD.bazel ' "$patch"; then
+    fail "${name} changes BUILD.bazel; the binary's version is stamped by build-worker.sh"
+  fi
+done
+while read -r name _; do
+  [[ -f "${patches_dir}/${name}" ]] ||
+    fail "build-worker.sh lists ${name}, which is not in patches/"
+done < "$patch_list"
+for platform in Darwin Linux; do
+  reported="$(reported_version "$platform")" ||
+    fail "no patch in build-worker.sh applies to ${platform}"
+  grep -q -F "nativelink ${reported}" "$readme" ||
+    fail "README.md does not name the version a ${platform} worker reports (nativelink ${reported})"
+done
 grep -q -F "$commit" "$readme" ||
   fail "README.md does not name the pinned commit ${commit}"
 for file in "$hub" "$worker"; do

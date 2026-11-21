@@ -1,6 +1,6 @@
 # Remote execution: the NativeLink hub and the macOS workers
 
-This directory holds everything that is installed on the hosts that run mono's remote builds on macOS workers: the NativeLink configs, the units that start them, the patch the workers need, the hub's health check, and this runbook. Nothing here is built or read by a build. The files are copied to the hosts by hand, which is why they are in the repository: a change to how the scheduler behaves is a reviewed change, and `tests/config_test.sh` keeps the files consistent with each other.
+This directory holds everything that is installed on the hosts that run mono's remote builds on macOS workers: the NativeLink configs, the units that start them, the patches the workers need, the hub's health check, and this runbook. Nothing here is built or read by a build. The files are copied to the hosts by hand, which is why they are in the repository: a change to how the scheduler behaves is a reviewed change, and `tests/config_test.sh` keeps the files consistent with each other.
 
 What decides whether a build executes remotely is elsewhere: [`.buildkite/README.md`](../../.buildkite/README.md) for CI steps and [`tools/test-sandbox/README.md`](../test-sandbox/README.md) for a developer's Mac. The Linux workers have a hub of their own, described in [`.buildkite/linux-agents-runbook.md`](../../.buildkite/linux-agents-runbook.md); see "Not covered here" at the end.
 
@@ -15,7 +15,7 @@ What decides whether a build executes remotely is elsewhere: [`.buildkite/README
 | `nativelink/worker-macos.json5`                          | `~/nativelink/worker-macos.json5` on each Mac     | The worker. The same file on every Mac.                                    |
 | `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac             | Starts the worker and sets what differs per Mac.                           |
 | `nativelink/action-env.sh`                               | `~/nativelink/action-env.sh` on each Mac          | Wraps every action: picks the Xcode and SDK the action asks for.           |
-| `nativelink/build-worker.sh` and `nativelink/patches/`   | run on one Mac                                    | Builds the worker binary: the pinned release plus the patch.               |
+| `nativelink/build-worker.sh` and `nativelink/patches/`   | run on one Mac, and on one Linux worker host      | Builds the worker binary: the pinned release plus the patches.             |
 
 ## Hosts
 
@@ -35,14 +35,21 @@ The workers, as inspected on 2026-11-18:
 
 The slot counts are the numbers the workers ran with before this change. They are sized by cores, and about four concurrent Rust compiles was the RAM-safe figure measured for a 16 GB host in September ([investigation](../../docs/investigations/nativelink-macos-remote-execution.md)), so expect memory pressure on a worker; the scheduler's `worker_timeout_s` is set with that in mind.
 
-## Version and patch
+## Version and patches
 
 Every host runs NativeLink **1.8.6** (`37f3b206a8e6d55613abae2b18a0665fff24e096`), and the hub and the workers are upgraded together: an older binary rejects fields these configs use, and an older worker does not acknowledge a dispatch, which `dispatch_ack_timeout_s` relies on.
 
 - **The hub** runs the upstream release, `nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz` from the [v1.8.6 release](https://github.com/TraceMachina/nativelink/releases/tag/v1.8.6), sha256 `9bad10aa1c11a00fb1544ddd28a5a5ab892cfa42817e96a6cf18f169df7f0472`. `nativelink --version` prints `nativelink 1.8.6`.
-- **The workers** run that release with [`patches/macos-clonefile-executables.patch`](nativelink/patches/macos-clonefile-executables.patch), built from source by `build-worker.sh`. `nativelink --version` prints `nativelink 1.8.6+macos-clonefile`, so a worker that was given an upstream binary by mistake can be told apart. Every worker runs the same file: compare its sha256 after copying it.
+- **The workers** run that release with the patches in [`nativelink/patches/`](nativelink/patches/), built from source by `build-worker.sh` on a host of the worker's platform. The script's `PATCHES` list says which patch goes into which platform's binary, and stamps the version from it: a macOS worker reports `nativelink 1.8.6+macos-clonefile.stale-entry` and a Linux worker `nativelink 1.8.6+stale-entry`, so a worker that was given an upstream binary by mistake, or one that is a patch behind, can be told apart. Every worker of a platform runs the same file: compare its sha256 after copying it.
 
-The patch exists because upstream stages an executable input as a hardlink out of the worker's store. On macOS dyld resolves `@loader_path` from whichever name of that inode the kernel reports, finds the store, and `rustc` fails with `Library not loaded: @rpath/librustc_driver-<hash>.dylib`. The patch stages executables with `clonefile(2)` instead, which gives each its own inode. It is the commit the workers already ran on 1.6.6 (`brianduff/nativelink` `3125a4fd`), carried forward; the patch file's header lists what changed on the way. It is not upstream: [issue #3137](https://github.com/TraceMachina/nativelink/issues/3137) is open, and so are the two pull requests that address it differently (#3138, #3191). Do not turn on `directory_cache` in the worker config: it stages inputs by another path, which the patch does not touch.
+| Patch                                                                                       | Workers         | Why                                                                                                                                       |
+| ------------------------------------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| [`macos-clonefile-executables.patch`](nativelink/patches/macos-clonefile-executables.patch) | macOS           | Upstream stages an executable as a hardlink out of the worker's store, and `rustc` then cannot load its own library.                      |
+| [`stale-entry-recovery.patch`](nativelink/patches/stale-entry-recovery.patch)               | macOS and Linux | A store entry whose file is gone is never fetched again, and every action that needs the blob fails on that worker until it is restarted. |
+
+**The clone patch.** Upstream stages an executable input as a hardlink out of the worker's store. On macOS dyld resolves `@loader_path` from whichever name of that inode the kernel reports, finds the store, and `rustc` fails with `Library not loaded: @rpath/librustc_driver-<hash>.dylib`. The patch stages executables with `clonefile(2)` instead, which gives each its own inode. It is the commit the workers already ran on 1.6.6 (`brianduff/nativelink` `3125a4fd`), carried forward; the patch file's header lists what changed on the way. It is not upstream: [issue #3137](https://github.com/TraceMachina/nativelink/issues/3137) is open, and so are the two pull requests that address it differently (#3138, #3191). Do not turn on `directory_cache` in the worker config: it stages inputs by another path, which the patch does not touch.
+
+**The stale-entry patch.** A worker's store answers "do you have this blob" from its index. If an entry's file is no longer on disk, the store still says yes, nothing fetches the blob, and every action that stages it fails: `executable-variant copy failed: … NotFound … Resolving executable variant for <digest>` for an executable input, `Could not make hardlink … file was likely evicted from cache` for a plain one. The failure is immediate, so the worker is free again at once and is handed the retries; one such entry for an input every test shares fails every test in the pool. This happened on a Linux worker on 2026-11-20, on 1.6.6, where a race in eviction left the entry behind. 1.8.6 closes that race and drops a stale entry when a blob is read through the store, but not on the two paths a worker stages inputs by; the patch covers those, so the blob is fetched again and the action runs. It is not upstream.
 
 Why 1.8.6 and not the 1.6.6 it replaces: on 2026-11-18 the 1.6.6 scheduler timed out operations on live workers after 5 s, evicted the workers, and went round again for hours while every client waited. The fixes, by the release that first had them:
 
@@ -58,7 +65,7 @@ Why 1.8.6 and not the 1.6.6 it replaces: on 2026-11-18 the 1.6.6 scheduler timed
 
 The "Worker ids do not match" error that ended each round of the loop is gone as well: evicting a worker now skips an action that has already moved to another.
 
-To move to a later release: change the three pins at the top of `build-worker.sh`, refresh the patch against the new tag (or delete it once a release stages executables on their own inode), run `build-worker.sh`, which runs the tests that cover the patch, and update the version in this file and in the two configs. `config_test` fails until they agree.
+To move to a later release: change the pins at the top of `build-worker.sh`, refresh each patch against the new tag (or delete one, and its line in `PATCHES`, once a release does what it does), run `build-worker.sh` on a Mac and on a Linux worker host, which runs the tests that cover the patches, and update the version in this file and in the two configs. `config_test` fails until they agree.
 
 ## Timeouts
 
@@ -205,13 +212,13 @@ From NativeLink 1.6.6 with the hub on `zakalwe` to 1.8.6 with the hub on the Lin
 tools/remote-execution/nativelink/build-worker.sh --src ~/nativelink-src --out ~/nativelink-1.8.6
 ```
 
-It fetches the pinned commit, applies the patch, runs the tests that cover it and prints the binary's sha256. Copy `~/nativelink-1.8.6/nativelink` to every Mac as `~/nativelink/nativelink-1.8.6` and check the digest there. Leave the running `~/nativelink/nativelink` alone for now.
+It fetches the pinned commit, applies the patches, runs the tests that cover them and prints the binary's sha256. Copy `~/nativelink-1.8.6/nativelink` to every Mac as `~/nativelink/nativelink-1.8.6` and check the digest there. Leave the running `~/nativelink/nativelink` alone for now.
 
 **2. Set up the hub**, on the Linux host, ahead of time. It has no clients until step 5.
 
 ```sh
 mkdir -p ~/nativelink-macos-hub && cd ~/nativelink-macos-hub
-# the release tarball named under "Version and patch"; check its sha256 before unpacking
+# the release tarball named under "Version and patches"; check its sha256 before unpacking
 tar xzf nativelink-1.8.6-x86_64-unknown-linux-musl.tar.gz nativelink
 install -m 644 <checkout>/tools/remote-execution/nativelink/hub.json5 .
 install -m 755 <checkout>/tools/remote-execution/nativelink/hub-health.sh .
@@ -250,7 +257,7 @@ A variable missing from `hub.env` fails the start with an error that names it.
 launchctl bootout gui/$(id -u)/com.brianduff.nativelink
 cd ~/nativelink
 mv nativelink nativelink-1.6.6 && mv nativelink-1.8.6 nativelink
-./nativelink --version                                    # nativelink 1.8.6+macos-clonefile
+./nativelink --version                                    # nativelink 1.8.6+macos-clonefile.stale-entry
 install -m 644 <checkout>/tools/remote-execution/nativelink/worker-macos.json5 .
 install -m 755 <checkout>/tools/remote-execution/nativelink/action-env.sh .
 cp ~/Library/LaunchAgents/com.brianduff.nativelink.plist com.brianduff.nativelink.plist.1.6.6
@@ -297,5 +304,5 @@ A checkout that built against the old hub may log `Lost inputs no longer availab
 
 ## Not covered here
 
-- **The Linux workers' hub** (`.buildkite/linux-agents-runbook.md`, "Remote execution workers") still runs NativeLink 1.6.6 with no timeouts set, so it has the scheduler this change replaces for the Macs. Its hub and workers need the same upgrade and the same scheduler block. The CI probe and the step timeouts already apply to Linux steps; the probe needs a status page on that hub's client port to see more than a connection.
+- **The Linux workers' hub** (`.buildkite/linux-agents-runbook.md`, "Remote execution workers") runs the 1.8.6 release, and its workers the Linux build from `build-worker.sh`, but its `hub.json5` is its own and sets no scheduler timeouts: it has the versions of this change and not yet the scheduler block. The CI probe and the step timeouts already apply to Linux steps; the probe needs a status page on that hub's client port to see more than a connection.
 - **A per-RPC deadline in the Bazel client** (`--remote_grpc_service_config` in Bazel 9.3 or later). That would fail the Execute call itself so a developer build could fall back instead of stopping. The status watchdog is the bound on Bazel 9.1.
