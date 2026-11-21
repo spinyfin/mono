@@ -165,10 +165,18 @@ notification is the one measured mapping) and that prompt is still outstanding
 two minutes later, the execution is recorded failed with an
 `UnansweredApprovalPrompt` reason naming the driver and the wait, its pane and
 slot are released, and a `stale_worker_reconcile` dispatch event carries
-`unanswered_approval_prompt`. The pane is released even if recording the
-failure write itself fails. A progression run is failed on its own row only:
+`unanswered_approval_prompt`. If recording the failure fails, the pane and its
+pool claim stay with the run. The write is retried after 30 seconds, doubling
+to a 10-minute ceiling; the pane is released only after the failure is recorded.
+The first incomplete attempt emits a dispatch event carrying
+`failure_write_error`. A progression run is failed on its own row only:
 the stuck item it was inspecting is not blocked or annotated, and the failure
 counts toward that item's infrastructure-failure cap like any other.
+
+Review guides currently use Codex (`resolve_review_guide_spawn_config`), and
+remote Grok spawns are refused (`reject_host_local_remote_spawn_plan`). The
+generic review-guide prompt and remote-staged rules therefore do not expose
+a live Grok invocation-spelling gap.
 
 The two minutes are a margin against acting on a prompt that was answered, not
 a wait for something expected: the only automatic answer measured takes 0.02

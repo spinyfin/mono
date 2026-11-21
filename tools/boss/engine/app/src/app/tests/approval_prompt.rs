@@ -18,7 +18,11 @@ const SESSION: &str = "76744658-0402-42f7-a644-68dd52f6dad4";
 /// A mid-turn worker of `driver`, optionally re-kinded as a progression run,
 /// with the durable tmux identity a pane release needs.
 fn working_run(state: &ServerState, driver: &str, progression: bool) -> String {
-    let run = register_working_worker_with_driver(state, SLOT, Some(driver));
+    working_run_on_slot(state, driver, progression, SLOT)
+}
+
+fn working_run_on_slot(state: &ServerState, driver: &str, progression: bool, slot: u8) -> String {
+    let run = register_working_worker_with_driver(state, slot, Some(driver));
     if progression {
         state
             .work_db
@@ -189,13 +193,29 @@ async fn a_prompt_followed_by_a_dialog_closing_event_is_not_a_failure() {
 /// the teardown and frees the pool capacity.
 #[tokio::test]
 async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_claim() {
+    assert_failed_write_retry_frees_pool_claim(false).await;
+}
+
+#[tokio::test]
+async fn a_failed_failure_write_keeps_the_progression_pool_claim_until_the_retry_completes() {
+    assert_failed_write_retry_frees_pool_claim(true).await;
+}
+
+async fn assert_failed_write_retry_frees_pool_claim(progression_pool: bool) {
     let (state, _dir) = test_server_state();
-    let run = working_run(&state, "grok", true);
+    let worker_id = if progression_pool { "progression-1" } else { "worker-1" };
+    let slot = boss_execution_contracts::slot_id_from_worker_id(worker_id).unwrap();
+    let run = working_run_on_slot(&state, "grok", true, slot);
     let mut progress = UnansweredPromptProgress::default();
-    let pool = state.execution_coordinator.worker_pool();
+    let pool = if progression_pool {
+        state.execution_coordinator.progression_worker_pool()
+    } else {
+        state.execution_coordinator.worker_pool()
+    };
+    let idle_before = pool.idle_count().await;
     let held = pool.claim_worker(&run, None).await.expect("test pool has a free slot");
-    assert_eq!(held, "worker-1");
-    let idle_while_held = pool.idle_count().await;
+    assert_eq!(held, worker_id);
+    assert_eq!(pool.idle_count().await, idle_before - 1);
     let sink = make_session_sink();
     state.register_app_session("session-app".into(), sink.clone()).await;
 
@@ -227,7 +247,7 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
     );
     assert_eq!(
         state.worker_registry.slot_for_run(&run),
-        Some(SLOT),
+        Some(slot),
         "tracking is kept while the failure is incomplete"
     );
     assert!(pool.claimed_execution_ids().await.contains(&run));
@@ -302,7 +322,7 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
         !pool.claimed_execution_ids().await.contains(&run),
         "the pool claim is freed"
     );
-    assert!(pool.idle_count().await > idle_while_held, "pool capacity is back");
+    assert_eq!(pool.idle_count().await, idle_before, "pool capacity is restored");
 }
 
 /// Grok's background `task_complete` is an ordinary Notification. It must

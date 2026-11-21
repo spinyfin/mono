@@ -267,8 +267,11 @@ macro_rules! shell_command_tokenizer_fragment {
 
 /// Inline Python decision hook that blocks workers from launching the Boss
 /// macOS app or a Boss engine, or signalling processes by name, pattern,
-/// process group, or dynamically selected PID. Always applied (matcher `Bash`)
-/// by Claude, Codex, and Grok, including remote and reviewer workers.
+/// process group, or dynamically selected PID. Applied with matcher `Bash`
+/// by Claude and Codex (including remote and reviewer workers) and ordinary
+/// Grok workers. Restricted Grok kinds (AnswerAgent, ReviewGuide, Progression)
+/// omit this guard because it refuses their bare `boss` spelling; they rely on
+/// the deny-by-default allowlist plus `VARIABLE_BOSS_PROGRAM_GUARD_COMMAND`.
 ///
 /// For app launches, this is the advisory layer; signal restrictions are
 /// enforced here before the worker shell runs. It fails in-session, with

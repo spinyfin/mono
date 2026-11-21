@@ -3,6 +3,11 @@
 //! `$GROK_HOME/hooks/` (never merged into the Claude worker settings file —
 //! see [`crate::HookWiringDestination::DriverOwned`]).
 //!
+//! Restricted kinds (AnswerAgent, ReviewGuide, Progression) omit the Boss
+//! launch guard because it refuses their bare `boss` spelling. They rely on
+//! the deny-by-default allowlist plus `VARIABLE_BOSS_PROGRAM_GUARD_COMMAND`;
+//! the launch guard remains armed for ordinary Grok workers.
+//!
 //! ## Why two different wiring shapes share this file
 //!
 //! The forwarder fires on every lifecycle event and hands its **raw** Grok
