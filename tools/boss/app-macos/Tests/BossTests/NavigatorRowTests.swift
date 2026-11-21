@@ -210,6 +210,61 @@ final class NavigatorRowTests: XCTestCase {
         XCTAssertFalse(P.isWorkerActive(row: row, liveStates: [:]))
     }
 
+    func testKindAndHealthIconsCaptureRepresentativeRows() throws {
+        let stack = try iconLegend()
+            .padding(12)
+            .frame(width: 400)
+            .background(Color(nsColor: .windowBackgroundColor))
+        let host = NSHostingView(rootView: stack)
+        host.frame = NSRect(origin: .zero, size: host.fittingSize)
+        try capture(host, name: "navigator-row-icons-light")
+        host.appearance = NSAppearance(named: .darkAqua)
+        try capture(host, name: "navigator-row-icons-dark")
+    }
+
+    func testChoresAndTasksShareAKindSymbolAndRevisionsDoNotCollideWithConflicts() throws {
+        XCTAssertEqual(try presentation(kind: "chore").symbol, "wrench.and.screwdriver")
+        XCTAssertEqual(try presentation(kind: "task").symbol, "wrench.and.screwdriver")
+        XCTAssertEqual(try presentation(kind: "project_task").symbol, "wrench.and.screwdriver")
+        XCTAssertEqual(try presentation(kind: "revision").symbol, "arrow.triangle.2.circlepath")
+        XCTAssertEqual(try presentation(kind: "design").symbol, "pencil.and.outline")
+        XCTAssertEqual(try presentation(kind: "followup").symbol, "arrow.turn.down.right")
+        XCTAssertEqual(try presentation(kind: "investigation").symbol, "magnifyingglass")
+
+        let conflict = try presentation(kind: "task", mergeable: "conflicting")
+        XCTAssertEqual(conflict.health, NavigatorRowHealth(label: "Merge conflict", symbol: "arrow.triangle.branch", tint: .warning))
+        XCTAssertTrue(conflict.accessibilityLabel.contains("Merge conflict"))
+        XCTAssertEqual(conflict.healthFacts, ["Merge conflict"])
+
+        let deferred = try presentation(kind: "task", mergeable: "conflicting", deferred: true)
+        XCTAssertEqual(deferred.health, conflict.health)
+        XCTAssertTrue(deferred.accessibilityLabel.contains("Merge conflict"))
+        XCTAssertEqual(deferred.healthFacts, ["Merge conflict", "Conflict resolves on merge"])
+
+        let failed = try presentation(kind: "task", ci: "fail")
+        XCTAssertEqual(failed.health, NavigatorRowHealth(label: "CI failed", symbol: "xmark.circle", tint: .failure))
+        XCTAssertTrue(failed.accessibilityLabel.contains("CI failed"))
+
+        let revisionConflict = try presentation(kind: "revision", mergeable: "conflicting")
+        XCTAssertEqual(revisionConflict.symbol, "arrow.triangle.2.circlepath")
+        XCTAssertEqual(revisionConflict.health?.symbol, "arrow.triangle.branch")
+        XCTAssertNotEqual(revisionConflict.symbol, revisionConflict.health?.symbol)
+    }
+
+    func testAccessibilityAnnouncesEachCIStateOnceWithAndWithoutConflict() throws {
+        for (state, label) in [("fail", "CI failed"), ("in_progress", "CI pending"), ("success", "CI passed")] {
+            for mergeable in ["mergeable", "conflicting"] {
+                let row = try presentation(kind: "task", mergeable: mergeable, ci: state)
+                let parts = row.accessibilityLabel.components(separatedBy: ", ")
+                XCTAssertEqual(parts.filter { $0.hasPrefix("CI ") }, [label])
+                XCTAssertTrue(row.healthFacts.contains(label))
+                if mergeable == "conflicting" {
+                    XCTAssertEqual(parts.filter { $0 == "Merge conflict" }.count, 1)
+                }
+            }
+        }
+    }
+
     func testHealthPriorityKeepsSuppressedFactsAccessible() throws {
         var task = NavigatorTestFixture.task()
         task.prMergeableState = "conflicting"
@@ -219,9 +274,15 @@ final class NavigatorRowTests: XCTestCase {
             NavigatorRowPresentation(row: NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root),
                                                        matchingAskID: nil), project: nil, width: 260)
         }
-        XCTAssertEqual(try presentation().health?.label, "Merge conflict")
+        XCTAssertEqual(try presentation().health, NavigatorRowHealth(label: "Merge conflict", symbol: "arrow.triangle.branch", tint: .warning))
+        task.conflictResolutionDeferred = true
+        XCTAssertEqual(try presentation().health, NavigatorRowHealth(label: "Merge conflict", symbol: "arrow.triangle.branch", tint: .warning))
+        XCTAssertTrue(try presentation().accessibilityLabel.contains("Merge conflict"))
+        XCTAssertTrue(try presentation().healthFacts.contains("Conflict resolves on merge"))
+        task.conflictResolutionDeferred = false
         task.prMergeableState = "mergeable"
-        XCTAssertEqual(try presentation().health?.label, "CI failed")
+        XCTAssertEqual(try presentation().health, NavigatorRowHealth(label: "CI failed", symbol: "xmark.circle", tint: .failure))
+        XCTAssertTrue(try presentation().accessibilityLabel.contains("CI failed"))
         task.ciRequiredState = "in_progress"
         XCTAssertEqual(try presentation().health?.label, "Review changes requested")
         task.reviewRequiredState = "approved"
@@ -253,7 +314,9 @@ final class NavigatorRowTests: XCTestCase {
     }
 
     private func capture<V: View>(_ host: NSHostingView<V>, name: String) throws {
-        host.appearance = NSAppearance(named: .aqua)
+        if host.appearance == nil {
+            host.appearance = NSAppearance(named: .aqua)
+        }
         for _ in 0..<3 {
             host.layoutSubtreeIfNeeded()
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
@@ -265,6 +328,45 @@ final class NavigatorRowTests: XCTestCase {
         XCTAssertGreaterThan(data.count, 100)
         if let output = ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"] {
             try data.write(to: URL(fileURLWithPath: output).appendingPathComponent(name + ".png"))
+        }
+    }
+
+    private func presentation(kind: String, mergeable: String? = nil, deferred: Bool = false, ci: String? = nil) throws -> NavigatorRowPresentation {
+        var task = NavigatorTestFixture.task(kind: kind)
+        task.prMergeableState = mergeable
+        task.conflictResolutionDeferred = deferred
+        task.ciRequiredState = ci
+        return NavigatorRowPresentation(
+            row: NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil),
+            project: nil, width: 360
+        )
+    }
+
+    private func iconLegend() throws -> some View {
+        let specs: [(name: String, kind: String, mergeable: String?, deferred: Bool, ci: String?)] = [
+            ("Chore", "chore", nil, false, nil),
+            ("Task", "task", nil, false, nil),
+            ("Project task", "project_task", nil, false, nil),
+            ("Revision", "revision", nil, false, nil),
+            ("Design", "design", nil, false, nil),
+            ("Followup", "followup", nil, false, nil),
+            ("Merge conflict", "task", "conflicting", false, nil),
+            ("Deferred conflict", "task", "conflicting", true, nil),
+            ("CI failed", "task", nil, false, "fail"),
+            ("Revision with conflict", "revision", "conflicting", false, nil),
+        ]
+        let rows: [NavigatorRow] = try specs.map { spec in
+            var task = NavigatorTestFixture.task(kind: spec.kind)
+            task.name = spec.name
+            task.prMergeableState = spec.mergeable
+            task.conflictResolutionDeferred = spec.deferred
+            task.ciRequiredState = spec.ci
+            return NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil)
+        }
+        return VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                WorkNavigatorRow(row: row, project: "Navigation", width: 360, isSelected: false, isWorkerActive: false)
+            }
         }
     }
 }

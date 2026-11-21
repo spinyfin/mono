@@ -16,45 +16,92 @@ struct NavigatorRowPresentation {
     }
 
     var showsSecondaryIndicators: Bool { width >= 340 }
-    var health: (label: String, symbol: String)? {
+    var health: NavigatorRowHealth? {
         if row.task.prMergeableState == "conflicting" {
-            return row.task.conflictResolutionDeferred
-                ? ("Conflict — resolves on merge", "info.circle")
-                : ("Merge conflict", "arrow.triangle.branch")
+            return NavigatorRowHealth(label: "Merge conflict", symbol: "arrow.triangle.branch", tint: .warning)
         }
-        if row.task.ciRequiredState == "fail" { return ("CI failed", "xmark.circle") }
-        if row.task.reviewRequiredState == "changes_requested" { return ("Review changes requested", "text.bubble") }
-        if row.task.ciRequiredState == "in_progress" { return ("CI pending", "clock") }
-        if row.task.reviewRequiredState == "approved" { return ("Review approved", "checkmark.circle") }
-        if row.task.ciRequiredState == "success" { return ("CI passed", "checkmark.circle") }
+        if row.task.ciRequiredState == "fail" {
+            return NavigatorRowHealth(label: "CI failed", symbol: "xmark.circle", tint: .failure)
+        }
+        if row.task.reviewRequiredState == "changes_requested" {
+            return NavigatorRowHealth(label: "Review changes requested", symbol: "text.bubble")
+        }
+        if row.task.ciRequiredState == "in_progress" {
+            return NavigatorRowHealth(label: "CI pending", symbol: "clock")
+        }
+        if row.task.reviewRequiredState == "approved" {
+            return NavigatorRowHealth(label: "Review approved", symbol: "checkmark.circle")
+        }
+        if row.task.ciRequiredState == "success" {
+            return NavigatorRowHealth(label: "CI passed", symbol: "checkmark.circle")
+        }
         return nil
     }
     var healthFacts: [String] {
-        [row.task.prMergeableState == "conflicting"
-            ? (row.task.conflictResolutionDeferred ? "Conflict resolves on merge" : "Merge conflict") : nil,
-         row.task.ciRequiredState.map { "CI \($0.replacingOccurrences(of: "_", with: " "))" },
-         row.task.reviewRequiredState.map { "Review \($0.replacingOccurrences(of: "_", with: " "))" }]
-            .compactMap { $0 }
+        var facts: [String] = []
+        if row.task.prMergeableState == "conflicting" {
+            facts.append("Merge conflict")
+            if row.task.conflictResolutionDeferred {
+                facts.append("Conflict resolves on merge")
+            }
+        }
+        if let ci = row.task.ciRequiredState {
+            switch ci {
+            case "fail": facts.append("CI failed")
+            case "in_progress": facts.append("CI pending")
+            case "success": facts.append("CI passed")
+            default: facts.append("CI \(ci.replacingOccurrences(of: "_", with: " "))")
+            }
+        }
+        if let review = row.task.reviewRequiredState {
+            facts.append("Review \(review.replacingOccurrences(of: "_", with: " "))")
+        }
+        return facts
     }
     var symbol: String {
         switch row.task.kind {
-        case "chore": "wrench.and.screwdriver"
+        case "chore", "task", "project_task": "wrench.and.screwdriver"
         case "followup": "arrow.turn.down.right"
         case "investigation": "magnifyingglass"
-        case "revision": "arrow.triangle.branch"
+        case "revision": "arrow.triangle.2.circlepath"
         case "design": "pencil.and.outline"
-        case "task", "project_task": "checkmark.circle"
         default: "questionmark.circle"
         }
     }
     var accessibilityLabel: String {
-        ([row.projection.knownSection?.title, row.task.kindLabel, row.task.name,
-         row.projection.reasonLabel, project,
-         row.projection.knownSection == .working ? (isWorkerActive ? "Worker active" : "Worker idle") : nil,
-         "\(row.projection.questionCount) questions or input requests",
-         "\(row.projection.revisions.open) open revisions"].compactMap { $0 } + healthFacts)
-            .joined(separator: ", ")
+        var parts: [String] = [
+            row.projection.knownSection?.title, row.task.kindLabel, row.task.name,
+            row.projection.reasonLabel, project,
+            row.projection.knownSection == .working ? (isWorkerActive ? "Worker active" : "Worker idle") : nil,
+            "\(row.projection.questionCount) questions or input requests",
+            "\(row.projection.revisions.open) open revisions",
+            health?.label,
+        ].compactMap { $0 }
+        for fact in healthFacts where !parts.contains(fact) {
+            parts.append(fact)
+        }
+        return parts.joined(separator: ", ")
     }
+}
+
+struct NavigatorRowHealth: Equatable {
+    enum Tint: Equatable {
+        case warning
+        case failure
+        case standard
+
+        var color: Color {
+            switch self {
+            case .warning: Color(nsColor: .systemOrange)
+            case .failure: Color(nsColor: .systemRed)
+            case .standard: Color.primary
+            }
+        }
+    }
+
+    let label: String
+    let symbol: String
+    var tint: Tint = .standard
 }
 
 struct WorkNavigatorRow: View {
@@ -91,7 +138,10 @@ struct WorkNavigatorRow: View {
                 Text("↻ \(row.projection.revisions.open)").font(.caption).fixedSize()
             }
             if let health = presentation.health {
-                Image(systemName: health.symbol).help(presentation.healthFacts.joined(separator: ", "))
+                Image(systemName: health.symbol)
+                    .foregroundStyle(health.tint.color)
+                    .help(presentation.healthFacts.joined(separator: ", "))
+                    .accessibilityLabel(health.label)
             }
             if row.projection.questionCount > 0 {
                 Label("\(row.projection.questionCount)", systemImage: "questionmark.bubble")
