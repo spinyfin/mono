@@ -1338,26 +1338,35 @@ impl WorkDb {
         if execution.status.is_terminal() || execution.kind.holds_cube_lease() {
             return Ok(None);
         }
-        let now = now_string();
-        let summary = normalize_optional_text(Some(result_summary.to_owned()));
-        tx.execute(
-            "UPDATE work_runs
+        let updated = fail_progression_in_transaction(&tx, execution_id, result_summary)?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(Some(updated))
+    }
+}
+
+/// Shared failure writes for driver failures and atomic deadline finalization.
+pub(crate) fn fail_progression_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    execution_id: &str,
+    result_summary: &str,
+) -> Result<WorkExecution> {
+    let now = now_string();
+    let summary = normalize_optional_text(Some(result_summary.to_owned()));
+    tx.execute(
+        "UPDATE work_runs
              SET status = 'failed',
                  error_text = COALESCE(?2, error_text),
                  result_summary = COALESCE(?2, result_summary),
                  finished_at = COALESCE(finished_at, ?3)
              WHERE id = (SELECT id FROM work_runs WHERE execution_id = ?1
                          ORDER BY created_at DESC, id DESC LIMIT 1)",
-            params![execution_id, summary, now],
-        )?;
-        tx.execute(
-            "UPDATE work_executions SET status = 'failed', finished_at = ?2 WHERE id = ?1",
-            params![execution_id, now],
-        )?;
-        let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let mut pending = PendingEvents::new();
-        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
-        Ok(Some(updated))
-    }
+        params![execution_id, summary, now],
+    )?;
+    tx.execute(
+        "UPDATE work_executions SET status = 'failed', finished_at = ?2 WHERE id = ?1",
+        params![execution_id, now],
+    )?;
+    query_execution(tx, execution_id).require("execution", execution_id)
 }

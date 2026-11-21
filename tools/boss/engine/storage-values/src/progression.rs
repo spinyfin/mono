@@ -52,7 +52,7 @@ pub const METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW: &str = "progression.max_crea
 pub const METADATA_KEY_MAX_CREATES_WINDOW_SECS: &str = "progression.max_creates_window_secs";
 
 /// `metadata` key holding the published `progression.run_timeout`. The
-/// stale-worker sweep reads it to reap a progression run that outlives it.
+/// progression deadline sweep reads it to retire a run that outlives it.
 pub const METADATA_KEY_RUN_TIMEOUT_SECS: &str = "progression.run_timeout_secs";
 
 /// A run that ended `no_changes_needed` judged the item not stuck in any way a
@@ -110,8 +110,8 @@ pub struct ProgressionSettings {
     #[builder(default = DEFAULT_MAX_CREATES_WINDOW_SECS)]
     pub max_creates_window_secs: i64,
     /// `progression.run_timeout`, in seconds. Placeholder 30 minutes. The
-    /// stale-worker sweep reaps a progression run older than this through its
-    /// ordinary reap path and records it `orphaned`, which the candidate view's
+    /// deadline sweep reaps a progression run older than this through the
+    /// ordinary pane teardown and records it `failed`, which the candidate view's
     /// infrastructure-failure clause counts (two in a row stops nominations).
     /// The engine publishes it as `progression.run_timeout_secs` metadata.
     #[builder(default = DEFAULT_RUN_TIMEOUT_SECS)]

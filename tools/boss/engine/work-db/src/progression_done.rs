@@ -210,6 +210,19 @@ impl WorkDb {
     /// recorded disposition is an error; the caller fails it as `no disposition`
     /// instead.
     pub fn finish_progression_declared(&self, execution_id: &str) -> Result<Option<WorkExecution>> {
+        self.finish_progression_or_timeout(execution_id, None)
+    }
+
+    /// Resolve the current declaration or fail the deadline under one write lock.
+    pub fn finish_progression_at_deadline(&self, execution_id: &str, reason: &str) -> Result<Option<WorkExecution>> {
+        self.finish_progression_or_timeout(execution_id, Some(reason))
+    }
+
+    fn finish_progression_or_timeout(
+        &self,
+        execution_id: &str,
+        timeout_reason: Option<&str>,
+    ) -> Result<Option<WorkExecution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -226,6 +239,15 @@ impl WorkDb {
             [execution_id],
             |row| row.get(0),
         )?;
+        if disposition.is_none()
+            && let Some(reason) = timeout_reason
+        {
+            let updated = crate::progression_candidates::fail_progression_in_transaction(&tx, execution_id, reason)?;
+            let mut pending = PendingEvents::new();
+            stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+            commit_and_publish(tx, pending, self.event_bus())?;
+            return Ok(Some(updated));
+        }
         let disposition = disposition
             .context("progression run has no recorded disposition")?
             .parse::<ProgressionDisposition>()
