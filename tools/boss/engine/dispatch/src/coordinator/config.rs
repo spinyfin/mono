@@ -166,6 +166,16 @@ impl ExecutionCoordinator {
 
     // Test-only entry points onto crate-internal coordinator operations.
     #[cfg(any(test, feature = "test-support"))]
+    pub fn inflight_dispatches_for_test(&self) -> crate::dispatch_inflight::InflightDispatches {
+        self.inflight_dispatches.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn release_abandoned_run_for_test(self: &Arc<Self>, execution_id: &str) {
+        self.release_abandoned_run(execution_id);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn drain_ready_queue_for_test(self: &Arc<Self>) -> DrainOutcome {
         self.drain_ready_queue().await
     }

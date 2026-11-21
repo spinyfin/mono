@@ -30,6 +30,21 @@ impl WorkDb {
     /// re-dispatch a chore whose previous worker died with the app
     /// before reaching `done`.
     ///
+    /// The predicate decides whether a started run is thrown away, so
+    /// it must also return `true` for a run whose worker the engine is
+    /// still starting or tearing down. The slot registry alone does not
+    /// know about those: a pane is registered seconds after its row
+    /// turns `running`, and a failed spawn leaves the registry before
+    /// its row is finished. A registry-only predicate abandons the run
+    /// a dispatch has just started. Callers with a coordinator go
+    /// through `ExecutionCoordinator::request_execution_via_db`, which
+    /// covers both; the sweeps pass the pool's claims, which span the
+    /// whole dispatch.
+    ///
+    /// `is_live` runs while the DB connection is held, so it must not block
+    /// on coordinator locks (reservation table, driving runs) that are ever
+    /// held across a DB call; use `try_lock` and treat a busy lock as live.
+    ///
     /// Idempotency contract:
     /// - existing execution terminal or absent → insert new `ready`,
     /// - existing non-terminal AND predicate returns `true` → no-op

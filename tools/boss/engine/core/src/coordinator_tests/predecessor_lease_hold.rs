@@ -1543,3 +1543,6 @@ async fn absent_lease_does_not_authorize_unconfirmed_worker_death() {
 
 #[path = "predecessor_recheck.rs"]
 mod recheck;
+
+#[path = "abandoned_predecessor.rs"]
+mod abandoned;

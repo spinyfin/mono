@@ -355,16 +355,7 @@ pub(crate) fn retry_pane_status(db: &WorkDb, is_live: bool, execution: &WorkExec
     // worker pid that is dead. A cancelled in-flight spawn (no pid recorded
     // yet) and a failed viewer abort (pid still alive) therefore stay held.
     match db.latest_local_shell_pid_for_execution(&execution.id) {
-        Ok(Some(pid))
-            if i32::try_from(pid).ok().is_some_and(|pid| {
-                matches!(
-                    crate::dead_pid_sweep::probe_pid(pid),
-                    crate::dead_pid_sweep::PidStatus::Dead
-                )
-            }) =>
-        {
-            PaneStatus::Gone
-        }
+        Ok(Some(pid)) if shell_pid_confirmed_dead(pid) => PaneStatus::Gone,
         // A row that never recorded a pid (a pre-start failure, or a spawn
         // that failed before its pane) is retried after an earlier release
         // attempt passed the pane gate: occupancy kept the lease, or cube
@@ -374,6 +365,25 @@ pub(crate) fn retry_pane_status(db: &WorkDb, is_live: bool, execution: &WorkExec
         Ok(None) if previous_release_passed_pane_gate(db, &execution.id) => PaneStatus::Gone,
         _ => PaneStatus::Present,
     }
+}
+
+fn shell_pid_confirmed_dead(pid: i64) -> bool {
+    i32::try_from(pid).ok().is_some_and(|pid| {
+        matches!(
+            crate::dead_pid_sweep::probe_pid(pid),
+            crate::dead_pid_sweep::PidStatus::Dead
+        )
+    })
+}
+
+/// Whether this run recorded a local worker shell that is now confirmed dead.
+/// That is durable proof the worker itself is gone. A run that never recorded
+/// a shell is not covered: nothing says whether its spawn got as far as one.
+pub(crate) fn recorded_shell_confirmed_dead(db: &WorkDb, execution_id: &str) -> bool {
+    matches!(
+        db.latest_local_shell_pid_for_execution(execution_id),
+        Ok(Some(pid)) if shell_pid_confirmed_dead(pid)
+    )
 }
 
 fn occupancy_keep_evidence(kind: &str, title: &str) -> bool {
