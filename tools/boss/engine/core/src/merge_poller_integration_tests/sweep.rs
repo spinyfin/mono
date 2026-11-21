@@ -140,6 +140,7 @@ async fn run_one_pass_recovers_late_pr_for_abandoned_execution() {
         Arc::new(NoopProbeQueuer),
         crate::completion_adapters::completion_collaborators(),
     )
+    // The late-PR recheck applies the base policy before binding; keep it hermetic.
     .with_pr_state_checker(Arc::new(crate::work::FakePrStateChecker::always(
         crate::work::PrOpenState::Open,
     )));
