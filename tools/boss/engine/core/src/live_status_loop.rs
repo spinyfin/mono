@@ -1039,7 +1039,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // the same liveness check as model-generated summaries.
         if matches!(
             trigger,
-            Trigger::ActivityChanged(WorkerActivity::Errored | WorkerActivity::WaitingForInput)
+            Trigger::ActivityChanged(
+                WorkerActivity::Errored
+                    | WorkerActivity::WaitingForInput
+                    | WorkerActivity::WaitingOnWork
+                    | WorkerActivity::WaitOverdue
+            )
         ) && permit != WorkerRefreshPermit::Refresh
         {
             continue;
@@ -1053,10 +1058,12 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     WorkerActivity::Idle => Some(Instant::now()),
                     _ => None,
                 };
-                let prior = registry.get(slot_id).and_then(|s| s.live_status);
-                let subtitle = live_status::activity_subtitle(new_activity, prior.as_deref());
-                if subtitle != prior && registry.set_live_status(slot_id, subtitle) {
-                    broadcaster.broadcast_live_worker_states().await;
+                if permit == WorkerRefreshPermit::Refresh {
+                    let prior = registry.get(slot_id).and_then(|s| s.live_status);
+                    let subtitle = live_status::activity_subtitle(new_activity, prior.as_deref());
+                    if subtitle != prior && registry.set_live_status(slot_id, subtitle) {
+                        broadcaster.broadcast_live_worker_states().await;
+                    }
                 }
                 match new_activity {
                     WorkerActivity::Errored => {
@@ -2161,6 +2168,50 @@ mod tests {
             );
         }
         mgr.stop_slot(2);
+    }
+
+    #[tokio::test]
+    async fn skip_this_cycle_does_not_write_waiting_on_work_or_wait_overdue_literals() {
+        let mgr = LiveStatusManager::new();
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(13, "run-13", "claude-opus-4-7", 0, None);
+        let prior = registry.get(13).unwrap();
+        let prior_status = prior.live_status.clone();
+        let prior_at = prior.live_status_at.clone();
+        let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let res = Arc::new(ScriptedPermitResolver::new(WorkerRefreshPermit::SkipThisCycle));
+        let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
+        mgr.start_slot(13, live_run("run-13"), keyless_utility(), registry.clone(), bc, res_dyn);
+
+        mgr.notify(13, Trigger::ActivityChanged(WorkerActivity::WaitingOnWork));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let skipped_work = registry.get(13).unwrap();
+        assert_eq!(skipped_work.live_status, prior_status);
+        assert_eq!(skipped_work.live_status_at, prior_at);
+        assert!(skipped_work.live_status.is_none());
+        assert!(skipped_work.live_status_at.is_none());
+
+        mgr.notify(13, Trigger::ActivityChanged(WorkerActivity::WaitOverdue));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let skipped_overdue = registry.get(13).unwrap();
+        assert_eq!(skipped_overdue.live_status, prior_status);
+        assert_eq!(skipped_overdue.live_status_at, prior_at);
+
+        *res.permit.lock().unwrap() = WorkerRefreshPermit::Refresh;
+        mgr.notify(13, Trigger::ActivityChanged(WorkerActivity::WaitOverdue));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.get(13).unwrap().live_status.as_deref(),
+            Some(live_status::WAIT_OVERDUE_LITERAL),
+        );
+
+        mgr.notify(13, Trigger::ActivityChanged(WorkerActivity::WaitingOnWork));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.get(13).unwrap().live_status.as_deref(),
+            Some(live_status::WAITING_ON_WORK_LITERAL),
+        );
+        mgr.stop_slot(13);
     }
 
     #[tokio::test]

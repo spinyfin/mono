@@ -258,6 +258,18 @@ final class AwaitingInputKanbanTests: XCTestCase {
         XCTAssertTrue(WorkerSlotLiveSlice(live).isWaitingOnJob)
         XCTAssertEqual(WorkerSlotLiveSlice(live).waitCaption, reason)
         XCTAssertFalse(WorkerActivity.waitOverdue.needsHuman)
+        let snap = WorkerSlotSnapshot.build(slot: WorkerSlot(slotId: 1, runId: "exec-1"), liveState: live)
+        XCTAssertEqual(snap.statusPillLabel, "Wait overdue")
+        XCTAssertEqual(snap.live?.waitCaption, reason)
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: makeDoingTask(),
+                column: .doing,
+                runtime: nil,
+                liveState: live
+            ),
+            reason
+        )
     }
 
     func testOnlyWaitingForInputNeedsAHuman() {
@@ -313,6 +325,24 @@ final class AwaitingInputKanbanTests: XCTestCase {
             tmuxHosted: tmuxHosted,
             waitReason: waitReason,
             waitExpiresAt: waitExpiresAt
+        )
+    }
+
+    private func makeDoingTask() -> WorkTask {
+        WorkTask(
+            id: "task_1",
+            productID: "prod_test",
+            projectID: nil,
+            kind: "chore",
+            name: "Test work",
+            description: "",
+            status: "active",
+            priority: "medium",
+            ordinal: nil,
+            prURL: nil,
+            deletedAt: nil,
+            createdAt: "2026-06-01T00:00:00Z",
+            updatedAt: "2026-06-01T00:00:00Z"
         )
     }
 
