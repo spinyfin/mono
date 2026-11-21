@@ -1341,6 +1341,59 @@ fn asking_parks_the_item_on_the_question_and_completes_the_run_as_asked() {
 }
 
 #[test]
+fn declaration_after_deadline_observation_still_parks_the_question() {
+    let fx = fx();
+    let item = fx.pr_item("Needs a merge", "success");
+    fx.sql(&format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed' WHERE id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+
+    assert!(fx.db.progression_disposition(&run).unwrap().is_none());
+    let asked = done(
+        &fx,
+        &run,
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        "ask",
+    );
+
+    assert_eq!(asked.proposal.state, ProposalState::Applied);
+    assert_eq!(
+        fx.db.progression_disposition(&run).unwrap(),
+        Some(ProgressionDisposition::Asked)
+    );
+    let questions = fx.db.list_operator_questions(&item).unwrap();
+    assert_eq!(questions.len(), 1);
+    assert_eq!(
+        questions[0].status,
+        boss_protocol::OperatorQuestionStatus::Open,
+        "a blocked item can park on it"
+    );
+    assert_eq!(
+        boss_protocol::run_done_question_criterion(&asked.proposal.payload_json),
+        Some(boss_protocol::ProgressionQuestionCriterion::HumanOnlyAction)
+    );
+    let finished = fx
+        .db
+        .finish_progression_at_deadline(&run, "progression-run-timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        finished.status,
+        ExecutionStatus::Completed,
+        "an asked run is not a failed run"
+    );
+    let parked = fx.task(&item);
+    assert_eq!(parked.status, TaskStatus::Blocked);
+    assert_eq!(parked.blocked_reason.as_deref(), Some("awaiting_operator_answer"));
+    assert_eq!(fx.actor(&item), LAST_STATUS_ACTOR_PROGRESSION);
+    assert_eq!(
+        fx.db.list_operator_questions(&item).unwrap()[0].status,
+        boss_protocol::OperatorQuestionStatus::Open
+    );
+}
+
+#[test]
 fn a_second_question_is_refused_while_one_is_open() {
     let fx = fx();
     let item = fx.chore("Already asked");

@@ -12,11 +12,17 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::pool_claim_sweep::WorkerViewerDetach;
 use crate::work::WorkDb;
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct ProgressionTimeoutSweep {
     pub work_db: Arc<WorkDb>,
     pub live_states: Arc<LiveWorkerStateRegistry>,
     pub coordinator: Arc<ExecutionCoordinator>,
     pub pane_releaser: Arc<dyn WorkerPaneReleaser>,
+    pub hold_registry: Arc<crate::hold_registry::HoldRegistry>,
+    pub dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink>,
+    #[builder(default)]
+    pub unstarted_claims: std::sync::Mutex<std::collections::HashMap<String, i64>>,
     pub viewers: Arc<dyn WorkerViewerDetach>,
 }
 
@@ -61,7 +67,15 @@ impl ProgressionTimeoutSweep {
     async fn run_one_pass(&self, now: i64) -> usize {
         let timeout_secs = progression_run_timeout_secs(&self.work_db);
         let mut released = 0;
-        for claim in self.coordinator.progression_worker_pool().claims().await {
+        let claims = self.coordinator.progression_worker_pool().claims().await;
+        self.unstarted_claims
+            .lock()
+            .unwrap()
+            .retain(|id, _| claims.iter().any(|c| &c.execution_id == id));
+        for claim in claims {
+            if self.hold_registry.is_held(&claim.execution_id) {
+                continue;
+            }
             let result = self.reconcile(&claim.execution_id, now, timeout_secs).await;
             match result {
                 Ok(true) => {
@@ -87,9 +101,25 @@ impl ProgressionTimeoutSweep {
             "non-progression claim in progression pool"
         );
         if !execution.status.is_terminal() {
-            // A claimed spawn with no start timestamp is bounded too. Queued
-            // executions without a pool claim are never visited here.
-            let started = execution.started_epoch().or_else(|| execution.created_epoch());
+            // Unstarted claims get a full timeout from first observation.
+            // Adopted running panes retain the durable creation-time fallback.
+            let started = execution.started_epoch().or_else(|| {
+                if matches!(
+                    execution.status,
+                    boss_protocol::ExecutionStatus::Ready | boss_protocol::ExecutionStatus::Claimed
+                ) {
+                    Some(
+                        *self
+                            .unstarted_claims
+                            .lock()
+                            .unwrap()
+                            .entry(execution_id.to_owned())
+                            .or_insert(now),
+                    )
+                } else {
+                    execution.created_epoch()
+                }
+            });
             let started = started.ok_or_else(|| anyhow::anyhow!("progression run has no valid start time"))?;
             let elapsed_secs = now.saturating_sub(started);
             if elapsed_secs < timeout_secs {
@@ -98,17 +128,37 @@ impl ProgressionTimeoutSweep {
             let reason = format!("progression-run-timeout: elapsed {elapsed_secs}s (limit {timeout_secs}s)");
             // A deadline is a deliberate failure, not inferred death that a
             // late Claude hook may readopt. Preserve an accepted declaration.
-            if self.work_db.progression_disposition(execution_id)?.is_some() {
-                self.work_db.finish_progression_declared(execution_id)?;
-            } else {
-                self.work_db.fail_progression_execution(execution_id, &reason)?;
+            let finalized = self.work_db.finish_progression_at_deadline(execution_id, &reason)?;
+            let Some(finalized) = finalized else {
+                // Another finalizer owns teardown and its terminal grace.
+                return Ok(false);
+            };
+            {
+                use crate::dispatch_events::{DispatchEvent, Outcome, Stage};
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::StaleWorkerReconcile, Outcome::Ok, execution_id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "progression_run_timeout", "elapsed_secs": elapsed_secs,
+                                "timeout_secs": timeout_secs, "execution_status": finalized.status,
+                            })),
+                    )
+                    .await;
             }
             tracing::warn!(execution_id, elapsed_secs, timeout_secs, "progression deadline reached");
+        } else if execution
+            .finished_epoch()
+            .is_some_and(|finished| now.saturating_sub(finished) < crate::pool_claim_sweep::LEAK_GRACE_SECS)
+        {
+            return Ok(false);
         }
 
         // Terminal rows still owning claims (including orphaned runs) retry
         // the normal token-verified process and viewer teardown every pass.
-        if self.pane_releaser.release_pane(execution_id).await != PaneReleaseOutcome::Reaped {
+        if self.work_db.tmux_identity_for_execution(execution_id)?.is_some()
+            && self.pane_releaser.release_pane(execution_id).await != PaneReleaseOutcome::Reaped
+        {
             anyhow::bail!("process teardown unconfirmed");
         }
         let result = self.viewers.confirm_viewers_detached(&[execution_id.to_owned()]).await;

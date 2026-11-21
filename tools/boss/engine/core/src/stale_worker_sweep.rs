@@ -892,7 +892,7 @@ pub async fn run_one_pass_with_terminal_and_grace(
         }
 
         // Progression deadlines, including adopted Spawning panes and missing
-        // start stamps, are handled by the independent pool-claim sweep.
+        // start stamps, are handled by the progression deadline sweep.
         if execution.kind == boss_protocol::ExecutionKind::Progression {
             continue;
         }

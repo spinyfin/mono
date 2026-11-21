@@ -11,12 +11,14 @@ const SLOT: u8 = 41;
 struct RecordingReaper {
     coordinator: Arc<ExecutionCoordinator>,
     calls: Arc<Mutex<Vec<(String, bool)>>>,
+    db: Arc<WorkDb>,
 }
 
 impl RecordingReaper {
-    fn new(coordinator: Arc<ExecutionCoordinator>) -> Self {
+    fn new(coordinator: Arc<ExecutionCoordinator>, db: Arc<WorkDb>) -> Self {
         Self {
             coordinator,
+            db,
             calls: Arc::default(),
         }
     }
@@ -35,7 +37,14 @@ impl WorkerPaneReleaser for RecordingReaper {
             .await
             .contains(execution_id);
         self.calls.lock().unwrap().push((execution_id.to_owned(), claimed));
-        PaneReleaseOutcome::Reaped
+        let db = &self.db;
+        if let Some(identity) = db.tmux_identity_for_execution(execution_id).unwrap() {
+            db.clear_tmux_identity_for_execution(execution_id, &identity.spawn_token)
+                .unwrap();
+            PaneReleaseOutcome::Reaped
+        } else {
+            PaneReleaseOutcome::NoLiveWorker
+        }
     }
 }
 
@@ -86,6 +95,8 @@ async fn progression_slot(
         .start_progression_run_on_local_host(&execution_id, "progression-1", "/tmp/progression-timeout-fixture", true)
         .unwrap();
     finish_run_worker_pane_alive(&db, &execution_id, &run.id, Some("spawned pane"));
+    db.record_tmux_spawn_intent_for_execution(&execution_id, "boss", "boss-progression-1", "deadline-token")
+        .unwrap();
     if let Some(secs) = timeout_secs {
         db.connect()
             .unwrap()
@@ -143,6 +154,9 @@ async fn sweep(
         live_states: live_states.clone(),
         coordinator: coordinator.clone(),
         pane_releaser: Arc::new(reaper.clone()),
+        hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
+        dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+        unstarted_claims: Default::default(),
         viewers: Arc::new(NoViewers),
     }
     .run_one_pass(boss_engine_utils::epoch_time::now_epoch_secs())
@@ -153,7 +167,7 @@ async fn sweep(
 async fn a_progression_run_past_its_timeout_is_reaped_failed_and_the_item_is_untouched() {
     let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_fixture(Some(60)).await;
     let before = description_of(&db, &work_item_id);
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
@@ -196,7 +210,7 @@ async fn a_progression_run_past_its_timeout_is_reaped_failed_and_the_item_is_unt
 async fn a_spawning_progression_run_past_its_timeout_is_reaped() {
     let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_slot(Some(60), false).await;
     let before = description_of(&db, &work_item_id);
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
@@ -221,7 +235,7 @@ async fn a_progression_run_with_no_started_at_is_reaped_from_created_at() {
         .unwrap();
     assert!(db.get_execution(&execution_id).unwrap().started_epoch().is_none());
     let before = description_of(&db, &work_item_id);
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
@@ -251,7 +265,7 @@ async fn claude_awaiting_input_is_bounded_and_releases_the_real_progression_pool
             [&execution],
         )
         .unwrap();
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
     assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
     assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
     assert!(states.get(SLOT).is_none());
@@ -276,7 +290,7 @@ async fn spawning_and_missing_live_state_cannot_hide_an_expired_claim() {
                 boss_protocol::WorkerActivity::Spawning
             );
         }
-        let reaper = RecordingReaper::new(coordinator.clone());
+        let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
         assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
         assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
         assert!(coordinator.progression_worker_pool().claims().await.is_empty());
@@ -287,8 +301,10 @@ async fn spawning_and_missing_live_state_cannot_hide_an_expired_claim() {
 async fn an_orphaned_claim_is_reaped_even_with_live_state_and_preserves_its_outcome() {
     let (_dir, db, item, execution, states, coordinator) = progression_fixture(Some(3_600)).await;
     let before = description_of(&db, &item);
-    let orphaned = db.mark_execution_orphaned(&execution, "worker lost").unwrap();
-    let reaper = RecordingReaper::new(coordinator.clone());
+    db.mark_execution_orphaned(&execution, "worker lost").unwrap();
+    age_terminal(&db, &execution);
+    let orphaned = db.get_execution(&execution).unwrap();
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
     assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
     assert_eq!(
         serde_json::to_value(db.get_execution(&execution).unwrap()).unwrap(),
@@ -301,8 +317,6 @@ async fn an_orphaned_claim_is_reaped_even_with_live_state_and_preserves_its_outc
     assert_eq!(reaper.reaped().len(), 1);
 }
 
-struct UnconfirmedProcess;
-
 #[tokio::test]
 async fn deadline_cleanup_preserves_an_accepted_disposition() {
     let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
@@ -313,7 +327,7 @@ async fn deadline_cleanup_preserves_an_accepted_disposition() {
             [&execution],
         )
         .unwrap();
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
     assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
     assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Completed);
     assert_eq!(
@@ -322,6 +336,8 @@ async fn deadline_cleanup_preserves_an_accepted_disposition() {
     );
     assert!(coordinator.progression_worker_pool().claims().await.is_empty());
 }
+
+struct UnconfirmedProcess;
 
 #[async_trait::async_trait]
 impl WorkerPaneReleaser for UnconfirmedProcess {
@@ -345,7 +361,7 @@ impl WorkerViewerDetach for UnconfirmedViewer {
 async fn failed_teardown_retains_the_claim_and_retries_the_recorded_terminal_outcome() {
     for process_failed in [true, false] {
         let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
-        let reaper = RecordingReaper::new(coordinator.clone());
+        let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
         let pending = ProgressionTimeoutSweep {
             work_db: db.clone(),
             live_states: states.clone(),
@@ -355,6 +371,9 @@ async fn failed_teardown_retains_the_claim_and_retries_the_recorded_terminal_out
             } else {
                 Arc::new(reaper.clone())
             },
+            hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
+            dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+            unstarted_claims: Default::default(),
             viewers: if process_failed {
                 Arc::new(NoViewers)
             } else {
@@ -367,6 +386,7 @@ async fn failed_teardown_retains_the_claim_and_retries_the_recorded_terminal_out
                 .await,
             0
         );
+        age_terminal(&db, &execution);
         let failed = db.get_execution(&execution).unwrap();
         assert_eq!(failed.status, ExecutionStatus::Failed);
         assert_eq!(coordinator.progression_worker_pool().claims().await.len(), 1);
@@ -393,7 +413,10 @@ async fn exact_deadline_and_missing_start_time_use_the_published_limit() {
         work_db: db.clone(),
         live_states: states,
         coordinator: coordinator.clone(),
-        pane_releaser: Arc::new(RecordingReaper::new(coordinator)),
+        pane_releaser: Arc::new(RecordingReaper::new(coordinator, db.clone())),
+        hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
+        dispatch_events: Arc::new(crate::dispatch_events::NoopDispatchEventSink),
+        unstarted_claims: Default::default(),
         viewers: Arc::new(NoViewers),
     };
     assert_eq!(sweep.run_one_pass(1059).await, 0);
@@ -411,7 +434,7 @@ async fn exact_deadline_and_missing_start_time_use_the_published_limit() {
 async fn a_progression_run_inside_its_timeout_is_left_alone_even_when_it_looks_idle() {
     let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_fixture(Some(3_600)).await;
     let before = description_of(&db, &work_item_id);
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
@@ -464,7 +487,7 @@ fn seed_stale_worker_attention(db: &WorkDb, work_item_id: &str) {
 async fn a_progression_timeout_reap_leaves_the_items_existing_stale_worker_attention_open() {
     let (_dir, db, work_item_id, _execution_id, live_states, coordinator) = progression_fixture(Some(60)).await;
     seed_stale_worker_attention(&db, &work_item_id);
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
@@ -477,7 +500,7 @@ async fn a_progression_run_seen_terminal_by_the_sweep_leaves_the_items_stale_wor
     let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_fixture(Some(3_600)).await;
     seed_stale_worker_attention(&db, &work_item_id);
     db.mark_execution_orphaned(&execution_id, "test: ended").unwrap();
-    let reaper = RecordingReaper::new(coordinator.clone());
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
 
     sweep(&db, &live_states, &coordinator, &reaper).await;
 
@@ -506,3 +529,16 @@ async fn the_pane_release_cleanup_helper_skips_a_progression_run_but_still_resol
     resolve_stale_worker_attention(&db, &execution_id);
     assert_eq!(open_stale_worker_attention_count(&db, &work_item_id), 0);
 }
+
+fn age_terminal(db: &WorkDb, execution: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET finished_at = '1000' WHERE id = ?1",
+            [execution],
+        )
+        .unwrap();
+}
+
+#[path = "progression_deadline_regression_tests.rs"]
+mod regressions;

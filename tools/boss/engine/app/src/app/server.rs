@@ -2016,6 +2016,9 @@ async fn serve_scoped(
             live_states: server_state.live_worker_states.clone(),
             coordinator: server_state.execution_coordinator.clone(),
             pane_releaser: progression_pane_releaser,
+            hold_registry: server_state.hold_registry.clone(),
+            dispatch_events: server_state.dispatch_events.clone(),
+            unstarted_claims: Default::default(),
             viewers: server_state.clone(),
         },
     );
