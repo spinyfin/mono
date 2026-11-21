@@ -74,6 +74,8 @@ impl ProgressionTimeoutSweep {
             .lock()
             .unwrap()
             .retain(|id, _| claims.iter().any(|c| &c.execution_id == id));
+        let claimed = claims.iter().map(|claim| claim.execution_id.clone()).collect();
+        self.teardown_retries.lock().unwrap().retain_claimed(&claimed);
         for claim in claims {
             if self.hold_registry.is_held(&claim.execution_id) {
                 continue;
@@ -210,3 +212,11 @@ impl ProgressionTimeoutSweep {
 #[cfg(test)]
 #[path = "progression_timeout_sweep_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "progression_timeout_test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "progression_deadline_regression_tests.rs"]
+mod regression_tests;

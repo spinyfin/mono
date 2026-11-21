@@ -1,4 +1,6 @@
+use super::test_support::*;
 use super::*;
+use boss_protocol::ExecutionStatus;
 
 fn deadline_sweep(
     db: &Arc<WorkDb>,
@@ -129,4 +131,52 @@ async fn declaration_committed_after_observation_wins_deadline_transaction() {
             .iter()
             .all(|run| run.status != "failed")
     );
+}
+
+#[tokio::test]
+async fn repeated_teardown_failures_raise_attention_and_success_clears_retries() {
+    use boss_engine_storage_values::attention_kinds::POOL_CLAIM_TEARDOWN_ATTENTION_KIND;
+    for process_failed in [true, false] {
+        let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+        let mut sweep = deadline_sweep(&db, &states, &coordinator);
+        if process_failed {
+            sweep.pane_releaser = Arc::new(UnconfirmedProcess);
+        } else {
+            sweep.viewers = Arc::new(UnconfirmedViewer);
+        }
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        for pass in 0..3 {
+            assert_eq!(sweep.run_one_pass(now + pass * 60).await, 0);
+            let items = db.list_attention_items(&execution).unwrap();
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(|item| item.kind == POOL_CLAIM_TEARDOWN_ATTENTION_KIND && item.status == "open")
+                    .count(),
+                usize::from(pass == 2)
+            );
+        }
+        assert_eq!(sweep.teardown_retries.lock().unwrap().failure_count(&execution), 3);
+        sweep.pane_releaser = Arc::new(RecordingReaper::new(coordinator.clone(), db.clone()));
+        sweep.viewers = Arc::new(NoViewers);
+        assert_eq!(sweep.run_one_pass(now + 180).await, 1);
+        assert!(coordinator.progression_worker_pool().claims().await.is_empty());
+        assert_eq!(sweep.teardown_retries.lock().unwrap().failure_count(&execution), 0);
+    }
+}
+
+#[tokio::test]
+async fn externally_released_claims_drop_their_teardown_retry_counts() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+    let mut sweep = deadline_sweep(&db, &states, &coordinator);
+    sweep.pane_releaser = Arc::new(UnconfirmedProcess);
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    assert_eq!(sweep.run_one_pass(now).await, 0);
+    assert_eq!(sweep.teardown_retries.lock().unwrap().failure_count(&execution), 1);
+    let claim = coordinator.progression_worker_pool().claims().await.remove(0);
+    coordinator
+        .release_pool_claim_if_execution(&claim.worker_id, &execution)
+        .await;
+    assert_eq!(sweep.run_one_pass(now + 60).await, 0);
+    assert_eq!(sweep.teardown_retries.lock().unwrap().failure_count(&execution), 0);
 }

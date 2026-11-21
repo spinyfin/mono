@@ -162,6 +162,15 @@ pub struct TeardownRetries {
 }
 
 impl TeardownRetries {
+    #[cfg(test)]
+    pub(crate) fn failure_count(&self, execution_id: &str) -> usize {
+        self.failures.get(execution_id).copied().unwrap_or_default()
+    }
+
+    pub(crate) fn retain_claimed(&mut self, claimed: &HashSet<String>) {
+        self.failures.retain(|execution_id, _| claimed.contains(execution_id));
+    }
+
     pub(crate) fn succeeded(&mut self, execution_id: &str) {
         self.failures.remove(execution_id);
     }
@@ -214,7 +223,7 @@ impl TeardownRetries {
         ] {
             claimed.extend(pool.claims().await.into_iter().map(|claim| claim.execution_id));
         }
-        self.failures.retain(|execution_id, _| claimed.contains(execution_id));
+        self.retain_claimed(&claimed);
         // Durable open items are the retry queue, even after restart or
         // another teardown path has removed the in-memory claim.
         let items = match db.list_open_attention_items_of_kind(TEARDOWN_ATTENTION_KIND) {
