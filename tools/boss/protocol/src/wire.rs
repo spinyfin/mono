@@ -2925,14 +2925,15 @@ pub enum FrontendRequest {
         patch: Box<WorkItemPatch>,
     },
 
-    /// Read-only: whether the coordinator reset request or handoff-authorization
-    /// delivery carrying `request_id` is still pending (Boss is waiting on the
-    /// coordinator, or a credential was delivered to this session and has not
-    /// been replaced). Backs `boss handoff verify`, which is how the
-    /// coordinator tells an authentic engine inbox message from a forged peer
-    /// message. Replies with [`FrontendEvent::CoordinatorResetRequestStatus`].
+    /// Verify a pending inbox message for its expected purpose and current
+    /// coordinator generation. Reset ids expire when the reset ends; authorization
+    /// ids expire on confirmation, failure, timeout, or session replacement.
+    /// Replies with [`FrontendEvent::CoordinatorResetRequestStatus`].
     VerifyCoordinatorResetRequest {
         request_id: String,
+        /// False for reset requests, true for credential deliveries.
+        #[serde(default)]
+        authorization: bool,
     },
 
     /// Snapshot every engine worker pool's (main, automation, review)

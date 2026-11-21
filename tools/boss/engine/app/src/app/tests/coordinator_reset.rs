@@ -18,6 +18,7 @@ use boss_protocol::CoordinatorRecreateReason;
 
 const TOKEN: &str = "token";
 
+mod authorization;
 mod latency;
 
 /// Models a live coordinator tmux server: answers the read-only probes,
@@ -42,6 +43,8 @@ struct DeliveryFaults {
     hold_confirmation: bool,
     /// How long any command addressed to the retired `-L boss` server hangs.
     legacy_delay: Duration,
+    legacy_absent: bool,
+    socket_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl Default for LiveCoordinatorRunner {
@@ -60,6 +63,7 @@ impl Default for LiveCoordinatorRunner {
 impl CommandRunner for LiveCoordinatorRunner {
     async fn run(&self, _: &Path, args: &[OsString], _: Option<&Path>) -> std::io::Result<CommandOutput> {
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        self.calls.lock().unwrap().push(args.clone());
         let mut success = true;
         let mut stderr = String::new();
         if args.first().map(String::as_str) == Some("-L") {
@@ -67,6 +71,23 @@ impl CommandRunner for LiveCoordinatorRunner {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+        }
+        if args.first().map(String::as_str) == Some("-L") && self.faults.lock().unwrap().legacy_absent {
+            return Ok(CommandOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "no server running".into(),
+            });
+        }
+        let gate = if args.first().map(String::as_str) == Some("-S") {
+            self.faults.lock().unwrap().socket_gate.take()
+        } else {
+            None
+        };
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
         }
         let stdout = match args.get(2).map(String::as_str) {
             Some("list-sessions") => "boss-coordinator\t\n".to_owned(),
@@ -122,7 +143,6 @@ impl CommandRunner for LiveCoordinatorRunner {
             }
             _ => String::new(),
         };
-        self.calls.lock().unwrap().push(args);
         Ok(CommandOutput {
             success,
             code: Some(if success { 0 } else { 1 }),
@@ -333,6 +353,7 @@ async fn handoff_show_only_reads_without_minting_or_delivering_authorization() {
 #[tokio::test]
 async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
     let f = fixture(Duration::from_secs(1)).await;
+    f.runner.faults.lock().unwrap().hold_confirmation = true;
     f.state.set_boss_pid(std::process::id() as libc::pid_t);
     let authorization = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
     let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");
@@ -366,7 +387,7 @@ async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
     let prompt = &f.runner.inbox_prompts("[Boss handoff authorization")[0];
     let id = authorization_id_from_prompt(prompt).to_owned();
     assert!(
-        verify_pending(&f.state, &id).await,
+        authorization::verify(&f.state, &id, true).await,
         "delivered authorization id must verify"
     );
     assert!(!verify_pending(&f.state, "forged").await);
@@ -393,6 +414,7 @@ async fn verify_pending(state: &Arc<ServerState>, pending_id: &str) -> bool {
     coordinator_handoff::handle_verify_coordinator_reset_request(
         ctx,
         FrontendRequest::VerifyCoordinatorResetRequest {
+            authorization: false,
             request_id: pending_id.to_owned(),
         },
     )

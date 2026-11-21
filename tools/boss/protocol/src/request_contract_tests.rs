@@ -165,12 +165,14 @@ fn handoff_redelivery_is_not_replayable() {
     );
     assert_eq!(
         replay_admission(&FrontendRequest::VerifyCoordinatorResetRequest {
+            authorization: false,
             request_id: "id".into(),
         }),
         (ReplayContract::Always, AdmissionLane::Bulk)
     );
     assert_eq!(
         worker_progression(&FrontendRequest::VerifyCoordinatorResetRequest {
+            authorization: false,
             request_id: "id".into(),
         }),
         (WorkerAccess::Coordinator, ProgressionAccess::Deny)

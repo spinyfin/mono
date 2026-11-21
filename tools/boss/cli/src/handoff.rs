@@ -43,6 +43,9 @@ pub(crate) enum HandoffCommand {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct HandoffVerifyArgs {
+    /// Verify a credential delivery rather than a reset request.
+    #[arg(long)]
+    pub(crate) authorization: bool,
     /// The id from the `[Boss reset request id=<id>]` or
     /// `[Boss handoff authorization id=<id>]` marker.
     pub(crate) id: String,
@@ -80,6 +83,7 @@ async fn run_verify(ctx: &RunContext, args: HandoffVerifyArgs) -> Result<(), Cli
     let pending: bool = rpc_call!(
         client,
         FrontendRequest::VerifyCoordinatorResetRequest {
+            authorization: args.authorization,
             request_id: args.id,
         },
         "handoff verify",
@@ -284,6 +288,21 @@ mod tests {
     }
 
     #[test]
+    fn authorization_verification_has_distinct_purpose() {
+        let parsed =
+            crate::Cli::try_parse_from(["boss", "handoff", "verify", "--authorization", "delivery-id"]).unwrap();
+        let crate::Commands::Handoff {
+            command: HandoffCommand::Verify(args),
+        } = parsed.command
+        else {
+            panic!("expected handoff verify");
+        };
+        assert!(args.authorization);
+        assert_eq!(args.id, "delivery-id");
+        assert!(include_str!(env!("HANDOFF_SYSTEM_PROMPT")).contains("boss handoff verify --authorization <id>"));
+    }
+
+    #[test]
     fn reset_prompt_verify_command_parses() {
         let source = include_str!(env!("HANDOFF_RESET_PROMPT"));
         let start = source.find("boss handoff verify {request_id}").unwrap();
@@ -302,6 +321,7 @@ mod tests {
             panic!("expected handoff verify");
         };
         assert_eq!(args.id, "test-request-id");
+        assert!(!args.authorization);
         assert!(
             include_str!(env!("HANDOFF_SYSTEM_PROMPT")).contains("boss handoff verify <id>"),
             "the coordinator prompt must name the verify command"

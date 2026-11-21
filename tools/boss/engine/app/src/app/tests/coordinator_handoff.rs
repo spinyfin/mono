@@ -97,6 +97,7 @@ async fn verify(state: &Arc<ServerState>, pending_id: &str) -> FrontendEvent {
     coordinator_handoff::handle_verify_coordinator_reset_request(
         dispatch(state, &sink),
         FrontendRequest::VerifyCoordinatorResetRequest {
+            authorization: false,
             request_id: pending_id.to_owned(),
         },
     )

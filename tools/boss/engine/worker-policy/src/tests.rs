@@ -381,6 +381,7 @@ fn coordinator_verbs_stay_closed() {
             body: "- greyarea is down".into(),
         },
         FrontendRequest::VerifyCoordinatorResetRequest {
+            authorization: false,
             request_id: "id".into(),
         },
         FrontendRequest::ListCoordinatorGuidance { product_id: None },

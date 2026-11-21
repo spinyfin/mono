@@ -96,7 +96,7 @@ async fn supervisor_pass(state: Arc<ServerState>) {
     let working_directory = state.coordinator_session_directory().unwrap();
     let _guard = state.coordinator_tmux_lock.lock().await;
     let active = boss_engine_runtime::coordinator_tmux::resolve_active_handle(&tmux, legacy.as_ref()).await;
-    let _ = boss_engine_runtime::coordinator_tmux::restart_if_dead(
+    let restarted = boss_engine_runtime::coordinator_tmux::restart_if_dead(
         &boss_engine_runtime::coordinator_tmux::CoordinatorSpawn::builder()
             .work_db(state.work_db.as_ref())
             .tmux(active)
@@ -108,7 +108,9 @@ async fn supervisor_pass(state: Arc<ServerState>) {
             .build(),
         0,
     )
-    .await;
+    .await
+    .expect("supervisor restart probe failed");
+    assert!(restarted.is_none(), "a live coordinator must not be restarted");
 }
 
 /// The durable socket hosts the coordinator, so a hung or absent retired
@@ -116,13 +118,40 @@ async fn supervisor_pass(state: Arc<ServerState>) {
 /// a real supervisor pass and an app-registration attach hold or queue on
 /// the lifecycle lock.
 async fn contended_legacy_reset(token: &str, legacy_delay: Duration) {
-    let (f, _read, mut write, connection) = rpc_fixture(token).await;
-    f.runner.faults.lock().unwrap().legacy_delay = legacy_delay;
+    let (f, mut read, mut write, connection) = rpc_fixture(token).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut faults = f.runner.faults.lock().unwrap();
+        faults.legacy_delay = legacy_delay;
+        faults.legacy_absent = legacy_delay.is_zero();
+        faults.socket_gate = Some((entered.clone(), release.clone()));
+    }
     let supervisor = tokio::spawn(supervisor_pass(f.state.clone()));
-    let attach = tokio::spawn(sessions::attach_coordinator_to_registered_app(f.state.clone()));
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        f.state.coordinator_tmux_lock.try_lock().is_err(),
+        "supervisor must hold the lifecycle lock"
+    );
+    let mut attach = tokio::spawn(sessions::attach_coordinator_to_registered_app(f.state.clone()));
     tokio::task::yield_now().await;
     let start = std::time::Instant::now();
     reset(&mut write, token, false).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !stages(token)
+            .iter()
+            .any(|e| e["event"] == "coordinator_handoff_delivery_started")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reset must reach delivery while supervisor is parked");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.state.coordinator_tmux_lock.try_lock().is_err());
+    release.notify_one();
     wait_for_prompt(&f.runner).await;
     report_stages(token);
     assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
@@ -142,6 +171,15 @@ async fn contended_legacy_reset(token: &str, legacy_delay: Duration) {
     ] {
         assert!(events.iter().any(|event| event["event"] == name), "missing {name}");
     }
+    let acquired = events
+        .iter()
+        .find(|e| e["event"] == "coordinator_reset_lock_acquired" && e["phase"] == "delivery")
+        .unwrap();
+    let waited = acquired["elapsed_ms"].as_u64().unwrap();
+    assert!(
+        (100..1000).contains(&waited),
+        "expected bounded real lock contention, waited {waited}ms"
+    );
     let gap = stage_gap_ms(
         &events,
         "coordinator_reset_rpc_received",
@@ -152,7 +190,28 @@ async fn contended_legacy_reset(token: &str, legacy_delay: Duration) {
         .await
         .expect("supervisor pass must not wait out a hung legacy server")
         .expect("supervisor pass panicked");
-    attach.abort();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                done = &mut attach => { done.expect("app attach panicked"); break; }
+                frame = read_frame_where(&mut read, |f| f["payload"]["type"] == "engine_request") => {
+                    let event: FrontendEvent = serde_json::from_value(frame["payload"].clone()).unwrap();
+                    if let FrontendEvent::EngineRequest { request_id, request: EngineToAppRequest::AttachCoordinatorPane(_) } = event {
+                        send_frame(&mut write, "attach-reply", serde_json::to_value(FrontendRequest::EngineResponse {
+                            request_id,
+                            response: EngineToAppResponse::AttachCoordinatorPane {
+                                result: Ok(boss_protocol::AttachCoordinatorPaneResult {}),
+                            },
+                        }).unwrap()).await;
+                    }
+                }
+            }
+        }
+    }).await.expect("app attach must complete after its viewer acknowledgement");
+    assert_eq!(
+        f.state.coordinator_attached_spawn_token.lock().unwrap().as_deref(),
+        Some(token)
+    );
     connection.abort();
 }
 

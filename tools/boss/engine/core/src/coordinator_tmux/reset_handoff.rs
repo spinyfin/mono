@@ -52,7 +52,7 @@ pub const DELIVERY_FAILED_PREFIX: &str = "coordinator did not receive the handof
 /// the engine (`boss handoff verify`) before acting. An id stops being pending
 /// as soon as `request_and_wait` returns, whatever the outcome, so a message
 /// that Claude Code releases after Boss gave up is refused.
-static PENDING_REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static PENDING_REQUESTS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether `request_id` is an authentic reset the engine is still waiting on.
 /// Empty and unknown ids are never pending.
@@ -60,20 +60,30 @@ pub fn is_request_pending(request_id: &str) -> bool {
     !request_id.is_empty()
         && PENDING_REQUESTS
             .lock()
-            .map(|pending| pending.iter().any(|id| id == request_id))
+            .map(|pending| pending.iter().any(|(id, _)| id == request_id))
             .unwrap_or(false)
+}
+
+/// Verify both the request purpose and the coordinator generation it targets.
+pub fn is_request_pending_for(request_id: &str, spawn_token: &str) -> bool {
+    !request_id.is_empty()
+        && PENDING_REQUESTS.lock().is_ok_and(|pending| {
+            pending
+                .iter()
+                .any(|(id, token)| id == request_id && token == spawn_token)
+        })
 }
 
 /// Registers an unguessable request id; dropping the guard withdraws it.
 struct PendingRequest(String);
 
 impl PendingRequest {
-    fn register() -> Result<Self> {
-        let id = crate::engine_control::generate_token();
+    fn register(spawn_token: &str) -> Result<Self> {
+        let id = boss_engine_utils::token::generate_secure_token()?;
         PENDING_REQUESTS
             .lock()
             .map_err(|_| anyhow!("handoff request id table poisoned"))?
-            .push(id.clone());
+            .push((id.clone(), spawn_token.to_owned()));
         Ok(Self(id))
     }
 }
@@ -81,7 +91,7 @@ impl PendingRequest {
 impl Drop for PendingRequest {
     fn drop(&mut self) {
         if let Ok(mut pending) = PENDING_REQUESTS.lock() {
-            pending.retain(|id| id != &self.0);
+            pending.retain(|(id, _)| id != &self.0);
         }
     }
 }
@@ -200,7 +210,7 @@ pub async fn request_and_wait(request: HandoffRequest<'_>) -> Result<bool> {
                 "{DELIVERY_FAILED_PREFIX}: the handoff credential for this session could not be minted ({error:#}). The coordinator session is still running."
             )
         })?;
-    let pending = PendingRequest::register()?;
+    let pending = PendingRequest::register(expected_token)?;
     let turn_ended = delivery
         .deliver_locked(
             tmux,

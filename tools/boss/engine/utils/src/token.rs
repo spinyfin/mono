@@ -1,21 +1,19 @@
-/// Generate a fresh 32-byte hex-encoded token. Backed by
-/// `fastrand::Rng::with_seed`-style RNG seeded from `getrandom` —
-/// `fastrand` is already in the workspace deps, and 256 bits of
-/// entropy via its `Rng::u64()` rolled four times is overkill for an
-/// auth credential whose threat model is "the wrong test ended up in
-/// the production codepath", not "a remote adversary."
-pub fn generate_token() -> String {
-    // Seed from OS entropy by way of `fastrand`'s default seeder
-    // (`fastrand::Rng::new()` already uses a thread-local CSPRNG-ish
-    // seed). Four u64 draws → 32 bytes → 64 hex chars.
-    let mut rng = fastrand::Rng::new();
+/// Generate a cryptographically unpredictable 32-byte hex token from OS entropy.
+/// Entropy failures are returned before any credential is registered or delivered.
+pub fn generate_secure_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 32];
-    for chunk in bytes.chunks_mut(8) {
-        let word = rng.u64(..);
-        let word_bytes = word.to_le_bytes();
-        chunk.copy_from_slice(&word_bytes[..chunk.len()]);
+    // SAFETY: the buffer is writable for its full length, below getentropy's
+    // 256-byte limit; no pointers escape the call.
+    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Generate a fresh OS-backed token. Callers without a fallible interface
+/// fail closed if the operating system cannot supply entropy.
+pub fn generate_token() -> String {
+    generate_secure_token().expect("OS entropy unavailable for authentication token")
 }
 
 #[cfg(test)]
