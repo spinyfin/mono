@@ -103,8 +103,9 @@ async fn launch_surfaces_allocation_errors_instead_of_using_engine_default() {
                 .build(),
         )
         .unwrap();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
-        .unwrap();
+    let mut split = DriverTrafficSplit::new(0, 0, 0, 100);
+    split.launch_enabled.agy = false;
+    db.set_driver_traffic_split(split).unwrap();
     let item = db.get_work_item(&chore.id).unwrap();
     let result = compose_worker_spawn(
         &db,
@@ -120,6 +121,7 @@ async fn launch_surfaces_allocation_errors_instead_of_using_engine_default() {
         .err()
         .expect("launch must fail when no eligible driver has a share");
     assert!(err.to_string().contains("0 share"), "{err}");
+    assert!(err.to_string().contains("agy excluded: launch flag off"), "{err}");
 }
 
 /// A product default that lacks the design/investigation tier model yields to

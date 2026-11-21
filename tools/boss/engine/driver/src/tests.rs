@@ -809,7 +809,10 @@ fn supported_interrupts_have_valid_plans_including_pinned_drivers() {
     for slug in registry.slugs() {
         let driver = registry.require(slug).expect("slug came from the registry");
         if driver.interrupt() == InterruptDelivery::Unsupported {
-            assert!(!driver.launch_ready(), "launch-ready driver {slug} cannot interrupt");
+            assert!(
+                !driver.launch_implemented(),
+                "launch-ready driver {slug} cannot interrupt"
+            );
             assert!(driver.interrupt_plan().is_none(), "{slug}");
             continue;
         }

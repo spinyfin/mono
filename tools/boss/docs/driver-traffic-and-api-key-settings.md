@@ -8,6 +8,19 @@ document is where the detail that used to live in those captions moved to.
 The four shares (Codex / Claude / Grok / Antigravity) control what
 percentage of new work is sent to each driver. They always sum to 100%.
 
+Each driver also has a persisted **allocated launches** flag. Settings shows
+the configured split and the effective split after these flags. Turning a
+flag off preserves its configured share and explicitly reports its exclusion;
+the remaining enabled shares are renormalised. Work-kind and model restrictions
+can narrow that effective split further. Flags survive restarts and apply to
+new and queued allocations; explicit pins remain available for canaries.
+
+`bossctl dispatch traffic-split` shows the same state (also available with
+`--json`). Use `bossctl dispatch traffic-split --disable agy` to close allocated
+Antigravity launches, or `--enable agy` to reopen them. Allocation snapshots in
+`execution_driver_decisions.split_at_decision` include the flags and an
+`exclusions` array such as `agy excluded: launch flag off`.
+
 - **PR reviews and automation keep their own pinned driver, outside the
   split.** This is the single most useful fact here: it explains why a
   driver with a large configured share can still appear to receive almost
@@ -30,9 +43,10 @@ percentage of new work is sent to each driver. They always sum to 100%.
   split is never in a state the engine would reject mid-edit.
 - **Up to three drivers may sit at 0%.** A driver at zero receives no work
   at all, and every such state is reachable by repeated single-share edits.
-  Antigravity ships at 0%. Before an Antigravity driver is registered, its
-  share is excluded and the remaining shares renormalise; at 100% work goes
-  to the engine default driver (Claude) even if Claude is at 0%.
+  Fresh installations start Antigravity at 0%. Existing configured shares are
+  preserved, and launch flags default on, including Antigravity. If no enabled
+  eligible driver has a non-zero share, allocation fails visibly rather than
+  selecting a driver at zero.
 
 ## Codex Sol model
 

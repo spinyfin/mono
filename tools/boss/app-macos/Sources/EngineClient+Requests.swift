@@ -63,9 +63,9 @@ extension EngineClient {
     /// 100; the engine rejects anything else with a `work_error` rather
     /// than repairing it, so callers must send a split built by
     /// `DriverTrafficSplit.adjusting(_:to:)`, which preserves that
-    /// invariant by construction. Persisted to `state.db` and applies to
-    /// executions created from this point on only — nothing already
-    /// dispatched is disturbed. Replies with
+    /// invariant by construction. Shares and launch flags are persisted to
+    /// `state.db` and rechecked for queued launches. Running workers retain
+    /// their saved routing. Replies with
     /// `driver_traffic_split_result`.
     func sendSetDriverTrafficSplit(_ split: DriverTrafficSplit) {
         sendLine([
@@ -75,6 +75,7 @@ extension EngineClient {
                 "claude": split.claude,
                 "codex": split.codex,
                 "agy": split.agy,
+                "launch_enabled": split.launchEnabled,
             ],
         ])
     }

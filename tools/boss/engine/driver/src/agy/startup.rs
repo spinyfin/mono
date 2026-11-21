@@ -30,8 +30,8 @@ use crate::{PermissionInput, ToolUseInterceptionConfig};
 /// The launcher proves discovery before it pastes the brief: it waits for the
 /// CLI's own startup log to show the rendered settings and `loaded 1 named
 /// hooks from 1 hooks.json file(s)`, and refuses the run if the CLI reports an
-/// unparseable hooks file. `AgyDriver::launch_ready` stays false during the
-/// pinned-only rollout.
+/// unparseable hooks file. The persisted launch flag controls allocated traffic;
+/// these startup checks apply to both allocated and explicitly pinned launches.
 pub fn verify_startup_authorization(input: &PermissionInput) -> anyhow::Result<AuthorizationProbeReport> {
     let expected = observation_from_permission(input);
     let interception = ToolUseInterceptionConfig::from_permission_input(input);

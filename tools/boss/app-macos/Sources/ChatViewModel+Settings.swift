@@ -71,6 +71,13 @@ extension ChatViewModel {
     /// produce a rejectable split. Patching first keeps the steppers
     /// responsive across a round trip; the echoed
     /// `driver_traffic_split_result` then confirms it.
+    func setDriverLaunchEnabled(_ driver: DriverSlug, enabled: Bool) {
+        var next = driverTrafficSplit
+        next.launchEnabled[driver.rawValue] = enabled
+        driverTrafficSplit = next
+        engine.sendSetDriverTrafficSplit(next)
+    }
+
     func setDriverTrafficShare(_ driver: DriverSlug, to value: Int) {
         let next = driverTrafficSplit.adjusting(driver, to: value)
         guard next != driverTrafficSplit else { return }

@@ -10,8 +10,8 @@
 //! pane command (`pane_command`) with its `PaneMonitorSpec`. The pane runs
 //! the shared initial-brief launcher, which withholds the brief until the
 //! CLI's startup log shows the rendered posture and the guard hooks loaded.
-//! Measured pane controls are live for explicit pins; `launch_ready` stays
-//! false during the pinned-only rollout. Retention preserves transcript
+//! Measured pane controls are live. Allocated traffic follows the persisted
+//! operator launch flag and traffic split. Retention preserves transcript
 //! evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
@@ -120,8 +120,8 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// the Antigravity driver design. Per-run `HOME` provisioning, permission
 /// rendering, PreToolUse authorization, hook progress observation, transcript
 /// access, pane controls, and the interactive pane command are live.
-/// `launch_ready` stays false for the pinned-only rollout, so unpinned traffic
-/// never reaches this driver. Retention preserves per-run transcript evidence.
+/// Allocated traffic follows the operator's persisted launch flag and split.
+/// Retention preserves per-run transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {
     _private: (),
@@ -143,10 +143,6 @@ fn refuse_agy_plan(env: Vec<crate::EnvDirective>, reason: &str) -> SpawnPlan {
 impl AgentDriver for AgyDriver {
     fn descriptor(&self) -> &DriverDescriptor {
         &AGY_DESCRIPTOR
-    }
-
-    fn launch_ready(&self) -> bool {
-        false
     }
 
     fn capabilities(&self) -> CapabilitySet {
@@ -1140,7 +1136,7 @@ mod tests {
             super::super::StopDelivery::PaneCommand { command: "/quit" }
         );
         assert_eq!(driver.reap(), super::super::ReapDelivery::ProcessGroup);
-        assert!(!driver.launch_ready());
+        assert!(driver.launch_implemented());
     }
 
     #[test]
@@ -1271,7 +1267,7 @@ mod tests {
             hooks_doc["boss"].get("SessionStart").is_some(),
             "SessionStart must forward progress after authorization install: {hooks_doc:#}"
         );
-        assert!(!driver.launch_ready());
+        assert!(driver.launch_implemented());
     }
 
     /// A host home for the live-probe tests. With `login_keychain`, provisioning

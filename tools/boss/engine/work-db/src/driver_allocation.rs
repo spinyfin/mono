@@ -209,7 +209,8 @@ impl DriverDecision {
 /// The drivers that may take a work item of `kind`, resolved from the
 /// dispatch capability gate and nothing else.
 ///
-/// This is the whole of allocation's eligibility rule. It builds the same
+/// This resolves allocation's code-level restrictions; the persisted launch
+/// flags are applied separately after reading the current split. It builds the same
 /// [`boss_engine_driver::DriverRegistry`] `runner::worker_spawn` builds and asks
 /// the same `check_dispatch` question the gate asks immediately before a
 /// pane spawns, so allocation cannot choose a driver that the gate would
@@ -237,7 +238,7 @@ fn eligible_drivers_for(
     registry
         .eligible_drivers_for_kind(kind, Some(execution_kind), &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER)
         .into_iter()
-        .filter(|slug| registry.get(slug).is_some_and(|driver| driver.launch_ready()))
+        .filter(|slug| registry.get(slug).is_some_and(|driver| driver.launch_implemented()))
         .filter(|slug| !design_or_investigation_tier || *slug == DRIVER_SLUG_CLAUDE || *slug == DRIVER_SLUG_CODEX)
         .filter(|slug| {
             model_override.is_none_or(|model| {
@@ -572,7 +573,12 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         .filter(|model| !model.is_empty());
     let eligible = eligible_drivers_for(&task_kind, &kind, model_override, design_or_investigation_tier);
     let split = load_driver_traffic_split_conn(conn)?;
-    let driver = allocate_among(split, work_item_id, &task_kind, &eligible)?;
+    let eligible: Vec<_> = eligible
+        .into_iter()
+        .filter(|driver| split.launch_enabled.enabled(driver))
+        .collect();
+    let driver = allocate_among(split, work_item_id, &task_kind, &eligible)
+        .map_err(|err| allocation_refused(format!("{err}; {}", split.launch_exclusions().join("; "))))?;
     Ok(DriverDecision::allocated(driver, split))
 }
 
@@ -626,7 +632,11 @@ pub(crate) fn record_execution_driver_decision(
 ) -> Result<()> {
     let split_json = decision
         .split_at_decision
-        .map(|split| serde_json::to_string(&split))
+        .map(|split| {
+            let mut snapshot = serde_json::to_value(split)?;
+            snapshot["exclusions"] = serde_json::to_value(split.launch_exclusions())?;
+            serde_json::to_string(&snapshot)
+        })
         .transpose()?;
     conn.execute(
         "INSERT INTO execution_driver_decisions
@@ -1184,3 +1194,6 @@ mod tests;
 
 #[cfg(test)]
 mod dispatch_tests;
+
+#[cfg(test)]
+mod launch_tests;
