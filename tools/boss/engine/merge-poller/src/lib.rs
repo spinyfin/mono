@@ -97,6 +97,7 @@ mod deferred_review_admission;
 mod disarm_drain;
 mod merge_queue;
 mod pass;
+mod pass_environment;
 mod pass_trace;
 mod poll_metrics;
 mod post_merge_review;

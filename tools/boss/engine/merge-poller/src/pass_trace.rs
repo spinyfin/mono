@@ -186,6 +186,8 @@ impl PhaseTiming {
 pub struct PassTimings {
     /// Time since the pass began.
     pub total: Duration,
+    /// Host sleep or a GitHub transport failure interrupted this pass.
+    pub interrupted: bool,
     /// Finished phases, in the order they ran.
     pub phases: Vec<PhaseTiming>,
     /// The phase in flight. `None` once the pass has run to its end.
@@ -293,6 +295,7 @@ impl OpenPhase {
 
 #[derive(Debug, Default)]
 struct TraceState {
+    interrupted: bool,
     started: Option<Instant>,
     finished: Vec<PhaseTiming>,
     open: Option<OpenPhase>,
@@ -394,12 +397,17 @@ impl PassTrace {
         work.deferred += deferred;
     }
 
+    pub(crate) fn interrupt(&self) {
+        self.state().interrupted = true;
+    }
+
     /// Read the trace. Safe at any point, including after the pass future
     /// was dropped mid-phase.
     pub fn timings(&self) -> PassTimings {
         let now = Instant::now();
         let state = self.state();
         PassTimings {
+            interrupted: state.interrupted,
             total: state
                 .started
                 .map(|started| now.saturating_duration_since(started))
@@ -483,6 +491,9 @@ pub(crate) fn record_pass_result(
     budget: Duration,
     now_epoch_secs: i64,
 ) {
+    if timings.interrupted {
+        return;
+    }
     if completed && !timings.open_walk_truncated() {
         record_completed_pass(signal);
     } else {
