@@ -181,6 +181,7 @@ Paths are under `tools/boss/engine/`. Recovery runs everything through the `Jj` 
 `tools/boss/engine/recovery/jj_repository.bzl` pins the release archives by checksum. `@jj_test_tools` is 0.26.0 and `@jj_upgrade_test_tools` is 0.46.0.
 
 - `//tools/cube:cube_lib_test`, `//tools/boss/engine/recovery:recovery_test` and `//tools/boss/engine/core:engine_lib_test` run on 0.26.0. Their `_jj_046_test` twins run the same tests on 0.46.0.
+- The `_jj_046_test` twins are tagged `manual` since 2026-11-20, so `bazel test //...` (and therefore CI) skips them. On macOS, jj 0.46 forces a whole-drive flush (`F_FULLFSYNC`) for every operation file it writes, and the GC tests' store rewrite saturated the shared remote workers' disks. They stay buildable; run them by label, for example `bazel test //tools/cube:cube_lib_jj_046_test //tools/boss/engine/recovery:recovery_jj_046_test //tools/boss/engine/core:engine_lib_jj_046_test`. Remove the tag once the 0.46 suite is cheap enough for CI.
 - The other jj-dependent targets (`app`, `work-db`, `completion`, `host-execution`, `test-git`) run on 0.26.0 in CI. To run them, or anything else, on 0.46.0, substitute the repository on the command line:
 
   ```sh

@@ -159,6 +159,12 @@ rust_binary(
             proc_macro_dev = True,
         ),
         shard_count = 7,
+        # The jj 0.46 twin is manual-only (skipped by `//...` wildcard runs, still
+        # runnable by explicit label) since 2026-11-20: jj 0.46's store rewrite
+        # forces a whole-drive flush (F_FULLFSYNC) per operation file on macOS
+        # and saturates the shared remote workers. Re-enable once the 0.46 suite
+        # is made cheap (its GC fixture is being shrunk separately).
+        tags = ["manual"] if name.endswith("_jj_046_test") else [],
         deps = TEST_DEPS + [
             "//tools/boss/engine/pane-summary",
             "//tools/boss/engine/prose-vocabulary",
