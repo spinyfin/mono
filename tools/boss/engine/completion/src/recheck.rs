@@ -500,24 +500,38 @@ impl WorkerCompletionHandler {
                         %reason,
                         "pr-recheck-late: PR does not target the default branch; leaving the task unbound",
                     );
-                    match self.work_db.upsert_work_item_attention(
-                        &candidate.work_item_id,
-                        PR_BASE_REFUSED,
-                        "PR must target the default branch",
-                        &format!("{pr_url}: {reason}"),
-                    ) {
-                        Ok(_) => {
-                            if let Ok(item) = self.work_db.get_work_item(&candidate.work_item_id) {
-                                self.publisher
-                                    .publish_work_item_changed(
-                                        item.product_id(),
-                                        &candidate.work_item_id,
-                                        PR_BASE_REFUSED,
-                                    )
-                                    .await;
+                    let body = format!("{pr_url}: {reason}");
+                    // This runs every sweep for recently terminal executions; an
+                    // unchanged refusal must not re-raise and republish each pass.
+                    let already_raised = self
+                        .work_db
+                        .list_attention_items_for_work_item(&candidate.work_item_id)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .any(|i| i.kind == PR_BASE_REFUSED && i.status == "open" && i.body_markdown == body)
+                        })
+                        .unwrap_or(false);
+                    if !already_raised {
+                        match self.work_db.upsert_work_item_attention(
+                            &candidate.work_item_id,
+                            PR_BASE_REFUSED,
+                            "PR must target the default branch",
+                            &body,
+                        ) {
+                            Ok(_) => {
+                                if let Ok(item) = self.work_db.get_work_item(&candidate.work_item_id) {
+                                    self.publisher
+                                        .publish_work_item_changed(
+                                            item.product_id(),
+                                            &candidate.work_item_id,
+                                            PR_BASE_REFUSED,
+                                        )
+                                        .await;
+                                }
                             }
+                            Err(err) => tracing::warn!(?err, "late PR recovery: could not record base refusal"),
                         }
-                        Err(err) => tracing::warn!(?err, "late PR recovery: could not record base refusal"),
                     }
                     return StopOutcome::PrBaseRefused { pr_url, detail };
                 }

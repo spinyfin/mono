@@ -108,6 +108,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
 use boss_github::gh_runner::{CommandGhRunner, GhRunner, GhRunnerError};
+use boss_github::trees::DefaultBranchCache;
 use boss_protocol::WorkItem;
 
 use crate::completion::{CommandPrDetector, PrDetector, PrStatus, expected_branch_name, parse_repo_slug};
@@ -184,14 +185,14 @@ pub(crate) trait PrAutoCreator: Send + Sync {
 /// this cache and [`Self::branch_ref_exists`] together address).
 struct CommandPrAutoCreator {
     gh: Arc<dyn GhRunner>,
-    default_branch_cache: AsyncMutex<HashMap<String, String>>,
+    default_branch_cache: DefaultBranchCache,
 }
 
 impl CommandPrAutoCreator {
     fn new() -> Self {
         Self {
             gh: Arc::new(CommandGhRunner),
-            default_branch_cache: AsyncMutex::new(HashMap::new()),
+            default_branch_cache: DefaultBranchCache::default(),
         }
     }
 
@@ -231,23 +232,18 @@ impl CommandPrAutoCreator {
     }
 
     async fn default_branch(&self, repo_slug: &str) -> Result<String, GhRunnerError> {
-        if let Some(cached) = self.default_branch_cache.lock().await.get(repo_slug) {
-            return Ok(cached.clone());
-        }
-        let resp = self.gh.rest_get(&format!("repos/{repo_slug}"), None).await?;
-        let branch = resp
-            .body
-            .get("default_branch")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                GhRunnerError::transient(format!("repos/{repo_slug} response had no default_branch field"))
-            })?;
         self.default_branch_cache
-            .lock()
+            .get_or_fetch(repo_slug, || async {
+                let resp = self.gh.rest_get(&format!("repos/{repo_slug}"), None).await?;
+                resp.body
+                    .get("default_branch")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        GhRunnerError::transient(format!("repos/{repo_slug} response had no default_branch field"))
+                    })
+            })
             .await
-            .insert(repo_slug.to_owned(), branch.clone());
-        Ok(branch)
     }
 }
 
@@ -1203,7 +1199,7 @@ mod tests {
     fn creator_with_fake_gh(fake: Arc<FakeGhRunner>) -> CommandPrAutoCreator {
         CommandPrAutoCreator {
             gh: fake,
-            default_branch_cache: AsyncMutex::new(HashMap::new()),
+            default_branch_cache: DefaultBranchCache::default(),
         }
     }
 

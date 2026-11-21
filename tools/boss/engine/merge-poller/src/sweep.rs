@@ -731,39 +731,15 @@ pub(crate) async fn sweep_one(
             return;
         }
     };
-    let base_attentions = match work_db.list_attention_items_for_work_item(&candidate.work_item_id) {
-        Ok(items) => items
-            .into_iter()
-            .filter(|item| item.kind == PR_BASE_REFUSED && item.status == "open")
-            .collect::<Vec<_>>(),
-        Err(err) => {
-            tracing::warn!(?err, "merge poller: could not read PR base refusals");
-            return;
-        }
+    let base_attentions = match open_base_refusals(work_db, candidate) {
+        Some(items) => items,
+        None => return,
     };
-    if let Some(reason) = &probe_result.base_branch_error {
-        let detail = format!(
-            "{} was observed as {:?} with base `{}`. It cannot complete this work item or release dependents. {reason}",
-            candidate.pr_url,
-            probe_result.state,
-            probe_result.base_ref_name.as_deref().unwrap_or("unknown"),
-        );
-        // Do not re-raise and republish an unchanged observation every pass.
-        if !base_attentions.iter().any(|item| item.body_markdown == detail) {
-            match work_db.upsert_refreshing_work_item_attention(
-                &candidate.work_item_id,
-                PR_BASE_REFUSED,
-                "PR has not landed in the default branch",
-                &detail,
-            ) {
-                Ok(()) => {
-                    publisher
-                        .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, PR_BASE_REFUSED)
-                        .await
-                }
-                Err(err) => tracing::warn!(?err, "merge poller: could not surface PR base refusal"),
-            }
-        }
+    // A closed-unmerged PR never landed anywhere, so its base needs no check:
+    // it falls through to the ordinary closed-unmerged retirement.
+    if !matches!(probe_result.state, PrLifecycleState::ClosedUnmerged)
+        && refuse_unlanded_base(work_db, publisher, candidate, &probe_result, &base_attentions).await
+    {
         update_pr_poll_state(work_db, publisher, candidate, &probe_result, None, caller).await;
         return;
     }
@@ -2097,6 +2073,69 @@ fn queue_failure_detail_json(failed_checks: &str) -> Option<String> {
     }
 }
 
+/// Open `pr_base_refused` attentions for the item, or `None` when they could
+/// not be read.
+fn open_base_refusals(
+    work_db: &WorkDb,
+    candidate: &PendingMergeCheck,
+) -> Option<Vec<boss_protocol::WorkAttentionItem>> {
+    match work_db.list_attention_items_for_work_item(&candidate.work_item_id) {
+        Ok(items) => Some(
+            items
+                .into_iter()
+                .filter(|item| item.kind == PR_BASE_REFUSED && item.status == "open")
+                .collect(),
+        ),
+        Err(err) => {
+            tracing::warn!(?err, "merge poller: could not read PR base refusals");
+            None
+        }
+    }
+}
+
+/// When the probe shows the PR targets a branch other than the repository
+/// default, raise (once per unchanged observation) the `pr_base_refused`
+/// attention and return `true`: the PR must not complete the work item or
+/// release its dependents.
+async fn refuse_unlanded_base(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    open_refusals: &[boss_protocol::WorkAttentionItem],
+) -> bool {
+    let Some(reason) = &probe.base_branch_error else {
+        return false;
+    };
+    let state = match &probe.state {
+        PrLifecycleState::Open(_) => "open",
+        PrLifecycleState::Merged => "merged",
+        PrLifecycleState::ClosedUnmerged => "closed without merging",
+    };
+    let detail = format!(
+        "{} was observed as {state} with base `{}`. It cannot complete this work item or release dependents. {reason}",
+        candidate.pr_url,
+        probe.base_ref_name.as_deref().unwrap_or("unknown"),
+    );
+    // Do not re-raise and republish an unchanged observation every pass.
+    if !open_refusals.iter().any(|item| item.body_markdown == detail) {
+        match work_db.upsert_refreshing_work_item_attention(
+            &candidate.work_item_id,
+            PR_BASE_REFUSED,
+            "PR has not landed in the default branch",
+            &detail,
+        ) {
+            Ok(()) => {
+                publisher
+                    .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, PR_BASE_REFUSED)
+                    .await
+            }
+            Err(err) => tracing::warn!(?err, "merge poller: could not surface PR base refusal"),
+        }
+    }
+    true
+}
+
 pub(crate) async fn mark_merged(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -2104,6 +2143,14 @@ pub(crate) async fn mark_merged(
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
 ) -> bool {
+    // Every merge-completion caller shares this guard: a merge into a branch
+    // other than the default does not land the work.
+    if probe.base_branch_error.is_some() {
+        if let Some(open) = open_base_refusals(work_db, candidate) {
+            refuse_unlanded_base(work_db, publisher, candidate, probe, &open).await;
+        }
+        return false;
+    }
     let observation = match work_db.observe_chore_pr_merged(&candidate.work_item_id, &candidate.pr_url) {
         Ok(observation) => observation,
         Err(err) => {
