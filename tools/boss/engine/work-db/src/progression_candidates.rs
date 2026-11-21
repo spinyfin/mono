@@ -35,15 +35,15 @@
 //!    `blocked: awaiting_operator_answer`, an operator-refused `worker_failed`
 //!    and the other holds the stuck report counts as waiting on a human. Done,
 //!    archived and soft-deleted rows are not rows of the view at all.
-//! 2. **No live or pending work** (`queued | ready | waiting_dependency |
-//!    claimed | running | waiting_human`) on the item, on its revisions, or on
-//!    any item sharing its PR, and no in-flight `ci_remediations` /
-//!    `conflict_resolutions` attempt on that family whose revision is missing or
-//!    still open. `waiting_dependency` counts everywhere in the family, as
-//!    design 2.1 specifies. A dead revision head that a later revision is
-//!    serialized behind (S13) is therefore not nominated while that gate row
-//!    exists; the engine-side fix that stops gating behind a dead head owns that
-//!    shape. An in-flight ladder attempt is named separately in
+//! 2. **No progressing work** (`queued | ready | claimed | running |
+//!    waiting_human`) on the item, its revisions, or any item sharing its PR.
+//!    Dependency-waiting executions hold a family only while a prerequisite
+//!    family is progressing, transitively. An idle gate cannot hide a failed
+//!    revision forever. CI/conflict attempts with a revision hold only while
+//!    that revision's family is progressing, and never hold their own revision
+//!    as a ladder candidate. Attempts without a revision still protect the
+//!    engine's mechanical work and revision-creation window. An in-flight
+//!    ladder attempt is named separately in
 //!    [`ProgressionClauses::no_inflight_ladder`] so diagnose can say which half
 //!    of the clause failed.
 //! 3. **Not waiting on capacity.** No queued execution of the item carries a
@@ -347,7 +347,7 @@ fn not_capacity_wait_sql(a: &str) -> String {
 }
 
 /// Clause 2, execution half: nothing live or pending anywhere in the item's
-/// family, `waiting_dependency` included (design 2.1). `family` is the alias of
+/// family, including dependency waits backed by progressing work. `family` is the alias of
 /// the item's `progression_family_keys` row, joined by the caller. The family
 /// test is a one-time `IN` set, not a correlated lookup, because the chain walk
 /// behind it is a recursive query that must be evaluated once per statement
@@ -357,29 +357,32 @@ fn no_live_work_sql(family: &str) -> String {
 }
 
 /// Clause 2, ladder half: no in-flight `ci_remediations` or
-/// `conflict_resolutions` attempt on the family whose revision is missing or
-/// still open. An attempt that has already finished, or whose revision is
-/// `done`/`archived`, does not exclude the item even if a live execution is
-/// also absent — that is the window the generic live-work check cannot see.
-/// Like clause 2's execution half this is a one-time `IN` set over
-/// `progression_ladder_families`.
-fn no_inflight_ladder_sql(family: &str) -> String {
-    format!("NOT COALESCE({family}.family_key IN (SELECT family_key FROM progression_ladder_families), 0)")
+/// `conflict_resolutions` attempt doing work. Never let an attempt's own
+/// revision exclude itself; the execution half still protects live workers.
+fn no_inflight_ladder_sql(item: &str) -> String {
+    format!("{item}.id NOT IN (SELECT task_id FROM progression_ladder_families)")
 }
 
 /// The view behind [`no_inflight_ladder_sql`]: families with an attempt in
-/// either ladder table that is `pending` or `running` and whose revision is
-/// missing or still open.
+/// either ladder table that is `pending` or `running`. An open revision alone
+/// is not progress: it must have progressing work in its family. A NULL
+/// revision still protects mechanical attempts and the revision-creation window.
+/// Expand to affected family members here, excluding the attempt's own revision,
+/// so the recursive family/liveness sets stay uncorrelated with candidate rows.
 fn ladder_families_select() -> String {
     let attempt = |table: &str| {
         format!(
-            "SELECT rk.family_key AS family_key
+            "SELECT rk.family_key AS family_key, candidate.task_id AS task_id
              FROM {table} r
              JOIN progression_family_keys rk ON rk.task_id = r.work_item_id
+             JOIN progression_family_keys candidate ON candidate.family_key = rk.family_key
              LEFT JOIN tasks rt ON rt.id = r.revision_task_id AND rt.deleted_at IS NULL
              WHERE r.status IN ('pending', 'running')
+               AND r.revision_task_id IS NOT candidate.task_id
                AND (r.revision_task_id IS NULL
-                    OR (rt.id IS NOT NULL AND rt.status NOT IN ('done', 'archived')))"
+                    OR (rt.id IS NOT NULL AND rt.status NOT IN ('done', 'archived')
+                        AND rt.id IN (SELECT k.task_id FROM progression_family_keys k
+                                      WHERE k.family_key IN (SELECT family_key FROM progression_live_families))))"
         )
     };
     format!(
@@ -641,7 +644,7 @@ fn views_sql() -> String {
     let stuck_kind = stuck_kind_sql("t", "root");
     let stuck_since = stuck_since_sql("t");
     let no_live_work = no_live_work_sql("fk");
-    let no_inflight_ladder = no_inflight_ladder_sql("fk");
+    let no_inflight_ladder = no_inflight_ladder_sql("t");
     let not_capacity_wait = not_capacity_wait_sql("t");
     let dependency_held = dependency_held_sql("t");
     let ladder_families = ladder_families_select();
@@ -685,13 +688,23 @@ fn views_sql() -> String {
          JOIN tasks r ON r.id = c.root_id
          JOIN tasks m ON m.id = c.task_id;
 
-         -- The families with live or pending work in them, `waiting_dependency`
-         -- gates included (design 2.1 clause 2).
+         -- Follow waiting gates only back to actual progressing work. UNION
+         -- terminates cycles; a cycle of idle waits cannot keep itself live.
          CREATE VIEW progression_live_families AS
-         SELECT DISTINCT k.family_key AS family_key
-         FROM progression_family_keys k
-         JOIN work_executions e ON e.work_item_id = k.task_id
-         WHERE e.status IN {LIVE_OR_PENDING};
+         WITH RECURSIVE live(family_key) AS (
+             SELECT k.family_key FROM progression_family_keys k
+             JOIN work_executions e ON e.work_item_id = k.task_id
+             WHERE e.status IN ('queued','ready','claimed','running','waiting_human')
+                OR (e.kind = 'progression' AND e.status = 'waiting_dependency')
+             UNION
+             SELECT dk.family_key FROM live l
+             JOIN progression_family_keys pk ON pk.family_key = l.family_key
+             JOIN progression_prereq_task_edges p ON p.prerequisite_task_id = pk.task_id
+             JOIN work_executions e ON e.work_item_id = p.dependent_id
+               AND e.status = 'waiting_dependency'
+             JOIN progression_family_keys dk ON dk.task_id = p.dependent_id
+         )
+         SELECT family_key FROM live;
 
          -- The families with an in-flight CI-fix or conflict-resolution attempt.
          CREATE VIEW progression_ladder_families AS
@@ -801,7 +814,7 @@ pub struct ProgressionClauses {
     /// revisions or its PR.
     pub no_live_work: bool,
     /// Clause 2, ladder half: no in-flight CI-fix or conflict-resolution
-    /// attempt on the family whose revision is missing or still open.
+    /// attempt doing work on the family, excluding the candidate's own attempt.
     #[builder(default = true)]
     pub no_inflight_ladder: bool,
     /// Clause 3: not waiting on capacity.
