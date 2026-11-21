@@ -1752,43 +1752,7 @@ impl WorkDb {
     /// discard a redundant `ready` execution before it ever reaches
     /// `start_execution_run`.
     pub fn mark_execution_redundant(&self, execution_id: &str) -> Result<()> {
-        let conn = self.connect()?;
-        let existing = query_execution(&conn, execution_id)?;
-        let now = now_string();
-        let updated = match &existing {
-            Some(existing) if !existing.status.is_terminal() => crate::task_status_audit::abandon(
-                &conn,
-                crate::task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
-                "UPDATE work_executions
-                 SET status = 'abandoned',
-                     finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = ?1",
-                rusqlite::params![execution_id, now],
-            )?,
-            _ => 0,
-        };
-        // Canonical terminalization trace — see
-        // `WorkDb::mark_execution_orphaned` in executions_runs.rs. The
-        // double-spawn guard abandoning a redundant duplicate is exactly
-        // the secondary-incident shape (a cross-kind duplicate execution
-        // that got abandoned and shadowed the real one), so this site must
-        // be attributable from the trace alone too.
-        if updated > 0 {
-            let existing = existing.expect("updated > 0 implies existing was Some and non-terminal");
-            tracing::warn!(
-                execution_id = %execution_id,
-                work_item_id = %existing.work_item_id,
-                from_status = %existing.status,
-                to_status = "abandoned",
-                reason = "redundant duplicate execution",
-                "execution terminalized: mark redundant",
-            );
-            // No open `Transaction` here — `conn` auto-commits each
-            // statement, so the UPDATE above is already durable and this
-            // publish carries no rollback risk.
-            publish_execution_terminal(&self.event_bus, &conn, execution_id, &existing.work_item_id)?;
-        }
-        Ok(())
+        self.mark_execution_redundant_impl(execution_id, None)
     }
 
     /// Like [`Self::mark_execution_redundant`], and stamps cancellation source,
@@ -1798,6 +1762,14 @@ impl WorkDb {
         &self,
         execution_id: &str,
         provenance: boss_protocol::CancelProvenance,
+    ) -> Result<()> {
+        self.mark_execution_redundant_impl(execution_id, Some(&provenance))
+    }
+
+    fn mark_execution_redundant_impl(
+        &self,
+        execution_id: &str,
+        provenance: Option<&boss_protocol::CancelProvenance>,
     ) -> Result<()> {
         let conn = self.connect()?;
         let existing = query_execution(&conn, execution_id)?;
@@ -1816,9 +1788,9 @@ impl WorkDb {
                 rusqlite::params![
                     execution_id,
                     now,
-                    provenance.source.as_str(),
-                    provenance.actor,
-                    provenance.reason
+                    provenance.map(|p| p.source.as_str()),
+                    provenance.map(|p| p.actor.as_str()),
+                    provenance.map(|p| p.reason.as_str())
                 ],
             )?,
             _ => 0,
@@ -1830,23 +1802,25 @@ impl WorkDb {
                 work_item_id = %existing.work_item_id,
                 from_status = %existing.status,
                 to_status = "abandoned",
-                source = %provenance.source,
-                actor = %provenance.actor,
-                reason = %provenance.reason,
+                source = ?provenance.map(|p| p.source),
+                actor = ?provenance.map(|p| &p.actor),
+                reason = provenance.map(|p| p.reason.as_str()).unwrap_or("redundant duplicate execution"),
                 "execution terminalized: mark redundant",
             );
-            let mut pending = PendingEvents::new();
-            stage_doomed_audit_only(
-                &mut pending,
-                &[DoomedExecution::new(
-                    execution_id,
-                    &existing.work_item_id,
-                    existing.status.as_str(),
-                )],
-                &ExecutionStatus::Abandoned,
-                &provenance,
-            );
-            self.flush_pending(pending);
+            if let Some(provenance) = provenance {
+                let mut pending = PendingEvents::new();
+                stage_doomed_audit_only(
+                    &mut pending,
+                    &[DoomedExecution::new(
+                        execution_id,
+                        &existing.work_item_id,
+                        existing.status.as_str(),
+                    )],
+                    &ExecutionStatus::Abandoned,
+                    provenance,
+                );
+                self.flush_pending(pending);
+            }
             // No open `Transaction` here — `conn` auto-commits each
             // statement, so the UPDATE above is already durable and this
             // publish carries no rollback risk.

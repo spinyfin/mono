@@ -71,31 +71,7 @@ impl WorkDb {
     /// Like [`Self::cancel_execution`], but accepts a reason and the
     /// `queued_only` gate used by `bossctl executions cancel`.
     pub fn cancel_execution_with(&self, execution_id: &str, opts: CancelExecutionOpts) -> Result<WorkExecution> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let reason = normalize_optional_text(opts.reason.clone()).unwrap_or_else(|| "explicit cancel".to_owned());
-        let mut pending = PendingEvents::new();
-        let updated = cancel_execution_in_tx(&tx, &mut pending, execution_id, opts)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
-        // `connect()` is a process-wide mutex; drop it before the review-guide
-        // follow-up, which needs its own connection.
-        drop(conn);
-        if existing.kind == ExecutionKind::PrReviewGuide
-            && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
-                execution_id,
-                ExecutionStatus::Cancelled,
-                &reason,
-                false,
-            )
-        {
-            tracing::warn!(
-                execution_id = %execution_id,
-                ?err,
-                "review-guide: cancelled the execution but failed to cancel the bound attempt",
-            );
-        }
-        Ok(updated)
+        self.cancel_execution_impl(execution_id, opts, None, &DecisionAuditContext::default())
     }
 
     /// Like [`Self::cancel_execution_with`], and stamps cancellation source,
@@ -109,14 +85,29 @@ impl WorkDb {
         provenance: boss_protocol::CancelProvenance,
         context: DecisionAuditContext,
     ) -> Result<WorkExecution> {
+        self.cancel_execution_impl(execution_id, opts, Some(&provenance), &context)
+    }
+
+    fn cancel_execution_impl(
+        &self,
+        execution_id: &str,
+        opts: CancelExecutionOpts,
+        provenance: Option<&boss_protocol::CancelProvenance>,
+        context: &DecisionAuditContext,
+    ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let reason = provenance.reason.clone();
+        let reason = provenance
+            .map(|p| p.reason.clone())
+            .or_else(|| normalize_optional_text(opts.reason.clone()))
+            .unwrap_or_else(|| "explicit cancel".to_owned());
         let mut pending = PendingEvents::new();
         let updated =
-            cancel_execution_in_tx_with_provenance(&tx, &mut pending, execution_id, opts, Some(&provenance), &context)?;
+            cancel_execution_in_tx_with_provenance(&tx, &mut pending, execution_id, opts, provenance, context)?;
         self.commit_pending(tx, pending)?;
+        // `connect()` is a process-wide mutex; drop it before the review-guide
+        // follow-up, which needs its own connection.
         drop(conn);
         if existing.kind == ExecutionKind::PrReviewGuide
             && let Err(err) = self.finish_pr_review_guide_attempt_for_terminal_execution(
@@ -2358,7 +2349,10 @@ pub(super) fn cancel_execution_in_tx_with_provenance(
             &DoomedExecution::new(execution_id, &updated.work_item_id, existing.status.as_str()),
             &ExecutionStatus::Cancelled,
             provenance,
-            context,
+            &DecisionAuditContext {
+                queued_only: Some(opts.queued_only),
+                ..context.clone()
+            },
         )?;
     } else {
         tracing::warn!(

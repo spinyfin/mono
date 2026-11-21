@@ -42,8 +42,8 @@ use boss_event_bus::{Event, EventBus};
 static ENGINE_AUDIT_SINK: OnceLock<fn(&str, &serde_json::Value)> = OnceLock::new();
 
 /// Install the process-wide writer for staged engine-audit records.
-/// The engine process registers `audit::record_event` at startup so
-/// work-db can flush cancel/abandon records without depending on core.
+/// Records are dropped until a writer is installed; engine startup does
+/// not currently register one. Dispatch-sink publication is independent.
 pub fn set_engine_audit_sink(sink: fn(&str, &serde_json::Value)) {
     let _ = ENGINE_AUDIT_SINK.set(sink);
 }
@@ -193,11 +193,22 @@ mod tests {
             "to_status": "abandoned", "source": "scheduler_preemption",
             "actor": "scheduler", "reason": "higher priority work needs this slot",
         });
-        {
-            let _tx = conn.transaction().unwrap();
-            let mut pending = PendingEvents::new();
-            pending.push_audit("execution_abandoned", payload.clone());
-        }
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+            CREATE TABLE parent (id INTEGER PRIMARY KEY);
+            CREATE TABLE child (parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO child VALUES (999)", []).unwrap();
+        let mut pending = PendingEvents::new();
+        pending.push_audit("execution_abandoned", payload.clone());
+        assert!(commit_and_publish_with_sink(tx, pending, &bus, &sink).is_err());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM child", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert!(sink.events().await.is_empty(), "rolled-back provenance must not escape");
         let tx = conn.transaction().unwrap();
         let mut pending = PendingEvents::new();

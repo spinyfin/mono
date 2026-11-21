@@ -42,7 +42,7 @@ use std::sync::{Arc, LazyLock};
 use async_trait::async_trait;
 use boss_engine_jsonl_append::JsonlAppender;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// Synthetic execution id for dispatch events that describe engine boot rather
 /// than a single durable execution.
@@ -1288,9 +1288,8 @@ pub trait DispatchEventSink: Send + Sync {
     async fn emit(&self, event: DispatchEvent);
     /// Record `event` on the calling thread. Used after a durable cancel
     /// commit so provenance is not queued on a bounded, lossy mailbox.
-    /// Existing sinks keep the historical async emit path; a no-op default
-    /// lets them compile until they implement a synchronous write.
-    fn emit_sync(&self, _event: DispatchEvent) {}
+    /// Every sink must explicitly implement this path to avoid losing events.
+    fn emit_sync(&self, event: DispatchEvent);
 }
 
 /// Default sink for tests and any caller that doesn't want the
@@ -1457,10 +1456,10 @@ impl JsonlFileSink {
     /// drift across process restarts — and needs no bookkeeping: an
     /// in-memory counter would have to be re-seeded from the file length on
     /// every startup to avoid drift, which is strictly more state than this.
-    async fn maybe_rotate_current(&self, current_path: &Path) {
-        let _guard = ROTATION_LOCK.lock().await;
+    fn maybe_rotate_current(&self, current_path: &Path) {
+        let _guard = ROTATION_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
-        let len = match tokio::fs::metadata(current_path).await {
+        let len = match std::fs::metadata(current_path) {
             Ok(meta) => meta.len(),
             Err(_) => return,
         };
@@ -1469,7 +1468,7 @@ impl JsonlFileSink {
         }
 
         let rotated = boss_log_files::next_rotated_path(current_path);
-        if let Err(err) = tokio::fs::rename(current_path, &rotated).await {
+        if let Err(err) = std::fs::rename(current_path, &rotated) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(
                     ?err,
@@ -1480,7 +1479,7 @@ impl JsonlFileSink {
             return;
         }
 
-        if let Err(err) = recreate_live_file(current_path).await {
+        if let Err(err) = recreate_live_file(current_path) {
             tracing::warn!(
                 ?err,
                 path = %current_path.display(),
@@ -1493,7 +1492,7 @@ impl JsonlFileSink {
             return;
         }
         for path in &to_prune[..to_prune.len() - self.max_files] {
-            if let Err(err) = tokio::fs::remove_file(path).await {
+            if let Err(err) = std::fs::remove_file(path) {
                 tracing::warn!(?err, path = %path.display(), "failed to prune old dispatch-events segment");
             }
         }
@@ -1506,25 +1505,27 @@ impl JsonlFileSink {
 /// `boss_engine_jsonl_append::APPEND_LOCK`, not `ROTATION_LOCK`) and write its
 /// line into a freshly-created file before this call runs; a truncating
 /// create (e.g. `tokio::fs::File::create`) would silently erase that line.
-async fn recreate_live_file(path: &Path) -> std::io::Result<()> {
-    tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
+fn recreate_live_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     Ok(())
 }
 
 #[async_trait]
 impl DispatchEventSink for JsonlFileSink {
     async fn emit(&self, event: DispatchEvent) {
+        let sink = self.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || sink.emit_sync(event)).await {
+            tracing::warn!(?err, "dispatch event writer failed");
+        }
+    }
+
+    fn emit_sync(&self, event: DispatchEvent) {
         let current_path = self.current_path();
         let execution_path = self.execution_path(&event.execution_id);
 
         let mut results = self
             .appender
-            .append_to_all(&[current_path.as_path(), execution_path.as_path()], &event)
-            .await
+            .append_to_all_sync(&[current_path.as_path(), execution_path.as_path()], &event)
             .into_iter();
         let current_result = results.next().expect("append_to_all returns one result per input path");
         let execution_result = results.next().expect("append_to_all returns one result per input path");
@@ -1538,7 +1539,7 @@ impl DispatchEventSink for JsonlFileSink {
                 "failed to append dispatch event to current.jsonl; dropping"
             );
         } else {
-            self.maybe_rotate_current(&current_path).await;
+            self.maybe_rotate_current(&current_path);
         }
 
         if let Err(err) = execution_result {
@@ -1680,7 +1681,7 @@ mod tests {
         fs::write(&current_path, b"{\"raced\":true}\n").unwrap();
 
         // A now runs its recreate step.
-        recreate_live_file(&current_path).await.unwrap();
+        recreate_live_file(&current_path).unwrap();
 
         let content = fs::read_to_string(&current_path).unwrap();
         assert_eq!(
