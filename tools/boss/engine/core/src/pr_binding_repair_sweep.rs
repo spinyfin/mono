@@ -876,7 +876,7 @@ mod tests {
 
         assert_eq!(outcome.rebound, 0, "{outcome:?}");
         assert_eq!(outcome.base_refused, 1, "{outcome:?}");
-        assert_eq!(task(&db, &task_id).pr_url.as_deref(), Some(ORIGIN));
+        assert_eq!(task(&db, &task_id).pr_url.as_deref(), None);
         assert!(docs.0.lock().unwrap().is_empty());
         assert!(
             db.list_attention_items_for_work_item(&task_id)

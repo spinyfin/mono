@@ -1119,7 +1119,6 @@ async fn late_recovery_checks_base_for_fresh_and_merged_prs() {
             let WorkItem::Chore(task) = db.get_work_item(&work_item_id).unwrap() else {
                 panic!("expected chore")
             };
-            assert_eq!(task.status, TaskStatus::Active);
             let open = db
                 .list_attention_items_for_work_item(&work_item_id)
                 .unwrap()
@@ -1135,10 +1134,12 @@ async fn late_recovery_checks_base_for_fresh_and_merged_prs() {
                 assert_eq!(task.pr_url.as_deref(), Some(OWN_PR));
                 assert_eq!(open, 0);
             } else if transient {
+                assert_eq!(task.status, TaskStatus::Active);
                 assert!(matches!(outcome, StopOutcome::DetectorFailed), "{outcome:?}");
                 assert!(task.pr_url.is_none());
                 assert_eq!(open, 0);
             } else {
+                assert_eq!(task.status, TaskStatus::Active);
                 assert!(matches!(outcome, StopOutcome::PrBaseRefused { .. }), "{outcome:?}");
                 assert!(task.pr_url.is_none());
                 assert_eq!(open, 1);

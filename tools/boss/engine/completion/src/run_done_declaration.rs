@@ -375,9 +375,7 @@ impl WorkerCompletionHandler {
         let url = pr_url.clone();
         let check = tokio::task::spawn_blocking(move || checker.check(&url));
         match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
-            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => {
-                self.resolve_declared_pr_base(execution, pr_url, false).await
-            }
+            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => self.resolve_declared_pr_base(execution, pr_url, false).await,
             Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
             Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::ClosedUnmerged { pr_url },
             result => DeclaredPrResolution::Transient {

@@ -65,7 +65,6 @@ impl WorkerCompletionHandler {
         pr_url: &str,
     ) -> Option<StopOutcome> {
         use crate::work::PrBaseVerdict;
-        use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
         if !self.binds_new_pr(execution, pr_url) {
             self.resolve_pr_base_refusal_attention(&execution.id);
             return None;
@@ -137,7 +136,6 @@ impl WorkerCompletionHandler {
             tracing::warn!(?err, "failed to resolve PR base refusal attention");
         }
     }
-
 
     /// Expected branches of every primary implementation execution of
     /// `execution`'s work item, this execution's own first. A PR whose head
