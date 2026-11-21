@@ -251,6 +251,20 @@ final class NavigatorRowTests: XCTestCase {
         XCTAssertNotEqual(revisionConflict.symbol, revisionConflict.health?.symbol)
     }
 
+    func testAccessibilityAnnouncesEachCIStateOnceWithAndWithoutConflict() throws {
+        for (state, label) in [("fail", "CI failed"), ("in_progress", "CI pending"), ("success", "CI passed")] {
+            for mergeable in ["mergeable", "conflicting"] {
+                let row = try presentation(kind: "task", mergeable: mergeable, ci: state)
+                let parts = row.accessibilityLabel.components(separatedBy: ", ")
+                XCTAssertEqual(parts.filter { $0.hasPrefix("CI ") }, [label])
+                XCTAssertTrue(row.healthFacts.contains(label))
+                if mergeable == "conflicting" {
+                    XCTAssertEqual(parts.filter { $0 == "Merge conflict" }.count, 1)
+                }
+            }
+        }
+    }
+
     func testHealthPriorityKeepsSuppressedFactsAccessible() throws {
         var task = NavigatorTestFixture.task()
         task.prMergeableState = "conflicting"

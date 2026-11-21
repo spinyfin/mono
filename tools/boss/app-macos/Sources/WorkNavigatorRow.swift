@@ -46,7 +46,12 @@ struct NavigatorRowPresentation {
             }
         }
         if let ci = row.task.ciRequiredState {
-            facts.append("CI \(ci.replacingOccurrences(of: "_", with: " "))")
+            switch ci {
+            case "fail": facts.append("CI failed")
+            case "in_progress": facts.append("CI pending")
+            case "success": facts.append("CI passed")
+            default: facts.append("CI \(ci.replacingOccurrences(of: "_", with: " "))")
+            }
         }
         if let review = row.task.reviewRequiredState {
             facts.append("Review \(review.replacingOccurrences(of: "_", with: " "))")
