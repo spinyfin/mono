@@ -99,7 +99,7 @@ final class NavigatorRowTests: XCTestCase {
             XCTAssertTrue(presentation.accessibilityLabel.contains("Review changes requested"))
             XCTAssertTrue(presentation.accessibilityLabel.contains("1 questions"))
             XCTAssertTrue(presentation.accessibilityLabel.contains(task.name))
-            let view = WorkNavigatorRow(row: row, project: "Navigation", width: width, isSelected: true, liveWorkers: LiveWorkerStateStore())
+            let view = WorkNavigatorRow(row: row, project: "Navigation", width: width, isSelected: true, isWorkerActive: false)
                 .frame(width: width).background(Color(nsColor: .windowBackgroundColor))
             let host = NSHostingView(rootView: view)
             host.frame = NSRect(origin: .zero, size: host.fittingSize)
@@ -107,7 +107,7 @@ final class NavigatorRowTests: XCTestCase {
             XCTAssertEqual(host.bounds.height, 30, accuracy: 1)
             try capture(host, name: "navigator-row-\(Int(width))")
         }
-        let large = NSHostingView(rootView: WorkNavigatorRow(row: row, project: "Navigation", width: 260, isSelected: false, liveWorkers: LiveWorkerStateStore())
+        let large = NSHostingView(rootView: WorkNavigatorRow(row: row, project: "Navigation", width: 260, isSelected: false, isWorkerActive: false)
             .dynamicTypeSize(.accessibility3).frame(width: 260).background(Color(nsColor: .windowBackgroundColor)))
         large.frame = NSRect(origin: .zero, size: large.fittingSize)
         XCTAssertEqual(large.bounds.width, 260, accuracy: 1)
@@ -122,6 +122,77 @@ final class NavigatorRowTests: XCTestCase {
         let active = NavigatorRowPresentation(row: row, project: nil, width: 260, isWorkerActive: true)
         XCTAssertTrue(idle.accessibilityLabel.contains("Worker idle"))
         XCTAssertTrue(active.accessibilityLabel.contains("Worker active"))
+    }
+
+    func testRevealRepublishesNavigatorChromeWhenSelectionIsAlreadyVisible() {
+        let model = NavigatorTestFixture.model([NavigatorTestFixture.task()])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("root")
+        model.revealNavigatorSelection()
+        model.presentationUpdates.flush()
+        XCTAssertEqual(model.navigator.selectedRootID, "root")
+        XCTAssertFalse(model.navigatorCollapsed.contains(.working))
+        XCTAssertTrue(model.workSearchText.isEmpty)
+
+        let chrome = WorkPresentationValue(updates: model.presentationUpdates) {
+            NavigatorChromeValue(model: model)
+        }
+        var publications = 0
+        let subscription = chrome.objectWillChange.sink { publications += 1 }
+        for action in 0..<3 {
+            let before = chrome.value
+            if action == 0 {
+                model.revealNavigatorSelection()
+            } else {
+                model.moveNavigatorSelection(by: action == 1 ? -1 : 1, edge: true)
+            }
+            model.presentationUpdates.flush()
+            XCTAssertEqual(publications, action + 1, "Each reveal must reach the scroll observer")
+            XCTAssertNotEqual(chrome.value.revealGeneration, before.revealGeneration)
+            XCTAssertEqual(chrome.value.revealGeneration, model.navigator.revealGeneration)
+            XCTAssertEqual(chrome.value.selectedRootID, before.selectedRootID)
+            XCTAssertEqual(chrome.value.collapsed, before.collapsed)
+            XCTAssertEqual(chrome.value.searchText, before.searchText)
+            XCTAssertEqual(chrome.value.sections, before.sections)
+        }
+        model.presentationUpdates.flush()
+        XCTAssertEqual(publications, 3, "A completed reveal must not replay on a later flush")
+        withExtendedLifetime(subscription) {}
+    }
+
+    func testWorkerTicksDoNotInvalidateNavigatorChromeOrUnrelatedRows() throws {
+        let task = NavigatorTestFixture.task("root", section: "working")
+        let model = NavigatorTestFixture.model([task])
+        func worker(_ run: String, _ activity: WorkerActivity, _ status: String) -> WorkerLiveState {
+            WorkerLiveState(slotId: 1, runId: run, model: "fixture", shellPid: 0, lastEventAt: nil,
+                currentTool: nil, lastToolEndedAt: nil, activity: activity, liveStatus: status,
+                liveStatusAt: nil, recoveryStatus: nil, tmuxHosted: true)
+        }
+        var chromeReads = 0
+        let chrome = WorkPresentationValue(updates: model.presentationUpdates) {
+            chromeReads += 1
+            return NavigatorChromeValue(model: model)
+        }
+        let row = NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil)
+        let rowState = NavigatorRowLiveState(model: model, row: row)
+        var chromeChanges = 0
+        var rowChanges = 0
+        let subscriptions = [
+            chrome.objectWillChange.sink { chromeChanges += 1 },
+            rowState.objectWillChange.sink { rowChanges += 1 },
+        ]
+        for tick in 0..<100 {
+            model.liveWorkerStates.update(states: (0..<20).map { worker("other-\($0)", .working, "tick \(tick)") })
+            model.presentationUpdates.flush()
+        }
+        XCTAssertEqual(chromeChanges, 0)
+        XCTAssertEqual(chromeReads, 1, "Live-only ticks must not rederive navigator chrome")
+        XCTAssertEqual(rowChanges, 0, "A row must ignore other workers' ticks")
+        model.liveWorkerStates.update(states: [worker("run", .working, "go")])
+        model.presentationUpdates.flush()
+        XCTAssertEqual(rowChanges, 1)
+        XCTAssertTrue(rowState.isWorkerActive)
+        withExtendedLifetime(subscriptions) {}
     }
 
     func testActiveDetectionMapsLiveWorkerStateToRow() throws {

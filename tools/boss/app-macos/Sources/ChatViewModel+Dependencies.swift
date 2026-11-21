@@ -140,10 +140,10 @@ extension ChatViewModel {
     /// `EventBindingManager.enqueueHoverUpdateIfNeeded()`). An
     /// unconditional assignment to a `@Published` fires
     /// `objectWillChange` even when the value is identical, and
-    /// `WorkBoardSectionItemsView` observes the whole `ChatViewModel`
-    /// and reads this set — so one no-op hover tick re-evaluated the
-    /// column, rebuilt every card's `WorkCardSnapshot`, and re-applied
-    /// the entire `LazyVStack` list, which invalidated the responder
+    /// every mounted card's `WorkCardRenderState` rebuilds its
+    /// `WorkCardSnapshot` when this set changes (it feeds the frontier
+    /// highlight) — so a no-op hover tick that still published would rebuild
+    /// every card and re-apply the entire `LazyVStack` list, which invalidated the responder
     /// tree and enqueued the next hover update. That is a closed
     /// re-entrant loop with no fixed point; see
     /// `tools/boss/docs/investigations/work-board-layout-livelock-2026-08-07.md`.

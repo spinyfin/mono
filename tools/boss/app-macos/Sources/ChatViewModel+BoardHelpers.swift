@@ -215,42 +215,22 @@ extension ChatViewModel {
     /// unsatisfied dependency gating it — if it did, the engine would
     /// have set `status = "blocked"`. These are tasks ready to dispatch.
     func unblockedTaskCount(forProjectID projectID: String) -> Int {
-        let parkedProjects = parkedProjectsByID
-        return (tasksByProjectID[projectID] ?? []).filter {
-            $0.status == "todo" && !isParked($0, parkedProjects: parkedProjects)
-        }.count
+        sidebarCounts.projects[projectID, default: .init()].unblocked
     }
 
     /// Count of dependency-blocked tasks for `projectID`. The engine
     /// sets `blocked_reason = "dependency"` when a task is gated by at
     /// least one unsatisfied prerequisite edge.
     func blockedTaskCount(forProjectID projectID: String) -> Int {
-        let parkedProjects = parkedProjectsByID
-        return (tasksByProjectID[projectID] ?? []).filter {
-            $0.status == "blocked" && $0.blockedReason == "dependency"
-                && !isParked($0, parkedProjects: parkedProjects)
-        }.count
+        sidebarCounts.projects[projectID, default: .init()].blocked
     }
 
     var unblockedChoreCount: Int {
-        guard let productID = currentSelectedProductID else { return 0 }
-        let parkedProjects = parkedProjectsByID
-        let isTodo: (WorkTask) -> Bool = { $0.status == "todo" && !self.isParked($0, parkedProjects: parkedProjects) }
-        let chores = (choresByProductID[productID] ?? []).filter(isTodo)
-        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter(isTodo)
-        return chores.count + projectlessTasks.count
+        sidebarCounts.products[currentSelectedProductID ?? "", default: .init()].unblocked
     }
 
     var blockedChoreCount: Int {
-        guard let productID = currentSelectedProductID else { return 0 }
-        let parkedProjects = parkedProjectsByID
-        let isBlocked: (WorkTask) -> Bool = {
-            $0.status == "blocked" && $0.blockedReason == "dependency"
-                && !self.isParked($0, parkedProjects: parkedProjects)
-        }
-        let chores = (choresByProductID[productID] ?? []).filter(isBlocked)
-        let projectlessTasks = (productLevelTasksByProductID[productID] ?? []).filter(isBlocked)
-        return chores.count + projectlessTasks.count
+        sidebarCounts.products[currentSelectedProductID ?? "", default: .init()].blocked
     }
 
     // MARK: Repo chip / recent repos
@@ -420,12 +400,16 @@ extension ChatViewModel {
 
     /// Build the equatable [[WorkCardSnapshot]] for a board card.
     ///
-    /// Called by the column container so per-card views no longer observe
-    /// `ChatViewModel` / `LiveWorkerStateStore` — they receive this value
-    /// and re-render only when their own inputs change (via
-    /// `WorkBoardCardView.equatable()`).
+    /// Called by each card's `WorkCardRenderState`, so neither the column nor
+    /// the card view observes `ChatViewModel` / `LiveWorkerStateStore` —
+    /// the card re-renders only when its own render value changes.
     ///
-    /// `liveState` is resolved by the container from `LiveWorkerStateStore`
+    /// INVARIANT: every input read while building a snapshot must be
+    /// covered by `WorkPresentationUpdates`' `observe(model.$...)` list (or
+    /// `invalidateWorkCache`), or cards go stale. Add new card-feeding
+    /// `@Published` state there, and to the guard test.
+    ///
+    /// `liveState` is resolved per card via `workerLiveState(forTaskID:)`
     /// (Doing column only). `now` is injectable for tests of time-relative
     /// live-status phrasing.
     func workCardSnapshot(

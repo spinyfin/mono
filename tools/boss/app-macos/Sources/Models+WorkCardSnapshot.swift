@@ -5,7 +5,7 @@ import Foundation
 //
 // Phase 1 of `tools/boss/docs/designs/boss-ui-performance-improvements.md`
 // (entry 4). Holds the subset of `WorkTask` fields the card body reads, the
-// already-resolved per-card context the column container supplies, and the
+// already-resolved per-card context the card's render state supplies, and the
 // booleans that today are recomputed inside `body` / `WorkBoardCardItem`
 // (`isDispatchPending`, `isResolvingConflicts`, `isRemediatingCI`,
 // `isAIReviewing`, per-badge visibility). Closures stay outside the
@@ -43,7 +43,7 @@ struct WorkCardRevisionRollup: Equatable, Identifiable {
     }
 }
 
-/// Already-resolved per-card inputs the column container has computed
+/// Already-resolved per-card inputs the card's render state has computed
 /// before building a [[WorkCardSnapshot]]. Closures (open terminal, merge
 /// when ready, design-doc open, badge hover, deferred-scope actions) are
 /// intentionally absent — only the presence flags that gate them appear
@@ -252,7 +252,7 @@ struct WorkCardSnapshot: Equatable {
     // MARK: - Builder
 
     /// Build a snapshot from a `WorkTask` plus the already-resolved
-    /// per-card context the column container holds.
+    /// per-card context the card's render state holds.
     static func build(task: WorkTask, context: WorkCardSnapshotContext) -> WorkCardSnapshot {
         let column = context.column
 
@@ -536,7 +536,7 @@ struct WorkCardSnapshot: Equatable {
 // ===========================================================================
 // Pre-resolved free-text live-status subtitle for a kanban card.
 //
-// Built by the column container before [[WorkCardSnapshot.build]] so
+// Built by the card's render state before [[WorkCardSnapshot.build]] so
 // time-relative phrasing is fixed at snapshot construction and the
 // snapshot stays pure / Equatable-stable (design entry 6 — observation
 // detach). Cards no longer re-resolve this from `LiveWorkerStateStore`.

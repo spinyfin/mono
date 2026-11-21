@@ -181,7 +181,7 @@ private struct DiagnosticReviewFixture: View {
         let sections = model.workSections(in: .review)
         ScrollView {
             WorkBoardSectionItemsView(items: sections.flatMap(\.items), column: .review,
-                boardStyle: .classic, model: model, liveStates: model.liveWorkerStates)
+                boardStyle: .classic, model: model)
         }
         .modifier(BoardDiagnosticColumn(trace: model.boardDiagnostics, column: "review",
             sections: sections))

@@ -1,8 +1,9 @@
 import SwiftUI
 
-struct WorkNavigatorView: View {
-    @ObservedObject var model: ChatViewModel
+struct WorkNavigatorView: View, @MainActor Equatable {
+    let model: ChatViewModel
     var workspace: WorkersWorkspaceModel? = nil
+    @StateObject private var state: WorkPresentationValue<NavigatorChromeValue>
     var registry: NavigatorDetailRegistry? = nil
     @Environment(\.openWindow) private var openWindow
     @FocusState private var focus: Focus?
@@ -10,13 +11,25 @@ struct WorkNavigatorView: View {
         case row(String), section(NavigatorSection), detail
     }
 
+    init(model: ChatViewModel, workspace: WorkersWorkspaceModel? = nil, registry: NavigatorDetailRegistry? = nil) {
+        self.model = model
+        self.workspace = workspace
+        self.registry = registry
+        _state = StateObject(wrappedValue: WorkPresentationValue(updates: model.presentationUpdates) {
+            NavigatorChromeValue(model: model)
+        })
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.model === rhs.model && lhs.workspace === rhs.workspace }
+
     var body: some View {
+        let value = state.value
         VStack(spacing: 0) {
-            if !model.isConnected {
+            if !value.isConnected {
                 Text("Disconnected — showing the last snapshot. Changes are unavailable until reconnect.")
                     .font(.callout).foregroundStyle(.secondary).padding(8)
             }
-            if let message = model.navigatorCompatibilityMessage {
+            if let message = value.compatibilityMessage {
                 VStack(spacing: 12) {
                     Text(message)
                     Button("Use Kanban") { model.setWorkViewMode(.kanban) }
@@ -24,7 +37,7 @@ struct WorkNavigatorView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 HSplitView {
-                    navigator.frame(minWidth: 260, idealWidth: 360, maxWidth: 520)
+                    navigator(value).frame(minWidth: 260, idealWidth: 360, maxWidth: 520)
                     WorkNavigatorDetail(model: model, registry: registry ?? .navigator(workspace: workspace))
                         .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
                         .focusable().focused($focus, equals: .detail)
@@ -44,20 +57,21 @@ struct WorkNavigatorView: View {
         .environmentObject(model)
     }
 
-    private var navigator: some View {
-        let scope = model.navigatorScopeKey
-        let sections = model.navigatorSections
+    private func navigator(_ value: NavigatorChromeValue) -> some View {
+        let scope = value.scopeKey
+        let sections = value.sections
         return VStack(spacing: 8) {
-            scopePicker
-            TextField("Search tasks and revision asks", text: $model.workSearchText)
+            scopePicker(value)
+            TextField("Search tasks and revision asks", text: Binding(
+                get: { value.searchText }, set: { model.workSearchText = $0 }))
                 .textFieldStyle(.roundedBorder).padding(.horizontal, 8)
             GeometryReader { geometry in
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
                             ForEach(sections) { section in
-                                sectionHeader(section)
-                                if !model.navigatorCollapsed.contains(section.section) {
+                                sectionHeader(section, value: value)
+                                if !value.collapsed.contains(section.section) {
                                     if section.rows.isEmpty {
                                         Text("No tasks").font(.caption).foregroundStyle(.secondary).padding(8)
                                     }
@@ -67,11 +81,11 @@ struct WorkNavigatorView: View {
                                             model.selectNavigatorRoot(row.id, askID: row.matchingAskID)
                                             focus = .row(row.id)
                                         } label: {
-                                            WorkNavigatorRow(row: row,
-                                                project: model.visibleSelectedProjectFilterIDs.count == 1 ? nil : model.projectName(for: row.task.projectID),
+                                            WorkNavigatorObservedRow(row: row,
+                                                project: value.projectNames[row.id],
                                                 width: geometry.size.width,
-                                                isSelected: model.navigator.selectedRootID == row.id,
-                                                liveWorkers: model.liveWorkerStates)
+                                                isSelected: value.selectedRootID == row.id,
+                                                model: model)
                                         }
                                         .buttonStyle(.plain)
                                         .focusable()
@@ -94,7 +108,7 @@ struct WorkNavigatorView: View {
                             model.confirmNavigatorReveal(rootID: id)
                         }
                     }
-                    .onChange(of: model.navigator.revealGeneration) { _, _ in
+                    .onChange(of: value.revealGeneration) { _, _ in
                         if let id = model.navigator.selectedRootID {
                             proxy.scrollTo(id)
                             model.confirmNavigatorReveal(rootID: id)
@@ -110,14 +124,10 @@ struct WorkNavigatorView: View {
         .padding(.vertical, 8)
     }
 
-    private var scopePicker: some View {
+    private func scopePicker(_ value: NavigatorChromeValue) -> some View {
         HStack {
             Picker("Scope", selection: Binding(
-                get: {
-                    if model.filterToChoresOnly { return "unprojected" }
-                    if model.visibleSelectedProjectFilterIDs.count > 1 { return "multiple" }
-                    return model.visibleSelectedProjectFilterIDs.first ?? ""
-                },
+                get: { value.scopeSelection },
                 set: { id in
                     guard id != "multiple" else { return }
                     model.changeNavigatorScope {
@@ -128,31 +138,31 @@ struct WorkNavigatorView: View {
                     }
                 }
             )) {
-                Text(model.selectedProduct?.name ?? "All projects").tag("")
+                Text(value.selectedProductName ?? "All projects").tag("")
                 Text("No project").tag("unprojected")
-                if model.visibleSelectedProjectFilterIDs.count > 1 {
-                    Text("\(model.visibleSelectedProjectFilterIDs.count) projects").tag("multiple")
+                if value.visibleProjectCount > 1 {
+                    Text("\(value.visibleProjectCount) projects").tag("multiple")
                 }
-                ForEach(model.projectsForSelectedProduct) { project in Text(project.name).tag(project.id) }
+                ForEach(value.projects) { project in Text(project.name).tag(project.id) }
             }
             .labelsHidden()
-            if let project = model.selectedProject {
+            if let project = value.selectedProject {
                 Button { model.pendingWorkEditRequest = WorkEditRequest(item: .project(project)) } label: { Image(systemName: "info.circle") }
-                    .help("Project information").disabled(!model.isConnected)
+                    .help("Project information").disabled(!value.isConnected)
             }
-            if model.navigatorProjectAttentionCount > 0 {
+            if value.projectAttentionCount > 0 {
                 Button { openWindow(id: "attentions") } label: {
-                    Label("\(model.navigatorProjectAttentionCount)", systemImage: "bell.badge")
+                    Label("\(value.projectAttentionCount)", systemImage: "bell.badge")
                 }
                 .help("Open project notifications")
-                .accessibilityLabel("\(model.navigatorProjectAttentionCount) project notifications")
+                .accessibilityLabel("\(value.projectAttentionCount) project notifications")
             }
         }
         .padding(.horizontal, 8)
     }
 
-    private func sectionHeader(_ section: NavigatorSectionRows) -> some View {
-        let expanded = !model.navigatorCollapsed.contains(section.section)
+    private func sectionHeader(_ section: NavigatorSectionRows, value: NavigatorChromeValue) -> some View {
+        let expanded = !value.collapsed.contains(section.section)
         return Button {
             model.setNavigatorSection(section.section, expanded: !expanded)
             focus = .section(section.section)
@@ -161,7 +171,7 @@ struct WorkNavigatorView: View {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right").frame(width: 12)
                 Text(section.section.title).fontWeight(.semibold)
                 Spacer()
-                Text(model.isWorkSearchActive ? "\(section.rows.count) / \(section.total)" : "\(section.total)")
+                Text(value.isSearchActive ? "\(section.rows.count) / \(section.total)" : "\(section.total)")
                     .monospacedDigit().foregroundStyle(.secondary)
             }
             .padding(8).contentShape(Rectangle())

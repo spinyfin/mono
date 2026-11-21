@@ -13,26 +13,20 @@ private let kanbanDocLinkLog = Logger(
     category: "kanban-doc-link"
 )
 
-/// Column-local card list. Observes `ChatViewModel` so model publishes
-/// (selection, dependency highlights, drag/merge notices,
-/// `taskRuntimesByID`, prereq caches, …) recompute per-card
-/// `WorkCardSnapshot`s once per column
-/// (design entry 6). Also observes `LiveWorkerStateStore` so Doing-lane
-/// live-status ticks rebuild snapshots without every card subscribing.
-/// Cards stay non-observing and receive snapshots as values —
-/// `.equatable()` skips bodies whose snapshot did not change.
+/// Stable membership only. Each mounted card owns its observed render state.
 struct WorkBoardSectionItemsView: View {
-    let items: [WorkTask]
+    let itemIDs: [String]
     let column: WorkBoardColumnKey
     let boardStyle: KanbanBoardStyle
-    /// Observed here so snapshot construction re-runs when model state
-    /// that feeds cards changes (including pure `taskRuntimesByID`
-    /// updates for Doing dispatch/slot status). Cards hold a
-    /// non-observing reference for action dispatch only.
-    @ObservedObject var model: ChatViewModel
-    /// Observed here so live-state publishes rebuild Doing snapshots once
-    /// per section instead of invalidating every mounted card.
-    @ObservedObject var liveStates: LiveWorkerStateStore
+    let model: ChatViewModel
+
+    init(items: [WorkTask], column: WorkBoardColumnKey, boardStyle: KanbanBoardStyle,
+         model: ChatViewModel) {
+        itemIDs = items.map(\.id)
+        self.column = column
+        self.boardStyle = boardStyle
+        self.model = model
+    }
 
     /// Live reviewers and supervisors shared by PR identity: primary Review
     /// cards and held revisions in Doing both link to the same review workers.
@@ -58,76 +52,20 @@ struct WorkBoardSectionItemsView: View {
     }
 
     var body: some View {
-        let selectedID = model.navigator.mode == .kanban ? model.selectedTask?.id : nil
-        let highlightID = model.revealHighlightID
-        let frontierIDs = model.depFrontierHighlightIDs
-        let selectedRevisionParentID = model.selectedRevisionParentID
-        let dragRefusal = model.dragRefusalNotice
-        let mergeFeedback = model.mergeFeedbackNotice
-        // One PR identity index per section render.
-        let reviewersByPR = Self.reviewerIndex(states: (column == .doing || column == .review) ? Array(liveStates.byRunID.values) : [])
-        // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
-        // the default (ungrouped) board layout each column is a single section,
-        // so this was the actual eagerly-built list of every card in the
-        // column regardless of scroll position. Combined with whole-model
-        // `@Published` invalidation that hover badges trigger, a plain
-        // `VStack` here meant hovering one badge while scrolling re-evaluated
-        // and re-hit-tested every card on the board, not just the visible
-        // ones. `LazyVStack` + `ScrollViewReader` + `.id(task.id)` below is
-        // the supported combo for reveal-scroll, so this doesn't change that
-        // behavior. Entry 6 further stops per-card observation of the model /
-        // live store: the container rebuilds snapshots; `.equatable()` skips
-        // card bodies whose snapshot did not change.
         LazyVStack(alignment: .leading, spacing: 10) {
-            ForEach(items) { task in
-                let isSelected = selectedID == task.id
-                let isFrontierHighlighted = frontierIDs.contains(task.id)
-                    || selectedRevisionParentID == task.id
-                let liveState: WorkerLiveState? = {
-                    guard column == .doing,
-                          let executionID = model.taskRuntime(for: task.id)?.executionID
-                    else { return nil }
-                    return liveStates.byRunID[executionID]
-                }()
-                let snapshot = model.workCardSnapshot(
-                    for: task,
-                    column: column,
-                    isSelected: isSelected,
-                    isFrontierHighlighted: isFrontierHighlighted,
-                    boardStyle: boardStyle,
-                    liveState: liveState
-                )
-                WorkBoardCardItem(
-                    task: task,
-                    column: column,
-                    snapshot: snapshot,
-                    reviewers: (column == .doing || column == .review) ? Self.reviewWorkers(for: task, index: reviewersByPR) : [],
-                    model: model,
-                    revisionHighlight: model.revisionHighlightState(for: task.id),
-                    isRevealed: highlightID == task.id,
-                    dragRefusal: dragRefusal?.taskID == task.id ? dragRefusal : nil,
-                    mergeFeedbackMessage: mergeFeedback?.taskID == task.id
-                        ? mergeFeedback?.message : nil,
-                    isRequestingMerge: model.mergingWhenReadyIDs.contains(task.id)
-                )
-                .id(task.id)
-                .background {
-                    RevealCardViewport(cardID: task.id, generation: model.revealGeneration,
-                        isTarget: model.revealScrollTarget == task.id, model: model)
-                        .allowsHitTesting(false)
-                }
+            ForEach(itemIDs, id: \.self) { id in
+                WorkBoardObservedCard(id: id, column: column, style: boardStyle, model: model)
+                    .equatable()
+                    .id(id)
             }
         }
-        // Cards are the column's scroll targets: `WorkBoardColumnScrollView`
-        // anchors the column on the card at the viewport centre so a refresh
-        // that reorders or resizes rows keeps that card where the user left it.
         .scrollTargetLayout()
     }
 }
 
 /// Wrapper for a single kanban card. Receives a pre-built
 /// [[WorkCardSnapshot]] and resolved banner messages as **values** from
-/// the column container — it does **not** observe `ChatViewModel` or
+/// its row state — it does **not** observe `ChatViewModel` or
 /// `LiveWorkerStateStore`. Holding `model` without `@ObservedObject`
 /// keeps action dispatch (`selectWorkCard`, terminal, merge, delete)
 /// without the "any of 77 `@Published` properties invalidates every
@@ -143,16 +81,16 @@ struct WorkBoardCardItem: View {
     let column: WorkBoardColumnKey
     let snapshot: WorkCardSnapshot
     var reviewers: [WorkerLiveState] = []
-    /// Non-observing; action dispatch only. Column container owns
+    /// Non-observing; action dispatch only. The row state owns
     /// observation and snapshot construction.
     let model: ChatViewModel
     /// The only observed hover state on a card. This keyed cell publishes
     /// only when this card enters or leaves the revision highlight set.
     @ObservedObject var revisionHighlight: WorkBoardRevisionHighlightState
     var isRevealed: Bool = false
-    /// Pre-resolved by the column container from `dragRefusalNotice`.
+    /// Pre-resolved by the row state from `dragRefusalNotice`.
     var dragRefusal: ChatViewModel.DragRefusalNotice? = nil
-    /// Pre-resolved by the column container from `mergeFeedbackNotice`.
+    /// Pre-resolved by the row state from `mergeFeedbackNotice`.
     var mergeFeedbackMessage: String? = nil
     var isRequestingMerge = false
     @Environment(\.openWindow) private var openWindow

@@ -114,14 +114,14 @@ struct NavigatorMergeEvidence: Decodable, Hashable {
     let mergedAt: String?
 }
 
-struct NavigatorRow: Identifiable {
+struct NavigatorRow: Identifiable, Equatable {
     let task: WorkTask
     let projection: NavigatorRoot
     let matchingAskID: String?
     var id: String { task.id }
 }
 
-struct NavigatorSectionRows: Identifiable {
+struct NavigatorSectionRows: Identifiable, Equatable {
     let section: NavigatorSection
     let rows: [NavigatorRow]
     let total: Int
