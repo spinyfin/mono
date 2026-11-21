@@ -1431,6 +1431,33 @@ fn the_owners_answer_makes_the_item_a_candidate_at_once_instead_of_after_the_coo
 }
 
 #[test]
+fn an_answer_without_a_pr_returns_to_progression_without_an_ordinary_worker() {
+    let fx = fx();
+    let item = fx.chore("Failed without a PR");
+    fx.sql(&format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed', autostart = 1 WHERE id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+    done(
+        &fx,
+        &run,
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        "ask",
+    );
+    fx.db.finish_progression_declared(&run).unwrap();
+    let outcome = fx
+        .db
+        .answer_operator_question_with(&item, boss_protocol::OperatorAnswer::YesNo { value: true }, &fx.checker)
+        .unwrap();
+    assert!(!outcome.minted_execution);
+    assert_eq!(fx.task(&item).blocked_reason.as_deref(), Some("worker_failed"));
+    assert!(fx.task(&item).autostart);
+    assert!(fx.task(&item).description.contains("Merge this PR?"));
+    assert!(fx.db.progression_clauses(&item).unwrap().unwrap().is_candidate());
+    assert!(fx.db.mint_progression_execution(&item).unwrap().is_some());
+}
+
+#[test]
 fn an_answer_to_a_worker_question_does_not_prompt_progression() {
     let fx = fx();
     let item = fx.pr_item("Asked by a worker", "fail");

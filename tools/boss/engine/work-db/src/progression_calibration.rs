@@ -27,10 +27,10 @@ pub(super) fn read_report(conn: &Connection) -> Result<Option<ProgressionCalibra
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Publish configuration and fallbacks without measuring history.
-    /// Unchanged configuration preserves the calibrated values.
+    /// Unchanged configuration preserves calibrated values while its report exists.
     pub fn configure_progression_calibration(&self, settings: &ProgressionSettings) -> Result<()> {
         let json = serde_json::to_string(settings)?;
-        if self.get_metadata(CONFIG_KEY)?.as_deref() != Some(&json) {
+        if self.get_metadata(CONFIG_KEY)?.as_deref() != Some(&json) || self.get_metadata(REPORT_KEY)?.is_none() {
             let mut conn = self.connect()?;
             let conn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             conn.execute("DELETE FROM metadata WHERE key = ?1", [REPORT_KEY])?;

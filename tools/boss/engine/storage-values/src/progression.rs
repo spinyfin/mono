@@ -63,7 +63,7 @@ pub const NO_ACTION_COOLDOWN_MULTIPLIER: i64 = 4;
 
 /// Longest fallback wait after a `no_changes_needed` run (24 hours). With the
 /// 6-hour default cooldown the multiplier alone reaches it; a larger
-/// operator-set cooldown is never stretched past this by the multiplier.
+/// explicitly configured cooldown is never stretched past this by the multiplier.
 pub const NO_ACTION_COOLDOWN_CAP_SECS: i64 = 24 * 60 * 60;
 
 /// Consecutive progression runs ending in infrastructure failure
@@ -96,7 +96,7 @@ pub struct ProgressionSettings {
     /// happened in between. A filed revision or prerequisite reaching a
     /// terminal state, or the owner answering the run's question, re-nominates
     /// the item at once without waiting for it. Default 6 hours; never
-    /// calibrated from history. Operator-tunable (`BOSS_PROGRESSION_COOLDOWN_SECS`).
+    /// calibrated from history. Configurable (`BOSS_PROGRESSION_COOLDOWN_SECS`).
     #[builder(default = DEFAULT_COOLDOWN_SECS)]
     pub cooldown_secs: i64,
     /// `progression.max_creates_per_item_window`: revisions plus precursors a

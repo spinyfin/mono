@@ -841,9 +841,9 @@ fn clause_6_with_no_event_the_fallback_is_six_hours_and_not_before() {
 #[test]
 fn clause_6_the_no_action_wait_is_capped_at_twenty_four_hours() {
     let f = fixture();
-    let id = f.stuck_chore("Long operator cooldown");
-    // An operator-set 12-hour cooldown would be 48 hours after four times; the cap holds it at 24.
-    f.db.configure_progression_calibration(&ProgressionSettings::builder().cooldown_secs(12 * HOUR).build())
+    let id = f.stuck_chore("Long configured cooldown");
+    // An explicitly configured 48-hour cooldown exceeds the cap even before multiplying; the cap holds it at 24.
+    f.db.configure_progression_calibration(&ProgressionSettings::builder().cooldown_secs(48 * HOUR).build())
         .unwrap();
     let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, 23 * HOUR);
     f.sql(&format!(
@@ -893,8 +893,8 @@ fn clause_6_a_filed_action_reaching_a_terminal_state_ends_the_cooldown() {
     f.sql(&format!("UPDATE tasks SET deleted_at = '1' WHERE id = '{filed}'"));
     f.assert_candidate(&id, true);
 
-    // Only what this run filed counts: another run's revision, or an ordinary
-    // revision that merged, does not end this run's cooldown.
+    // A filed action must belong to a progression execution on this item;
+    // unrelated or ordinary revisions do not end the cooldown.
     let id = f.stuck_chore("Somebody else's revision merged");
     let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
     f.filed_by(&id, "another-run", "done");
@@ -954,7 +954,11 @@ fn clause_6_a_later_run_has_its_own_cooldown_after_an_event() {
     let f = fixture();
     let id = f.stuck_chore("Second run");
     let first = finished_progression_run(&f, &id, ExecutionStatus::Completed, 2 * HOUR);
-    f.filed_by(&id, &first, "done");
+    let filed = f.filed_by(&id, &first, "done");
+    f.sql(&format!(
+        "UPDATE task_status_audit SET changed_at = '{}' WHERE work_item_id = '{filed}'",
+        now() - 2 * HOUR
+    ));
     f.assert_candidate(&id, true);
     // The next run found nothing to do; the earlier run's event does not excuse it.
     let second = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
@@ -962,6 +966,44 @@ fn clause_6_a_later_run_has_its_own_cooldown_after_an_event() {
         "UPDATE work_executions SET run_done_outcome = 'no_changes_needed' WHERE id = '{second}'"
     ));
     f.assert_candidate(&id, false);
+    // Editing a finished action is not another terminal transition.
+    f.sql(&format!(
+        "UPDATE tasks SET name = 'Updated name', updated_at = '{}' WHERE id = '{filed}'",
+        now()
+    ));
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn an_earlier_runs_action_ends_a_later_runs_cooldown() {
+    let f = fixture();
+    let id = f.stuck_chore("Earlier action finished");
+    let first = finished_progression_run(&f, &id, ExecutionStatus::Completed, 8 * HOUR);
+    let filed = f.filed_by(&id, &first, "todo");
+    let second = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+    f.sql(&format!(
+        "UPDATE work_executions SET run_done_outcome = 'no_changes_needed' WHERE id = '{second}'"
+    ));
+    f.assert_candidate(&id, false);
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'done', updated_at = '{}' WHERE id = '{filed}'",
+        now()
+    ));
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn unchanged_explicit_configuration_is_republished_after_the_reset() {
+    let f = fixture();
+    let settings = ProgressionSettings::builder().cooldown_secs(48 * HOUR).build();
+    f.db.configure_progression_calibration(&settings).unwrap();
+    f.db.calibrate_progression(now()).unwrap();
+    super::progression_events::migrate_reset_calibrated_cooldown(&f.db.connect().unwrap()).unwrap();
+    f.db.configure_progression_calibration(&settings).unwrap();
+    assert_eq!(
+        f.db.get_metadata("progression.cooldown_secs").unwrap().as_deref(),
+        Some("172800")
+    );
 }
 
 #[test]
@@ -973,7 +1015,7 @@ fn the_calibrated_cooldown_is_reset_to_the_default_by_the_migration() {
         "INSERT OR REPLACE INTO metadata(key, value) VALUES ('progression.cooldown_secs', '187680');
          INSERT OR REPLACE INTO metadata(key, value) VALUES ('progression.calibration', '{}')",
     );
-    let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, 7 * HOUR);
+    finished_progression_run(&f, &id, ExecutionStatus::Completed, 7 * HOUR);
     f.assert_candidate(&id, false);
 
     {
@@ -983,10 +1025,9 @@ fn the_calibrated_cooldown_is_reset_to_the_default_by_the_migration() {
     assert_eq!(f.db.get_metadata("progression.cooldown_secs").unwrap(), None);
     assert_eq!(f.db.get_metadata("progression.calibration").unwrap(), None);
     f.assert_candidate(&id, true);
-    let _ = run;
 
     // The next calibration publishes the default, not a measurement, and an
-    // explicit operator setting still wins.
+    // explicit setting still wins.
     f.db.calibrate_progression(now()).unwrap();
     assert_eq!(
         f.db.get_metadata("progression.cooldown_secs").unwrap().as_deref(),

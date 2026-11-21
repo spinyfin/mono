@@ -554,8 +554,8 @@ fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
                    AND NOT {launch_failed}
                    AND COALESCE(CAST(px.finished_at AS INTEGER), CAST(px.created_at AS INTEGER))
                        + (CASE WHEN px.run_done_outcome = 'no_changes_needed'
-                               THEN MAX(({cooldown}), MIN(({cooldown}) * {NO_ACTION_COOLDOWN_MULTIPLIER},
-                                                          {NO_ACTION_COOLDOWN_CAP_SECS}))
+                               THEN MIN(({cooldown}) * {NO_ACTION_COOLDOWN_MULTIPLIER},
+                                        {NO_ACTION_COOLDOWN_CAP_SECS})
                                ELSE ({cooldown}) END) > {NOW}
                    AND NOT {ended_early})"
     )

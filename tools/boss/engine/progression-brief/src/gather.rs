@@ -98,6 +98,7 @@ pub fn gather_progression_brief(db: &WorkDb, work_item_id: &str) -> Result<Progr
                     .map(|p| format!("{}: {}", p.kind, p.payload_json))
                     .collect(),
                 execution_id: row.id.clone(),
+                work_item_id: row.work_item_id.clone(),
                 status: row.status.clone(),
                 created_at: row.created_at.clone(),
                 run_done_outcome: row.run_done_outcome.clone(),

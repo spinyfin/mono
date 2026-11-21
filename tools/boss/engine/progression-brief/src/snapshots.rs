@@ -1123,6 +1123,7 @@ fn an_answered_question_is_rendered_with_its_answer_and_a_directive_to_act_on_it
     packet.prior_progression.push(
         crate::packet::PriorProgressionRun::builder()
             .execution_id("run-1")
+            .work_item_id(&id)
             .actions(Vec::new())
             .status("completed")
             .created_at("1")
@@ -1158,6 +1159,38 @@ fn an_answered_question_is_rendered_with_its_answer_and_a_directive_to_act_on_it
         text.contains("This run exists to act on that answer") && text.contains("Do not ask the same question again"),
         "{text}"
     );
+
+    // The handling run retires the directive while keeping the answer visible.
+    packet.prior_progression.push(
+        crate::packet::PriorProgressionRun::builder()
+            .execution_id("handling-run")
+            .work_item_id(&id)
+            .actions(Vec::new())
+            .status("completed")
+            .created_at("124")
+            .build(),
+    );
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("answer: Yes"));
+    assert!(!text.contains("This run exists to act on that answer"));
+    packet.prior_progression.pop();
+    packet.prior_progression.push(
+        crate::packet::PriorProgressionRun::builder()
+            .execution_id("other-member-run")
+            .work_item_id("another-chain-member")
+            .actions(Vec::new())
+            .status("completed")
+            .created_at("125")
+            .build(),
+    );
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("This run exists to act on that answer"));
+
+    packet.questions[0].work_item_id = "another-chain-member".into();
+    packet.questions[0].question.execution_id = "other-member-run".into();
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("answer: Yes"));
+    assert!(!text.contains("This run exists to act on that answer"));
 
     // An answer to a question some other run asked, or an open question, is not that prompt.
     packet.questions = vec![

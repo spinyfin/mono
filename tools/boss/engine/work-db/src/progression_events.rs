@@ -15,9 +15,8 @@
 //! - **The owner answered the run's question.** The answer is on the item's
 //!   brief and in the next run's packet, and nothing else acts on it.
 //!
-//! Both are read per run, from rows that already exist, so there is no event
-//! table to keep in step. A later run on the same item has its own cooldown
-//! and its own events.
+//! Events are read from existing rows. Terminal actions filed by any run on
+//! the item release cooldowns evaluated before that event.
 use super::*;
 use boss_engine_storage_values::progression::METADATA_KEY_COOLDOWN_SECS;
 
@@ -33,7 +32,15 @@ pub(crate) fn run_ended_early_sql(run: &str, item: &str) -> String {
         "(EXISTS (SELECT 1 FROM operator_questions oq
                   WHERE oq.work_item_id = {item}.id AND oq.execution_id = {run}.id AND oq.status = 'answered')
           OR EXISTS (SELECT 1 FROM tasks filed
-                     WHERE filed.created_via = '{prefix}' || {run}.id
+                     JOIN work_executions filer ON filed.created_via = '{prefix}' || filer.id
+                     WHERE filer.work_item_id = {item}.id AND filer.kind = 'progression'
+                       AND (filer.id = {run}.id OR
+                            MAX(COALESCE(CAST(filed.deleted_at AS INTEGER), 0),
+                                COALESCE((SELECT MAX(CAST(event.changed_at AS INTEGER))
+                                          FROM task_status_audit event WHERE event.work_item_id = filed.id
+                                            AND ((event.property = 'status' AND event.new_value IN ('done', 'archived', 'blocked'))
+                                              OR (event.property = 'blocked_reason' AND event.new_value = 'worker_failed'))), 0))
+                              > COALESCE(CAST({run}.finished_at AS INTEGER), CAST({run}.created_at AS INTEGER)))
                        AND (filed.deleted_at IS NOT NULL
                             OR filed.status IN ('done', 'archived')
                             OR (filed.status = 'blocked' AND filed.blocked_reason = 'worker_failed'))))"
@@ -71,8 +78,8 @@ pub(crate) fn waive_grace_after_answer(
 /// Drop the cooldown the daily calibration published before the cooldown stopped
 /// being calibrated (three times the longest revision-to-review time, about 52
 /// hours), and the cached report that recorded it. Without the row the views
-/// use the 6-hour default; the engine's next calibration, which the missing
-/// report forces, republishes the default or the operator's explicit setting.
+/// use the 6-hour default; startup configuration republishes settings when the
+/// report is missing, including an explicitly configured cooldown.
 pub(super) fn migrate_reset_calibrated_cooldown(conn: &Connection) -> Result<()> {
     conn.execute(
         "DELETE FROM metadata WHERE key IN (?1, ?2)",

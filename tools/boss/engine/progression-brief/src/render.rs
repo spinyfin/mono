@@ -479,10 +479,22 @@ fn render_questions(out: &mut String, packet: &ProgressionBriefPacket) {
         .iter()
         .filter(|question| {
             question.status == OperatorQuestionStatus::Answered
+                && question.work_item_id == packet.item.id
                 && packet
                     .prior_progression
                     .iter()
                     .any(|run| run.execution_id == question.question.execution_id)
+                && question
+                    .answered_at
+                    .as_deref()
+                    .and_then(|at| at.parse::<i64>().ok())
+                    .is_some_and(|answered| {
+                        packet
+                            .prior_progression
+                            .iter()
+                            .filter(|run| run.work_item_id == packet.item.id)
+                            .all(|run| run.created_at.parse::<i64>().is_ok_and(|created| created <= answered))
+                    })
         })
         .collect();
     if !answered_run_questions.is_empty() {
