@@ -229,7 +229,7 @@ fn run_done_seam_on_worker_signal_seam_off_teaches_summary_not_blocked_verb() {
         "worker_signal seam off: blocked outcome must preserve the reason on propose done --summary:\n{prompt}",
     );
     assert!(prompt.contains(
-        "--question \"Approve switching the retry to exponential backoff?\" --answer-type yes-no --explanation"
+        "--question \"Approve switching the retry to exponential backoff?\" --answer-type yes-no --explanation-file /tmp/explanation.txt"
     ));
     assert!(
         prompt.contains(

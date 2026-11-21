@@ -1790,6 +1790,15 @@ fn progression_guard_admits_only_inspection_and_declaration() {
         "boss propose done --summary 'Is the archived prerequisite still needed?'",
         "boss propose done --summary '$5 < $10 {estimate} ~ ! * ? [note]'",
         "\"$BOSS_BIN\" propose done --outcome delivered --summary 'stuck item re-dispatched'",
+        // Documented forms for a labelled explanation: the command string
+        // contains no newline. Progression cannot write files, so it passes
+        // one quoted argument per line. Workers that can write a file use
+        // `--explanation-file`. Inline `--explanation` with labelled
+        // sections is rejected below.
+        "boss propose done --outcome blocked --summary 'Need a decision' --question 'Approve the retry?' --answer-type yes-no --explanation 'Context:' 'Work is blocked.' 'Yes:' 'Approve a small fix.' 'No:' 'Ship the smaller change instead.' 'Recommendation:' 'Yes, to finish the work.' --criterion 3",
+        "\"$BOSS_BIN\" propose done --outcome blocked --summary 'Need a decision' --question 'Approve the retry?' --answer-type yes-no --explanation 'Context:' 'Work is blocked.' 'Yes:' 'Approve a small fix.' 'No:' 'Ship the smaller change instead.' 'Recommendation:' 'Yes, to finish the work.' --criterion 3",
+        "boss propose done --outcome blocked --summary 'Need a decision' --question 'Approve the retry?' --answer-type yes-no --explanation-file /tmp/explanation.txt --criterion 3",
+        "\"$BOSS_BIN\" propose done --outcome blocked --summary 'Need a decision' --question 'Approve the retry?' --answer-type yes-no --explanation-file /tmp/explanation.txt --criterion 3",
         "boss task show chore_1 --json",
         "\"$BOSS_BIN\" task list --json",
         "\"$BOSS_BIN\" pr status --refresh --json",
@@ -1803,6 +1812,7 @@ fn progression_guard_admits_only_inspection_and_declaration() {
     }
     for command in [
         "gh pr comment 1 --body hi",
+        "boss propose done --outcome blocked --summary 'Need a decision' --question 'Approve the retry?' --answer-type yes-no --explanation 'Context:\nWork is blocked.\nYes:\nApprove a small fix.\nNo:\nShip the smaller change instead.\nRecommendation:\nYes, to finish the work.' --criterion 3",
         "boss propose done --summary 'safe'$HOME",
         "boss propose done --summary \"'unsafe $HOME'\"",
         "boss propose done --summary \\'$HOME\\'",

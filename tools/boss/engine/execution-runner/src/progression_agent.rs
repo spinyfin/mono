@@ -56,8 +56,13 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
      - `{boss} propose unblock`: move the item `blocked` to `todo`, or `in_review` when it already owns a bound PR, once nothing holds it.\n\
      - `{boss} propose followup-task --name '<name>' --description '<text>' --rationale '<why>'`: a non-blocking follow-up.\n\
      \n\
-     You cannot write files, so pass text inline in single quotes. A long brief\n\
-     can be piped as a heredoc to `--brief-file /dev/stdin`.\n\
+     You cannot write files, so pass single-line text inline in single quotes. A\n\
+     long brief can be piped as a heredoc to `--brief-file /dev/stdin` or\n\
+     `--brief-file -`. A labelled explanation cannot be one quoted block: pass\n\
+     `--explanation` with one quoted argument per line so the command contains\n\
+     no newline. `--explanation-file` needs a file you write first; you cannot.\n\
+     Some PreToolUse guards reject any command that contains a newline, even\n\
+     inside quotes.\n\
      \n\
      Every refusal is typed and names why (a repeat of a verb at the same\n\
      fingerprint names the run that already did it; a spent bound names the run\n\
@@ -87,10 +92,12 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
        last worker declared a blocker: redispatch with the evidence it is stale, fix the\n\
        mechanical gap, or ask.\n\
      - `{boss} propose done --outcome blocked --summary \"<one line>\" --question\n\
-       \"<one decision>\" --answer-type yes-no|multiple-choice --explanation \"<...>\"\n\
-       --criterion 1|2|3|4`: ask the owner. A bare `blocked` is refused. Ask only\n\
-       under one of the four numbered criteria in your brief, and never to confirm\n\
-       something you may do directly.\n\
+       \"<one decision>\" --answer-type yes-no|multiple-choice --explanation 'Context:'\n\
+       '<work and blocker>' 'Yes:' '<what approval does>' 'No:' '<what declining does>'\n\
+       'Recommendation:' '<one-line reason>' --criterion 1|2|3|4`: ask the owner.\n\
+       A bare `blocked` is refused. Ask only under one of the four numbered criteria in\n\
+       your brief, and never to confirm something you may do directly. For\n\
+       `multiple-choice` omit Yes:/No: and say in Context what each option leads to.\n\
      \n\
      ## Your working directory\n\
      \n\
@@ -156,8 +163,12 @@ mod tests {
         assert!(md.contains("Do not retry a refused call"));
         // followup-task takes --description and --rationale, matching the CLI.
         assert!(md.contains("followup-task --name '<name>' --description '<text>' --rationale '<why>'"));
-        // The agent cannot write files, so briefs go inline.
-        assert!(md.contains("pass text inline in single quotes"));
+        // The agent cannot write files, so briefs go inline; labelled
+        // explanations are one quoted argument per line so the command stays
+        // one line under guards that reject newlines.
+        assert!(md.contains("pass single-line text inline in single quotes"));
+        assert!(md.contains("--explanation 'Context:'"));
+        assert!(md.contains("one quoted argument per line"));
     }
 
     #[test]
