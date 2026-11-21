@@ -151,11 +151,10 @@ terminate_child_group() {
 # to finish the job.
 release_watchdog() {
   if [[ -n "${watchdog_pid}" ]]; then
-    # The watchdog may still be blocked reading the announce FIFO, whose write
-    # end this shell holds; closing it ends that read when no test was
-    # launched. Once a launcher has inherited the descriptor it closes its own
-    # copy after announcing, so this never takes a pid away from the watchdog.
-    exec 10<&- 12<&-
+    # The watchdog may still be in its readiness handshake (fd 12) or polling
+    # for the pid file; closing the leftover descriptor cannot steal a pid
+    # the launcher has already written.
+    exec 12<&-
     printf 'done\n' >&8 2>/dev/null || true
     wait "${watchdog_pid}" 2>/dev/null || true
     watchdog_pid=""
@@ -450,22 +449,23 @@ else:
 # good, a healthy one keeps running against a build that is over, and the
 # private root is never removed.
 #
-# Two FIFOs: the lifeline (this shell holds the only write end on fd 8) tells
-# the watchdog whether cleanup already happened, and the announce FIFO (fd 10)
-# carries the test's pid. Both are unlinked once the ends are open. The
-# watchdog starts first and publishes watchdog-ready before the test can run,
-# so a kill of this group cannot leave a test with no cleanup owner. The
-# kernel closes the write ends however this shell dies. A line on the lifeline
-# says cleanup already happened; end-of-file says the shell is gone, and the
+# The lifeline FIFO (this shell holds the only write end on fd 8) tells the
+# watchdog whether cleanup already happened. The launcher writes its pid to a
+# regular file rather than a FIFO: Darwin write(2) on a FIFO opened O_RDWR
+# returns EINVAL when no reader is blocked in read yet, which raced the
+# watchdog and failed macOS tests in the merge queue. The watchdog starts
+# first and publishes watchdog-ready before the test can run, so a kill of
+# this group cannot leave a test with no cleanup owner. The kernel closes the
+# lifeline write end however this shell dies. A line on the lifeline says
+# cleanup already happened; end-of-file says the shell is gone, and the
 # watchdog does the cleanup in its place.
 lifeline="${TEST_TMPDIR}/wrapper-lifeline"
-announce="${TEST_TMPDIR}/wrapper-announce"
+announce="${TEST_TMPDIR}/wrapper-child-pid"
 ready_fifo="${TEST_TMPDIR}/wrapper-ready"
-"${runtime_bin}/mkfifo" "${lifeline}" "${announce}" "${ready_fifo}"
+"${runtime_bin}/mkfifo" "${lifeline}" "${ready_fifo}"
 exec 8<>"${lifeline}" 9<"${lifeline}"
-exec 10<>"${announce}" 11<"${announce}"
 exec 12<>"${ready_fifo}"
-"${runtime_bin}/rm" -f "${lifeline}" "${announce}" "${ready_fifo}"
+"${runtime_bin}/rm" -f "${lifeline}" "${ready_fifo}"
 
 # The watchdog gets a group of its own so a kill aimed at this shell's group
 # cannot take it too. It is listening before the test starts. Record this
@@ -476,7 +476,7 @@ set -m
 (
   set +m
   trap - EXIT INT TERM HUP
-  exec 8<&- 10<&- </dev/null >/dev/null 2>&1
+  exec 8<&- </dev/null >/dev/null 2>&1
   printf '%s\n' "${wrapper_pid}" >"${TEST_TMPDIR}/watchdog-ready"
   if [[ -n "${hold_before_ready}" ]]; then
     : >"${hold_before_ready}.paused"
@@ -486,15 +486,27 @@ set -m
   fi
   printf 'ready\n' >&12
   exec 12<&-
-  if ! IFS= read -r child_pid <&11; then
-    child_pid=""
-  fi
-  exec 11<&-
+  child_pid=""
+  while true; do
+    if [[ -s "${announce}" ]]; then
+      IFS= read -r child_pid <"${announce}" || true
+      if [[ -n "${child_pid}" ]]; then
+        break
+      fi
+    fi
+    if IFS= read -r -t 1 _ <&9; then
+      exit 0
+    fi
+    if ! kill -0 "${wrapper_pid}" 2>/dev/null; then
+      if [[ -s "${announce}" ]]; then
+        IFS= read -r child_pid <"${announce}" || true
+      fi
+      break
+    fi
+  done
   if [[ -z "${child_pid}" ]]; then
-    # End-of-file on the announce FIFO: no process holds its write end any
-    # more, so no launcher was started or it exited without announcing. (A
-    # launcher that is merely slow to announce still holds the write end, and
-    # takes the branch below once it does.) Only the private root is left.
+    # The wrapper is gone and no launcher pid was published, so no test was
+    # started or it exited without announcing. Only the private root is left.
     if [[ "${owns_test_tmpdir}" == "1" ]]; then
       "${runtime_bin}/rm" -rf "${test_tmpdir}"
     fi
@@ -513,7 +525,7 @@ set +m
 if [[ -n "${hold_before_ready}" ]]; then
   printf '%s %s\n' "${watchdog_pid}" "${test_tmpdir}" >"${hold_before_ready}.watchdog"
 fi
-exec 9<&- 11<&-
+exec 9<&-
 
 # Block until the watchdog says it is listening. There is no give-up bound,
 # because a watchdog that is merely slow to be scheduled on a loaded host is
@@ -531,8 +543,9 @@ exit_if_cancelled
 # The launcher stays in this shell's group, writes its pid, then setpgid's
 # into its own group and execs sandbox-exec. Until the pid reaches the
 # watchdog, a kill of this group still takes the launcher with it. Neither
-# FIFO end is passed through the exec, so a surviving test descendant cannot
-# hold them open.
+# lifeline end is passed through the exec, so a surviving test descendant
+# cannot hold it open.
+MONO_WRAPPER_ANNOUNCE="${announce}" \
 MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID="${hold_before_setpgid}" "${runtime_bin}/python3" -c \
   'import os, signal, sys
 # A non-interactive shell starts an asynchronous command with SIGINT and
@@ -540,8 +553,17 @@ MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID="${hold_before_setpgid}" "${runtime_bin}/p
 # defaults so the test sees what it would outside the wrapper.
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 signal.signal(signal.SIGQUIT, signal.SIG_DFL)
-os.write(10, ("%d\n" % os.getpid()).encode())
-for fd in (8, 9, 10, 11, 12):
+announce = os.environ.pop("MONO_WRAPPER_ANNOUNCE", "")
+if not announce:
+    sys.exit("wrapper announce path missing")
+with open(announce, "w") as pidfile:
+    pidfile.write("%d\n" % os.getpid())
+    pidfile.flush()
+    try:
+        os.fsync(pidfile.fileno())
+    except OSError:
+        pass
+for fd in (8, 9, 12):
     try:
         os.close(fd)
     except OSError:
@@ -559,9 +581,8 @@ if hold:
 os.setpgid(0, 0)
 os.execvp(sys.argv[1], sys.argv[1:])
 os._exit(127)' \
-  /usr/bin/sandbox-exec -f "${profile}" "$@" 0<&0 8<&- 9<&- 11<&- 12<&- &
+  /usr/bin/sandbox-exec -f "${profile}" "$@" 0<&0 8<&- 9<&- 12<&- &
 child_pid=$!
-exec 10<&-
 exit_if_cancelled
 
 set +e
