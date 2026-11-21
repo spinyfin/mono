@@ -509,6 +509,9 @@ impl AgentDriver for StubDriver {
     fn progress_fidelity(&self) -> ProgressFidelity {
         self.progress_fidelity
     }
+    fn progress_ingress_kind(&self) -> crate::ProgressIngressKind {
+        crate::ProgressIngressKind::StdoutJsonl
+    }
     fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressIngress {
         // No hooks: a StdoutJsonl-shaped ingress. `write_workspace_files`
         // / settings rendering tolerate an empty hooks map.

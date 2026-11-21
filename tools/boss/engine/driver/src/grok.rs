@@ -586,6 +586,10 @@ impl AgentDriver for GrokDriver {
         ProgressFidelity::Rich
     }
 
+    fn progress_ingress_kind(&self) -> crate::ProgressIngressKind {
+        crate::ProgressIngressKind::HookCallback
+    }
+
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
         // Destination is DriverOwned: `write_permission_config` (via
         // `hooks::write_hooks`) is what actually writes this wiring to

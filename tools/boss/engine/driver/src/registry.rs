@@ -2,12 +2,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    AgentDriver, AgyDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngress,
-    ProgressObservationConfig, WorkerProcessLifetime,
+    AgentDriver, AgyDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngressKind,
+    WorkerProcessLifetime,
 };
 
 /// A driver slug the current binary's [`DriverRegistry`] does not recognise.
@@ -77,18 +76,8 @@ impl Default for DriverRegistry {
 /// `StdoutJsonl`-declaring test drivers to exercise that still-supported
 /// generic ingress kind in isolation from any real driver.
 fn refuse_stdout_jsonl_ingress(slug: &str, driver: &dyn AgentDriver) {
-    let probe_config = ProgressObservationConfig {
-        events_socket_path: PathBuf::new(),
-        lease_id: String::new(),
-        run_id: String::new(),
-        workspace_path: PathBuf::new(),
-        forwarder_binary: PathBuf::new(),
-    };
     assert!(
-        !matches!(
-            driver.progress_observation_wiring(&probe_config),
-            ProgressIngress::StdoutJsonl
-        ),
+        driver.progress_ingress_kind() != ProgressIngressKind::StdoutJsonl,
         "driver '{slug}' declared ProgressIngress::StdoutJsonl at registration; the engine-spawned \
          stdout-JSONL topology was intentionally discontinued and production ingress activation does \
          not wire it up — see tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md"
@@ -274,6 +263,30 @@ mod tests {
     use super::*;
     use crate::test_support::{StubDriver, stub_descriptor};
     use crate::{Capability, CapabilitySet, SpawnRequest};
+
+    /// `progress_ingress_kind` must match the variant the wiring returns for
+    /// a real config, since callers classify drivers with it instead of
+    /// building the wiring.
+    #[test]
+    fn ingress_kind_agrees_with_wiring_for_every_builtin_driver() {
+        let reg = DriverRegistry::default();
+        let tmp = std::env::temp_dir();
+        for slug in ["claude", "codex", "grok", "agy"] {
+            let driver = reg.require(slug).unwrap();
+            let config = crate::ProgressObservationConfig {
+                events_socket_path: tmp.join("events.sock"),
+                lease_id: "lease".into(),
+                run_id: format!("run-{slug}"),
+                workspace_path: tmp.join("ws"),
+                forwarder_binary: tmp.join("boss-event"),
+            };
+            assert_eq!(
+                driver.progress_ingress_kind(),
+                driver.progress_observation_wiring(&config).kind(),
+                "driver '{slug}'"
+            );
+        }
+    }
 
     #[test]
     fn default_registry_contains_claude() {

@@ -728,6 +728,9 @@ mod tests {
         fn progress_fidelity(&self) -> crate::driver::ProgressFidelity {
             unimplemented!()
         }
+        fn progress_ingress_kind(&self) -> boss_engine_driver::ProgressIngressKind {
+            boss_engine_driver::ProgressIngressKind::StdoutJsonl
+        }
         fn progress_observation_wiring(
             &self,
             _: &crate::driver::ProgressObservationConfig,

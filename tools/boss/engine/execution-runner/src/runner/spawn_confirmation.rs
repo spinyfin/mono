@@ -33,7 +33,6 @@
 //! "Composer never became ready" is reported only when neither composer
 //! chrome nor turn-start evidence arrives.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use boss_protocol::PaneMonitorSpec;
@@ -45,7 +44,7 @@ pub use boss_execution_contracts::{
 };
 
 use crate::driver::initial_prompt::{DELIVERY_BUDGET, DeliveryState};
-use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig};
+use crate::driver::{AgentDriver, ProgressIngressKind};
 use crate::host::DriverSignals;
 use crate::work::WorkDb;
 
@@ -127,16 +126,9 @@ pub fn prompt_confirm_timeout_for_driver(driver: &dyn AgentDriver, discovery_tim
 }
 
 fn hook_or_discovery_timeout(driver: &dyn AgentDriver, hook: Duration, discovery: Duration) -> Duration {
-    let dummy = ProgressObservationConfig {
-        events_socket_path: PathBuf::from("/dev/null"),
-        lease_id: String::new(),
-        run_id: String::new(),
-        workspace_path: PathBuf::from("/"),
-        forwarder_binary: PathBuf::from("/dev/null"),
-    };
-    match driver.progress_observation_wiring(&dummy) {
-        ProgressIngress::AgentJsonlFile(_) => discovery,
-        ProgressIngress::HookCallback(_) | ProgressIngress::StdoutJsonl => hook,
+    match driver.progress_ingress_kind() {
+        ProgressIngressKind::AgentJsonlFile => discovery,
+        ProgressIngressKind::HookCallback | ProgressIngressKind::StdoutJsonl => hook,
     }
 }
 

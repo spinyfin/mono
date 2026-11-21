@@ -1347,6 +1347,27 @@ pub enum ProgressIngress {
     AgentJsonlFile(AgentJsonlFileIngress),
 }
 
+impl ProgressIngress {
+    /// The variant of this ingress without its payload.
+    pub fn kind(&self) -> ProgressIngressKind {
+        match self {
+            Self::HookCallback(_) => ProgressIngressKind::HookCallback,
+            Self::StdoutJsonl => ProgressIngressKind::StdoutJsonl,
+            Self::AgentJsonlFile(_) => ProgressIngressKind::AgentJsonlFile,
+        }
+    }
+}
+
+/// Which [`ProgressIngress`] variant a driver declares, without any wiring.
+/// Returned by [`AgentDriver::progress_ingress_kind`] so callers that only
+/// need to classify a driver never have to build a run config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressIngressKind {
+    HookCallback,
+    StdoutJsonl,
+    AgentJsonlFile,
+}
+
 /// Which provider dialect the generic JSONL reader is consuming.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProgressStreamSource {
@@ -2202,6 +2223,13 @@ pub trait AgentDriver: Send + Sync {
     /// returns the byte-stream ingress appropriate to its topology
     /// (`StdoutJsonl` or `AgentJsonlFile`) instead.
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress;
+
+    /// Which [`ProgressIngress`] variant [`Self::progress_observation_wiring`]
+    /// returns. Needs no run config, so callers that only classify a driver
+    /// (registration guards, timeout sizing, readoption) must use this rather
+    /// than building a placeholder config and building the wiring from it.
+    /// Must agree with the wiring's variant for every real config.
+    fn progress_ingress_kind(&self) -> ProgressIngressKind;
 
     /// Decode one raw event-source payload into a typed [`WorkerEvent`] that
     /// drives the (driver-agnostic) activity machine. For the Claude driver

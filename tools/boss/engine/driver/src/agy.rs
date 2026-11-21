@@ -494,6 +494,10 @@ impl AgentDriver for AgyDriver {
         ProgressFidelity::Rich
     }
 
+    fn progress_ingress_kind(&self) -> crate::ProgressIngressKind {
+        crate::ProgressIngressKind::HookCallback
+    }
+
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
         // Destination is DriverOwned: hooks are discovered from
         // `$HOME/.gemini/config/hooks.json`, never from the Claude worker
@@ -1139,6 +1143,18 @@ mod tests {
         );
         assert_eq!(driver.reap(), super::super::ReapDelivery::ProcessGroup);
         assert!(driver.launch_implemented());
+    }
+
+    #[test]
+    fn authorization_wiring_still_refuses_an_empty_run_id() {
+        let config = ProgressObservationConfig {
+            events_socket_path: std::path::PathBuf::from("/tmp/events.sock"),
+            lease_id: "lease".into(),
+            run_id: String::new(),
+            workspace_path: std::path::PathBuf::from("/tmp/ws"),
+            forwarder_binary: std::path::PathBuf::from("/tmp/boss-event"),
+        };
+        assert!(hooks::authorization_hooks_map(&config).is_err());
     }
 
     #[test]

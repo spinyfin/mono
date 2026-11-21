@@ -237,6 +237,9 @@ mod tests {
         fn progress_fidelity(&self) -> ProgressFidelity {
             ProgressFidelity::Minimal
         }
+        fn progress_ingress_kind(&self) -> boss_engine_driver::ProgressIngressKind {
+            boss_engine_driver::ProgressIngressKind::StdoutJsonl
+        }
         fn progress_observation_wiring(&self, _config: &ProgressObservationConfig) -> ProgressIngress {
             ProgressIngress::StdoutJsonl
         }
