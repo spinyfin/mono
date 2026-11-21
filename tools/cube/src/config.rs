@@ -156,7 +156,13 @@ pub const DEFAULT_MAX_FREE_WORKSPACES: usize = 20;
 /// than a full disk.
 pub const DEFAULT_COMPACT_IDLE_HOURS: u64 = 6;
 
-/// Absolute free-space floor below which a lease triggers reclamation.
+/// Absolute free-space low-water mark below which cube starts reclaiming.
+///
+/// This (with [`DEFAULT_MIN_FREE_PERCENT`]) only decides when *cleanup*
+/// starts. It does not decide whether a new workspace may be provisioned —
+/// that is [`PoolConfig::mint_floor_bytes`], sized off what one workspace
+/// needs. The two used to be one number, so raising this to make cleanup start
+/// earlier also made provisioning refuse with plenty of space left.
 ///
 /// 20 GiB is roughly one fully-built mono workspace (the largest observed
 /// `target/` was 20.93 GiB), so this is "less than one more worker's worth of
@@ -190,6 +196,33 @@ pub const DEFAULT_MIN_FREE_PERCENT: u64 = 2;
 /// build is already refilling the volume; one well above it would cold-start
 /// several warm workspaces to buy headroom that one build spends in minutes.
 pub const DEFAULT_CLEANUP_HEADROOM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Disk one newly provisioned workspace is expected to consume once it has
+/// been built: its checkout plus its Bazel output base.
+///
+/// Sized off the measurement, not a guess. On 2026-10-28, across the 29 mono
+/// workspaces on a busy host, the Bazel output bases had a median of 15.0
+/// GiB, nine in ten were at or under 18.7 GiB, and the largest was 19.2 GiB;
+/// the checkouts themselves were 0.06–0.65 GiB. The largest was 16.5 GiB a
+/// week earlier, so bases are still growing with the repo: 24 GiB is the
+/// largest observed workspace (~20 GiB) plus about 20% for that growth. See
+/// [`PoolConfig::mint_floor_bytes`] for how it is used.
+pub const DEFAULT_WORKSPACE_FOOTPRINT_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+
+/// How many workspace footprints of free space a mint must leave room for.
+///
+/// More than one because a mint is rarely alone: other workspaces leased at
+/// the same time are building too, and an output base can grow past its
+/// steady-state size mid-build (sandbox trees, repository fetches, test
+/// outputs). Two footprints means the new workspace can build fully even if a
+/// concurrent build grows by as much again.
+pub const DEFAULT_MINT_FOOTPRINT_MARGIN: u64 = 2;
+
+/// Free space kept back for the OS and everything that is not cube (swap,
+/// APFS snapshots, logs, other tools' caches), on top of the workspace's own
+/// needs. A fixed amount, not a fraction: what the OS needs to stay healthy
+/// does not grow with the size of the disk.
+pub const DEFAULT_MINT_OS_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Directory names, relative to a workspace root, treated as regenerable
 /// build output and reclaimed by compaction.
@@ -265,6 +298,10 @@ pub struct PoolConfig {
     /// [`DEFAULT_CLEANUP_HEADROOM_BYTES`].
     #[serde(rename = "cleanup-headroom-bytes")]
     pub cleanup_headroom_bytes: Option<u64>,
+    /// Free space below which provisioning a new workspace is refused. See
+    /// [`Self::mint_floor_bytes`].
+    #[serde(rename = "mint-min-free-bytes")]
+    pub mint_min_free_bytes: Option<u64>,
 }
 
 impl PoolConfig {
@@ -299,12 +336,13 @@ impl PoolConfig {
         (hours as i64).saturating_mul(SECS_PER_HOUR)
     }
 
-    /// The free-space floor for a volume of `total_bytes`:
+    /// The cleanup low-water mark for a volume of `total_bytes`:
     /// `max(min_free_bytes, min_free_percent% of total)`.
     ///
-    /// Below this, a lease reclaims before it does anything else; a mint that
-    /// still cannot clear it afterwards fails loudly rather than pushing the
-    /// volume over.
+    /// Below this, cube reclaims: a lease compacts before it does anything
+    /// else, and the periodic pass cleans free workspaces. It is a trigger for
+    /// reclamation only — whether a mint is refused is decided by
+    /// [`Self::mint_floor_bytes`].
     pub fn free_space_floor_bytes(&self, total_bytes: u64) -> u64 {
         let absolute = env_u64("CUBE_POOL_MIN_FREE_BYTES")
             .or(self.min_free_bytes)
@@ -318,6 +356,26 @@ impl PoolConfig {
 }
 
 impl PoolConfig {
+    /// The free space below which provisioning a new workspace is refused.
+    ///
+    /// Defaults to what one workspace actually needs —
+    /// [`DEFAULT_WORKSPACE_FOOTPRINT_BYTES`] ×
+    /// [`DEFAULT_MINT_FOOTPRINT_MARGIN`] + [`DEFAULT_MINT_OS_RESERVE_BYTES`] —
+    /// and deliberately does not scale with the volume: a bigger disk does not
+    /// make a workspace bigger. It is independent of the cleanup trigger
+    /// ([`Self::free_space_floor_bytes`]), so tuning when cleanup starts never
+    /// moves the point at which leases start failing. Override with
+    /// `[pool] mint-min-free-bytes` or `CUBE_POOL_MINT_MIN_FREE_BYTES`.
+    pub fn mint_floor_bytes(&self) -> u64 {
+        env_u64("CUBE_POOL_MINT_MIN_FREE_BYTES")
+            .or(self.mint_min_free_bytes)
+            .unwrap_or(
+                DEFAULT_WORKSPACE_FOOTPRINT_BYTES
+                    .saturating_mul(DEFAULT_MINT_FOOTPRINT_MARGIN)
+                    .saturating_add(DEFAULT_MINT_OS_RESERVE_BYTES),
+            )
+    }
+
     /// The mark a repo-declared workspace cleanup stops at once it has started:
     /// the free-space floor (its low-water mark) plus
     /// [`DEFAULT_CLEANUP_HEADROOM_BYTES`] of margin.
@@ -505,6 +563,33 @@ mod tests {
     fn free_space_floor_honours_explicit_config() {
         let cfg: CubeConfig = toml::from_str("[pool]\nmin-free-bytes = 1024\nmin-free-percent = 0\n").expect("parse");
         assert_eq!(cfg.pool.free_space_floor_bytes(1_000_000), 1024);
+    }
+
+    #[test]
+    fn mint_floor_is_what_a_workspace_needs_not_a_fraction_of_the_disk() {
+        let pool = PoolConfig::default();
+        let expected =
+            DEFAULT_WORKSPACE_FOOTPRINT_BYTES * DEFAULT_MINT_FOOTPRINT_MARGIN + DEFAULT_MINT_OS_RESERVE_BYTES;
+        assert_eq!(pool.mint_floor_bytes(), expected);
+        // It does not move with the cleanup trigger: a host that raises
+        // `min-free-percent` to start cleaning earlier keeps the same mint
+        // floor, on a small disk and a large one alike.
+        let tuned: CubeConfig = toml::from_str("[pool]\nmin-free-percent = 10\n").expect("parse");
+        assert_eq!(tuned.pool.mint_floor_bytes(), expected);
+        let large = 1_858 * 1024 * 1024 * 1024_u64;
+        assert_eq!(tuned.pool.free_space_floor_bytes(large), large / 100 * 10);
+        assert!(tuned.pool.mint_floor_bytes() < tuned.pool.free_space_floor_bytes(large));
+    }
+
+    #[test]
+    fn mint_floor_honours_explicit_config() {
+        let cfg: CubeConfig = toml::from_str("[pool]\nmint-min-free-bytes = 4096\n").expect("parse");
+        assert_eq!(cfg.pool.mint_floor_bytes(), 4096);
+        // Setting it leaves the cleanup trigger alone.
+        assert_eq!(
+            cfg.pool.free_space_floor_bytes(1_000_000),
+            PoolConfig::default().free_space_floor_bytes(1_000_000)
+        );
     }
 
     #[test]
