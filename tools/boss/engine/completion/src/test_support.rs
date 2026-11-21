@@ -94,30 +94,7 @@ pub fn seed_published_guide_comment(db: &WorkDb, pr_number: u32, body: &str) -> 
     (root, series, comment)
 }
 
-/// Spawn a long-lived `sleep` in its OWN process group and return the
-/// child handle. A reap signals the process *group*, so a test exercising
-/// a REAL kill (durable-state teardown, `release_worker_pane`,
-/// `retire_pane`'s durable-evidence auto-teardown) must target a process
-/// in its own group — never `std::process::id()` — or the signal lands on
-/// the test runner's own group and kills the test process itself.
-pub fn spawn_group_leader_sleeper() -> std::process::Child {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    unsafe {
-        Command::new("sleep")
-            .arg("300")
-            .pre_exec(|| {
-                // setpgid(0, 0): become our own process group leader.
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            })
-            .spawn()
-            .expect("spawn sleep child")
-    }
-}
+pub use boss_engine_test_process::{ProcessGroupChild, spawn_group_leader_sleeper, spawn_setsid_sleeper};
 
 /// Give a local completion fixture the same durable recovery record as a
 /// dispatched worker. Uses the fixture's existing directory and real jj.

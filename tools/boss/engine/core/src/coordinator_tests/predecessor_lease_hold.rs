@@ -318,7 +318,6 @@ async fn resume_preserves_the_stalled_runs_work_and_returns_its_lease_before_the
 
 #[tokio::test]
 async fn orphan_cleanup_preserves_work_and_unblocks_the_successor() {
-    use std::io::BufRead;
     let s = Stalled::new(true).await;
     s.db().mark_execution_orphaned(&s.stalled_id, "worker gone").unwrap();
     let successor = s
@@ -329,31 +328,9 @@ async fn orphan_cleanup_preserves_work_and_unblocks_the_successor() {
                 .build(),
         )
         .unwrap();
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut child = Child(
-        std::process::Command::new("python3")
-            .args([
-                "-u",
-                "-c",
-                "import os,time; os.setsid(); print('ready'); time.sleep(600)",
-            ])
-            .env("BOSS_RUN_ID", &s.stalled_id)
-            .current_dir(&s.repo.worker)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let mut ready = String::new();
-    std::io::BufReader::new(child.0.stdout.take().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
-    assert_eq!(ready.trim(), "ready");
+    let mut child = spawn_setsid_sleeper(&s.repo.worker, |command| {
+        command.env("BOSS_RUN_ID", &s.stalled_id);
+    });
     assert!(s.db().recovery_predecessor_holding_lease(&successor).unwrap().is_some());
     let started = std::time::Instant::now();
     let result = apply_release(
@@ -379,7 +356,7 @@ async fn orphan_cleanup_preserves_work_and_unblocks_the_successor() {
         "{:?}",
         s.db().list_attention_items(&s.stalled_id).unwrap()
     );
-    assert!(child.0.try_wait().unwrap().is_some());
+    assert!(child.try_wait().unwrap().is_some());
     assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_some());
     assert!(s.db().recovery_predecessor_holding_lease(&successor).unwrap().is_none());
     s.drain().await;
@@ -390,44 +367,13 @@ async fn orphan_cleanup_preserves_work_and_unblocks_the_successor() {
     );
 }
 
-fn spawn_workspace_occupant(workspace: &Path, run_id: Option<&str>) -> Occupant {
-    use std::io::BufRead;
-    let mut command = std::process::Command::new("python3");
-    command
-        .args([
-            "-u",
-            "-c",
-            "import os,time; os.setsid(); print('ready'); time.sleep(600)",
-        ])
-        .current_dir(workspace)
-        .env_remove("BOSS_RUN_ID")
-        .env_remove("BOSS_SPAWN_TOKEN")
-        .stdout(std::process::Stdio::piped());
-    if let Some(run_id) = run_id {
-        command.env("BOSS_RUN_ID", run_id);
-    }
-    let mut child = command.spawn().unwrap();
-    let mut ready = String::new();
-    std::io::BufReader::new(child.stdout.as_mut().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
-    assert_eq!(ready.trim(), "ready");
-    Occupant(child)
-}
-
-struct Occupant(std::process::Child);
-
-impl Occupant {
-    fn pid(&self) -> u32 {
-        self.0.id()
-    }
-}
-
-impl Drop for Occupant {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+fn spawn_workspace_occupant(workspace: &Path, run_id: Option<&str>) -> crate::test_support::ProcessGroupChild {
+    spawn_setsid_sleeper(workspace, |command| {
+        command.env_remove("BOSS_RUN_ID").env_remove("BOSS_SPAWN_TOKEN");
+        if let Some(run_id) = run_id {
+            command.env("BOSS_RUN_ID", run_id);
+        }
+    })
 }
 
 fn wait_until_occupied(path: &Path) -> Occupancy {
@@ -549,7 +495,7 @@ async fn successor_failure_quotes_fresh_occupancy_not_the_original_list() {
         keep_lease_with_occupants(&s).await,
         LeaseReleaseOutcome::Kept { .. }
     ));
-    let original_pid = original.pid().to_string();
+    let original_pid = original.id().to_string();
     let original_body = s
         .db()
         .list_attention_items(&s.stalled_id)
@@ -571,7 +517,7 @@ async fn successor_failure_quotes_fresh_occupancy_not_the_original_list() {
         .unwrap();
     let live_occupant = spawn_workspace_occupant(&s.repo.worker, Some(&live.id));
     assert_eq!(wait_until_occupied(&s.repo.worker), Occupancy::Occupied);
-    let live_pid = live_occupant.pid().to_string();
+    let live_pid = live_occupant.id().to_string();
 
     s.drain().await;
     assert_eq!(
@@ -1052,7 +998,7 @@ async fn successor_never_signals_a_recorded_live_shell() {
         let s = Stalled::new(true).await;
         let mut shell = spawn_workspace_occupant(&s.repo.worker, Some(&s.stalled_id));
         s.db()
-            .set_run_shell_pid_for_execution(&s.stalled_id, i64::from(shell.pid()))
+            .set_run_shell_pid_for_execution(&s.stalled_id, i64::from(shell.id()))
             .unwrap();
         s.db()
             .mark_execution_orphaned(&s.stalled_id, "abort unconfirmed")
@@ -1087,7 +1033,7 @@ async fn successor_never_signals_a_recorded_live_shell() {
             ExecutionStatus::Ready
         );
         assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
-        assert!(shell.0.try_wait().unwrap().is_none(), "the shell must not be signalled");
+        assert!(shell.try_wait().unwrap().is_none(), "the shell must not be signalled");
         assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
     }
 }

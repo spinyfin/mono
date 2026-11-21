@@ -252,24 +252,11 @@ async fn release_worker_pane_refuses_to_reap_from_a_pid_outside_the_trust_window
 
 #[tokio::test]
 async fn reap_worker_process_tree_kills_orphan_child() {
-    use std::io::BufRead;
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().to_string_lossy().to_string();
-    let mut child = std::process::Command::new("python3")
-        .args([
-            "-u",
-            "-c",
-            "import os,time; os.setsid(); print('ready'); time.sleep(60)",
-        ])
-        .env("BOSS_SPAWN_TOKEN", &token)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut ready = String::new();
-    std::io::BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
-    assert_eq!(ready.trim(), "ready");
+    let mut child = boss_engine_runtime::test_support::spawn_setsid_sleeper(dir.path(), |command| {
+        command.env("BOSS_SPAWN_TOKEN", &token);
+    });
     let pid = child.id() as i32;
     assert!(
         matches!(
