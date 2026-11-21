@@ -143,7 +143,7 @@ async fn an_abandoned_run_whose_worker_is_still_alive_keeps_its_lease_and_holds_
     let s = Stalled::new(true).await;
     let mut shell = spawn_workspace_occupant(&s.repo.worker, Some(&s.stalled_id));
     s.db()
-        .set_run_shell_pid_for_execution(&s.stalled_id, i64::from(shell.pid()))
+        .set_run_shell_pid_for_execution(&s.stalled_id, i64::from(shell.id()))
         .unwrap();
     let successor = start_explicitly(&s, true);
 
@@ -159,7 +159,7 @@ async fn an_abandoned_run_whose_worker_is_still_alive_keeps_its_lease_and_holds_
         ExecutionStatus::Ready
     );
     assert_eq!(s.stalled().cube_lease_id.as_deref(), Some("lease-old"));
-    assert!(shell.0.try_wait().unwrap().is_none(), "the shell must not be signalled");
+    assert!(shell.try_wait().unwrap().is_none(), "the shell must not be signalled");
     assert!(s.db().preserved_tip(&s.stalled_id).unwrap().is_none());
     assert!(s.cube.force_release_calls.lock().await.is_empty());
 }
