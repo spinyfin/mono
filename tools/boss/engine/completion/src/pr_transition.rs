@@ -246,7 +246,6 @@ impl WorkerCompletionHandler {
             && matches!(target, WorkerPrCompletionTarget::InReview)
             && pr_head_after.is_none()
             && self.enable_revision_triggered_reviews
-            && let Ok(execution) = execution_result.as_ref()
             && execution.kind == ExecutionKind::RevisionImplementation
             && !super::run_done_declaration::review_skipped_before_hold(
                 &self.work_db,
@@ -258,7 +257,7 @@ impl WorkerCompletionHandler {
                 Ok(Some(ref stamped)) if !stamped.is_empty()
             )
         {
-            return self.fail_delivery_with_unreadable_head(execution, &pr_url).await;
+            return self.fail_delivery_with_unreadable_head(&execution, &pr_url).await;
         }
 
         // For reviewer-triggering executions with a fresh
@@ -695,10 +694,7 @@ impl WorkerCompletionHandler {
         // and a hold keyed on either is one this batch's decision would not
         // release.
         let review_hold_head = review_hold_head.filter(|_| enqueued_reviewer);
-        let holds_revision = enqueued_reviewer
-            && execution_result
-                .as_ref()
-                .is_ok_and(|execution| execution.kind == ExecutionKind::RevisionImplementation);
+        let holds_revision = enqueued_reviewer && execution.kind == ExecutionKind::RevisionImplementation;
         // When admission named no batch (it was deferred, or the pull request
         // could not be read), a hold the Stop boundary did not stamp falls
         // back to the head the run finished at, so a batch admitted for that
