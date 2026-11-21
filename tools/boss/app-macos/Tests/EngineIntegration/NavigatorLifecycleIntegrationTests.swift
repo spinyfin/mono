@@ -52,7 +52,7 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
             INSERT INTO pr_review_verdicts(id,execution_id,work_item_id,head_sha,findings_count,revision_warranted,gate_outcome,created_at)
             VALUES ('nav-verdict','nav-review','task_nav_root','fixture-head',0,0,'completed_clean','101');
             """)
-        try await refresh(model, section: .needsAttention)
+        try await refresh(model, section: .ready)
         XCTAssertTrue(model.navigator.tabs.contains(.review))
 
         try fixture.sql("""
@@ -104,7 +104,7 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
             UPDATE work_executions SET status='completed' WHERE work_item_id='task_nav_revision';
             UPDATE work_runs SET status='completed' WHERE id='nav-repair-run';
             """)
-        try await refresh(model, section: .needsAttention)
+        try await refresh(model, section: .ready)
         model.navigator.tab = .review
         try await capture(host, name: "review")
         try fixture.sql("UPDATE tasks SET merge_queue_state='queued' WHERE id='task_nav_root'")

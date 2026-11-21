@@ -68,7 +68,7 @@ final class NavigatorAttentionTests: XCTestCase {
         let model = model([root, revision])
         model.setWorkViewMode(.navigator)
         model.selectWorkCard("root")
-        XCTAssertEqual(model.navigatorSections.map(\.total), [1, 0, 0, 0])
+        XCTAssertEqual(model.navigatorSections.map(\.total), [0, 1, 0, 0, 0])
         XCTAssertEqual(model.navigatorSelectedTask?.navigator?.root?.knownSection, .working)
         XCTAssertEqual(model.navigatorSelectedTask?.navigator?.root?.questionCount, 1)
         XCTAssertTrue(model.navigator.tabs.contains(.attention))

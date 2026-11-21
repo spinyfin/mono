@@ -298,6 +298,25 @@ final class NavigatorRowTests: XCTestCase {
         XCTAssertTrue(try presentation().accessibilityLabel.contains("CI unknown"))
     }
 
+    func testReadyRowsOmitTheGreenCheckHealthIcon() throws {
+        var task = NavigatorTestFixture.task(section: "ready")
+        task.ciRequiredState = "success"
+        task.reviewRequiredState = "approved"
+        let ready = NavigatorRowPresentation(
+            row: NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil),
+            project: nil, width: 360)
+        XCTAssertNil(ready.health)
+        XCTAssertTrue(ready.accessibilityLabel.contains("CI success"))
+        XCTAssertTrue(ready.accessibilityLabel.contains("Review approved"))
+        task = NavigatorTestFixture.task(section: "working")
+        task.ciRequiredState = "success"
+        task.reviewRequiredState = "approved"
+        let working = NavigatorRowPresentation(
+            row: NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil),
+            project: nil, width: 360)
+        XCTAssertEqual(working.health?.label, "Review approved")
+    }
+
     func testDetailSlotsAndNavigatorRenderWithoutProductionEngine() throws {
         var root = NavigatorTestFixture.task()
         root.prMergeableState = "conflicting"
@@ -312,6 +331,21 @@ final class NavigatorRowTests: XCTestCase {
             host.frame = NSRect(x: 0, y: 0, width: 1000, height: 650)
             try capture(host, name: "navigator-\(slot.rawValue)")
         }
+    }
+
+    func testNavigatorRendersReadyAsTheFirstSection() throws {
+        let ready = NavigatorTestFixture.task("ready", section: "ready", order: "0")
+        let working = NavigatorTestFixture.task("working", section: "working", order: "1")
+        let attention = NavigatorTestFixture.task("attention", section: "needs_attention", order: "2")
+        let model = NavigatorTestFixture.model([ready, working, attention])
+        model.setWorkViewMode(.navigator)
+        model.selectWorkCard("ready")
+        let host = NSHostingView(rootView: WorkNavigatorView(model: model).frame(width: 1000, height: 650))
+        host.frame = NSRect(x: 0, y: 0, width: 1000, height: 650)
+        try capture(host, name: "navigator-ready-section")
+        XCTAssertEqual(model.navigatorSections.map(\.section.title),
+                       ["Ready", "Working", "Needs attention", "Backlog", "Landed"])
+        XCTAssertEqual(model.navigatorSections[0].rows.map(\.id), ["ready"])
     }
 
     private func capture<V: View>(_ host: NSHostingView<V>, name: String) throws {

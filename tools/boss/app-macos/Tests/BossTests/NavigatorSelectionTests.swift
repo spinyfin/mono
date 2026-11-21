@@ -3,6 +3,25 @@ import XCTest
 
 @MainActor
 final class NavigatorSelectionTests: XCTestCase {
+    func testReadyIsTheFirstNavigatorSectionAndCountsLikeTheOthers() {
+        XCTAssertEqual(
+            NavigatorSection.allCases.map(\.title),
+            ["Ready", "Working", "Needs attention", "Backlog", "Landed"]
+        )
+        let ready = NavigatorTestFixture.task("ready", section: "ready", order: "0")
+        let working = NavigatorTestFixture.task("working", section: "working", order: "1")
+        let model = NavigatorTestFixture.model([ready, working])
+        XCTAssertEqual(model.navigatorSections.map(\.section), NavigatorSection.allCases)
+        XCTAssertEqual(model.navigatorSections.map(\.total), [1, 1, 0, 0, 0])
+        XCTAssertEqual(model.navigatorSections[0].rows.map(\.id), ["ready"])
+        XCTAssertEqual(model.navigatorSections[1].rows.map(\.id), ["working"])
+        model.setNavigatorSection(.ready, expanded: false)
+        XCTAssertTrue(model.navigatorCollapsed.contains(.ready))
+        XCTAssertEqual(model.navigatorVisibleRows.map(\.id), ["working"])
+        model.setNavigatorSection(.ready, expanded: true)
+        XCTAssertEqual(model.navigatorVisibleRows.map(\.id), ["ready", "working"])
+    }
+
     func testExplicitDeselectionSurvivesRefreshAndExcludedCardDoesNotReuseOldRoot() {
         let root = NavigatorTestFixture.task()
         var excluded = NavigatorTestFixture.task("automation")
@@ -51,7 +70,7 @@ final class NavigatorSelectionTests: XCTestCase {
         let patch: [String: Any] = ["product_id": "product", "sequence": UInt64(2), "base_sequence": UInt64(1),
                                    "changes": ["tasks": ["upserts": [wire("needs_attention", detail: "attention")]]]]
         try apply(XCTUnwrap(cache.apply(patch)))
-        XCTAssertEqual(model.navigatorSections.map(\.total), [0, 1, 0, 0])
+        XCTAssertEqual(model.navigatorSections.map(\.total), [0, 0, 1, 0, 0])
         XCTAssertEqual(model.navigator.selectedRootID, "root")
         XCTAssertEqual(model.navigator.tab, .history)
         cache.startConnection(2)
@@ -71,11 +90,11 @@ final class NavigatorSelectionTests: XCTestCase {
         model.showBlockedOnly = true
         model.includeChores = false
         model.toggleProjectFilter("alpha")
-        XCTAssertEqual(model.navigatorSections[0].rows.map(\.id), ["other", "root"])
+        XCTAssertEqual(model.navigatorSections[1].rows.map(\.id), ["other", "root"])
         model.workSearchText = "keyboard"
-        XCTAssertEqual(model.navigatorSections[0].total, 2)
-        XCTAssertEqual(model.navigatorSections[0].rows.map(\.id), ["root"])
-        XCTAssertEqual(model.navigatorSections[0].rows.first?.matchingAskID, "revision")
+        XCTAssertEqual(model.navigatorSections[1].total, 2)
+        XCTAssertEqual(model.navigatorSections[1].rows.map(\.id), ["root"])
+        XCTAssertEqual(model.navigatorSections[1].rows.first?.matchingAskID, "revision")
         model.moveNavigatorSelection(by: 1)
         XCTAssertEqual(model.navigator.selectedRootID, "root")
         XCTAssertEqual(model.navigator.askID, "revision")
@@ -91,7 +110,7 @@ final class NavigatorSelectionTests: XCTestCase {
         XCTAssertEqual(model.navigator.selectedRootID, "root")
         XCTAssertEqual(model.navigator.tab, .history)
         XCTAssertEqual(model.navigator.revealGeneration, reveal)
-        XCTAssertEqual(model.navigatorSections.map(\.total), [0, 0, 0, 1])
+        XCTAssertEqual(model.navigatorSections.map(\.total), [0, 0, 0, 0, 1])
         XCTAssertTrue(model.navigatorVisibleRows.isEmpty)
         XCTAssertEqual(model.navigatorSelectionNotice, "Moved to Landed.")
         model.revealNavigatorSelection()
@@ -254,7 +273,7 @@ final class NavigatorSelectionTests: XCTestCase {
         acknowledgement.navigator = nil
         acknowledgement.status = "done"
         model.applyIncrementalTaskUpdate(acknowledgement, isChore: false)
-        XCTAssertEqual(model.navigatorSections.map(\.total), [1, 0, 0, 0])
+        XCTAssertEqual(model.navigatorSections.map(\.total), [0, 1, 0, 0, 0])
     }
 
     func testKeyboardSkipsCollapsedAndFilteredRowsAndSupportsEdges() {

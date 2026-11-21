@@ -6,7 +6,7 @@ use super::*;
 use crate::board_projection::{CachedProjection, Refresh};
 use boss_protocol::{
     NavigatorAction, NavigatorActivityKind, NavigatorCommandKind, NavigatorHumanAction, NavigatorProjection,
-    NavigatorReason, NavigatorRoot, NavigatorSection, NavigatorWait,
+    NavigatorReason, NavigatorRoot, NavigatorSection, NavigatorWait, ReviewSection,
 };
 
 const PR: &str = "https://github.com/spinyfin/mono/pull/7";
@@ -33,6 +33,15 @@ fn row(model: &Model, id: &str) -> NavigatorRoot {
     projection(model, id)
         .root
         .unwrap_or_else(|| panic!("{id} is folded into another row"))
+}
+
+fn card<'a>(model: &'a Model, id: &str) -> &'a boss_protocol::Task {
+    let tree = model.as_ref().expect("a retained projection").tree();
+    tree.tasks
+        .iter()
+        .chain(&tree.chores)
+        .find(|task| task.id == id)
+        .unwrap_or_else(|| panic!("{id} is not on the board"))
 }
 
 fn has_projection(model: &Model, id: &str) -> bool {
@@ -181,7 +190,7 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
     reviewed_clean_pr(&db, &root);
     assert!(matches!(step(&db, &product, &mut model), Refresh::Incremental(_)));
     let ready = row(&model, &root);
-    assert_eq!(ready.section, NavigatorSection::NeedsAttention);
+    assert_eq!(ready.section, NavigatorSection::Ready);
     assert_eq!(
         ready.reason,
         NavigatorReason::Human {
@@ -189,8 +198,9 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
         }
     );
     assert_eq!(ready.reason_label, "Review");
+    assert_eq!(ready.default_detail, boss_protocol::NavigatorDetail::Review);
     assert_eq!(actions(&model, &root), [(NavigatorHumanAction::Review, root.clone())]);
-    assert!(ready.sort_key.starts_with("1|002|"), "{}", ready.sort_key);
+    assert!(ready.sort_key.starts_with("0|002|"), "{}", ready.sort_key);
     assert!(
         ready
             .commands
@@ -206,7 +216,8 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
     );
     step(&db, &product, &mut model);
     assert_eq!(actions(&model, &root), [(NavigatorHumanAction::Merge, root.clone())]);
-    assert!(row(&model, &root).sort_key.starts_with("1|003|"));
+    assert_eq!(row(&model, &root).section, NavigatorSection::Ready);
+    assert!(row(&model, &root).sort_key.starts_with("0|003|"));
 
     // A queued revision withdraws the decision; the family keeps one row.
     let revision = insert_revision_row(&db, &product, &root);
@@ -246,7 +257,7 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
     assert_eq!(working.activities.len(), 1);
     assert_eq!(working.activities[0].execution_id, repair);
     assert_eq!(working.activities[0].task_id, revision);
-    assert!(working.sort_key.starts_with("0|"));
+    assert!(working.sort_key.starts_with("1|"));
     set_run(&db, &repair, "completed");
     step(&db, &product, &mut model);
     assert_eq!(
@@ -298,11 +309,11 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
     );
     assert_eq!(input_only.default_detail, boss_protocol::NavigatorDetail::Activity);
 
-    // The revision completes: the original PR needs its person again.
+    // The revision completes: the original PR is ready to merge again.
     set_exec(&db, &repair, "completed");
     update(&db, "UPDATE tasks SET status = 'done' WHERE id = ?1", &revision);
     step(&db, &product, &mut model);
-    assert_eq!(row(&model, &root).section, NavigatorSection::NeedsAttention);
+    assert_eq!(row(&model, &root).section, NavigatorSection::Ready);
     assert_eq!(row(&model, &root).revisions.open, 0);
     assert_eq!(row(&model, &root).revisions.total, 1);
 
@@ -324,7 +335,7 @@ fn a_family_moves_through_review_revision_question_and_merge_without_changing_ro
     assert_eq!(landed.section, NavigatorSection::Landed);
     assert_eq!(landed.reason_label, "Merged");
     assert_eq!(landed.merge_evidence.as_ref().unwrap().pr_url, PR);
-    assert!(landed.sort_key.starts_with("3|"));
+    assert!(landed.sort_key.starts_with("4|"));
 
     // Rebinding to another PR cannot inherit the old merge.
     update(&db, "UPDATE tasks SET status = 'done' WHERE id = ?1", &stale);
@@ -931,4 +942,92 @@ fn project_worker_question_reaches_task_but_design_question_does_not() {
     step(&db, &product, &mut model);
     assert_eq!(row(&model, &task.id).section, NavigatorSection::Backlog);
     assert!(actions(&model, &task.id).is_empty());
+}
+
+/// Navigator Ready is the Review column's Ready fact (`classify_review_section`),
+/// except an open question keeps the row in Needs attention.
+#[test]
+fn navigator_ready_shares_the_kanban_ready_predicate() {
+    let db = WorkDb::open(temp_db_path("navigator-ready-kanban")).unwrap();
+    let product = make_revision_product(&db, "navigator-ready-kanban");
+    let ready = in_review_named(&db, &product, "ready", PR);
+    let pending = in_review_named(&db, &product, "pending", OTHER_PR);
+    let conflicted = in_review_named(&db, &product, "conflicted", "https://github.com/spinyfin/mono/pull/9");
+    let revising = in_review_named(&db, &product, "revising", "https://github.com/spinyfin/mono/pull/10");
+    let asked = in_review_named(&db, &product, "asked", "https://github.com/spinyfin/mono/pull/11");
+    reviewed_clean_pr(&db, &ready);
+    reviewed_clean_pr(&db, &pending);
+    reviewed_clean_pr(&db, &conflicted);
+    reviewed_clean_pr(&db, &revising);
+    reviewed_clean_pr(&db, &asked);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET ci_required_state = 'in_progress' WHERE id = ?1",
+            [&pending],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_mergeable_state = 'conflicting' WHERE id = ?1",
+            [&conflicted],
+        )
+        .unwrap();
+    let revision = insert_revision_row(&db, &product, &revising);
+    let question_exec = exec(&db, &asked, ExecutionKind::ChoreImplementation, "completed", None);
+    ask(&db, &asked, &question_exec);
+
+    let mut model = None;
+    step(&db, &product, &mut model);
+
+    assert_eq!(card(&model, &ready).review_section, Some(ReviewSection::Ready));
+    assert_eq!(row(&model, &ready).section, NavigatorSection::Ready);
+    assert_eq!(
+        row(&model, &ready).reason,
+        NavigatorReason::Human {
+            action: NavigatorHumanAction::Review
+        }
+    );
+
+    assert_eq!(card(&model, &pending).review_section, Some(ReviewSection::Pending));
+    assert_eq!(row(&model, &pending).section, NavigatorSection::Backlog);
+    assert_eq!(waiting(&model, &pending), NavigatorWait::WaitingChecks);
+
+    assert_eq!(card(&model, &conflicted).review_section, Some(ReviewSection::Blocked));
+    assert_eq!(row(&model, &conflicted).section, NavigatorSection::Backlog);
+
+    assert_eq!(card(&model, &revising).review_section, Some(ReviewSection::InRevision));
+    assert_eq!(row(&model, &revising).section, NavigatorSection::Backlog);
+    assert_eq!(projection(&model, &revision).root_task_id, revising);
+
+    // Kanban Ready does not look at open questions; Navigator Ready does.
+    assert_eq!(card(&model, &asked).review_section, Some(ReviewSection::Ready));
+    assert_eq!(row(&model, &asked).section, NavigatorSection::NeedsAttention);
+    assert_eq!(
+        actions(&model, &asked),
+        [
+            (NavigatorHumanAction::Question, asked.clone()),
+            (NavigatorHumanAction::Review, asked.clone())
+        ]
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET ci_required_state = 'in_progress' WHERE id = ?1",
+            [&ready],
+        )
+        .unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(card(&model, &ready).review_section, Some(ReviewSection::Pending));
+    assert_eq!(row(&model, &ready).section, NavigatorSection::Backlog);
+
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET ci_required_state = 'success' WHERE id = ?1", [&ready])
+        .unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(card(&model, &ready).review_section, Some(ReviewSection::Ready));
+    assert_eq!(row(&model, &ready).section, NavigatorSection::Ready);
 }
