@@ -1586,6 +1586,13 @@ async fn merge_into_parent_branch_preserves_dependency_hold() {
             let result = run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await;
             assert_eq!(result.merged, 0);
         }
+        let events = publisher.events.lock().await;
+        let refusals = events
+            .iter()
+            .filter(|(_, _, reason)| reason == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+            .count();
+        assert_eq!(refusals, 1, "unchanged refusal publishes once");
+        drop(events);
         assert!(db.get_merge_evidence(&parent).unwrap().is_none());
         let WorkItem::Chore(task) = db.get_work_item(&parent).unwrap() else {
             panic!("expected chore")
@@ -1639,4 +1646,54 @@ fn batched_probe_preserves_default_branch_validation() {
             crate::probe::parse_probe_json("https://github.com/foo/bar/pull/42", &flat.to_string(), None).unwrap();
         assert_eq!(probe.base_branch_error.is_none(), base == "trunk");
     }
+}
+
+#[tokio::test]
+async fn successful_probe_preserves_base_refusal_about_another_pr() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/42";
+    let (_, chore) = make_chore_in_review(&db, "binding repair", pr);
+    let kind = boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+    db.upsert_work_item_attention(
+        &chore,
+        kind,
+        "Wrong base",
+        "https://github.com/foo/bar/pull/99: refused feature/parent",
+    )
+    .unwrap();
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+    run_one_pass(&db, probe.as_ref(), &RecordingPublisher::default(), None, None, None).await;
+    assert!(
+        db.list_attention_items_for_work_item(&chore)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == kind && item.status == "open")
+    );
+}
+
+#[tokio::test]
+async fn refused_open_base_still_refreshes_poll_state() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/42";
+    let (_, chore) = make_chore_in_review(&db, "unsupported base", pr);
+    let observed = crate::probe::parse_probe_json(
+        pr,
+        &serde_json::json!({
+            "state": "OPEN", "baseRefName": "feature/parent", "defaultBranch": "main",
+        })
+        .to_string(),
+        None,
+    )
+    .unwrap();
+    let probe = StubProbe::new();
+    probe.states.lock().unwrap().insert(pr.into(), Ok(observed));
+    let publisher = RecordingPublisher::default();
+    run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await;
+    let WorkItem::Chore(task) = db.get_work_item(&chore).unwrap() else {
+        panic!("expected chore")
+    };
+    assert!(task.ci_required_state.is_some());
 }

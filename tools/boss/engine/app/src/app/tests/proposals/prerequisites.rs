@@ -1094,3 +1094,39 @@ async fn worker_pr_created_refuses_non_default_base_without_binding() {
     };
     assert!(task.pr_url.is_none());
 }
+
+#[tokio::test]
+async fn accepted_pr_created_replay_survives_base_lookup_outage() {
+    struct Once(std::sync::atomic::AtomicUsize);
+    impl boss_work_db::PrStateChecker for Once {
+        fn check(&self, _: &str) -> anyhow::Result<boss_work_db::PrOpenState> {
+            Ok(boss_work_db::PrOpenState::Open)
+        }
+        fn base_verdict(&self, _: &str) -> anyhow::Result<boss_work_db::PrBaseVerdict> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                anyhow::bail!("GitHub unavailable");
+            }
+            Ok(boss_work_db::PrBaseVerdict::DefaultBranch)
+        }
+    }
+    let checker = Arc::new(Once(std::sync::atomic::AtomicUsize::new(0)));
+    let fx = WorkerFixture::with_state(test_server_state_with_pr_state_checker(checker.clone()));
+    for _ in 0..2 {
+        let response = call_with_peer(
+            &fx.server_state,
+            Some(fx.peer_pid),
+            submit_request_keyed(
+                &fx.execution_id,
+                ProposalKind::PrCreated,
+                json!({"pr_url": "https://github.com/o/r/pull/42"}),
+                "published",
+            ),
+        )
+        .await;
+        assert!(
+            matches!(response, FrontendEvent::ProposalSubmitted { .. }),
+            "{response:?}"
+        );
+    }
+    assert_eq!(checker.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

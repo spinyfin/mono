@@ -325,14 +325,8 @@ impl WorkerCompletionHandler {
             )
         };
         match detected {
-            Ok(Ok(PrStatus::Fresh { url })) => DeclaredPrResolution::Bound {
-                pr_url: url,
-                merged: false,
-            },
-            Ok(Ok(PrStatus::Merged { url })) => DeclaredPrResolution::Bound {
-                pr_url: url,
-                merged: true,
-            },
+            Ok(Ok(PrStatus::Fresh { url })) => self.resolve_declared_pr_base(url, false).await,
+            Ok(Ok(PrStatus::Merged { url })) => self.resolve_declared_pr_base(url, true).await,
             Ok(Ok(
                 status @ (PrStatus::None
                 | PrStatus::Closed { .. }
@@ -373,6 +367,24 @@ impl WorkerCompletionHandler {
     /// Branch identity is already verified; read lifecycle fresh because a
     /// capture-time branch cache cannot certify that a PR is still open.
     pub(super) async fn resolve_verified_pr_state(&self, pr_url: String) -> DeclaredPrResolution {
+        let base = self.resolve_declared_pr_base(pr_url.clone(), false).await;
+        if !matches!(base, DeclaredPrResolution::Bound { .. }) {
+            return base;
+        }
+        let checker = Arc::clone(&self.pr_state_checker);
+        let url = pr_url.clone();
+        let check = tokio::task::spawn_blocking(move || checker.check(&url));
+        match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
+            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => DeclaredPrResolution::Bound { pr_url, merged: false },
+            Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
+            Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::ClosedUnmerged { pr_url },
+            result => DeclaredPrResolution::Transient {
+                detail: format!("could not determine state of PR {pr_url}: {result:?}"),
+            },
+        }
+    }
+
+    async fn resolve_declared_pr_base(&self, pr_url: String, merged: bool) -> DeclaredPrResolution {
         match crate::work::bounded_base_verdict(
             Arc::clone(&self.pr_state_checker),
             &pr_url,
@@ -390,17 +402,7 @@ impl WorkerCompletionHandler {
                 };
             }
         }
-        let checker = Arc::clone(&self.pr_state_checker);
-        let url = pr_url.clone();
-        let check = tokio::task::spawn_blocking(move || checker.check(&url));
-        match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
-            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => DeclaredPrResolution::Bound { pr_url, merged: false },
-            Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
-            Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::ClosedUnmerged { pr_url },
-            result => DeclaredPrResolution::Transient {
-                detail: format!("could not determine state of PR {pr_url}: {result:?}"),
-            },
-        }
+        DeclaredPrResolution::Bound { pr_url, merged }
     }
 
     /// `delivered`: terminalize against the PR this execution opened
@@ -419,7 +421,8 @@ impl WorkerCompletionHandler {
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
     pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
-        let (pr_url, mut merged, mut closed_unmerged) = match self.resolve_declared_pr_url(execution).await {
+        let resolution = self.resolve_declared_pr_url(execution).await;
+        let (pr_url, mut merged, mut closed_unmerged) = match resolution {
             DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged, false),
             DeclaredPrResolution::BaseRefused { pr_url, reason } => {
                 self.record_pr_base_refusal(execution, &pr_url, &reason).await;
@@ -459,8 +462,12 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        if let Some(outcome) = self.guard_pr_base(execution, &pr_url).await {
-            return outcome;
+        // Successful resolution has already verified the base.
+        if let Err(err) = self.work_db.resolve_attention_kind_for_execution(
+            &execution.id,
+            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+        ) {
+            tracing::warn!(?err, "failed to resolve PR base refusal attention");
         }
 
         if !merged && !closed_unmerged {
