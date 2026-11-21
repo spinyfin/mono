@@ -1292,11 +1292,12 @@ mod tests {
     }
 
     #[test]
-    fn grok_process_home_preserves_host_bazel_disk_cache() {
+    fn grok_process_home_preserves_host_bazel_configuration_and_cache() {
         let tmp = TempDir::new().unwrap();
         let host = tmp.path().join("host");
         let cache = host.join(".cache/bazelcache");
         fs::create_dir_all(&cache).unwrap();
+        fs::write(host.join(".bazelrc"), "build --announce_rc\n").unwrap();
         let _guard = MultiEnvGuard::set_and_clear(&[("HOME", &host)], &[]);
         let process_home = tmp.path().join("process-home");
         let environment =
@@ -1304,5 +1305,9 @@ mod tests {
                 .unwrap();
         environment.provision_home_delegates().unwrap();
         assert_eq!(fs::read_link(process_home.join(".cache/bazelcache")).unwrap(), cache);
+        assert_eq!(
+            fs::read_to_string(process_home.join(".bazelrc")).unwrap(),
+            "build --announce_rc\n"
+        );
     }
 }

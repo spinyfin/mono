@@ -18,16 +18,8 @@ use type_imports::*;
 mod topics;
 pub use topics::*;
 
-/// Optional task-list predicates evaluated before transferring rows to clients.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TaskListQuery {
-    /// Canonical task id or decimal short id, scoped by the request's product.
-    pub selector: Option<String>,
-    pub match_term: Option<String>,
-    #[serde(default)]
-    pub kinds: Vec<crate::TaskKind>,
-    pub created_since: Option<i64>,
-}
+mod task_list_query;
+pub use task_list_query::TaskListQuery;
 
 fn default_pool_size() -> i64 {
     1
@@ -2974,7 +2966,8 @@ pub use events::{FrontendEvent, FrontendEventWorkerVisitor};
 mod invalidation;
 pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePatchItem};
 
-// Snapshot / pool-summary DTOs: split out to keep this file under the size limit.
+// Snapshot / pool-summary DTOs: split out to keep this file under the size limit
+// and re-exported so external `boss_protocol::{..}` paths are unchanged.
 mod snapshot_wire;
 pub use snapshot_wire::{
     FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, TrunkQueueCheckDto,
