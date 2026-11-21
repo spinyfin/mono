@@ -1,6 +1,7 @@
 //! Markdown rendering of a [`ProgressionBriefPacket`].
 
 use crate::catalogue::{render_question_criteria, render_verb_catalogue};
+use boss_protocol::{OperatorAnswer, OperatorQuestionStatus};
 use boss_work_db::ProductPrCiSnapshot;
 
 use crate::packet::{Neighbour, ProgressionBriefPacket};
@@ -465,8 +466,53 @@ fn render_questions(out: &mut String, packet: &ProgressionBriefPacket) {
             status = question.status,
             text = question.question.text,
         ));
+        if let (OperatorQuestionStatus::Answered, Some(answer)) = (&question.status, &question.answer) {
+            out.push_str(&format!(
+                "  answer: {} (answered_at={})\n",
+                render_answer(answer),
+                question.answered_at.as_deref().unwrap_or("(unrecorded)"),
+            ));
+        }
+    }
+    let answered_run_questions: Vec<_> = packet
+        .questions
+        .iter()
+        .filter(|question| {
+            question.status == OperatorQuestionStatus::Answered
+                && question.work_item_id == packet.item.id
+                && packet
+                    .prior_progression
+                    .iter()
+                    .any(|run| run.execution_id == question.question.execution_id)
+                && question
+                    .answered_at
+                    .as_deref()
+                    .and_then(|at| at.parse::<i64>().ok())
+                    .is_some_and(|answered| {
+                        packet
+                            .prior_progression
+                            .iter()
+                            .filter(|run| run.work_item_id == packet.item.id)
+                            .all(|run| run.created_at.parse::<i64>().is_ok_and(|created| created <= answered))
+                    })
+        })
+        .collect();
+    if !answered_run_questions.is_empty() {
+        out.push_str(
+            "\nThe owner has answered a question an earlier progression run asked (listed above with its answer). \
+             This run exists to act on that answer: do what it decides, with the verbs below, before anything else. \
+             Do not ask the same question again.\n",
+        );
     }
     out.push('\n');
+}
+
+fn render_answer(answer: &OperatorAnswer) -> String {
+    match answer {
+        OperatorAnswer::YesNo { value: true } => "Yes".to_owned(),
+        OperatorAnswer::YesNo { value: false } => "No".to_owned(),
+        OperatorAnswer::MultipleChoice { value } => value.clone(),
+    }
 }
 
 fn render_history(out: &mut String, packet: &ProgressionBriefPacket) {

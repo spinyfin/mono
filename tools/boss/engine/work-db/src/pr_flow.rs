@@ -2804,6 +2804,7 @@ impl WorkDb {
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
         }
 
+        crate::progression_events::waive_grace_after_answer(&tx, &task.id, &question.question.execution_id)?;
         let mut updated = query_task(&tx, &task.id).require("task", &task.id)?;
         project_for_work_item_updated(&tx, &mut updated, "answer_operator_question");
         commit_and_publish(tx, pending, &self.event_bus)?;

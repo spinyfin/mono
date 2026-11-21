@@ -1116,3 +1116,96 @@ fn episode_metadata_for_removed_executions_is_pruned_on_next_write() {
         Some("kept")
     );
 }
+
+#[test]
+fn an_answered_question_is_rendered_with_its_answer_and_a_directive_to_act_on_it() {
+    let f = fixture();
+    let id = f.chore("Answered");
+    let mut packet = gather_progression_brief(&f.db, &id).unwrap();
+    packet.prior_progression.push(
+        crate::packet::PriorProgressionRun::builder()
+            .execution_id("run-1")
+            .work_item_id(&id)
+            .actions(Vec::new())
+            .status("completed")
+            .created_at("1")
+            .build(),
+    );
+    let question = |execution: &str, status, answer| {
+        let mut record = boss_protocol::OperatorQuestionRecord::builder()
+            .question(
+                boss_protocol::OperatorQuestionView::builder()
+                    .id(format!("q-{execution}"))
+                    .text("Rerun the failing check?")
+                    .answer_type(boss_protocol::OperatorAnswerType::YesNo)
+                    .explanation("explanation")
+                    .asked_at("1")
+                    .execution_id(execution)
+                    .build(),
+            )
+            .work_item_id(&id)
+            .status(status)
+            .build();
+        record.answer = answer;
+        record.answered_at = Some("123".into());
+        record
+    };
+    packet.questions = vec![question(
+        "run-1",
+        boss_protocol::OperatorQuestionStatus::Answered,
+        Some(boss_protocol::OperatorAnswer::YesNo { value: true }),
+    )];
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("answer: Yes (answered_at=123)"), "{text}");
+    assert!(
+        text.contains("This run exists to act on that answer") && text.contains("Do not ask the same question again"),
+        "{text}"
+    );
+
+    // The handling run retires the directive while keeping the answer visible.
+    packet.prior_progression.push(
+        crate::packet::PriorProgressionRun::builder()
+            .execution_id("handling-run")
+            .work_item_id(&id)
+            .actions(Vec::new())
+            .status("completed")
+            .created_at("124")
+            .build(),
+    );
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("answer: Yes"));
+    assert!(!text.contains("This run exists to act on that answer"));
+    packet.prior_progression.pop();
+    packet.prior_progression.push(
+        crate::packet::PriorProgressionRun::builder()
+            .execution_id("other-member-run")
+            .work_item_id("another-chain-member")
+            .actions(Vec::new())
+            .status("completed")
+            .created_at("125")
+            .build(),
+    );
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("This run exists to act on that answer"));
+
+    packet.questions[0].work_item_id = "another-chain-member".into();
+    packet.questions[0].question.execution_id = "other-member-run".into();
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("answer: Yes"));
+    assert!(!text.contains("This run exists to act on that answer"));
+
+    // An answer to a question some other run asked, or an open question, is not that prompt.
+    packet.questions = vec![
+        question(
+            "other-run",
+            boss_protocol::OperatorQuestionStatus::Answered,
+            Some(boss_protocol::OperatorAnswer::MultipleChoice {
+                value: "Keep trying".into(),
+            }),
+        ),
+        question("run-1", boss_protocol::OperatorQuestionStatus::Open, None),
+    ];
+    let text = render_progression_brief(&packet);
+    assert!(text.contains("answer: Keep trying"), "{text}");
+    assert!(!text.contains("This run exists to act on that answer"), "{text}");
+}

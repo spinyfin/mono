@@ -458,6 +458,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: progression_candidates::migrate_views_noop,
         },
         Migration {
+            id: progression_events::RESET_CALIBRATED_COOLDOWN_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: progression_events::migrate_reset_calibrated_cooldown,
+        },
+        Migration {
             id: progression_candidates::GRACE_COLUMN_MIGRATION_ID.into(),
             legacy_version: None,
             apply: parking_reconcile::migrate,

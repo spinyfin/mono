@@ -56,9 +56,15 @@ pub const METADATA_KEY_MAX_CREATES_WINDOW_SECS: &str = "progression.max_creates_
 pub const METADATA_KEY_RUN_TIMEOUT_SECS: &str = "progression.run_timeout_secs";
 
 /// A run that ended `no_changes_needed` judged the item not stuck in any way a
-/// verb addresses, so the item is re-nominated only after the cooldown times
-/// this factor (design 2.5, "`no_action` is not an escalation").
+/// verb addresses, so the item's fallback re-check is the cooldown times this
+/// factor, capped at [`NO_ACTION_COOLDOWN_CAP_SECS`] (design 2.5, "`no_action`
+/// is not an escalation").
 pub const NO_ACTION_COOLDOWN_MULTIPLIER: i64 = 4;
+
+/// Longest fallback wait after a `no_changes_needed` run (24 hours). With the
+/// 6-hour default cooldown the multiplier alone reaches it; a larger
+/// explicitly configured cooldown is never stretched past this by the multiplier.
+pub const NO_ACTION_COOLDOWN_CAP_SECS: i64 = 24 * 60 * 60;
 
 /// Consecutive progression runs ending in infrastructure failure
 /// (`failed | orphaned | abandoned`) after which the sweep stops nominating the
@@ -85,8 +91,12 @@ pub struct ProgressionSettings {
     /// un-park and a worker-declared blocker waive it once.
     #[builder(default = DEFAULT_STUCK_AFTER_SECS)]
     pub stuck_after_secs: i64,
-    /// `progression.cooldown`, in seconds, between progression runs on one
-    /// item. Placeholder 6 hours.
+    /// `progression.cooldown`, in seconds: the *fallback* wait before a
+    /// progression run on one item is followed by another when nothing
+    /// happened in between. A filed revision or prerequisite reaching a
+    /// terminal state, or the owner answering the run's question, re-nominates
+    /// the item at once without waiting for it. Default 6 hours; never
+    /// calibrated from history. Configurable (`BOSS_PROGRESSION_COOLDOWN_SECS`).
     #[builder(default = DEFAULT_COOLDOWN_SECS)]
     pub cooldown_secs: i64,
     /// `progression.max_creates_per_item_window`: revisions plus precursors a
@@ -157,7 +167,7 @@ pub const DEFAULT_POOL_SIZE: usize = 1;
 pub const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 300;
 /// Placeholder `progression.stuck_after` (2 hours).
 pub const DEFAULT_STUCK_AFTER_SECS: i64 = 2 * 60 * 60;
-/// Placeholder `progression.cooldown` (6 hours).
+/// Default `progression.cooldown` (6 hours): the fallback re-check interval.
 pub const DEFAULT_COOLDOWN_SECS: i64 = 6 * 60 * 60;
 /// Placeholder `progression.max_creates_per_item_window` (3 per window).
 pub const DEFAULT_MAX_CREATES_PER_ITEM_WINDOW: u32 = 3;

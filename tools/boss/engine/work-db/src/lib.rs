@@ -902,6 +902,7 @@ mod pre_start_failure;
 pub use pre_start_failure::PositioningHold;
 mod progression_candidates;
 mod progression_done;
+mod progression_events;
 mod progression_ladder;
 mod progression_scope;
 mod progression_verbs;

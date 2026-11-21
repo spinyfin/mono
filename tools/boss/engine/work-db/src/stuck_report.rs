@@ -212,7 +212,7 @@ pub(super) fn build(
             StuckBucket::ProgressionFailing
         } else if progression.live || progression.in_completed_cooldown {
             // An agent is working the item, or has just finished and the item is
-            // inside the cooldown that follows a completed run (four times as long after a
+            // inside the cooldown that follows a completed run (four times as long, capped at 24 hours, after a
             // run that judged the item not stuck).
             StuckBucket::ProgressionInFlight
         } else if dependency_cycle {

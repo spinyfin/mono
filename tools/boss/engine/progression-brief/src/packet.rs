@@ -29,6 +29,7 @@ pub struct DeclaredBlocker {
 #[builder(on(String, into))]
 pub struct PriorProgressionRun {
     pub execution_id: String,
+    pub work_item_id: String,
     pub fingerprint: Option<String>,
     pub actions: Vec<String>,
     pub status: String,

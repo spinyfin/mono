@@ -786,7 +786,7 @@ fn clause_6_a_recent_run_puts_the_item_in_cooldown() {
     assert!(!f.clauses(&id).in_cooldown);
     f.assert_candidate(&id, true);
 
-    // A run that judged the item not stuck earns four times the cooldown.
+    // A run that judged the item not stuck waits four times the cooldown: 24 hours.
     let quiet = f.stuck_chore("No action");
     let run = finished_progression_run(&f, &quiet, ExecutionStatus::Completed, 7 * HOUR);
     f.assert_candidate(&quiet, true);
@@ -795,7 +795,13 @@ fn clause_6_a_recent_run_puts_the_item_in_cooldown() {
     ));
     f.assert_candidate(&quiet, false);
     f.sql(&format!(
-        "UPDATE work_executions SET finished_at = finished_at - 18 * 3600, created_at = created_at - 18 * 3600
+        "UPDATE work_executions SET finished_at = finished_at - 16 * 3600, created_at = created_at - 16 * 3600
+         WHERE id = '{run}'"
+    ));
+    // 23 hours since the run: still waiting. 24 hours and a minute: due.
+    f.assert_candidate(&quiet, false);
+    f.sql(&format!(
+        "UPDATE work_executions SET finished_at = finished_at - 1 * 3600 - 60, created_at = created_at - 1 * 3600 - 60
          WHERE id = '{run}'"
     ));
     f.assert_candidate(&quiet, true);
@@ -812,6 +818,221 @@ fn clause_6_a_recent_run_puts_the_item_in_cooldown() {
     f.db.configure_progression_calibration(&ProgressionSettings::builder().cooldown_secs(HOUR).build())
         .unwrap();
     f.assert_candidate(&id, true);
+}
+
+/// Move a run's end `secs` into the past, keeping the rest of its row.
+fn age_run(f: &Fixture, run: &str, secs: i64) {
+    f.sql(&format!(
+        "UPDATE work_executions SET finished_at = finished_at - {secs}, created_at = created_at - {secs}
+         WHERE id = '{run}'"
+    ));
+}
+
+#[test]
+fn clause_6_with_no_event_the_fallback_is_six_hours_and_not_before() {
+    let f = fixture();
+    let id = f.stuck_chore("Quiet");
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, 6 * HOUR - 120);
+    f.assert_candidate(&id, false);
+    age_run(&f, &run, 240);
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn clause_6_the_no_action_wait_is_capped_at_twenty_four_hours() {
+    let f = fixture();
+    let id = f.stuck_chore("Long configured cooldown");
+    // An explicitly configured 48-hour cooldown exceeds the cap even before multiplying; the cap holds it at 24.
+    f.db.configure_progression_calibration(&ProgressionSettings::builder().cooldown_secs(48 * HOUR).build())
+        .unwrap();
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, 23 * HOUR);
+    f.sql(&format!(
+        "UPDATE work_executions SET run_done_outcome = 'no_changes_needed' WHERE id = '{run}'"
+    ));
+    f.assert_candidate(&id, false);
+    age_run(&f, &run, 2 * HOUR);
+    f.assert_candidate(&id, true);
+}
+
+impl Fixture {
+    /// A task `run` filed, as the progression verbs stamp it, in `status`.
+    fn filed_by(&self, parent: &str, run: &str, status: &str) -> String {
+        let id = self.revision_of(parent, &format!("Filed by progression {status} {run}"));
+        self.sql(&format!(
+            "UPDATE tasks SET created_via = 'progression:{run}', status = '{status}' WHERE id = '{id}'"
+        ));
+        id
+    }
+}
+
+#[test]
+fn clause_6_a_filed_action_reaching_a_terminal_state_ends_the_cooldown() {
+    let f = fixture();
+    for (status, extra) in [
+        ("done", ""),
+        ("archived", ""),
+        ("blocked", ", blocked_reason = 'worker_failed'"),
+    ] {
+        let id = f.stuck_chore(&format!("Filed a {status} revision"));
+        let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+        let filed = f.filed_by(&id, &run, "todo");
+        f.assert_candidate(&id, false);
+        assert!(f.clauses(&id).in_cooldown, "{status}: not yet terminal");
+        f.sql(&format!(
+            "UPDATE tasks SET status = '{status}'{extra} WHERE id = '{filed}'"
+        ));
+        assert!(!f.clauses(&id).in_cooldown, "{status}");
+        f.assert_candidate(&id, true);
+    }
+
+    // A deleted action is terminal too.
+    let id = f.stuck_chore("Filed a revision that was deleted");
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+    let filed = f.filed_by(&id, &run, "todo");
+    f.assert_candidate(&id, false);
+    f.sql(&format!("UPDATE tasks SET deleted_at = '1' WHERE id = '{filed}'"));
+    f.assert_candidate(&id, true);
+
+    // A filed action must belong to a progression execution on this item;
+    // unrelated or ordinary revisions do not end the cooldown.
+    let id = f.stuck_chore("Somebody else's revision merged");
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+    f.filed_by(&id, "another-run", "done");
+    let ordinary = f.revision_of(&id, "Ordinary revision");
+    f.sql(&format!("UPDATE tasks SET status = 'done' WHERE id = '{ordinary}'"));
+    f.assert_candidate(&id, false);
+    f.filed_by(&id, &run, "done");
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn clause_6_a_terminal_filed_action_never_bypasses_the_live_work_exclusion() {
+    let f = fixture();
+    let id = f.stuck_chore("Filed fix finished but work is live");
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+    f.filed_by(&id, &run, "done");
+    f.assert_candidate(&id, true);
+    f.execution(&id, ExecutionKind::TaskImplementation, ExecutionStatus::Running);
+    assert!(!f.clauses(&id).in_cooldown);
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn clause_6_the_owner_answering_the_runs_question_ends_the_cooldown() {
+    let f = fixture();
+    let id = f.stuck_chore("Asked the owner");
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+    let insert = |status: &str, execution: &str, question: &str| {
+        f.sql(&format!(
+            "INSERT INTO operator_questions
+               (id, work_item_id, execution_id, proposal_id, question_json, status, answer_json,
+                answered_by, answered_at, created_at)
+             VALUES ('{question}', '{id}', '{execution}', 'proposal', '{{}}', '{status}',
+                     {answer}, {by}, {at}, '1')",
+            answer = if status == "answered" {
+                "'{\"kind\":\"yes_no\",\"value\":true}'"
+            } else {
+                "NULL"
+            },
+            by = if status == "answered" { "'human'" } else { "NULL" },
+            at = if status == "answered" { "'2'" } else { "NULL" },
+        ));
+    };
+    // A question this run asked that was withdrawn, or one another run asked,
+    // is no answer to this run.
+    insert("withdrawn", &run, "q-withdrawn");
+    insert("answered", "another-run", "q-other");
+    f.assert_candidate(&id, false);
+    assert!(f.clauses(&id).in_cooldown);
+    insert("answered", &run, "q-answered");
+    assert!(!f.clauses(&id).in_cooldown);
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn clause_6_a_later_run_has_its_own_cooldown_after_an_event() {
+    let f = fixture();
+    let id = f.stuck_chore("Second run");
+    let first = finished_progression_run(&f, &id, ExecutionStatus::Completed, 2 * HOUR);
+    let filed = f.filed_by(&id, &first, "done");
+    f.sql(&format!(
+        "UPDATE task_status_audit SET changed_at = '{}' WHERE work_item_id = '{filed}'",
+        now() - 2 * HOUR
+    ));
+    f.assert_candidate(&id, true);
+    // The next run found nothing to do; the earlier run's event does not excuse it.
+    let second = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+    f.sql(&format!(
+        "UPDATE work_executions SET run_done_outcome = 'no_changes_needed' WHERE id = '{second}'"
+    ));
+    f.assert_candidate(&id, false);
+    // Editing a finished action is not another terminal transition.
+    f.sql(&format!(
+        "UPDATE tasks SET name = 'Updated name', updated_at = '{}' WHERE id = '{filed}'",
+        now()
+    ));
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn an_earlier_runs_action_ends_a_later_runs_cooldown() {
+    let f = fixture();
+    let id = f.stuck_chore("Earlier action finished");
+    let first = finished_progression_run(&f, &id, ExecutionStatus::Completed, 8 * HOUR);
+    let filed = f.filed_by(&id, &first, "todo");
+    let second = finished_progression_run(&f, &id, ExecutionStatus::Completed, HOUR);
+    f.sql(&format!(
+        "UPDATE work_executions SET run_done_outcome = 'no_changes_needed' WHERE id = '{second}'"
+    ));
+    f.assert_candidate(&id, false);
+    f.sql(&format!(
+        "UPDATE tasks SET status = 'done', updated_at = '{}' WHERE id = '{filed}'",
+        now()
+    ));
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn unchanged_explicit_configuration_is_republished_after_the_reset() {
+    let f = fixture();
+    let settings = ProgressionSettings::builder().cooldown_secs(48 * HOUR).build();
+    f.db.configure_progression_calibration(&settings).unwrap();
+    f.db.calibrate_progression(now()).unwrap();
+    super::progression_events::migrate_reset_calibrated_cooldown(&f.db.connect().unwrap()).unwrap();
+    f.db.configure_progression_calibration(&settings).unwrap();
+    assert_eq!(
+        f.db.get_metadata("progression.cooldown_secs").unwrap().as_deref(),
+        Some("172800")
+    );
+}
+
+#[test]
+fn the_calibrated_cooldown_is_reset_to_the_default_by_the_migration() {
+    let f = fixture();
+    let id = f.stuck_chore("Calibrated cooldown");
+    // What an engine that calibrated the cooldown left behind.
+    f.sql(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES ('progression.cooldown_secs', '187680');
+         INSERT OR REPLACE INTO metadata(key, value) VALUES ('progression.calibration', '{}')",
+    );
+    finished_progression_run(&f, &id, ExecutionStatus::Completed, 7 * HOUR);
+    f.assert_candidate(&id, false);
+
+    {
+        let conn = f.db.connect().unwrap();
+        super::progression_events::migrate_reset_calibrated_cooldown(&conn).unwrap();
+    }
+    assert_eq!(f.db.get_metadata("progression.cooldown_secs").unwrap(), None);
+    assert_eq!(f.db.get_metadata("progression.calibration").unwrap(), None);
+    f.assert_candidate(&id, true);
+
+    // The next calibration publishes the default, not a measurement, and an
+    // explicit setting still wins.
+    f.db.calibrate_progression(now()).unwrap();
+    assert_eq!(
+        f.db.get_metadata("progression.cooldown_secs").unwrap().as_deref(),
+        Some("21600")
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! The progression escalation ladder (design 2.5): what the engine does when
 //! progression agents have been spent on an item and it is still stuck.
 //!
-//! The sweep re-evaluates an item after `progression.cooldown` (clause 6 of the
+//! The sweep re-evaluates an item on a qualifying event or after `progression.cooldown` (clause 6 of the
 //! candidate view), so run 1 acts and run 2 is spawned on the next pass. The
 //! fingerprint refusal on the verbs forces run 2 onto a different action. What
 //! this module adds is the rung above that: **the engine itself** files a

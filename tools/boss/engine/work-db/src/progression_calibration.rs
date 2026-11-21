@@ -27,10 +27,10 @@ pub(super) fn read_report(conn: &Connection) -> Result<Option<ProgressionCalibra
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Publish configuration and fallbacks without measuring history.
-    /// Unchanged configuration preserves the calibrated values.
+    /// Unchanged configuration preserves calibrated values while its report exists.
     pub fn configure_progression_calibration(&self, settings: &ProgressionSettings) -> Result<()> {
         let json = serde_json::to_string(settings)?;
-        if self.get_metadata(CONFIG_KEY)?.as_deref() != Some(&json) {
+        if self.get_metadata(CONFIG_KEY)?.as_deref() != Some(&json) || self.get_metadata(REPORT_KEY)?.is_none() {
             let mut conn = self.connect()?;
             let conn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             conn.execute("DELETE FROM metadata WHERE key = ?1", [REPORT_KEY])?;
@@ -116,11 +116,12 @@ impl WorkDb {
                 "effective stuck grace / 10, rounded down; at least the 300-second placeholder",
                 3600,
             ),
-            Descriptor::new(
-                COOLDOWN_SECS_SETTING,
-                triple("revision_to_review_max_secs"),
-                "3 * longest progression revision time to first review",
-                7 * DAY as u64,
+            // Never calibrated: a measured revision-to-review time is a bad
+            // guess at when to look again, and the events that matter (a filed
+            // action finishing, the owner answering) re-nominate the item
+            // directly. The cooldown is the short fallback for when none occurs.
+            Descriptor::new(COOLDOWN_SECS_SETTING, None, "", 7 * DAY as u64).fixed(
+                "fixed fallback; items are also re-checked when an action progression filed finishes or the owner answers",
             ),
             Descriptor::new(
                 MAX_CREATES_PER_ITEM_WINDOW_SETTING,
@@ -175,7 +176,7 @@ impl WorkDb {
             } else if enough && computed.is_some() {
                 (
                     computed.map(|v| {
-                        if descriptor.default_is_ceiling {
+                        if matches!(descriptor.default_role, DefaultRole::Ceiling) {
                             v.min(default.unwrap_or(u64::MAX))
                         } else {
                             v.max(default.unwrap_or(0))
@@ -188,7 +189,9 @@ impl WorkDb {
                 (
                     default,
                     "fallback",
-                    if enough {
+                    if let DefaultRole::Fixed(basis) = descriptor.default_role {
+                        basis.to_owned()
+                    } else if enough {
                         "no eligible measurement samples".to_owned()
                     } else {
                         format!("{} daily snapshots; need {MINIMUM_DAYS}", report.snapshot_days)
@@ -281,8 +284,18 @@ struct Descriptor {
     computed: Option<u64>,
     basis: &'static str,
     sanity_bound: u64,
-    /// The placeholder caps the computed value instead of flooring it.
-    default_is_ceiling: bool,
+    default_role: DefaultRole,
+}
+
+/// What the placeholder default does for a setting.
+#[derive(Clone, Copy)]
+enum DefaultRole {
+    /// The default is a floor under the computed value.
+    Floor,
+    /// The default caps the computed value instead of flooring it.
+    Ceiling,
+    /// The setting is never calibrated; the string is the basis its default shows.
+    Fixed(&'static str),
 }
 
 impl Descriptor {
@@ -292,12 +305,17 @@ impl Descriptor {
             computed,
             basis,
             sanity_bound,
-            default_is_ceiling: false,
+            default_role: DefaultRole::Floor,
         }
     }
 
+    fn fixed(mut self, basis: &'static str) -> Self {
+        self.default_role = DefaultRole::Fixed(basis);
+        self
+    }
+
     fn ceiling_at_default(mut self) -> Self {
-        self.default_is_ceiling = true;
+        self.default_role = DefaultRole::Ceiling;
         self
     }
 }

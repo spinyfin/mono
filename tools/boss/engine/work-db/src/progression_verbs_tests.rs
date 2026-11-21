@@ -1406,6 +1406,96 @@ fn the_owners_answer_returns_an_asked_pr_item_to_review_instead_of_failing() {
     );
 }
 
+#[test]
+fn the_owners_answer_makes_the_item_a_candidate_at_once_instead_of_after_the_cooldown() {
+    let fx = fx();
+    // In review with a failing required check: stuck, and the run's question
+    // is the only thing holding it.
+    let item = fx.pr_item("Needs the owner", "fail");
+    fx.sql(&format!(
+        "UPDATE task_status_audit SET changed_at = CAST(changed_at AS INTEGER) - 10800 WHERE work_item_id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, "S6_ci_failure");
+    done(
+        &fx,
+        &run,
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        "ask",
+    );
+    fx.db.finish_progression_declared(&run).unwrap();
+    let asked = fx.db.progression_clauses(&item).unwrap().unwrap();
+    assert!(!asked.is_candidate(), "an open question holds the item: {asked:?}");
+
+    fx.db
+        .answer_operator_question_with(&item, boss_protocol::OperatorAnswer::YesNo { value: true }, &fx.checker)
+        .expect("the owner's answer is recorded");
+
+    // The run finished seconds ago, well inside the six-hour fallback, and the
+    // answer moved the item's status just now (so it is not stuck-aged either).
+    let answered = fx.db.progression_clauses(&item).unwrap().unwrap();
+    assert!(!answered.in_cooldown, "{answered:?}");
+    assert!(answered.grace_waived, "{answered:?}");
+    assert!(answered.is_candidate(), "{answered:?}");
+    assert!(
+        fx.db
+            .list_progression_candidates(None)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.work_item_id == item)
+    );
+}
+
+#[test]
+fn an_answer_without_a_pr_returns_to_progression_without_an_ordinary_worker() {
+    let fx = fx();
+    let item = fx.chore("Failed without a PR");
+    fx.sql(&format!(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'worker_failed', autostart = 1 WHERE id = '{item}'"
+    ));
+    let run = fx.run(&item, FINGERPRINT, STUCK);
+    done(
+        &fx,
+        &run,
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question(), "criterion": "1"}),
+        "ask",
+    );
+    fx.db.finish_progression_declared(&run).unwrap();
+    let outcome = fx
+        .db
+        .answer_operator_question_with(&item, boss_protocol::OperatorAnswer::YesNo { value: true }, &fx.checker)
+        .unwrap();
+    assert!(!outcome.minted_execution);
+    assert_eq!(fx.task(&item).blocked_reason.as_deref(), Some("worker_failed"));
+    assert!(fx.task(&item).autostart);
+    assert!(fx.task(&item).description.contains("Merge this PR?"));
+    assert!(fx.db.progression_clauses(&item).unwrap().unwrap().is_candidate());
+    assert!(fx.db.mint_progression_execution(&item).unwrap().is_some());
+}
+
+#[test]
+fn an_answer_to_a_worker_question_does_not_prompt_progression() {
+    let fx = fx();
+    let item = fx.pr_item("Asked by a worker", "fail");
+    let worker_run = fx
+        .db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&item)
+                .kind(ExecutionKind::TaskImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap()
+        .id;
+    {
+        let tx_conn = fx.db.connect().unwrap();
+        let tx = tx_conn.unchecked_transaction().unwrap();
+        crate::progression_events::waive_grace_after_answer(&tx, &item, &worker_run).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(fx.db.progression_grace_waived_at(&item).unwrap(), None);
+}
+
 fn assert_progression_status(fx: &Fx, item: &str) {
     assert_eq!(fx.actor(item), LAST_STATUS_ACTOR_PROGRESSION);
     let actor: String = fx.db.connect().unwrap().query_row(

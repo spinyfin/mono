@@ -65,8 +65,12 @@
 //!    `progression.stuck_after`, measured from the task status ledger exactly as
 //!    the stuck report ages it; or the grace was waived since the item entered
 //!    that state (`tasks.progression_grace_waived_at`).
-//! 6. **Cooldown and budget.** No progression run within `progression.cooldown`
-//!    (four times that after a `no_changes_needed` run), the last
+//! 6. **Cooldown and budget.** No progression run within the fallback
+//!    `progression.cooldown` (6 hours by default; four times that, capped at 24
+//!    hours, after a `no_changes_needed` run) unless that run has an event that
+//!    makes the wait pointless: an action it filed reached a terminal state, or
+//!    the owner answered its question
+//!    ([`crate::progression_events::run_ended_early_sql`]). The last
 //!    [`INFRASTRUCTURE_FAILURE_CAP`] runs since the owner's last "keep trying"
 //!    were not all infrastructure failures (the engine asks the owner about such
 //!    an item: `progression_ladder`),
@@ -118,7 +122,7 @@ use boss_engine_storage_values::progression::{
     CREATED_VIA_PROGRESSION_SWEEP, DEFAULT_COOLDOWN_SECS, DEFAULT_MAX_CREATES_PER_ITEM_WINDOW,
     DEFAULT_MAX_CREATES_WINDOW_SECS, DEFAULT_STUCK_AFTER_SECS, INFRASTRUCTURE_FAILURE_CAP, METADATA_KEY_COOLDOWN_SECS,
     METADATA_KEY_MAX_CREATES_PER_ITEM_WINDOW, METADATA_KEY_MAX_CREATES_WINDOW_SECS, METADATA_KEY_STUCK_AFTER_SECS,
-    NO_ACTION_COOLDOWN_MULTIPLIER,
+    NO_ACTION_COOLDOWN_CAP_SECS, NO_ACTION_COOLDOWN_MULTIPLIER,
 };
 
 pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_grace_waived_at";
@@ -528,15 +532,18 @@ pub(crate) fn create_budget_used_sql(a: &str, window: &str) -> String {
     )
 }
 
-/// Whether the item is inside the cooldown after a progression run. The cooldown
-/// is measured from the end of the run (its creation while it has not ended), a
-/// run that was cancelled before it started does not start one, a run the engine
-/// withdrew before it ever started (`abandoned` with no `started_at`) is not an
-/// attempt at all. Failed launches use their own bounded backoff instead. A
-/// run that judged the item not stuck (`no_changes_needed`) earns the longer cooldown. `completed_only` restricts
-/// the runs to ones that reached `completed`: the cooldown the stuck report
-/// treats as "being handled" (design 3.2), as opposed to the broader one that
-/// only throttles nomination.
+/// Whether the item is inside the fallback cooldown after a progression run.
+/// The cooldown is measured from the end of the run (its creation while it has
+/// not ended), a run that was cancelled before it started does not start one, a
+/// run the engine withdrew before it ever started (`abandoned` with no
+/// `started_at`) is not an attempt at all. Failed launches use their own bounded
+/// backoff instead. A run that judged the item not stuck (`no_changes_needed`)
+/// waits the cooldown times [`NO_ACTION_COOLDOWN_MULTIPLIER`], capped at
+/// [`NO_ACTION_COOLDOWN_CAP_SECS`]. A run that has an event
+/// ([`crate::progression_events::run_ended_early_sql`]) is not in cooldown at
+/// all. `completed_only` restricts the runs to ones that reached `completed`:
+/// the cooldown the stuck report treats as "being handled" (design 3.2), as
+/// opposed to the broader one that only throttles nomination.
 fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
     let status_filter = if completed_only {
         "px.status = 'completed'"
@@ -544,13 +551,17 @@ fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
         "px.status <> 'cancelled' AND NOT (px.status = 'abandoned' AND px.started_at IS NULL)"
     };
     let launch_failed = launch_failed_sql("px");
+    let ended_early = crate::progression_events::run_ended_early_sql("px", a);
     format!(
         "EXISTS (SELECT 1 FROM work_executions px
                  WHERE px.work_item_id = {a}.id AND px.kind = 'progression' AND {status_filter}
                    AND NOT {launch_failed}
                    AND COALESCE(CAST(px.finished_at AS INTEGER), CAST(px.created_at AS INTEGER))
-                       + ({cooldown}) * (CASE WHEN px.run_done_outcome = 'no_changes_needed'
-                                              THEN {NO_ACTION_COOLDOWN_MULTIPLIER} ELSE 1 END) > {NOW})"
+                       + (CASE WHEN px.run_done_outcome = 'no_changes_needed'
+                               THEN MIN(({cooldown}) * {NO_ACTION_COOLDOWN_MULTIPLIER},
+                                        {NO_ACTION_COOLDOWN_CAP_SECS})
+                               ELSE ({cooldown}) END) > {NOW}
+                   AND NOT {ended_early})"
     )
 }
 
