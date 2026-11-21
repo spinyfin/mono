@@ -71,24 +71,26 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let now = now_string();
-        let cancelled = if !execution.status.is_terminal() {
-            let affected = tx.execute(
-                "UPDATE work_executions
-                 SET status      = 'cancelled',
-                     finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = ?1",
-                params![execution_id, now],
-            )?;
-            affected > 0
-        } else {
-            false
-        };
         let mut pending = PendingEvents::new();
-        if cancelled {
-            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
-        }
+        let cancelled = cancel_non_terminal_in_tx(&tx, &mut pending, &execution, None)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(cancelled)
+    }
+
+    /// Like [`Self::cancel_running_execution`], and stamps cancellation source,
+    /// actor, and reason on the same `UPDATE`. Existing callers keep writing
+    /// unattributed rows until they migrate.
+    pub fn cancel_running_execution_with_provenance(
+        &self,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let mut pending = PendingEvents::new();
+        let cancelled = cancel_non_terminal_in_tx(&tx, &mut pending, &execution, Some(&provenance))?;
+        self.commit_pending(tx, pending)?;
         Ok(cancelled)
     }
 
@@ -98,18 +100,8 @@ impl WorkDb {
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let now = now_string();
         // Cancel the execution only if it is still non-terminal.
-        let exec_cancelled = if !execution.status.is_terminal() {
-            let affected = tx.execute(
-                "UPDATE work_executions
-                 SET status     = 'cancelled',
-                     finished_at = COALESCE(finished_at, ?2)
-                 WHERE id = ?1",
-                params![execution_id, now],
-            )?;
-            affected > 0
-        } else {
-            false
-        };
+        let mut pending = PendingEvents::new();
+        let exec_cancelled = cancel_non_terminal_in_tx(&tx, &mut pending, &execution, None)?;
         // Demote the task only if it is still `active` AND this execution
         // is still the work item's CURRENT (latest) execution.
         //
@@ -131,10 +123,6 @@ impl WorkDb {
         // Shared with `cancel_execution_with`'s live path so the guard
         // and `last_status_actor = 'engine'` stamp cannot drift.
         let task_demoted = demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?;
-        let mut pending = PendingEvents::new();
-        if exec_cancelled {
-            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
-        }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((exec_cancelled, task_demoted))
     }
@@ -747,6 +735,62 @@ impl WorkDb {
         tx.commit()?;
         Ok(n > 0)
     }
+}
+
+/// Move `execution` to `cancelled` when it is still non-terminal. When
+/// `provenance` is `Some`, the same `UPDATE` stamps the cancel columns and
+/// stages a decision-terminal audit; when `None`, those columns stay NULL.
+fn cancel_non_terminal_in_tx(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    execution: &WorkExecution,
+    provenance: Option<&boss_protocol::CancelProvenance>,
+) -> Result<bool> {
+    if execution.status.is_terminal() {
+        return Ok(false);
+    }
+    let affected = tx.execute(
+        "UPDATE work_executions
+         SET status        = 'cancelled',
+             finished_at   = COALESCE(finished_at, ?2),
+             cancel_source = ?3,
+             cancel_actor  = ?4,
+             cancel_reason = ?5
+         WHERE id = ?1",
+        params![
+            execution.id,
+            now_string(),
+            provenance.map(|p| p.source.as_str()),
+            provenance.map(|p| p.actor.as_str()),
+            provenance.map(|p| p.reason.as_str()),
+        ],
+    )?;
+    if affected == 0 {
+        return Ok(false);
+    }
+    if let Some(provenance) = provenance {
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            from_status = %execution.status,
+            to_status = "cancelled",
+            source = %provenance.source,
+            actor = %provenance.actor,
+            reason = %provenance.reason,
+            "execution terminalized: cancel running",
+        );
+        stage_decision_terminal(
+            pending,
+            tx,
+            &DoomedExecution::new(&execution.id, &execution.work_item_id, execution.status.as_str()),
+            &ExecutionStatus::Cancelled,
+            provenance,
+            &DecisionAuditContext::default(),
+        )?;
+    } else {
+        stage_execution_terminal(pending, tx, &execution.id, &execution.work_item_id)?;
+    }
+    Ok(true)
 }
 
 /// Snapshot inside the caller's transaction before teardown clears the live pointer.

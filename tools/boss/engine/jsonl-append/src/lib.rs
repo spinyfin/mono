@@ -19,7 +19,7 @@
 //! [`JsonlAppender`] fixes this by serializing every append — across all
 //! paths, and across every [`JsonlAppender`] instance, since the lock is a
 //! crate-level `static` rather than an instance field — through one
-//! process-wide `tokio::sync::Mutex`. That is a correctness-first choice
+//! process-wide `std::sync::Mutex`. That is a correctness-first choice
 //! over "build one buffer, issue one `write_all`": a single `write_all`
 //! call is atomic against concurrent appenders in practice (a single
 //! `write()` to a regular file opened with `O_APPEND` essentially never
@@ -52,10 +52,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
-use tokio::sync::Mutex;
 
 /// Process-wide lock backing every [`JsonlAppender`]. Living at crate scope
 /// (rather than as an instance field) is what makes the "one process-wide
@@ -102,8 +101,9 @@ impl JsonlAppender {
         line.push(b'\n');
 
         let owned_paths: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
-        let guard = APPEND_LOCK.lock().await;
+
         let results = tokio::task::spawn_blocking(move || {
+            let guard = APPEND_LOCK.lock().unwrap_or_else(|err| err.into_inner());
             let results = owned_paths.iter().map(|path| append_locked(path, &line)).collect();
             drop(guard);
             results
@@ -116,6 +116,21 @@ impl JsonlAppender {
                 .map(|_| Err(io::Error::other(join_err.to_string())))
                 .collect(),
         }
+    }
+    /// Append on the calling thread, sharing serialization with async writers.
+    pub fn append_to_all_sync(&self, paths: &[&Path], value: &impl Serialize) -> Vec<io::Result<()>> {
+        let mut line = match serde_json::to_vec(value) {
+            Ok(line) => line,
+            Err(err) => {
+                return paths
+                    .iter()
+                    .map(|_| Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string())))
+                    .collect();
+            }
+        };
+        line.push(b'\n');
+        let _guard = APPEND_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        paths.iter().map(|path| append_locked(path, &line)).collect()
     }
 }
 
@@ -142,6 +157,40 @@ mod tests {
 
     use serde::Deserialize;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn sync_and_async_writers_share_append_serialization() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mixed.jsonl");
+        let sync_path = path.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            for seq in 0..100 {
+                JsonlAppender::new()
+                    .append_to_all_sync(&[&sync_path], &serde_json::json!({"sync": seq}))
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+        for seq in 0..100 {
+            JsonlAppender::new()
+                .append(&path, &serde_json::json!({"async": seq}))
+                .await
+                .unwrap();
+        }
+        writer.await.unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        let rows: std::collections::HashSet<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(contents.lines().count(), 200);
+        for seq in 0..100 {
+            assert!(rows.contains(&serde_json::json!({"sync": seq})));
+            assert!(rows.contains(&serde_json::json!({"async": seq})));
+        }
+    }
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Record {

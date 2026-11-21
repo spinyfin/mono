@@ -1752,6 +1752,25 @@ impl WorkDb {
     /// discard a redundant `ready` execution before it ever reaches
     /// `start_execution_run`.
     pub fn mark_execution_redundant(&self, execution_id: &str) -> Result<()> {
+        self.mark_execution_redundant_impl(execution_id, None)
+    }
+
+    /// Like [`Self::mark_execution_redundant`], and stamps cancellation source,
+    /// actor, and reason on the same `UPDATE`. Existing callers keep writing
+    /// unattributed rows until they migrate.
+    pub fn mark_execution_redundant_with_provenance(
+        &self,
+        execution_id: &str,
+        provenance: boss_protocol::CancelProvenance,
+    ) -> Result<()> {
+        self.mark_execution_redundant_impl(execution_id, Some(&provenance))
+    }
+
+    fn mark_execution_redundant_impl(
+        &self,
+        execution_id: &str,
+        provenance: Option<&boss_protocol::CancelProvenance>,
+    ) -> Result<()> {
         let conn = self.connect()?;
         let existing = query_execution(&conn, execution_id)?;
         let now = now_string();
@@ -1761,18 +1780,21 @@ impl WorkDb {
                 crate::task_status_audit::abandon_cause::REDUNDANT_DUPLICATE,
                 "UPDATE work_executions
                  SET status = 'abandoned',
-                     finished_at = COALESCE(finished_at, ?2)
+                     finished_at = COALESCE(finished_at, ?2),
+                     cancel_source = ?3,
+                     cancel_actor = ?4,
+                     cancel_reason = ?5
                  WHERE id = ?1",
-                rusqlite::params![execution_id, now],
+                rusqlite::params![
+                    execution_id,
+                    now,
+                    provenance.map(|p| p.source.as_str()),
+                    provenance.map(|p| p.actor.as_str()),
+                    provenance.map(|p| p.reason.as_str())
+                ],
             )?,
             _ => 0,
         };
-        // Canonical terminalization trace — see
-        // `WorkDb::mark_execution_orphaned` in executions_runs.rs. The
-        // double-spawn guard abandoning a redundant duplicate is exactly
-        // the secondary-incident shape (a cross-kind duplicate execution
-        // that got abandoned and shadowed the real one), so this site must
-        // be attributable from the trace alone too.
         if updated > 0 {
             let existing = existing.expect("updated > 0 implies existing was Some and non-terminal");
             tracing::warn!(
@@ -1780,9 +1802,25 @@ impl WorkDb {
                 work_item_id = %existing.work_item_id,
                 from_status = %existing.status,
                 to_status = "abandoned",
-                reason = "redundant duplicate execution",
+                source = ?provenance.map(|p| p.source),
+                actor = ?provenance.map(|p| &p.actor),
+                reason = provenance.map(|p| p.reason.as_str()).unwrap_or("redundant duplicate execution"),
                 "execution terminalized: mark redundant",
             );
+            if let Some(provenance) = provenance {
+                let mut pending = PendingEvents::new();
+                stage_doomed_audit_only(
+                    &mut pending,
+                    &[DoomedExecution::new(
+                        execution_id,
+                        &existing.work_item_id,
+                        existing.status.as_str(),
+                    )],
+                    &ExecutionStatus::Abandoned,
+                    provenance,
+                );
+                self.flush_pending(pending);
+            }
             // No open `Transaction` here — `conn` auto-commits each
             // statement, so the UPDATE above is already durable and this
             // publish carries no rollback risk.

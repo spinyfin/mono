@@ -112,6 +112,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             engine_rebase_holds: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: super::default_dispatch_events(),
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
@@ -142,6 +143,7 @@ impl WorkDb {
             boothby_action: Arc::default(),
             engine_rebase_holds: Arc::default(),
             event_bus: Arc::new(EventBus::new()),
+            dispatch_events: super::default_dispatch_events(),
             persona_metrics: personas::new_metrics_registry(),
             engine_build_identity: None,
             token_generator: super::default_token_generator(),
@@ -154,6 +156,14 @@ impl WorkDb {
     /// [`Self::open_in_memory`].
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.event_bus = bus;
+        self
+    }
+
+    /// Replace this handle's dispatch-event sink with `sink`. Chainable after
+    /// [`Self::open`]. Decision-terminal provenance is written here after
+    /// commit; the default is a no-op.
+    pub fn with_dispatch_events(mut self, sink: Arc<dyn boss_dispatch_events::DispatchEventSink>) -> Self {
+        self.dispatch_events = sink;
         self
     }
 

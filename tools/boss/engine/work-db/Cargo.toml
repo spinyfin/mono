@@ -15,6 +15,7 @@ bon = { workspace = true }
 boss-board-projection = { path = "../board-projection" }
 boss-comment-anchor = { path = "../../comment_anchor" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
+boss-dispatch-events = { path = "../dispatch-events" }
 boss-engine-attachments = { path = "../attachments" }
 boss-engine-automation-dedup = { path = "../automation-dedup" }
 boss-engine-board-gesture = { path = "../board-gesture" }

@@ -71,13 +71,41 @@ impl WorkDb {
     /// Like [`Self::cancel_execution`], but accepts a reason and the
     /// `queued_only` gate used by `bossctl executions cancel`.
     pub fn cancel_execution_with(&self, execution_id: &str, opts: CancelExecutionOpts) -> Result<WorkExecution> {
+        self.cancel_execution_impl(execution_id, opts, None, &DecisionAuditContext::default())
+    }
+
+    /// Like [`Self::cancel_execution_with`], and stamps cancellation source,
+    /// actor, and reason on the same `UPDATE` that moves the row. Existing
+    /// callers of [`Self::cancel_execution`] keep writing unattributed rows
+    /// until they migrate.
+    pub fn cancel_execution_with_provenance(
+        &self,
+        execution_id: &str,
+        opts: CancelExecutionOpts,
+        provenance: boss_protocol::CancelProvenance,
+        context: DecisionAuditContext,
+    ) -> Result<WorkExecution> {
+        self.cancel_execution_impl(execution_id, opts, Some(&provenance), &context)
+    }
+
+    fn cancel_execution_impl(
+        &self,
+        execution_id: &str,
+        opts: CancelExecutionOpts,
+        provenance: Option<&boss_protocol::CancelProvenance>,
+        context: &DecisionAuditContext,
+    ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let reason = normalize_optional_text(opts.reason.clone()).unwrap_or_else(|| "explicit cancel".to_owned());
+        let reason = provenance
+            .map(|p| p.reason.clone())
+            .or_else(|| normalize_optional_text(opts.reason.clone()))
+            .unwrap_or_else(|| "explicit cancel".to_owned());
         let mut pending = PendingEvents::new();
-        let updated = cancel_execution_in_tx(&tx, &mut pending, execution_id, opts)?;
-        commit_and_publish(tx, pending, &self.event_bus)?;
+        let updated =
+            cancel_execution_in_tx_with_provenance(&tx, &mut pending, execution_id, opts, provenance, context)?;
+        self.commit_pending(tx, pending)?;
         // `connect()` is a process-wide mutex; drop it before the review-guide
         // follow-up, which needs its own connection.
         drop(conn);
@@ -2213,11 +2241,27 @@ impl WorkDb {
 }
 
 /// Cancel within a caller's transaction, staging terminal events for publication after commit.
+/// Unattributed: columns stay NULL and no decision-audit record is staged.
 pub(super) fn cancel_execution_in_tx(
     tx: &Connection,
     pending: &mut PendingEvents,
     execution_id: &str,
     opts: CancelExecutionOpts,
+) -> Result<WorkExecution> {
+    cancel_execution_in_tx_with_provenance(tx, pending, execution_id, opts, None, &DecisionAuditContext::default())
+}
+
+/// Cancel within a caller's transaction. When `provenance` is `Some`, the
+/// same `UPDATE` stamps `cancel_source` / `cancel_actor` / `cancel_reason`
+/// and stages a decision-terminal audit; when `None`, those columns stay
+/// NULL so existing callers keep compiling until they migrate.
+pub(super) fn cancel_execution_in_tx_with_provenance(
+    tx: &Connection,
+    pending: &mut PendingEvents,
+    execution_id: &str,
+    opts: CancelExecutionOpts,
+    provenance: Option<&boss_protocol::CancelProvenance>,
+    context: &DecisionAuditContext,
 ) -> Result<WorkExecution> {
     let existing = query_execution(tx, execution_id).require("execution", execution_id)?;
     if existing.status.is_terminal() {
@@ -2246,19 +2290,28 @@ pub(super) fn cancel_execution_in_tx(
     }
     let supplied_reason = normalize_optional_text(opts.reason);
     let persist_last_error = existing.status.is_pre_run() && opts.record_failure_reason && supplied_reason.is_some();
-    let reason = supplied_reason.clone().unwrap_or_else(|| "explicit cancel".to_owned());
+    let reason = provenance
+        .map(|p| p.reason.clone())
+        .or_else(|| supplied_reason.clone())
+        .unwrap_or_else(|| "explicit cancel".to_owned());
     let now = now_string();
     tx.execute(
         "UPDATE work_executions
              SET status = 'cancelled',
                  finished_at = ?2,
-                 last_error = CASE WHEN ?3 THEN ?4 ELSE last_error END
+                 last_error = CASE WHEN ?3 THEN ?4 ELSE last_error END,
+                 cancel_source = ?5,
+                 cancel_actor = ?6,
+                 cancel_reason = ?7
              WHERE id = ?1",
         params![
             execution_id,
             now.as_str(),
             persist_last_error,
             supplied_reason.as_deref().unwrap_or(""),
+            provenance.map(|p| p.source.as_str()),
+            provenance.map(|p| p.actor.as_str()),
+            provenance.map(|p| p.reason.as_str()),
         ],
     )?;
     // Live cancel only: demote active → todo when this execution is
@@ -2278,16 +2331,41 @@ pub(super) fn cancel_execution_in_tx(
     // `reason` is the operator- or engine-supplied cancel reason so the
     // audit trail distinguishes deliberate cancellation from
     // `orphaned` (engine lost the run) and `abandoned`.
-    tracing::warn!(
-        execution_id = %execution_id,
-        work_item_id = %updated.work_item_id,
-        from_status = %existing.status,
-        to_status = %updated.status,
-        reason = %reason,
-        queued_only = opts.queued_only,
-        "execution terminalized: cancel",
-    );
-    stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;
+    if let Some(provenance) = provenance {
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %updated.work_item_id,
+            from_status = %existing.status,
+            to_status = %updated.status,
+            source = %provenance.source,
+            actor = %provenance.actor,
+            reason = %provenance.reason,
+            queued_only = opts.queued_only,
+            "execution terminalized: cancel",
+        );
+        stage_decision_terminal(
+            pending,
+            tx,
+            &DoomedExecution::new(execution_id, &updated.work_item_id, existing.status.as_str()),
+            &ExecutionStatus::Cancelled,
+            provenance,
+            &DecisionAuditContext {
+                queued_only: Some(opts.queued_only),
+                ..context.clone()
+            },
+        )?;
+    } else {
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %updated.work_item_id,
+            from_status = %existing.status,
+            to_status = %updated.status,
+            reason = %reason,
+            queued_only = opts.queued_only,
+            "execution terminalized: cancel",
+        );
+        stage_execution_terminal(pending, tx, execution_id, &updated.work_item_id)?;
+    }
     Ok(updated)
 }
 
