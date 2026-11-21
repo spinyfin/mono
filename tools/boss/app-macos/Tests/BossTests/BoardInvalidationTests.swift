@@ -183,6 +183,27 @@ final class BoardInvalidationTests: XCTestCase {
         withExtendedLifetime(subscriptions) {}
     }
 
+    func testEveryCardInputRepublishesItsRow() {
+        let model = makeModel()
+        let row = WorkCardRenderState(model: model, id: "first", column: .backlog, style: .classic)
+        var changes = 0
+        let subscription = row.objectWillChange.sink { changes += 1 }
+        let mutations: [(String, () -> Void)] = [
+            ("selectedWorkCardID", { model.selectedWorkCardID = "first" }),
+            ("depFrontierHighlightIDs", { model.depFrontierHighlightIDs = ["first"] }),
+            ("revealHighlightID", { model.revealHighlightID = "first" }),
+            ("mergingWhenReadyIDs", { model.mergingWhenReadyIDs = ["first"] }),
+            ("revisionComposerTaskID", { model.revisionComposerTaskID = "first" }),
+        ]
+        for (name, mutate) in mutations {
+            let before = changes
+            mutate()
+            model.presentationUpdates.flush()
+            XCTAssertEqual(changes, before + 1, "\(name) must republish the card row")
+        }
+        withExtendedLifetime(subscription) {}
+    }
+
     private func makeModel() -> ChatViewModel {
         let model = ChatViewModel(socketPath: "/tmp/boss-board-observation-\(UUID().uuidString).sock")
         model.products = [WorkProduct(id: "product", name: "Product", slug: "product", description: "",

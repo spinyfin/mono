@@ -750,9 +750,9 @@ struct ContentView: View {
                                 .accessibilityHidden(model.navigator.mode != .kanban)
                             if model.navigator.mode == .navigator {
                                 #if canImport(GhosttyKit)
-                                WorkNavigatorView(model: model, workspace: workersWorkspace)
+                                WorkNavigatorView(model: model, workspace: workersWorkspace).equatable()
                                 #else
-                                WorkNavigatorView(model: model)
+                                WorkNavigatorView(model: model).equatable()
                                 #endif
                             }
                         }

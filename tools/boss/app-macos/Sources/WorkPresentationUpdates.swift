@@ -7,6 +7,7 @@ import Foundation
 final class WorkPresentationUpdates {
     private weak var model: ChatViewModel?
     private(set) var reviewersByPR: [ReviewPRIdentity: [WorkerLiveState]] = [:]
+    static let clockTickSeconds: TimeInterval = 15
     let chrome = PassthroughSubject<Void, Never>()
     let cards = PassthroughSubject<Bool, Never>()
     private var subscriptions: Set<AnyCancellable> = []
@@ -66,6 +67,13 @@ final class WorkPresentationUpdates {
         observe(model.$ciRemediations)
         observe(model.$retryingReviewGuideRootTaskIDs)
         observe(model.$revisionComposerTaskID)
+        // Snapshots bake in `now`-relative text (countdowns, parked chip,
+        // badge freshness windows). Rebuild periodically; the render value's
+        // equality gate means only cards whose text changed republish.
+        Timer.publish(every: Self.clockTickSeconds, on: .main, in: .common).autoconnect().sink { [weak self] _ in
+            self?.cardsDirty = true
+            self?.schedule()
+        }.store(in: &subscriptions)
     }
 
     private func observe<Value>(_ publisher: Published<Value>.Publisher) {

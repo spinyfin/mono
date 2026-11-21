@@ -52,6 +52,7 @@ struct WorkSidebarSnapshot: Equatable {
     let isConnected: Bool
     let editorialControlsEnabled: Bool
     let choresOnly: Bool
+    let hasProjectFilters: Bool
     let includeChores: Bool
     let blockedOnly: Bool
     let showParked: Bool
@@ -69,6 +70,7 @@ struct WorkSidebarSnapshot: Equatable {
         isConnected = model.isConnected
         editorialControlsEnabled = model.isEditorialControlsEnabled
         choresOnly = model.filterToChoresOnly
+        hasProjectFilters = model.hasProjectFilters
         includeChores = model.includeChores
         blockedOnly = model.showBlockedOnly
         showParked = model.showParked

@@ -62,12 +62,11 @@ struct WorkNavigatorRow: View {
     let project: String?
     let width: CGFloat
     let isSelected: Bool
-    @ObservedObject var liveWorkers: LiveWorkerStateStore
+    let isWorkerActive: Bool
     @Environment(\.dynamicTypeSize) private var textSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let isWorkerActive = NavigatorRowPresentation.isWorkerActive(row: row, liveStates: liveWorkers.byRunID)
         let presentation = NavigatorRowPresentation(row: row, project: project, width: width, isWorkerActive: isWorkerActive)
         HStack(spacing: 6) {
             if row.projection.knownSection == .working {
@@ -108,5 +107,29 @@ struct WorkNavigatorRow: View {
         .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
         .help(presentation.accessibilityLabel)
+    }
+}
+
+/// Mounts a row with its own live-state value; the surrounding list never
+/// observes live worker traffic.
+struct WorkNavigatorObservedRow: View {
+    let row: NavigatorRow
+    let project: String?
+    let width: CGFloat
+    let isSelected: Bool
+    @StateObject private var live: NavigatorRowLiveState
+
+    init(row: NavigatorRow, project: String?, width: CGFloat, isSelected: Bool, model: ChatViewModel) {
+        self.row = row
+        self.project = project
+        self.width = width
+        self.isSelected = isSelected
+        _live = StateObject(wrappedValue: NavigatorRowLiveState(model: model, row: row))
+    }
+
+    var body: some View {
+        WorkNavigatorRow(row: row, project: project, width: width, isSelected: isSelected,
+                         isWorkerActive: live.isWorkerActive)
+            .onChange(of: row) { _, row in live.setRow(row) }
     }
 }

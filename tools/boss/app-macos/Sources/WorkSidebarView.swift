@@ -73,7 +73,7 @@ struct WorkSidebarView: View, @MainActor Equatable {
                         title: "All Projects",
                         subtitle: nil,
                         systemImage: "square.stack.3d.up",
-                        isSelected: !value.projects.contains { value.selectedProjectIDs.contains($0.id) } && !value.choresOnly,
+                        isSelected: !value.hasProjectFilters,
                         trailing: nil,
                         showsCheckbox: false
                     )

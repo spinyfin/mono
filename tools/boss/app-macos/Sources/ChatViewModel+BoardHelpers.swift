@@ -400,12 +400,16 @@ extension ChatViewModel {
 
     /// Build the equatable [[WorkCardSnapshot]] for a board card.
     ///
-    /// Called by the column container so per-card views no longer observe
-    /// `ChatViewModel` / `LiveWorkerStateStore` — they receive this value
-    /// and re-render only when their own inputs change (via
-    /// `WorkBoardCardView.equatable()`).
+    /// Called by each card's `WorkCardRenderState`, so neither the column nor
+    /// the card view observes `ChatViewModel` / `LiveWorkerStateStore` —
+    /// the card re-renders only when its own render value changes.
     ///
-    /// `liveState` is resolved by the container from `LiveWorkerStateStore`
+    /// INVARIANT: every input read while building a snapshot must be
+    /// covered by `WorkPresentationUpdates`' `observe(model.$...)` list (or
+    /// `invalidateWorkCache`), or cards go stale. Add new card-feeding
+    /// `@Published` state there, and to the guard test.
+    ///
+    /// `liveState` is resolved per card via `workerLiveState(forTaskID:)`
     /// (Doing column only). `now` is injectable for tests of time-relative
     /// live-status phrasing.
     func workCardSnapshot(

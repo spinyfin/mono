@@ -17,6 +17,11 @@ struct WorkCardRenderValue: Equatable {
     let runtime: WorkTaskRuntime?
 }
 
+/// INVARIANT: `refresh` (and the snapshot it builds) may read only model
+/// state that `WorkPresentationUpdates` observes (its `observe(model.$...)`
+/// list, `invalidateWorkCache`, or the live store). A new card input that is
+/// not added there leaves cards stale; `testEveryCardInputRepublishesItsRow`
+/// guards the current list.
 @MainActor
 final class WorkCardRenderState: ObservableObject {
     @Published private(set) var value: WorkCardRenderValue?
