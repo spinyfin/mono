@@ -1,0 +1,337 @@
+store, worker: forget a blob whose file is gone, so it is fetched again
+
+Applies to NativeLink v1.8.6 (37f3b206a8e6d55613abae2b18a0665fff24e096).
+build-worker.sh applies it on macOS, after the clone patch, and on Linux by
+itself; ../../README.md, "Version and patches", says where each binary runs.
+
+A worker's filesystem store answers `has()` from its index. When an entry's
+file is no longer on disk the index still lists the blob, so
+`populate_fast_store` takes it for resident and fetches nothing. v1.8.6
+repairs an input whose blob was evicted while its tree was staged by fetching
+it and resolving it again, up to three times; with a stale entry every one of
+those fetches is a no-op, and the action fails. So does every later action
+that needs the blob, until the worker restarts and rebuilds the index from
+the directory. An input that every test shares takes the whole pool's tests
+down with it: the worker fails each of them at once, is free again
+immediately, and is handed the retries.
+
+What an action reports:
+
+  executable-variant copy failed: Os { code: 2, kind: NotFound, ... } :
+  Resolving executable variant for <digest>
+
+for an executable input, whose 0o555 copy is made from the blob, and `Could
+not make hardlink ... file was likely evicted from cache` for a plain one.
+
+Seen on 2026-11-20 on a v1.6.6 worker, where a race in eviction left such an
+entry for a 941-byte script that every sandboxed test stages: 31 of 95 Linux
+CI jobs failed over seven hours. v1.8.6 closes that race (a file's path
+carries a generation, so a late removal cannot take a newer file), and a
+read through the store already drops a stale entry. The two paths the worker
+stages inputs by did not:
+
+- Building an executable variant. The copy's `NotFound`, when it is the
+  source that is gone, is now reported as `NotFound` instead of `Internal`,
+  and the entry is dropped. `NotFound` is what the worker's fetch-and-resolve
+  loop retries on, and the retry now fetches.
+- Linking a plain input again after the batch found its source gone. A
+  `NotFound` from that link drops the entry (`forget_if_missing`), for the
+  same reason.
+
+An entry is dropped only when its own file is missing, looked at under the
+entry's path lock, and only that entry: one inserted since has a file of its
+own. Tests: the store drops a stale entry when a variant cannot be built and
+leaves an entry alone whose file exists; the worker stages a tree whose plain
+and executable inputs both sit behind stale entries. Without the fix the
+worker test fails with the first message above.
+
+Not upstream. Drop this file when a release clears a stale entry on these two
+paths.
+
+diff --git a/nativelink-store/src/filesystem_store.rs b/nativelink-store/src/filesystem_store.rs
+index b875024..c192d6c 100644
+--- a/nativelink-store/src/filesystem_store.rs
++++ b/nativelink-store/src/filesystem_store.rs
+@@ -1768,12 +1768,22 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
+         // writable fd opened by `copy` is fully closed before the `rename`
+         // publishes the inode, so no reachable hardlink of the variant ever has
+         // an open writer.
+-        spawn_blocking!(
++        let result = spawn_blocking!(
+             "filesystem_store_executable_variant",
+             move || -> Result<(), Error> {
+                 use std::os::unix::fs::PermissionsExt;
+                 std::fs::copy(&src_path, &temp_owned).map_err(|e| {
+-                    make_err!(Code::Internal, "executable-variant copy failed: {e:?}")
++                    // `NotFound` can also be the variant directory. Only a
++                    // source that is gone is a stale index entry, which the
++                    // caller drops and reports as a miss.
++                    let source_gone = e.kind() == std::io::ErrorKind::NotFound
++                        && matches!(std::fs::exists(&src_path), Ok(false));
++                    let code = if source_gone {
++                        Code::NotFound
++                    } else {
++                        Code::Internal
++                    };
++                    make_err!(code, "executable-variant copy failed: {e:?}")
+                 })?;
+                 std::fs::set_permissions(&temp_owned, std::fs::Permissions::from_mode(0o555))
+                     .map_err(|e| {
+@@ -1818,7 +1828,54 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
+             }
+         )
+         .await
+-        .err_tip(|| "executable-variant spawn_blocking join failed")?
++        .err_tip(|| "executable-variant spawn_blocking join failed")?;
++        if result.as_ref().is_err_and(|err| err.code == Code::NotFound) {
++            // The caller populates the fast store and resolves again on
++            // `NotFound`, which only fetches once the stale entry is gone.
++            self.forget_entry_if_missing(digest, &file_entry).await;
++        }
++        result
++    }
++
++    /// Drops the index entry for `digest` when the file it names is no longer
++    /// on disk, and reports whether it did.
++    ///
++    /// For a caller that used the blob's path and found nothing there. The
++    /// index is what `has()` answers from, so `populate_fast_store` takes a
++    /// blob with a stale entry for resident and never fetches it: every action
++    /// that needs the blob then fails until the process restarts. With the
++    /// entry gone the next populate fetches the blob again.
++    pub async fn forget_if_missing(&self, digest: &DigestInfo) -> bool {
++        let Some(entry) = self.evicting_map.get(&digest.into()).await else {
++            return false;
++        };
++        self.forget_entry_if_missing(digest, &entry).await
++    }
++
++    async fn forget_entry_if_missing(&self, digest: &DigestInfo, entry: &Arc<Fe>) -> bool {
++        // Looked at under the entry's path lock, which a rename of the file
++        // takes for writing, and released before the removal, whose `unref()`
++        // takes it too.
++        let missing = entry
++            .get_file_path_locked(|path| async move {
++                Ok(matches!(
++                    fs::metadata(&path).await,
++                    Err(err) if err.code == Code::NotFound
++                ))
++            })
++            .await
++            .unwrap_or(false);
++        if !missing {
++            return false;
++        }
++        warn!(
++            %digest,
++            "Filesystem store map/disk divergence: the blob's file is gone, removing its entry so it is fetched again",
++        );
++        // Only this entry: one inserted since has a file of its own.
++        self.evicting_map
++            .remove_if(&digest.into(), |map_entry| Arc::ptr_eq(map_entry, entry))
++            .await
+     }
+ 
+     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
+diff --git a/nativelink-store/tests/filesystem_store_test.rs b/nativelink-store/tests/filesystem_store_test.rs
+index 53e706b..5709b50 100644
+--- a/nativelink-store/tests/filesystem_store_test.rs
++++ b/nativelink-store/tests/filesystem_store_test.rs
+@@ -2067,6 +2067,91 @@ async fn orphaned_executable_variant_is_a_miss() -> Result<(), Error> {
+     Ok(())
+ }
+ 
++/// Deletes the file behind `digest` and leaves its index entry in place, which
++/// is the state a blob is in when something other than the store removed it.
++fn remove_blob_file(content_path: &str, digest: &DigestInfo) -> Result<(), Error> {
++    let prefix = digest.to_string();
++    let mut removed = 0;
++    for entry in std::fs::read_dir(format!("{content_path}/{DIGEST_FOLDER_V2}"))? {
++        let entry = entry?;
++        if entry.file_name().to_string_lossy().starts_with(&prefix) {
++            std::fs::remove_file(entry.path())?;
++            removed += 1;
++        }
++    }
++    assert_eq!(removed, 1, "expected one file for {digest}");
++    Ok(())
++}
++
++/// An index entry can outlive its file. `has()` answers from the index, so a
++/// caller that populates the fast store before it builds a variant fetches
++/// nothing, and the copy then fails for every action that needs the blob.
++/// Building the variant must drop the entry and report a miss, which is what
++/// makes the caller's next populate fetch the blob.
++#[cfg(target_family = "unix")]
++#[nativelink_test]
++async fn stale_blob_entry_is_dropped_when_its_variant_cannot_be_built() -> Result<(), Error> {
++    let content_path = make_temp_path("content_path");
++    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
++    let store = Box::pin(
++        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
++            content_path: content_path.clone(),
++            temp_path: make_temp_path("temp_path"),
++            ..Default::default()
++        })
++        .await?,
++    );
++    store.update_oneshot(digest, VALUE1.into()).await?;
++    remove_blob_file(&content_path, &digest)?;
++    assert!(
++        store.has(digest).await?.is_some(),
++        "the index still lists the blob"
++    );
++
++    let err = store
++        .get_executable_hardlink_source(&digest)
++        .await
++        .expect_err("a variant cannot be built from a file that is gone");
++    assert_eq!(err.code, Code::NotFound, "{err:?}");
++    assert!(
++        store.has(digest).await?.is_none(),
++        "the stale entry must be dropped"
++    );
++
++    // What the caller's populate does next.
++    store.update_oneshot(digest, VALUE1.into()).await?;
++    let variant_path = store.get_executable_hardlink_source(&digest).await?;
++    assert_eq!(std::fs::read(&variant_path)?, VALUE1.as_bytes());
++    Ok(())
++}
++
++/// `forget_if_missing` is for a caller that found nothing at a blob's path. It
++/// must leave alone an entry whose file is there.
++#[nativelink_test]
++async fn forget_if_missing_drops_only_an_entry_without_a_file() -> Result<(), Error> {
++    let content_path = make_temp_path("content_path");
++    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
++    let store = Box::pin(
++        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
++            content_path: content_path.clone(),
++            temp_path: make_temp_path("temp_path"),
++            ..Default::default()
++        })
++        .await?,
++    );
++    assert!(!store.forget_if_missing(&digest).await, "nothing to forget");
++
++    store.update_oneshot(digest, VALUE1.into()).await?;
++    assert!(!store.forget_if_missing(&digest).await);
++    assert!(store.has(digest).await?.is_some());
++
++    remove_blob_file(&content_path, &digest)?;
++    assert!(store.forget_if_missing(&digest).await);
++    assert!(store.has(digest).await?.is_none());
++    assert!(!store.forget_if_missing(&digest).await);
++    Ok(())
++}
++
+ /// This test simulates a full disk without needing one. It writes past the `RLIMIT_FSIZE`
+ /// cap, thus failing with `EFBIG`, which tokio defers exactly like `ENOSPC`. The
+ /// [`SIGXFSZ`](`libc::SIGXFSZ`) signal must be ignored or the kernel will kill the process
+diff --git a/nativelink-worker/src/running_actions_manager.rs b/nativelink-worker/src/running_actions_manager.rs
+index 62e6171..6473ece 100644
+--- a/nativelink-worker/src/running_actions_manager.rs
++++ b/nativelink-worker/src/running_actions_manager.rs
+@@ -1748,9 +1748,16 @@ async fn relink_evicted_input(
+                 .await
+                 .err_tip(|| "Resolving an evicted hardlink source again")?;
+             let dst = link.dst.clone();
+-            file_entry
++            let linked = file_entry
+                 .get_file_path_locked(|src| async move { fs::hard_link(src, dst).await })
+-                .await
++                .await;
++            if linked.as_ref().is_err_and(|err| err.code == Code::NotFound) {
++                // The store lists the blob and its file is gone. The fetch
++                // above did nothing for that reason, and neither will the
++                // next one unless the store forgets the entry.
++                filesystem_store.forget_if_missing(&link.digest).await;
++            }
++            linked
+         },
+     )
+     .await?;
+diff --git a/nativelink-worker/tests/running_actions_manager_test.rs b/nativelink-worker/tests/running_actions_manager_test.rs
+index a146dc7..e7cd938 100644
+--- a/nativelink-worker/tests/running_actions_manager_test.rs
++++ b/nativelink-worker/tests/running_actions_manager_test.rs
+@@ -1286,6 +1286,78 @@ mod tests {
+         Ok(())
+     }
+ 
++    /// Deletes the file behind `digest` in the fast store and leaves its index
++    /// entry in place.
++    fn remove_blob_file(content_path: &str, digest: &DigestInfo) -> Result<(), std::io::Error> {
++        let prefix = digest.to_string();
++        let mut removed = 0;
++        for entry in std::fs::read_dir(format!("{content_path}/d2"))? {
++            let entry = entry?;
++            if entry.file_name().to_string_lossy().starts_with(&prefix) {
++                std::fs::remove_file(entry.path())?;
++                removed += 1;
++            }
++        }
++        assert_eq!(removed, 1, "expected one file for {digest}");
++        Ok(())
++    }
++
++    /// A fast store entry can outlive its file. The store then answers that it
++    /// has the blob, so fetching the blob again does nothing and every action
++    /// that stages it fails. Staging must make the store forget the entry and
++    /// fetch the blob: here for a plain input, and for an executable whose
++    /// variant has to be built from it.
++    #[nativelink_test]
++    async fn download_to_directory_refetches_inputs_whose_store_files_are_gone()
++    -> Result<(), Box<dyn core::error::Error>> {
++        const PLAIN_CONTENT: &str = "plain input behind a stale entry";
++        const EXEC_CONTENT: &str = "#!/bin/sh\necho stale\n";
++
++        let content_path = make_temp_path("content_path");
++        let (fast_store, slow_store, cas_store, _ac_store) =
++            setup_stores_at(content_path.clone(), None).await?;
++        let plain_digest = DigestInfo::new([61u8; 32], PLAIN_CONTENT.len() as u64);
++        let exec_digest = DigestInfo::new([62u8; 32], EXEC_CONTENT.len() as u64);
++        for (digest, content) in [(plain_digest, PLAIN_CONTENT), (exec_digest, EXEC_CONTENT)] {
++            slow_store
++                .as_ref()
++                .update_oneshot(digest, content.into())
++                .await?;
++            // Resident in the fast store; then the file goes and the entry stays.
++            cas_store.populate_fast_store(digest.into()).await?;
++            remove_blob_file(&content_path, &digest)?;
++            assert!(fast_store.has(digest).await?.is_some());
++        }
++
++        let download_dir = stage_tree(
++            &slow_store,
++            &cas_store,
++            &fast_store,
++            vec![
++                FileNode {
++                    name: "plain.txt".to_string(),
++                    digest: Some(plain_digest.into()),
++                    ..Default::default()
++                },
++                FileNode {
++                    name: "tool".to_string(),
++                    digest: Some(exec_digest.into()),
++                    is_executable: true,
++                    ..Default::default()
++                },
++            ],
++        )
++        .await?;
++
++        let plain = fs::read(format!("{download_dir}/plain.txt")).await?;
++        assert_eq!(from_utf8(&plain)?, PLAIN_CONTENT);
++        let tool_path = format!("{download_dir}/tool");
++        assert_eq!(from_utf8(&fs::read(&tool_path).await?)?, EXEC_CONTENT);
++        #[cfg(target_family = "unix")]
++        assert_ne!(fs::metadata(&tool_path).await?.mode() & 0o111, 0);
++        Ok(())
++    }
++
+     #[nativelink_test]
+     async fn download_to_directory_zero_digest_empty_file_test()
+     -> Result<(), Box<dyn core::error::Error>> {

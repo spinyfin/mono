@@ -1,6 +1,6 @@
 // NativeLink worker for a Mac in the remote-execution pool. For the patched
 // 1.8.6 binary build-worker.sh produces; an upstream release cannot run Rust
-// actions on macOS (../README.md, "Version and patch").
+// actions on macOS (../README.md, "Version and patches").
 //
 // Started by launchd (com.brianduff.nativelink.plist). The scheduler and the
 // shared cache are the hub (hub.json5) on another host. This process only

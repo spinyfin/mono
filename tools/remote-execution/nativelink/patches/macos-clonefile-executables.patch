@@ -1,7 +1,7 @@
 worker: clone executables on macOS instead of hardlinking them
 
 Applies to NativeLink v1.8.6 (37f3b206a8e6d55613abae2b18a0665fff24e096).
-build-worker.sh applies it; ../../README.md, "Version and patch", says why
+build-worker.sh applies it; ../../README.md, "Version and patches", says why
 the macOS workers cannot run an upstream release without it.
 
 dyld resolves @loader_path and @executable_path from the main image's path
@@ -38,28 +38,14 @@ forward. What changed on the way to v1.8.6:
 - New tests at the worker level: a staged executable has its own inode and
   one link while a plain input is still a hardlink, and a repaired
   executable has one link.
-- BUILD.bazel gives the binary a version. A Bazel build otherwise reports
-  0.0.0, and the suffix lets `nativelink --version` tell a worker binary
-  that carries this patch from an upstream release.
+- The binary's version is no longer set here. build-worker.sh stamps it
+  from the patches it applied, so that `nativelink --version` names every
+  patch a worker binary carries.
 
 Not upstream: TraceMachina/nativelink#3137 is open, as are the two pull
 requests that address it another way (#3138, #3191). Drop this file when a
 release stages macOS executables on their own inode.
 
-diff --git a/BUILD.bazel b/BUILD.bazel
-index 06bece2a..6ac43dbd 100644
---- a/BUILD.bazel
-+++ b/BUILD.bazel
-@@ -44,6 +44,9 @@ rust_binary(
-     srcs = [
-         "src/bin/nativelink.rs",
-     ],
-+    # Bazel builds otherwise report 0.0.0. The suffix marks a binary that
-+    # carries the macOS clone patch, which `--version` could not show before.
-+    version = "1.8.6+macos-clonefile",
-     deps = [
-         ":nativelink_lib",
-         "//nativelink-config",
 diff --git a/nativelink-util/src/fs.rs b/nativelink-util/src/fs.rs
 index a7eb4ac5..1143b4b1 100644
 --- a/nativelink-util/src/fs.rs
