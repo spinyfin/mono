@@ -34,7 +34,8 @@
 //!     `CommentsBannerState`, `TailRunTranscript`, `ExecutionTranscript`,
 //!     `FindWorkItemsByPr`, `WorkerPoolSummary`, `WorkspacePoolSummary`,
 //!     `TrunkStatus`, `GitHubAuthStatus`, `ProbeStatus`, `MetricsListLive`,
-//!     `MetricsShowLive`, `DebugLiveStatusPipeline`).
+//!     `MetricsShowLive`, `DebugLiveStatusPipeline`,
+//!     `VerifyCoordinatorResetRequest`).
 //!   * *Declarative setters*: every `Set*` request writes an absolute value, so
 //!     repeating it leaves the same state.
 //!   * *Documented idempotent writes* (each is called out as idempotent in its
@@ -324,6 +325,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
             WorkerAccess::Coordinator,
             ProgressionAccess::Deny,
         ),
+        R::VerifyCoordinatorResetRequest { .. } => bulk_read(WorkerAccess::Coordinator, ProgressionAccess::Deny),
         // Payload-dependent: a refresh probe must not hold a bulk slot.
         // Own-PR reads use peer pid → execution → work item, with a run_id
         // cross-check, just like GetWorkerContext/GetPrBody. Refresh stays on

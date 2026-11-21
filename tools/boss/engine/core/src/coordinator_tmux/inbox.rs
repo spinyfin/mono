@@ -83,9 +83,11 @@ pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// blindly.
 pub const AUTHORIZATION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// `--settings` JSON the production coordinator launches with. Delivery
-/// confirms only when the coordinator accepts cross-session input, so this is
-/// set explicitly rather than inherited from user or default configuration.
+/// `--settings` JSON the production coordinator launches with. Claude Code's
+/// inbound values are `accept`, `hold`, and `refuse`. Delivery confirms only
+/// when the coordinator accepts cross-session input (`hold` needs an
+/// interactive dialog; `refuse` drops the request), so this is set to
+/// `accept` rather than inherited from user or default configuration.
 pub const COORDINATOR_INBOUND_SETTINGS: &str = r#"{"crossSessionInbound":"accept"}"#;
 
 /// Shared production command. The brief is never part of it: the terminal

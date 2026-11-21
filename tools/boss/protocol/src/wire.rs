@@ -101,27 +101,6 @@ impl FrontendEventEnvelope {
     }
 }
 
-/// Why a [`FrontendRequest::RecreateCoordinator`] was confirmed. Both paths
-/// call the same engine-owned recreate, but the reason is recorded to the
-/// audit log so an operator-initiated reset is distinguishable there from an
-/// automatic model-mismatch replacement — and, separately, from a crash or
-/// unexpected session loss, which is never audited under this event at all.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CoordinatorRecreateReason {
-    /// The coordinator's running model no longer matches the engine's
-    /// configured model; the operator confirmed replacing it. Also the
-    /// default: it was the only caller before `reason` existed, so an
-    /// older app talking to a newer engine (a `recreate_coordinator` line
-    /// with no `reason` field) can only have meant this.
-    #[default]
-    ModelMismatch,
-    /// The operator explicitly asked to reset the coordinator — to pick up
-    /// a newer `claude` binary, clear accumulated context, or apply an
-    /// environment change. Never triggered automatically.
-    OperatorReset,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrontendRequest {
@@ -2946,6 +2925,16 @@ pub enum FrontendRequest {
         patch: Box<WorkItemPatch>,
     },
 
+    /// Read-only: whether the coordinator reset request or handoff-authorization
+    /// delivery carrying `request_id` is still pending (Boss is waiting on the
+    /// coordinator, or a credential was delivered to this session and has not
+    /// been replaced). Backs `boss handoff verify`, which is how the
+    /// coordinator tells an authentic engine inbox message from a forged peer
+    /// message. Replies with [`FrontendEvent::CoordinatorResetRequestStatus`].
+    VerifyCoordinatorResetRequest {
+        request_id: String,
+    },
+
     /// Snapshot every engine worker pool's (main, automation, review)
     /// own claimed-slot bookkeeping — capacity, idle count, and each
     /// held slot's `worker_id → execution_id` mapping — cross-referenced
@@ -2964,24 +2953,22 @@ pub enum FrontendRequest {
     WorkspacePoolSummary,
 }
 
+mod coordinator_recreate;
+pub use coordinator_recreate::CoordinatorRecreateReason;
+
 mod events;
 pub use events::{FrontendEvent, FrontendEventWorkerVisitor};
 
 mod invalidation;
 pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePatchItem};
 
-// Feature-flag / setting snapshots and workspace / worker pool summary
-// rows live in the `snapshot_wire` submodule (extracted to keep this file
-// under the size limit) and are re-exported so external
-// `boss_protocol::{..}` paths are unchanged.
+// Snapshot / pool-summary DTOs: split out to keep this file under the size limit.
 mod snapshot_wire;
 pub use snapshot_wire::{
     FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, TrunkQueueCheckDto,
     WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
 };
 
-// The topic-push payload enum lives in `topic_event_payload`; re-exported as
-// `boss_protocol::TopicEventPayload` next to `PaneCaptureState`.
 mod topic_event_payload;
 pub use topic_event_payload::{PaneCaptureState, TopicEventPayload};
 

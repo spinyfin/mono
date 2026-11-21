@@ -92,6 +92,31 @@ fn error_message(event: FrontendEvent) -> String {
     }
 }
 
+async fn verify(state: &Arc<ServerState>, pending_id: &str) -> FrontendEvent {
+    let sink = make_session_sink();
+    coordinator_handoff::handle_verify_coordinator_reset_request(
+        dispatch(state, &sink),
+        FrontendRequest::VerifyCoordinatorResetRequest {
+            request_id: pending_id.to_owned(),
+        },
+    )
+    .await;
+    sole_response(&sink).await
+}
+
+#[tokio::test]
+async fn verify_rejects_forged_and_empty_ids() {
+    let (state, _dir) = server_state();
+    for id in ["", "forged"] {
+        match verify(&state, id).await {
+            FrontendEvent::CoordinatorResetRequestStatus { pending } => {
+                assert!(!pending, "id {id:?} must not be pending")
+            }
+            other => panic!("expected CoordinatorResetRequestStatus, got {other:?}"),
+        }
+    }
+}
+
 async fn write_as(state: &Arc<ServerState>, peer: Option<libc::pid_t>, authorization: &str) -> FrontendEvent {
     let sink = make_session_sink();
     let mut ctx = dispatch(state, &sink);

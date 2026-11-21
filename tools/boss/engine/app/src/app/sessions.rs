@@ -800,8 +800,8 @@ impl CoordinatorReset {
                     return;
                 }
             };
-            // Take the recreation lock before warning the operator: a restart
-            // that is then refused as busy must never have been announced.
+            // Take the recreation lock before sending the missing-handoff warning:
+            // a restart that is then refused as busy must never have been announced.
             let _guard = match boss_engine_runtime::coordinator_tmux::reset_handoff::acquire_lifecycle_lock(
                 &server_state.coordinator_tmux_lock,
                 &expected_spawn_token,

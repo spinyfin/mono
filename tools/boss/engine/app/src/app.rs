@@ -2843,7 +2843,8 @@ async fn handle_frontend_connection(
         {
             let handoff_authorization = match &request {
                 FrontendRequest::SetCoordinatorHandoff { authorization, .. } => Some(authorization.as_str()),
-                FrontendRequest::GetCoordinatorHandoff { .. } => Some(""),
+                FrontendRequest::GetCoordinatorHandoff { .. }
+                | FrontendRequest::VerifyCoordinatorResetRequest { .. } => Some(""),
                 _ => None,
             };
             if let Some(authorization) = handoff_authorization {

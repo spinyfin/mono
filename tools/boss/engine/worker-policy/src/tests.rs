@@ -380,6 +380,9 @@ fn coordinator_verbs_stay_closed() {
             authorization: String::new(),
             body: "- greyarea is down".into(),
         },
+        FrontendRequest::VerifyCoordinatorResetRequest {
+            request_id: "id".into(),
+        },
         FrontendRequest::ListCoordinatorGuidance { product_id: None },
     ] {
         let denial = assert_denied(request);

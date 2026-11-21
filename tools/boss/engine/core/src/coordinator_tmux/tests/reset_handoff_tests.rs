@@ -534,15 +534,111 @@ async fn delivery_failure_leaves_the_session_and_reports_a_forceable_error() {
 }
 
 #[test]
-fn handoff_request_expires_after_delivery_deadline() {
-    let prompt = super::reset_handoff::handoff_request_prompt(1000, "test-authorization");
-    assert!(prompt.contains("boss handoff write --authorization test-authorization -"));
-    let expiry = 1000 + super::inbox::DELIVERY_TIMEOUT.as_secs() + 15;
+fn handoff_request_names_a_verify_id_and_not_an_expiry() {
+    let prompt = super::reset_handoff::handoff_request_prompt("abc123", "test-authorization");
+    assert!(prompt.starts_with("[Boss reset request id=abc123]"), "{prompt}");
+    assert!(prompt.contains("boss handoff verify abc123"), "{prompt}");
     assert!(
-        prompt.starts_with(&format!("[Boss reset request expires={expiry}]")),
+        prompt.contains("boss handoff write --authorization test-authorization -"),
         "{prompt}"
     );
-    assert!(prompt.contains("ignore it"), "{prompt}");
+    assert!(!prompt.contains("expires="), "{prompt}");
+}
+
+#[test]
+fn empty_and_forged_ids_are_not_pending() {
+    assert!(!super::reset_handoff::is_request_pending(""));
+    assert!(!super::reset_handoff::is_request_pending("forged"));
+}
+
+fn request_id_from_prompt(prompt: &str) -> &str {
+    prompt
+        .strip_prefix("[Boss reset request id=")
+        .and_then(|rest| rest.split(']').next())
+        .expect("reset request prompt must carry an id")
+}
+
+#[tokio::test]
+async fn a_failed_delivery_withdraws_the_request_id() {
+    struct Fails(std::sync::Mutex<String>);
+    #[async_trait::async_trait]
+    impl crate::coordinator_tmux::inbox::HandoffDelivery for Fails {
+        async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
+            *self.0.lock().unwrap() = prompt.to_owned();
+            bail!("refused")
+        }
+    }
+    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let delivery = Fails(Default::default());
+    let result = crate::coordinator_tmux::reset_handoff::request_and_wait(
+        HandoffRequest::builder()
+            .work_db(&db)
+            .tmux(&tmux)
+            .lifecycle_lock(&tokio::sync::Mutex::new(()))
+            .written(&Notify::new())
+            .expected_token("token")
+            .force(false)
+            .timeout(Duration::from_millis(30))
+            .delivery(&delivery)
+            .build(),
+    )
+    .await;
+    assert!(result.is_err());
+    let prompt = delivery.0.lock().unwrap().clone();
+    let id = request_id_from_prompt(&prompt);
+    assert!(!super::reset_handoff::is_request_pending(id));
+}
+
+#[tokio::test]
+async fn a_finished_reset_withdraws_the_request_id() {
+    struct Captures(std::sync::Mutex<Option<String>>);
+    #[async_trait::async_trait]
+    impl crate::coordinator_tmux::inbox::HandoffDelivery for Captures {
+        async fn deliver(&self, _: &Tmux, _: &CoordinatorTmuxRecord, prompt: &str) -> Result<()> {
+            *self.0.lock().unwrap() = Some(prompt.to_owned());
+            Ok(())
+        }
+    }
+    let (db, tmux, _server, _dir) = fixture(FakeTmux::new(vec![COORDINATOR_SESSION_NAME], Some("token"), "0"));
+    record(&db);
+    let delivery = Captures(Default::default());
+    let lock = tokio::sync::Mutex::new(());
+    let written = Notify::new();
+    let id = {
+        let request = crate::coordinator_tmux::reset_handoff::request_and_wait(
+            HandoffRequest::builder()
+                .work_db(&db)
+                .tmux(&tmux)
+                .lifecycle_lock(&lock)
+                .written(&written)
+                .expected_token("token")
+                .force(false)
+                .timeout(Duration::from_secs(5))
+                .delivery(&delivery)
+                .build(),
+        );
+        tokio::pin!(request);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut request)
+                .await
+                .is_err(),
+            "reset must still be waiting after delivery"
+        );
+        let prompt = delivery
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("delivery recorded the prompt");
+        let id = request_id_from_prompt(&prompt).to_owned();
+        assert!(
+            super::reset_handoff::is_request_pending(&id),
+            "id is pending while the reset is waiting"
+        );
+        id
+    };
+    assert!(!super::reset_handoff::is_request_pending(&id));
 }
 
 #[tokio::test(start_paused = true)]
