@@ -21,6 +21,7 @@ use super::ProductStatus;
 use super::ProjectCommand;
 use super::ProjectStatusArg;
 use super::RepoSelector;
+use super::ReviewGuideCommand;
 use super::RunContext;
 use super::TaskCommand;
 use super::TaskListCriteria;
@@ -2786,6 +2787,19 @@ fn parses_chore_comment_command_with_exact() {
             assert_eq!(args.author.as_deref(), Some("user:alice"));
         }
         _ => panic!("expected chore comment command"),
+    }
+}
+
+#[test]
+fn parses_review_guide_show() {
+    let cli = Cli::parse_from(["boss", "review-guide", "show", "exec_review_guide_1"]);
+    match cli.command {
+        Commands::ReviewGuide {
+            command: ReviewGuideCommand::Show(args),
+        } => {
+            assert_eq!(args.execution_id, "exec_review_guide_1");
+        }
+        _ => panic!("expected review-guide show command"),
     }
 }
 

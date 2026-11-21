@@ -1,7 +1,9 @@
 //! PR review-guide wire types — the `GetReviewGuideSummary` /
-//! `GetReviewGuideContent` / `GenerateReviewGuide` / `RetryReviewGuide` RPC
-//! surface. Board/task detail replies use [`ReviewGuideSummary`] alone; only an opened viewer
-//! fetches [`ReviewGuideVersion`]'s full Markdown. See
+//! `GetReviewGuideContent` / `GetReviewGuideRun` / `GenerateReviewGuide` /
+//! `RetryReviewGuide` RPC surface. Board/task detail replies use
+//! [`ReviewGuideSummary`] alone; only an opened viewer fetches
+//! [`ReviewGuideVersion`]'s full Markdown; [`ReviewGuideRun`] is the
+//! operator inspection payload. See
 //! `tools/boss/docs/designs/automatic-pr-review-guides.md`.
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +81,71 @@ pub struct ReviewGuideAttempt {
 pub struct ReviewGuideFindings {
     pub status_text: String,
     pub addendum_markdown: String,
+}
+
+/// Operator inspection of one review-guide generation run. Returned by
+/// `GetReviewGuideRun`. Phase timestamps are the durable columns on the
+/// attempt (`created_at` / `started_at` / `finished_at`) and version
+/// (`generated_at`); source identity is the pinned comparison packet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ReviewGuideRun {
+    pub execution_id: String,
+    pub attempt_id: String,
+    pub series_id: String,
+    pub request_epoch: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    pub source: ReviewGuideRunSource,
+    pub prompt_version: String,
+    pub model: ReviewGuideRunModel,
+    pub timings: ReviewGuideRunTimings,
+}
+
+/// Pinned comparison identity for [`ReviewGuideRun`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ReviewGuideRunSource {
+    pub comparison_id: String,
+    pub canonical_pr_url: String,
+    pub observed_base_sha: String,
+    pub merge_base_sha: String,
+    pub head_sha: String,
+    pub packet_hash: String,
+}
+
+/// Resolved spawn identity for [`ReviewGuideRun`]. Absent fields mean the
+/// attempt was recorded before spawn config was stamped, or never launched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ReviewGuideRunModel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Separate phase timestamps for [`ReviewGuideRun`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct ReviewGuideRunTimings {
+    /// `pr_review_guide_source_comparisons.captured_at`.
+    pub source_captured_at: String,
+    /// `pr_review_guide_attempts.created_at` — when the attempt was queued.
+    pub queued_at: String,
+    /// `pr_review_guide_attempts.started_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// `pr_review_guide_attempts.finished_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// `pr_review_guide_versions.generated_at` — publication of the immutable
+    /// version, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
 }
 
 /// Engine-selected revision that can still push commits to the PR and

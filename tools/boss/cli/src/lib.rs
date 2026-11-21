@@ -68,6 +68,7 @@ pub(crate) use boss_protocol::ReasoningMode;
 pub(crate) use boss_protocol::RemoveDependencyInput;
 pub(crate) use boss_protocol::ResolveProjectDesignDocOutput;
 pub(crate) use boss_protocol::ResolvedDesignDocKind;
+pub(crate) use boss_protocol::ReviewGuideRun;
 pub(crate) use boss_protocol::SetProductEditorialRulesInput;
 pub(crate) use boss_protocol::SetProductExternalTrackerInput;
 pub(crate) use boss_protocol::SetProjectDesignDocInput;
@@ -344,6 +345,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Comment { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_comment_command(command, &ctx).await
+        }
+        Commands::ReviewGuide { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_review_guide_command(command, &ctx).await
         }
         Commands::Decision { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;

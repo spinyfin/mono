@@ -101,10 +101,12 @@ fn unpolled_future_releases_its_claim_and_coalesces_sequences() {
 }
 
 #[test]
-fn automatic_capture_defaults_off_and_respects_the_rollout_flag() {
+fn automatic_capture_defaults_on_and_respects_the_rollout_flag() {
     let directory = tempfile::tempdir().unwrap();
     let flags = FeatureFlagsStore::new(directory.path().join("feature-flags.toml"));
     flags.load().unwrap();
+    assert!(source_capture_enabled(&flags));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, false).unwrap();
     assert!(!source_capture_enabled(&flags));
     flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
     assert!(source_capture_enabled(&flags));
@@ -116,6 +118,7 @@ fn disabled_reconciler_does_not_allocate_or_spawn_collection() {
     let work_db = Arc::new(work_db);
     let flag_directory = tempfile::tempdir().unwrap();
     let flags = Arc::new(FeatureFlagsStore::new(flag_directory.path().join("feature-flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, false).unwrap();
     reconcile_review_guide_source_with_collector(
         work_db.clone(),
         flags,

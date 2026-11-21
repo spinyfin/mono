@@ -366,7 +366,8 @@ impl WorkerCompletionHandler {
     /// completion path. `app.rs` calls this once at startup with the
     /// store loaded from `~/Library/Application Support/Boss/feature-flags.toml`.
     /// Tests that don't invoke it get the default store (every flag
-    /// at its registry default), preserving the pre-change behaviour.
+    /// at its registry default). `TestHarness` pins the review-guide
+    /// flags off so ordinary completion tests stay hermetic.
     pub fn with_feature_flags(mut self, flags: Arc<crate::feature_flags::FeatureFlagsStore>) -> Self {
         self.feature_flags = flags;
         self

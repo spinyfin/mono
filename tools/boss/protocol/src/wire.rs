@@ -18,39 +18,8 @@ use type_imports::*;
 mod topics;
 pub use topics::*;
 
-/// Optional task-list predicates evaluated before transferring rows to clients.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TaskListQuery {
-    /// Canonical task id or decimal short id, scoped by the request's product.
-    pub selector: Option<String>,
-    pub match_term: Option<String>,
-    #[serde(default)]
-    pub kinds: Vec<crate::TaskKind>,
-    pub created_since: Option<i64>,
-}
-
-fn default_pool_size() -> i64 {
-    1
-}
-
-/// Serde default for [`FrontendRequest::ProbeRun`]'s `interrupt` field.
-///
-/// `true`, so a payload written before the field existed gets the
-/// interrupting behaviour rather than the old wait-for-a-boundary one. That
-/// direction is deliberate: the boundary-only path is the one that silently
-/// lost probes, so an unspecified request must not opt into it by accident.
-fn default_probe_interrupt() -> bool {
-    true
-}
-
-/// One task preserved (not deleted) by [`FrontendRequest::UnpopulateProject`]
-/// because it already had an execution — i.e. it was released and
-/// dispatched, so undoing the populate would destroy in-flight work.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnpopulatePreservedTask {
-    pub id: String,
-    pub name: String,
-}
+mod request_support;
+pub use request_support::{TaskListQuery, UnpopulatePreservedTask};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendRequestEnvelope {
@@ -171,7 +140,7 @@ pub enum FrontendRequest {
     AddHost {
         id: String,
         ssh_target: String,
-        #[serde(default = "default_pool_size")]
+        #[serde(default = "request_support::default_pool_size")]
         pool_size: i64,
         #[serde(default)]
         tags: Vec<String>,
@@ -967,6 +936,16 @@ pub enum FrontendRequest {
     /// version id is unknown).
     GetReviewGuideContent {
         version_id: String,
+    },
+
+    /// Operator inspection of one review-guide generation run, keyed by
+    /// its `pr_review_guide` execution id. Emits source/queue/generation/
+    /// publication timestamps and source, prompt, and model identities.
+    /// Replies with [`FrontendEvent::ReviewGuideRun`], or
+    /// [`FrontendEvent::WorkError`] when the execution is unknown or is
+    /// not a review-guide run.
+    GetReviewGuideRun {
+        execution_id: String,
     },
 
     /// Series identity and current lifecycle for a PR's review guide, keyed
@@ -2002,7 +1981,7 @@ pub enum FrontendRequest {
         /// possibly a partial edit or an in-flight build — so a probe that
         /// genuinely can wait for a boundary should say so and let the
         /// worker finish.
-        #[serde(default = "default_probe_interrupt")]
+        #[serde(default = "request_support::default_probe_interrupt")]
         interrupt: bool,
     },
 

@@ -1618,6 +1618,12 @@ pub enum FrontendEvent {
         version_id: String,
         content: Option<ReviewGuideVersion>,
     },
+    /// Response to [`FrontendRequest::GetReviewGuideRun`]. Operator
+    /// inspection of one review-guide generation: phase timestamps and
+    /// source/prompt/model identities. Unknown or non-guide executions
+    /// reply `WorkError` instead.
+    #[worker(passthrough)]
+    ReviewGuideRun { run: ReviewGuideRun },
     /// Response to [`FrontendRequest::RetryReviewGuide`]. `already_requested`
     /// is `true` when the supplied idempotency token matched an existing
     /// attempt rather than creating a new one — mirrors

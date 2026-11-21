@@ -1,10 +1,10 @@
 //! Behaviour tests for the "viewer requests" seam: `GetReviewGuideSummary`,
-//! `GetReviewGuideContent`, and `RetryReviewGuide`, dispatched into
-//! `app::review_guide`. Nothing here calls the real Astra driver or GitHub —
-//! generation is simulated by seeding durable attempt/version rows directly
-//! through the same `WorkDb` methods the completion handler uses, exactly
-//! like `work::review_guide_jobs_tests`. See
-//! `tools/boss/docs/designs/automatic-pr-review-guides.md`.
+//! `GetReviewGuideContent`, `GetReviewGuideRun`, and `RetryReviewGuide`,
+//! dispatched into `app::review_guide`. Nothing here calls the real Astra
+//! driver or GitHub — generation is simulated by seeding durable
+//! attempt/version rows directly through the same `WorkDb` methods the
+//! completion handler uses, exactly like `work::review_guide_jobs_tests`.
+//! See `tools/boss/docs/designs/automatic-pr-review-guides.md`.
 
 use super::*;
 use crate::app::review_guide;
@@ -60,6 +60,19 @@ async fn get_content(state: &Arc<ServerState>, version_id: &str) -> FrontendEven
     sole_response(&sink).await
 }
 
+async fn get_run(state: &Arc<ServerState>, execution_id: &str) -> FrontendEvent {
+    let sink = make_session_sink();
+    let ctx = dispatch_ctx(state, &sink);
+    review_guide::handle_get_review_guide_run(
+        ctx,
+        FrontendRequest::GetReviewGuideRun {
+            execution_id: execution_id.to_owned(),
+        },
+    )
+    .await;
+    sole_response(&sink).await
+}
+
 async fn retry(state: &Arc<ServerState>, root_task_id: &str, idempotency_token: Option<&str>) -> FrontendEvent {
     let sink = make_session_sink();
     let ctx = dispatch_ctx(state, &sink);
@@ -104,6 +117,44 @@ fn seed_ready_guide(server_state: &ServerState) -> (String, String, String) {
     (root, series_id, version.id)
 }
 
+/// Seed a published guide whose attempt is bound to an execution, with spawn
+/// config stamped — the inspection RPC's happy path. Returns
+/// `(execution_id, attempt_id, version_id)`.
+fn seed_inspectable_guide(server_state: &ServerState) -> (String, String, String) {
+    let db = &server_state.work_db;
+    let product = create_product(db);
+    let root = create_active_chore(db, &product, "inspectable guide root");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget' WHERE id = ?1",
+            [&root],
+        )
+        .unwrap();
+    let (series_id, comparison_id) = seed_review_guide_series(db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v12")
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "https://github.com/acme/widget")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.record_pr_review_guide_attempt_spawn_config(&attempt.id, "codex", "gpt-6-astra", "high")
+        .unwrap();
+    let PublishReviewGuideOutcome::Published(version) = db
+        .publish_pr_review_guide_version(
+            &attempt.id,
+            "# Guide\n\n## Problem\n## Fix\n## Changes\n## Tests\n",
+            "raw",
+        )
+        .unwrap()
+    else {
+        panic!("expected the seed attempt to publish")
+    };
+    (execution.id, attempt.id, version.id)
+}
+
 #[tokio::test]
 async fn summary_is_none_before_any_pr_observation() {
     let (server_state, _dir) = test_server_state();
@@ -143,6 +194,69 @@ async fn summary_and_content_reflect_a_ready_guide() {
     assert_eq!(echoed_id, version_id);
     let content = content.expect("a known version id must return its content");
     assert!(content.markdown.contains("## Problem"));
+}
+
+#[tokio::test]
+async fn run_inspection_emits_phase_timings_and_identities() {
+    let (server_state, _dir) = test_server_state();
+    let (execution_id, attempt_id, version_id) = seed_inspectable_guide(&server_state);
+
+    let event = get_run(&server_state, &execution_id).await;
+    let FrontendEvent::ReviewGuideRun { run } = event else {
+        panic!("expected ReviewGuideRun, got {event:?}");
+    };
+    assert_eq!(run.execution_id, execution_id);
+    assert_eq!(run.attempt_id, attempt_id);
+    assert_eq!(run.version_id.as_deref(), Some(version_id.as_str()));
+    assert_eq!(run.status, "succeeded");
+    assert_eq!(run.prompt_version, "review-guide-v12");
+    assert_eq!(run.model.driver.as_deref(), Some("codex"));
+    assert_eq!(run.model.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(run.model.effort.as_deref(), Some("high"));
+    assert_eq!(run.source.canonical_pr_url, "https://github.com/acme/widget/pull/9");
+    assert_eq!(run.source.observed_base_sha, "base");
+    assert_eq!(run.source.merge_base_sha, "base");
+    assert_eq!(run.source.head_sha, "head");
+    assert!(!run.source.packet_hash.is_empty());
+    assert!(!run.timings.source_captured_at.is_empty());
+    assert!(!run.timings.queued_at.is_empty());
+    assert!(run.timings.started_at.is_some());
+    assert!(run.timings.finished_at.is_some());
+    assert!(run.timings.published_at.is_some());
+}
+
+#[tokio::test]
+async fn run_inspection_rejects_a_non_guide_execution() {
+    let (server_state, _dir) = test_server_state();
+    let db = &server_state.work_db;
+    let product = create_product(db);
+    let root = create_active_chore(db, &product, "not a guide");
+    let execution = db
+        .create_execution(
+            boss_protocol::CreateExecutionInput::builder()
+                .work_item_id(root)
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                .status(boss_protocol::ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let event = get_run(&server_state, &execution.id).await;
+    match event {
+        FrontendEvent::WorkError { message } => {
+            assert!(message.contains("is not a review-guide run"), "{message}");
+        }
+        other => panic!("expected WorkError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn run_inspection_rejects_an_unknown_execution() {
+    let (server_state, _dir) = test_server_state();
+    let event = get_run(&server_state, "exec_missing").await;
+    match event {
+        FrontendEvent::WorkError { .. } => {}
+        other => panic!("expected WorkError for an unknown execution, got {other:?}"),
+    }
 }
 
 #[tokio::test]

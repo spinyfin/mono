@@ -114,6 +114,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: CommentCommand,
     },
+    /// Inspect a PR review-guide generation run: source/queue/generation/
+    /// publication timings and source, prompt, and model identities.
+    /// Keyed by the `pr_review_guide` execution id. JSON with `--json`.
+    #[command(name = "review-guide")]
+    ReviewGuide {
+        #[command(subcommand)]
+        command: ReviewGuideCommand,
+    },
     /// Manage product decision records: standing "considered and declined"
     /// / operator-owned rulings that outlive any single work item.
     ///
@@ -534,7 +542,9 @@ pub(crate) enum TaskCommand {
     /// dispatched it. `answer_agent` and `automation_triage` executions
     /// don't bind a task/chore (their `work_item_id` is a comment id or
     /// automation id respectively) — those are reported with a pointer to
-    /// the right inspection verb instead of a work-item lookup.
+    /// the right inspection verb instead of a work-item lookup. A
+    /// `pr_review_guide` execution is inspected in place (same payload as
+    /// `boss review-guide show`).
     #[command(name = "by-exec")]
     ByExec(ByExecArgs),
     /// Full execution history for a work item — every `work_executions`
@@ -2325,6 +2335,21 @@ pub(crate) struct ByExecArgs {
     /// The execution id to resolve (e.g. `exec_18ad6336fedcb190_12`, as
     /// seen in an authoring branch name `boss/exec_…` or in
     /// `bossctl agents status`/`bossctl work executions`).
+    pub(crate) execution_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ReviewGuideCommand {
+    /// Inspect one review-guide generation run: phase timings and
+    /// source, prompt, and model identities. Engine RPC over
+    /// `GetReviewGuideRun`. JSON with `--json`.
+    Show(ReviewGuideShowArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ReviewGuideShowArgs {
+    /// The review-guide execution id (`exec_…`), as shown on the worker
+    /// pane and in `bossctl agents status` while the job is generating.
     pub(crate) execution_id: String,
 }
 

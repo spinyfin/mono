@@ -47,7 +47,10 @@ impl Fixture {
                 rusqlite::params![PR_URL, root],
             )
             .unwrap();
+        // This fixture drives the manual capture path with both rollout
+        // flags off — automatic capture/generation must not fire.
         for flag in ["review_guide_source_capture", "review_guide_generation"] {
+            state.feature_flags.set(flag, false).unwrap();
             assert!(!state.feature_flags.is_enabled(flag));
         }
         Self {

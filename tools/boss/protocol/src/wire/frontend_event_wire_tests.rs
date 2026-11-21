@@ -23,8 +23,8 @@ use crate::{
     AttachmentMediaType, AutomationTrigger, BoardRefusalAction, BoardRefusalCode, COORDINATOR_GUIDANCE_PATH,
     CoordinatorGuidanceState, CoordinatorHandoffAuthorizationDelivery, Decision, DecisionKind, DecisionStatus,
     DesignDocEntry, DesignDocTree, DispatchAdmissionBlocker, DispatchPauseSnapshot, EffortLevel, ExecutionKind,
-    ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus,
-    WorkerTierDenialReason,
+    ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, ReviewGuideRun,
+    ReviewGuideRunModel, ReviewGuideRunSource, ReviewGuideRunTimings, TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -2042,6 +2042,47 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "review_guide_content",
         },
         TagCase {
+            label: "ReviewGuideRun",
+            event: FrontendEvent::ReviewGuideRun {
+                run: ReviewGuideRun::builder()
+                    .execution_id("exec_1")
+                    .attempt_id("prga_1")
+                    .series_id("prgs_1")
+                    .request_epoch(1)
+                    .status("succeeded")
+                    .version_id("prgv_1")
+                    .source(
+                        ReviewGuideRunSource::builder()
+                            .comparison_id("prgc_1")
+                            .canonical_pr_url("https://github.com/acme/widget/pull/4")
+                            .observed_base_sha("base")
+                            .merge_base_sha("base")
+                            .head_sha("head")
+                            .packet_hash("abc")
+                            .build(),
+                    )
+                    .prompt_version("review-guide-v12")
+                    .model(
+                        ReviewGuideRunModel::builder()
+                            .driver("codex")
+                            .model("gpt-6-astra")
+                            .effort("high")
+                            .build(),
+                    )
+                    .timings(
+                        ReviewGuideRunTimings::builder()
+                            .source_captured_at("2026-01-01T00:00:00Z")
+                            .queued_at("2026-01-01T00:00:01Z")
+                            .started_at("2026-01-01T00:00:02Z")
+                            .finished_at("2026-01-01T00:02:00Z")
+                            .published_at("2026-01-01T00:02:00Z")
+                            .build(),
+                    )
+                    .build(),
+            },
+            expected_tag: "review_guide_run",
+        },
+        TagCase {
             label: "ReviewGuideRetryQueued",
             event: FrontendEvent::ReviewGuideRetryQueued {
                 root_task_id: "task_1".to_owned(),
@@ -2510,6 +2551,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::AnswerAgentRunsList { .. }
         | FrontendEvent::ReviewGuideSummary { .. }
         | FrontendEvent::ReviewGuideContent { .. }
+        | FrontendEvent::ReviewGuideRun { .. }
         | FrontendEvent::ReviewGuideRetryQueued { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }

@@ -614,6 +614,20 @@ impl TestHarness {
     ) -> Self {
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
+        // Automatic review-guide capture/generation default on in production.
+        // The harness pins both flags off so ordinary completion tests do
+        // not spawn GitHub collection or enqueue guide jobs. Tests that
+        // exercise those seams replace the store via `with_feature_flags`.
+        let flags_dir = tempdir().unwrap();
+        let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            flags_dir.path().join("feature-flags.toml"),
+        ));
+        flags
+            .set(crate::review_guide_capture::REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, false)
+            .unwrap();
+        flags
+            .set(crate::review_guide_capture::REVIEW_GUIDE_GENERATION_FLAG, false)
+            .unwrap();
         let handler = WorkerCompletionHandler::new(
             db,
             detector,
@@ -623,6 +637,7 @@ impl TestHarness {
             queuer,
             CompletionCollaborators::noop(),
         )
+        .with_feature_flags(flags)
         // PR-completion terminalization records a fresh head. Keep the shared
         // harness hermetic; tests that exercise branch-specific behaviour
         // replace this with their own verifier.

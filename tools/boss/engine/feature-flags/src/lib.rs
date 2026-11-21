@@ -84,16 +84,16 @@ pub struct FeatureFlagSpec {
 pub const REGISTRY: &[FeatureFlagSpec] = &[
     FeatureFlagSpec {
         name: "review_guide_source_capture",
-        description: "Capture immutable, revision-pinned source packets for pull-request review guides at PR creation, completion, and merge-poller observations. DEFAULT OFF — enable only after operators have verified source capture against live GitHub repositories. Disable to stop new collection immediately while retaining already captured diagnostic artifacts.",
+        description: "Capture immutable, revision-pinned source packets for pull-request review guides at PR creation, completion, and merge-poller observations. DEFAULT ON. Disable to stop new collection immediately while retaining already captured diagnostic artifacts.",
         category: "review",
-        default_enabled: false,
+        default_enabled: true,
         capability_id: None,
     },
     FeatureFlagSpec {
         name: "review_guide_generation",
-        description: "Launch enforced-read-only Astra (codex/gpt-6-astra/high) pr_review_guide executions from captured source comparisons. DEFAULT OFF, and only takes effect once `review_guide_source_capture` is also enabled — generation has nothing to consume otherwise. Disable to stop new guide jobs immediately while retaining already-published versions and comments.",
+        description: "Launch enforced-read-only Astra (codex/gpt-6-astra/high) pr_review_guide executions from captured source comparisons. DEFAULT ON, and only takes effect once `review_guide_source_capture` is also enabled — generation has nothing to consume otherwise. Disable to stop new guide jobs immediately while retaining already-published versions and comments.",
         category: "review",
-        default_enabled: false,
+        default_enabled: true,
         capability_id: None,
     },
     FeatureFlagSpec {
@@ -847,6 +847,28 @@ mod tests {
         assert!(detect.default_enabled);
         assert!(detect.enabled);
         assert_eq!(detect.category, "completion");
+    }
+
+    #[test]
+    fn review_guide_flags_default_on() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        for name in ["review_guide_source_capture", "review_guide_generation"] {
+            assert!(store.is_enabled(name), "{name} must default to enabled",);
+            let snap = store.snapshot_all(None);
+            let flag = snap.iter().find(|s| s.name == name).expect(name);
+            assert!(flag.default_enabled, "{name} default_enabled must be true");
+            assert!(flag.enabled, "{name} enabled must be true with no override");
+            assert_eq!(flag.category, "review");
+        }
+        store.set("review_guide_generation", false).unwrap();
+        assert!(!store.is_enabled("review_guide_generation"));
+        assert!(store.is_enabled("review_guide_source_capture"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(!store2.is_enabled("review_guide_generation"));
+        assert!(store2.is_enabled("review_guide_source_capture"));
     }
 
     #[test]

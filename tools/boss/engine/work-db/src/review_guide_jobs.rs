@@ -1027,6 +1027,21 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// The immutable version published from `attempt_id`, if any. Used by the
+    /// `GetReviewGuideRun` inspection RPC so publication time is available
+    /// without fetching Markdown by version id.
+    pub fn get_pr_review_guide_version_for_attempt(&self, attempt_id: &str) -> Result<Option<PrReviewGuideVersion>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, series_id, comparison_id, attempt_id, markdown, raw_output, content_hash, prompt_version, generated_at
+             FROM pr_review_guide_versions WHERE attempt_id = ?1",
+            [attempt_id],
+            map_pr_review_guide_version,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// Idempotently create the next attempt for a series' current desired
     /// comparison — the `RetryReviewGuide` RPC. A repeated call with the same
     /// `idempotency_token` returns the original attempt rather than creating
