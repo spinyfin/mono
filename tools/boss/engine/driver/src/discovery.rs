@@ -60,6 +60,10 @@ use crate::AgentJsonlFileIngress;
 
 /// How often discovery re-scans the root while waiting for the rollout.
 pub const DISCOVERY_POLL: Duration = Duration::from_millis(100);
+/// How often discovery re-scans after the overdue threshold. Production slows
+/// from [`DISCOVERY_POLL`] to this so an unattached run does not keep scanning
+/// ten times a second until teardown. Tests inject a short interval.
+pub const DISCOVERY_POST_OVERDUE_POLL: Duration = Duration::from_secs(1);
 /// Historical discovery window, now the production overdue reporting threshold.
 /// Discovery continues after this interval until attachment or cancellation.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -978,16 +982,27 @@ pub async fn discover_candidate(
     halt: &mut watch::Receiver<StreamHalt>,
     timeout: Duration,
 ) -> Result<Option<Candidate>, String> {
-    discover_candidate_observed(prepared, halt, timeout, |_, _, _, overdue, _| async move { overdue }).await
+    discover_candidate_observed(
+        prepared,
+        halt,
+        timeout,
+        DISCOVERY_POST_OVERDUE_POLL,
+        |_, _, _, overdue, _| async move { overdue },
+    )
+    .await
 }
 
 /// Poll until attachment or cancellation, reporting overdue diagnostics to
 /// the caller. Returning true from the observer ends the bounded test probe;
 /// production keeps observing late rollouts until its ingress is torn down.
+///
+/// `post_overdue_poll` is the gap between scans once `overdue_after` has
+/// elapsed; production passes [`DISCOVERY_POST_OVERDUE_POLL`].
 pub async fn discover_candidate_observed<F, Fut>(
     prepared: &PreparedSource,
     halt: &mut watch::Receiver<StreamHalt>,
     overdue_after: Duration,
+    post_overdue_poll: Duration,
     mut overdue: F,
 ) -> Result<Option<Candidate>, String>
 where
@@ -1054,7 +1069,7 @@ where
                 if wait_for_next_poll(
                     halt,
                     if now >= deadline {
-                        Duration::from_secs(1)
+                        post_overdue_poll
                     } else {
                         DISCOVERY_POLL
                     },
@@ -1123,7 +1138,7 @@ where
         if wait_for_next_poll(
             halt,
             if now >= deadline {
-                Duration::from_secs(1)
+                post_overdue_poll
             } else {
                 DISCOVERY_POLL
             },
@@ -1958,18 +1973,24 @@ mod tests {
         // Restore access only after discovery has observed the failed scan.
         // A timer can fire before spawn_blocking starts scanning on a busy host.
         let mut restored = false;
-        let err = discover_candidate_observed(&prepared, &mut running_halt(), Duration::ZERO, |_, reason, _, _, _| {
-            let stop = restored;
-            if !restored {
-                assert!(
-                    reason.contains("last error:"),
-                    "the first scan must fail; got: {reason}"
-                );
-                fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-                restored = true;
-            }
-            async move { stop }
-        })
+        let err = discover_candidate_observed(
+            &prepared,
+            &mut running_halt(),
+            Duration::ZERO,
+            DISCOVERY_POLL,
+            |_, reason, _, _, _| {
+                let stop = restored;
+                if !restored {
+                    assert!(
+                        reason.contains("last error:"),
+                        "the first scan must fail; got: {reason}"
+                    );
+                    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+                    restored = true;
+                }
+                async move { stop }
+            },
+        )
         .await
         .expect_err("the empty root must expire the window");
         assert!(

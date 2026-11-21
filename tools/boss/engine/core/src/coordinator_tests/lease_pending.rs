@@ -658,7 +658,8 @@ async fn repeated_lease_timeouts_back_off_for_longer_each_time() {
         .with_pre_start_retry_delays(vec![Duration::from_secs(1), Duration::from_secs(6)])
         .with_cube_lease_timeout(Duration::from_millis(80)),
     );
-    let epoch = || boss_engine_utils::epoch_time::now_epoch_secs() as i64;
+    let clock = boss_engine_utils::epoch_time::NowGuard::set(1_700_000_000);
+    let epoch = || boss_engine_utils::epoch_time::now_epoch_secs();
     let not_before = |id: &str| -> i64 {
         db.get_execution(id)
             .unwrap()
@@ -686,7 +687,7 @@ async fn repeated_lease_timeouts_back_off_for_longer_each_time() {
     coordinator.drain_ready_queue_for_test().await;
     wait_for_failures(1).await;
     let first_not_before = not_before(id);
-    assert!(first_not_before <= epoch() + 2, "first backoff is the short delay");
+    assert_eq!(first_not_before, epoch() + 1, "first backoff is the short delay");
     assert_eq!(coordinator.worker_pool().occupancy().await.lease_pending, 0);
     assert_eq!(
         coordinator
@@ -696,9 +697,7 @@ async fn repeated_lease_timeouts_back_off_for_longer_each_time() {
         "a backing-off row holds no permit"
     );
 
-    while epoch() <= first_not_before {
-        sleep(Duration::from_millis(100)).await;
-    }
+    clock.set_to(first_not_before + 1);
     let before_second = epoch();
     coordinator.drain_ready_queue_for_test().await;
     wait_for_failures(2).await;

@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 
 #[test]
 fn attention_reconcile_releases_connection_between_kinds() {
@@ -80,22 +80,6 @@ fn narrow_workspace_scan_filters_and_keeps_the_first_lease() {
     );
 }
 
-fn project(db: &WorkDb, product_id: &str) -> Project {
-    let project = db
-        .create_project(CreateProjectInput {
-            product_id: product_id.into(),
-            name: "Contention fixture".into(),
-            description: None,
-            goal: None,
-            autostart: false,
-            no_design_task: true,
-            design_reasoning_effort_xhigh: false,
-        })
-        .unwrap();
-    db.set_project_design_doc(set_design_doc_input(&project.id, "docs/design.md"))
-        .unwrap()
-}
-
 #[test]
 fn in_flight_plan_avoids_terminal_history_and_sort() {
     let db = WorkDb::open(temp_db_path("in-flight-plan")).unwrap();
@@ -144,95 +128,121 @@ fn in_flight_plan_avoids_terminal_history_and_sort() {
     assert_eq!(db.list_in_flight_executions().unwrap().len(), 1);
 }
 
-#[test]
-fn sixty_one_concurrent_resolvers_allow_writes_and_release_before_workspace_lookup() {
-    let (_dir, path) = disk_db_path("design-doc-contention");
-    let db = WorkDb::open(path.clone()).unwrap();
-    let product = create_test_product(&db);
-    let project = project(&db, &product.id);
-    let index_sql: String = {
-        let conn = db.connect().unwrap();
-        conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<50000)
+/// The 61-way contention reproduction runs over a 50,000-row, 100 MB history
+/// and reports timings: a scale measurement, built and run only by
+/// `:work_db_scale_test`. The module is named `scale` so the target's name
+/// filter selects it.
+#[cfg(boss_scale_tests)]
+mod scale {
+    use super::*;
+    use std::sync::Barrier;
+
+    fn project(db: &WorkDb, product_id: &str) -> Project {
+        let project = db
+            .create_project(CreateProjectInput {
+                product_id: product_id.into(),
+                name: "Contention fixture".into(),
+                description: None,
+                goal: None,
+                autostart: false,
+                no_design_task: true,
+                design_reasoning_effort_xhigh: false,
+            })
+            .unwrap();
+        db.set_project_design_doc(set_design_doc_input(&project.id, "docs/design.md"))
+            .unwrap()
+    }
+
+    #[test]
+    fn sixty_one_concurrent_resolvers_allow_writes_and_release_before_workspace_lookup() {
+        let (_dir, path) = disk_db_path("design-doc-contention");
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = create_test_product(&db);
+        let project = project(&db, &product.id);
+        let index_sql: String = {
+            let conn = db.connect().unwrap();
+            conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<50000)
             INSERT INTO work_executions(id,work_item_id,kind,status,repo_remote_url,created_at,last_error)
             SELECT 'history-'||i,'fixture','chore_implementation','completed','repo',CAST(i AS TEXT),printf('%02048d',0) FROM n").unwrap();
-        let sql = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE name='work_executions_in_flight_idx'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        conn.execute_batch("DROP INDEX work_executions_in_flight_idx").unwrap();
-        sql
-    };
-    // Reproduce the original 61-way full-row scan on a synthetic history.
-    // Report timing rather than asserting a machine-dependent wall-clock bound.
-    let old_barrier = Arc::new(Barrier::new(61));
-    let mut old_durations = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _ in 0..61 {
-            let reader = WorkDb::open_existing(path.clone()).unwrap();
-            let barrier = old_barrier.clone();
-            handles.push(scope.spawn(move || {
-                barrier.wait();
-                let start = std::time::Instant::now();
-                assert!(reader.list_in_flight_executions().unwrap().is_empty());
-                start.elapsed()
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<Vec<_>>()
-    });
-    old_durations.sort();
-    db.connect().unwrap().execute_batch(&index_sql).unwrap();
-    println!(
-        "synthetic history rows=50000 payload_bytes_per_row=2048 fanout=61 old_scan_median_ms={} old_scan_max_ms={}",
-        old_durations[30].as_millis(),
-        old_durations[60].as_millis()
-    );
-    let barrier = Arc::new(Barrier::new(62));
-    let improved_start = std::time::Instant::now();
-    std::thread::scope(|scope| {
-        for _ in 0..61 {
-            let reader = WorkDb::open_existing(path.clone()).unwrap();
-            let barrier = barrier.clone();
-            let project_id = project.id.clone();
-            scope.spawn(move || {
-                barrier.wait();
-                for _ in 0..5 {
-                    let paths = reader.list_in_flight_repo_workspaces().unwrap();
-                    reader
-                        .resolve_project_design_doc(&project_id, |repo| {
-                            // This succeeds only when the resolver released its guard.
-                            assert!(reader.conn.try_lock().is_ok());
-                            std::thread::sleep(Duration::from_millis(2));
-                            paths.get(repo).cloned()
-                        })
-                        .unwrap();
-                }
-            });
-        }
-        barrier.wait();
-        let conn = db.connect().unwrap();
-        // The reader callback asserts mutex release with `try_lock`. Writes
-        // use a short busy timeout to retry transient WAL shared-memory
-        // contention from 61 concurrent readers instead of surfacing
-        // `SQLITE_BUSY`.
-        conn.busy_timeout(Duration::from_millis(250)).unwrap();
-        for n in 0..100 {
-            conn.execute(
-                "INSERT OR REPLACE INTO metadata(key,value) VALUES('contention-test',?1)",
-                [n.to_string()],
-            )
-            .unwrap();
-        }
-    });
-    println!(
-        "indexed 61 readers x 5 resolutions plus 100 writes elapsed_ms={}",
-        improved_start.elapsed().as_millis()
-    );
+            let sql = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='work_executions_in_flight_idx'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute_batch("DROP INDEX work_executions_in_flight_idx").unwrap();
+            sql
+        };
+        // Reproduce the original 61-way full-row scan on a synthetic history.
+        // Report timing rather than asserting a machine-dependent wall-clock bound.
+        let old_barrier = Arc::new(Barrier::new(61));
+        let mut old_durations = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..61 {
+                let reader = WorkDb::open_existing(path.clone()).unwrap();
+                let barrier = old_barrier.clone();
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    let start = std::time::Instant::now();
+                    assert!(reader.list_in_flight_executions().unwrap().is_empty());
+                    start.elapsed()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        old_durations.sort();
+        db.connect().unwrap().execute_batch(&index_sql).unwrap();
+        println!(
+            "synthetic history rows=50000 payload_bytes_per_row=2048 fanout=61 old_scan_median_ms={} old_scan_max_ms={}",
+            old_durations[30].as_millis(),
+            old_durations[60].as_millis()
+        );
+        let barrier = Arc::new(Barrier::new(62));
+        let improved_start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..61 {
+                let reader = WorkDb::open_existing(path.clone()).unwrap();
+                let barrier = barrier.clone();
+                let project_id = project.id.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..5 {
+                        let paths = reader.list_in_flight_repo_workspaces().unwrap();
+                        reader
+                            .resolve_project_design_doc(&project_id, |repo| {
+                                // This succeeds only when the resolver released its guard.
+                                assert!(reader.conn.try_lock().is_ok());
+                                std::thread::sleep(Duration::from_millis(2));
+                                paths.get(repo).cloned()
+                            })
+                            .unwrap();
+                    }
+                });
+            }
+            barrier.wait();
+            let conn = db.connect().unwrap();
+            // The reader callback asserts mutex release with `try_lock`. Writes
+            // use a short busy timeout to retry transient WAL shared-memory
+            // contention from 61 concurrent readers instead of surfacing
+            // `SQLITE_BUSY`.
+            conn.busy_timeout(Duration::from_millis(250)).unwrap();
+            for n in 0..100 {
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES('contention-test',?1)",
+                    [n.to_string()],
+                )
+                .unwrap();
+            }
+        });
+        println!(
+            "indexed 61 readers x 5 resolutions plus 100 writes elapsed_ms={}",
+            improved_start.elapsed().as_millis()
+        );
+    }
 }
 
 #[test]

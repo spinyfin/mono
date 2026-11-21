@@ -2063,8 +2063,15 @@ impl ServerState {
         // conflict-detection path can wake the scheduler after inserting
         // a ready execution. The coordinator must exist before this is
         // called — hence the late bind.
-        let coord_for_kick = server_state.execution_coordinator.clone();
-        publisher_impl.set_kick(move || coord_for_kick.kick());
+        //
+        // Weak, because the coordinator owns this publisher: a strong handle
+        // here is a reference cycle.
+        let coord_for_kick = Arc::downgrade(&server_state.execution_coordinator);
+        publisher_impl.set_kick(move || {
+            if let Some(coordinator) = coord_for_kick.upgrade() {
+                coordinator.kick();
+            }
+        });
         let weak_for_queue = Arc::downgrade(&server_state);
         let queue_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let weak = weak_for_queue.clone();

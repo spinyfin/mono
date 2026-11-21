@@ -372,6 +372,9 @@ impl RecordingPaneRunner {
                 }
                 CaptureBehavior::Empty | CaptureBehavior::Paused(_) => Self::success(""),
                 CaptureBehavior::Fixed(text) => Self::success(*text),
+                // `Tmux::send_keys` writes text by `load-buffer` paste or
+                // `send-keys -l`; echo whichever was last so single-line
+                // writes are visible to the verify window.
                 CaptureBehavior::EchoLastPaste => Self::success(self.try_last_paste().unwrap_or_default()),
             };
         }

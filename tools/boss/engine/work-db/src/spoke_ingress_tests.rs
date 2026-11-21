@@ -1,4 +1,8 @@
 use super::*;
+// Run by `:work_db_scale_test`. The module is named `scale` so
+// TESTBRIDGE_TEST_ONLY=scale selects it; `tests::scale_selection_guard` checks
+// that pairing.
+#[cfg(boss_scale_tests)]
 #[path = "spoke_ingress_scale.rs"]
 mod scale;
 use std::path::PathBuf;
@@ -293,14 +297,25 @@ fn a_new_result_cannot_be_receipted_without_storage() {
 fn quota_counts_encoded_frame_bytes() {
     let db = db();
     let admission = db.open_spoke_journal("host-a", "journal", 0, 1).unwrap();
-    let huge = vec![0u8; MAX_HOST_INGRESS_BYTES as usize + 1];
+    // One byte over a small byte quota takes the same comparison as one byte
+    // over the default. A frame at the default limit is 512 MiB, and a commit
+    // owns a copy of its frame while it waits for the writer: that pair was
+    // 1 GiB of resident memory for an assertion that needs none of it.
+    let quota = IngressQuota {
+        records: MAX_HOST_INGRESS_RECORDS,
+        bytes: 4096,
+    };
+    let over = vec![0u8; quota.bytes as usize + 1];
     assert_eq!(
         fault_of(
-            &db.commit_spoke_record(commit("host-a", &admission, 1, &huge, &[], None))
+            &db.commit_spoke_record_within(commit("host-a", &admission, 1, &over, &[], None), quota)
                 .unwrap_err()
         ),
         Some(HostOutboxFault::Full)
     );
+    // A commit that names no quota is held to the published per-host limits.
+    assert_eq!(DEFAULT_QUOTA.bytes, MAX_HOST_INGRESS_BYTES);
+    assert_eq!(DEFAULT_QUOTA.records, MAX_HOST_INGRESS_RECORDS);
     assert!(db.spoke_ingress_frame("host-a", 1).unwrap().is_none());
     assert_eq!(db.spoke_journal("host-a").unwrap().unwrap().received, 0);
 }
