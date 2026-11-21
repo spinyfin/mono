@@ -64,9 +64,9 @@ use boss_protocol::ExecutionKind;
 /// What lowers a raised signal.
 ///
 /// The variants are ordered from "the engine can prove this itself" to "only
-/// a human can". [`Self::WorkResumed`], [`Self::ExecutionKindCompleted`] and
-/// [`Self::OwningExecutionTerminal`] are the three the generic reconciler
-/// acts on; the other two are declarations that no generic rule applies, and why.
+/// a human can". The generic reconciler acts on [`Self::WorkResumed`],
+/// [`Self::ExecutionKindCompleted`], [`Self::OwningExecutionTerminal`] and
+/// [`Self::WorkItemPrBound`]; the other two explain why no generic rule applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClearedBy {
     /// The signal asserts that the engine could not get work moving on this
@@ -93,6 +93,8 @@ pub enum ClearedBy {
     /// failed, abandoned, completed, or orphaned — ends the condition, even
     /// when no later run of the same work item starts.
     OwningExecutionTerminal,
+    /// The work item now has a bound PR, ending missing-binding recovery.
+    WorkItemPrBound,
     /// The kind's own producer re-evaluates the live condition on every one
     /// of its passes and resolves the item itself when the condition clears
     /// (the external-tracker reconcile loop on a successful fetch, the
@@ -121,7 +123,7 @@ impl ClearedBy {
     pub fn is_automatic(&self) -> bool {
         matches!(
             self,
-            Self::WorkResumed | Self::ExecutionKindCompleted(_) | Self::OwningExecutionTerminal
+            Self::WorkResumed | Self::ExecutionKindCompleted(_) | Self::OwningExecutionTerminal | Self::WorkItemPrBound
         )
     }
 }
@@ -442,15 +444,15 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
-        ClearedBy::ProducerReconciles,
-        "The sweep re-checks the branch every pass and resolves the item itself once a PR appears \
-         — a direct read of the condition, strictly better than any run-start proxy.",
+        ClearedBy::WorkItemPrBound,
+        "The sweep resolves this on recovery; reconciliation also clears it once the task has a \
+         bound PR, including manual binding after the recovery window ends.",
     ),
     entry(
         ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
-        ClearedBy::ProducerReconciles,
-        "The abandoned-branch sweep re-reads the PR base every pass and resolves this itself once \
-         the lookup succeeds (and binds, or files the more accurate wrong-base diagnosis).",
+        ClearedBy::WorkItemPrBound,
+        "The sweep resolves this when the lookup succeeds; reconciliation also clears it once \
+         the task has a bound PR, including manual binding after the recovery window ends.",
     ),
     entry(
         REVIEW_VERDICT_BATCH_NOT_APPLYING_ATTENTION_KIND,

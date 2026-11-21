@@ -31,6 +31,20 @@ impl WorkerCompletionHandler {
         if !execution.status.is_live() {
             return StopOutcome::AlreadyTerminal;
         }
+        // Declaration recovery owns refused runs, including after the cooldown:
+        // it reads lifecycle state before the base and can observe a merge.
+        // Poller passes must neither re-query nor move the recovery deadline.
+        let refused = self
+            .pr_base_refusal_next_check
+            .lock()
+            .expect("pr-base-refusal park map poisoned")
+            .contains_key(execution_id);
+        if refused
+            && (self.pr_base_refusal_is_parked(execution_id)
+                || matches!(self.work_db.execution_run_done_outcome(execution_id), Ok(Some(_))))
+        {
+            return StopOutcome::AwaitingInput;
+        }
         // Reviewer executions never open a PR; skip the
         // PR-detection recheck entirely. The reviewer's Stop path already
         // drives its resolution via finalize_pr_review_pass.

@@ -95,7 +95,7 @@ impl WorkerCompletionHandler {
             .remove(execution_id);
     }
 
-    fn pr_base_refusal_is_parked(&self, execution_id: &str) -> bool {
+    pub(super) fn pr_base_refusal_is_parked(&self, execution_id: &str) -> bool {
         self.pr_base_refusal_next_check
             .lock()
             .expect("pr-base-refusal park map poisoned")
@@ -188,6 +188,10 @@ impl WorkerCompletionHandler {
                 .live_executions_with_pending_run_done(declared_at_or_before)
             {
                 Ok(pending) => {
+                    self.pr_base_refusal_next_check
+                        .lock()
+                        .expect("pr-base-refusal park map poisoned")
+                        .retain(|id, _| pending.iter().any(|(pending_id, _)| pending_id == id));
                     for (execution_id, declared) in pending {
                         // The retained-input path below owns this attempt in
                         // this process. Durable recovery covers lost handlers.

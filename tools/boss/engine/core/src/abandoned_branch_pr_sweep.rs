@@ -735,6 +735,7 @@ async fn bind_and_record(
                 tracing::warn!(?err, "could not surface recovered PR base refusal");
             }
             outcome.base_refused += 1;
+            failure_counts.remove(&candidate.execution_id);
             resolve_work_item_attention(
                 work_db,
                 &candidate.work_item_id,
@@ -746,7 +747,7 @@ async fn bind_and_record(
                  Retarget the PR to the repository default branch, then bind it by hand with \
                  `boss task update --pr-url`. The engine re-checks this branch for up to 24 hours after \
                  the execution finished; after that window the candidate leaves the sweep and this item \
-                 stays until a human binds the PR.",
+                 is cleared by reconciliation once a human binds the PR.",
                 execution_id = candidate.execution_id,
             );
             let title = "PR exists but does not target the default branch";
@@ -787,8 +788,9 @@ async fn bind_and_record(
                 *entry += 1;
                 *entry
             };
-            if count >= ESCALATE_AFTER_CONSECUTIVE_FAILURES {
-                file_base_lookup_attention(work_db, candidate, pr_url, &format!("{err:#}"), count);
+            if count >= ESCALATE_AFTER_CONSECUTIVE_FAILURES
+                && file_base_lookup_attention(work_db, candidate, pr_url, &format!("{err:#}"))
+            {
                 outcome.escalated += 1;
             }
             return;
@@ -889,17 +891,11 @@ fn resolve_work_item_attention(work_db: &WorkDb, work_item_id: &str, kind: &str)
 /// File a dedicated diagnosis when the PR exists but its base branch cannot
 /// be read. Uses its own kind so it cannot overwrite a more accurate
 /// wrong-base refusal sharing the work item.
-fn file_base_lookup_attention(
-    work_db: &WorkDb,
-    candidate: &LatePrCandidate,
-    pr_url: &str,
-    last_error: &str,
-    attempts: u32,
-) {
+fn file_base_lookup_attention(work_db: &WorkDb, candidate: &LatePrCandidate, pr_url: &str, last_error: &str) -> bool {
     let title = "Could not read the PR's base branch";
     let body = format!(
         "Execution `{execution_id}` finished without a Stop, and its branch has a pull request \
-         ({pr_url}), but the engine has failed {attempts} time(s) to read which branch that PR \
+         ({pr_url}), but the engine cannot read which branch that PR \
          targets.\n\n\
          **Last error:** {last_error}\n\n\
          The engine keeps retrying on its normal sweep interval. If GitHub is reachable, check \
@@ -907,13 +903,13 @@ fn file_base_lookup_attention(
          the PR by hand with `boss task update --pr-url`.",
         execution_id = candidate.execution_id,
     );
-    let _ = upsert_work_item_attention_if_changed(
+    upsert_work_item_attention_if_changed(
         work_db,
         &candidate.work_item_id,
         ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
         title,
         &body,
-    );
+    )
 }
 
 /// File (idempotently) the attention item raised once a
@@ -1379,6 +1375,32 @@ mod tests {
         assert!(items[0].body_markdown.contains(url));
         assert!(items[0].body_markdown.contains("GitHub unavailable"));
         assert!(!items[0].title.contains("no PR"));
+        let repeated = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(FailingBaseChecker),
+            &sink,
+            &mut failures,
+        )
+        .await;
+        assert_eq!(repeated.escalated, 0);
+        let refused = Arc::new(
+            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open)
+                .with_base(crate::work::PrBaseVerdict::Refused("feature base".into())),
+        );
+        run_one_pass(&db, &detector, &creator, refused, &sink, &mut failures).await;
+        assert!(failures.is_empty());
+        let next = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(FailingBaseChecker),
+            &sink,
+            &mut failures,
+        )
+        .await;
+        assert_eq!(next.escalated, 0);
     }
 
     struct FailingBaseChecker;

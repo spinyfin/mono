@@ -194,6 +194,15 @@ fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle
             );
             conn.execute(&sql, params![now, lifecycle.kind, execution_kind.as_str()])?
         }
+        ClearedBy::WorkItemPrBound => {
+            let sql = format!(
+                "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?1
+                 WHERE status = 'open' AND kind = ?2
+                 AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = {ATTENTION_WORK_ITEM}
+                             AND NULLIF(t.pr_url, '') IS NOT NULL)"
+            );
+            conn.execute(&sql, params![now, lifecycle.kind])?
+        }
         ClearedBy::OwningExecutionTerminal => {
             let sql = format!(
                 "UPDATE work_attention_items

@@ -1317,10 +1317,14 @@ async fn finalize_declared_delivery_skips_base_guard_for_merged_pr() {
 struct RecordingBaseChecker {
     inner: crate::work::FakePrStateChecker,
     calls: std::sync::atomic::AtomicUsize,
+    merged: std::sync::atomic::AtomicBool,
 }
 
 impl crate::work::PrStateChecker for RecordingBaseChecker {
     fn check(&self, pr_url: &str) -> anyhow::Result<crate::work::PrOpenState> {
+        if self.merged.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(crate::work::PrOpenState::Merged);
+        }
         self.inner.check(pr_url)
     }
     fn base_verdict(&self, pr_url: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
@@ -1359,12 +1363,16 @@ async fn sweep_pending_finalizes_parks_a_confirmed_refusal_without_reprobing() {
     let checker = Arc::new(RecordingBaseChecker {
         inner: FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature base".into())),
         calls: std::sync::atomic::AtomicUsize::new(0),
+        merged: std::sync::atomic::AtomicBool::new(false),
     });
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
         .handler
         .with_branch_verifier(two_pr_verifier(&execution_id))
         .with_pr_state_checker(checker.clone())
         .with_feature_flags(flags_on_run_done(workspace.path()));
+    handler
+        .staged_pr_urls
+        .record_command_observation(&execution_id, OWN_PR, true);
     let first = handler.sweep_pending_finalizes(i64::MAX).await;
     assert_eq!(first.still_pending, 1, "{first:?}");
     assert_eq!(first.finalized, 0);
@@ -1383,6 +1391,7 @@ async fn sweep_pending_finalizes_parks_a_confirmed_refusal_without_reprobing() {
         )
         .unwrap();
     for _ in 0..3 {
+        assert_eq!(handler.recheck_for_pr(&execution_id).await, StopOutcome::AwaitingInput);
         let pass = handler.sweep_pending_finalizes(i64::MAX).await;
         assert_eq!(pass.still_pending, 1, "{pass:?}");
         assert_eq!(pass.finalized, 0);
@@ -1402,4 +1411,76 @@ async fn sweep_pending_finalizes_parks_a_confirmed_refusal_without_reprobing() {
         )
         .unwrap();
     assert_eq!(raised_at, raised_again);
+    handler
+        .pr_base_refusal_next_check
+        .lock()
+        .unwrap()
+        .insert(execution_id.clone(), std::time::Instant::now());
+    let deadline = handler.pr_base_refusal_next_check.lock().unwrap()[&execution_id];
+    assert_eq!(handler.recheck_for_pr(&execution_id).await, StopOutcome::AwaitingInput);
+    assert_eq!(
+        handler.pr_base_refusal_next_check.lock().unwrap()[&execution_id],
+        deadline
+    );
+    checker.merged.store(true, std::sync::atomic::Ordering::SeqCst);
+    let recovered = handler.sweep_pending_finalizes(i64::MAX).await;
+    assert_eq!(recovered.finalized, 1, "{recovered:?}");
+    assert_eq!(checker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    handler.sweep_pending_finalizes(i64::MAX).await;
+    assert!(handler.pr_base_refusal_next_check.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn closed_conflict_delivery_clears_existing_base_refusal() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, _, execution_id, _) = conflict_revision_fixture(workspace.path(), OWN_PR, "head");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::ClosedUnmerged)
+                .with_base(PrBaseVerdict::Refused("feature base".into())),
+        ));
+    let execution = db.get_execution(&execution_id).unwrap();
+    let kind = boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
+    handler
+        .upsert_execution_attention(&execution, kind, "Wrong base", "Retarget")
+        .await
+        .unwrap();
+    let outcome = handler.finalize_declared_delivery(&execution).await;
+    assert!(!matches!(outcome, StopOutcome::PrBaseRefused { .. }), "{outcome:?}");
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Completed
+    );
+    assert!(
+        db.list_attention_items(&execution_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == kind && item.status == "resolved")
+    );
+}
+
+#[tokio::test]
+async fn pending_finalize_prunes_cancelled_refusal() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = followup_fixture(workspace.path());
+    stamp_delivered(&db, &execution_id);
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()));
+    handler.park_pr_base_refusal(&execution_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'cancelled' WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    handler.sweep_pending_finalizes(i64::MAX).await;
+    assert!(handler.pr_base_refusal_next_check.lock().unwrap().is_empty());
 }
