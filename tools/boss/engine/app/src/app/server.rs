@@ -2008,6 +2008,18 @@ async fn serve_scoped(
             None
         }
     };
+    let progression_pane_releaser = Arc::new(ServerStatePaneReleaser::default());
+    progression_pane_releaser.set_server_state(Arc::downgrade(&server_state));
+    let _progression_timeout_handle = boss_engine_runtime::progression_timeout_sweep::spawn_loop(
+        boss_engine_runtime::progression_timeout_sweep::ProgressionTimeoutSweep {
+            work_db: server_state.work_db.clone(),
+            live_states: server_state.live_worker_states.clone(),
+            coordinator: server_state.execution_coordinator.clone(),
+            pane_releaser: progression_pane_releaser,
+            viewers: server_state.clone(),
+        },
+    );
+
     let _stale_worker_sweep_handle = boss_engine_runtime::stale_worker_sweep::spawn_loop(
         boss_engine_runtime::stale_worker_sweep::StaleWorkerSweepDeps {
             work_db: server_state.work_db.clone(),

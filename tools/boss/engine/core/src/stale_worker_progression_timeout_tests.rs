@@ -1,8 +1,54 @@
-//! `progression.run_timeout` applied through the stale-worker sweep: a
-//! progression run older than the timeout is reaped through the sweep's
-//! ordinary reaper and recorded `orphaned` (an infrastructure failure to the
-//! candidate view), and the stuck item it inspects is never touched.
 use super::*;
+use crate::stale_worker_sweep::{STALE_WORKER_ATTENTION_KIND, resolve_stale_worker_attention};
+use crate::test_support::*;
+use boss_execution_contracts::WorkerPool;
+use boss_protocol::{ExecutionStatus, WorkerEvent};
+use std::sync::Mutex;
+
+const SLOT: u8 = 41;
+
+#[derive(Clone)]
+struct RecordingReaper {
+    coordinator: Arc<ExecutionCoordinator>,
+    calls: Arc<Mutex<Vec<(String, bool)>>>,
+}
+
+impl RecordingReaper {
+    fn new(coordinator: Arc<ExecutionCoordinator>) -> Self {
+        Self {
+            coordinator,
+            calls: Arc::default(),
+        }
+    }
+    fn reaped(&self) -> Vec<(String, bool)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkerPaneReleaser for RecordingReaper {
+    async fn release_pane(&self, execution_id: &str) -> PaneReleaseOutcome {
+        let claimed = self
+            .coordinator
+            .progression_worker_pool()
+            .claimed_execution_ids()
+            .await
+            .contains(execution_id);
+        self.calls.lock().unwrap().push((execution_id.to_owned(), claimed));
+        PaneReleaseOutcome::Reaped
+    }
+}
+
+struct NoViewers;
+#[async_trait::async_trait]
+impl WorkerViewerDetach for NoViewers {
+    async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn confirm_viewers_detached(&self, ids: &[String]) -> Vec<Result<(), String>> {
+        ids.iter().map(|_| Ok(())).collect()
+    }
+}
 
 fn description_of(db: &WorkDb, id: &str) -> String {
     match db.get_work_item(id).unwrap() {
@@ -36,6 +82,10 @@ async fn progression_slot(
             [&execution_id],
         )
         .unwrap();
+    let (_, run) = db
+        .start_progression_run_on_local_host(&execution_id, "progression-1", "/tmp/progression-timeout-fixture", true)
+        .unwrap();
+    finish_run_worker_pane_alive(&db, &execution_id, &run.id, Some("spawned pane"));
     if let Some(secs) = timeout_secs {
         db.connect()
             .unwrap()
@@ -46,12 +96,26 @@ async fn progression_slot(
             .unwrap();
     }
     let live_states = Arc::new(LiveWorkerStateRegistry::new());
-    register_slot(&live_states, 1, &execution_id, &work_item_id);
+    live_states.register_spawn(SLOT, &execution_id, "claude-sonnet", 1, None);
     if drive_working {
-        drive_to_working_idle(&live_states, 1);
+        live_states.apply_event(
+            SLOT,
+            &WorkerEvent::PreToolUse {
+                session_id: "s".into(),
+                tool_name: "Bash".into(),
+                tool_input: serde_json::json!({}),
+            },
+        );
     }
-    let coordinator = make_coordinator(db.clone(), 1);
-    coordinator.worker_pool().claim_worker(&execution_id, None).await;
+    let mut coordinator = make_coordinator(db.clone(), 1);
+    Arc::get_mut(&mut coordinator)
+        .unwrap()
+        .set_progression_pool(WorkerPool::new_progression(1));
+    coordinator
+        .progression_worker_pool()
+        .claim_progression_worker(&execution_id, 1)
+        .await
+        .unwrap();
     (dir, db, work_item_id, execution_id, live_states, coordinator)
 }
 
@@ -70,37 +134,31 @@ async fn progression_fixture(
 
 async fn sweep(
     db: &Arc<WorkDb>,
-    live_states: &LiveWorkerStateRegistry,
+    live_states: &Arc<LiveWorkerStateRegistry>,
     coordinator: &Arc<ExecutionCoordinator>,
     reaper: &RecordingReaper,
-) -> StaleWorkerSweepOutcome {
-    // Thresholds that would reap/flag any ordinary worker on sight: a
-    // progression run must be governed by its own timeout instead.
-    run_one_pass(
-        db.as_ref(),
-        live_states,
-        coordinator.clone(),
-        &RecordingDispatchEventSink::new(),
-        reaper,
-        &HoldRegistry::new(),
-        ALWAYS_STALE,
-    )
+) -> usize {
+    ProgressionTimeoutSweep {
+        work_db: db.clone(),
+        live_states: live_states.clone(),
+        coordinator: coordinator.clone(),
+        pane_releaser: Arc::new(reaper.clone()),
+        viewers: Arc::new(NoViewers),
+    }
+    .run_one_pass(boss_engine_utils::epoch_time::now_epoch_secs())
     .await
 }
 
 #[tokio::test]
-async fn a_progression_run_past_its_timeout_is_reaped_orphaned_and_the_item_is_untouched() {
+async fn a_progression_run_past_its_timeout_is_reaped_failed_and_the_item_is_untouched() {
     let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_fixture(Some(60)).await;
     let before = description_of(&db, &work_item_id);
     let reaper = RecordingReaper::new(coordinator.clone());
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
-    assert_eq!(outcome.reaped, 1);
-    assert_eq!(
-        db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::Orphaned
-    );
+    assert_eq!(outcome, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
     assert_eq!(
         reaper.reaped(),
         vec![(execution_id.clone(), true)],
@@ -108,12 +166,20 @@ async fn a_progression_run_past_its_timeout_is_reaped_orphaned_and_the_item_is_u
     );
     assert!(
         !coordinator
-            .worker_pool()
+            .progression_worker_pool()
             .claimed_execution_ids()
             .await
             .contains(&execution_id)
     );
     assert_eq!(description_of(&db, &work_item_id), before, "no audit line on the item");
+    let run = db.list_runs(&execution_id).unwrap().remove(0);
+    assert_eq!(run.status, "failed");
+    assert!(run.error_text.unwrap().contains("progression-run-timeout:"));
+    assert!(db.get_execution(&execution_id).unwrap().finished_at.is_some());
+    assert!(
+        db.readopt_inferred_terminal_execution(&execution_id, "late hook", None)
+            .is_err()
+    );
     assert!(
         db.list_attention_items_for_work_item(&work_item_id)
             .unwrap()
@@ -134,11 +200,8 @@ async fn a_spawning_progression_run_past_its_timeout_is_reaped() {
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
-    assert_eq!(outcome.reaped, 1);
-    assert_eq!(
-        db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::Orphaned
-    );
+    assert_eq!(outcome, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
     assert_eq!(description_of(&db, &work_item_id), before, "no audit line on the item");
 }
 
@@ -162,12 +225,186 @@ async fn a_progression_run_with_no_started_at_is_reaped_from_created_at() {
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
-    assert_eq!(outcome.reaped, 1);
-    assert_eq!(
-        db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::Orphaned
-    );
+    assert_eq!(outcome, 1);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
     assert_eq!(description_of(&db, &work_item_id), before);
+}
+
+#[tokio::test]
+async fn claude_awaiting_input_is_bounded_and_releases_the_real_progression_pool() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+    states.apply_event(
+        SLOT,
+        &WorkerEvent::Notification {
+            session_id: "s".into(),
+            message: "Claude needs permission".into(),
+        },
+    );
+    assert_eq!(
+        states.get(SLOT).unwrap().activity,
+        boss_protocol::WorkerActivity::WaitingForInput
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'waiting_human' WHERE id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    let reaper = RecordingReaper::new(coordinator.clone());
+    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
+    assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+    assert!(states.get(SLOT).is_none());
+    assert!(
+        coordinator
+            .progression_worker_pool()
+            .claim_progression_worker("replacement", 1)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn spawning_and_missing_live_state_cannot_hide_an_expired_claim() {
+    for registered in [true, false] {
+        let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+        states.release_slot_for_run(&execution);
+        if registered {
+            states.register_spawn(SLOT, &execution, "claude-sonnet", 1, None);
+            assert_eq!(
+                states.get(SLOT).unwrap().activity,
+                boss_protocol::WorkerActivity::Spawning
+            );
+        }
+        let reaper = RecordingReaper::new(coordinator.clone());
+        assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
+        assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+        assert!(coordinator.progression_worker_pool().claims().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn an_orphaned_claim_is_reaped_even_with_live_state_and_preserves_its_outcome() {
+    let (_dir, db, item, execution, states, coordinator) = progression_fixture(Some(3_600)).await;
+    let before = description_of(&db, &item);
+    let orphaned = db.mark_execution_orphaned(&execution, "worker lost").unwrap();
+    let reaper = RecordingReaper::new(coordinator.clone());
+    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
+    assert_eq!(
+        serde_json::to_value(db.get_execution(&execution).unwrap()).unwrap(),
+        serde_json::to_value(orphaned).unwrap()
+    );
+    assert_eq!(description_of(&db, &item), before);
+    assert!(states.get(SLOT).is_none());
+    assert!(coordinator.progression_worker_pool().claims().await.is_empty());
+    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 0);
+    assert_eq!(reaper.reaped().len(), 1);
+}
+
+struct UnconfirmedProcess;
+
+#[tokio::test]
+async fn deadline_cleanup_preserves_an_accepted_disposition() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET progression_disposition = 'no_action' WHERE id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    let reaper = RecordingReaper::new(coordinator.clone());
+    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
+    assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Completed);
+    assert_eq!(
+        db.progression_disposition(&execution).unwrap(),
+        Some(boss_protocol::ProgressionDisposition::NoAction)
+    );
+    assert!(coordinator.progression_worker_pool().claims().await.is_empty());
+}
+
+#[async_trait::async_trait]
+impl WorkerPaneReleaser for UnconfirmedProcess {
+    async fn release_pane(&self, _: &str) -> PaneReleaseOutcome {
+        PaneReleaseOutcome::NoLiveWorker
+    }
+}
+
+struct UnconfirmedViewer;
+#[async_trait::async_trait]
+impl WorkerViewerDetach for UnconfirmedViewer {
+    async fn confirm_process_torn_down(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn confirm_viewers_detached(&self, ids: &[String]) -> Vec<Result<(), String>> {
+        ids.iter().map(|_| Err("viewer unavailable".into())).collect()
+    }
+}
+
+#[tokio::test]
+async fn failed_teardown_retains_the_claim_and_retries_the_recorded_terminal_outcome() {
+    for process_failed in [true, false] {
+        let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+        let reaper = RecordingReaper::new(coordinator.clone());
+        let pending = ProgressionTimeoutSweep {
+            work_db: db.clone(),
+            live_states: states.clone(),
+            coordinator: coordinator.clone(),
+            pane_releaser: if process_failed {
+                Arc::new(UnconfirmedProcess)
+            } else {
+                Arc::new(reaper.clone())
+            },
+            viewers: if process_failed {
+                Arc::new(NoViewers)
+            } else {
+                Arc::new(UnconfirmedViewer)
+            },
+        };
+        assert_eq!(
+            pending
+                .run_one_pass(boss_engine_utils::epoch_time::now_epoch_secs())
+                .await,
+            0
+        );
+        let failed = db.get_execution(&execution).unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        assert_eq!(coordinator.progression_worker_pool().claims().await.len(), 1);
+        assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 1);
+        assert_eq!(
+            serde_json::to_value(db.get_execution(&execution).unwrap()).unwrap(),
+            serde_json::to_value(failed).unwrap()
+        );
+        assert!(coordinator.progression_worker_pool().claims().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn exact_deadline_and_missing_start_time_use_the_published_limit() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET started_at = NULL, created_at = '1000' WHERE id = ?1",
+            [&execution],
+        )
+        .unwrap();
+    let sweep = ProgressionTimeoutSweep {
+        work_db: db.clone(),
+        live_states: states,
+        coordinator: coordinator.clone(),
+        pane_releaser: Arc::new(RecordingReaper::new(coordinator)),
+        viewers: Arc::new(NoViewers),
+    };
+    assert_eq!(sweep.run_one_pass(1059).await, 0);
+    assert_eq!(sweep.run_one_pass(1060).await, 1);
+    assert!(
+        db.list_runs(&execution).unwrap()[0]
+            .error_text
+            .as_ref()
+            .unwrap()
+            .contains("elapsed 60s (limit 60s)")
+    );
 }
 
 #[tokio::test]
@@ -178,12 +415,8 @@ async fn a_progression_run_inside_its_timeout_is_left_alone_even_when_it_looks_i
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
-    assert_eq!(outcome.reaped, 0);
-    assert_eq!(outcome.genuinely_stuck, 0);
-    assert_ne!(
-        db.get_execution(&execution_id).unwrap().status,
-        ExecutionStatus::Orphaned
-    );
+    assert_eq!(outcome, 0);
+    assert_ne!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
     assert!(reaper.reaped().is_empty());
     assert_eq!(description_of(&db, &work_item_id), before);
     assert!(
@@ -235,7 +468,7 @@ async fn a_progression_timeout_reap_leaves_the_items_existing_stale_worker_atten
 
     let outcome = sweep(&db, &live_states, &coordinator, &reaper).await;
 
-    assert_eq!(outcome.reaped, 1);
+    assert_eq!(outcome, 1);
     assert_eq!(open_stale_worker_attention_count(&db, &work_item_id), 1);
 }
 

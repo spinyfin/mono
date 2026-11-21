@@ -58,7 +58,7 @@
 //!
 //! The watch is a timer started by the prompt's own event, held in memory. An
 //! engine restart during the grace window loses it. A progression run is then
-//! bounded by `progression.run_timeout` in the stale-worker sweep, which
+//! bounded by `progression.run_timeout` in the progression deadline sweep, which
 //! evaluates that timeout even while the slot is still `Spawning` (adopted
 //! panes start there, and Grok never reports `AwaitingInput`).
 
