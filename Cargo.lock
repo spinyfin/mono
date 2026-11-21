@@ -1275,7 +1275,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
- "fastrand 2.4.1",
  "libc",
  "tempfile",
 ]

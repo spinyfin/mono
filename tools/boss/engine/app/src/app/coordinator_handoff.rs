@@ -156,8 +156,6 @@ pub(super) async fn handle_verify_coordinator_reset_request(ctx: Dispatch, req: 
                 entry.as_ref().is_some_and(|entry| {
                     Some(&entry.spawn_token) == current.as_ref()
                         && entry.delivery_id.as_deref() == Some(pending_id.as_str())
-                        && entry.started.elapsed()
-                            < boss_engine_runtime::coordinator_tmux::inbox::AUTHORIZATION_CONFIRMATION_TIMEOUT
                 })
             })
     } else {
@@ -177,14 +175,16 @@ pub(super) async fn handle_verify_coordinator_reset_request(ctx: Dispatch, req: 
 /// frame is retried instead of being reported as pending.
 const PENDING_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// A credential delivery awaiting confirmation, keyed to the coordinator
+/// A credential delivery awaiting confirmation or turn end, keyed to the coordinator
 /// generation it targets so a replacement session is never suppressed by its
 /// predecessor's outstanding attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct PendingAuthorizationDelivery {
     spawn_token: String,
     attempt_id: u64,
     delivery_id: Option<String>,
+    confirmed: bool,
     started: std::time::Instant,
 }
 
@@ -249,7 +249,8 @@ pub(super) async fn deliver_authorization(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("credential delivery state lock poisoned"))?;
             if pending.as_ref().is_some_and(|entry| {
-                entry.spawn_token == record.spawn_token && entry.started.elapsed() < PENDING_COALESCE_WINDOW
+                entry.spawn_token == record.spawn_token
+                    && (entry.confirmed || entry.started.elapsed() < PENDING_COALESCE_WINDOW)
             }) {
                 return Ok(None);
             }
@@ -257,6 +258,7 @@ pub(super) async fn deliver_authorization(
                 spawn_token: record.spawn_token.clone(),
                 attempt_id,
                 delivery_id: None,
+                confirmed: false,
                 started: std::time::Instant::now(),
             });
         }
@@ -316,9 +318,16 @@ pub(super) async fn deliver_authorization(
                     confirmation,
                 )
                 .await;
-                clear_pending(&pending, attempt_id);
+                let mut turn_end = None;
                 let (outcome, error) = match outcome {
-                    Ok(Ok(())) => {
+                    Ok(Ok(observer)) => {
+                        if let Ok(mut entry) = pending.lock()
+                            && let Some(entry) = entry.as_mut()
+                            && entry.attempt_id == attempt_id
+                        {
+                            entry.confirmed = true;
+                        }
+                        turn_end = Some(observer);
                         match work_db.record_coordinator_handoff_authorization_delivered(&spawn_token) {
                             Ok(true) => {}
                             Ok(false) => {
@@ -346,6 +355,10 @@ pub(super) async fn deliver_authorization(
                 if let Some(error) = error {
                     tracing::error!(%error, trigger, "coordinator handoff credential delivery was not confirmed");
                 }
+                if let Some(turn_end) = turn_end {
+                    turn_end.await;
+                }
+                clear_pending(&pending, attempt_id);
             });
             boss_protocol::CoordinatorHandoffAuthorizationDelivery {
                 requested: true,

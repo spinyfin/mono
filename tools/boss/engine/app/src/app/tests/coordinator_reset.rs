@@ -33,7 +33,8 @@ struct LiveCoordinatorRunner {
 }
 
 /// Inbox delivery failure modes the runner can be told to simulate.
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
 struct DeliveryFaults {
     /// Every inbox delivery fails with this reason, the way a missing
     /// registration or an expired delivery deadline would.
@@ -41,6 +42,8 @@ struct DeliveryFaults {
     /// `deliver_accepted` accepts the frame but its confirmation never
     /// resolves, the way a held or lost frame would.
     hold_confirmation: bool,
+    authorization_turn_end: Arc<tokio::sync::Notify>,
+    confirmation_failure: bool,
     /// How long any command addressed to the retired `-L boss` server hangs.
     legacy_delay: Duration,
     legacy_absent: bool,
@@ -191,7 +194,15 @@ impl boss_engine_runtime::coordinator_tmux::inbox::HandoffDelivery for LiveCoord
         if self.faults.lock().unwrap().hold_confirmation {
             return Ok(Box::pin(std::future::pending()));
         }
-        Ok(Box::pin(std::future::ready(Ok(()))))
+        let faults = self.faults.lock().unwrap();
+        if faults.confirmation_failure {
+            return Ok(Box::pin(async { anyhow::bail!("inbox refused delivery") }));
+        }
+        let ended = faults.authorization_turn_end.clone();
+        Ok(Box::pin(async move {
+            Ok(Box::pin(async move { ended.notified().await })
+                as boss_engine_runtime::coordinator_tmux::inbox::PendingTurnEnd)
+        }))
     }
 }
 
@@ -353,7 +364,6 @@ async fn handoff_show_only_reads_without_minting_or_delivering_authorization() {
 #[tokio::test]
 async fn handoff_show_recovers_authorization_only_through_main_session_inbox() {
     let f = fixture(Duration::from_secs(1)).await;
-    f.runner.faults.lock().unwrap().hold_confirmation = true;
     f.state.set_boss_pid(std::process::id() as libc::pid_t);
     let authorization = f.state.work_db.coordinator_handoff_authorization().unwrap().unwrap();
     let mut ctx = dispatch(&f.state, &f.sink, "read-handoff");

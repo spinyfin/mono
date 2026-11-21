@@ -62,13 +62,19 @@ pub trait HandoffDelivery: Send + Sync {
     ) -> Result<PendingConfirmation> {
         self.deliver(tmux, record, prompt).await?;
         drop(guard);
-        Ok(Box::pin(std::future::ready(Ok(()))))
+        Ok(Box::pin(std::future::ready(Ok(
+            Box::pin(std::future::pending()) as PendingTurnEnd
+        ))))
     }
 }
 
 /// Confirmation of a delivery whose frame the coordinator's inbox has already
 /// accepted; see [`HandoffDelivery::deliver_accepted`].
-pub type PendingConfirmation = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>>;
+pub type PendingConfirmation =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<PendingTurnEnd>> + Send + 'static>>;
+
+/// End of the turn started by a confirmed inbox delivery.
+pub type PendingTurnEnd = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 /// Bound on registration lookup, connect and delivery confirmation. Delivery
 /// has its own deadline and never consumes the handoff grace period. It is
@@ -278,7 +284,12 @@ impl HandoffDelivery for ClaudeInbox {
             Ok(result) => result?,
             Err(_) => return Err(stages.expiry_error()),
         };
-        Ok(Box::pin(async move { injected.confirm().await.map(|_| ()) }))
+        Ok(Box::pin(async move {
+            injected
+                .confirm()
+                .await
+                .map(|observer| Box::pin(observer.wait()) as PendingTurnEnd)
+        }))
     }
 }
 
