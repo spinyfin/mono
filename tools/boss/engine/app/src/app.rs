@@ -2251,6 +2251,7 @@ impl ServerState {
             self.agent_jsonl_progress_manager.stop_run(run_id);
             self.transcript_path_cache.forget(run_id);
             self.run_cost_capture.forget(run_id);
+            self.forget_approval_watch(run_id);
             boss_engine_runtime::stale_worker_sweep::resolve_stale_worker_attention(&self.work_db, run_id);
             self.broadcast_live_worker_states().await;
             return PaneReleaseOutcome::Reaped;
@@ -2381,6 +2382,7 @@ impl ServerState {
         // durable source of truth — but a bounded cache is hygienic.
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
+        self.forget_approval_watch(run_id);
         self.broadcast_live_worker_states().await;
         // A slot was mapped, so a worker had finished spawning: its pane
         // was torn down and (above) its OS process tree signalled. Report
@@ -2436,6 +2438,7 @@ impl ServerState {
         }
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
+        self.forget_approval_watch(run_id);
         PaneReleaseOutcome::Reaped
     }
 

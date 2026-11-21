@@ -707,11 +707,14 @@ impl WorkerCompletionHandler {
         .await
     }
 
-    /// [`Self::finalize_progression`], also reached at declaration time
-    /// (`declared`). A declaration's finalize reports a database failure as
-    /// [`StopOutcome::DbError`] before tearing anything down, so the pending
-    /// finalize retries with the declaration still stamped; the Stop path keeps
-    /// finalizing the pane whatever the write did.
+    /// [`Self::finalize_progression`], also reached at declaration time and
+    /// when the engine fails the run. `keep_worker_on_write_failure` says what
+    /// a failed terminalizing write does. A declaration's finalize and a
+    /// failure the engine is recording ([`Self::fail_blocking_dialog`]) pass
+    /// `true`: the database failure is reported as [`StopOutcome::DbError`]
+    /// before anything is torn down or published, so the caller retries the
+    /// write while it still owns the worker. The Stop path passes `false` and
+    /// finalizes the pane whatever the write did, because its turn is over.
     ///
     /// `failure` is the `error_text` of a run the engine is failing whatever
     /// it declared: a fatal driver error, or a pane left on an approval
@@ -720,7 +723,7 @@ impl WorkerCompletionHandler {
         &self,
         execution: &crate::work::WorkExecution,
         failure: Option<String>,
-        declared: bool,
+        keep_worker_on_write_failure: bool,
     ) -> StopOutcome {
         let workspace_path = execution.workspace_path.clone();
         let teardown = self.begin_teardown(&execution.id);
@@ -751,7 +754,7 @@ impl WorkerCompletionHandler {
                     ?err,
                     "failed to finalise progression execution row",
                 );
-                if declared {
+                if keep_worker_on_write_failure {
                     return StopOutcome::DbError;
                 }
             }

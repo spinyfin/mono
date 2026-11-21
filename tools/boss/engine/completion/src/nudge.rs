@@ -916,10 +916,13 @@ impl WorkerCompletionHandler {
             if execution.status.is_terminal() {
                 return Ok(());
             }
-            self.finalize_progression_run(&execution, Some(format!("progression: {detail}")), false)
+            // A failed write returns before any teardown, so the caller still
+            // owns the worker and can retry the write before releasing it.
+            let outcome = self
+                .finalize_progression_run(&execution, Some(format!("progression: {detail}")), true)
                 .await;
             anyhow::ensure!(
-                self.work_db.get_execution(run_id)?.status.is_terminal(),
+                !matches!(outcome, StopOutcome::DbError) && self.work_db.get_execution(run_id)?.status.is_terminal(),
                 "could not persist blocking-dialog failure for progression run {run_id}"
             );
             return Ok(());

@@ -27,10 +27,22 @@
 //!
 //! # Retrying an incomplete failure
 //!
-//! Failing the run needs a durable write and a verified pane teardown. When
-//! either does not complete, the pane may still be alive and the pool claim
-//! is still held, so the watch keeps its record and tries both again every
-//! [`INCOMPLETE_FAILURE_RETRY_DELAY`] rather than dropping tracking.
+//! Failing the run needs a durable write and a verified pane teardown, in
+//! that order: the pane is not touched until the failure is recorded. When
+//! either step does not complete, the pane may still be alive and the pool
+//! claim is still held, so the watch keeps its record and tries again, backing
+//! off from [`INCOMPLETE_FAILURE_RETRY_DELAY`] to
+//! [`MAX_INCOMPLETE_FAILURE_RETRY_DELAY`], rather than dropping tracking. Once
+//! the failure is recorded the teardown is owed: a dialog-closing event that
+//! arrives afterwards does not cancel it.
+//!
+//! # Per-run state
+//!
+//! The first dialog-closing event of a run reads its execution row once and
+//! caches whether the run is of a deny-by-default kind, so later tool and
+//! turn events from any worker are answered from memory. The entry is dropped
+//! when the run's pane is released, and when an unanswered-prompt failure
+//! settles. A terminal run never gets a new entry.
 //!
 //! # Why only the restricted kinds
 //!
@@ -72,11 +84,21 @@ use super::*;
 /// `unanswered_approval_prompt`.
 pub(super) const UNANSWERED_APPROVAL_PROMPT_GRACE: Duration = Duration::from_secs(120);
 
-/// How long to wait before trying again when failing a run did not complete
-/// (the durable write or the verified pane teardown failed). Each attempt is
-/// a local database write and a tmux teardown, so the interval only spaces
-/// the log line it raises; it is not a limit.
+/// How long to wait before the first retry when failing a run did not
+/// complete (the durable write or the verified pane teardown failed). Each
+/// later retry waits twice as long as the one before, up to
+/// [`MAX_INCOMPLETE_FAILURE_RETRY_DELAY`].
 pub(super) const INCOMPLETE_FAILURE_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// The longest wait between retries of an incomplete failure. A failure that
+/// stays incomplete (tmux evidence unavailable, say) is still retried, but no
+/// more often than this.
+pub(super) const MAX_INCOMPLETE_FAILURE_RETRY_DELAY: Duration = Duration::from_secs(600);
+
+/// The wait before the retry that follows one that waited `previous`.
+pub(super) fn next_incomplete_failure_retry_delay(previous: Duration) -> Duration {
+    previous.saturating_mul(2).min(MAX_INCOMPLETE_FAILURE_RETRY_DELAY)
+}
 
 /// A deny-by-default run's last reported approval prompt, still open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,13 +106,38 @@ pub(super) struct OutstandingApprovalPrompt {
     prompt_ingress_seq: Option<u64>,
 }
 
-/// What the watch knows about one deny-by-default run.
-#[derive(Debug, Default)]
+/// What the watch knows about one live run.
+#[derive(Debug)]
 pub(super) struct RunApprovalWatch {
+    /// Whether the run is of a kind launched deny-by-default, read from its
+    /// execution row once. A run of any other kind keeps only this flag.
+    deny_by_default: bool,
     /// Ingress sequence of the newest dialog-closing event seen for the run,
     /// whether or not live state applied it.
     latest_close_seq: Option<u64>,
     outstanding: Option<OutstandingApprovalPrompt>,
+}
+
+impl RunApprovalWatch {
+    fn new(deny_by_default: bool) -> Self {
+        Self {
+            deny_by_default,
+            latest_close_seq: None,
+            outstanding: None,
+        }
+    }
+}
+
+/// What earlier attempts at failing one run have already done. Carried from
+/// one retry to the next by the watch's own task.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct UnansweredPromptProgress {
+    /// The durable failure is recorded, so the pane teardown is owed whatever
+    /// the outstanding prompt now reads.
+    failure_recorded: bool,
+    /// An incomplete attempt was already reported as a dispatch event; later
+    /// incomplete attempts only log.
+    incomplete_reported: bool,
 }
 
 /// Result of [`ServerState::fail_if_approval_prompt_unanswered`].
@@ -125,14 +172,19 @@ impl ServerState {
         let state = self.clone();
         boss_task_scope::spawn(async move {
             let mut waited = UNANSWERED_APPROVAL_PROMPT_GRACE;
+            let mut progress = UnansweredPromptProgress::default();
+            let mut retry_delay = INCOMPLETE_FAILURE_RETRY_DELAY;
             tokio::time::sleep(waited).await;
             loop {
-                let outcome = state.fail_if_approval_prompt_unanswered(&run_id, &mark, waited).await;
+                let outcome = state
+                    .fail_if_approval_prompt_unanswered(&run_id, &mark, waited, &mut progress)
+                    .await;
                 if outcome != UnansweredPromptOutcome::Incomplete {
                     break;
                 }
-                tokio::time::sleep(INCOMPLETE_FAILURE_RETRY_DELAY).await;
-                waited += INCOMPLETE_FAILURE_RETRY_DELAY;
+                tokio::time::sleep(retry_delay).await;
+                waited += retry_delay;
+                retry_delay = next_incomplete_failure_retry_delay(retry_delay);
             }
         });
     }
@@ -156,7 +208,9 @@ impl ServerState {
             prompt_ingress_seq: incoming.connection.ingress_seq,
         };
         let mut watches = self.lock_approval_watches();
-        let watch = watches.entry(run_id.to_owned()).or_default();
+        let watch = watches
+            .entry(run_id.to_owned())
+            .or_insert_with(|| RunApprovalWatch::new(true));
         // A closing event newer than this prompt was dispatched first: the
         // dialog this prompt opened was already answered.
         if let (Some(prompt_seq), Some(close_seq)) = (mark.prompt_ingress_seq, watch.latest_close_seq)
@@ -197,16 +251,45 @@ impl ServerState {
         })
     }
 
+    /// Whether `run_id` is a live run of a deny-by-default kind, from the
+    /// cached watch entry when there is one. Otherwise the execution row is
+    /// read once and the answer cached for the run's lifetime; a terminal or
+    /// unknown run is not cached, so a late event cannot leave an entry behind
+    /// a released run.
+    fn watched_kind_cached(&self, run_id: &str) -> bool {
+        if let Some(watch) = self.lock_approval_watches().get(run_id) {
+            return watch.deny_by_default;
+        }
+        let Ok(execution) = self.work_db.get_execution(run_id) else {
+            return false;
+        };
+        if execution.status.is_terminal() {
+            return false;
+        }
+        let deny_by_default = boss_execution_contracts::worker_kind_for_execution(&execution.kind)
+            .forced_permission_mode()
+            .is_some();
+        self.lock_approval_watches()
+            .entry(run_id.to_owned())
+            .or_insert_with(|| RunApprovalWatch::new(deny_by_default))
+            .deny_by_default
+    }
+
+    /// Drop everything the watch holds for `run_id`. Called when the run's
+    /// pane is released and when its unanswered-prompt failure settles.
+    pub(super) fn forget_approval_watch(&self, run_id: &str) {
+        self.lock_approval_watches().remove(run_id);
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_approval_watch(&self, run_id: &str) -> bool {
+        self.lock_approval_watches().contains_key(run_id)
+    }
+
     fn lock_approval_watches(&self) -> std::sync::MutexGuard<'_, HashMap<String, RunApprovalWatch>> {
         self.outstanding_approval_prompts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn take_outstanding_approval(&self, run_id: &str) -> Option<OutstandingApprovalPrompt> {
-        self.lock_approval_watches()
-            .get_mut(run_id)
-            .and_then(|watch| watch.outstanding.take())
     }
 
     fn outstanding_approval(&self, run_id: &str) -> Option<OutstandingApprovalPrompt> {
@@ -224,12 +307,15 @@ impl ServerState {
         let Some(run_id) = incoming.run_id.as_deref() else {
             return;
         };
-        if !dialog_closed_by(&incoming.event) || !self.is_deny_by_default_kind(run_id) {
+        if !dialog_closed_by(&incoming.event) || !self.watched_kind_cached(run_id) {
             return;
         }
         let close_seq = incoming.connection.ingress_seq;
         let mut watches = self.lock_approval_watches();
-        let watch = watches.entry(run_id.to_owned()).or_default();
+        // Released between the check above and this lock: nothing to record.
+        let Some(watch) = watches.get_mut(run_id) else {
+            return;
+        };
         if let Some(close_seq) = close_seq {
             watch.latest_close_seq = Some(watch.latest_close_seq.map_or(close_seq, |seen| seen.max(close_seq)));
         }
@@ -253,14 +339,21 @@ impl ServerState {
     /// its pane teardown is verified. Anything short of that leaves the watch
     /// in place and returns [`UnansweredPromptOutcome::Incomplete`]: the
     /// tracking and the pool claim stay with the run until a retry completes,
-    /// because a refused teardown can leave the pane alive.
+    /// because a refused teardown can leave the pane alive. `progress` carries
+    /// what earlier attempts did: once the failure is recorded the teardown is
+    /// owed even if a dialog-closing event has since cleared the prompt, and
+    /// only the first incomplete attempt and the settling one emit a dispatch
+    /// event.
     pub(super) async fn fail_if_approval_prompt_unanswered(
         &self,
         run_id: &str,
         mark: &OutstandingApprovalPrompt,
         waited: Duration,
+        progress: &mut UnansweredPromptProgress,
     ) -> UnansweredPromptOutcome {
-        if self.outstanding_approval(run_id).as_ref() != Some(mark) || !self.is_deny_by_default_kind(run_id) {
+        if !progress.failure_recorded
+            && (self.outstanding_approval(run_id).as_ref() != Some(mark) || !self.is_deny_by_default_kind(run_id))
+        {
             return UnansweredPromptOutcome::NotApplicable;
         }
         let driver = self
@@ -291,8 +384,9 @@ impl ServerState {
         } else {
             None
         };
-        let settled = write.is_ok()
-            && self.execution_is_terminal(run_id)
+        let recorded = write.is_ok() && self.execution_is_terminal(run_id);
+        progress.failure_recorded |= recorded;
+        let settled = recorded
             && (release == Some(PaneReleaseOutcome::Reaped) || self.worker_registry.slot_for_run(run_id).is_none());
         let mut details = serde_json::json!({
             "unanswered_approval_prompt": true,
@@ -304,19 +398,25 @@ impl ServerState {
         if let Err(error) = &write {
             details["failure_write_error"] = serde_json::Value::String(error.to_string());
         }
-        let outcome = if settled { Outcome::Ok } else { Outcome::Error };
-        let mut event = DispatchEvent::new(Stage::StaleWorkerReconcile, outcome, run_id).with_details(details);
-        if let Ok(execution) = self.work_db.get_execution(run_id) {
-            event = event.with_work_item(execution.work_item_id);
+        // Report the first incomplete attempt and the settling one; the
+        // retries in between only log, so a failure that stays incomplete
+        // does not flood the dispatch-event stream.
+        if settled || !progress.incomplete_reported {
+            let outcome = if settled { Outcome::Ok } else { Outcome::Error };
+            let mut event = DispatchEvent::new(Stage::StaleWorkerReconcile, outcome, run_id).with_details(details);
+            if let Ok(execution) = self.work_db.get_execution(run_id) {
+                event = event.with_work_item(execution.work_item_id);
+            }
+            self.dispatch_events.emit(event).await;
+            progress.incomplete_reported |= !settled;
         }
-        self.dispatch_events.emit(event).await;
         if settled {
-            let _ = self.take_outstanding_approval(run_id);
+            self.forget_approval_watch(run_id);
             UnansweredPromptOutcome::Failed
         } else {
             tracing::error!(
                 run_id,
-                retry_secs = INCOMPLETE_FAILURE_RETRY_DELAY.as_secs(),
+                failure_recorded = progress.failure_recorded,
                 ?release,
                 "unanswered-approval-prompt: the run is not yet recorded failed with its pane verified released; \
                  keeping its tracking and pool claim and retrying"

@@ -7,7 +7,10 @@ use boss_engine_runtime::events_socket::IncomingHookEvent;
 use boss_engine_runtime::stale_worker_sweep::STALE_WORKER_ATTENTION_KIND;
 use boss_protocol::{ExecutionStatus, WorkerEvent};
 
-use crate::app::approval_prompt::{UNANSWERED_APPROVAL_PROMPT_GRACE, UnansweredPromptOutcome};
+use crate::app::approval_prompt::{
+    INCOMPLETE_FAILURE_RETRY_DELAY, MAX_INCOMPLETE_FAILURE_RETRY_DELAY, UNANSWERED_APPROVAL_PROMPT_GRACE,
+    UnansweredPromptOutcome, UnansweredPromptProgress, next_incomplete_failure_retry_delay,
+};
 
 const SLOT: u8 = 1;
 const SESSION: &str = "76744658-0402-42f7-a644-68dd52f6dad4";
@@ -85,6 +88,7 @@ fn tool_finished(run: &str, ingress_seq: u64) -> IncomingHookEvent {
 async fn a_progression_run_left_on_an_approval_prompt_is_failed_with_the_reason_and_frees_its_slot() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
+    let mut progress = UnansweredPromptProgress::default();
     let work_item_id = state.work_db.get_execution(&run).unwrap().work_item_id;
     let item_before = format!("{:?}", state.work_db.get_work_item(&work_item_id).unwrap());
 
@@ -97,7 +101,7 @@ async fn a_progression_run_left_on_an_approval_prompt_is_failed_with_the_reason_
 
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
             .await,
         UnansweredPromptOutcome::Failed
     );
@@ -140,10 +144,15 @@ async fn a_progression_run_left_on_an_approval_prompt_is_failed_with_the_reason_
             .all(|item| item.kind != STALE_WORKER_ATTENTION_KIND),
         "no attention is raised on the stuck item"
     );
-    // A second check after the failure is a no-op, not a second failure.
+    // A second watch firing after the failure is a no-op, not a second failure.
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(
+                &run,
+                &mark,
+                UNANSWERED_APPROVAL_PROMPT_GRACE,
+                &mut UnansweredPromptProgress::default(),
+            )
             .await,
         UnansweredPromptOutcome::NotApplicable
     );
@@ -154,6 +163,7 @@ async fn a_progression_run_left_on_an_approval_prompt_is_failed_with_the_reason_
 async fn a_prompt_followed_by_a_dialog_closing_event_is_not_a_failure() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
+    let mut progress = UnansweredPromptProgress::default();
 
     let prompt = approval_prompt(&run, 7);
     dispatch_live_worker_state(&state, &prompt).await;
@@ -164,7 +174,7 @@ async fn a_prompt_followed_by_a_dialog_closing_event_is_not_a_failure() {
 
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
             .await,
         UnansweredPromptOutcome::NotApplicable
     );
@@ -172,14 +182,16 @@ async fn a_prompt_followed_by_a_dialog_closing_event_is_not_a_failure() {
     assert_eq!(state.worker_registry.slot_for_run(&run), Some(SLOT));
 }
 
-/// A failed failure-write must not drop tracking: the pane may still be alive
-/// and the run still holds its pool claim. The watch stays armed, and a retry
-/// once writes work again records the failure, verifies the teardown and
-/// frees the pool capacity.
+/// A failed failure-write must not drop tracking or touch the worker: the
+/// pane stays up and the run still holds its pool claim. No pane release or
+/// driver teardown is attempted until the failure is recorded. The watch stays
+/// armed, and a retry once writes work again records the failure, verifies
+/// the teardown and frees the pool capacity.
 #[tokio::test]
 async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_claim() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
+    let mut progress = UnansweredPromptProgress::default();
     let pool = state.execution_coordinator.worker_pool();
     let held = pool.claim_worker(&run, None).await.expect("test pool has a free slot");
     assert_eq!(held, "worker-1");
@@ -191,6 +203,10 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
     dispatch_live_worker_state(&state, &prompt).await;
     let (_, mark) = state.approval_prompt_to_watch(&prompt).unwrap();
 
+    // No tmux replies are scripted: any pane teardown would hit the stub with
+    // nothing to answer and fail the test.
+    let (untouched_tmux, untouched) = super::tmux_stub::fake_tmux([]);
+    state.set_tmux_override_for_test(untouched_tmux);
     state
         .work_db
         .connect()
@@ -200,7 +216,7 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
 
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
             .await,
         UnansweredPromptOutcome::Incomplete,
         "the failure write failed, so the failure is not complete"
@@ -215,6 +231,15 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
         "tracking is kept while the failure is incomplete"
     );
     assert!(pool.claimed_execution_ids().await.contains(&run));
+    assert!(
+        untouched.calls().is_empty(),
+        "no pane release was attempted before the failure was recorded: {:?}",
+        untouched.calls()
+    );
+    assert!(
+        state.work_db.tmux_identity_for_execution(&run).unwrap().is_some(),
+        "the worker's tmux identity is kept for the retry's verified teardown"
+    );
 
     state
         .work_db
@@ -222,8 +247,7 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
         .unwrap()
         .execute_batch("PRAGMA query_only = OFF;")
         .unwrap();
-    // The first attempt's own teardown used the scripted replies; the retry
-    // verifies and reaps the pane again.
+    // The retry records the failure and only then verifies and reaps the pane.
     let env = format!("BOSS_SPAWN_TOKEN=token-{run}\n");
     let (tmux, _) = super::tmux_stub::fake_tmux([
         super::tmux_stub::ok(&env),
@@ -261,7 +285,7 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
 
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
             .await,
         UnansweredPromptOutcome::Failed
     );
@@ -287,6 +311,7 @@ async fn a_failed_failure_write_keeps_tracking_and_the_retry_frees_the_pool_clai
 async fn a_prompt_followed_by_task_complete_still_fails_after_the_grace() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
+    let mut progress = UnansweredPromptProgress::default();
 
     let prompt = approval_prompt(&run, 7);
     dispatch_live_worker_state(&state, &prompt).await;
@@ -297,7 +322,7 @@ async fn a_prompt_followed_by_task_complete_still_fails_after_the_grace() {
 
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
             .await,
         UnansweredPromptOutcome::Failed
     );
@@ -405,6 +430,7 @@ async fn the_prompt_event_starts_a_watch_that_fails_the_run_after_the_grace_peri
 async fn a_prompt_dispatched_after_a_later_task_complete_is_still_watched() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
+    let mut progress = UnansweredPromptProgress::default();
 
     let complete = task_complete(&run, 8);
     dispatch_live_worker_state(&state, &complete).await;
@@ -417,7 +443,7 @@ async fn a_prompt_dispatched_after_a_later_task_complete_is_still_watched() {
 
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
             .await,
         UnansweredPromptOutcome::Failed
     );
@@ -429,6 +455,7 @@ async fn a_prompt_dispatched_after_a_later_task_complete_is_still_watched() {
 async fn an_older_tool_event_dispatched_after_the_prompt_does_not_clear_it() {
     let (state, _dir) = test_server_state();
     let run = working_run(&state, "grok", true);
+    let mut progress = UnansweredPromptProgress::default();
 
     let prompt = approval_prompt(&run, 7);
     dispatch_live_worker_state(&state, &prompt).await;
@@ -450,8 +477,117 @@ async fn an_older_tool_event_dispatched_after_the_prompt_does_not_clear_it() {
 
     assert_eq!(
         state
-            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE)
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
             .await,
         UnansweredPromptOutcome::Failed
     );
+}
+
+/// Once the failure is recorded the teardown is owed. A dialog-closing event
+/// that arrives while the teardown is still incomplete clears the prompt, but
+/// the retry still releases the pane and the slot.
+#[tokio::test]
+async fn a_closing_event_after_the_failure_is_recorded_does_not_cancel_the_owed_teardown() {
+    let (state, _dir) = test_server_state();
+    let run = working_run(&state, "grok", true);
+    let mut progress = UnansweredPromptProgress::default();
+
+    let prompt = approval_prompt(&run, 7);
+    dispatch_live_worker_state(&state, &prompt).await;
+    let (_, mark) = state.approval_prompt_to_watch(&prompt).unwrap();
+
+    // tmux answers nothing useful, so the teardown cannot be verified.
+    let (broken, _) = super::tmux_stub::fake_tmux(std::iter::repeat_n(
+        super::tmux_stub::failure("error connecting to socket: operation timed out"),
+        64,
+    ));
+    state.set_tmux_override_for_test(broken);
+    assert_eq!(
+        state
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
+            .await,
+        UnansweredPromptOutcome::Incomplete
+    );
+    assert_eq!(
+        state.work_db.get_execution(&run).unwrap().status,
+        ExecutionStatus::Failed,
+        "the failure is recorded"
+    );
+    assert_eq!(
+        state.worker_registry.slot_for_run(&run),
+        Some(SLOT),
+        "the pane is still tracked"
+    );
+
+    // The dialog closes (or a late Stop arrives) before the teardown completes.
+    let finished = tool_finished(&run, 8);
+    state.watch_approval_prompt(&finished);
+
+    let env = format!("BOSS_SPAWN_TOKEN=token-{run}\n");
+    let (tmux, _) = super::tmux_stub::fake_tmux([
+        super::tmux_stub::ok(&env),
+        super::tmux_stub::ok("0"),
+        super::tmux_stub::ok(&env),
+        super::tmux_stub::ok(""),
+        super::tmux_stub::ok(""),
+    ]);
+    state.set_tmux_override_for_test(tmux);
+    assert_eq!(
+        state
+            .fail_if_approval_prompt_unanswered(&run, &mark, UNANSWERED_APPROVAL_PROMPT_GRACE, &mut progress)
+            .await,
+        UnansweredPromptOutcome::Failed
+    );
+    assert!(
+        state.worker_registry.slot_for_run(&run).is_none(),
+        "the owed teardown released the slot"
+    );
+    assert!(
+        !state.has_approval_watch(&run),
+        "a settled failure leaves no watch entry"
+    );
+}
+
+/// Every run that sends a tool or turn event gets one cached entry, read from
+/// its execution row once; releasing the pane drops it, and a later event for
+/// the now-terminal run does not bring it back.
+#[tokio::test]
+async fn releasing_the_pane_drops_the_runs_watch_entry() {
+    for progression in [true, false] {
+        let (state, _dir) = test_server_state();
+        let run = working_run(&state, "grok", progression);
+
+        state.watch_approval_prompt(&tool_finished(&run, 3));
+        assert!(state.has_approval_watch(&run), "progression={progression}");
+
+        state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute("UPDATE work_executions SET status = 'failed' WHERE id = ?1", [&run])
+            .unwrap();
+        assert_eq!(state.release_worker_pane(&run).await, PaneReleaseOutcome::Reaped);
+        assert!(!state.has_approval_watch(&run), "progression={progression}");
+
+        state.watch_approval_prompt(&tool_finished(&run, 4));
+        assert!(
+            !state.has_approval_watch(&run),
+            "a terminal run gets no new entry (progression={progression})"
+        );
+    }
+}
+
+/// Retries of an incomplete failure back off to a ceiling instead of firing
+/// every 30 s forever.
+#[test]
+fn incomplete_failure_retries_back_off_to_a_ceiling() {
+    let mut delay = INCOMPLETE_FAILURE_RETRY_DELAY;
+    let mut seen = vec![delay];
+    for _ in 0..8 {
+        delay = next_incomplete_failure_retry_delay(delay);
+        seen.push(delay);
+    }
+    assert_eq!(seen[1], INCOMPLETE_FAILURE_RETRY_DELAY * 2);
+    assert!(seen.windows(2).all(|pair| pair[1] >= pair[0]));
+    assert_eq!(*seen.last().unwrap(), MAX_INCOMPLETE_FAILURE_RETRY_DELAY);
 }
