@@ -21,6 +21,8 @@ fn seed_conversation(fx: &Fixture) {
     let dir = conversation_dir(fx);
     fs::create_dir_all(dir.join("scratch")).unwrap();
     fs::create_dir_all(dir.join(".system_generated/steps/3")).unwrap();
+    fs::create_dir_all(dir.join(".system_generated/tasks")).unwrap();
+    fs::write(dir.join(".system_generated/tasks/task-2.log"), "build output\n").unwrap();
     fs::create_dir_all(dir.join(".system_generated/logs")).unwrap();
     fs::write(dir.join("scratch/split_modules.py"), "print('split')\n").unwrap();
     fs::write(dir.join(".system_generated/steps/3/output.txt"), "full output\n").unwrap();
@@ -84,6 +86,10 @@ fn own_conversation_scratch_and_spill_files_are_usable() {
         ("write_file", json!({"Path": script, "Contents": "print(1)\n"})),
         ("edit_file", json!({"Path": script})),
         ("read_file", json!({"Path": spill})),
+        (
+            "read_file",
+            json!({"Path": dir.join(".system_generated/tasks/task-2.log")}),
+        ),
         ("list_dir", json!({"Path": dir.join("scratch")})),
         (
             "grep",
@@ -167,19 +173,28 @@ fn real_data_guard_allows_durable_scratch_but_fences_transcripts_and_state() {
             ("write_file", json!({"Path": script, "Contents": "print('split')\n"})),
             ("read_file", json!({"Path": script})),
             ("read_file", json!({"Path": spill})),
+            (
+                "read_file",
+                json!({"Path": dir.join(".system_generated/tasks/task-2.log")}),
+            ),
         ] {
             assert_allowed(&fx, &payload_for(Some(CONVERSATION), tool, args), tool);
         }
         for command in [
             format!("python3 '{}'", script.display()),
             format!("cat '{}'", spill.display()),
+            format!("cat '{}'", dir.join(".system_generated/tasks/task-2.log").display()),
         ] {
             assert_command_allowed(&fx, &command);
             let output = Command::new("/bin/sh").args(["-c", &command]).output().unwrap();
             assert!(output.status.success(), "{command}: {output:?}");
             assert!(!output.stdout.is_empty(), "{command}");
         }
-        for ancestor in [dir.clone(), dir.join(".system_generated")] {
+        for ancestor in [
+            dir.clone(),
+            dir.join(".system_generated"),
+            dir.join(".system_generated/tasks/.."),
+        ] {
             for command in [
                 format!("mv '{}' /tmp/moved", ancestor.display()),
                 format!("rm -rf '{}'", ancestor.display()),
@@ -375,6 +390,11 @@ fn quoted_heredoc_and_single_quoted_python_bodies_are_data() {
         format!("python3 - <<'PY'\n{body}PY"),
         format!("python3 - <<'PY'\n{body}PY\necho done"),
         format!("python3 - 2>/dev/null <<'PY'\n{body}PY"),
+        format!("python3 - <<'PY' 2>&1\n{body}PY"),
+        "node - <<'JS' >&2\nconsole.log(1)\nJS".to_owned(),
+        "python3 - < script.py 2>&1".to_owned(),
+        "python3 - < script.py >&2".to_owned(),
+        "python3 - < 'script<name.py'".to_owned(),
         format!("python3 - <<\"PY\"\n{body}PY"),
         format!("python3 - <<-'PY'\n{body}PY"),
         format!("cd {scratch} && python3 - <<'PY'\n{body}PY"),
@@ -448,6 +468,8 @@ fn substitutions_that_really_run_are_still_denied() {
     for command in [
         "bash 2>/dev/null",
         "python3 - </dev/tty",
+        "python3 - <script.py</dev/tty",
+        "python3 - < script.py</dev/tty",
         "python3 - <<'PY' | python3 -\nprint(1)\nPY",
     ] {
         assert_command_denied(&fx, command);

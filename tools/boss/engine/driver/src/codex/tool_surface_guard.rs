@@ -210,39 +210,35 @@ def has_inline_program(program, arguments):
     return False
 
 
-# An unquoted `<file`, `<<delimiter` or `<<<word` redirection (optionally on
-# fd 0). `<&n` and `<>` are not input redirections from a fixed source.
-STDIN_REDIRECT = re.compile(r"^0?<(?![&>])")
-
-
 def stdin_comes_from_redirect(group):
-    """True when an unquoted redirection feeds the program's stdin.
+    """Accept one fixed fd-0 source, preserving quote provenance.
 
-    Such a program's stdin is a file or a heredoc, closed at its end, not the
-    terminal session `write_stdin` writes into, so it is not a command channel.
-    A quoted `<` is an ordinary argument and does not count.
+    Adjacent operators inside shlex words fail closed: they are shell syntax,
+    while quoted angle brackets remain ordinary filename characters.
     """
     redirects = []
     for index, token in enumerate(group):
-        literal = group.literal_chars[index] if index < len(group.literal_chars) else []
-        if literal and literal[0]:
+        literal = group.literal_chars[index]
+        angles = [i for i, char in enumerate(token) if char in '<>' and not literal[i]]
+        if not angles:
             continue
-        # Fail closed on multiple fd-0 redirects and descriptor duplication:
-        # a later redirect can restore the terminal saved in another fd.
-        if re.match(r"^(?:[0-9]+)?[<>]&|^(?:[0-9]+)?<>|^0>", token):
+        match = re.match(r"([0-9]*)(<<<|<<-|<<|<>|[<>]&|>>|[<>])", token)
+        if not match or any(literal[:match.end()]):
             return False
-        if re.match(r"^0?<", token):
-            redirects.append((index, token))
+        fd, operator = match.groups()
+        if any(i >= match.end() for i in angles):
+            return False
+        fd = int(fd) if fd else (0 if operator.startswith('<') else 1)
+        if fd != 0:
+            continue
+        if operator not in ('<', '<<', '<<-', '<<<'):
+            return False
+        target = token[match.end():] or (group[index + 1] if index + 1 < len(group) else '')
+        redirects.append((operator, target))
     if len(redirects) != 1:
         return False
-    index, token = redirects[0]
-    match = STDIN_REDIRECT.match(token)
-    if not match:
-        return False
-    if token[match.end():].startswith("<"):
-        return True  # heredoc or here-string
-    target = token[match.end():] or (group[index + 1] if index + 1 < len(group) else "")
-    return bool(target) and not target.startswith(("/dev/", "/proc/"))
+    operator, target = redirects[0]
+    return bool(target) and (operator != '<' or not target.startswith(('/dev/', '/proc/')))
 
 
 def stdin_channel_detail(group):
@@ -530,6 +526,11 @@ mod tests {
             "python3 - <<-'PY'\nprint(1)\nPY",
             "python3 <<'PY'\nprint(1)\nPY",
             "python3 - < script.py",
+            "python3 - < 'script<name.py'",
+            "python3 - < script.py 2>&1",
+            "python3 - < script.py >&2",
+            "python3 - <<'PY' 2>&1\nprint(1)\nPY",
+            "node - <<'JS' >&2\nconsole.log(1)\nJS",
             "python3 - < script.py 2>/dev/null",
             "python3 - <<<'print(1)'",
             "sqlite3 db.sqlite < script.sql",
@@ -550,6 +551,10 @@ mod tests {
             "python3 - \\<x",
             // Not a file or heredoc feeding stdin.
             "python3 - <&3",
+            "python3 - <script.py</dev/tty",
+            "python3 - < script.py</dev/tty",
+            "python3 - < script.py 0>&1",
+            "python3 - < script.py 0>out",
             "python3 - < script.py < /dev/tty",
             "python3 - 3<&0 < script.py <&3",
             "python3 - 3>&0 < script.py 0>&3",

@@ -8,6 +8,36 @@ macro_rules! render_reviewer_blocked_programs {
 
 pub const REVIEWER_BLOCKED_PROGRAMS_PY: &str = crate::render_reviewer_blocked_programs!();
 
+/// Conversation scratch policy shared by the adapter and data guard.
+#[macro_export]
+macro_rules! render_conversation_scratch {
+    () => {
+        r#"
+def conversation_scratch_base(root, conversation):
+    if not isinstance(root, str) or not root or not isinstance(conversation, str):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", conversation):
+        return None
+    base = os.path.join(os.path.realpath(root), conversation)
+    return base if os.path.realpath(base) == base else None
+
+
+def conversation_scratch_contains(resolved, base):
+    if base is None:
+        return False
+    # Keep ancestors and transcripts protected; never resolve allow roots.
+    return any(resolved == allowed or resolved.startswith(allowed + os.sep)
+               for allowed in (os.path.join(base, "scratch"),
+                               os.path.join(base, ".system_generated", "steps"),
+                               os.path.join(base, ".system_generated", "tasks")))
+"#
+    };
+}
+
+pub fn with_conversation_scratch(template: &str) -> String {
+    template.replace("# CONVERSATION_SCRATCH_FRAGMENT", crate::render_conversation_scratch!())
+}
+
 /// Shell tokenizer shared by driver guards that inspect `Bash` commands.
 ///
 /// This matches the lexer used by the shared Claude guards, including

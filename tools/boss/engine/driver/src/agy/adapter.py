@@ -811,40 +811,15 @@ def protected_spellings(root):
     return unique
 
 
-CONVERSATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+# CONVERSATION_SCRATCH_FRAGMENT
 
 
 def conversation_scratch_dir(policy):
-    # The conversation under the protected agy home whose scratch/steps
-    # subtrees this run may use: `<brain>/<this run's conversation id>`.
-    # This is where agy keeps the scratch files
-    # it hands the model and the full output of a command whose output it
-    # truncated. The id is the one agy stamped on this hook payload, checked
-    # against a strict pattern, so no other conversation, sibling directory or
-    # `..` spelling can name it. Returns the physical directory, or None.
-    root = policy.get("conversation_scratch_root")
-    conversation = policy.get("conversation_id")
-    if not isinstance(root, str) or not isinstance(conversation, str):
-        return None
-    if not CONVERSATION_ID_RE.fullmatch(conversation):
-        return None
-    physical = os.path.realpath(os.path.join(root, conversation))
-    # A conversation directory replaced by a link out of the brain directory
-    # is not the conversation directory.
-    if physical != os.path.join(os.path.realpath(root), conversation):
-        return None
-    return physical
+    return conversation_scratch_base(policy.get("conversation_scratch_root"), policy.get("conversation_id"))
 
 
 def within_conversation_scratch(resolved, policy):
-    base = conversation_scratch_dir(policy)
-    if base is None:
-        return False
-    # Ancestors also contain the engine transcript: never allow them as
-    # operands of a move, deletion or recursive walk.
-    return any(resolved == root or resolved.startswith(root + os.sep)
-               for root in (os.path.join(base, "scratch"),
-                            os.path.join(base, ".system_generated", "steps")))
+    return conversation_scratch_contains(resolved, conversation_scratch_dir(policy))
 
 
 def path_is_protected(path, policy, cwd=None, pre_expanded=False):

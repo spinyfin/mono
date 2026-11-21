@@ -44,7 +44,8 @@ import shlex
 import sys
 
 "#,
-    r#"
+    concat!(
+        r#"
 
 MALFORMED = (
     "Blocked (fail-closed): the data-directory gate could not read this "
@@ -427,21 +428,13 @@ def emit(decision, reason=None):
     sys.exit(0)
 
 
+"#,
+        crate::render_conversation_scratch!(),
+        r#"
 def conversation_scratch_path(candidate, cwd, payload):
-    # This root comes from engine-owned agy hook wiring, never the payload.
-    root = os.environ.get("BOSS_AGY_SCRATCH_ROOT")
-    conversation = payload.get("session_id")
-    if not root or not isinstance(conversation, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", conversation):
-        return False
-    base = os.path.join(os.path.realpath(root), conversation)
-    if os.path.realpath(base) != base:
-        return False
-    resolved = canonical(candidate, cwd)
-    # Do not resolve these allow roots: a substituted subtree symlink must
-    # not grant access to logs, another conversation, or other Boss state.
-    return any(is_inside(resolved, allowed)
-               for allowed in (os.path.join(base, "scratch"),
-                               os.path.join(base, ".system_generated", "steps")))
+    # The root comes from engine-owned hook wiring, never the payload.
+    base = conversation_scratch_base(os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
+    return conversation_scratch_contains(canonical(candidate, cwd), base)
 
 
 def main():
@@ -575,4 +568,5 @@ def main():
 if __name__ == "__main__":
     main()
 "#
+    )
 );

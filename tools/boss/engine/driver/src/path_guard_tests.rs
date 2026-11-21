@@ -38,7 +38,8 @@ fn conversation_allowance_is_scoped_in_both_path_and_substring_checks() {
     for base in [&brain, &sessions] {
         let safe = base.join("c1/scratch/helper.py");
         let spill = base.join("c1/.system_generated/steps/3/output.txt");
-        for path in [&safe, &spill] {
+        let task = base.join("c1/.system_generated/tasks/task-2.log");
+        for path in [&safe, &spill, &task] {
             for tool in ["Read", "Write"] {
                 assert_eq!(
                     verdict(
@@ -66,6 +67,7 @@ fn conversation_allowance_is_scoped_in_both_path_and_substring_checks() {
         for path in [
             base.join("c1"),
             base.join("c1/.system_generated"),
+            base.join("c1/.system_generated/tasks/.."),
             base.join("c1/.system_generated/logs/transcript_full.jsonl"),
             base.join("c2/scratch/helper.py"),
             data.join("settings.json"),
