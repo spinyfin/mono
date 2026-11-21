@@ -36,6 +36,7 @@ pub enum ProposalKind {
     ReviewGuide,
     ReviewReport,
     ReviewVerdict,
+    ReviewOutcomes,
     RunDone,
     /// Worker-declared, time-bounded wait: the calling execution is
     /// deliberately idle on a long-running job and the produce-a-PR nudge
@@ -78,6 +79,7 @@ impl ProposalKind {
         ProposalKind::ReviewGuide,
         ProposalKind::ReviewReport,
         ProposalKind::ReviewVerdict,
+        ProposalKind::ReviewOutcomes,
         ProposalKind::RunDone,
         ProposalKind::Wait,
         ProposalKind::Revise,
@@ -126,6 +128,7 @@ impl ProposalKind {
             | ProposalKind::ReviewGuide
             | ProposalKind::ReviewReport
             | ProposalKind::ReviewVerdict
+            | ProposalKind::ReviewOutcomes
             | ProposalKind::RunDone
             | ProposalKind::Wait => false,
         }
@@ -142,6 +145,7 @@ impl ProposalKind {
             ProposalKind::PrCreated => "pr_created",
             ProposalKind::ReviewGuide => "review_guide",
             ProposalKind::ReviewReport => "review_report",
+            ProposalKind::ReviewOutcomes => "review_outcomes",
             ProposalKind::ReviewVerdict => "review_verdict",
             ProposalKind::RunDone => "run_done",
             ProposalKind::Wait => "wait",
@@ -176,6 +180,7 @@ impl std::str::FromStr for ProposalKind {
             "pr_created" => Ok(ProposalKind::PrCreated),
             "review_guide" => Ok(ProposalKind::ReviewGuide),
             "review_report" => Ok(ProposalKind::ReviewReport),
+            "review_outcomes" => Ok(ProposalKind::ReviewOutcomes),
             "review_verdict" => Ok(ProposalKind::ReviewVerdict),
             "run_done" => Ok(ProposalKind::RunDone),
             "wait" => Ok(ProposalKind::Wait),
@@ -190,7 +195,7 @@ impl std::str::FromStr for ProposalKind {
             other => Err(format!(
                 "unknown proposal kind `{other}`; expected one of: attention, effort_escalation, \
                  blocked, deferred_scope, followup_task, automation_outcome, pr_created, review_guide, review_report, \
-                 review_verdict, run_done, wait, revise, precursor, depend, undepend, redispatch, clear_signal, \
+                 review_verdict, review_outcomes, run_done, wait, revise, precursor, depend, undepend, redispatch, clear_signal, \
                  archive_revision, unblock"
             )),
         }
@@ -473,6 +478,64 @@ pub struct ReviewReportProposalPayload {
 pub struct ReviewVerdictProposalPayload {
     pub batch_id: String,
     pub verdict: serde_json::Value,
+}
+
+/// A complete disposition set for the review findings assigned to this run.
+/// On acceptance the ledger wraps this submission with the engine-resolved
+/// remediation PR URL, retaining the branch verification's scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewOutcomesProposalPayload {
+    pub outcomes: Vec<ReviewFindingOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingDisposition {
+    Fixed,
+    NotFixed,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFindingOutcome {
+    pub finding_id: String,
+    pub outcome: ReviewFindingDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+}
+
+impl ReviewOutcomesProposalPayload {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for finding in &self.outcomes {
+            if finding.finding_id.trim().is_empty() || !ids.insert(&finding.finding_id) {
+                return Err("finding ids must be nonempty and appear exactly once".into());
+            }
+            if finding.outcome == ReviewFindingDisposition::Fixed {
+                if !finding
+                    .commit_sha
+                    .as_deref()
+                    .is_some_and(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                {
+                    return Err(format!(
+                        "fixed finding {} requires a full commit_sha",
+                        finding.finding_id
+                    ));
+                }
+            } else if !finding
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+            {
+                return Err(format!("finding {} requires a reason unless fixed", finding.finding_id));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How a run ended, as the worker itself states it in a

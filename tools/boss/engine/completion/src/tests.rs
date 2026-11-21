@@ -2369,3 +2369,99 @@ pub fn memory_db() -> (WorkDb, String) {
     let product = create_test_product(&db);
     (db, product.id)
 }
+
+#[cfg(test)]
+fn assign_identified_finding(db: &WorkDb, root_id: &str, remediation_id: &str, pr_url: &str) {
+    let reviewer = create_ready_chore_execution(db, root_id);
+    let finding = serde_json::json!({
+        "id": "C1", "severity": "high", "category": "correctness", "confidence": "high",
+        "file": "src/lib.rs", "title": "Handle the error", "detail": "Return the error", "sources": ["codex-1"]
+    });
+    let payload = serde_json::json!({"batch_id":"unused", "verdict":{
+        "batch_id":"unused", "pr_url": pr_url, "target_sha":"reviewed", "phase":"pre_merge",
+        "summary":"One issue", "revision_warranted":true, "findings":[finding], "contradictions":[]
+    }});
+    let conn = db.connect().unwrap();
+    for task in [root_id, remediation_id] {
+        conn.execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![task, pr_url],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+        rusqlite::params![reviewer.id, pr_url],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO worker_proposals (id, execution_id, work_item_id, kind, payload_json, idempotency_key, state, created_at)
+         VALUES ('verdict-proposal', ?1, ?2, 'review_verdict', ?3, 'verdict', 'applied', ?4)",
+        rusqlite::params![reviewer.id, root_id, payload.to_string(), crate::work::now_string()],
+    )
+    .unwrap();
+    crate::work::WorkDb::insert_review_verdict_in_tx(
+        &conn,
+        &reviewer.id,
+        root_id,
+        &crate::work::ReviewVerdictInput {
+            head_sha: Some("reviewed".into()),
+            findings_count: 1,
+            revision_warranted: true,
+            gate_outcome: crate::work::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+        },
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE pr_review_verdicts SET proposal_id = 'verdict-proposal', revision_task_id = ?1 WHERE execution_id = ?2",
+        rusqlite::params![remediation_id, reviewer.id],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn stop_without_review_outcomes_is_incomplete_not_a_db_error() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    assign_identified_finding(&db, &chore_id, &chore_id, SOURCE_CAPTURE_PR_URL);
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+
+    let in_review = handler
+        .finalize_pr_transition(
+            &execution_id,
+            SOURCE_CAPTURE_PR_URL.to_owned(),
+            WorkerPrCompletionTarget::InReview,
+            "test",
+        )
+        .await;
+    assert!(
+        !matches!(in_review, StopOutcome::DbError),
+        "missing outcomes must not retry as a DB failure; got {in_review:?}"
+    );
+    assert!(
+        matches!(in_review, StopOutcome::EscalationPending { .. }),
+        "got {in_review:?}"
+    );
+    assert!(!db.get_execution(&execution_id).unwrap().status.is_terminal());
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items.iter().any(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::REVIEW_OUTCOMES_NOT_SUBMITTED_ATTENTION_KIND
+        }),
+        "{items:?}"
+    );
+
+    let merged = handler
+        .finalize_pr_transition(
+            &execution_id,
+            SOURCE_CAPTURE_PR_URL.to_owned(),
+            WorkerPrCompletionTarget::Done,
+            "test",
+        )
+        .await;
+    assert!(
+        !matches!(merged, StopOutcome::DbError),
+        "merged completion without outcomes must not loop; got {merged:?}"
+    );
+    assert!(db.get_execution(&execution_id).unwrap().status.is_terminal());
+}

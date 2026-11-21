@@ -484,6 +484,7 @@ fn apply_verb(
         | ProposalKind::ReviewGuide
         | ProposalKind::ReviewReport
         | ProposalKind::ReviewVerdict
+        | ProposalKind::ReviewOutcomes
         | ProposalKind::RunDone
         | ProposalKind::Wait => Err(VerbError::Internal(anyhow::anyhow!(
             "`{kind}` is not a progression verb"

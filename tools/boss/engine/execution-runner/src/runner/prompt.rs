@@ -126,6 +126,8 @@ pub(super) struct ExecutionPromptParams<'a> {
     bazel_workspace: Option<bool>,
     #[builder(default)]
     remote_workspace: bool,
+    #[builder(default)]
+    review_finding_ids: Vec<String>,
 }
 
 /// The structured-output payload this execution's prompt is built around —
@@ -230,6 +232,7 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         merge_order_preservation,
         bazel_workspace,
         remote_workspace,
+        review_finding_ids,
     } = params;
     let bazel_workspace = if remote_workspace {
         bazel_workspace
@@ -577,6 +580,9 @@ fn compose_execution_prompt_body(params: ExecutionPromptParams<'_>) -> String {
         worker_kind_for_execution(&execution.kind) == WorkerKind::Standard,
         bazel_workspace,
     ));
+    if !review_finding_ids.is_empty() {
+        prompt.push_str(&format!("\nThis run is assigned review findings [{}]. Submit every id exactly once using `\"$BOSS_BIN\" propose review-outcomes --body-file /absolute/path/outcomes.json` after publishing the fix and before `propose done`. The JSON is {{\"outcomes\":[{{\"finding_id\":\"C1\",\"outcome\":\"fixed\",\"commit_sha\":\"<full published commit SHA>\"}}]}}. Outcomes are fixed, not_fixed, or not_applicable. A non-fixed outcome requires a nonempty reason; fixed requires a full commit SHA on your remediation PR branch. Include all ids even when nothing was changed. Unknown, duplicate, or missing ids are errors. Completion without a complete set is refused. This structured record replaces the legacy findings-status comment for findings with ids; do not post that template for them. Legacy findings without ids retain the comment instructions.\n", review_finding_ids.join(", ")));
+    }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
     if let Some(details) = work_item_details(work_item) {
@@ -1848,7 +1854,7 @@ fn compose_revision_directive(
     out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review. The title check (step b2) is NEVER skippable — always verify it.\n");
     out.push_str("   f. If, after the comparison in step b, the description already matches the PR's current state, do NOT edit it just to have touched it — leave it as-is and say so explicitly in your final response (e.g. \"PR description verified accurate against this revision's diff; no edit needed\"). The bar is whether the description describes the PR's current state, not whether this revision left a visible mark on it.\n");
     out.push('\n');
-    out.push_str("6. **If this revision addresses automated review findings, post a findings-status summary comment on the PR.** This is a DIFFERENT artifact from the PR description in step 5, for a different reader: the description tells reviewers what the PR now does; this comment tells them what happened to each finding from the review pass that spawned this revision.\n");
+    out.push_str("6. **For legacy review findings WITHOUT stable finding ids only, post a findings-status summary comment on the PR.** This is a DIFFERENT artifact from the PR description in step 5, for a different reader: the description tells reviewers what the PR now does; this comment tells them what happened to each finding from the review pass that spawned this revision.\n");
     out.push_str(
         "   a. This applies ONLY when this task's description (the `- details:` block under \"Task description\" at the end of this prompt) enumerates review findings — look for one or more `### [<severity>] \
          <title>` sections, the shape an automated review pass renders. If this revision is \

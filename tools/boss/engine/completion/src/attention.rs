@@ -75,4 +75,40 @@ impl WorkerCompletionHandler {
         }
         Ok(())
     }
+
+    /// Surface a missing review-outcome set as incomplete instead of a DB retry.
+    pub(super) async fn stop_for_missing_review_outcomes(
+        &self,
+        execution_id: &str,
+        err: &anyhow::Error,
+    ) -> StopOutcome {
+        let reason = err.to_string();
+        match self.work_db.get_execution(execution_id) {
+            Ok(execution) => {
+                if let Err(attn_err) = self
+                    .file_execution_attention(
+                        &execution,
+                        boss_engine_storage_values::attention_kinds::REVIEW_OUTCOMES_NOT_SUBMITTED_ATTENTION_KIND,
+                        "Review outcomes not submitted",
+                        reason.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id,
+                        ?attn_err,
+                        "failed to file missing review-outcomes attention"
+                    );
+                }
+            }
+            Err(load_err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?load_err,
+                    "failed to load execution for missing review-outcomes attention"
+                );
+            }
+        }
+        StopOutcome::EscalationPending { reason }
+    }
 }

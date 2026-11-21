@@ -1936,23 +1936,27 @@ fn revision_directive_permits_leaving_accurate_description_untouched() {
     );
 }
 
-#[test]
-fn revision_directive_requires_findings_status_comment() {
-    // Operator instruction: revisions that address automated review
-    // findings must post a compact GitHub comment summarising the status of
-    // every finding, alongside (not instead of) the PR-description
-    // reconciliation above. It must be skipped entirely — no empty table —
-    // when the revision has no review findings to report.
+fn revision_prompt_with_finding_ids(ids: Vec<String>) -> String {
     let work_item = revision_task_with_created_via(None, "operator");
-    let prompt = compose_execution_prompt(
+    compose_execution_prompt(
         ExecutionPromptParams::builder()
             .review_signal_checks(|_| &[])
             .execution(&revision_execution("https://github.com/org/repo/pull/77"))
             .work_item(&work_item)
             .workspace_path(std::path::Path::new("/tmp/workspace"))
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .review_finding_ids(ids)
             .build(),
-    );
+    )
+}
+
+#[test]
+fn revision_directive_requires_findings_status_comment() {
+    let prompt = revision_prompt_with_finding_ids(vec!["C1".into(), "C2".into()]);
+    assert!(prompt.contains("propose review-outcomes --body-file"));
+    assert!(prompt.contains("This run is assigned review findings [C1, C2]"));
+    assert!(prompt.contains("WITHOUT stable finding ids only"));
+    assert!(prompt.contains("Completion without a complete set is refused"));
     assert!(
         prompt.contains("findings-status summary comment"),
         "revision directive must require a findings-status summary comment:\n{prompt}",
@@ -1989,6 +1993,12 @@ fn revision_directive_requires_findings_status_comment() {
         prompt.contains("a push or staged PR URL alone does not mean the revision is done"),
         "the revision directive must state the completion contract explicitly:\n{prompt}",
     );
+}
+
+#[test]
+fn review_outcome_instruction_is_omitted_without_an_assignment() {
+    let prompt = revision_prompt_with_finding_ids(Vec::new());
+    assert!(!prompt.contains("propose review-outcomes --body-file"), "{prompt}");
 }
 
 // -----------------------------------------------------------------------

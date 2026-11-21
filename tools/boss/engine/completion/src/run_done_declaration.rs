@@ -480,6 +480,9 @@ impl WorkerCompletionHandler {
             {
                 Ok(Some(completion)) => completion,
                 Ok(None) => return StopOutcome::AlreadyTerminal,
+                Err(err) if err.is::<crate::work::ReviewRemediationIncomplete>() => {
+                    return self.stop_for_missing_review_outcomes(&execution.id, &err).await;
+                }
                 Err(err) => {
                     tracing::error!(
                         execution_id = %execution.id,

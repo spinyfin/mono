@@ -236,6 +236,7 @@ mod tests {
                 "worker_proposals.submitted.precursor",
                 "worker_proposals.submitted.redispatch",
                 "worker_proposals.submitted.review_guide",
+                "worker_proposals.submitted.review_outcomes",
                 "worker_proposals.submitted.review_report",
                 "worker_proposals.submitted.review_verdict",
                 "worker_proposals.submitted.revise",
