@@ -23,7 +23,7 @@ use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::home::{agy_homes_root, process_home_for_run, session_settings_path_for_run};
+use super::home::{agy_homes_root, brain_link, process_home_for_run, session_settings_path_for_run};
 use crate::hook_guards::{Guard, guard_commands, write_executable};
 use crate::hook_settings::forwarder_command;
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig, WorkerKind};
@@ -303,7 +303,16 @@ pub(super) fn expected_authorization_policy(
     obs: &ProgressObservationConfig,
     interception: &ToolUseInterceptionConfig,
 ) -> anyhow::Result<Value> {
-    let guards = authorization_guards(worker_kind, interception);
+    let mut guards = authorization_guards(worker_kind, interception);
+    if interception.data_dir.is_some() && interception.path_guard_script.is_some() {
+        // Only agy supplies this trusted root; the shared guard validates the
+        // conversation id and permits only scratch and command-output steps/tasks.
+        guards[0].command = format!(
+            "BOSS_AGY_SCRATCH_ROOT={} {}",
+            shell_quote(&brain_link(process_home).display().to_string()),
+            guards[0].command
+        );
+    }
     if guards.is_empty() {
         bail!("AgyDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
     }
@@ -324,6 +333,10 @@ pub(super) fn expected_authorization_policy(
         "workspace_path": obs.workspace_path.display().to_string(),
         "process_home": process_home.display().to_string(),
         "protected_paths": protected_paths(process_home, interception),
+        // Where agy keeps per-conversation scratch and truncated-output files.
+        // The adapter exempts only scratch/steps/tasks under the payload's validated
+        // conversation id, never the conversation directory or a sibling.
+        "conversation_scratch_root": brain_link(process_home).display().to_string(),
         "artifact_write_paths": artifact_write_paths_json(worker_kind, &obs.run_id),
         "forwarder": obs.forwarder_binary.display().to_string(),
         "attestation_path": attestation_path(process_home).display().to_string(),
@@ -358,7 +371,10 @@ pub fn install_authorization(
     let obs = &private_obs;
 
     let adapter = adapter_path(process_home);
-    write_executable(&adapter, &crate::guard_python::with_command_tokenizer(ADAPTER_SCRIPT))?;
+    write_executable(
+        &adapter,
+        &crate::guard_python::with_conversation_scratch(&crate::guard_python::with_command_tokenizer(ADAPTER_SCRIPT)),
+    )?;
 
     let policy_file = policy_path(process_home);
     let attestation_file = attestation_path(process_home);

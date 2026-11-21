@@ -9,6 +9,7 @@ is not an authorization. Never emit allow, ask, or force_ask.
 The engine probes this installed command with harmless sentinels and checks
 content binding. Native SessionStart is not a pre-prompt readiness signal.
 """
+import glob
 import hashlib
 import json
 import math
@@ -123,6 +124,9 @@ def load_policy():
     paths = policy.get("protected_paths")
     if not isinstance(paths, list) or not paths or any(not isinstance(p, str) or not os.path.isabs(p) for p in paths):
         fail_closed("authorization policy has malformed protected paths")
+    scratch_root = policy.get("conversation_scratch_root")
+    if scratch_root is not None and (not isinstance(scratch_root, str) or not os.path.isabs(scratch_root)):
+        fail_closed("authorization policy has a malformed conversation scratch root")
     artifacts = policy.get("artifact_write_paths")
     if artifacts is None:
         artifacts = []
@@ -383,11 +387,17 @@ def text_outside_single_quotes(command):
 
 
 def reject_dynamic_text(command):
-    text = text_outside_single_quotes(command)
+    # Inspect shell code only. The body of a non-expanding (quoted-delimiter)
+    # heredoc is data, so it is masked first, and `text_outside_single_quotes`
+    # then blanks single-quoted data. Neither can be evaluated by the shell.
+    code = mask_literal_heredoc_bodies(command)
+    text = text_outside_single_quotes(code)
     if DYNAMIC_NAME_RE.search(text):
         fail_closed("variables that bash later executes or evaluates cannot be named")
-    # Single-quoted or heredoc text containing a substitution is data until an
-    # arithmetic context, integer attribute or subscript evaluates it.
+    # A substitution inside single-quoted or heredoc data is inert until an
+    # arithmetic context, integer attribute or subscript in the shell code
+    # evaluates it. Data without a substitution, or shell code without such an
+    # evaluating context, needs no further inspection.
     if ("$(" in command or chr(96) in command) and ARITHMETIC_EVAL_RE.search(text):
         fail_closed("arithmetic evaluation of text containing a substitution cannot be inspected")
     if "$(" in command or chr(96) in command:
@@ -486,11 +496,10 @@ def nested_shell_bodies(group):
             if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
                 return [rest[index + 1]]
         fail_closed("shell stdin or script execution cannot be inspected")
-    if base in ("python", "python3"):
-        if getattr(group, "body", ""):
-            fail_closed("interpreter stdin bodies cannot be inspected")
-        if len(rest) >= 3 and rest[1] == "-c":
-            return [rest[2]]
+    # A Python `-c` string or stdin body is Python source, not shell. It is not
+    # shell-parsed (its quotes, backticks and `$` mean nothing to bash). Python
+    # is as opaque here as a script file the worker runs by name; the shell
+    # text that carries it is still fully inspected.
     if base == "find":
         bodies = []
         for index, arg in enumerate(rest):
@@ -501,14 +510,46 @@ def nested_shell_bodies(group):
     return []
 
 
-def has_substitution(command):
+def mask_heredoc_bodies(command, expanding):
+    # Blank heredoc bodies. With `expanding` False only the bodies of heredocs
+    # whose delimiter is quoted are blanked (bash performs no expansion in
+    # them, so they are data); with True, the bodies bash does expand are
+    # blanked as well. Returns the text and the expanding bodies it blanked.
     command = strip_line_continuations(command)
     masked = list(command)
+    expanded = []
     for group in command_records(command, True):
-        if group.body_span and not group.expanding_body:
-            start, end = group.body_span
-            masked[start:end] = ' ' * (end - start)
-    masked = ''.join(masked)
+        if not group.body_span or (group.expanding_body and not expanding):
+            continue
+        start, end = group.body_span
+        if group.expanding_body:
+            expanded.append(command[start:end])
+        masked[start:end] = ' ' * (end - start)
+    return ''.join(masked), expanded
+
+
+def mask_literal_heredoc_bodies(command):
+    return mask_heredoc_bodies(command, False)[0]
+
+
+def expanding_body_substitutes(body):
+    # Quote characters mean nothing inside an unquoted heredoc: only a
+    # backslash escape protects a `$(` or backtick from bash.
+    escaped = False
+    for index, char in enumerate(body):
+        if escaped:
+            escaped = False
+        elif char == chr(92):
+            escaped = True
+        elif char == chr(96) or body[index:index + 2] == "$(":
+            return True
+    return False
+
+
+def has_substitution(command):
+    masked, expanded = mask_heredoc_bodies(command, True)
+    if any(expanding_body_substitutes(body) for body in expanded):
+        return True
     quote, escaped, skip = None, False, False
     for index, char in enumerate(masked):
         if skip:
@@ -770,8 +811,21 @@ def protected_spellings(root):
     return unique
 
 
+# CONVERSATION_SCRATCH_FRAGMENT
+
+
+def conversation_scratch_dir(policy):
+    return conversation_scratch_base(policy.get("conversation_scratch_root"), policy.get("conversation_id"))
+
+
+def within_conversation_scratch(resolved, policy):
+    return conversation_scratch_contains(resolved, conversation_scratch_dir(policy))
+
+
 def path_is_protected(path, policy, cwd=None, pre_expanded=False):
     expanded = resolve_path(path, policy, cwd, pre_expanded=pre_expanded)
+    if within_conversation_scratch(expanded, policy):
+        return False
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
             root_abs = spelling.rstrip(os.sep)
@@ -802,6 +856,20 @@ def glob_touches_protected(expanded, policy):
     # collapsing `link/../` away from the protected root.
     static = re.split(r"[\*\?\[]", expanded, 1)[0].rstrip(os.sep) or os.sep
     prefixes = glob_prefix_spellings(static)
+    # A glob whose fixed prefix is inside this run's conversation scratch
+    # directory is that directory's own business, provided its wildcard part
+    # cannot climb out (`..` after a wildcard can step through a link) or reach
+    # the engine-read transcript (a wildcard directly under the conversation
+    # directory or its `.system_generated` directory could match `logs`).
+    base = conversation_scratch_dir(policy)
+    if base is not None and ".." not in expanded[len(static):].split(os.sep):
+        inner = [os.path.realpath(prefix) for prefix in prefixes]
+        hubs = (base, os.path.join(base, ".system_generated"))
+        if all(within_conversation_scratch(p, policy) and p not in hubs for p in inner):
+            # A wildcard can match a link that leads out of the directory, so
+            # every actual match must resolve inside it too.
+            if all(within_conversation_scratch(os.path.realpath(match), policy) for match in glob.glob(expanded)):
+                return False
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
             root_abs = spelling.rstrip(os.sep)
@@ -1312,18 +1380,28 @@ def run_bounded(argv, **kwargs):
 
 def run_guards(policy, canonical, rewrites=0, synthetic=False):
     commands = []
+    bodies = set()
+    stripped = set()
     if not synthetic and canonical.get("tool_name") == "Bash":
         original = canonical["tool_input"]["command"]
         for body in inspected_commands(original):
             if body != original:
                 commands.append(body)
+                bodies.add(body)
             for group in command_groups(body):
                 normalized = without_redirections(group)
                 if normalized and normalized != list(group):
-                    commands.append(shlex.join(normalized))
+                    form = shlex.join(normalized)
+                    commands.append(form)
+                    stripped.add(form)
         for command in commands:
             nested = dict(canonical)
             nested["tool_input"] = dict(canonical["tool_input"], command=command)
+            # Tell guards that read redirections themselves that this form had
+            # them removed on purpose (a form that is also a real nested body
+            # keeps them).
+            if command in stripped and command not in bodies:
+                nested["redirects_stripped"] = True
             run_guards(policy, nested, rewrites, synthetic=True)
     guards = policy.get("guards")
     if not isinstance(guards, list) or not guards:
@@ -1482,6 +1560,9 @@ def authorize_payload(payload, policy, raw_stdin):
     verify_binding(policy)
     native_name, args, canonical = canonicalise(payload)
     canonical["_native_args"] = dict(args)
+    # The conversation id comes from agy's own hook payload, never from the
+    # tool arguments the model controls. It scopes the scratch allowance.
+    policy["conversation_id"] = canonical.get("session_id")
     reason = structural_reason(native_name, args, canonical, policy)
     if reason:
         emit("deny", reason=reason)
