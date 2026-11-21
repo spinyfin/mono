@@ -18,7 +18,11 @@ use std::fmt;
 
 use boss_pr_template::{HeadingToken, parse_all_headings};
 
+mod composition;
 mod context;
+mod reference_links;
+
+pub use composition::{compose_prompt, linked_range_ok, valid_linked_path};
 
 pub use context::{
     GuideContext, Project, RelatedWork, Relation, Revision, RevisionOrigin, RootTask, render_guide_context,
@@ -474,6 +478,45 @@ fn github_links(text: &str) -> Vec<String> {
     hrefs.sort();
     hrefs.dedup();
     hrefs
+}
+
+/// A Markdown target or bare GitHub reference and its nearest section.
+/// Both baseline and production guides contribute human-review rows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GuideReference {
+    pub section: String,
+    pub href: String,
+}
+
+/// Every distinct section/reference pair, including non-GitHub Markdown links.
+pub fn guide_references(markdown: &str) -> Vec<GuideReference> {
+    let mut out: Vec<GuideReference> = Vec::new();
+    let mut section = "(before any heading)".to_owned();
+    let definitions = reference_links::definitions(markdown);
+    for line in markdown.lines() {
+        let trimmed_start = line.trim_start();
+        let hashes = trimmed_start.chars().take_while(|c| *c == '#').count();
+        if (2..=6).contains(&hashes) {
+            let rest = &trimmed_start[hashes..];
+            if rest.starts_with(' ') || rest.is_empty() {
+                section = rest.trim().to_owned();
+            }
+        }
+        let mut hrefs = reference_links::targets(line, &definitions);
+        hrefs.extend(github_links(line));
+        for href in hrefs {
+            if !out
+                .iter()
+                .any(|existing| existing.href == href && existing.section == section)
+            {
+                out.push(GuideReference {
+                    section: section.clone(),
+                    href,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Classify and validate one extracted `github.com` href against the packet.
@@ -1067,6 +1110,23 @@ mod tests {
     }
 
     #[test]
+    fn shared_composition_preserves_template_context_and_screenshots() {
+        let packet = packet();
+        let context = primary_context();
+        let screenshots = "[{\"caption\":\"verified view\"}]\n";
+        for template in ["primary template", "incremental update template"] {
+            assert_eq!(
+                compose_prompt(template.to_owned(), &packet, &context, screenshots),
+                format!(
+                    "{template}\n\n{}\n{}\n### Registered screenshots\n\n{screenshots}",
+                    render_source_context(&packet),
+                    render_guide_context(&context)
+                )
+            );
+        }
+    }
+
+    #[test]
     fn source_context_lists_changed_files_without_inlining_content() {
         let context = render_source_context(&packet());
         assert!(context.contains("src/retry.rs"));
@@ -1153,6 +1213,17 @@ mod tests {
     }
 
     #[test]
+    fn source_context_allows_the_pinned_workspace_to_supply_related_source() {
+        let context = render_source_context(&packet());
+        assert!(!context.contains("Do not reference a path, line range, or repository location"));
+        assert!(
+            PROMPT_TEMPLATE
+                .contains("Read changed files, related callers, helpers, types, and tests directly from the checkout")
+        );
+        assert!(PROMPT_TEMPLATE.contains("revision-pinned source lines you actually read"));
+    }
+
+    #[test]
     fn valid_guide_with_pinned_link_passes() {
         let href = format!(
             "https://github.com/acme/widget/blob/{}/src/retry.rs#L1-L2",
@@ -1177,6 +1248,51 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    #[test]
+    fn guide_references_pairs_each_href_with_its_section_and_dedupes() {
+        let href = format!(
+            "https://github.com/acme/widget/blob/{}/src/retry.rs#L1-L2",
+            "c".repeat(40)
+        );
+        let link = format!("[the fix]({href})");
+        let body = valid_guide_body(&link);
+        // Repetitions in the same section are redundant, but another
+        // section can make a different claim about the same lines.
+        let body = format!("{body}\n## Core fix\nAlso see {link} again.\n");
+
+        let refs = guide_references(&body);
+        assert_eq!(
+            refs,
+            vec![GuideReference {
+                section: "Core fix".to_owned(),
+                href,
+            }]
+        );
+    }
+
+    #[test]
+    fn guide_references_keeps_repeated_sources_in_other_sections_and_heading_links() {
+        let href = "https://github.com/acme/widget/blob/abc/src/retry.rs#L1";
+        let body = format!("## Core fix\n[fix]({href})\n## Example\n[example]({href})\n## [Tests]({href})\n");
+        let refs = guide_references(&body);
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].section, "Core fix");
+        assert_eq!(refs[1].section, "Example");
+        assert!(refs[2].section.starts_with("[Tests]"));
+        assert!(refs.iter().all(|reference| reference.href == href));
+    }
+
+    #[test]
+    fn markdown_link_followed_by_a_colon_is_not_also_captured_as_a_mangled_bare_link() {
+        // A colon after a Markdown link is prose, not part of its target.
+        let href = format!(
+            "https://github.com/acme/widget/blob/{}/src/retry_test.rs#L1-L2",
+            "c".repeat(40)
+        );
+        let markdown = format!("- [Page suite]({href}): four added scenarios cover the regression.\n");
+        assert_eq!(github_links(&markdown), vec![href]);
     }
 
     #[test]

@@ -1,0 +1,19 @@
+{
+  "case_id": "mono-2886",
+  "variant": "baseline",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "started_at_epoch": 1794995779.155818,
+  "ended_at_epoch": 1794995851.7004201,
+  "wall_seconds": 72.54460215568542,
+  "exit_code": 0,
+  "turn_failed": false,
+  "usage": {
+    "input_tokens": 150625,
+    "cached_input_tokens": 122496,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2865,
+    "reasoning_output_tokens": 60
+  },
+  "accepted_submissions": 0
+}

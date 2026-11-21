@@ -1,0 +1,18 @@
+{
+  "comparison": {
+    "id": "mono-2860",
+    "pr_url": "https://github.com/spinyfin/mono/pull/2860",
+    "base_tip_sha": "97db22f5bb3fcb02dc105cf6973cc57de3810104",
+    "merge_base_sha": "91567c86a7195ee78f3e340fbcf6c5bccc5ebedc",
+    "head_sha": "725bd759480d416ffffcd39c32ab5fa99d3acc97"
+  },
+  "packet_sha256": "21246ea0bea12f3eb03489789fecbb672310719573c6aa02bfec576eac04518b",
+  "codex_version": "codex-cli 0.164.0",
+  "renderer_source_sha256": "270b3cd98a1a3fb0e7cdae2ccbe61a173d4fa9a80f5a137d9fa09e8b9e22e404",
+  "model": "gpt-6-astra",
+  "effort": "high",
+  "saved_sources_matching_pinned_objects": 42,
+  "checkout": "/Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/checkouts/mono-2860",
+  "git_dir": "/Users/brianduff/.local/share/cube/workspaces/mono-agent-511/.codex/corpus-work/pinned-repos/spinyfin-mono/.git",
+  "submission": "local stdout capture with production validation; no live engine binding"
+}

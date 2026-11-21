@@ -1,0 +1,76 @@
+I want you to provide me a guided summary of the changes in https://github.com/spinyfin/mono/pull/2886. The summary should break down as:
+
+1. a general overview of the problem being solved.
+2. a general overview of the core fix / implementation.
+3. a runthrough of major changes to logic and architecture in the change, with a primary focus on the core change that fixed the problem / implemented the solution.
+4. a summary of what tests were added, and what test infrastructure was modified to support it.
+
+This is meant to function as a human guide to code review, so it should reference and include code snippets, but not giant diffs.
+
+Make the core fix concrete with one worked example. Give the input and relevant state, trace the decisive old and new behavior, and show the observable result. Choose an example supported by the implementation or tests; label invented inputs as illustrative. Include a contrasting boundary or failure case only when it helps explain the changed contract. For changes without a runtime behavior, use an equivalent concrete before/after scenario. Check every step against the actual code.
+
+Review context:
+- Repository: spinyfin/mono
+- PR title: Preserve healthy engines on inconclusive checks
+- Merge-base revision: 6f8ca35153d0fcae9aea5e9852894ea549989ca0
+- Head revision: 68e51b6cfd5cb8ccac6473273d04d57fe972d7a4
+- You have a read-only checkout of the repository at the head revision in your working directory, plus immutable git access to the merge-base revision. Read changed files, related callers, helpers, types, and tests directly from the checkout. Read a file's merge-base ("before") content with `git --git-dir /private/tmp/boss-review-guide-corpus-793/pinned-repos/spinyfin-mono/.git show 6f8ca35153d0fcae9aea5e9852894ea549989ca0:<path>`, and its diff with `git --git-dir /private/tmp/boss-review-guide-corpus-793/pinned-repos/spinyfin-mono/.git diff --no-ext-diff --no-textconv 6f8ca35153d0fcae9aea5e9852894ea549989ca0 68e51b6cfd5cb8ccac6473273d04d57fe972d7a4 -- <path>`. Always pass `--git-dir /private/tmp/boss-review-guide-corpus-793/pinned-repos/spinyfin-mono/.git` explicitly: that is the pinned object store for this checkout, it is not exported as `GIT_DIR`, and a bare `git` has no repository to read. Boss also supplies the PR description and the changed-file manifest below. Do not invent content you have not read.
+
+## Source context
+
+Comparison: `https://github.com/spinyfin/mono/pull/2886` base `6f8ca35153d0fcae9aea5e9852894ea549989ca0` (merge base `6f8ca35153d0fcae9aea5e9852894ea549989ca0`) to head `68e51b6cfd5cb8ccac6473273d04d57fe972d7a4`.
+
+### PR description
+
+## Summary
+- Keep a reachable engine attached when its fingerprint RPC is inconclusive, while still replacing positively mismatched builds.
+- Debounce unreachable supervision ticks and emit production logs that identify the liveness source and restart evidence.
+- Add regression coverage for unresponsive fingerprint RPCs and consecutive-failure restart scheduling.
+
+## Validation
+- `bazel build //tools/boss/app-macos:boss_mac_app_lib //tools/boss/app-macos:BossTestsShard3`
+- `bazel test //tools/boss/app-macos:BossTestsShard3`
+- `bazel build //tools/boss/app-macos:Boss //tools/boss/installer:release`
+- `checkleft run`
+
+
+### Changed files
+
+- `tools/boss/app-macos/Sources/EngineProcessController.swift` (Modified, +23/-12)
+- `tools/boss/app-macos/Sources/EngineSupervisor.swift` (Modified, +12/-0)
+- `tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift` (Modified, +24/-4)
+- `tools/boss/app-macos/Tests/BossTests/EngineRestartPolicyTests.swift` (Modified, +23/-3)
+
+
+### Task context
+
+Inputs for the `## Orientation` section, taken from the engine's records of the work. Treat them as claims to check against the source, as with the PR description. Describe things in plain words and do not repeat internal work-item identifiers.
+
+#### Original change
+
+- Title: Preserve healthy engines on inconclusive checks
+- Task description:
+
+> ## Summary
+> - Keep a reachable engine attached when its fingerprint RPC is inconclusive, while still replacing positively mismatched builds.
+> - Debounce unreachable supervision ticks and emit production logs that identify the liveness source and restart evidence.
+> - Add regression coverage for unresponsive fingerprint RPCs and consecutive-failure restart scheduling.
+> 
+> ## Validation
+> - `bazel build //tools/boss/app-macos:boss_mac_app_lib //tools/boss/app-macos:BossTestsShard3`
+> - `bazel test //tools/boss/app-macos:BossTestsShard3`
+> - `bazel build //tools/boss/app-macos:Boss //tools/boss/installer:release`
+> - `checkleft run`
+
+#### Revisions filed against this PR
+
+None. This guide covers a primary change; the Orientation describes the change itself and needs no revision structure.
+
+#### Containing project
+
+None. This change is not part of a larger project; do not describe one.
+
+
+### Registered screenshots
+
+No screenshots are registered for this task or its revisions.

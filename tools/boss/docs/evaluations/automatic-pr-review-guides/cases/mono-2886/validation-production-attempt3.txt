@@ -1,0 +1,7 @@
+INVALID — 5 issue(s):
+  - reference `https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/BossEnginePaths.swift#L256-L291` does not resolve to any pinned source in the packet
+  - reference `https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/ChatViewModel.swift#L1215-L1228` does not resolve to any pinned source in the packet
+  - reference `https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Sources/EngineClient.swift#L107-L136` does not resolve to any pinned source in the packet
+  - reference `https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/Tests/BossTests/BossCaptureTests.swift#L347-L408` does not resolve to any pinned source in the packet
+  - reference `https://github.com/spinyfin/mono/blob/68e51b6cfd5cb8ccac6473273d04d57fe972d7a4/tools/boss/app-macos/BUILD.bazel#L278-L291` does not resolve to any pinned source in the packet
+corpus-tool: validation failed for /Users/brianduff/.local/share/cube/workspaces/mono-agent-473/tools/boss/docs/evaluations/automatic-pr-review-guides/cases/mono-2886/guide-production-attempt3.md

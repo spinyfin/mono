@@ -5,10 +5,18 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+anyhow = { workspace = true }
 bon = { workspace = true }
 boss-pr-review-sources = { path = "../pr-review-sources" }
 boss-pr-template = { path = "../pr-template" }
 regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+
+[[bin]]
+name = "review-guide-corpus-tool"
+path = "src/bin/corpus_tool.rs"

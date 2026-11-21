@@ -1,0 +1,13 @@
+{
+  "algorithm": "internal-id-redaction-v1",
+  "files": {
+    "mono-2890/events-baseline.jsonl": {
+      "original_sha256": "e90810772b09c735dc55aac91fc17cfc025280485a4a94114b8446da8b613f41",
+      "published_sha256": "cf9d4b6d1eaf32b514bcd94292d6e3ad4d6e09f9d4c97635179968a6481ae8d1"
+    },
+    "mono-2890/events-production.jsonl": {
+      "original_sha256": "215b67728c0c425eddd6aefdc0d7c26c3948f349f34164f202b1d652919493fa",
+      "published_sha256": "57b1a2d0d43880f0aec8eaf7ff91b559ff151ee1cb1c4b81bef44db2add67409"
+    }
+  }
+}
