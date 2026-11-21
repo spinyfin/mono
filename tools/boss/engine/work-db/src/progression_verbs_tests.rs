@@ -13,6 +13,9 @@ use serde_json::json;
 const FINGERPRINT: &str = "fp-1";
 const STUCK: &str = "S7_worker_failed";
 
+#[path = "progression_redispatch_pr_tests.rs"]
+mod redispatch_pr;
+
 struct Fx {
     db: WorkDb,
     product: String,
