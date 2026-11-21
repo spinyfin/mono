@@ -14,6 +14,15 @@ const OVERDUE_NUDGE_DETAIL: &str = "the nudge could not be written into the work
 
 pub(super) const PROPOSAL_OBSERVATION_FINGERPRINT: &str = "codex-unobserved-proposal";
 
+/// Result of comparing a retained produce-a-PR intent against current
+/// engine state. `Handled` means the caller must not replay the captured
+/// intent: `Some` is the outcome to surface, `None` means the intent was
+/// retired and finalization belongs to another path.
+enum StaleNoPr {
+    StillNoPr,
+    Handled(Option<StopOutcome>),
+}
+
 impl WorkerCompletionHandler {
     /// Generic auto-nudge gate. Records the intent to nudge `execution`
     /// against the circuit breaker (keyed by `fingerprint`, which must
@@ -583,6 +592,19 @@ impl WorkerCompletionHandler {
             }
         };
 
+        // A retained produce-a-PR intent is a snapshot of the moment it was
+        // recorded. If a PR has since been staged or bound, replaying that
+        // snapshot would act on a "no PR" premise current state contradicts
+        // (incident-009: a quiet merge-poller sweep tripped the breaker
+        // after the worker had already opened a verified PR). Re-derive
+        // from current state before any delivery/nudge_or_park work.
+        if intent.fingerprint == NO_PR_FINGERPRINT {
+            match self.redirect_stale_no_pr_intent(&execution).await {
+                StaleNoPr::StillNoPr => {}
+                StaleNoPr::Handled(outcome) => return outcome,
+            }
+        }
+
         // Consult the probe and horizon directly first. When the outcome is
         // unchanged from the last pass (still delegated descendants, still
         // inside the horizon), return the same `BackgroundChildrenPending`
@@ -726,6 +748,15 @@ impl WorkerCompletionHandler {
             _ => {}
         }
         let replay = intent.clone();
+        // Re-check immediately before replay: a PR can land between the
+        // live-row load above and this call. A produce-a-PR replay must
+        // never act on a stale "no PR" premise.
+        if replay.fingerprint == NO_PR_FINGERPRINT {
+            match self.redirect_stale_no_pr_intent(&execution).await {
+                StaleNoPr::StillNoPr => {}
+                StaleNoPr::Handled(outcome) => return outcome,
+            }
+        }
         let outcome = self
             .nudge_or_park(
                 &execution,
@@ -809,7 +840,7 @@ impl WorkerCompletionHandler {
 
     /// Fail an unproductive attempt, releasing its slot and recording a visible
     /// task failure before any terminal event can trigger orphan recovery.
-    pub(super) async fn fail_for_unproductive_nudges(
+    pub(crate) async fn fail_for_unproductive_nudges(
         &self,
         execution: &crate::work::WorkExecution,
         nudge_count: u32,
@@ -820,7 +851,7 @@ impl WorkerCompletionHandler {
             "Execution `{}` failed: auto-nudge circuit breaker stopped the attempt after \
              {nudge_count} nudges: {detail}. {} No automatic replacement will be started.",
             execution.id,
-            Self::pr_clause(bound_pr_url),
+            Self::pr_clause(self.pr_url_for_failure_clause(execution, bound_pr_url).as_deref()),
         );
         self.fail_nudge_ladder(execution, reason, "Worker failed: auto-nudge loop bounded")
             .await
@@ -848,7 +879,7 @@ impl WorkerCompletionHandler {
              failure: {detail}. This is a delivery failure, not an unresponsive worker. {} No \
              automatic replacement will be started.",
             execution.id,
-            Self::pr_clause(bound_pr_url),
+            Self::pr_clause(self.pr_url_for_failure_clause(execution, bound_pr_url).as_deref()),
         );
         self.fail_nudge_ladder(execution, reason, "Worker failed: auto-nudges could not be delivered")
             .await
@@ -859,6 +890,73 @@ impl WorkerCompletionHandler {
             Some(url) => format!("A PR already exists for this work: {url}."),
             None => "No PR was produced.".to_owned(),
         }
+    }
+
+    /// PR URL used in a breaker-trip failure sentence. Prefers current
+    /// engine state (staged cache, then the bound work-item/execution URL)
+    /// over a replayed argument, so a trip after a PR was opened never
+    /// claims "No PR was produced".
+    fn pr_url_for_failure_clause(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: Option<&str>,
+    ) -> Option<String> {
+        self.staged_pr_urls
+            .get(&execution.id)
+            .or_else(|| self.resolve_bound_pr_url(execution))
+            .or_else(|| bound_pr_url.map(str::to_owned))
+    }
+
+    /// A staged or bound PR is the progress [`NO_PR_FINGERPRINT`] exists to
+    /// detect. Drop any retained produce-a-PR intent and reset that breaker
+    /// entry so a later quiet sweep cannot replay it. Leaves a later,
+    /// unrelated cycle (run-done backstop, push-to-existing) intact.
+    pub(super) fn retire_produce_pr_nudge(&self, execution_id: &str) {
+        if self
+            .background_children_tracker
+            .intent(execution_id)
+            .is_some_and(|intent| intent.fingerprint == NO_PR_FINGERPRINT)
+        {
+            self.background_children_tracker.forget_intent(execution_id);
+        }
+        self.nudge_breaker
+            .forget_if_fingerprint(execution_id, NO_PR_FINGERPRINT);
+    }
+
+    /// If a retained produce-a-PR intent is contradicted by a verified
+    /// staged or bound PR, retire it and follow the staged-PR / run-done
+    /// path instead of replaying.
+    async fn redirect_stale_no_pr_intent(&self, execution: &crate::work::WorkExecution) -> StaleNoPr {
+        let Some(pr_url) = self.current_verified_or_bound_pr_url(execution).await else {
+            return StaleNoPr::StillNoPr;
+        };
+        self.retire_produce_pr_nudge(&execution.id);
+        tracing::info!(
+            execution_id = %execution.id,
+            pr_url = %pr_url,
+            "auto-nudge: dropping retained produce-a-PR intent — a PR is now staged or bound",
+        );
+        if execution.kind != ExecutionKind::RevisionImplementation
+            && !self.primary_staged_url_may_finalize(&execution.id)
+        {
+            return StaleNoPr::Handled(Some(self.await_run_done_declaration(execution, &pr_url).await));
+        }
+        // Declaration already present, or the proposal seam is off:
+        // finalization belongs to `recheck_for_pr`. Do not replay.
+        StaleNoPr::Handled(None)
+    }
+
+    /// Verified staged PR URL, else the work-item/execution bound URL.
+    /// Unverified staged candidates are not progress: they may be a
+    /// captured URL from an unrelated `gh pr view`.
+    async fn current_verified_or_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
+        if let Some(url) = self
+            .verified_staged_pr_url(&execution.id, execution, "background-nudge-recheck")
+            .await
+        {
+            return Some(url);
+        }
+        self.resolve_bound_pr_url(execution)
     }
 
     /// Terminal shared by both ways the nudge ladder ends an attempt: commit
