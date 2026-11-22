@@ -13,7 +13,7 @@ use boss_protocol::{
 
 /// Resolve the display label for an attention's `association` field.
 ///
-/// Prefers an explicit caller-supplied label (e.g. `"T42: Engine core"`) when
+/// Prefers an explicit caller-supplied label (e.g. `"Task: Engine core"`) when
 /// non-empty, falling back to `"task:<id>"` or `"project:<id>"` from the
 /// exclusive association columns, or `"unknown"` when neither is present.
 pub fn association_context_label(
@@ -53,6 +53,7 @@ pub fn render_attention_brief(
         kind: &group.kind,
         association: &association,
         group_label: &group_label,
+        group_key: None,
         source_kind: non_empty(Some(&group.source_kind)),
         source_doc_path: non_empty(group.source_doc_path.as_deref()),
         source_task_id: non_empty(group.source_task_id.as_deref()),
@@ -87,10 +88,7 @@ pub fn render_candidate_brief(input: &CreateAttentionInput, association_label: O
         input.association_task_id.as_deref(),
         association_label,
     );
-    let group_id = non_empty(input.group_id.as_deref())
-        .or_else(|| non_empty(input.group_key.as_deref()))
-        .unwrap_or("(pending)")
-        .to_owned();
+    let group_id = non_empty(input.group_id.as_deref()).unwrap_or("(pending)").to_owned();
     let group_label = if group_id == "(pending)" {
         "pending card".to_owned()
     } else {
@@ -100,6 +98,7 @@ pub fn render_candidate_brief(input: &CreateAttentionInput, association_label: O
         kind: &input.kind,
         association: &association,
         group_label: &group_label,
+        group_key: non_empty(input.group_key.as_deref()),
         source_kind: non_empty(input.source_kind.as_deref()),
         source_doc_path: non_empty(input.source_doc_path.as_deref()),
         source_task_id: non_empty(input.source_task_id.as_deref()),
@@ -131,6 +130,7 @@ struct RenderFields<'a> {
     kind: &'a str,
     association: &'a str,
     group_label: &'a str,
+    group_key: Option<&'a str>,
     source_kind: Option<&'a str>,
     source_doc_path: Option<&'a str>,
     source_task_id: Option<&'a str>,
@@ -232,6 +232,9 @@ fn render_context_line(fields: &RenderFields<'_>) -> String {
         format!("association={}", fields.association),
         format!("group={}", fields.group_label),
     ];
+    if let Some(group_key) = fields.group_key {
+        parts.push(format!("group_key={group_key}"));
+    }
     if let Some(source_kind) = fields.source_kind {
         let mut source = source_kind.to_owned();
         if let Some(doc_path) = fields.source_doc_path {
@@ -292,11 +295,11 @@ mod tests {
             .rationale("Queries filter by product_id and state")
             .build();
 
-        let brief = render_attention_brief(&attention, &group, Some("P7: Notification dedup"));
+        let brief = render_attention_brief(&attention, &group, Some("Notification dedup project"));
         assert_eq!(brief.attention_id, "atn_42");
         assert_eq!(brief.group_id, "atg_10");
         assert_eq!(brief.kind, "question");
-        assert_eq!(brief.association, "P7: Notification dedup");
+        assert_eq!(brief.association, "Notification dedup project");
         assert!(
             brief
                 .rendered
@@ -309,7 +312,7 @@ mod tests {
                 .rendered
                 .contains("Rationale: Queries filter by product_id and state")
         );
-        assert!(brief.rendered.contains("association=P7: Notification dedup"));
+        assert!(brief.rendered.contains("association=Notification dedup project"));
         assert!(brief.rendered.contains("group=A12 (atg_10)"));
         assert!(
             brief
@@ -405,5 +408,21 @@ mod tests {
         assert!(brief.rendered.contains("Description: Startup scan reads whole table."));
         assert!(brief.rendered.contains("association=task:task_5"));
         assert!(brief.rendered.contains("group=pending card"));
+    }
+
+    #[test]
+    fn candidate_with_group_key_only_keeps_pending_group_id() {
+        let input = CreateAttentionInput::builder()
+            .kind("followup")
+            .group_key("followup|task_5|retry-jitter")
+            .association_task_id("task_5")
+            .proposed_name("Add retry jitter")
+            .build();
+
+        let brief = render_candidate_brief(&input, None);
+        assert_eq!(brief.attention_id, CANDIDATE_ID);
+        assert_eq!(brief.group_id, "(pending)");
+        assert!(brief.rendered.contains("group=pending card"));
+        assert!(brief.rendered.contains("group_key=followup|task_5|retry-jitter"));
     }
 }

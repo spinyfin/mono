@@ -16,6 +16,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use anyhow::Result;
+use boss_engine_utils::iso8601::parse_stored_timestamp;
 use boss_protocol::{Attention, AttentionBrief, AttentionGroup, CreateAttentionInput};
 
 use crate::dedup::brief::render_attention_brief;
@@ -133,8 +134,6 @@ impl<'a> PrefilterCandidate<'a> {
             self.proposed_name,
             self.proposed_description,
             self.rationale,
-            self.source_anchor,
-            self.source_doc_path,
         ])
     }
 }
@@ -185,7 +184,7 @@ pub fn prefilter_open_attentions(
         if candidate.exclude_attention_id == Some(attention.id.as_str()) {
             continue;
         }
-        let Some(created_secs) = parse_timestamp_secs(&attention.created_at) else {
+        let Some(created_secs) = parse_stored_timestamp(attention.created_at.trim()) else {
             tracing::warn!(
                 attention_id = %attention.id,
                 created_at = %attention.created_at,
@@ -304,14 +303,12 @@ fn has_same_association(candidate: &PrefilterCandidate<'_>, group: &AttentionGro
     same_task || same_project
 }
 
-fn item_semantic_tokens(attention: &Attention, group: &AttentionGroup) -> BTreeSet<String> {
+fn item_semantic_tokens(attention: &Attention, _group: &AttentionGroup) -> BTreeSet<String> {
     tokenize_fields(&[
         non_empty(attention.prompt_text.as_deref()),
         non_empty(attention.proposed_name.as_deref()),
         non_empty(attention.proposed_description.as_deref()),
         non_empty(attention.rationale.as_deref()),
-        non_empty(attention.source_anchor.as_deref()),
-        non_empty(group.source_doc_path.as_deref()),
     ])
 }
 
@@ -376,17 +373,6 @@ fn is_stopword(token: &str) -> bool {
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
-}
-
-/// Parse an engine timestamp (`now_string()` epoch seconds, or RFC 3339).
-fn parse_timestamp_secs(raw: &str) -> Option<i64> {
-    let trimmed = raw.trim();
-    if let Ok(secs) = trimmed.parse::<i64>() {
-        return Some(secs);
-    }
-    chrono::DateTime::parse_from_rfc3339(trimmed)
-        .ok()
-        .map(|dt| dt.timestamp())
 }
 
 #[cfg(test)]
@@ -660,7 +646,7 @@ mod tests {
         )];
 
         let mut labels = HashMap::new();
-        labels.insert("task_7".to_owned(), "T7: Retry client".to_owned());
+        labels.insert("task_7".to_owned(), "Retry client task".to_owned());
 
         let input = CreateAttentionInput::builder()
             .kind("followup")
@@ -671,7 +657,7 @@ mod tests {
 
         let res = prefilter_open_attentions(&cand, &pool, Some(&labels), &PrefilterConfig::default(), NOW);
         assert_eq!(res.briefs.len(), 1);
-        assert_eq!(res.briefs[0].association, "T7: Retry client");
+        assert_eq!(res.briefs[0].association, "Retry client task");
     }
 
     #[test]
@@ -734,5 +720,49 @@ mod tests {
         .unwrap();
         let sweep_ids: Vec<&str> = sweep_res.briefs.iter().map(|b| b.attention_id.as_str()).collect();
         assert_eq!(sweep_ids, vec![a2.id.as_str()]);
+    }
+
+    #[test]
+    fn shared_doc_path_and_anchor_do_not_outrank_cross_task_paraphrase() {
+        let mut doc_group = make_group("atg_doc", "prod_1", "question", "open", None, Some("proj_1"));
+        doc_group.source_kind = "design_doc".to_owned();
+        doc_group.source_doc_path = Some("tools/boss/docs/designs/notification-dedup-scoring.md".to_owned());
+        let mut unrelated_same_doc = make_question(
+            "atn_doc_unrelated",
+            "atg_doc",
+            &(NOW - 100).to_string(),
+            "Which color token for the banner?",
+        );
+        unrelated_same_doc.source_anchor = Some("ui-surface".to_owned());
+
+        let transcript_group = make_group("atg_tx", "prod_1", "question", "open", Some("task_other"), None);
+        let cross_task_paraphrase = make_question(
+            "atn_cross_task",
+            "atg_tx",
+            &(NOW - 100).to_string(),
+            "Deduplicate retry backoff",
+        );
+
+        let pool = vec![
+            (unrelated_same_doc, doc_group),
+            (cross_task_paraphrase, transcript_group),
+        ];
+
+        let input = CreateAttentionInput::builder()
+            .kind("question")
+            .source_kind("design_doc")
+            .source_doc_path("tools/boss/docs/designs/notification-dedup-scoring.md")
+            .source_anchor("ui-surface")
+            .prompt_text("Retry backoff")
+            .build();
+        let cand = PrefilterCandidate::from_create_input("prod_1", &input);
+
+        let config = PrefilterConfig {
+            top_k: 1,
+            recency_window_secs: DEFAULT_RECENCY_WINDOW_SECS,
+        };
+        let res = prefilter_open_attentions(&cand, &pool, None, &config, NOW);
+        assert_eq!(res.briefs.len(), 1);
+        assert_eq!(res.briefs[0].attention_id, "atn_cross_task");
     }
 }
