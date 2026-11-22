@@ -180,7 +180,7 @@ fn exec_command(parsed_input: &Value) -> Option<String> {
 
 /// Whether a cell script is positively identified as starting no command: a
 /// `write_stdin` poll of an existing session, or a compute-only cell that
-/// just uses the cell builtins (`text` / `load` / `store` / `notify`).
+/// uses cell builtins or known non-shell `tools.*` helpers.
 fn is_non_command_cell(source: &str) -> bool {
     cell::script_is_continuation_only(source) || cell::script_is_compute_only(source)
 }
@@ -461,13 +461,46 @@ mod tests {
             r#"text(load("r").output);"#,
             r#"store("k", 1); notify("hi");"#,
             "const v = `a ${1 + 1} b`;\ntext(v);",
+            r#"await tools.view_image({path:"/tmp/image.png"});"#,
+            r#"await tools.apply_patch("*** Begin Patch\n*** End Patch");"#,
         ] {
             let call = canonical_exec_script(source);
             assert!(!call.issues_command, "script: {source}");
             assert_eq!(call.tool_input.get("command"), None, "script: {source}");
         }
-        // A computed `tools[...]` access could reach a shell: stay conservative.
+        // A computed `tools[...]` access, an alias, or an unknown member
+        // could reach a shell: stay conservative.
         assert!(canonical_exec_script(r#"text(await tools["exec_command"]({cmd:"sleep 999"}));"#).issues_command);
+        assert!(canonical_exec_script("const t = tools; text(t);").issues_command);
+        assert!(canonical_exec_script(r#"text(await tools.unknown_helper({}));"#).issues_command);
+        assert!(canonical_exec_script("echo hi").issues_command);
+    }
+
+    #[test]
+    fn a_command_inside_a_template_does_not_drop_a_later_command() {
+        let call = canonical_exec_script(concat!(
+            r#"text(`${await tools.exec_command({cmd:"echo hi"})}`);"#,
+            r#" await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("echo hi\nsleep 999")
+        );
+    }
+
+    #[test]
+    fn nested_object_in_a_template_and_division_after_a_brace_still_recover_sleep_999() {
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " text(`${ {a:1} }`); ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = {a:1} / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
     }
 
     #[test]
