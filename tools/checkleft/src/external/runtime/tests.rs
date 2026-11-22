@@ -1662,9 +1662,7 @@ fn fix_apply_no_edits_is_a_no_op() {
 
 #[test]
 fn component_checks_read_base_files_once_only_when_consumed_and_pass_ignore_working_copy() {
-    use std::collections::HashMap;
     use std::path::Path;
-    use std::sync::Mutex;
 
     use crate::external::{
         BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
@@ -1672,70 +1670,8 @@ fn component_checks_read_base_files_once_only_when_consumed_and_pass_ignore_work
     use crate::source_tree::BaseCommandRunner;
     use crate::vcs::BaseRevision;
 
-    struct CountingJjRunner {
-        base_contents: HashMap<PathBuf, Vec<u8>>,
-        calls: Mutex<Vec<(String, Vec<String>)>>,
-    }
-
-    impl BaseCommandRunner for CountingJjRunner {
-        fn run(&self, _root: &Path, binary: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((binary.to_owned(), args.iter().map(|s| (*s).to_owned()).collect()));
-            let path = args.last().map(PathBuf::from).unwrap_or_default();
-            self.base_contents
-                .get(&path)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing base file {}", path.display()))
-        }
-    }
-
     let temp = tempdir().expect("temp dir");
-    fs::create_dir_all(temp.path().join("api")).expect("create api dir");
-    // Modified proto: field `old_name` (tag 1) removed without reservation.
-    fs::write(
-        temp.path().join("api/modified.proto"),
-        "syntax = \"proto3\"; package p; message M {}\n",
-    )
-    .unwrap();
-    // Renamed proto (from api/old_renamed.proto -> api/new_renamed.proto): field tag 1 removed.
-    fs::write(
-        temp.path().join("api/new_renamed.proto"),
-        "syntax = \"proto3\"; package p; message R {}\n",
-    )
-    .unwrap();
-    // Added proto: new file, no base read needed.
-    fs::write(
-        temp.path().join("api/added.proto"),
-        "syntax = \"proto3\"; package p; message Added { string id = 1; }\n",
-    )
-    .unwrap();
-    // Modified rs file with removed LINT.IfChange block and unupdated target.
-    fs::write(temp.path().join("changed.rs"), "pub fn updated() {}\n").unwrap();
-    fs::write(temp.path().join("companion.txt"), "unchanged\n").unwrap();
-
-    let runner = Arc::new(CountingJjRunner {
-        base_contents: HashMap::from([
-            (
-                PathBuf::from("api/modified.proto"),
-                b"syntax = \"proto3\"; package p; message M { string x = 1; }\n".to_vec(),
-            ),
-            (
-                PathBuf::from("api/deleted.proto"),
-                b"syntax = \"proto3\"; package p; message Gone {}\n".to_vec(),
-            ),
-            (
-                PathBuf::from("api/old_renamed.proto"),
-                b"syntax = \"proto3\"; package p; message R { int32 old_id = 1; }\n".to_vec(),
-            ),
-            (
-                PathBuf::from("changed.rs"),
-                b"// LINT.IfChange\npub fn old() {}\n// LINT.ThenChange(companion.txt)\n".to_vec(),
-            ),
-        ]),
-        calls: Mutex::new(Vec::new()),
-    });
+    let (runner, changeset) = crate::external::test_support::base_reads_fixture(temp.path());
 
     let tree = LocalSourceTree::with_base_command_runner(
         temp.path(),
@@ -1743,48 +1679,6 @@ fn component_checks_read_base_files_once_only_when_consumed_and_pass_ignore_work
         Arc::clone(&runner) as Arc<dyn BaseCommandRunner>,
     )
     .expect("create tree");
-
-    let changeset = ChangeSet::new(vec![
-        ChangedFile {
-            path: "api/modified.proto".into(),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        },
-        ChangedFile {
-            path: "api/deleted.proto".into(),
-            kind: ChangeKind::Deleted,
-            old_path: None,
-        },
-        ChangedFile {
-            path: "api/new_renamed.proto".into(),
-            kind: ChangeKind::Renamed,
-            old_path: Some("api/old_renamed.proto".into()),
-        },
-        ChangedFile {
-            path: "api/added.proto".into(),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-        ChangedFile {
-            path: "changed.rs".into(),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        },
-    ])
-    .with_file_diff(
-        PathBuf::from("changed.rs"),
-        FileDiff {
-            hunks: vec![DiffHunk {
-                old_start: 1,
-                old_lines: 3,
-                new_start: 1,
-                new_lines: 1,
-                added_lines: 1,
-                removed_lines: 3,
-            }],
-            added_line_ranges: vec![(1, 1)],
-        },
-    );
 
     let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
     let empty_config = toml::Value::Table(Default::default());
@@ -1807,9 +1701,9 @@ fn component_checks_read_base_files_once_only_when_consumed_and_pass_ignore_work
             .unwrap_or_else(|err| panic!("{check_name} failed: {err:#}"));
     }
     assert!(
-        runner.calls.lock().unwrap().is_empty(),
+        runner.calls().is_empty(),
         "non-base checks must not invoke jj for base files; got: {:?}",
-        runner.calls.lock().unwrap()
+        runner.calls()
     );
 
     // Checks that declare `needs_base_files = true` read each base file once across both checks,
@@ -1847,31 +1741,16 @@ fn component_checks_read_base_files_once_only_when_consumed_and_pass_ignore_work
         )
         .expect("file/ifchange");
 
-    let calls = runner.calls.lock().unwrap().clone();
     // 4 non-added files (`api/modified.proto`, `api/deleted.proto`, `api/old_renamed.proto`, `changed.rs`)
     // read exactly once each across all 7 checks (not 4 * 7 = 28).
-    assert_eq!(calls.len(), 4, "expected 4 unique base reads, got: {calls:?}");
-    let read_paths: std::collections::HashSet<&str> = calls
-        .iter()
-        .map(|(bin, args)| {
-            assert_eq!(bin, "jj");
-            assert_eq!(
-                &args[..4],
-                ["file", "show", "--ignore-working-copy", "-r"],
-                "every base jj read must pass --ignore-working-copy"
-            );
-            assert_eq!(args[4], "base-sha");
-            args[5].as_str()
-        })
-        .collect();
-    assert_eq!(
-        read_paths,
-        std::collections::HashSet::from([
+    runner.assert_jj_base_reads(
+        "base-sha",
+        &[
             "api/modified.proto",
             "api/deleted.proto",
             "api/old_renamed.proto",
             "changed.rs",
-        ])
+        ],
     );
 
     // Verify base contents reached proto/breaking for modified, deleted, and renamed files.

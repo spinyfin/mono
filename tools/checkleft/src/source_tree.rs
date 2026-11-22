@@ -14,7 +14,7 @@ use crate::path::validate_relative_path;
 use crate::vcs::BaseRevision;
 
 /// Runs VCS commands to read base-revision file contents.
-pub trait BaseCommandRunner: Send + Sync {
+pub(crate) trait BaseCommandRunner: Send + Sync {
     fn run(&self, root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>>;
 }
 
@@ -55,7 +55,7 @@ impl LocalSourceTree {
 
     /// Like [`with_base_revision`] but injects the VCS command runner used for
     /// base-revision file reads.
-    pub fn with_base_command_runner(
+    pub(crate) fn with_base_command_runner(
         root: impl Into<PathBuf>,
         base_revision: impl Into<Option<BaseRevision>>,
         command_runner: Arc<dyn BaseCommandRunner>,
@@ -344,58 +344,23 @@ fn run_bytes_command(root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    use anyhow::Result;
     use tempfile::tempdir;
 
     use super::{BaseCommandRunner, LocalSourceTree};
+    use crate::external::test_support::RecordingBaseCommandRunner;
     use crate::input::{SourceTree, TreeVersion};
     use crate::vcs::BaseRevision;
-
-    struct RecordingCommandRunner {
-        responses: HashMap<PathBuf, Vec<u8>>,
-        calls: Mutex<Vec<(String, Vec<String>)>>,
-    }
-
-    impl RecordingCommandRunner {
-        fn new(responses: Vec<(&str, &[u8])>) -> Self {
-            Self {
-                responses: responses
-                    .into_iter()
-                    .map(|(path, bytes)| (PathBuf::from(path), bytes.to_vec()))
-                    .collect(),
-                calls: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn calls(&self) -> Vec<(String, Vec<String>)> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl BaseCommandRunner for RecordingCommandRunner {
-        fn run(&self, _root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((binary.to_owned(), args.iter().map(|s| (*s).to_owned()).collect()));
-            let path = args.last().map(PathBuf::from).unwrap_or_default();
-            self.responses
-                .get(&path)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing base file {}", path.display()))
-        }
-    }
 
     #[test]
     fn jj_base_reads_pass_ignore_working_copy_and_memoize_per_path() {
         let temp = tempdir().expect("create temp dir");
-        let runner = Arc::new(RecordingCommandRunner::new(vec![
+        let runner = Arc::new(RecordingBaseCommandRunner::new(vec![
             ("a.rs", b"base a"),
             ("b.rs", b"base b"),
             ("old/c.rs", b"base c"),
@@ -433,17 +398,7 @@ mod tests {
             }
         });
 
-        let calls = runner.calls();
-        assert_eq!(
-            calls.len(),
-            4,
-            "expected 1 jj invocation per unique path, got: {calls:?}"
-        );
-        for (binary, args) in &calls {
-            assert_eq!(binary, "jj");
-            assert_eq!(&args[..4], ["file", "show", "--ignore-working-copy", "-r"]);
-            assert_eq!(args[4], "@-");
-        }
+        runner.assert_jj_base_reads("@-", &["a.rs", "b.rs", "old/c.rs", "missing.rs"]);
     }
 
     #[test]

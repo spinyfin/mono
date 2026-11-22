@@ -836,19 +836,17 @@ fn lift_access_scope(scope: Option<&wit_types::AccessScope>) -> Option<AccessSco
 /// essentially free — it just maps the WIT variant. For `declared-files`, it
 /// instantiates the component with a changeset-only sandbox, calls the export,
 /// and returns an `ExplicitFiles` scope built from the returned paths.
-#[allow(clippy::too_many_arguments)]
 fn resolve_access_scope(
     engine: &Engine,
     linker: &Linker<HostState>,
     ceiling: &HostCeiling,
     run: &ComponentRun<'_>,
-    wit_scope: Option<&wit_types::AccessScope>,
-    needs_base_files: bool,
+    descriptor: &wit_types::CheckDescriptor,
     max_memory_bytes: usize,
     timeout_ticks: u64,
 ) -> Result<(AccessScope, Option<wit_types::ChangeSet>)> {
     // Handle the static scopes first — no component call needed.
-    if let Some(static_scope) = lift_access_scope(wit_scope) {
+    if let Some(static_scope) = lift_access_scope(descriptor.access_scope.as_ref()) {
         return Ok((static_scope, None));
     }
 
@@ -868,7 +866,7 @@ fn resolve_access_scope(
     // starting the guest deadline, including for declared-files discovery.
     let config_json =
         serde_json::to_string(run.config).context("failed to serialize config for declare-required-files")?;
-    let wit_changeset = lower_changeset(run.changeset, run.source_tree, needs_base_files);
+    let wit_changeset = lower_changeset(run.changeset, run.source_tree, descriptor.needs_base_files);
     let host_state = HostState::with_sandbox_root(temp_sandbox.root.path(), max_memory_bytes).with_context(|| {
         format!(
             "failed to configure WASI context for declare-required-files in check `{}`",
@@ -990,8 +988,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         &linker,
         &ceiling,
         &run,
-        descriptor.access_scope.as_ref(),
-        needs_base_files,
+        &descriptor,
         max_memory_bytes,
         timeout_ticks,
     )

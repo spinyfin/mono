@@ -1472,25 +1472,6 @@ async fn runner_reads_each_base_file_once_across_parallel_external_checks() {
     use crate::source_tree::BaseCommandRunner;
     use crate::vcs::BaseRevision;
 
-    struct CountingJjRunner {
-        base_contents: std::collections::HashMap<PathBuf, Vec<u8>>,
-        calls: Mutex<Vec<(String, Vec<String>)>>,
-    }
-
-    impl BaseCommandRunner for CountingJjRunner {
-        fn run(&self, _root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((binary.to_owned(), args.iter().map(|s| (*s).to_owned()).collect()));
-            let path = args.last().map(PathBuf::from).unwrap_or_default();
-            self.base_contents
-                .get(&path)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing base file {}", path.display()))
-        }
-    }
-
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.yaml"),
@@ -1507,46 +1488,7 @@ async fn runner_reads_each_base_file_once_across_parallel_external_checks() {
     )
     .expect("write config");
 
-    fs::create_dir_all(temp.path().join("api")).expect("create api dir");
-    fs::write(
-        temp.path().join("api/modified.proto"),
-        "syntax = \"proto3\"; package p; message M {}\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("api/new_renamed.proto"),
-        "syntax = \"proto3\"; package p; message R {}\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("api/added.proto"),
-        "syntax = \"proto3\"; package p; message Added { string id = 1; }\n",
-    )
-    .unwrap();
-    fs::write(temp.path().join("changed.rs"), "pub fn updated() {}\n").unwrap();
-    fs::write(temp.path().join("companion.txt"), "unchanged\n").unwrap();
-
-    let jj_runner = Arc::new(CountingJjRunner {
-        base_contents: std::collections::HashMap::from([
-            (
-                PathBuf::from("api/modified.proto"),
-                b"syntax = \"proto3\"; package p; message M { string x = 1; }\n".to_vec(),
-            ),
-            (
-                PathBuf::from("api/deleted.proto"),
-                b"syntax = \"proto3\"; package p; message Gone {}\n".to_vec(),
-            ),
-            (
-                PathBuf::from("api/old_renamed.proto"),
-                b"syntax = \"proto3\"; package p; message R { int32 old_id = 1; }\n".to_vec(),
-            ),
-            (
-                PathBuf::from("changed.rs"),
-                b"// LINT.IfChange\npub fn old() {}\n// LINT.ThenChange(companion.txt)\n".to_vec(),
-            ),
-        ]),
-        calls: Mutex::new(Vec::new()),
-    });
+    let (jj_runner, changeset) = crate::external::test_support::base_reads_fixture(temp.path());
 
     let source_tree = Arc::new(
         LocalSourceTree::with_base_command_runner(
@@ -1565,64 +1507,17 @@ async fn runner_reads_each_base_file_once_across_parallel_external_checks() {
         shared_builder_audit_executor(),
     );
 
-    let changeset = ChangeSet::new(vec![
-        ChangedFile {
-            path: PathBuf::from("api/modified.proto"),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("api/deleted.proto"),
-            kind: ChangeKind::Deleted,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("api/new_renamed.proto"),
-            kind: ChangeKind::Renamed,
-            old_path: Some(PathBuf::from("api/old_renamed.proto")),
-        },
-        ChangedFile {
-            path: PathBuf::from("api/added.proto"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("changed.rs"),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        },
-    ])
-    .with_file_diff(
-        PathBuf::from("changed.rs"),
-        crate::input::FileDiff {
-            hunks: vec![crate::input::DiffHunk {
-                old_start: 1,
-                old_lines: 3,
-                new_start: 1,
-                new_lines: 1,
-                added_lines: 1,
-                removed_lines: 3,
-            }],
-            added_line_ranges: vec![(1, 1)],
-        },
-    );
-
     let results = runner.run_changeset(&changeset).await.expect("run checks");
 
-    let calls = jj_runner.calls.lock().unwrap().clone();
-    assert_eq!(
-        calls.len(),
-        4,
-        "each non-added base file must be read once across all 5 parallel checks, got: {calls:?}"
+    jj_runner.assert_jj_base_reads(
+        "@-",
+        &[
+            "api/modified.proto",
+            "api/deleted.proto",
+            "api/old_renamed.proto",
+            "changed.rs",
+        ],
     );
-    for (binary, args) in &calls {
-        assert_eq!(binary, "jj");
-        assert_eq!(
-            &args[..4],
-            ["file", "show", "--ignore-working-copy", "-r"],
-            "every base jj read must pass --ignore-working-copy"
-        );
-    }
 
     let proto_msgs: Vec<&str> = results
         .iter()

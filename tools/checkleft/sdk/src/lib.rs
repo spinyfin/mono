@@ -115,8 +115,12 @@ pub struct ChangeSet {
     /// renamed file's entry is keyed by its `old_path`, the path that existed
     /// at the base revision.
     ///
-    /// Empty when no base revision is available (e.g. `--all` mode). Checks
-    /// should handle the absent case by skipping base-revision enforcement.
+    /// Populated only when the check descriptor declares `needs_base_files = true`
+    /// in `#[check(...)]` (`needs-base-files` in WIT) and a base revision is
+    /// available (e.g. not `--all` mode). A check that reads base contents must
+    /// set `needs_base_files = true`; otherwise this list is always empty. Checks
+    /// should also handle the absent case (such as `--all` mode) by skipping
+    /// base-revision enforcement.
     pub base_files: Vec<BaseFile>,
     /// True when this changeset is the full tracked-tree scan produced by
     /// `checkleft run --all`. Every tracked file is listed as Modified with no
@@ -127,6 +131,10 @@ pub struct ChangeSet {
 
 impl ChangeSet {
     /// Return the base-revision content for `path`, or `None` when not available.
+    ///
+    /// Only populated when the check descriptor declares `needs_base_files = true`
+    /// (`needs-base-files` in WIT) and a base revision is available. Checks that
+    /// call this method must set `needs_base_files = true` in `#[check(...)]`.
     pub fn base_file_content(&self, path: &str) -> Option<&str> {
         self.base_files
             .iter()
@@ -135,8 +143,12 @@ impl ChangeSet {
     }
 
     /// Return the base-revision content of `file`, looking under its
-    /// `old_path` when it was renamed, or `None` when not available (an added
-    /// file, `--all` mode, or a base the host could not read).
+    /// `old_path` when it was renamed, or `None` when not available (`needs_base_files`
+    /// not declared, an added file, `--all` mode, or a base the host could not read).
+    ///
+    /// Checks that call this method must set `needs_base_files = true` in
+    /// `#[check(...)]` (`needs-base-files` in WIT); otherwise `base_files` is empty
+    /// and this always returns `None`.
     pub fn base_content_for(&self, file: &ChangedFile) -> Option<&str> {
         let base_path = match (&file.kind, &file.old_path) {
             (ChangeKind::Renamed, Some(old_path)) => old_path.as_str(),

@@ -9,9 +9,14 @@
 //! pushed `checkleft_lib_test` toward its 60 s `size = "small"` timeout — see
 //! `docs/investigations/checkleft-lib-test-wasm-compile-timeout.md`.
 
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use super::DefaultExternalCheckExecutor;
+use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff};
+use crate::source_tree::BaseCommandRunner;
 
 /// Whether a staged runfiles path is expected to be a regular file (a binary)
 /// or a directory (a fixture tree). Distinguishes the `exists()` vs `is_dir()`
@@ -90,4 +95,157 @@ pub(crate) fn executor_with_precompiled_cache(root: &Path) -> DefaultExternalChe
         }
         None => DefaultExternalCheckExecutor::new(root).expect("executor"),
     }
+}
+
+/// Test double for [`BaseCommandRunner`] that records `(binary, args)` calls
+/// and serves canned responses keyed by the path argument.
+pub(crate) struct RecordingBaseCommandRunner {
+    responses: HashMap<PathBuf, Vec<u8>>,
+    calls: Mutex<Vec<(String, Vec<String>)>>,
+}
+
+impl RecordingBaseCommandRunner {
+    pub(crate) fn new(responses: Vec<(&str, &[u8])>) -> Self {
+        Self {
+            responses: responses
+                .into_iter()
+                .map(|(path, bytes)| (PathBuf::from(path), bytes.to_vec()))
+                .collect(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn calls(&self) -> Vec<(String, Vec<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn assert_jj_base_reads(&self, expected_rev: &str, expected_paths: &[&str]) {
+        let calls = self.calls();
+        assert_eq!(
+            calls.len(),
+            expected_paths.len(),
+            "expected {} unique jj base reads, got: {calls:?}",
+            expected_paths.len()
+        );
+        let read_paths: HashSet<&str> = calls
+            .iter()
+            .map(|(binary, args)| {
+                assert_eq!(binary, "jj");
+                assert_eq!(
+                    &args[..4],
+                    ["file", "show", "--ignore-working-copy", "-r"],
+                    "every base jj read must pass --ignore-working-copy"
+                );
+                assert_eq!(args[4], expected_rev);
+                args[5].as_str()
+            })
+            .collect();
+        let expected: HashSet<&str> = expected_paths.iter().copied().collect();
+        assert_eq!(read_paths, expected);
+    }
+}
+
+impl BaseCommandRunner for RecordingBaseCommandRunner {
+    fn run(&self, _root: &Path, binary: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((binary.to_owned(), args.iter().map(|s| (*s).to_owned()).collect()));
+        let path = args.last().map(PathBuf::from).unwrap_or_default();
+        self.responses
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing base file {}", path.display()))
+    }
+}
+
+/// Shared fixture for tests verifying base-file read deduplication across
+/// `proto/breaking` (modified, deleted, renamed, added) and `file/ifchange`
+/// (`declared-files` scope).
+pub(crate) fn base_reads_fixture(root: &Path) -> (Arc<RecordingBaseCommandRunner>, ChangeSet) {
+    fs::create_dir_all(root.join("api")).expect("create api dir");
+    // Modified proto: field `old_name` (tag 1) removed without reservation.
+    fs::write(
+        root.join("api/modified.proto"),
+        "syntax = \"proto3\"; package p; message M {}\n",
+    )
+    .unwrap();
+    // Renamed proto (from api/old_renamed.proto -> api/new_renamed.proto): field tag 1 removed.
+    fs::write(
+        root.join("api/new_renamed.proto"),
+        "syntax = \"proto3\"; package p; message R {}\n",
+    )
+    .unwrap();
+    // Added proto: new file, no base read needed.
+    fs::write(
+        root.join("api/added.proto"),
+        "syntax = \"proto3\"; package p; message Added { string id = 1; }\n",
+    )
+    .unwrap();
+    // Modified rs file with removed LINT.IfChange block and unupdated target.
+    fs::write(root.join("changed.rs"), "pub fn updated() {}\n").unwrap();
+    fs::write(root.join("companion.txt"), "unchanged\n").unwrap();
+
+    let runner = Arc::new(RecordingBaseCommandRunner::new(vec![
+        (
+            "api/modified.proto",
+            b"syntax = \"proto3\"; package p; message M { string x = 1; }\n",
+        ),
+        (
+            "api/deleted.proto",
+            b"syntax = \"proto3\"; package p; message Gone {}\n",
+        ),
+        (
+            "api/old_renamed.proto",
+            b"syntax = \"proto3\"; package p; message R { int32 old_id = 1; }\n",
+        ),
+        (
+            "changed.rs",
+            b"// LINT.IfChange\npub fn old() {}\n// LINT.ThenChange(companion.txt)\n",
+        ),
+    ]));
+
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: PathBuf::from("api/modified.proto"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: PathBuf::from("api/deleted.proto"),
+            kind: ChangeKind::Deleted,
+            old_path: None,
+        },
+        ChangedFile {
+            path: PathBuf::from("api/new_renamed.proto"),
+            kind: ChangeKind::Renamed,
+            old_path: Some(PathBuf::from("api/old_renamed.proto")),
+        },
+        ChangedFile {
+            path: PathBuf::from("api/added.proto"),
+            kind: ChangeKind::Added,
+            old_path: None,
+        },
+        ChangedFile {
+            path: PathBuf::from("changed.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ])
+    .with_file_diff(
+        PathBuf::from("changed.rs"),
+        FileDiff {
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 3,
+                new_start: 1,
+                new_lines: 1,
+                added_lines: 1,
+                removed_lines: 3,
+            }],
+            added_line_ranges: vec![(1, 1)],
+        },
+    );
+
+    (runner, changeset)
 }
