@@ -208,21 +208,21 @@ def _build_info_rs_impl(ctx):
     # those values live in build_provenance_rs (a leaf crate only the engine
     # binaries link). See that rule's doc comment.
     if is_stamping_enabled(ctx):
-        info_file = ctx.info_file
+        info_file = ctx.file.status_file if ctx.attr.status_file else ctx.info_file
+        tmpl = ctx.actions.declare_file(ctx.attr.out + ".tmpl")
+        ctx.actions.write(
+            output = tmpl,
+            content = _build_info_rs_source("@BOSS_VERSION@"),
+        )
         command = (
             "set -euo pipefail\n" +
             "VERSION=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
             " | cut -d' ' -f2 2>/dev/null || true)\n" +
             "[ -z \"$VERSION\" ] && VERSION=unknown\n" +
-            "printf 'pub const BOSS_VERSION: &str = \"%s\";\\n" +
-            "#[allow(dead_code)]\\n" +
-            "pub const BOSS_GIT_SHA: &str = \"unknown\";\\n" +
-            "#[allow(dead_code)]\\n" +
-            "pub const BOSS_BUILD_TIME: &str = \"unknown\";\\n' " +
-            "\"$VERSION\" > " + output.path + "\n"
+            "sed \"s|@BOSS_VERSION@|${VERSION}|g\" " + tmpl.path + " > " + output.path + "\n"
         )
         ctx.actions.run_shell(
-            inputs = [info_file],
+            inputs = [tmpl, info_file],
             outputs = [output],
             command = command,
             mnemonic = "BuildInfoRs",
@@ -242,6 +242,10 @@ build_info_rs = rule(
         "out": attr.string(
             mandatory = True,
             doc = "Output filename for the generated Rust source file.",
+        ),
+        "status_file": attr.label(
+            allow_single_file = True,
+            doc = "Optional test fixture overriding ctx.info_file when stamped.",
         ),
     }),
     doc = """
@@ -284,14 +288,24 @@ def _build_provenance_rs_impl(ctx):
     # values appear in the live-status debug report.
     #
     # VERSION is STABLE_BOSS_VERSION (`1.0.N` on a release tag, `1.0.N-dev-<sha>`
-    # otherwise). It already changes every commit on a dev build, so stamping
-    # it here does not add cache churn beyond GIT_SHA. Empty / `0.0.0` fall
-    # back to `unknown` — never the Cargo-crate placeholder.
+    # otherwise) when `--stamp` is set, and UNSTAMPED_BOSS_VERSION (`0.0.0-dev`)
+    # when unstamped so the tag-derived version only reaches release binaries.
+    # SHA, dirty, and build-time are always populated here because this leaf
+    # crate already changes every commit/build and is isolated to the engine
+    # binaries. Empty / `0.0.0` when stamped fall back to `unknown` — never
+    # the Cargo-crate placeholder.
+    if is_stamping_enabled(ctx):
+        version_cmd = (
+            "VERSION=$(grep '^STABLE_BOSS_VERSION ' " + ctx.info_file.path +
+            " | cut -d' ' -f2 2>/dev/null || true)\n" +
+            "if [ -z \"$VERSION\" ] || [ \"$VERSION\" = \"0.0.0\" ]; then VERSION=unknown; fi\n"
+        )
+    else:
+        version_cmd = "VERSION=\"" + UNSTAMPED_BOSS_VERSION + "\"\n"
+
     command = (
         "set -euo pipefail\n" +
-        "VERSION=$(grep '^STABLE_BOSS_VERSION ' " + ctx.info_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "if [ -z \"$VERSION\" ] || [ \"$VERSION\" = \"0.0.0\" ]; then VERSION=unknown; fi\n" +
+        version_cmd +
         "SHA=$(grep '^STABLE_BOSS_GIT_SHA_FULL ' " + ctx.info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
@@ -320,17 +334,17 @@ def _build_provenance_rs_impl(ctx):
 
 build_provenance_rs = rule(
     implementation = _build_provenance_rs_impl,
-    attrs = {
+    attrs = attrs_with_stamp({
         "out": attr.string(
             mandatory = True,
             doc = "Output filename for the generated Rust source file.",
         ),
-    },
+    }),
     doc = """
-Generates a Rust source file containing the engine's real build provenance.
+Generates a Rust source file containing the engine's build provenance.
 
 Emits:
-  pub const VERSION: &str = "<1.0.N or 1.0.N-dev-<sha>, else unknown>";
+  pub const VERSION: &str = "0.0.0-dev" (unstamped) or "<1.0.N or 1.0.N-dev-<sha>, else unknown>" (stamped);
   pub const GIT_SHA: &str = "<full commit sha>";
   pub const GIT_DIRTY: bool = <true|false>;
   pub const BUILD_TIME: &str = "<ISO-8601 UTC>";
@@ -378,7 +392,12 @@ def _boss_short_version_plist_impl(ctx):
     # BossFullVersion key; the macOS app reads it via Bundle.main and passes
     # it to orderFrontStandardAboutPanel(options:).
     if is_stamping_enabled(ctx):
-        info_file = ctx.info_file
+        info_file = ctx.file.status_file if ctx.attr.status_file else ctx.info_file
+        tmpl = ctx.actions.declare_file(ctx.attr.out + ".tmpl")
+        ctx.actions.write(
+            output = tmpl,
+            content = _boss_version_plist_xml("@BOSS_BASE_VERSION@", "@BOSS_FULL_VERSION@"),
+        )
         command = (
             "set -euo pipefail\n" +
             "V=$(grep '^STABLE_BOSS_VERSION ' " + info_file.path +
@@ -387,17 +406,11 @@ def _boss_short_version_plist_impl(ctx):
             " | cut -d' ' -f2 2>/dev/null || true)\n" +
             "[ -z \"$V\" ] && V=dev\n" +
             "[ -z \"$B\" ] && B=0.0.0\n" +
-            "printf '<?xml version=\"1.0\" encoding=\"UTF-8\"?>\\n" +
-            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"" +
-            " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\\n" +
-            "<plist version=\"1.0\"><dict>\\n" +
-            "<key>CFBundleShortVersionString</key><string>%s</string>\\n" +
-            "<key>CFBundleVersion</key><string>%s</string>\\n" +
-            "<key>BossFullVersion</key><string>%s</string>\\n" +
-            "</dict></plist>\\n' \"$B\" \"$B\" \"$V\" > " + output.path + "\n"
+            "sed -e \"s|@BOSS_BASE_VERSION@|${B}|g\" -e \"s|@BOSS_FULL_VERSION@|${V}|g\" " +
+            tmpl.path + " > " + output.path + "\n"
         )
         ctx.actions.run_shell(
-            inputs = [info_file],
+            inputs = [tmpl, info_file],
             outputs = [output],
             command = command,
             mnemonic = "BossShortVersionPlist",
@@ -420,6 +433,10 @@ boss_short_version_plist = rule(
         "out": attr.string(
             mandatory = True,
             doc = "Output filename for the generated plist fragment.",
+        ),
+        "status_file": attr.label(
+            allow_single_file = True,
+            doc = "Optional test fixture overriding ctx.info_file when stamped.",
         ),
     }),
     doc = """

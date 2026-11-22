@@ -6,7 +6,7 @@ load(
     "ENGINE_BINARY_NAME",
 )
 load(":pkg.bzl", "boss_pkg_payload", "boss_pkg_unsigned", "boss_short_version_plist", "build_info_rs", "build_provenance_rs")
-load(":stamp.bzl", "stamp_flag")
+load(":stamp.bzl", "stamp_flag", "stamp_inputs_analysis_test")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -113,6 +113,15 @@ build_info_rs(
     visibility = ["//tools/boss:__subpackages__"],
 )
 
+# Deterministic stable-status fixture for build_info_stamp_test so stamped
+# assertions verify exact tag-derived values regardless of local git tags.
+genrule(
+    name = "stable_status_fixture",
+    testonly = True,
+    outs = ["stable_status_fixture.txt"],
+    cmd = "printf 'STABLE_BOSS_BASE_VERSION 1.0.42\\nSTABLE_BOSS_VERSION 1.0.42-dev-abc1234\\n' > $@",
+)
+
 # Always-stamped sibling of :build_info_rs, used only by
 # build_info_stamp_test to assert a --stamp build embeds the tag-derived
 # version rather than the placeholder. Not on the library/test graph.
@@ -121,6 +130,7 @@ build_info_rs(
     testonly = True,
     out = "build_info_stamped.rs",
     stamp = 1,
+    status_file = ":stable_status_fixture",
 )
 
 # Plist counterparts of the two build_info_rs targets above. The
@@ -131,7 +141,6 @@ boss_short_version_plist(
     name = "version_plist_unstamped",
     testonly = True,
     out = "BossVersionUnstamped.plist",
-    stamp = 0,
 )
 
 boss_short_version_plist(
@@ -139,6 +148,7 @@ boss_short_version_plist(
     testonly = True,
     out = "BossVersionStamped.plist",
     stamp = 1,
+    status_file = ":stable_status_fixture",
 )
 
 sh_test(
@@ -152,15 +162,60 @@ sh_test(
         "$(location :version_plist_stamped)",
         "$(location //tools/boss/cli:boss)",
         "$(location //tools/boss/bossctl)",
+        "$(location :build_provenance_rs)",
     ],
     data = [
         ":build_info_rs",
         ":build_info_rs_stamped",
+        ":build_provenance_rs",
         ":version_plist_stamped",
         ":version_plist_unstamped",
         "//tools/boss/bossctl",
         "//tools/boss/cli:boss",
     ],
+)
+
+# Positive-control targets for stamp_inputs_analysis_test (reading real
+# stable-status.txt rather than the test fixture).
+build_info_rs(
+    name = "build_info_rs_stamped_default_status",
+    testonly = True,
+    out = "build_info_stamped_default_status.rs",
+    stamp = 1,
+)
+
+boss_short_version_plist(
+    name = "version_plist_stamped_default_status",
+    testonly = True,
+    out = "BossVersionStampedDefaultStatus.plist",
+    stamp = 1,
+)
+
+# Structural regression guards: unstamped build_info_rs and version plist
+# must never take stable-status.txt as an action input (tag-change cache
+# stability); stamped counterparts must (positive control).
+stamp_inputs_analysis_test(
+    name = "build_info_rs_unstamped_no_status_input_test",
+    expect_stable_status = False,
+    target_under_test = ":build_info_rs",
+)
+
+stamp_inputs_analysis_test(
+    name = "version_plist_unstamped_no_status_input_test",
+    expect_stable_status = False,
+    target_under_test = ":version_plist_unstamped",
+)
+
+stamp_inputs_analysis_test(
+    name = "build_info_rs_stamped_has_status_input_test",
+    expect_stable_status = True,
+    target_under_test = ":build_info_rs_stamped_default_status",
+)
+
+stamp_inputs_analysis_test(
+    name = "version_plist_stamped_has_status_input_test",
+    expect_stable_status = True,
+    target_under_test = ":version_plist_stamped_default_status",
 )
 
 # Stamped Rust constants file consumed ONLY by the `boss-build-provenance`

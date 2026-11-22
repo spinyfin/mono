@@ -103,8 +103,8 @@ fi
 # commit, or every release tag busts the Rust action cache and forces a full
 # recompile of those crates and their tests. The SHA and full version remain
 # here for packaging and for the leaf provenance crate, which are cheap and
-# do not recompile engine_lib. (A wall-clock STABLE_BOSS_BUILD_TIME used to
-# live here; it was the prime offender and has been removed.)
+# do not recompile engine_lib. Wall-clock build time goes to volatile-status
+# (BOSS_BUILD_TIME), never stable-status.
 #
 # STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY are read ONLY by
 # `build_provenance_rs`, which stamps its own dedicated, single-purpose

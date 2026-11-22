@@ -317,6 +317,18 @@ final class UpdateCheckerTests: XCTestCase {
         }
     }
 
+    /// Unstamped builds (0.0.0-dev-unstamped) have no tag-derived version and
+    /// report up-to-date instead of showing a permanent update badge.
+    func testUnstampedBuildReportsUpToDate() async {
+        let checker = makeChecker(
+            current: "0.0.0",
+            fullVersion: "0.0.0-dev-unstamped",
+            releases: [release(tag: "boss-v1.0.28")]
+        )
+        let result = await checker.checkForUpdates()
+        XCTAssertEqual(result, .upToDate)
+    }
+
     // MARK: Request headers
 
     func testSetsRequiredRequestHeaders() async throws {

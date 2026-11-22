@@ -73,3 +73,31 @@ def attrs_with_stamp(attrs):
     merged = dict(attrs)
     merged.update(STAMP_ATTRS)
     return merged
+
+def _stamp_inputs_analysis_test_impl(ctx):
+    target = ctx.attr.target_under_test
+    expect_stable_status = ctx.attr.expect_stable_status
+    has_stable_status = False
+    for action in target.actions:
+        for f in action.inputs.to_list():
+            if f.basename == "stable-status.txt":
+                has_stable_status = True
+                break
+    if has_stable_status != expect_stable_status:
+        msg = "expected stable-status.txt input=%s for %s, got %s" % (
+            expect_stable_status,
+            target.label,
+            has_stable_status,
+        )
+        return [AnalysisTestResultInfo(success = False, message = msg)]
+    return [AnalysisTestResultInfo(success = True, message = "OK")]
+
+stamp_inputs_analysis_test = rule(
+    implementation = _stamp_inputs_analysis_test_impl,
+    analysis_test = True,
+    attrs = {
+        "target_under_test": attr.label(mandatory = True),
+        "expect_stable_status": attr.bool(mandatory = True),
+    },
+    doc = "Asserts whether target_under_test's actions take stable-status.txt as an input.",
+)

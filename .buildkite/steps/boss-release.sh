@@ -144,6 +144,40 @@ fi
 [[ -f "${ZIP_PATH}" ]] || die "Boss.zip not found at discovered path: ${ZIP_PATH}"
 echo "[boss-release] Boss.zip: ${ZIP_PATH}"
 
+# ── verify stamped version in Boss.zip ───────────────────────────────────────
+# Release correctness depends on --config=release flipping the stamp_flag select
+# so Boss.app's Info.plist and bundled binaries embed the tag-derived version
+# instead of the unstamped 0.0.0-dev placeholder. Verify the zip before upload.
+log "[boss-release] verifying stamped version in Boss.zip"
+EXPECTED_VERSION="${TAG#boss-v}"
+VERIFY_DIR=$(mktemp -d)
+(
+  # Subshell keeps this cleanup trap isolated from ci-env.sh's outer EXIT trap.
+  trap 'rm -rf "${VERIFY_DIR}"' EXIT
+  unzip -q "${ZIP_PATH}" -d "${VERIFY_DIR}"
+
+  APP_PLIST="${VERIFY_DIR}/Boss.app/Contents/Info.plist"
+  [[ -f "${APP_PLIST}" ]] || die "Boss.app/Contents/Info.plist missing from ${ZIP_PATH}"
+
+  for key in CFBundleShortVersionString CFBundleVersion BossFullVersion; do
+    actual=$(plutil -extract "${key}" raw -o - "${APP_PLIST}" 2>/dev/null || true)
+    if [[ "${actual}" != "${EXPECTED_VERSION}" ]] || [[ "${actual}" == *-dev-* ]]; then
+      die "Version mismatch in ${APP_PLIST} for ${key}: got '${actual}', expected '${EXPECTED_VERSION}' (no -dev-)"
+    fi
+  done
+
+  actual_boss_ver=$("${VERIFY_DIR}/Boss.app/Contents/Resources/bin/boss" --version)
+  if [[ "${actual_boss_ver}" != "boss ${EXPECTED_VERSION}" ]]; then
+    die "Version mismatch for bundled boss --version: got '${actual_boss_ver}', expected 'boss ${EXPECTED_VERSION}'"
+  fi
+
+  actual_bossctl_ver=$("${VERIFY_DIR}/Boss.app/Contents/Resources/bin/bossctl" --version)
+  if [[ "${actual_bossctl_ver}" != "bossctl ${EXPECTED_VERSION}" ]]; then
+    die "Version mismatch for bundled bossctl --version: got '${actual_bossctl_ver}', expected 'bossctl ${EXPECTED_VERSION}'"
+  fi
+)
+echo "[boss-release] verified version ${EXPECTED_VERSION} in Info.plist, boss, and bossctl"
+
 log "[boss-release] uploading Boss-{version}.zip"
 bin/release upload --config "${CONFIG}" --tag "${TAG}" \
   --asset "Boss-{version}.zip=${ZIP_PATH}"

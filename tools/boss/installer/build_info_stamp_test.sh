@@ -11,11 +11,12 @@
 #
 # Args:
 #   $1 — unstamped build_info_rs (stamp = -1, this test runs --nostamp)
-#   $2 — always-stamped build_info_rs (stamp = 1)
-#   $3 — unstamped version plist (stamp = 0)
-#   $4 — always-stamped version plist (stamp = 1)
+#   $2 — always-stamped build_info_rs (stamp = 1, fed stable_status_fixture)
+#   $3 — unstamped version plist (stamp = -1, this test runs --nostamp)
+#   $4 — always-stamped version plist (stamp = 1, fed stable_status_fixture)
 #   $5 — //tools/boss/cli:boss
 #   $6 — //tools/boss/bossctl
+#   $7 — unstamped build_provenance_rs (stamp = -1, this test runs --nostamp)
 set -euo pipefail
 
 unstamped_rs="$1"
@@ -24,6 +25,7 @@ unstamped_plist="$3"
 stamped_plist="$4"
 boss_bin="$5"
 bossctl_bin="$6"
+unstamped_provenance_rs="$7"
 
 expect_line() {
   local file="$1" line="$2"
@@ -59,14 +61,13 @@ while IFS= read -r line; do
 done <"$stamped_rs"
 stamped_version="${stamped_line#*\"}"
 stamped_version="${stamped_version%%\"*}"
-if [[ -z "$stamped_version" ]]; then
-  echo "ERROR: always-stamped build_info_rs has no BOSS_VERSION: $(<"$stamped_rs")" >&2
+if [[ "$stamped_version" != "1.0.42" ]]; then
+  echo "ERROR: always-stamped build_info_rs BOSS_VERSION was '${stamped_version}', expected '1.0.42'" >&2
+  echo "contents: $(<"$stamped_rs")" >&2
   exit 1
 fi
-if [[ "$stamped_version" == "0.0.0-dev" ]]; then
-  echo "ERROR: always-stamped build_info_rs still has the unstamped placeholder 0.0.0-dev" >&2
-  echo "A --stamp / stamp=1 build must embed STABLE_BOSS_BASE_VERSION." >&2
-  echo "contents: $(<"$stamped_rs")" >&2
+if ! [[ "$stamped_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$stamped_version" == "0.0.0" ]]; then
+  echo "ERROR: stamped BOSS_VERSION '${stamped_version}' is not a valid non-zero semver" >&2
   exit 1
 fi
 
@@ -86,6 +87,23 @@ if grep -q '<string>0.0.0-dev-unstamped</string>' "$stamped_plist"; then
   cat "$stamped_plist" >&2
   exit 1
 fi
+if ! grep -q "<key>CFBundleShortVersionString</key><string>${stamped_version}</string>" "$stamped_plist"; then
+  echo "ERROR: stamped plist CFBundleShortVersionString does not match stamped rs version '${stamped_version}':" >&2
+  cat "$stamped_plist" >&2
+  exit 1
+fi
+if ! grep -q "<key>CFBundleVersion</key><string>${stamped_version}</string>" "$stamped_plist"; then
+  echo "ERROR: stamped plist CFBundleVersion does not match stamped rs version '${stamped_version}':" >&2
+  cat "$stamped_plist" >&2
+  exit 1
+fi
+if ! grep -q "<key>BossFullVersion</key><string>1.0.42-dev-abc1234</string>" "$stamped_plist"; then
+  echo "ERROR: stamped plist BossFullVersion does not match fixture '1.0.42-dev-abc1234':" >&2
+  cat "$stamped_plist" >&2
+  exit 1
+fi
+
+expect_line "$unstamped_provenance_rs" 'pub const VERSION: &str = "0.0.0-dev";'
 
 boss_version="$("$boss_bin" --version)"
 if [[ "$boss_version" != "boss 0.0.0-dev" ]]; then
