@@ -263,10 +263,10 @@ pub(crate) async fn fire_unconfirmed_stop_after_answered_spawn(
     clock
 }
 
-/// Kick until `completed()` reaches `target`, firing `deadline` once per
-/// in-flight command wait. `started` / `completed` are per-execution pass
-/// counters so a no-budget-spend assertion cannot pass without that many
-/// parking/result updates (including local failures that never send).
+/// Kick until `done` is true, firing `deadline` once per in-flight command
+/// wait. `started` / `completed` detect that a pass actually ran this kick;
+/// `done` is the outer stop condition (for example every execution's
+/// completion delta reaching the pre-start budget).
 pub(crate) async fn drive_kicked_deadline_passes(
     kick: impl Fn(),
     mut started: impl FnMut() -> u64,
@@ -274,10 +274,10 @@ pub(crate) async fn drive_kicked_deadline_passes(
     mut waiting: impl FnMut() -> bool,
     mut idle: impl FnMut() -> bool,
     deadline: Duration,
-    target: u64,
+    mut done: impl FnMut() -> bool,
 ) {
     let _clock = (!clock_frozen()).then(FrozenClock::new);
-    while completed() < target {
+    while !done() {
         let start_before = started();
         let complete_before = completed();
         kick();
@@ -315,19 +315,17 @@ pub(crate) async fn drive_kicked_deadline_passes(
     }
 }
 
-/// Advance `interval` until `passes` distinct retry/poll cycles complete.
-/// Each cycle waits for a new pass start, fires any armed command wait,
-/// then waits for that pass's parking/result update (or local failure).
-/// Returns how many cycles completed.
+/// Drive `passes` distinct retry/poll cycles. Each cycle waits for a new
+/// pass start, fires any armed command wait, then waits for that pass's
+/// parking/result update (or local failure).
 pub(crate) async fn drive_poll_deadline_passes(
-    _interval: Duration,
     mut started: impl FnMut() -> u64,
     mut completed: impl FnMut() -> u64,
     mut waiting: impl FnMut() -> bool,
     mut idle: impl FnMut() -> bool,
     deadline: Duration,
     passes: usize,
-) -> usize {
+) {
     let _clock = (!clock_frozen()).then(FrozenClock::new);
     let mut seen = 0;
     while seen < passes {
@@ -366,7 +364,34 @@ pub(crate) async fn drive_poll_deadline_passes(
         .await;
         seen += 1;
     }
-    seen
+}
+
+/// After a restart sweep resumes a live execution, wait until that driver
+/// has started and completed one pass. Fires any armed command deadline
+/// under a frozen clock, and ticks virtual time so prompt-confirmation
+/// timers can fire too. An idle command layer is not evidence of a pass.
+pub(crate) async fn drive_resumed_deadline_pass(
+    mut started: impl FnMut() -> u64,
+    mut completed: impl FnMut() -> u64,
+    mut waiting: impl FnMut() -> bool,
+    deadline: Duration,
+    starts_before: u64,
+    completions_before: u64,
+) {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    until("a resumed pass started", || started() > starts_before).await;
+    let watchdog = std::time::Instant::now();
+    while completed() <= completions_before {
+        assert!(
+            watchdog.elapsed() < WAIT,
+            "timed out waiting for the resumed pass completed parking or a local failure"
+        );
+        if waiting() {
+            elapse(deadline + TICK).await;
+        } else {
+            elapse(TICK).await;
+        }
+    }
 }
 
 struct Authority {

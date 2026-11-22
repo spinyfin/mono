@@ -162,13 +162,18 @@ async fn restarted_unconfirmed_stop_launch_keeps_reconciling() {
     until("launch attention", || attention_open(&fx, &execution.id)).await;
     let next = restarted(&fx, &env.coordinator, 1).await;
     assert!(fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap());
-    let sends_before = fx.provider.command_sends();
+    let starts_before = next.spoke_pass_starts(&execution.id);
+    let completions_before = next.spoke_pass_completions(&execution.id);
     next.reconcile_ended_in_doubt_spokes().await;
-    until("unconfirmed-stop recovery sweep asked the host", || {
-        fx.provider.command_sends() > sends_before || command_idle(&fx)
-    })
+    drive_resumed_deadline_pass(
+        || next.spoke_pass_starts(&execution.id),
+        || next.spoke_pass_completions(&execution.id),
+        || command_waiting(&fx),
+        Duration::from_millis(300),
+        starts_before,
+        completions_before,
+    )
     .await;
-    until("unconfirmed-stop recovery sweep went idle", || command_idle(&fx)).await;
     assert!(attention_open(&fx, &execution.id), "unconfirmed_stop");
     assert!(
         fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap(),

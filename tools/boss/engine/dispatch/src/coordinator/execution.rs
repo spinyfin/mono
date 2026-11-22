@@ -1341,6 +1341,7 @@ impl ExecutionCoordinator {
         );
         self.publish_dispatch_runtime_changed(std::slice::from_ref(execution), "workspace_leasing")
             .await;
+        #[cfg(any(test, feature = "test-support"))]
         self.note_spoke_pass_start(&execution.id);
         let lease_result = self
             .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
@@ -1355,11 +1356,13 @@ impl ExecutionCoordinator {
                     self.kick();
                 }
                 let err = self.park_in_doubt_spoke_lease(execution, err).await;
+                #[cfg(any(test, feature = "test-support"))]
                 self.note_spoke_pass_complete(&execution.id);
                 return Err(err);
             }
             other => other,
         };
+        #[cfg(any(test, feature = "test-support"))]
         self.note_spoke_pass_complete(&execution.id);
         // The per-repo permit bounds concurrent lease calls, which contend on
         // cube's per-repo lock. Once the call has returned that contention is

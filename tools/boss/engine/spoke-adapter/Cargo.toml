@@ -26,7 +26,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-boss-engine-runtime = { path = "../core/runtime" }
+boss-engine-runtime = { path = "../core/runtime", features = ["test-support"] }
 boss-host-enrollment = { path = "../host-enrollment" }
 rcgen = { workspace = true }
 rustls = { workspace = true }

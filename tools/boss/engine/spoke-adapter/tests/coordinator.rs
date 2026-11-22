@@ -2,8 +2,8 @@
 use super::{short, support::*, timing, workspace_slack};
 
 pub(crate) use super::support::{
-    FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, elapse, fire_after_all_stored,
-    fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_elapsed,
+    FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, drive_resumed_deadline_pass, elapse,
+    fire_after_all_stored, fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_elapsed,
     until_ready_after_stored,
 };
 use boss_engine_runtime::{
@@ -273,8 +273,7 @@ async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconc
         || async { env.pool.busy_count().await == 0 },
     )
     .await;
-    let retries = drive_poll_deadline_passes(
-        Duration::from_millis(100),
+    drive_poll_deadline_passes(
         || env.coordinator.spoke_pass_starts(&execution.id),
         || env.coordinator.spoke_pass_completions(&execution.id),
         || command_waiting(&fx),
@@ -283,10 +282,6 @@ async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconc
         MORE_THAN_PRE_START_BUDGET,
     )
     .await;
-    assert!(
-        retries >= MORE_THAN_PRE_START_BUDGET,
-        "parked spawn retries must have completed more cycles than the pre-start budget"
-    );
     assert_never_failed(&fx, &execution.id);
     assert!(!released(&peer.commands()));
 
@@ -350,8 +345,7 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
         || attention_open(&fx, &execution.id),
     )
     .await;
-    let retries = drive_poll_deadline_passes(
-        Duration::from_millis(100),
+    drive_poll_deadline_passes(
         || env.coordinator.spoke_pass_starts(&execution.id),
         || env.coordinator.spoke_pass_completions(&execution.id),
         || command_waiting(&fx),
@@ -360,10 +354,6 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
         MORE_THAN_PRE_START_BUDGET,
     )
     .await;
-    assert!(
-        retries >= MORE_THAN_PRE_START_BUDGET,
-        "parked spawn retries must have completed more cycles than the pre-start budget"
-    );
     assert_never_failed(&fx, &execution.id);
     assert!(fx.db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
     assert!(!released(&peer.commands()));
@@ -582,29 +572,42 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
             .filter(|c| is_lease(c))
             .map(|c| c.command_id.clone())
             .collect();
-        let lease_completed = || {
-            executions
-                .iter()
-                .map(|e| env.coordinator.spoke_pass_completions(&e.id))
-                .sum::<u64>()
-        };
-        let lease_started = || {
-            executions
-                .iter()
-                .map(|e| env.coordinator.spoke_pass_starts(&e.id))
-                .sum::<u64>()
-        };
+        let completions_before: Vec<u64> = executions
+            .iter()
+            .map(|e| env.coordinator.spoke_pass_completions(&e.id))
+            .collect();
         drive_kicked_deadline_passes(
             || env.coordinator.kick(),
-            lease_started,
-            lease_completed,
+            || {
+                executions
+                    .iter()
+                    .map(|e| env.coordinator.spoke_pass_starts(&e.id))
+                    .sum()
+            },
+            || {
+                executions
+                    .iter()
+                    .map(|e| env.coordinator.spoke_pass_completions(&e.id))
+                    .sum()
+            },
             || command_waiting(&fx),
             || command_idle(&fx),
             Duration::from_millis(300),
-            lease_completed() + (MORE_THAN_PRE_START_BUDGET * executions.len()) as u64,
+            || {
+                executions.iter().enumerate().all(|(i, e)| {
+                    env.coordinator.spoke_pass_completions(&e.id)
+                        >= completions_before[i] + MORE_THAN_PRE_START_BUDGET as u64
+                })
+            },
         )
         .await;
-        for execution in &executions {
+        for (execution, baseline) in executions.iter().zip(&completions_before) {
+            let delta = env.coordinator.spoke_pass_completions(&execution.id) - *baseline;
+            assert!(
+                delta >= MORE_THAN_PRE_START_BUDGET as u64,
+                "{} completed {delta} cycles, need at least {MORE_THAN_PRE_START_BUDGET}",
+                execution.id
+            );
             let row = fx.db.get_execution(&execution.id).unwrap();
             assert!(!row.status.is_terminal(), "{row:?}");
             assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
@@ -793,8 +796,7 @@ async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty
         )
         .unwrap();
     until_elapsed("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
-    let retries = drive_poll_deadline_passes(
-        Duration::from_millis(100),
+    drive_poll_deadline_passes(
         || env.coordinator.spoke_pass_starts(&execution.id),
         || env.coordinator.spoke_pass_completions(&execution.id),
         || command_waiting(&fx),
@@ -803,10 +805,6 @@ async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty
         MORE_THAN_PRE_START_BUDGET,
     )
     .await;
-    assert!(
-        retries >= MORE_THAN_PRE_START_BUDGET,
-        "local spawn retries must complete even when they fail before a command is sent"
-    );
     thaw_clock();
     assert_never_failed(&fx, &execution.id);
     assert_eq!(
@@ -923,13 +921,11 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
     let restarted = restarted(&fx, &env.coordinator, 1).await;
     let sends_before = fx.provider.command_sends();
     restarted.reconcile_ended_in_doubt_spokes().await;
-    until("the restart sweep asked the host", || {
-        fx.provider.command_sends() > sends_before || command_idle(&fx)
-    })
-    .await;
-    until("the restart sweep went idle", || command_idle(&fx)).await;
+    assert!(
+        fx.provider.command_sends() > sends_before,
+        "the restart sweep must ask the host about the unanswered spawn"
+    );
     restarted.reconcile_ended_in_doubt_spokes().await;
-    until("the second restart sweep went idle", || command_idle(&fx)).await;
     assert!(!released(&peer.commands()), "no release while the spawn is unanswered");
     assert!(attention_open(&fx, &execution.id));
     assert!(persona_held(&fx, &execution.id));
@@ -1401,7 +1397,6 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
         || fx.provider.command_waits_for("adopt") >= 1 && fx.provider.command_sends_for("adopt") > adopt_sends_before;
     let beats_before = env.coordinator.heartbeat_beats();
     let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
-    let mut advanced = Duration::ZERO;
     let beat = Duration::from_millis(80);
     // Virtual-time advances that happen before the heartbeat task has
     // registered its opening sleep are lost. Step TICK until that first
@@ -1428,17 +1423,14 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
             "the second row must spawn while the heartbeat's Adopt is still waiting"
         );
         elapse(beat).await;
-        advanced += beat;
     }
     until("a stranded ready row to be re-kicked by the heartbeat", spawned).await;
     assert!(
         heartbeat_adopt_wait(),
         "the second row must spawn while the heartbeat's Adopt is still waiting"
     );
-    assert!(
-        advanced < Duration::from_secs(5),
-        "spawn must land before the Adopt command deadline (advanced {advanced:?})"
-    );
+    // `until(spawned)` runs under a frozen clock, so the Adopt deadline
+    // cannot expire while that wait is in flight.
 }
 
 mod recovery;

@@ -5,6 +5,7 @@ use super::*;
 use boss_execution_contracts::WorkerLife;
 
 impl ExecutionCoordinator {
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn note_spoke_pass_start(&self, execution_id: &str) {
         let mut map = self
             .spoke_pass_starts
@@ -13,6 +14,7 @@ impl ExecutionCoordinator {
         *map.entry(execution_id.to_owned()).or_insert(0) += 1;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn note_spoke_pass_complete(&self, execution_id: &str) {
         let mut map = self
             .spoke_pass_completions
@@ -80,8 +82,10 @@ impl ExecutionCoordinator {
         if self.repo_lease_limiter.release(&execution.id) {
             self.kick();
         }
+        #[cfg(any(test, feature = "test-support"))]
         self.note_spoke_pass_start(&execution.id);
         let err = self.park_in_doubt_spoke_lease(execution, err).await;
+        #[cfg(any(test, feature = "test-support"))]
         self.note_spoke_pass_complete(&execution.id);
         err
     }
