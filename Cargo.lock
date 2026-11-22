@@ -2311,6 +2311,7 @@ dependencies = [
  "flate2",
  "globset",
  "hashbrown 0.15.5",
+ "httpdate",
  "ignore",
  "jaq-core",
  "jaq-interpret",

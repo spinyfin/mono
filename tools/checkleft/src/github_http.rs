@@ -2,9 +2,9 @@
 //!
 //! Timeouts, connection errors, HTTP 5xx and 429 are retried with jittered
 //! exponential backoff (honouring `Retry-After` on 429 and retryable 5xx,
-//! capped). Other 4xx responses fail on the first attempt. The per-request
-//! timeout is unchanged; retries are bounded so a dead GitHub still fails in
-//! a predictable time.
+//! capped). Other 4xx responses fail on the first attempt. Each attempt uses
+//! the 30 s per-request timeout ([`GITHUB_API_TIMEOUT`]); the retry budget
+//! bounds the whole call so a dead GitHub fails in a predictable time.
 //!
 //! GET, POST, and PATCH share this path. POST/PATCH are retried on the same
 //! transient classes: a 5xx means GitHub did not accept the write, and a
@@ -23,10 +23,11 @@ use crate::http_retry::{
     parse_retry_after, retry_loop,
 };
 
-/// Three attempts: the original plus two retries. Each request still uses the
-/// 30s GitHub client timeout; backoff is 1s then 2s (jittered, capped at 8s,
-/// including `Retry-After`). Worst case stays under [`GithubRetryPolicy::production`]'s
-/// two-minute budget: 3 × 30s + two 8s delays = 106s.
+/// Three attempts: the original plus two retries. Each request uses the 30 s
+/// [`GITHUB_API_TIMEOUT`]; backoff is 1 s then 2 s (jittered), and a
+/// `Retry-After` is capped at 8 s. Worst case stays under
+/// [`GithubRetryPolicy::production`]'s two-minute budget: 3 × 30s + two 8s
+/// delays = 106s.
 pub const GITHUB_RETRY_MAX_ATTEMPTS: u32 = 3;
 const GITHUB_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const GITHUB_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);

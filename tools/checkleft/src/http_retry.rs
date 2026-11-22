@@ -3,12 +3,14 @@
 //! One attempt loop, budget, backoff, jitter, `Retry-After` parsing, and
 //! typed failure classification. [`get_bytes_with_retry`] is the generic GET
 //! used by config and Node downloads; GitHub REST calls are a thin adapter
-//! on the same loop.
+//! on the same loop. Checkleft keeps its own backoff and jitter rather than
+//! using `boss-backoff` / `boss-http-retry` because it ships as a standalone
+//! crates.io crate.
 
 use std::collections::hash_map::RandomState;
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, bail};
 use reqwest::StatusCode;
@@ -177,14 +179,16 @@ pub(crate) fn failure_from_http(
     }
 }
 
-/// Integer-seconds or IMF-fixdate `Retry-After`. A past HTTP-date is a zero
-/// delay (retry immediately). An unparseable value is ignored.
+/// Integer-seconds or HTTP-date `Retry-After` (IMF-fixdate, plus the obsolete
+/// RFC 850 and asctime forms RFC 9110 requires recipients to accept). A past
+/// HTTP-date is a zero delay (retry immediately). An unparseable value is
+/// ignored.
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    let when = parse_imf_fixdate(value)?;
+    let when = httpdate::parse_http_date(value).ok()?;
     Some(when.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO))
 }
 
@@ -246,11 +250,11 @@ where
     let mut budget_stopped = false;
 
     for attempt in 1..=max_attempts {
-        attempts = attempt;
         if remaining_budget(settings).is_some_and(|remaining| remaining.is_zero() && attempt > 1) {
             budget_stopped = true;
             break;
         }
+        attempts = attempt;
         let timeout = attempt_timeout(settings);
         let failure = match send_once(attempt, timeout).await {
             Ok(bytes) => return (SendOutcome::Success(bytes), false),
@@ -418,47 +422,6 @@ async fn send_get_once(
     }
 }
 
-/// IMF-fixdate (`Wed, 21 Oct 2015 07:28:00 GMT`) to `SystemTime`.
-fn parse_imf_fixdate(value: &str) -> Option<SystemTime> {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let rest = value.split_once(", ")?.1;
-    let mut parts = rest.split_whitespace();
-    let day: u32 = parts.next()?.parse().ok()?;
-    let month_name = parts.next()?;
-    let month = u32::try_from(MONTHS.iter().position(|&name| name == month_name)? + 1).ok()?;
-    let year: i32 = parts.next()?.parse().ok()?;
-    let mut hms = parts.next()?.split(':');
-    let hour: u32 = hms.next()?.parse().ok()?;
-    let minute: u32 = hms.next()?.parse().ok()?;
-    let second: u32 = hms.next()?.parse().ok()?;
-    if parts.next()? != "GMT" {
-        return None;
-    }
-    let unix = days_from_civil(year, month, day)?
-        .checked_mul(86400)?
-        .checked_add(i64::from(hour) * 3600)?
-        .checked_add(i64::from(minute) * 60)?
-        .checked_add(i64::from(second))?;
-    let unix = u64::try_from(unix).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(unix))
-}
-
-/// Howard Hinnant's civil-from-days, returning days since Unix epoch.
-fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || day == 0 || day > 31 {
-        return None;
-    }
-    let year = if month <= 2 { year.checked_sub(1)? } else { year };
-    let era = if year >= 0 { year } else { year.checked_sub(399)? }.div_euclid(400);
-    let yoe = u32::try_from(year - era * 400).ok()?;
-    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * shifted_month + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(i64::from(era) * 146097 + i64::from(doe) - 719468)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -466,9 +429,7 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{
-        GetRetryPolicy, RetrySettings, get_bytes_with_retry, jitter, parse_imf_fixdate, parse_retry_after, retry_delay,
-    };
+    use super::{GetRetryPolicy, RetrySettings, get_bytes_with_retry, jitter, parse_retry_after, retry_delay};
 
     fn url(server: &MockServer) -> reqwest::Url {
         format!("{}/file", server.uri()).parse().expect("url")
@@ -490,8 +451,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_imf_fixdate_known_instant() {
-        let parsed = parse_imf_fixdate("Wed, 21 Oct 2015 07:28:00 GMT").expect("date");
+    fn parse_http_date_known_instant() {
+        let parsed = httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").expect("date");
         assert_eq!(
             parsed.duration_since(UNIX_EPOCH).expect("epoch").as_secs(),
             1_445_412_480
@@ -519,6 +480,20 @@ mod tests {
             delay > Duration::from_secs(60),
             "future HTTP-date should be far away, got {delay:?}"
         );
+
+        // RFC 9110 also requires recipients to accept the obsolete RFC 850 and
+        // asctime HTTP-date forms.
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Sunday, 06-Nov-94 08:49:37 GMT".parse().expect("header"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Sun Nov  6 08:49:37 1994".parse().expect("header"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
     }
 
     #[test]
@@ -555,6 +530,68 @@ mod tests {
             );
         }
         assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_at_loop_top_does_not_count_unsent_attempt() {
+        use std::cell::Cell;
+
+        // `remaining` is consulted three times on a successful first iteration
+        // (top-of-loop check, per-attempt timeout, delay check) and then at
+        // the top of the next iteration. Return a positive budget for those
+        // first three calls so the first request is sent, then zero so the
+        // second iteration stops before `send_once`.
+        let remaining_calls = Cell::new(0);
+        let remaining = || {
+            let n = remaining_calls.get();
+            remaining_calls.set(n + 1);
+            if n < 3 {
+                Duration::from_millis(50)
+            } else {
+                Duration::ZERO
+            }
+        };
+        let settings = RetrySettings {
+            max_attempts: 4,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            jitter: false,
+            not_found_base_delay: None,
+            remaining: Some(&remaining),
+            request_timeout: Some(Duration::from_millis(10)),
+        };
+        let sends = Cell::new(0);
+        let (outcome, budget_stopped) = super::retry_loop_detailed(
+            &settings,
+            |_attempt, _timeout| {
+                sends.set(sends.get() + 1);
+                async {
+                    Err(super::AttemptFailure {
+                        kind: super::FailureKind::Timeout,
+                        retryable: true,
+                        retry_after: Some(Duration::ZERO),
+                        cause: "timed out".to_owned(),
+                    })
+                }
+            },
+            |_| {},
+        )
+        .await;
+        assert!(
+            budget_stopped,
+            "loop must stop because remaining hit zero at the next iteration"
+        );
+        assert_eq!(sends.get(), 1, "only the first request is sent");
+        match outcome {
+            super::SendOutcome::Timeout { attempts } => {
+                assert_eq!(
+                    attempts,
+                    sends.get(),
+                    "reported attempts must equal send_once invocations, not the unsent next slot"
+                );
+            }
+            other => panic!("expected timeout after the sent attempts, got {other:?}"),
+        }
     }
 
     #[tokio::test]

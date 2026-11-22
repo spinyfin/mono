@@ -124,6 +124,7 @@ async fn discover_installation_id(
     client: &reqwest::Client,
 ) -> Result<String> {
     let url = format!("{}/repos/{}/installation", base_url.trim_end_matches('/'), owner_repo);
+    let what = format!("GET /repos/{owner_repo}/installation");
     let bytes = github_bytes(
         client,
         GithubCall {
@@ -136,11 +137,11 @@ async fn discover_installation_id(
             extra_headers: &[("X-GitHub-Api-Version", "2022-11-28")],
             body: None,
         },
-        "GET /repos/{owner_repo}/installation",
+        &what,
     )
     .await?;
     let parsed: InstallationResponse =
-        serde_json::from_slice(&bytes).context("parsing GET /repos/{owner_repo}/installation response")?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {what} response"))?;
     Ok(parsed.id.to_string())
 }
 
@@ -159,6 +160,7 @@ async fn exchange_for_installation_token(
         base_url.trim_end_matches('/'),
         installation_id
     );
+    let what = format!("POST /app/installations/{installation_id}/access_tokens");
     let bytes = github_bytes(
         client,
         GithubCall {
@@ -171,7 +173,7 @@ async fn exchange_for_installation_token(
             extra_headers: &[("X-GitHub-Api-Version", "2022-11-28")],
             body: None,
         },
-        "POST /app/installations/{installation_id}/access_tokens",
+        &what,
     )
     .await?;
     let parsed: InstallationTokenResponse =
@@ -343,6 +345,15 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("404"), "error should include status: {msg}");
         assert!(msg.contains("Not Found"), "error should include body excerpt: {msg}");
+        assert!(
+            msg.contains("owner/repo"),
+            "error should include the queried repo slug: {msg}"
+        );
+        let label = msg.split(" returned HTTP").next().expect("HTTP error label");
+        assert!(
+            !label.contains('{'),
+            "error label should interpolate the repo slug rather than leave a placeholder: {msg}"
+        );
     }
 
     #[tokio::test]
