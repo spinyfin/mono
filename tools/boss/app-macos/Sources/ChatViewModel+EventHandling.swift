@@ -123,9 +123,9 @@ extension ChatViewModel {
                 message: "Connection to the engine was lost before it could answer — try the move again.",
                 includeMovesWithoutCheck: false
             )
-            // History now stays registered across tab switches, so a drop
-            // cannot wait for the next activation to recover. Clear the
-            // in-flight set and cached rows; reconnect reloads them.
+            // A History tab stays registered while another tab is selected,
+            // so a drop cannot wait for the next activation to recover.
+            // Clear in-flight loads and cached rows now; reconnect reloads them.
             noteExecutionsDisconnected()
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
@@ -709,10 +709,17 @@ extension ChatViewModel {
             ExecutionHistoryTiming.record("apply", taskID: taskId)
             // A reply that lands after its last consumer closed must not
             // re-create the entry that closing evicted.
+            executionsInFlightTaskIDs.remove(taskId)
+            if executionsStaleTaskIDs.contains(taskId), hasLiveExecutionsConsumer(taskID: taskId) {
+                // An invalidation landed while this load was in flight, so
+                // the rows are already out of date. Drop them and reload;
+                // History keeps showing its loading state until the fresh reply.
+                loadExecutions(taskId: taskId)
+                break
+            }
             if hasOpenExecutionsConsumer(taskID: taskId) {
                 executionsByTaskID[taskId] = executions
             }
-            executionsInFlightTaskIDs.remove(taskId)
             executionsLoadFailureByTaskID.removeValue(forKey: taskId)
         case .attachmentsList(let taskId, let attachments):
             attachmentsByTaskID[taskId] = attachments
