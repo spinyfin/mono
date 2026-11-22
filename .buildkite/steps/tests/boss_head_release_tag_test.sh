@@ -84,6 +84,23 @@ assert_eq \
   "$(ci_boss_already_released_skip_message "boss-v1.0.1102")" \
   "already-released skip message"
 
+# Latest published family tag is the max matching published row, not GitHub order
+# and not another release family.
+got="$(printf '%s\n' \
+  $'checkleft-v0.9.0\tfalse' \
+  $'boss-v1.0.2\tfalse' \
+  $'boss-v1.0.4\ttrue' \
+  $'boss-v1.0.3\tfalse' \
+  | ci_boss_select_latest_published_family_tag || true)"
+assert_eq "boss-v1.0.3" "$got" "latest published family tag ignores drafts and other families"
+
+got="$(printf '%s\n' $'boss-v1.0.3\ttrue' | ci_boss_row_draft_for_tag "boss-v1.0.3")"
+assert_eq "true" "$got" "draft flag for HEAD tag"
+
+if printf '%s\n' $'boss-v1.0.1\ttrue' | ci_boss_select_latest_published_family_tag; then
+  fail "draft-only rows should not select a published family tag"
+fi
+
 # ---------------------------------------------------------------------------
 # Fixture origin + agent checkout (Buildkite-style tagless fetch).
 # ---------------------------------------------------------------------------
@@ -173,18 +190,30 @@ chmod +x "${stub_bin}/bazel"
 printf '%s\n' \
   '#!/bin/bash' \
   'echo "gh invoked: $*" >> "${TRACE_FILE}"' \
-  'if [[ "${STUB_GH_IS_DRAFT:-false}" == "error" ]]; then' \
-  '  exit 1' \
+  'if [[ "$1" == "api" ]]; then' \
+  '  if [[ "${STUB_GH_FAIL:-}" == "1" ]]; then' \
+  '    echo "${STUB_GH_STDERR:-gh: HTTP 401}" >&2' \
+  '    exit 1' \
+  '  fi' \
+  '  if [[ -n "${STUB_GH_RELEASE_ROWS+x}" ]]; then' \
+  '    printf "%s\n" "$STUB_GH_RELEASE_ROWS"' \
+  '  else' \
+  '    printf "%s\t%s\n" "boss-v1.0.3" "false"' \
+  '  fi' \
+  '  exit 0' \
   'fi' \
-  'printf "%s\n" "${STUB_GH_IS_DRAFT:-false}"' \
+  'echo "unexpected gh invocation: $*" >&2' \
+  'exit 1' \
   > "${stub_bin}/gh"
 chmod +x "${stub_bin}/gh"
 
 export PATH="${stub_bin}:$PATH"
 
 TRACE_FILE="${tmpdir}/trace"
+STDERR_FILE="${tmpdir}/step.err"
 export TRACE_FILE
 : > "$TRACE_FILE"
+: > "$STDERR_FILE"
 
 steps_dir="${tmpdir}/steps"
 mkdir -p "$steps_dir"
@@ -207,13 +236,28 @@ run_stub_step() {
   local repo="$1"
   (
     cd "$repo"
+    export TMPDIR="$tmpdir"
     bash "${steps_dir}/boss-release.sh"
-  )
+  ) 2>"$STDERR_FILE"
 }
 
-# 1. Scheduled + published release (isDraft=false): skips before ci-env/bazel.
+assert_stderr_has() {
+  local needle="$1" msg="$2"
+  if ! grep -qF "$needle" "$STDERR_FILE"; then
+    fail "${msg}: stderr=$(cat "$STDERR_FILE")"
+  fi
+}
+
+assert_stderr_lacks() {
+  local needle="$1" msg="$2"
+  if grep -qF "$needle" "$STDERR_FILE"; then
+    fail "${msg}: stderr=$(cat "$STDERR_FILE")"
+  fi
+}
+
+# 1. Scheduled + HEAD is the latest published family release: skips before ci-env/bazel.
 : > "$TRACE_FILE"
-if ! out="$(BUILDKITE_SOURCE=schedule STUB_GH_IS_DRAFT=false run_stub_step "${tmpdir}/tagged")"; then
+if ! out="$(BUILDKITE_SOURCE=schedule run_stub_step "${tmpdir}/tagged")"; then
   fail "scheduled published tagged boss-release.sh should exit 0"
 fi
 assert_eq \
@@ -226,10 +270,11 @@ fi
 if grep -q 'bazel invoked' "$TRACE_FILE"; then
   fail "scheduled published invoked bazel: $(cat "$TRACE_FILE")"
 fi
+assert_stderr_lacks "release early-skip not taken" "scheduled published should skip without a fall-through log"
 
-# 2. UI trigger + published release (isDraft=false): also skips before ci-env/bazel.
+# 2. UI trigger + HEAD is the latest published family release: also skips.
 : > "$TRACE_FILE"
-if ! out="$(BUILDKITE_SOURCE=ui STUB_GH_IS_DRAFT=false run_stub_step "${tmpdir}/tagged")"; then
+if ! out="$(BUILDKITE_SOURCE=ui run_stub_step "${tmpdir}/tagged")"; then
   fail "ui published tagged boss-release.sh should exit 0"
 fi
 assert_eq \
@@ -240,54 +285,62 @@ if grep -q 'ci-env stub sourced' "$TRACE_FILE"; then
   fail "ui published should not source ci-env.sh: $(cat "$TRACE_FILE")"
 fi
 
-# 3. Scheduled + stranded draft (isDraft=true): reaches prepare.
+# 3. Scheduled + stranded draft: reaches prepare and logs the reason.
 : > "$TRACE_FILE"
-if ! (BUILDKITE_SOURCE=schedule STUB_GH_IS_DRAFT=true run_stub_step "${tmpdir}/tagged"); then
+if ! (BUILDKITE_SOURCE=schedule STUB_GH_RELEASE_ROWS=$'boss-v1.0.2\tfalse\nboss-v1.0.3\ttrue' \
+  run_stub_step "${tmpdir}/tagged"); then
   fail "scheduled draft tagged boss-release.sh should exit 0 through stub prepare"
 fi
 if ! grep -q 'prepare-invoked' "$TRACE_FILE"; then
   fail "scheduled draft tagged HEAD should invoke bin/release prepare: $(cat "$TRACE_FILE")"
 fi
+assert_stderr_has "release early-skip not taken: release is a draft" "scheduled draft should log fall-through"
 
-# 4. UI trigger + stranded draft (isDraft=true): reaches prepare and resumes.
+# 4. UI trigger + stranded draft: reaches prepare and logs the reason.
 : > "$TRACE_FILE"
-if ! (BUILDKITE_SOURCE=ui STUB_GH_IS_DRAFT=true run_stub_step "${tmpdir}/tagged"); then
+if ! (BUILDKITE_SOURCE=ui STUB_GH_RELEASE_ROWS=$'boss-v1.0.2\tfalse\nboss-v1.0.3\ttrue' \
+  run_stub_step "${tmpdir}/tagged"); then
   fail "ui draft tagged boss-release.sh should exit 0 through stub prepare"
 fi
 if ! grep -q 'prepare-invoked' "$TRACE_FILE"; then
   fail "ui draft tagged HEAD should invoke bin/release prepare: $(cat "$TRACE_FILE")"
 fi
+assert_stderr_has "release early-skip not taken: release is a draft" "ui draft should log fall-through"
 
 # 5. Scheduled + published + RELEASE_RESUME_DRAFT=1: reaches prepare.
 : > "$TRACE_FILE"
-if ! (BUILDKITE_SOURCE=schedule STUB_GH_IS_DRAFT=false RELEASE_RESUME_DRAFT=1 run_stub_step "${tmpdir}/tagged"); then
+if ! (BUILDKITE_SOURCE=schedule RELEASE_RESUME_DRAFT=1 run_stub_step "${tmpdir}/tagged"); then
   fail "RELEASE_RESUME_DRAFT=1 should exit 0 through stub prepare"
 fi
 if ! grep -q 'prepare-invoked' "$TRACE_FILE"; then
   fail "RELEASE_RESUME_DRAFT=1 should invoke bin/release prepare: $(cat "$TRACE_FILE")"
 fi
+assert_stderr_has "release early-skip not taken: resume-draft set" "RESUME_DRAFT should log fall-through"
 
 # 6. Scheduled + published + CHECKLEFT_RESUME_DRAFT=1 fallback: reaches prepare.
 : > "$TRACE_FILE"
-if ! (BUILDKITE_SOURCE=schedule STUB_GH_IS_DRAFT=false CHECKLEFT_RESUME_DRAFT=1 run_stub_step "${tmpdir}/tagged"); then
+if ! (BUILDKITE_SOURCE=schedule CHECKLEFT_RESUME_DRAFT=1 run_stub_step "${tmpdir}/tagged"); then
   fail "CHECKLEFT_RESUME_DRAFT=1 should exit 0 through stub prepare"
 fi
 if ! grep -q 'prepare-invoked' "$TRACE_FILE"; then
   fail "CHECKLEFT_RESUME_DRAFT=1 should invoke bin/release prepare: $(cat "$TRACE_FILE")"
 fi
+assert_stderr_has "release early-skip not taken: resume-draft set" "CHECKLEFT_RESUME_DRAFT should log fall-through"
 
-# 7. Scheduled + missing release / gh error: reaches prepare.
+# 7. Scheduled + gh error: reaches prepare and logs captured stderr.
 : > "$TRACE_FILE"
-if ! (BUILDKITE_SOURCE=schedule STUB_GH_IS_DRAFT=error run_stub_step "${tmpdir}/tagged"); then
+if ! (BUILDKITE_SOURCE=schedule STUB_GH_FAIL=1 STUB_GH_STDERR="gh: HTTP 401" \
+  run_stub_step "${tmpdir}/tagged"); then
   fail "gh error should fall through to stub prepare"
 fi
 if ! grep -q 'prepare-invoked' "$TRACE_FILE"; then
   fail "gh error should invoke bin/release prepare: $(cat "$TRACE_FILE")"
 fi
+assert_stderr_has "release early-skip not taken: gh error: gh: HTTP 401" "gh error should log captured stderr"
 
-# 8. Untagged HEAD: reaches prepare.
+# 8. Untagged HEAD: reaches prepare without a fall-through log.
 : > "$TRACE_FILE"
-if ! (BUILDKITE_SOURCE=schedule STUB_GH_IS_DRAFT=false run_stub_step "${tmpdir}/untagged"); then
+if ! (BUILDKITE_SOURCE=schedule run_stub_step "${tmpdir}/untagged"); then
   fail "untagged boss-release.sh should exit 0 through stub prepare"
 fi
 if ! grep -q 'ci-env stub sourced' "$TRACE_FILE"; then
@@ -299,6 +352,38 @@ fi
 if grep -q 'bazel invoked' "$TRACE_FILE"; then
   fail "untagged path invoked bazel: $(cat "$TRACE_FILE")"
 fi
+assert_stderr_lacks "release early-skip not taken" "untagged HEAD should not log a family-tag fall-through"
+
+# 9. HEAD carries an older published family tag than GitHub's latest: prepare.
+: > "$TRACE_FILE"
+if ! out="$(BUILDKITE_SOURCE=ui STUB_GH_RELEASE_ROWS=$'boss-v1.0.3\tfalse\nboss-v1.0.4\tfalse\ncheckleft-v0.9.0\tfalse' \
+  run_stub_step "${tmpdir}/tagged")"; then
+  fail "older published HEAD should exit 0 through stub prepare"
+fi
+if ! grep -q 'prepare-invoked' "$TRACE_FILE"; then
+  fail "older published HEAD should invoke bin/release prepare: $(cat "$TRACE_FILE")"
+fi
+if [[ "$out" == release\ skipped:* ]]; then
+  fail "older published HEAD should not skip, stdout=${out}"
+fi
+assert_stderr_has "release early-skip not taken: newer published release exists" \
+  "older published HEAD should log that a newer family release exists"
+
+# 10. Invalid release.toml: reaches prepare and logs parse failure.
+clone_at "${tmpdir}/bad-config" "$c2_sha"
+ci_fetch_boss_tags "${tmpdir}/bad-config" origin >/dev/null 2>&1
+printf '%s\n' 'repo = "spinyfin/mono"' 'tag_prefix = "boss-v"' \
+  '[version]' 'scheme = "alpha-counter"' 'major_minor = "1.0"' \
+  > "${tmpdir}/bad-config/tools/boss/release.toml"
+: > "$TRACE_FILE"
+if ! (BUILDKITE_SOURCE=schedule run_stub_step "${tmpdir}/bad-config"); then
+  fail "invalid release.toml should exit 0 through stub prepare"
+fi
+if ! grep -q 'prepare-invoked' "$TRACE_FILE"; then
+  fail "invalid release.toml should invoke bin/release prepare: $(cat "$TRACE_FILE")"
+fi
+assert_stderr_has "release early-skip not taken: release.toml parse failed" \
+  "invalid release.toml should log parse failure"
 
 # Ordering: fetch + already-tagged skip must precede sourcing ci-env.sh, and
 # prepare must still run after that skip.

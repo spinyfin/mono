@@ -68,8 +68,9 @@ sh_test(
 )
 
 # Script-level test for the cheap already-tagged skip boss-release.sh runs
-# before ci-env.sh builds //tools/release: a fixture whose HEAD carries a
-# boss-v1.0.N tag exits without bazel; an untagged HEAD reaches prepare.
+# before ci-env.sh builds //tools/release: a fixture whose HEAD is the latest
+# published boss-v1.0.N family release exits without bazel; an older published
+# HEAD, a draft, or an untagged HEAD reaches prepare.
 # Tag matching is the same version-family rule as bin/release prepare.
 sh_test(
     name = "boss_head_release_tag_test",

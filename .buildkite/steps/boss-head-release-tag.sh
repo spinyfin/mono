@@ -176,17 +176,77 @@ ci_boss_resume_draft_enabled() {
   [[ "$val" == "1" ]]
 }
 
-# ci_boss_release_is_published <tag> [repo]
+# Last successful TSV listing from ci_boss_github_family_release_rows.
+CI_BOSS_RELEASE_ROWS=""
+# Stderr captured from the last failed ci_boss_github_family_release_rows call.
+CI_BOSS_GH_STDERR=""
+
+# ci_boss_github_family_release_rows [repo]
 #
-# Returns 0 only when the GitHub Release for `tag` exists and is published
-# (isDraft == false). Returns 1 on a draft, missing release, or gh error.
-ci_boss_release_is_published() {
-  local tag="$1"
-  local repo="${2:-${CI_BOSS_RELEASE_REPO}}"
-  [[ -n "$tag" && -n "$repo" ]] || return 1
-  local is_draft
-  is_draft="$(gh release view "$tag" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null)" || return 1
-  [[ "$is_draft" == "false" ]]
+# Stores TSV rows `tag<TAB>draft` for every GitHub Release in `repo` into
+# CI_BOSS_RELEASE_ROWS (`draft` is `true` or `false`). Uses `gh api --paginate`
+# rather than `/releases/latest`, which would pick a non-Boss family such as
+# checkleft. On gh failure, returns 1 and stores captured stderr in
+# CI_BOSS_GH_STDERR. Globals are used so the values survive the call; a
+# command substitution would run this function in a subshell and drop them.
+ci_boss_github_family_release_rows() {
+  local repo="${1:-${CI_BOSS_RELEASE_REPO}}"
+  local listing status=0
+  CI_BOSS_RELEASE_ROWS=""
+  CI_BOSS_GH_STDERR=""
+  [[ -n "$repo" ]] || return 1
+  # Merge stderr into the capture: a failed `gh` prints nothing on stdout, so
+  # the captured text is the error. Avoids a temp file in the CI sandbox.
+  listing="$(gh api "repos/${repo}/releases" --paginate -X GET -F per_page=100 \
+    --jq '.[] | [.tag_name, (.draft|tostring)] | @tsv' 2>&1)" || status=$?
+  if (( status != 0 )); then
+    CI_BOSS_GH_STDERR="$listing"
+    return 1
+  fi
+  CI_BOSS_RELEASE_ROWS="$listing"
+  return 0
+}
+
+# ci_boss_select_latest_published_family_tag
+#
+# Reads TSV rows `tag<TAB>draft` from stdin and prints the highest published
+# (draft == false) version-family tag. Returns 1 when none match.
+ci_boss_select_latest_published_family_tag() {
+  local tag draft suffix n norm best="" best_n=""
+  local prefix="${CI_BOSS_RELEASE_TAG_PREFIX}"
+  local major_minor="${CI_BOSS_RELEASE_MAJOR_MINOR}"
+  [[ -n "$prefix" && -n "$major_minor" ]] || return 1
+  while IFS=$'\t' read -r tag draft || [[ -n "$tag" ]]; do
+    [[ -n "$tag" ]] || continue
+    [[ "$draft" == "false" ]] || continue
+    ci_boss_release_tag_matches "$tag" "$prefix" "$major_minor" || continue
+    suffix="${tag#"$prefix"}"
+    n="${suffix#"${major_minor}."}"
+    norm="$(ci_boss_u64_normalize "$n")" || continue
+    if [[ -z "$best_n" ]] || ci_boss_u64_gt "$norm" "$best_n"; then
+      best="$tag"
+      best_n="$norm"
+    fi
+  done
+  if [[ -n "$best" ]]; then
+    printf '%s' "$best"
+    return 0
+  fi
+  return 1
+}
+
+# ci_boss_row_draft_for_tag <tag>
+#
+# Reads TSV rows `tag<TAB>draft` from stdin and prints the draft flag for
+# `tag` (`true` or `false`). Prints nothing when `tag` is absent.
+ci_boss_row_draft_for_tag() {
+  local want="$1" tag draft found=""
+  while IFS=$'\t' read -r tag draft || [[ -n "$tag" ]]; do
+    if [[ "$tag" == "$want" ]]; then
+      found="$draft"
+    fi
+  done
+  printf '%s' "$found"
 }
 
 # Log line `bin/release prepare` prints for SkipReason::AlreadyReleased.
@@ -194,4 +254,10 @@ ci_boss_release_is_published() {
 ci_boss_already_released_skip_message() {
   local tag="$1"
   printf 'release skipped: HEAD is already %s — re-releasing the same commit is a no-op' "$tag"
+}
+
+# One-line fall-through reason when a HEAD family tag exists but the cheap
+# skip is not taken. Callers still proceed to `bin/release prepare`.
+ci_boss_early_skip_not_taken() {
+  echo "release early-skip not taken: $*" >&2
 }
