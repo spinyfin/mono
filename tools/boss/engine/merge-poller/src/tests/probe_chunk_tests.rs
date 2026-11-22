@@ -315,7 +315,7 @@ async fn shallow_probes_ask_for_lifecycle_only_in_larger_chunks() {
     let all = urls(250);
     for number in 1..=250usize {
         match results[&all[number - 1]].as_ref().unwrap() {
-            ShallowProbe::Open { updated_at } => {
+            ShallowProbe::Open { updated_at, .. } => {
                 assert!(!number.is_multiple_of(50));
                 assert_eq!(updated_at.as_deref(), Some("2026-11-21T00:00:00Z"));
             }
@@ -332,6 +332,62 @@ async fn shallow_probes_ask_for_lifecycle_only_in_larger_chunks() {
                 );
             }
         }
+    }
+}
+
+/// A shallow probe carries queue and auto-merge flags so a row that has gone
+/// cheap can still be promoted on the next pass.
+#[tokio::test]
+async fn a_shallow_probe_notices_queue_entry_and_auto_merge() {
+    let probe = probe_with(fake_github(&Queries::default(), |query| {
+        (
+            Duration::ZERO,
+            output(
+                true,
+                answer(query, |number| {
+                    serde_json::json!({
+                        "state": "OPEN",
+                        "updatedAt": "2026-11-21T00:00:00Z",
+                        "mergeQueueEntry": if number == 1 {
+                            serde_json::json!({"state": "QUEUED"})
+                        } else {
+                            serde_json::Value::Null
+                        },
+                        "autoMergeRequest": if number == 2 {
+                            serde_json::json!({"enabledAt": "2026-11-21T00:00:00Z"})
+                        } else {
+                            serde_json::Value::Null
+                        },
+                    })
+                }),
+                "",
+            ),
+        )
+    }));
+
+    let all = urls(2);
+    let results = probe.probe_shallow_batch(&all).await;
+    match results[&all[0]].as_ref().unwrap() {
+        ShallowProbe::Open {
+            in_merge_queue,
+            auto_merge_enabled,
+            ..
+        } => {
+            assert!(*in_merge_queue);
+            assert!(!*auto_merge_enabled);
+        }
+        other => panic!("expected an open queued probe, got {other:?}"),
+    }
+    match results[&all[1]].as_ref().unwrap() {
+        ShallowProbe::Open {
+            in_merge_queue,
+            auto_merge_enabled,
+            ..
+        } => {
+            assert!(!*in_merge_queue);
+            assert!(*auto_merge_enabled);
+        }
+        other => panic!("expected an open auto-merge probe, got {other:?}"),
     }
 }
 

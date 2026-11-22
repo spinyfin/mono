@@ -225,10 +225,8 @@ impl ServerState {
     }
 }
 
-/// The products the merge poller keeps fully observed: the product the
-/// app has selected, plus every product named by dispatch focus (directly, or
-/// through a focused project). It answers "where is the operator working?"
-/// from the two places the engine already records that, and singles out
+/// The active products: the product selected in the app plus any named by
+/// dispatch focus (directly, or through a focused project). Singles out
 /// nothing — so the poller treats every product as active — when neither
 /// names one: no app connected, nothing selected, focus mode off.
 pub(super) struct PollerActiveProducts(pub(super) Weak<ServerState>);

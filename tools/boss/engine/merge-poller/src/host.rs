@@ -167,8 +167,9 @@ pub trait LoopPasses: Send + Sync {
     fn start_passes(&self) -> Box<dyn SweepPasses>;
 }
 
-/// Which products the operator is working in right now, so the poller can
-/// spend its full probes where they will be acted on.
+/// The active products: the product selected in the app plus any named by
+/// dispatch focus, so the poller can spend its full probes where they will
+/// be acted on.
 ///
 /// The poller probes a PR in an active product in full every pass, and a PR in
 /// any other product only for merge or close, on a slower cadence (see

@@ -11,8 +11,8 @@
 //! | ------- | -------------------------------------------------------------------------------------------- | ------------- |
 //! | full    | blocked rows (merge conflict, CI failure, dependency / review feedback, stranded)            | every pass    |
 //! |         | `in_review` rows in an active product, not parked, not dormant                               | every pass    |
-//! |         | `in_review` rows with a merge in flight (a recorded merge request, or last seen queued)     | every pass    |
-//! | shallow | parked rows, rows in other products, rows GitHub has not touched for [`DORMANT_AFTER_SECS`] | every [`SHALLOW_PROBE_INTERVAL`] |
+//! |         | `in_review` rows with a merge in flight (a recorded merge request, durable queue state, or last seen queued), including parked rows | every pass    |
+//! | shallow | parked rows without a merge in flight, rows in other products, rows GitHub has not touched for [`DORMANT_AFTER_SECS`] | every [`SHALLOW_PROBE_INTERVAL`] |
 //!
 //! Merge and close detection covers every tracked PR in every product; only
 //! how often a PR is asked about, and how much, depends on the tier. Nothing
@@ -85,13 +85,15 @@ impl ProbeMemory {
             matches!(probe.state, PrLifecycleState::Open(_)) && (probe.in_merge_queue || probe.auto_merge_enabled);
     }
 
-    /// Record a successful shallow probe. It says nothing about queues.
-    pub(crate) fn observe_shallow(&mut self, url: &str, updated_at: Option<&str>, now: Instant) {
+    /// Record a successful shallow probe, including whether it saw the PR
+    /// queued or with auto-merge armed so the next pass can promote it.
+    pub(crate) fn observe_shallow(&mut self, url: &str, updated_at: Option<&str>, queued: bool, now: Instant) {
         let Some(entry) = self.by_url.get_mut(url) else { return };
         entry.last_observed = Some(now);
         if let Some(updated_at) = updated_at {
             entry.updated_at = Some(updated_at.to_owned());
         }
+        entry.queued = queued;
     }
 
     /// GitHub has not touched the PR for [`DORMANT_AFTER_SECS`], as of the
@@ -105,7 +107,7 @@ impl ProbeMemory {
             .is_some_and(|updated| epoch_now.saturating_sub(updated) >= DORMANT_AFTER_SECS)
     }
 
-    /// The last full probe saw the PR queued or with auto-merge armed.
+    /// The last probe saw the PR queued or with auto-merge armed.
     pub(crate) fn is_queued(&self, url: &str) -> bool {
         self.by_url.get(url).is_some_and(|entry| entry.queued)
     }
@@ -135,8 +137,9 @@ impl ProbeMemory {
 pub(crate) struct TierState {
     /// When each tracked PR was last observed, and what it showed.
     pub(crate) memory: ProbeMemory,
-    /// The products the operator is working in, set by the loop before each
-    /// pass. `None` singles out no product, so every product is active.
+    /// The active products: the product selected in the app plus any named
+    /// by dispatch focus. Set by the loop before each pass. `None` singles
+    /// out no product, so every product is active.
     pub(crate) active_products: Option<HashSet<String>>,
 }
 
@@ -176,8 +179,9 @@ pub(crate) struct TierInputs<'a> {
     /// Work item ids with a merge in flight; `None` when that could not be
     /// read, which counts every row as having one rather than guess.
     pub(crate) merge_in_flight: Option<&'a HashSet<String>>,
-    /// Product ids the operator is working in; `None` when no product is
-    /// singled out, which makes every product active.
+    /// The active products: the product selected in the app plus any named
+    /// by dispatch focus. `None` when no product is singled out, which makes
+    /// every product active.
     pub(crate) active_products: Option<&'a HashSet<String>>,
 }
 
@@ -214,15 +218,15 @@ fn in_review_tier(
     memory: &ProbeMemory,
     epoch_now: i64,
 ) -> TierReason {
-    // A parked PR is watched for its merge or close and nothing else, so a
-    // merge in flight does not make it a candidate for upkeep.
-    if inputs.parked.contains(&row.work_item_id) {
-        return TierReason::Parked;
-    }
+    // A merge in flight is detected on every pass even while the row is
+    // parked: the parked skip in `sweep_one` still withholds open-PR upkeep.
     let merging =
         inputs.merge_in_flight.is_none_or(|ids| ids.contains(&row.work_item_id)) || memory.is_queued(&row.pr_url);
     if merging {
         return TierReason::MergeInFlight;
+    }
+    if inputs.parked.contains(&row.work_item_id) {
+        return TierReason::Parked;
     }
     if inputs
         .active_products
@@ -353,6 +357,9 @@ pub(crate) struct TieredProbe {
     /// Review-guide source observation sequences, allocated ahead of the full
     /// probe (see [`crate::pass::allocate_source_observation_sequences`]).
     pub(crate) sequences: HashMap<String, i64>,
+    /// When the oldest contributing chunk started. The snapshot ages from
+    /// this instant, not from when the last chunk finished.
+    pub(crate) taken_at: Instant,
 }
 
 /// Probe every tracked PR at the depth its tier calls for: the full tier
@@ -380,14 +387,18 @@ pub(crate) async fn probe_by_tier(probe: &dyn MergeProbe, request: TierRequest<'
         )
     };
     let sequences = crate::pass::allocate_source_observation_sequences(work_db, completion_handler, &plan.full);
+    state.probe_order.lock().unwrap().observation.clear();
+    let trace = &state.trace;
+    let full_chunks_before = trace.probe_work(ProbeDepth::Full.chunk_work_kind());
+    let shallow_chunks_before = trace.probe_work(ProbeDepth::Shallow.chunk_work_kind());
     let mut results = probe.probe_batch(&plan.full).await;
     let shallow_results = if plan.shallow_due.is_empty() {
         HashMap::new()
     } else {
         probe.probe_shallow_batch(&plan.shallow_due).await
     };
+    let observation = state.probe_order.lock().unwrap().observation.clone();
 
-    let now = Instant::now();
     let mut shallow_observed = 0;
     let mut terminal_shallow = HashSet::new();
     {
@@ -395,17 +406,31 @@ pub(crate) async fn probe_by_tier(probe: &dyn MergeProbe, request: TierRequest<'
         let memory = &mut tiering.memory;
         for (url, result) in &results {
             if let Ok(full) = result {
-                memory.observe_full(url, full, now);
+                memory.observe_full(url, full, observation.observed_at(url));
             }
         }
         for (url, result) in shallow_results {
             match result {
-                Ok(ShallowProbe::Open { updated_at }) => {
-                    memory.observe_shallow(&url, updated_at.as_deref(), now);
+                Ok(ShallowProbe::Open {
+                    updated_at,
+                    in_merge_queue,
+                    auto_merge_enabled,
+                }) => {
+                    memory.observe_shallow(
+                        &url,
+                        updated_at.as_deref(),
+                        in_merge_queue || auto_merge_enabled,
+                        observation.observed_at(&url),
+                    );
                     shallow_observed += 1;
                 }
                 Ok(ShallowProbe::Terminal(terminal)) => {
-                    memory.observe_shallow(&url, terminal.updated_at.as_deref(), now);
+                    memory.observe_shallow(
+                        &url,
+                        terminal.updated_at.as_deref(),
+                        terminal.in_merge_queue || terminal.auto_merge_enabled,
+                        observation.observed_at(&url),
+                    );
                     shallow_observed += 1;
                     terminal_shallow.insert(url.clone());
                     results.insert(url, Ok(*terminal));
@@ -422,7 +447,6 @@ pub(crate) async fn probe_by_tier(probe: &dyn MergeProbe, request: TierRequest<'
         .cloned()
         .collect();
 
-    let trace = &state.trace;
     let tiering = state.tiering();
     log_tier_outcome(
         &TierOutcome::builder()
@@ -434,8 +458,16 @@ pub(crate) async fn probe_by_tier(probe: &dyn MergeProbe, request: TierRequest<'
                     .count(),
             )
             .shallow_observed(shallow_observed)
-            .full_chunks(trace.probe_work(ProbeDepth::Full.chunk_work_kind()))
-            .shallow_chunks(trace.probe_work(ProbeDepth::Shallow.chunk_work_kind()))
+            .full_chunks(
+                trace
+                    .probe_work(ProbeDepth::Full.chunk_work_kind())
+                    .saturating_sub(&full_chunks_before),
+            )
+            .shallow_chunks(
+                trace
+                    .probe_work(ProbeDepth::Shallow.chunk_work_kind())
+                    .saturating_sub(&shallow_chunks_before),
+            )
             .maybe_active_products(tiering.active_products.as_ref())
             .build(),
         &tiering.memory,
@@ -446,5 +478,6 @@ pub(crate) async fn probe_by_tier(probe: &dyn MergeProbe, request: TierRequest<'
         results,
         unwalked,
         sequences,
+        taken_at: observation.taken_at(),
     }
 }

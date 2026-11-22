@@ -4,10 +4,12 @@
 //! The pass is driven through `run_one_pass_tracked` against a probe that
 //! records which tier asked about which PR. Time is tokio's virtual clock.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as StdMutex;
 
 use super::*;
+use crate::pass::PROBE_SNAPSHOT_MAX_AGE;
+use crate::probe::FULL_PROBE_CHUNK_SIZE;
 use crate::probe_tier::{DORMANT_AFTER_SECS, ProbeMemory, SHALLOW_PROBE_INTERVAL, TierInputs, TierReason, plan_tiers};
 use tokio::time::Instant;
 
@@ -77,6 +79,60 @@ impl MergeProbe for TierProbe {
     }
 }
 
+/// Full-tier probe that records per-chunk starts and, on the first batch,
+/// lets later chunks take longer than [`PROBE_SNAPSHOT_MAX_AGE`]. A second
+/// `probe_batch` is the walk's refresh: PR 1 has merged.
+struct ChunkingProbe {
+    stub: Arc<StubProbe>,
+    batches: StdMutex<usize>,
+}
+
+impl ChunkingProbe {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stub: StubProbe::new(),
+            batches: StdMutex::new(0),
+        })
+    }
+
+    fn batch_count(&self) -> usize {
+        *self.batches.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl MergeProbe for ChunkingProbe {
+    async fn probe(&self, url: &str) -> Result<PrLifecycleProbe> {
+        self.stub.probe(url).await
+    }
+
+    async fn probe_batch(&self, urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        let batch = {
+            let mut batches = self.batches.lock().unwrap();
+            *batches += 1;
+            *batches
+        };
+        if batch > 1 {
+            self.stub
+                .set_with_base_head(&pr(1), PrLifecycleState::Merged, "base", "head");
+        }
+        let mut out = HashMap::new();
+        for (index, chunk) in urls.chunks(FULL_PROBE_CHUNK_SIZE).enumerate() {
+            let started = Instant::now();
+            let _ = crate::probe_budget::CONTEXT.try_with(|context| {
+                context.order.lock().unwrap().observation.record_chunk(chunk, started);
+            });
+            if index > 0 && batch == 1 {
+                tokio::time::advance(PROBE_SNAPSHOT_MAX_AGE + Duration::from_secs(1)).await;
+            }
+            for url in chunk {
+                out.insert(url.clone(), self.stub.probe(url).await.map_err(|err| err.to_string()));
+            }
+        }
+        out
+    }
+}
+
 fn pr(n: u64) -> String {
     format!("https://github.com/foo/bar/pull/{n}")
 }
@@ -89,7 +145,7 @@ fn row(db: &WorkDb, product_id: &str, n: u64) -> String {
     chore_in_review_for_product(db, product_id, &format!("Card {n}"), &pr(n))
 }
 
-async fn pass(db: &WorkDb, probe: &TierProbe, state: &PassState) -> SweepOutcome {
+async fn pass(db: &WorkDb, probe: &dyn MergeProbe, state: &PassState) -> SweepOutcome {
     run_one_pass_tracked(
         db,
         probe,
@@ -147,7 +203,7 @@ async fn active_product_rows_are_probed_in_full_every_pass() {
     state.set_active_products(active(&[&mono]));
 
     for pass_number in 0..4 {
-        pass(&db, &probe, &state).await;
+        pass(&db, probe.as_ref(), &state).await;
         let (full, shallow) = probe.take();
         assert_eq!(
             full,
@@ -180,7 +236,7 @@ async fn another_products_merge_is_detected_on_the_shallow_cadence() {
     let state = PassState::default();
     state.set_active_products(active(&[&mono]));
 
-    let outcome = pass(&db, &probe, &state).await;
+    let outcome = pass(&db, probe.as_ref(), &state).await;
     assert_eq!(outcome.merged, 1);
     assert!(
         is_done(&db, &merged_first),
@@ -194,7 +250,7 @@ async fn another_products_merge_is_detected_on_the_shallow_cadence() {
         .stub
         .set_with_base_head(&pr(3), PrLifecycleState::Merged, "base", "head");
     tokio::time::advance(Duration::from_secs(60)).await;
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     assert!(
         !is_done(&db, &merged_later),
         "not asked about again until the shallow interval has passed"
@@ -202,7 +258,7 @@ async fn another_products_merge_is_detected_on_the_shallow_cadence() {
     assert_eq!(probe.take().1, HashSet::new());
 
     tokio::time::advance(SHALLOW_PROBE_INTERVAL).await;
-    let outcome = pass(&db, &probe, &state).await;
+    let outcome = pass(&db, probe.as_ref(), &state).await;
     assert_eq!(outcome.merged, 1);
     assert!(is_done(&db, &merged_later), "seen once the interval has passed");
     let (full, shallow) = probe.take();
@@ -223,7 +279,7 @@ async fn a_parked_rows_merge_is_detected_on_the_shallow_cadence() {
     let probe = TierProbe::new();
     let state = PassState::default();
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     let (full, shallow) = probe.take();
     assert_eq!((full, shallow), (set_of(&[1]), set_of(&[2])));
 
@@ -231,11 +287,11 @@ async fn a_parked_rows_merge_is_detected_on_the_shallow_cadence() {
         .stub
         .set_with_base_head(&pr(2), PrLifecycleState::Merged, "base", "head");
     tokio::time::advance(Duration::from_secs(60)).await;
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     assert!(!is_done(&db, &parked));
 
     tokio::time::advance(SHALLOW_PROBE_INTERVAL).await;
-    let outcome = pass(&db, &probe, &state).await;
+    let outcome = pass(&db, probe.as_ref(), &state).await;
     assert_eq!(outcome.merged, 1);
     assert!(
         is_done(&db, &parked),
@@ -255,7 +311,7 @@ async fn another_products_unmerged_close_is_detected() {
     let state = PassState::default();
     state.set_active_products(active(&[&mono]));
 
-    let outcome = pass(&db, &probe, &state).await;
+    let outcome = pass(&db, probe.as_ref(), &state).await;
 
     assert_eq!(outcome.closed_unmerged, 1);
     assert!(is_done(&db, &closed));
@@ -275,7 +331,7 @@ async fn shallow_rows_that_are_still_open_are_not_walked() {
     let state = PassState::default();
     state.set_active_products(active(&[&mono]));
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
 
     let timings = state.trace().timings();
     let open_walk = timings
@@ -304,7 +360,7 @@ async fn blocked_rows_are_probed_in_full_in_every_product() {
     let state = PassState::default();
     state.set_active_products(active(&[&mono]));
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
 
     let (full, shallow) = probe.take();
     assert_eq!(
@@ -328,15 +384,15 @@ async fn a_row_with_a_merge_in_flight_is_probed_in_full_in_every_product() {
     let state = PassState::default();
     state.set_active_products(active(&[&mono]));
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
 
     let (full, shallow) = probe.take();
     assert_eq!(full, set_of(&[1, 2]));
     assert_eq!(shallow, set_of(&[3]));
 }
 
-/// A PR last seen in a merge queue keeps the full probe after the operator
-/// moves to another product.
+/// A PR last seen in a merge queue keeps the full probe after the active
+/// products move to another product.
 #[tokio::test(start_paused = true)]
 async fn a_pr_last_seen_queued_stays_in_the_full_tier() {
     let (_dir, db) = open_db();
@@ -357,7 +413,7 @@ async fn a_pr_last_seen_queued_stays_in_the_full_tier() {
     );
     let state = PassState::default();
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     assert_eq!(
         probe.take().0,
         set_of(&[1, 2]),
@@ -366,9 +422,138 @@ async fn a_pr_last_seen_queued_stays_in_the_full_tier() {
 
     state.set_active_products(active(&[&mono]));
     tokio::time::advance(Duration::from_secs(60)).await;
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     let (full, shallow) = probe.take();
     assert_eq!((full, shallow), (set_of(&[1, 2]), HashSet::new()));
+}
+
+/// Durable queue membership survives an engine restart: a fresh pass with empty
+/// in-memory flags still probes a queued other-product row in full.
+#[tokio::test(start_paused = true)]
+async fn a_queued_other_product_row_is_full_after_restart() {
+    let (_dir, db) = open_db();
+    let (mono, other) = (product(&db, "Mono"), product(&db, "Other"));
+    row(&db, &mono, 1);
+    let queued = row(&db, &other, 2);
+    seed_queued(&db, &queued, Some(1), "2026-11-21T00:00:00Z", "QUEUED");
+    let probe = TierProbe::new();
+    let state = PassState::default();
+    state.set_active_products(active(&[&mono]));
+
+    pass(&db, probe.as_ref(), &state).await;
+
+    let (full, shallow) = probe.take();
+    assert_eq!(
+        (full, shallow),
+        (set_of(&[1, 2]), HashSet::new()),
+        "durable merge_queue_state puts the other-product row in the full tier"
+    );
+}
+
+/// A shallow probe that sees GitHub queue the PR promotes it on the next pass.
+#[tokio::test(start_paused = true)]
+async fn an_external_enqueue_promotes_a_shallow_row_on_the_next_pass() {
+    let (_dir, db) = open_db();
+    let (mono, other) = (product(&db, "Mono"), product(&db, "Other"));
+    row(&db, &mono, 1);
+    row(&db, &other, 2);
+    let probe = TierProbe::new();
+    let state = PassState::default();
+    state.set_active_products(active(&[&mono]));
+
+    pass(&db, probe.as_ref(), &state).await;
+    assert_eq!(probe.take(), (set_of(&[1]), set_of(&[2])));
+
+    probe.stub.states.lock().unwrap().insert(
+        pr(2),
+        Ok(probe_with_queue_fields(
+            true,
+            Some("QUEUED"),
+            Some(1),
+            Some("2026-11-21T00:00:00Z"),
+            false,
+            None,
+        )),
+    );
+    tokio::time::advance(SHALLOW_PROBE_INTERVAL).await;
+    pass(&db, probe.as_ref(), &state).await;
+    let (full, shallow) = probe.take();
+    assert_eq!(full, set_of(&[1]));
+    assert_eq!(
+        shallow,
+        set_of(&[2]),
+        "this pass's shallow probe is what notices the queue"
+    );
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    pass(&db, probe.as_ref(), &state).await;
+    assert_eq!(
+        probe.take(),
+        (set_of(&[1, 2]), HashSet::new()),
+        "queued in memory: full on the next pass"
+    );
+}
+
+/// A parked row with an active merge request stays in the full tier so the
+/// merge is seen on the next pass, not five minutes later. Open-PR upkeep
+/// still does not run while it is parked.
+#[tokio::test(start_paused = true)]
+async fn a_parked_row_with_a_merge_intent_is_probed_in_full() {
+    let (_dir, db) = open_db();
+    let mono = product(&db, "Mono");
+    row(&db, &mono, 1);
+    let parked = row(&db, &mono, 2);
+    db.park_work_item_as_actor(&parked, true, Some("not now"), "human")
+        .unwrap();
+    db.record_merge_intent(&parked, &pr(2), Some("head-2")).unwrap();
+    let probe = TierProbe::new();
+    let state = PassState::default();
+
+    pass(&db, probe.as_ref(), &state).await;
+    assert_eq!(
+        probe.take(),
+        (set_of(&[1, 2]), HashSet::new()),
+        "merge in flight wins over the parked demotion"
+    );
+
+    probe
+        .stub
+        .set_with_base_head(&pr(2), PrLifecycleState::Merged, "base", "head");
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let outcome = pass(&db, probe.as_ref(), &state).await;
+    assert_eq!(outcome.merged, 1);
+    assert!(
+        is_done(&db, &parked),
+        "a parked merge-intent row is marked done on the next full pass"
+    );
+}
+
+/// The first full chunk answers quickly; later chunks take more than the
+/// snapshot's max age. The walk must re-probe before acting, or it would
+/// write from an Open result that has since merged.
+#[tokio::test(start_paused = true)]
+async fn a_slow_later_chunk_ages_the_snapshot_from_the_first_chunk_start() {
+    let (_dir, db) = open_db();
+    let mono = product(&db, "Mono");
+    let first = row(&db, &mono, 1);
+    for n in 2..=(FULL_PROBE_CHUNK_SIZE as u64 + 1) {
+        row(&db, &mono, n);
+    }
+    let probe = ChunkingProbe::new();
+    let state = PassState::default();
+
+    let outcome = pass(&db, probe.as_ref(), &state).await;
+
+    assert_eq!(
+        probe.batch_count(),
+        2,
+        "the walk re-probes once the first chunk is older than the snapshot max age"
+    );
+    assert_eq!(outcome.merged, 1);
+    assert!(
+        is_done(&db, &first),
+        "the refresh sees the first PR merge instead of acting on the stale open result"
+    );
 }
 
 /// A PR GitHub has not touched for two weeks is watched cheaply, and
@@ -389,7 +574,7 @@ async fn a_dormant_pr_returns_to_the_full_tier_when_it_is_updated() {
         .insert(pr(1), Ok(open_updated_at(&pr(1), old)));
     let state = PassState::default();
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     assert_eq!(
         probe.take().0,
         set_of(&[1, 2]),
@@ -397,7 +582,7 @@ async fn a_dormant_pr_returns_to_the_full_tier_when_it_is_updated() {
     );
 
     tokio::time::advance(Duration::from_secs(60)).await;
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     let (full, shallow) = probe.take();
     assert_eq!(
         (full, shallow),
@@ -416,7 +601,7 @@ async fn a_dormant_pr_returns_to_the_full_tier_when_it_is_updated() {
         .unwrap()
         .insert(pr(1), Ok(open_updated_at(&pr(1), &fresh)));
     tokio::time::advance(SHALLOW_PROBE_INTERVAL).await;
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     let (full, shallow) = probe.take();
     assert_eq!(
         (full, shallow),
@@ -425,7 +610,7 @@ async fn a_dormant_pr_returns_to_the_full_tier_when_it_is_updated() {
     );
 
     tokio::time::advance(Duration::from_secs(60)).await;
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     assert_eq!(probe.take().0, set_of(&[1, 2]), "active again: full every pass");
 }
 
@@ -443,7 +628,7 @@ async fn a_failed_shallow_probe_is_retried_on_the_next_pass() {
     state.set_active_products(active(&[&mono]));
 
     for _ in 0..3 {
-        pass(&db, &probe, &state).await;
+        pass(&db, probe.as_ref(), &state).await;
         assert_eq!(probe.take().1, set_of(&[2]), "still due after a failure");
         tokio::time::advance(Duration::from_secs(60)).await;
     }
@@ -460,7 +645,7 @@ async fn every_product_is_active_when_none_is_singled_out() {
     let state = PassState::default();
     state.set_active_products(Some(HashSet::new()));
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
 
     assert_eq!(probe.take(), (set_of(&[1, 2]), HashSet::new()));
 }
@@ -487,9 +672,9 @@ async fn the_pass_logs_probe_tiers_and_the_oldest_unobserved_age() {
     let state = PassState::default();
     state.set_active_products(active(&[&mono]));
 
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
     tokio::time::advance(Duration::from_secs(400)).await;
-    pass(&db, &probe, &state).await;
+    pass(&db, probe.as_ref(), &state).await;
 
     let logs = String::from_utf8_lossy(&logs.lock()).into_owned();
     let line = logs
@@ -523,7 +708,7 @@ fn candidate(work_item_id: &str, product_id: &str, n: u64) -> PendingMergeCheck 
 }
 
 #[test]
-fn the_tier_decision_orders_parked_before_merging_before_product_before_dormancy() {
+fn the_tier_decision_orders_merging_before_parked_before_product_before_dormancy() {
     let now = Instant::now();
     let rows = [
         candidate("parked-merging", "a", 1),
@@ -553,18 +738,18 @@ fn the_tier_decision_orders_parked_before_merging_before_product_before_dormancy
         epoch_now,
     );
 
-    assert_eq!(plan.full, vec![pr(2), pr(5)]);
-    assert_eq!(plan.shallow, vec![pr(1), pr(3), pr(4)]);
+    assert_eq!(plan.full, vec![pr(1), pr(2), pr(5)]);
+    assert_eq!(plan.shallow, vec![pr(3), pr(4)]);
     let counts = |reason: TierReason| plan.reasons.get(reason.key()).copied().unwrap_or(0);
-    assert_eq!(counts(TierReason::Parked), 1);
-    assert_eq!(counts(TierReason::MergeInFlight), 1);
+    assert_eq!(counts(TierReason::Parked), 0);
+    assert_eq!(counts(TierReason::MergeInFlight), 2);
     assert_eq!(counts(TierReason::OtherProduct), 1);
     assert_eq!(counts(TierReason::Dormant), 1);
     assert_eq!(counts(TierReason::ActiveProduct), 1);
 }
 
 #[test]
-fn unknown_merges_in_flight_probe_every_unparked_row_in_full() {
+fn unknown_merges_in_flight_probe_every_row_in_full() {
     let now = Instant::now();
     let rows = [candidate("elsewhere", "b", 1), candidate("parked", "b", 2)];
     let mut memory = ProbeMemory::default();
@@ -585,7 +770,7 @@ fn unknown_merges_in_flight_probe_every_unparked_row_in_full() {
         1_800_000_000,
     );
 
-    assert_eq!((plan.full, plan.shallow), (vec![pr(1)], vec![pr(2)]));
+    assert_eq!((plan.full, plan.shallow), (vec![pr(1), pr(2)], vec![]));
 }
 
 #[test]
@@ -593,7 +778,10 @@ fn memory_forgets_untracked_prs_and_never_remembers_an_unmerged_verdict() {
     let now = Instant::now();
     let mut memory = ProbeMemory::default();
     memory.track(&[pr(1).as_str(), pr(2).as_str()].into_iter().collect(), now);
-    memory.observe_shallow(&pr(1), Some("2020-01-01T00:00:00Z"), now);
+    memory.observe_shallow(&pr(1), Some("2020-01-01T00:00:00Z"), true, now);
+    assert!(memory.is_queued(&pr(1)), "a shallow probe can notice a queue");
+    memory.observe_shallow(&pr(1), Some("2020-01-01T00:00:00Z"), false, now);
+    assert!(!memory.is_queued(&pr(1)));
     assert!(memory.is_dormant(&pr(1), 1_800_000_000));
     assert!(!memory.is_dormant(&pr(2), 1_800_000_000), "never probed is not dormant");
     assert!(!memory.shallow_due(&pr(1), now));

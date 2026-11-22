@@ -178,6 +178,9 @@ fn recurring_reads() -> Vec<Read> {
         ("merge poller: merges in flight", "60 s", |db| {
             db.list_work_item_ids_with_pending_merge().unwrap();
         }),
+        ("merge poller: merge queue members", "60 s", |db| {
+            db.list_work_item_ids_in_merge_queue().unwrap();
+        }),
         ("merge poller: review admission", "60 s", |db| {
             db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
         }),

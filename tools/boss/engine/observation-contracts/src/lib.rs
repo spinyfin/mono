@@ -327,6 +327,10 @@ pub enum ShallowProbe {
     Open {
         /// GitHub's `updatedAt` for the PR (RFC 3339), when it reported one.
         updated_at: Option<String>,
+        /// Non-null `mergeQueueEntry`: GitHub has the PR in a merge queue.
+        in_merge_queue: bool,
+        /// Non-null `autoMergeRequest`: auto-merge is armed.
+        auto_merge_enabled: bool,
     },
     /// Merged or closed without merging. The probe carries what the
     /// merge/close transition reads (state, merge commit, head and base refs,
@@ -341,6 +345,8 @@ impl ShallowProbe {
         match probe.state {
             PrLifecycleState::Open(_) => Self::Open {
                 updated_at: probe.updated_at,
+                in_merge_queue: probe.in_merge_queue,
+                auto_merge_enabled: probe.auto_merge_enabled,
             },
             PrLifecycleState::Merged | PrLifecycleState::ClosedUnmerged => Self::Terminal(Box::new(probe)),
         }

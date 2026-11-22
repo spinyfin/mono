@@ -264,10 +264,14 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
 /// default (`require_default_branch`) and what the post-merge review keys on;
 /// a merge recorded without them could complete work that never landed.
 /// `updatedAt` is what lets the poller notice that a PR it is watching
-/// cheaply has become active again.
+/// cheaply has become active again. `mergeQueueEntry` and `autoMergeRequest`
+/// are scalars-plus-null-object, still 0 requested nodes, and are how a
+/// shallow probe notices that GitHub queued the PR or armed auto-merge so
+/// the next pass can promote it to the full tier.
 pub(crate) const PR_SHALLOW_FIELDS: &str = concat!(
     "repository { defaultBranchRef { name } } ",
     "state mergedAt closedAt baseRefOid headRefOid headRefName baseRefName ",
+    "mergeQueueEntry { state } autoMergeRequest { enabledAt } ",
     "mergeCommit { oid } updatedAt",
 );
 
@@ -307,10 +311,10 @@ impl CommandMergeProbe {
     /// attendance order (terminal candidates first, then least recently
     /// attended), one query per chunk, one chunk at a time.
     ///
-    /// Each chunk gets its own deadline, the same `min(30 s, pass time left /
-    /// 4)` a whole call used to share, taken when the chunk starts. A chunk
-    /// that is rejected or hangs therefore spends its own allowance and no
-    /// more: the chunks after it still run. The allowance shrinks with the
+    /// Each chunk gets its own deadline, `min(30 s, pass time left / 4)`,
+    /// taken when the chunk starts (see [`crate::probe_budget::deadline`]). A
+    /// chunk that is rejected or hangs therefore spends its own allowance and
+    /// no more: the chunks after it still run. The allowance shrinks with the
     /// pass's remaining time, so a run of failing chunks cannot take the pass;
     /// a chunk reached with the allowance already spent is deferred, comes
     /// back as retryable errors, and sorts to the front of the next pass.
@@ -353,6 +357,10 @@ impl CommandMergeProbe {
                                 out.extend(chunk.iter().map(|url| (url.clone(), Err(msg.clone()))));
                                 continue;
                             }
+                            let started = tokio::time::Instant::now();
+                            let _ = crate::probe_budget::CONTEXT.try_with(|context| {
+                                context.order.lock().unwrap().observation.record_chunk(chunk, started);
+                            });
                             measurement.attempt();
                             let chunk_out = self.probe_batch_with_deadline(chunk, deadline, depth).await;
                             if chunk.iter().all(|url| matches!(chunk_out.get(url), Some(Ok(_)))) {

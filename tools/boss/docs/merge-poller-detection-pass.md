@@ -60,12 +60,12 @@ poller will act on. Every other tracked PR is watched only so that a merge or a
 close is still recorded, and a shallow probe answers that for a handful of
 scalar fields.
 
-| Tier    | Rows                                                                                                                                   | Probed                          |
-| ------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| full    | blocked rows (merge conflict, CI failure, dependency or review feedback, stranded)                                                     | every pass                      |
-|         | `in_review` rows in an active product that are not parked and not dormant                                                              | every pass                      |
-|         | `in_review` rows with a merge in flight (an active merge request, GitHub auto-merge intent or Trunk queue intent, or last seen queued) | every pass                      |
-| shallow | parked rows, `in_review` rows in other products, rows GitHub has not updated for 14 days                                               | when not observed for 5 minutes |
+| Tier    | Rows                                                                                                                                             | Probed                          |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------- |
+| full    | blocked rows (merge conflict, CI failure, dependency or review feedback, stranded)                                                               | every pass                      |
+|         | `in_review` rows in an active product that are not parked and not dormant                                                                        | every pass                      |
+|         | `in_review` rows with a merge in flight (an active merge request, durable `tasks.merge_queue_state`, or last seen queued), including parked rows | every pass                      |
+| shallow | parked rows without a merge in flight, `in_review` rows in other products, rows GitHub has not updated for 14 days                               | when not observed for 5 minutes |
 
 Merge and close detection covers every tracked PR in every product; only how
 often a PR is asked about, and how much, depends on its tier. A row that is
@@ -107,6 +107,17 @@ A chunk that GitHub rejects or that never returns costs its own PRs only: the
 chunks after it are still sent. A chunk reached with its allowance already
 spent is deferred, and its PRs sort to the front of the next pass. A rate-limit
 rejection stops the rest of the call.
+
+The snapshot the walks write from ages from when the oldest contributing
+chunk started, not from when the last chunk finished. If later chunks run
+long enough that the first results are more than 60 s old, the open-PR walk
+re-probes the remaining PRs before acting.
+
+A PR in GitHub's merge queue, or with auto-merge armed, is probed in full
+every pass even after an engine restart: the pass unions live
+`tasks.merge_queue_state` with recorded merge requests. A shallow probe also
+reads `mergeQueueEntry` and `autoMergeRequest`, so an external enqueue of a
+row that had gone shallow is noticed and the next pass promotes it.
 
 Every pass logs one `merge poller: probe tiers` line at `info`:
 

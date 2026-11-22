@@ -1751,8 +1751,9 @@ async fn serve_scoped(
             // population are carried out by the services that own them; the
             // poller reaches them through this host.
             .host(server_state.sweep_host.clone())
-            // Full probes go to the product the operator is working in; every
-            // other product's PRs are still watched for merge and close.
+            // Full probes go to the active products: the product selected in
+            // the app plus any named by dispatch focus. Every other product's
+            // PRs are still watched for merge and close.
             .active_products(Arc::new(selected_product::PollerActiveProducts(Arc::downgrade(
                 &server_state,
             ))))

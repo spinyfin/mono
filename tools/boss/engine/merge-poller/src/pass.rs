@@ -151,10 +151,21 @@ pub(crate) struct ProbeSnapshot {
 }
 
 impl ProbeSnapshot {
+    #[cfg(test)]
     pub(crate) fn new(results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>) -> Self {
+        Self::at(results, tokio::time::Instant::now())
+    }
+
+    /// `taken_at` is when the oldest contributing chunk started, not when
+    /// the last chunk finished: a later slow chunk must not make an early
+    /// result look fresh.
+    pub(crate) fn at(
+        results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+        taken_at: tokio::time::Instant,
+    ) -> Self {
         Self {
             results,
-            taken_at: tokio::time::Instant::now(),
+            taken_at,
             refreshes_left: MAX_PROBE_REFRESHES_PER_PASS,
             refreshed_last_call: false,
         }
@@ -177,9 +188,21 @@ impl ProbeSnapshot {
     /// never read again, and every candidate list is rebuilt from the DB next
     /// pass. It is a closure rather than a slice so the common (fresh) case
     /// allocates nothing.
+    #[cfg(test)]
     pub(crate) async fn ensure_fresh(
         &mut self,
         probe: &dyn MergeProbe,
+        remaining_urls: impl FnOnce() -> Vec<String>,
+    ) -> bool {
+        self.ensure_fresh_from(probe, None, remaining_urls).await
+    }
+
+    /// Like [`Self::ensure_fresh`], and ages a refresh from this pass's
+    /// chunk-start clock so a slow later chunk cannot hide an early result.
+    pub(crate) async fn ensure_fresh_from(
+        &mut self,
+        probe: &dyn MergeProbe,
+        state: Option<&PassState>,
         remaining_urls: impl FnOnce() -> Vec<String>,
     ) -> bool {
         self.refreshed_last_call = false;
@@ -205,10 +228,18 @@ impl ProbeSnapshot {
             "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
              before writing further state",
         );
+        if let Some(state) = state {
+            state.probe_order.lock().unwrap().observation.clear();
+        }
         // Merge rather than replace: entries for candidates already walked
         // stay readable for the pass's adaptive-poll observations.
+        // Age from when the oldest refresh chunk started, matching the
+        // initial snapshot: a slow later chunk must not hide an early result.
+        let fallback = tokio::time::Instant::now();
         self.results.extend(probe.probe_batch(&urls).await);
-        self.taken_at = tokio::time::Instant::now();
+        self.taken_at = state
+            .map(|state| state.probe_order.lock().unwrap().observation.taken_at())
+            .unwrap_or(fallback);
         self.refreshed_last_call = true;
         true
     }
@@ -243,12 +274,15 @@ fn parked_ids_for_pass<'a>(
 async fn ensure_fresh_refreshing_parked<'a>(
     snapshot: &mut ProbeSnapshot,
     probe: &dyn MergeProbe,
+    state: &PassState,
     work_db: &WorkDb,
     parked_ids: &mut HashSet<String>,
     parked_scope: &[&'a PendingMergeCheck],
     remaining: impl IntoIterator<Item = &'a PendingMergeCheck>,
 ) -> bool {
-    let ok = snapshot.ensure_fresh(probe, || remaining_probe_urls(remaining)).await;
+    let ok = snapshot
+        .ensure_fresh_from(probe, Some(state), || remaining_probe_urls(remaining))
+        .await;
     if ok && snapshot.refreshed_last_call {
         *parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
     }
@@ -617,11 +651,20 @@ pub async fn run_one_pass_tracked(
     trace.enter(PassPhase::Probe, 1);
     let in_review_parked = parked_ids_for_pass(work_db, in_review.iter());
     let merge_in_flight = match work_db.list_work_item_ids_with_pending_merge() {
-        Ok(ids) => Some(ids),
+        Ok(mut ids) => {
+            match work_db.list_work_item_ids_in_merge_queue() {
+                Ok(queued) => ids.extend(queued),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "merge poller: could not read durable merge-queue membership; using merge requests only",
+                ),
+            }
+            Some(ids)
+        }
         Err(err) => {
             tracing::warn!(
                 ?err,
-                "merge poller: could not read merges in flight; probing every unparked in-review PR in full",
+                "merge poller: could not read merges in flight; probing every in-review PR in full",
             );
             None
         }
@@ -638,6 +681,7 @@ pub async fn run_one_pass_tracked(
         results,
         unwalked,
         sequences: source_observation_sequences,
+        taken_at,
     } = crate::probe_tier::probe_by_tier(
         probe,
         crate::probe_tier::TierRequest {
@@ -655,7 +699,7 @@ pub async fn run_one_pass_tracked(
         },
     )
     .await;
-    let mut snapshot = ProbeSnapshot::new(results);
+    let mut snapshot = ProbeSnapshot::at(results, taken_at);
     trace.finish_item();
 
     // The pass's candidate walk, materialised so a mid-pass re-probe can be
@@ -693,6 +737,7 @@ pub async fn run_one_pass_tracked(
         if !ensure_fresh_refreshing_parked(
             &mut snapshot,
             probe,
+            state,
             work_db,
             &mut parked_ids,
             &parked_scope,
@@ -777,6 +822,7 @@ pub async fn run_one_pass_tracked(
                     if !ensure_fresh_refreshing_parked(
                         &mut snapshot,
                         probe,
+                        state,
                         work_db,
                         &mut parked_ids,
                         &parked_scope,
@@ -877,6 +923,7 @@ pub async fn run_one_pass_tracked(
                                 if !ensure_fresh_refreshing_parked(
                                     &mut snapshot,
                                     probe,
+                                    state,
                                     work_db,
                                     &mut parked_ids,
                                     &parked_scope,

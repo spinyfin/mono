@@ -564,8 +564,9 @@ pub struct LoopServices<C> {
     /// Conflict handling, design-doc maintenance, population and the optional
     /// passes that ride the full-sweep cadence.
     pub host: Arc<dyn SweepHost>,
-    /// Which products the operator is working in; read before every pass to
-    /// decide which PRs that pass probes in full.
+    /// The active products: the product selected in the app plus any named
+    /// by dispatch focus; read before every pass to decide which PRs that
+    /// pass probes in full.
     pub active_products: Arc<dyn ActiveProducts>,
     /// Where the loop reports that full detection passes are being
     /// abandoned, for the engine health report.

@@ -794,9 +794,10 @@ async fn report_from_the_app_session_is_acked_as_accepted_and_recorded() {
 
 // ── The merge poller's active products ─────────────────────────────────────
 //
-// The poller probes a product's PRs in full only while the operator is working
-// in it. Singling out nothing must read as "every product is active", never as
-// "no product is", or every row would be demoted at once.
+// The poller probes a product's PRs in full only for the active products: the
+// product selected in the app plus any named by dispatch focus. Singling out
+// nothing must read as "every product is active", never as "no product is", or
+// every row would be demoted at once.
 
 async fn active_products(server_state: &Arc<ServerState>) -> Option<std::collections::HashSet<String>> {
     use boss_engine_merge_poller::ActiveProducts;

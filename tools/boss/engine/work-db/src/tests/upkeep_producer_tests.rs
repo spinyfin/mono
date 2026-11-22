@@ -680,6 +680,10 @@ const NOT_UPKEEP: &[(&str, &str)] = &[
         "list_work_item_ids_with_pending_merge",
         "a set of ids the merge poller reads to choose how deeply to probe a PR; it nominates and mints nothing",
     ),
+    (
+        "list_work_item_ids_in_merge_queue",
+        "a set of ids the merge poller reads to choose how deeply to probe a PR; it nominates and mints nothing",
+    ),
 ];
 
 const LISTING_KEYWORDS: &[&str] = &[

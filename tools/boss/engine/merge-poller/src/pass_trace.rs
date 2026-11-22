@@ -204,6 +204,19 @@ pub struct ProbeWork {
     pub deferred: usize,
 }
 
+impl ProbeWork {
+    /// Counts recorded after `earlier`, for a log line that must not include
+    /// work that ran before the tier probes (the disarm drain).
+    pub(crate) fn saturating_sub(&self, earlier: &Self) -> Self {
+        Self {
+            elapsed: self.elapsed.saturating_sub(earlier.elapsed),
+            attempted: self.attempted.saturating_sub(earlier.attempted),
+            completed: self.completed.saturating_sub(earlier.completed),
+            deferred: self.deferred.saturating_sub(earlier.deferred),
+        }
+    }
+}
+
 impl PassTimings {
     /// One line naming each phase's cost, e.g.
     /// `list_candidates=14ms probe=910ms(1/1) open_walk=178000ms(12/46)[cut off at chore_x]`.
