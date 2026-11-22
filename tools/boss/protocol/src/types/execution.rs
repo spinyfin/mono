@@ -879,8 +879,11 @@ pub struct RequestExecutionInput {
     /// onto `work_executions.created_via` (see
     /// [`CreateExecutionInput::created_via`]). Engine sweeps and handlers
     /// name themselves here (`orphan_sweep`, `rescan_active_dispatch`,
-    /// `frontend:request_execution`, ...); `None` records the generic
-    /// `request_execution` label.
+    /// `frontend:request_execution`, ...). `None` records `audit_basis`
+    /// when that is set, otherwise the generic `request_execution` label.
+    /// The RequestExecution RPC overwrites this to
+    /// `frontend:request_execution`, the same way it overwrites the audit
+    /// fields from the socket peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_via: Option<String>,
 

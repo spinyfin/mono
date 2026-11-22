@@ -982,6 +982,7 @@ async fn request_execution_and_board_drop_stamp_created_via() {
         FrontendRequest::RequestExecution {
             input: RequestExecutionInput::builder()
                 .work_item_id(rpc_chore.id.clone())
+                .created_via("orphan_sweep")
                 .build(),
         },
     )

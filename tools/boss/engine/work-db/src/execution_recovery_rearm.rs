@@ -122,12 +122,11 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
                AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')",
             params![id, now_string()],
         )?;
-        let kind = execution_kind_for_work_item(conn, &id)?;
-        let pr_url = if kind == ExecutionKind::RevisionImplementation {
-            get_chain_root_task(conn, &id)?.and_then(|root| root.pr_url)
-        } else {
-            None
-        };
+        // v039 / v043 / v059 run before TASK_COLUMNS (critical provenance,
+        // parking, operator-question / merge-intent projections). Read only
+        // columns that exist at those steps.
+        let kind = historical_execution_kind(conn, &id)?;
+        let pr_url = historical_chain_root_pr_url(conn, &id, &kind)?;
         // Preserve the terminal attempt and its bookmarks as recovery
         // provenance. The normal reconciler applies dependency admission
         // and project ordering before promoting this replacement to ready.
@@ -143,9 +142,9 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
                     .build(),
             )?;
         } else {
-            let repo_remote_url = resolve_execution_repo_remote_url(conn, &id, None)?;
-            let worker_branch_prefix = resolve_execution_worker_branch_prefix(conn, &id)?;
-            let branch_naming = resolve_execution_branch_naming(conn, &id)?;
+            let repo_remote_url = historical_execution_repo_remote_url(conn, &id)?;
+            let worker_branch_prefix = historical_worker_branch_prefix(conn, &id)?;
+            let branch_naming = historical_branch_naming(conn, &id)?;
             let branch_naming_json = serde_json::to_string(&branch_naming).unwrap_or_default();
             conn.execute(
                 "INSERT INTO work_executions (
@@ -192,6 +191,141 @@ pub(super) fn migrate_fresh_start(conn: &Connection) -> Result<()> {
         [now_string()],
     )?;
     Ok(())
+}
+
+/// `ExecutionKind` for a work item using only `tasks.kind`, which exists at
+/// schema 39. [`execution_kind_for_work_item`] loads a full [`Task`] row.
+fn historical_execution_kind(conn: &Connection, work_item_id: &str) -> Result<ExecutionKind> {
+    Ok(match classify_id(work_item_id)? {
+        ItemKind::Product => ExecutionKind::ProductDesign,
+        ItemKind::Project => ExecutionKind::ProjectDesign,
+        ItemKind::Task => {
+            let kind_str: String = conn
+                .query_row(
+                    "SELECT kind FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                    [work_item_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .with_context(|| format!("unknown task: {work_item_id}"))?;
+            let kind: TaskKind = kind_str
+                .parse()
+                .map_err(|_| anyhow::anyhow!("unknown task kind in DB row {work_item_id}: {kind_str}"))?;
+            execution_kind_for_task_kind(&kind)
+        }
+        ItemKind::Comment => bail!("comment ids do not map to a primary execution kind: {work_item_id}"),
+        ItemKind::Comparison => bail!("comparison ids do not map to a primary execution kind: {work_item_id}"),
+    })
+}
+
+/// Chain-root `pr_url` for a revision using `tasks.kind` / `parent_task_id` /
+/// `pr_url`. [`get_chain_root_task`] loads a full [`Task`] row.
+fn historical_chain_root_pr_url(conn: &Connection, work_item_id: &str, kind: &ExecutionKind) -> Result<Option<String>> {
+    if *kind != ExecutionKind::RevisionImplementation {
+        return Ok(None);
+    }
+    let root_id = chain_root(conn, work_item_id)?;
+    if root_id == work_item_id {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row("SELECT pr_url FROM tasks WHERE id = ?1", [&root_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten()
+        .filter(|url| !url.is_empty()))
+}
+
+fn historical_execution_repo_remote_url(conn: &Connection, work_item_id: &str) -> Result<String> {
+    let row = conn
+        .query_row(
+            "SELECT t.repo_remote_url, t.kind, p.repo_remote_url, p.design_repo, p.docs_repo
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.id = ?1",
+            [work_item_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((override_repo, kind_str, product_repo, design_repo, docs_repo)) = row else {
+        bail!("work item {work_item_id} does not resolve to a repo_remote_url; provide one explicitly");
+    };
+    if let Some(url) = override_repo.filter(|s| !s.is_empty()) {
+        return Ok(url);
+    }
+    let kind: TaskKind = kind_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unknown task kind in DB row {work_item_id}: {kind_str}"))?;
+    historical_repo_from_product(&kind, product_repo, design_repo, docs_repo).with_context(|| {
+        format!("work item {work_item_id} does not resolve to a repo_remote_url; provide one explicitly")
+    })
+}
+
+fn historical_repo_from_product(
+    kind: &TaskKind,
+    product_repo: Option<String>,
+    design_repo: Option<String>,
+    docs_repo: Option<String>,
+) -> Option<String> {
+    match kind {
+        TaskKind::Design | TaskKind::DesignPostmortem => {
+            if let Some(url) = design_repo.filter(|s| !s.is_empty()) {
+                return Some(url);
+            }
+        }
+        TaskKind::Investigation => {
+            if let Some(url) = docs_repo.filter(|s| !s.is_empty()) {
+                return Some(url);
+            }
+            if let Ok(user_docs) = std::env::var("BOSS_USER_DOCS_REPO")
+                && !user_docs.is_empty()
+            {
+                return Some(user_docs);
+            }
+        }
+        TaskKind::Chore | TaskKind::Followup | TaskKind::ProjectTask | TaskKind::Revision | TaskKind::Task => {}
+    }
+    product_repo.filter(|s| !s.is_empty())
+}
+
+fn historical_worker_branch_prefix(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT p.worker_branch_prefix
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.id = ?1",
+            [work_item_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|s| !s.is_empty()))
+}
+
+fn historical_branch_naming(conn: &Connection, work_item_id: &str) -> Result<BranchNaming> {
+    let rules_json: Option<String> = conn
+        .query_row(
+            "SELECT p.editorial_rules
+             FROM tasks t JOIN products p ON p.id = t.product_id
+             WHERE t.id = ?1",
+            [work_item_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(rules_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<EditorialRules>(s).ok())
+        .map(|rules| rules.branch_naming)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -761,31 +895,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("work.db");
         let stale = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_18dd050856e97880_290");
-        let wedged = {
-            let db = WorkDb::open(path.clone()).unwrap();
-            let product_id = product(&db);
-            let wedged = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
-            db.create_execution(
-                CreateExecutionInput::builder()
-                    .work_item_id(wedged.clone())
-                    .kind(ExecutionKind::TaskImplementation)
-                    .status(ExecutionStatus::Failed)
-                    .created_via("test")
-                    .build(),
+        let pr_url = "https://github.com/example/repo/pull/42";
+        let wedged = "task_rearm_rev";
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::schema_init::seed_integer_schema_through_v038(&conn);
+            assert!(
+                !crate::schema_init::table_has_column(&conn, "tasks", "critical_set_by").unwrap(),
+                "v038 must not have columns added by v046"
+            );
+            assert!(
+                !crate::schema_init::table_has_column(&conn, "work_executions", "created_via").unwrap(),
+                "v038 must not have execution provenance"
+            );
+            conn.execute_batch(
+                "INSERT INTO products (id, name, slug, description, repo_remote_url, status, created_at, updated_at)
+                 VALUES ('prod_rearm_hist', 'rearm', 'rearm-hist', '', 'git@example.invalid:foo/bar.git', 'active', '1', '1');
+                 INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, pr_url)
+                 VALUES ('task_rearm_root', 'prod_rearm_hist', 'chore', 'root', '', 'in_review', '1', '1', 1, 'https://github.com/example/repo/pull/42');
+                 INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, blocked_reason, blocked_detail, parent_task_id)
+                 VALUES ('task_rearm_rev', 'prod_rearm_hist', 'revision', 'wedged', '', 'blocked', '1', '1', 0, 'execution_recovery_failed', '', 'task_rearm_root');
+                 INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, started_at, finished_at)
+                 VALUES ('exec_rearm_failed', 'task_rearm_rev', 'revision_implementation', 'failed', 'git@example.invalid:foo/bar.git', '1', '1', '2');",
             )
             .unwrap();
-            let conn = db.connect().unwrap();
-            drop_audit_ledger(&conn);
-            conn.execute_batch("ALTER TABLE work_executions DROP COLUMN created_via;")
-                .unwrap();
-            conn.execute_batch(RESET_TO_38).unwrap();
-            wedged
-        };
+            conn.execute(
+                "UPDATE tasks SET blocked_detail = ?1 WHERE id = 'task_rearm_rev'",
+                [&stale],
+            )
+            .unwrap();
+        }
         let db = WorkDb::open(path.clone()).unwrap();
-        assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
+        assert_eq!(state(&db, wedged), ("todo".to_owned(), None, None, 1));
         super::super::schema_init::assert_all_migrations_applied(&db.connect().unwrap());
+        let execs = db.list_executions(Some(wedged)).unwrap();
+        assert_eq!(execs.len(), 2, "terminal prior plus exactly one replacement");
+        let replacement = execs
+            .iter()
+            .find(|execution| execution.id != "exec_rearm_failed")
+            .expect("replacement execution");
+        assert_eq!(replacement.status, ExecutionStatus::WaitingDependency);
+        assert_eq!(replacement.kind, ExecutionKind::RevisionImplementation);
+        assert_eq!(replacement.pr_url.as_deref(), Some(pr_url));
         drop(db);
         let db = WorkDb::open(path).unwrap();
-        assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
+        assert_eq!(state(&db, wedged), ("todo".to_owned(), None, None, 1));
+        let execs = db.list_executions(Some(wedged)).unwrap();
+        assert_eq!(execs.len(), 2, "second open must not mint another replacement");
+        assert_eq!(
+            execs
+                .iter()
+                .filter(|execution| execution.status == ExecutionStatus::WaitingDependency)
+                .count(),
+            1
+        );
     }
 }
