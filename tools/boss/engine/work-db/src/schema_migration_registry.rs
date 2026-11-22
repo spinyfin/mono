@@ -501,6 +501,14 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: "20261121_1800_refresh_blocked_reason_audit_trigger_merged_base".into(),
+            legacy_version: None,
+            apply: |conn| {
+                conn.execute_batch("DROP TRIGGER IF EXISTS task_status_audit_update_blocked_reason")?;
+                task_status_audit::install_property_triggers(conn, "blocked_reason")
+            },
+        },
+        Migration {
             id: "20261120_1630_run_usage_unavailable".into(),
             legacy_version: None,
             apply: |conn| {

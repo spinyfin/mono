@@ -557,8 +557,10 @@ pub(crate) async fn sweep_pending_pr(handler: &dyn CompletionRequests, execution
         // `recheck_for_pr` — covered for exhaustiveness.
         | StopOutcome::RunDoneDeclaredWithoutDelivery { .. }
         // The foreign-PR guard already failed the execution and filed its
-        // attention item; nothing further for the sweep to do.
-        | StopOutcome::ForeignPrRefused { .. } => {}
+        // attention item. A merged PR on a non-default base fails the same
+        // way, with its own outcome.
+        | StopOutcome::ForeignPrRefused { .. }
+        | StopOutcome::MergedUnsupportedBaseRefused { .. } => {}
         // The base guard filed its attention item and parked the execution
         // awaiting a retarget; the next sweep re-evaluates it.
         StopOutcome::PrBaseRefused { pr_url, .. } => {
@@ -678,10 +680,11 @@ pub(crate) async fn sweep_late_pr(
         // SubmitProposal RPC handler (`app::proposals`), never from a
         // late-PR recheck — covered for exhaustiveness.
         | StopOutcome::RunDoneDeclaredWithoutDelivery { .. }
-        // The late-PR recheck binds through `bind_pr_to_active_task_from_terminal_execution`,
-        // never through `finalize_pr_transition`, so the foreign-PR guard's
-        // refusal cannot surface here — covered for exhaustiveness.
-        | StopOutcome::ForeignPrRefused { .. } => {}
+        // A new bind of a PR merged into a non-default base files
+        // `pr_merged_unsupported_base` and leaves the work unbound. Late
+        // recovery of an already-terminal execution takes that same path.
+        | StopOutcome::ForeignPrRefused { .. }
+        | StopOutcome::MergedUnsupportedBaseRefused { .. } => {}
         // Late-PR recheck applies the base policy before binding. A refused
         // PR stays unbound for a later pass (or the abandoned-branch sweep).
         StopOutcome::PrBaseRefused { pr_url, .. } => {

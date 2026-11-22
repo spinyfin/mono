@@ -220,6 +220,7 @@ fn unpark_keeps_every_other_worker_failure_as_evidence_for_progression() {
         WorkerFailureBasis::NudgeBreaker,
         WorkerFailureBasis::DeliveredWithoutPr,
         WorkerFailureBasis::ForeignPrBinding,
+        WorkerFailureBasis::MergedUnsupportedBase,
     ] {
         let db = open();
         let chore = failed_with(&db, basis.as_str(), basis);

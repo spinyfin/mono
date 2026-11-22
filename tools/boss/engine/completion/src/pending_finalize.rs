@@ -50,6 +50,16 @@ pub(crate) const STUCK_FINALIZE_ATTENTION_AFTER: Duration = Duration::from_secs(
 /// not be the retry cadence.
 pub(crate) const PR_BASE_REFUSED_RECHECK_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// A confirmed PR-base refusal parked until a human retargets. Keeps the
+/// refused URL and detail so a merge-poller pass that hits this park reports
+/// [`StopOutcome::PrBaseRefused`] instead of a missed detection.
+#[derive(Clone, Debug)]
+pub(crate) struct PrBaseRefusalPark {
+    pub until: Instant,
+    pub pr_url: String,
+    pub detail: String,
+}
+
 /// Attention kind filed when a declared finalize is stuck.
 pub const RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND: &str = "run_done_finalize_stuck";
 
@@ -81,11 +91,18 @@ pub fn finalize_resolved(outcome: &StopOutcome) -> bool {
 }
 
 impl WorkerCompletionHandler {
-    pub(super) fn park_pr_base_refusal(&self, execution_id: &str) {
+    pub(super) fn park_pr_base_refusal(&self, execution_id: &str, pr_url: &str, detail: &str) {
         self.pr_base_refusal_next_check
             .lock()
             .expect("pr-base-refusal park map poisoned")
-            .insert(execution_id.to_owned(), Instant::now() + PR_BASE_REFUSED_RECHECK_AFTER);
+            .insert(
+                execution_id.to_owned(),
+                PrBaseRefusalPark {
+                    until: Instant::now() + PR_BASE_REFUSED_RECHECK_AFTER,
+                    pr_url: pr_url.to_owned(),
+                    detail: detail.to_owned(),
+                },
+            );
     }
 
     pub(super) fn unpark_pr_base_refusal(&self, execution_id: &str) {
@@ -100,7 +117,7 @@ impl WorkerCompletionHandler {
             .lock()
             .expect("pr-base-refusal park map poisoned")
             .get(execution_id)
-            .is_some_and(|deadline| Instant::now() < *deadline)
+            .is_some_and(|park| Instant::now() < park.until)
     }
 
     /// [`Self::finalize_declared_run_done`], repeated until it reaches a
@@ -208,8 +225,8 @@ impl WorkerCompletionHandler {
                             continue;
                         }
                         let result = self.finalize_declared_run_done(&execution_id, declared).await;
-                        if matches!(result, StopOutcome::PrBaseRefused { .. }) {
-                            self.park_pr_base_refusal(&execution_id);
+                        if let StopOutcome::PrBaseRefused { pr_url, detail } = &result {
+                            self.park_pr_base_refusal(&execution_id, pr_url, detail);
                             outcome.still_pending += 1;
                         } else if finalize_resolved(&result) {
                             outcome.finalized += 1;

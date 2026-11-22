@@ -694,6 +694,13 @@ pub enum StopOutcome {
     /// as its blocked reason, and an attention item was filed. A PR that
     /// belongs to another row is never this execution's deliverable.
     ForeignPrRefused { pr_url: String, detail: String },
+    /// A new bind of a PR that has already merged into a branch other than
+    /// the repository default (`pr_binding_guard`). Nothing was bound: the
+    /// live execution failed, a `pr_merged_unsupported_base` attention names
+    /// the unsupported base, and the work item stays unfinished. Distinct
+    /// from [`Self::ForeignPrRefused`] (another work item holds the PR) and
+    /// from [`Self::PrBaseRefused`] (an open PR that can still be retargeted).
+    MergedUnsupportedBaseRefused { pr_url: String, detail: String },
     /// A primary execution's PR does not target the repository default
     /// branch (`pr_binding_guard`). Nothing was bound and an attention item
     /// names the retarget remedy. Unlike [`Self::DetectorFailed`] this is a

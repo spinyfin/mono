@@ -54,15 +54,38 @@ impl WorkerCompletionHandler {
         }
     }
 
-    /// Policy refusal is actionable and parks for a human
-    /// ([`StopOutcome::PrBaseRefused`]); unavailable GitHub evidence is
-    /// retryable ([`StopOutcome::DetectorFailed`]). Only a primary execution
-    /// binding a new PR is checked; callers skip PRs that are already merged
-    /// or closed, which can no longer be retargeted.
+    /// Policy refusal is actionable. An open PR parks for a human
+    /// ([`StopOutcome::PrBaseRefused`]); a PR already merged into a
+    /// non-default base cannot be retargeted, so the execution fails
+    /// visibly instead ([`StopOutcome::MergedUnsupportedBaseRefused`]).
+    /// Unavailable GitHub evidence is retryable
+    /// ([`StopOutcome::DetectorFailed`]). Only a primary execution binding
+    /// a new PR is checked; revisions and already-bound PRs skip the
+    /// policy. Closed-unmerged PRs still skip it at the caller.
     pub(super) async fn guard_pr_base(
         &self,
         execution: &crate::work::WorkExecution,
         pr_url: &str,
+    ) -> Option<StopOutcome> {
+        self.guard_pr_base_with_merged(execution, pr_url, false).await
+    }
+
+    /// Same policy as [`Self::guard_pr_base`], for a PR the caller already
+    /// knows has merged. A refused base fails the execution instead of
+    /// parking it for a retarget that cannot happen.
+    pub(super) async fn guard_merged_pr_base(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+    ) -> Option<StopOutcome> {
+        self.guard_pr_base_with_merged(execution, pr_url, true).await
+    }
+
+    async fn guard_pr_base_with_merged(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+        merged: bool,
     ) -> Option<StopOutcome> {
         use crate::work::PrBaseVerdict;
         if !self.binds_new_pr(execution, pr_url) {
@@ -81,6 +104,10 @@ impl WorkerCompletionHandler {
                 None
             }
             Ok(PrBaseVerdict::NotChecked) => None,
+            Ok(PrBaseVerdict::Refused(reason)) if merged => Some(
+                self.refuse_merged_unsupported_base(execution, pr_url, &reason, "pr_base_guard")
+                    .await,
+            ),
             Ok(PrBaseVerdict::Refused(reason)) => {
                 self.record_pr_base_refusal(execution, pr_url, &reason).await;
                 Some(StopOutcome::PrBaseRefused {
@@ -93,6 +120,86 @@ impl WorkerCompletionHandler {
                 Some(StopOutcome::DetectorFailed)
             }
         }
+    }
+
+    /// A new bind of a PR that has already merged into a non-default base
+    /// cannot be retargeted. Fail the live execution (releasing the slot),
+    /// file a `pr_merged_unsupported_base` attention naming the unsupported
+    /// base, and leave the work item unfinished so dependents stay blocked.
+    /// An already-recorded row for this PR skips the error log and the
+    /// attention upsert. `guard_pr_base` and declared-delivery callers have
+    /// already probed GitHub; `recheck_for_pr_late` skips its probe only
+    /// for a non-live execution. A live execution is always failed, even
+    /// when the attention already exists; a database error from that write
+    /// is returned as [`StopOutcome::DbError`].
+    pub(super) async fn refuse_merged_unsupported_base(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+        reason: &str,
+        source: &str,
+    ) -> StopOutcome {
+        let detail = crate::work::WorkDb::merged_unsupported_base_detail(pr_url, reason);
+        let already = self
+            .work_db
+            .already_recorded_merged_unsupported_base(&execution.work_item_id, pr_url);
+        if already {
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                pr_url,
+                source,
+                "PR base guard: merged unsupported-base refusal already recorded; skipping log and attention upsert",
+            );
+        } else {
+            tracing::error!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                pr_url,
+                source,
+                %reason,
+                "PR base guard: refusing a PR merged into a non-default base",
+            );
+        }
+        self.resolve_pr_base_refusal_attention(&execution.id);
+        if let Err(err) = self.work_db.resolve_external_tracker_attention(
+            &execution.work_item_id,
+            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "PR base guard: failed to resolve leftover work-item base-refusal attention",
+            );
+        }
+        if let Err(err) = self
+            .work_db
+            .file_merged_unsupported_base_attention(&execution.work_item_id, pr_url, reason)
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "PR base guard: failed to file merged-unsupported-base attention",
+            );
+        }
+        if execution.status.is_live()
+            && !self
+                .finalize_worker_failure(execution, &detail, WorkerFailureBasis::MergedUnsupportedBase)
+                .await
+        {
+            return StopOutcome::DbError;
+        }
+        StopOutcome::MergedUnsupportedBaseRefused {
+            pr_url: pr_url.to_owned(),
+            detail,
+        }
+    }
+
+    /// Open or resolved `pr_merged_unsupported_base` for this work item and
+    /// PR URL. A human-resolved row must not be re-created on the next pass.
+    pub(super) fn already_recorded_merged_unsupported_base(&self, work_item_id: &str, pr_url: &str) -> bool {
+        self.work_db
+            .already_recorded_merged_unsupported_base(work_item_id, pr_url)
     }
 
     pub(super) async fn record_pr_base_refusal(
@@ -123,7 +230,7 @@ impl WorkerCompletionHandler {
         {
             tracing::warn!(?err, "failed to record PR base refusal");
         }
-        self.park_pr_base_refusal(&execution.id);
+        self.park_pr_base_refusal(&execution.id, pr_url, &detail);
     }
 
     pub(super) fn resolve_pr_base_refusal_attention(&self, execution_id: &str) {

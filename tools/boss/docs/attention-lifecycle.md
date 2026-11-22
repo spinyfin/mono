@@ -11,13 +11,14 @@ Both are engine-owned state. The app renders them and does not interpret them: i
 
 **A signal comes down when, and only when, there is positive evidence that the condition it describes is over.** Not on a timer, not on a lane change, not because an operator got tired of looking at it.
 
-Every attention kind declares which shape of evidence applies to it, in `tools/boss/engine/core/src/attention_lifecycle.rs`. The five shapes are:
+Every attention kind declares which shape of evidence applies to it, in `tools/boss/engine/storage-values/src/attention_lifecycle.rs`. The six shapes are:
 
 | `ClearedBy`                    | Evidence                                                                                                                                                    | Applied by             |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | `WorkResumed`                  | A run for the same work item started at or after the signal was raised; for `pane_spawn_failed`, that later spawn run must also have status `completed`     | the generic reconciler |
 | `ExecutionKindCompleted(kind)` | An execution of that kind for the same work item (other than the one the attention was filed against) reached `completed` at or after the signal was raised | the generic reconciler |
 | `OwningExecutionTerminal`      | The execution the item is scoped to has reached a terminal status (cancelled, failed, abandoned, completed, or orphaned), even with no later run            | the generic reconciler |
+| `WorkItemPrBound`              | The work item has a non-empty bound `pr_url`; applied by the generic reconciler                                                                             | the generic reconciler |
 | `ProducerReconciles`           | The kind's own producer re-reads its condition every pass and resolves the item itself                                                                      | that producer          |
 | `HumanDecision`                | None is sufficient — the signal records something a later success does not undo, or is a gate a human is meant to open                                      | a human                |
 

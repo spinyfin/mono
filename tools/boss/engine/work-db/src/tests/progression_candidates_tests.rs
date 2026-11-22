@@ -278,6 +278,7 @@ fn clause_1_human_holds_are_never_candidates() {
         for basis in [
             WorkerFailureBasis::DeliveredWithoutPr,
             WorkerFailureBasis::ForeignPrBinding,
+            WorkerFailureBasis::MergedUnsupportedBase,
             WorkerFailureBasis::DeclaredBlocked,
             WorkerFailureBasis::NudgeBreaker,
             WorkerFailureBasis::OperatorNo,

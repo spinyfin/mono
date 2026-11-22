@@ -168,6 +168,45 @@ fn upsert_work_item_attention_rejects_an_unknown_work_item() {
     );
 }
 
+#[test]
+fn merged_unsupported_base_attention_matches_the_exact_pr_url() {
+    let (db, _product, chore) = chore_fixture("merged-base-prefix");
+    let short = "https://github.com/foo/bar/pull/8";
+    let longer = "https://github.com/foo/bar/pull/80";
+    db.file_merged_unsupported_base_attention(&chore, short, "feature/parent")
+        .unwrap();
+    assert!(db.already_recorded_merged_unsupported_base(&chore, short));
+    assert!(
+        !db.already_recorded_merged_unsupported_base(&chore, longer),
+        "a body for /pull/8 must not suppress /pull/80"
+    );
+}
+
+#[test]
+fn merged_unsupported_base_attention_does_not_refile_a_resolved_row() {
+    let (db, _product, chore) = chore_fixture("merged-base-resolved");
+    let pr = "https://github.com/foo/bar/pull/8";
+    db.file_merged_unsupported_base_attention(&chore, pr, "feature/parent")
+        .unwrap();
+    db.resolve_external_tracker_attention(
+        &chore,
+        boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE,
+    )
+    .unwrap();
+    db.file_merged_unsupported_base_attention(&chore, pr, "feature/parent")
+        .unwrap();
+    let open = db
+        .list_attention_items_for_work_item(&chore)
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE
+                && item.status == "open"
+        })
+        .count();
+    assert_eq!(open, 0, "a human-resolved row must not be re-created");
+}
+
 // ── resolve_worker_signal_attentions_for_execution ─────────────────────────
 
 /// A probe acks both worker-signal markers at once and reports how many it

@@ -427,6 +427,12 @@ impl BindAction<'_> {
     }
 }
 
+/// Detector or create result plus whether GitHub already reports the PR merged.
+struct RecoveredPr<'a> {
+    action: BindAction<'a>,
+    merged: bool,
+}
+
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
 /// using the shared [`crate::sweep_loop::spawn_sweep_loop`] scaffold. The
 /// per-execution failure-count map must survive across passes so
@@ -583,13 +589,31 @@ pub(crate) async fn run_one_pass(
         };
 
         match pr_status {
-            PrStatus::Fresh { url } | PrStatus::Merged { url } => {
+            PrStatus::Fresh { url } => {
                 bind_and_record(
                     Arc::clone(&pr_checker),
                     work_db,
                     dispatch_events,
                     candidate,
-                    BindAction::Bound(&url),
+                    RecoveredPr {
+                        action: BindAction::Bound(&url),
+                        merged: false,
+                    },
+                    &mut outcome,
+                    failure_counts,
+                )
+                .await;
+            }
+            PrStatus::Merged { url } => {
+                bind_and_record(
+                    Arc::clone(&pr_checker),
+                    work_db,
+                    dispatch_events,
+                    candidate,
+                    RecoveredPr {
+                        action: BindAction::Bound(&url),
+                        merged: true,
+                    },
                     &mut outcome,
                     failure_counts,
                 )
@@ -615,7 +639,10 @@ pub(crate) async fn run_one_pass(
                             work_db,
                             dispatch_events,
                             candidate,
-                            BindAction::Bound(&url),
+                            RecoveredPr {
+                                action: BindAction::Bound(&url),
+                                merged: false,
+                            },
                             &mut outcome,
                             failure_counts,
                         )
@@ -627,7 +654,10 @@ pub(crate) async fn run_one_pass(
                             work_db,
                             dispatch_events,
                             candidate,
-                            BindAction::Created(&url),
+                            RecoveredPr {
+                                action: BindAction::Created(&url),
+                                merged: false,
+                            },
                             &mut outcome,
                             failure_counts,
                         )
@@ -698,10 +728,11 @@ async fn bind_and_record(
     work_db: &WorkDb,
     dispatch_events: &dyn DispatchEventSink,
     candidate: &LatePrCandidate,
-    action: BindAction<'_>,
+    recovered: RecoveredPr<'_>,
     outcome: &mut AbandonedBranchPrSweepOutcome,
     failure_counts: &mut HashMap<String, u32>,
 ) {
+    let RecoveredPr { action, merged } = recovered;
     let (BindAction::Bound(pr_url) | BindAction::Created(pr_url)) = action;
     match crate::work::bounded_base_verdict(pr_checker, pr_url, crate::work::PR_QUERY_TIMEOUT).await {
         Ok(crate::work::PrBaseVerdict::DefaultBranch) => {
@@ -725,14 +756,12 @@ async fn bind_and_record(
             );
         }
         Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
-            tracing::warn!(%reason, pr_url, "abandoned PR base refused; leaving binding untouched");
-            if let Err(err) = work_db.upsert_work_item_attention(
+            tracing::warn!(%reason, pr_url, merged, "abandoned PR base refused; leaving binding untouched");
+            if let Err(err) = work_db.resolve_external_tracker_attention(
                 &candidate.work_item_id,
                 boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
-                "PR base could not be accepted",
-                &format!("Cannot bind {pr_url}: {reason}"),
             ) {
-                tracing::warn!(?err, "could not surface recovered PR base refusal");
+                tracing::warn!(?err, "could not clear recovered PR base refusal");
             }
             outcome.base_refused += 1;
             failure_counts.remove(&candidate.execution_id);
@@ -741,6 +770,23 @@ async fn bind_and_record(
                 &candidate.work_item_id,
                 ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
             );
+            if merged {
+                // `pr_merged_unsupported_base` already names this condition
+                // (and a merged PR cannot be retargeted). Resolve a leftover
+                // retarget card from when this PR was still open, then file
+                // the merged card. Do not leave both open.
+                resolve_work_item_attention(work_db, &candidate.work_item_id, ATTENTION_KIND_ABANDONED_BRANCH_NO_PR);
+                if let Err(err) =
+                    work_db.file_merged_unsupported_base_attention(&candidate.work_item_id, pr_url, &reason)
+                {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        ?err,
+                        "abandoned-branch-pr sweep: failed to file merged-unsupported-base attention",
+                    );
+                }
+                return;
+            }
             let body = format!(
                 "Execution `{execution_id}` finished without a Stop, and its branch has a PR that the engine \
                  will not bind: {pr_url}: {reason}.\n\n\
@@ -1225,6 +1271,13 @@ mod tests {
     async fn pr_on_a_non_default_base_is_not_adopted() {
         let (_dir, db) = open_db();
         let (chore_id, _exec_id) = make_candidate_chore(&db, "stacked-pr");
+        db.upsert_work_item_attention(
+            &chore_id,
+            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+            "PR base could not be accepted",
+            "Cannot bind https://github.com/foo/bar/pull/8: leftover",
+        )
+        .unwrap();
         let detector = FixedPrDetector(PrStatus::Merged {
             url: "https://github.com/foo/bar/pull/8".to_owned(),
         });
@@ -1246,10 +1299,41 @@ mod tests {
         assert_ne!(status, "in_review");
         assert!(pr_url.is_none());
         let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
-        assert!(items.iter().any(|a| {
-            a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
-                && a.body_markdown.contains("feature/parent")
-        }));
+        let open: Vec<_> = items.iter().filter(|a| a.status == "open").collect();
+        assert_eq!(open.len(), 1, "{items:?}");
+        assert_eq!(
+            open[0].kind,
+            boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE
+        );
+        assert!(open[0].body_markdown.contains("feature/parent"));
+        assert!(
+            !open[0].body_markdown.contains("Retarget the PR"),
+            "a merged PR must not ask a human to retarget: {}",
+            open[0].body_markdown
+        );
+        assert!(
+            items.iter().all(|a| {
+                a.kind != boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED || a.status != "open"
+            })
+        );
+
+        db.update_work_item(
+            &chore_id,
+            WorkItemPatch {
+                pr_url: Some("https://github.com/foo/bar/pull/8".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.reconcile_stale_attention_signals().unwrap();
+        assert!(
+            db.list_attention_items_for_work_item(&chore_id)
+                .unwrap()
+                .iter()
+                .all(|a| a.status != "open"),
+            "manual bind must leave no open attention: {:?}",
+            db.list_attention_items_for_work_item(&chore_id).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1286,6 +1370,113 @@ mod tests {
             assert_eq!(result.recovered + result.created, 0);
             assert!(!work_item_pr_url_already_set(&db, &chore_id));
         }
+    }
+
+    #[tokio::test]
+    async fn merged_non_default_pr_leaves_exactly_one_open_attention_without_retarget_text() {
+        use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
+        let url = "https://github.com/foo/bar/pull/8";
+        let (_dir, db) = open_db();
+        let (chore_id, _) = make_candidate_chore(&db, "merged-then-sweep");
+        db.upsert_work_item_attention(
+            &chore_id,
+            PR_MERGED_UNSUPPORTED_BASE,
+            "PR merged into an unsupported base",
+            &format!(
+                "{url}: PR targets `feature/parent`. The PR has merged into a branch other than the \
+                 repository default, so it cannot be retargeted and is not a deliverable. The work item \
+                 is unfinished and dependents stay blocked."
+            ),
+        )
+        .unwrap();
+        let detector = FixedPrDetector(PrStatus::Merged { url: url.to_owned() });
+        let creator = QueuePrAutoCreator::new(vec![]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut failures = HashMap::new();
+
+        let outcome = run_one_pass(
+            &db,
+            &detector,
+            &creator,
+            Arc::new(ParentBranchChecker),
+            &sink,
+            &mut failures,
+        )
+        .await;
+        assert_eq!(outcome.recovered, 0);
+        assert_eq!(outcome.base_refused, 1);
+        assert!(!work_item_pr_url_already_set(&db, &chore_id));
+        let open: Vec<_> = db
+            .list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].kind, PR_MERGED_UNSUPPORTED_BASE);
+        assert!(
+            open.iter().all(|a| !a.body_markdown.contains("Retarget the PR")),
+            "{open:?}"
+        );
+        assert!(open.iter().all(|a| a.kind != ATTENTION_KIND_ABANDONED_BRANCH_NO_PR));
+    }
+
+    #[tokio::test]
+    async fn open_then_merged_refused_pr_replaces_the_retarget_card() {
+        use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+        use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
+        let url = "https://github.com/foo/bar/pull/8";
+        let (_dir, db) = open_db();
+        let (chore_id, _) = make_candidate_chore(&db, "open-then-merged");
+        let creator = QueuePrAutoCreator::new(vec![]);
+        let sink = NoopDispatchEventSink;
+        let mut failures = HashMap::new();
+
+        let first = run_one_pass(
+            &db,
+            &FixedPrDetector(PrStatus::Fresh { url: url.into() }),
+            &creator,
+            Arc::new(
+                FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature base".into())),
+            ),
+            &sink,
+            &mut failures,
+        )
+        .await;
+        assert_eq!(first.base_refused, 1);
+        let open: Vec<_> = db
+            .list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].kind, ATTENTION_KIND_ABANDONED_BRANCH_NO_PR);
+        assert!(open[0].body_markdown.contains("Retarget the PR"), "{open:?}");
+
+        let second = run_one_pass(
+            &db,
+            &FixedPrDetector(PrStatus::Merged { url: url.into() }),
+            &creator,
+            Arc::new(ParentBranchChecker),
+            &sink,
+            &mut failures,
+        )
+        .await;
+        assert_eq!(second.base_refused, 1);
+        let open: Vec<_> = db
+            .list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].kind, PR_MERGED_UNSUPPORTED_BASE);
+        assert!(
+            open.iter().all(|a| !a.body_markdown.contains("Retarget the PR")),
+            "{open:?}"
+        );
+        assert!(open.iter().all(|a| a.kind != ATTENTION_KIND_ABANDONED_BRANCH_NO_PR));
     }
 
     #[tokio::test]
