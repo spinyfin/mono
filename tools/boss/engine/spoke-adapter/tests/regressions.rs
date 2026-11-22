@@ -673,6 +673,7 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
         let adapter = Arc::clone(&adapter);
         tokio::spawn(async move { spawn(&adapter).await })
     };
+    let stop_sends = fx.provider.command_sends_for("stop");
     let clock = fire_unconfirmed_stop_after_answered_spawn(
         || {
             peer.commands()
@@ -680,6 +681,7 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
                 .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
         },
         || fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some(),
+        || fx.provider.command_waits_for("stop") >= 1 && fx.provider.command_sends_for("stop") > stop_sends,
         || {
             peer.commands()
                 .iter()
@@ -691,17 +693,18 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
     let first = first_waiting.await.unwrap().unwrap_err();
     let uncertain = first.downcast_ref::<SpawnOutcomeUncertain>().expect("stop unconfirmed");
     assert!(uncertain.settled, "{first:#}");
-    // A later attempt asks only about the stop: wait until that Stop's
-    // command timer is armed, fire the deadline once, then wait for the
-    // result without advancing more virtual time.
-    let sends_before = fx.provider.command_sends();
+    // A later attempt asks only about the stop. The first spawn already
+    // stored one Stop (`stop_sends_before`); the retry arms a new Stop
+    // send_command (not a spawn replay), so waits_for("stop") and a send
+    // count above that snapshot name the retry directly.
+    let stop_sends_before = fx.provider.command_sends_for("stop");
     let second_waiting = {
         let adapter = Arc::clone(&adapter);
         tokio::spawn(async move { spawn(&adapter).await })
     };
     until("retry Stop command timer is armed", || {
         second_waiting.is_finished()
-            || (fx.provider.command_waits() >= 1 && fx.provider.command_sends() > sends_before + 1)
+            || (fx.provider.command_waits_for("stop") >= 1 && fx.provider.command_sends_for("stop") > stop_sends_before)
     })
     .await;
     if !second_waiting.is_finished() {

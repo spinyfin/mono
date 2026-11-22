@@ -87,7 +87,7 @@ struct Env {
 }
 
 async fn env(fx: &Fixture, slots: usize) -> Env {
-    fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
+    fx.db.add_host(HOST, "worker@host", HOST_SLOTS as i64, &[]).unwrap();
     fx.db
         .connect()
         .unwrap()
@@ -275,13 +275,18 @@ async fn an_unanswered_spawn_past_the_retry_bound_parks_and_a_late_result_reconc
     .await;
     let retries = drive_poll_deadline_passes(
         Duration::from_millis(100),
+        || env.coordinator.spoke_pass_starts(&execution.id),
+        || env.coordinator.spoke_pass_completions(&execution.id),
         || command_waiting(&fx),
         || command_idle(&fx),
         Duration::from_millis(300),
         MORE_THAN_PRE_START_BUDGET,
     )
     .await;
-    assert!(retries > 0, "parked spawn retries must have asked the host");
+    assert!(
+        retries >= MORE_THAN_PRE_START_BUDGET,
+        "parked spawn retries must have completed more cycles than the pre-start budget"
+    );
     assert_never_failed(&fx, &execution.id);
     assert!(!released(&peer.commands()));
 
@@ -347,22 +352,45 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
     .await;
     let retries = drive_poll_deadline_passes(
         Duration::from_millis(100),
+        || env.coordinator.spoke_pass_starts(&execution.id),
+        || env.coordinator.spoke_pass_completions(&execution.id),
         || command_waiting(&fx),
         || command_idle(&fx),
         Duration::from_secs(5),
         MORE_THAN_PRE_START_BUDGET,
     )
     .await;
-    assert!(retries > 0, "parked spawn retries must have asked the host");
+    assert!(
+        retries >= MORE_THAN_PRE_START_BUDGET,
+        "parked spawn retries must have completed more cycles than the pre-start budget"
+    );
     assert_never_failed(&fx, &execution.id);
     assert!(fx.db.get_execution(&execution.id).unwrap().cube_lease_id.is_some());
     assert!(!released(&peer.commands()));
 
     alive.store(true, Ordering::SeqCst);
-    until("the adopt to find the worker", || {
-        fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some()
-    })
-    .await;
+    let pane_recorded = || fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some();
+    // Freeze the 300 ms Adopt deadline across persist. The driving run is
+    // in `spawn_poll`; step TICK until the next Adopt send is entered, then
+    // wait on I/O without advancing so persist cannot lose the deadline.
+    let _clock = FrozenClock::new();
+    let adopt_sends_before = fx.provider.command_sends_for("adopt");
+    let adopt_armed = || {
+        pane_recorded()
+            || (fx.provider.command_waits_for("adopt") >= 1
+                && fx.provider.command_sends_for("adopt") > adopt_sends_before)
+    };
+    let armed = std::time::Instant::now();
+    while !adopt_armed() {
+        assert!(
+            armed.elapsed() < Duration::from_secs(20),
+            "timed out waiting for a post-alive Adopt send"
+        );
+        elapse(TICK).await;
+        env.coordinator.kick();
+        tokio::task::yield_now().await;
+    }
+    until("the adopt to find the worker", pane_recorded).await;
     until("the in-doubt attention to resolve", || {
         !attention_open(&fx, &execution.id)
     })
@@ -464,7 +492,11 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
             },
         )
         .unwrap();
-    elapse(Duration::from_secs(1)).await;
+    until("the in-doubt spawn noticed the cancel", || {
+        fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Cancelled
+            && !env.coordinator.is_driving_execution(&execution.id)
+    })
+    .await;
     assert_eq!(
         fx.db.get_execution(&execution.id).unwrap().status,
         ExecutionStatus::Cancelled
@@ -509,13 +541,12 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
 
 #[tokio::test]
 async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_retry_budget() {
-    // 300 ms is well under the 3 s observation window, so later dispatch
-    // passes re-send the stored lease and hit the command deadline again.
-    // Those re-sends must stay `LeaseOutcomeUncertain` (parked, retry
-    // budget untouched), not a pre-start failure. `workspace_slack` would
-    // raise the lease deadline to 5 s and hide that path. The clock is held so
-    // that only the explicit advances below expire the deliberately unanswered
-    // leases, never CI contention while a reply is crossing the socket.
+    // A 300 ms lease deadline is short enough that each kicked dispatch
+    // pass re-sends the stored lease and hits the deadline again. Those
+    // re-sends must stay `LeaseOutcomeUncertain` (parked, retry budget
+    // untouched). `workspace_slack` would raise the deadline to 5 s and
+    // hide that path. The clock is held so only the explicit advances
+    // below expire the unanswered leases.
     freeze_clock();
     let (fx, env, executions, peer) = timing::guarded(async {
         let fx = Fixture::with_frozen_liveness(short(300)).await;
@@ -551,13 +582,26 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
             .filter(|c| is_lease(c))
             .map(|c| c.command_id.clone())
             .collect();
+        let lease_completed = || {
+            executions
+                .iter()
+                .map(|e| env.coordinator.spoke_pass_completions(&e.id))
+                .sum::<u64>()
+        };
+        let lease_started = || {
+            executions
+                .iter()
+                .map(|e| env.coordinator.spoke_pass_starts(&e.id))
+                .sum::<u64>()
+        };
         drive_kicked_deadline_passes(
             || env.coordinator.kick(),
-            || fx.provider.command_sends(),
+            lease_started,
+            lease_completed,
             || command_waiting(&fx),
             || command_idle(&fx),
             Duration::from_millis(300),
-            MORE_THAN_PRE_START_BUDGET * executions.len(),
+            lease_completed() + (MORE_THAN_PRE_START_BUDGET * executions.len()) as u64,
         )
         .await;
         for execution in &executions {
@@ -749,10 +793,20 @@ async fn a_local_error_on_a_spawn_retry_does_not_discard_the_earlier_uncertainty
         )
         .unwrap();
     until_elapsed("the spawn to be parked", || attention_open(&fx, &execution.id)).await;
-    for _ in 0..MORE_THAN_PRE_START_BUDGET {
-        elapse(Duration::from_millis(100)).await;
-        until("a local spawn retry finished", || command_idle(&fx)).await;
-    }
+    let retries = drive_poll_deadline_passes(
+        Duration::from_millis(100),
+        || env.coordinator.spoke_pass_starts(&execution.id),
+        || env.coordinator.spoke_pass_completions(&execution.id),
+        || command_waiting(&fx),
+        || command_idle(&fx),
+        Duration::from_millis(300),
+        MORE_THAN_PRE_START_BUDGET,
+    )
+    .await;
+    assert!(
+        retries >= MORE_THAN_PRE_START_BUDGET,
+        "local spawn retries must complete even when they fail before a command is sent"
+    );
     thaw_clock();
     assert_never_failed(&fx, &execution.id);
     assert_eq!(
@@ -867,9 +921,15 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
     // A restarted engine has only stored state to go on. The host says the
     // session does not exist, but the spawn is unanswered and still deliverable.
     let restarted = restarted(&fx, &env.coordinator, 1).await;
+    let sends_before = fx.provider.command_sends();
     restarted.reconcile_ended_in_doubt_spokes().await;
-    elapse(Duration::from_millis(500)).await;
+    until("the restart sweep asked the host", || {
+        fx.provider.command_sends() > sends_before || command_idle(&fx)
+    })
+    .await;
+    until("the restart sweep went idle", || command_idle(&fx)).await;
     restarted.reconcile_ended_in_doubt_spokes().await;
+    until("the second restart sweep went idle", || command_idle(&fx)).await;
     assert!(!released(&peer.commands()), "no release while the spawn is unanswered");
     assert!(attention_open(&fx, &execution.id));
     assert!(persona_held(&fx, &execution.id));
@@ -1044,7 +1104,10 @@ async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
     restarted.reconcile_ended_in_doubt_spokes().await;
     assert!(!fx.db.spoke_execution_in_doubt(&execution.id).unwrap());
     assert!(!attention_open(&fx, &execution.id));
-    elapse(Duration::from_millis(300)).await;
+    until("the healthy-worker sweep finished asking the host", || {
+        command_idle(&fx)
+    })
+    .await;
     assert_eq!(
         count(&peer, |c| matches!(c.body, Some(command::Body::Spawn(_)))),
         spawns
@@ -1252,7 +1315,7 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     let env = env(&fx, 2).await;
     let first = triage(&fx, &env, "hung adopt");
     let first_id = first.id.clone();
-    let _peer = fx
+    let peer = fx
         .spoke(
             Box::new(move |command| match &command.body {
                 Some(command::Body::Spawn(_)) if run_of(command) == first_id => {
@@ -1265,7 +1328,19 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
             0,
         )
         .await;
+    let mut clock = FrozenClock::new();
     env.coordinator.kick();
+    until("the first spawn to be stored", || {
+        peer.commands()
+            .iter()
+            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == first.id)
+    })
+    .await;
+    until("the launch Adopt wait is armed", || {
+        fx.provider.command_waits_for("adopt") >= 1
+    })
+    .await;
+    elapse(Duration::from_millis(5_000) + TICK).await;
     until("the first spawn to be parked", || attention_open(&fx, &first.id)).await;
     fx.db
         .cancel_execution_with(
@@ -1277,47 +1352,93 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
             },
         )
         .unwrap();
-    fx.db.set_host_enabled(HOST, false).unwrap();
+    env.coordinator.abort_driving_runs();
+    until_async("the first execution released its pool slot", || async {
+        env.pool.busy_count().await == 0
+    })
+    .await;
+    until("the first execution's commands drained", || command_idle(&fx)).await;
+    until("the scheduler drained after abort", || {
+        !env.coordinator.scheduler_is_running() && !env.coordinator.scheduler_wakeup_pending()
+    })
+    .await;
+    until("the in-doubt sweep is idle before the heartbeat", || {
+        !env.coordinator.in_doubt_sweep_is_running()
+    })
+    .await;
+    until("the first execution is no longer driving", || {
+        !env.coordinator.is_driving_execution(&first.id)
+    })
+    .await;
+    assert!(
+        fx.db.spoke_assignment_needs_recovery(&first.id).unwrap(),
+        "heartbeat reconcile must still see the cancelled in-doubt assignment"
+    );
+    clock.thaw();
     fx.add_spoke_host("other", 8);
     let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
     let second = triage(&fx, &env, "stranded ready");
-    // Keep the clock frozen so the unanswered Adopt deadline cannot kick the
-    // stranded row. Advance one heartbeat interval at a time and wait on I/O
-    // between beats; spawn must land after a few beats, well under the ~5s
-    // Adopt command deadline.
-    let _clock = FrozenClock::new();
-    until("the unanswered adopt is stored", || {
-        _peer
-            .commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Adopt(_))) && run_of(c) == first.id)
-    })
-    .await;
-    let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
+    clock.freeze();
     let spawned = || {
         other
             .commands()
             .iter()
             .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == second.id)
+            || peer
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == second.id)
     };
+    assert!(
+        !spawned(),
+        "the stranded row must still be undispatched before the heartbeat"
+    );
+    // After drain, no Adopt is in flight. The heartbeat's own reconcile
+    // must enter a new Adopt wait; historical sends from the first launch
+    // do not count.
+    let adopt_sends_before = fx.provider.command_sends_for("adopt");
+    let heartbeat_adopt_wait =
+        || fx.provider.command_waits_for("adopt") >= 1 && fx.provider.command_sends_for("adopt") > adopt_sends_before;
+    let beats_before = env.coordinator.heartbeat_beats();
+    let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
     let mut advanced = Duration::ZERO;
-    let watchdog = std::time::Instant::now();
-    while !spawned() {
+    let beat = Duration::from_millis(80);
+    // Virtual-time advances that happen before the heartbeat task has
+    // registered its opening sleep are lost. Step TICK until that first
+    // beat is observed, then wait on I/O for its Adopt send_command —
+    // do not keep burning virtual time or the 5s sweep timeout cancels
+    // the reconcile before waits_for("adopt") is visible.
+    let armed = std::time::Instant::now();
+    while env.coordinator.heartbeat_beats() == beats_before && !heartbeat_adopt_wait() {
         assert!(
-            watchdog.elapsed() < Duration::from_secs(20),
-            "timed out waiting for a stranded ready row to be re-kicked by the heartbeat"
+            armed.elapsed() < Duration::from_secs(20),
+            "timed out waiting for the heartbeat's first beat"
         );
-        elapse(Duration::from_millis(80)).await;
-        advanced += Duration::from_millis(80);
-        assert!(
-            advanced < Duration::from_secs(2),
-            "spawn must come from the heartbeat, not the Adopt deadline (advanced {advanced:?})"
-        );
-        let io = std::time::Instant::now();
-        while !spawned() && io.elapsed() < Duration::from_millis(500) {
-            tokio::task::yield_now().await;
-        }
+        elapse(TICK).await;
+        tokio::task::yield_now().await;
     }
+    until("heartbeat Adopt wait to be armed", heartbeat_adopt_wait).await;
+    // Adopt is in flight on the original host. Take that host out of
+    // placement so the stranded row must go to `other`, without tearing
+    // down the stream the hung Adopt still uses.
+    fx.db.set_host_enabled(HOST, false).unwrap();
+    for _ in 0..3 {
+        assert!(
+            heartbeat_adopt_wait(),
+            "the second row must spawn while the heartbeat's Adopt is still waiting"
+        );
+        elapse(beat).await;
+        advanced += beat;
+    }
+    until("a stranded ready row to be re-kicked by the heartbeat", spawned).await;
+    assert!(
+        heartbeat_adopt_wait(),
+        "the second row must spawn while the heartbeat's Adopt is still waiting"
+    );
+    assert!(
+        advanced < Duration::from_secs(5),
+        "spawn must land before the Adopt command deadline (advanced {advanced:?})"
+    );
 }
 
 mod recovery;

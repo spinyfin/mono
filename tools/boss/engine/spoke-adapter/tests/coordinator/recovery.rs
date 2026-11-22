@@ -139,6 +139,7 @@ async fn restarted_unconfirmed_stop_launch_keeps_reconciling() {
         )
         .await;
     env.coordinator.kick();
+    let stop_sends = fx.provider.command_sends_for("stop");
     let clock = fire_unconfirmed_stop_after_answered_spawn(
         || {
             peer.commands()
@@ -146,6 +147,7 @@ async fn restarted_unconfirmed_stop_launch_keeps_reconciling() {
                 .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
         },
         || fx.db.open_spoke_assignment_for_pane_pid(HOST, 4242).unwrap().is_some(),
+        || fx.provider.command_waits_for("stop") >= 1 && fx.provider.command_sends_for("stop") > stop_sends,
         || {
             peer.commands()
                 .iter()
@@ -154,12 +156,19 @@ async fn restarted_unconfirmed_stop_launch_keeps_reconciling() {
         Duration::from_millis(300),
     )
     .await;
-    until("launch attention", || attention_open(&fx, &execution.id)).await;
+    // Assignment age is wall time. Park under a frozen clock can land
+    // before `attention_after`; thaw so a later pass can raise it.
     drop(clock);
+    until("launch attention", || attention_open(&fx, &execution.id)).await;
     let next = restarted(&fx, &env.coordinator, 1).await;
     assert!(fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap());
+    let sends_before = fx.provider.command_sends();
     next.reconcile_ended_in_doubt_spokes().await;
-    elapse(Duration::from_millis(400)).await;
+    until("unconfirmed-stop recovery sweep asked the host", || {
+        fx.provider.command_sends() > sends_before || command_idle(&fx)
+    })
+    .await;
+    until("unconfirmed-stop recovery sweep went idle", || command_idle(&fx)).await;
     assert!(attention_open(&fx, &execution.id), "unconfirmed_stop");
     assert!(
         fx.db.spoke_assignment_needs_recovery(&execution.id).unwrap(),

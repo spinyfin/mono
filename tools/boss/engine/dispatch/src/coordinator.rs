@@ -897,6 +897,18 @@ pub struct ExecutionCoordinator {
     /// through, opened on first use. See [`Self::queued_display_db`].
     #[builder(skip)]
     queued_display_reader: std::sync::OnceLock<Arc<WorkDb>>,
+    /// Per-execution in-doubt retry/dispatch pass starts, including local
+    /// failures that never send a host command. Tests wait on these so a
+    /// no-budget-spend assertion cannot pass without a real pass.
+    #[builder(skip = Default::default())]
+    spoke_pass_starts: std::sync::Mutex<HashMap<String, u64>>,
+    /// Matching completions (parking, result update, or local-error return).
+    #[builder(skip = Default::default())]
+    spoke_pass_completions: std::sync::Mutex<HashMap<String, u64>>,
+    /// Heartbeat loop iterations that have started (after the opening sleep).
+    /// Tests wait on this so virtual-time advances cannot race the first beat.
+    #[builder(default)]
+    heartbeat_beats: AtomicU64,
 }
 
 mod allocation_refusal;

@@ -5,6 +5,22 @@ use super::*;
 use boss_execution_contracts::WorkerLife;
 
 impl ExecutionCoordinator {
+    pub(super) fn note_spoke_pass_start(&self, execution_id: &str) {
+        let mut map = self
+            .spoke_pass_starts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *map.entry(execution_id.to_owned()).or_insert(0) += 1;
+    }
+
+    pub(super) fn note_spoke_pass_complete(&self, execution_id: &str) {
+        let mut map = self
+            .spoke_pass_completions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *map.entry(execution_id.to_owned()).or_insert(0) += 1;
+    }
+
     /// Park an attempt whose spoke lease the host has not answered: back to
     /// `ready` behind `dispatch_not_before`, with the failure count untouched,
     /// so nothing is held while the host is silent and the retry budget is not
@@ -64,7 +80,10 @@ impl ExecutionCoordinator {
         if self.repo_lease_limiter.release(&execution.id) {
             self.kick();
         }
-        self.park_in_doubt_spoke_lease(execution, err).await
+        self.note_spoke_pass_start(&execution.id);
+        let err = self.park_in_doubt_spoke_lease(execution, err).await;
+        self.note_spoke_pass_complete(&execution.id);
+        err
     }
 
     /// File the in-doubt attention item once the assignment has waited past

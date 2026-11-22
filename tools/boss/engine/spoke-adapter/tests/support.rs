@@ -46,7 +46,7 @@ pub const HOST: &str = "host";
 /// Wall-clock bound for event waits. Virtual time (`tokio::time::timeout`) does
 /// not move while the clock is paused, so a hang must be detected on `Instant`.
 const WAIT: Duration = Duration::from_secs(20);
-const TICK: Duration = Duration::from_millis(20);
+pub(crate) const TICK: Duration = Duration::from_millis(20);
 
 thread_local! {
     static CLOCK_FROZEN: Cell<bool> = const { Cell::new(false) };
@@ -188,19 +188,17 @@ pub(crate) async fn until_ready_after_stored(
     ready_what: &str,
     ready: impl FnMut() -> bool,
 ) {
-    freeze_clock();
+    let _clock = FrozenClock::new();
     until(stored_what, stored).await;
     until_elapsed(ready_what, ready).await;
-    thaw_clock();
 }
 
 /// Freeze timers until `stored`, fire `deadline` once, then thaw. Use when the
 /// next wait is wall-clock (lease `attention_after` is assignment age).
 pub(crate) async fn fire_after_stored(stored_what: &str, stored: impl FnMut() -> bool, deadline: Duration) {
-    freeze_clock();
+    let _clock = FrozenClock::new();
     until(stored_what, stored).await;
     elapse(deadline).await;
-    thaw_clock();
 }
 
 /// Freeze until `count` commands are persisted, then fire `deadline`.
@@ -217,7 +215,7 @@ pub(crate) async fn fire_after_all_stored(
     deadline: Duration,
     host_slots: usize,
 ) {
-    freeze_clock();
+    let _clock = FrozenClock::new();
     until(first_what, || stored_count() >= 1).await;
     if host_slots >= count {
         until("every unanswered command to be stored", || stored_count() >= count).await;
@@ -229,60 +227,102 @@ pub(crate) async fn fire_after_all_stored(
         }
     }
     elapse(deadline).await;
-    thaw_clock();
 }
 
-/// Freeze until spawn is stored and the pane pid is recorded, thaw so the
-/// prompt wait can complete, freeze once Stop is stored, then fire `deadline`.
-/// The returned guard keeps the clock frozen and thaws on drop.
+/// Freeze until spawn is stored and the pane pid is recorded, then advance
+/// virtual time until the prompt wait arms a Stop send. Persist still runs
+/// on wall time while the clock stays frozen, so the Stop deadline is not
+/// racing persist. Fire `deadline` once the Stop is stored. The returned
+/// guard keeps the clock frozen and thaws on drop.
 pub(crate) async fn fire_unconfirmed_stop_after_answered_spawn(
     mut spawn_stored: impl FnMut() -> bool,
     mut pane_pid: impl FnMut() -> bool,
+    mut stop_send_armed: impl FnMut() -> bool,
     mut stop_stored: impl FnMut() -> bool,
     deadline: Duration,
 ) -> FrozenClock {
-    let mut clock = FrozenClock::new();
+    let clock = FrozenClock::new();
     until("spawn command stored", &mut spawn_stored).await;
     until("pane pid recorded before prompt wait", &mut pane_pid).await;
-    clock.thaw();
+    // Pane pid is recorded before `confirm_prompt_accepted_or_reap` starts
+    // its timer. Keep stepping virtual time until `send_command` is entered
+    // (waits/sends increment before persist) so a late prompt-wait start
+    // cannot sit behind a frozen 300 ms timeout. Stop advancing the moment
+    // the Stop send is armed: persist still runs on wall time, and the
+    // command deadline must not expire during that persist.
+    let watchdog = std::time::Instant::now();
+    while !stop_send_armed() {
+        assert!(
+            watchdog.elapsed() < WAIT,
+            "timed out waiting for stop send entered with its timer armed"
+        );
+        elapse(TICK).await;
+    }
     until("unconfirmed stop stored", &mut stop_stored).await;
-    clock.freeze();
-    elapse(deadline).await;
+    elapse(deadline + TICK).await;
     clock
 }
 
-/// Kick, wait until a new command wait is armed, fire `deadline`, then wait
-/// until those waits finish. Repeats `passes` times so a no-budget-spend
-/// assertion cannot pass without the retry path having run.
+/// Kick until `completed()` reaches `target`, firing `deadline` once per
+/// in-flight command wait. `started` / `completed` are per-execution pass
+/// counters so a no-budget-spend assertion cannot pass without that many
+/// parking/result updates (including local failures that never send).
 pub(crate) async fn drive_kicked_deadline_passes(
     kick: impl Fn(),
-    sends: impl Fn() -> u64,
+    mut started: impl FnMut() -> u64,
+    mut completed: impl FnMut() -> u64,
     mut waiting: impl FnMut() -> bool,
     mut idle: impl FnMut() -> bool,
     deadline: Duration,
-    passes: usize,
+    target: u64,
 ) {
     let _clock = (!clock_frozen()).then(FrozenClock::new);
-    for _ in 0..passes {
-        let before = sends();
+    while completed() < target {
+        let start_before = started();
+        let complete_before = completed();
         kick();
-        until("a dispatch pass started a command wait", || {
-            sends() > before || waiting()
+        until("a dispatch pass started", || {
+            started() > start_before || waiting() || completed() > complete_before
         })
         .await;
-        while waiting() {
-            elapse(deadline + TICK).await;
+        until("the pass armed a command wait or completed", || {
+            waiting() || completed() > complete_before
+        })
+        .await;
+        loop {
+            while waiting() {
+                elapse(deadline + TICK).await;
+            }
+            if completed() > complete_before {
+                break;
+            }
+            until("the dispatch pass finished its command wait or completed", || {
+                idle() || completed() > complete_before || waiting()
+            })
+            .await;
+            if completed() > complete_before {
+                break;
+            }
+            if waiting() {
+                continue;
+            }
+            break;
         }
-        until("the dispatch pass finished its command wait", &mut idle).await;
+        until("the dispatch pass completed parking or a local failure", || {
+            completed() > complete_before
+        })
+        .await;
     }
 }
 
-/// Advance `interval`, fire any armed command wait, and repeat `passes` times.
-/// For parked-spawn poll loops that are not kick-driven. Returns how many
-/// times a command wait was observed, so the caller can require that retries
-/// actually ran.
+/// Advance `interval` until `passes` distinct retry/poll cycles complete.
+/// Each cycle waits for a new pass start, fires any armed command wait,
+/// then waits for that pass's parking/result update (or local failure).
+/// Returns how many cycles completed.
 pub(crate) async fn drive_poll_deadline_passes(
-    interval: Duration,
+    _interval: Duration,
+    mut started: impl FnMut() -> u64,
+    mut completed: impl FnMut() -> u64,
     mut waiting: impl FnMut() -> bool,
     mut idle: impl FnMut() -> bool,
     deadline: Duration,
@@ -290,20 +330,41 @@ pub(crate) async fn drive_poll_deadline_passes(
 ) -> usize {
     let _clock = (!clock_frozen()).then(FrozenClock::new);
     let mut seen = 0;
-    for _ in 0..passes {
-        while waiting() {
-            seen += 1;
-            elapse(deadline + TICK).await;
-        }
-        until("the poll finished its command wait", &mut idle).await;
-        elapse(interval).await;
-        if waiting() {
-            seen += 1;
+    while seen < passes {
+        let start_before = started();
+        let complete_before = completed();
+        until_elapsed("a poll pass started", || {
+            started() > start_before || waiting() || completed() > complete_before
+        })
+        .await;
+        until("the poll armed a command wait or completed", || {
+            waiting() || completed() > complete_before
+        })
+        .await;
+        loop {
             while waiting() {
                 elapse(deadline + TICK).await;
             }
-            until("the poll finished its command wait", &mut idle).await;
+            if completed() > complete_before {
+                break;
+            }
+            until("the poll finished its command wait or completed", || {
+                idle() || completed() > complete_before || waiting()
+            })
+            .await;
+            if completed() > complete_before {
+                break;
+            }
+            if waiting() {
+                continue;
+            }
+            break;
         }
+        until("the poll completed parking or a local failure", || {
+            completed() > complete_before
+        })
+        .await;
+        seen += 1;
     }
     seen
 }
