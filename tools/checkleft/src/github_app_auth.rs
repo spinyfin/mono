@@ -20,7 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
+
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubGetOutcome, GithubRetryPolicy, github_request};
 
 /// `CHECKS_GITHUB_APP_ID`: GitHub App numeric ID.
 pub const CHECKS_GITHUB_APP_ID_ENV: &str = "CHECKS_GITHUB_APP_ID";
@@ -121,25 +124,21 @@ async fn discover_installation_id(
     client: &reqwest::Client,
 ) -> Result<String> {
     let url = format!("{}/repos/{}/installation", base_url.trim_end_matches('/'), owner_repo);
-    let response = client
-        .get(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header(reqwest::header::USER_AGENT, "checkleft-cli")
-        .bearer_auth(jwt)
-        .send()
-        .await
-        .context("GET /repos/{owner_repo}/installation")?;
-
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .context("reading installation discovery response body")?;
-    if !status.is_success() {
-        let snippet = truncate_response_body(String::from_utf8_lossy(&bytes).trim(), 300);
-        anyhow::bail!("GET /repos/{owner_repo}/installation returned HTTP {status}: {snippet}");
-    }
+    let bytes = github_bytes(
+        client,
+        GithubCall {
+            method: Method::GET,
+            url: &url,
+            token: Some(jwt),
+            operation: "discovering the GitHub App installation",
+            timeout: GITHUB_API_TIMEOUT,
+            retry: GithubRetryPolicy::production(),
+            extra_headers: &[("X-GitHub-Api-Version", "2022-11-28")],
+            body: None,
+        },
+        "GET /repos/{owner_repo}/installation",
+    )
+    .await?;
     let parsed: InstallationResponse =
         serde_json::from_slice(&bytes).context("parsing GET /repos/{owner_repo}/installation response")?;
     Ok(parsed.id.to_string())
@@ -160,28 +159,39 @@ async fn exchange_for_installation_token(
         base_url.trim_end_matches('/'),
         installation_id
     );
-    let response = client
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header(reqwest::header::USER_AGENT, "checkleft-cli")
-        .bearer_auth(jwt)
-        .send()
-        .await
-        .context("POST /app/installations/{installation_id}/access_tokens")?;
-
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .context("reading installation token response body")?;
-    if !status.is_success() {
-        let snippet = truncate_response_body(String::from_utf8_lossy(&bytes).trim(), 300);
-        anyhow::bail!("installation token exchange returned HTTP {status}: {snippet}");
-    }
+    let bytes = github_bytes(
+        client,
+        GithubCall {
+            method: Method::POST,
+            url: &url,
+            token: Some(jwt),
+            operation: "exchanging a GitHub App JWT for an installation token",
+            timeout: GITHUB_API_TIMEOUT,
+            retry: GithubRetryPolicy::production(),
+            extra_headers: &[("X-GitHub-Api-Version", "2022-11-28")],
+            body: None,
+        },
+        "POST /app/installations/{installation_id}/access_tokens",
+    )
+    .await?;
     let parsed: InstallationTokenResponse =
         serde_json::from_slice(&bytes).context("parsing installation token response")?;
     Ok(parsed.token)
+}
+
+async fn github_bytes(client: &reqwest::Client, call: GithubCall<'_>, what: &str) -> Result<Vec<u8>> {
+    match github_request(client, call).await {
+        GithubGetOutcome::Success(bytes) => Ok(bytes),
+        GithubGetOutcome::Timeout { attempts } => {
+            anyhow::bail!("{what} timed out after {attempts} attempts")
+        }
+        GithubGetOutcome::Transport { error } => Err(error).context(what.to_owned()),
+        GithubGetOutcome::Body { error } => Err(error).with_context(|| format!("reading {what} response body")),
+        GithubGetOutcome::Http { status, body } => {
+            let snippet = truncate_response_body(String::from_utf8_lossy(&body).trim(), 300);
+            anyhow::bail!("{what} returned HTTP {status}: {snippet}");
+        }
+    }
 }
 
 /// Acquire a short-lived GitHub App installation access token for `owner_repo`.

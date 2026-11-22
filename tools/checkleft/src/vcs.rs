@@ -54,6 +54,7 @@ impl<'a> GithubApiContext<'a> {
     }
 
     /// Same as [`Self::new`] but with short, unjittered retry delays for tests.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn testing(base_url: &'a str, timeout: Duration) -> Self {
         Self::new(base_url, timeout).with_retry(GithubRetryPolicy::for_tests())
     }
@@ -494,7 +495,7 @@ async fn fetch_github_bytes(
                 "GitHub API {reason_name} response body error: {error}"
             )))
         }
-        GithubGetOutcome::Http { status } => {
+        GithubGetOutcome::Http { status, .. } => {
             warn!(repository, %status, "checkleft: GitHub {skip_name} skipped — non-success status");
             Ok(FetchedGithubBytes::LookupFailed(format!(
                 "GitHub API {reason_name} returned HTTP {status}"

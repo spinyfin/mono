@@ -1,16 +1,26 @@
-//! Shared retrying GitHub REST GET used by PR lookup paths.
+//! GitHub REST adapter over the shared HTTP retry loop.
 //!
 //! Timeouts, connection errors, HTTP 5xx and 429 are retried with jittered
-//! exponential backoff (honouring `Retry-After` on 429, capped). Other 4xx
-//! responses fail on the first attempt. The per-request timeout is unchanged;
-//! retries are bounded so a dead GitHub still fails in a predictable time.
+//! exponential backoff (honouring `Retry-After` on 429 and retryable 5xx,
+//! capped). Other 4xx responses fail on the first attempt. The per-request
+//! timeout is unchanged; retries are bounded so a dead GitHub still fails in
+//! a predictable time.
+//!
+//! GET, POST, and PATCH share this path. POST/PATCH are retried on the same
+//! transient classes: a 5xx means GitHub did not accept the write, and a
+//! connect/timeout with no response leaves the call unconfirmed. A timeout
+//! after GitHub actually applied a write can still produce a duplicate
+//! check-run or SARIF upload; that is accepted so annotation posting is not
+//! one-shot on a blip.
 
 use std::time::{Duration, Instant};
 
-use reqwest::StatusCode;
+use reqwest::{Method, StatusCode};
 use tracing::warn;
 
-use crate::http_retry::is_retryable_http_status;
+use crate::http_retry::{
+    RetrySettings, SendOutcome, failure_from_body, failure_from_http, failure_from_send, parse_retry_after, retry_loop,
+};
 
 /// Three attempts: the original plus two retries. Each request still uses the
 /// 30s GitHub client timeout; backoff is 1s then 2s (jittered, capped at 8s,
@@ -21,7 +31,10 @@ const GITHUB_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const GITHUB_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 const GITHUB_RETRY_BUDGET: Duration = Duration::from_secs(120);
 
-/// Retry / budget settings for one GitHub REST GET.
+/// Per-attempt timeout for GitHub REST calls.
+pub(crate) const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Retry / budget settings for one GitHub REST call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GithubRetryPolicy {
     pub max_attempts: u32,
@@ -52,6 +65,7 @@ impl GithubRetryPolicy {
 
     /// Short, unjittered delays so tests exercise the retry loop without
     /// waiting on production backoff.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests() -> Self {
         Self {
             max_attempts: GITHUB_RETRY_MAX_ATTEMPTS,
@@ -63,29 +77,25 @@ impl GithubRetryPolicy {
     }
 }
 
-/// Classified result of a GitHub GET after retries have been applied.
+/// Classified result of a GitHub REST call after retries have been applied.
 #[derive(Debug)]
 pub(crate) enum GithubGetOutcome {
     Success(Vec<u8>),
     Timeout { attempts: u32 },
     Transport { error: reqwest::Error },
     Body { error: reqwest::Error },
-    Http { status: StatusCode },
+    Http { status: StatusCode, body: Vec<u8> },
 }
 
-#[derive(Clone, Copy)]
-enum RetryableKind {
-    Timeout,
-    Transport,
-    Body,
-    Http,
-}
-
-struct AttemptFailure {
-    outcome: GithubGetOutcome,
-    retryable: Option<RetryableKind>,
-    cause: String,
-    retry_after: Option<Duration>,
+pub(crate) struct GithubCall<'a> {
+    pub method: Method,
+    pub url: &'a str,
+    pub token: Option<&'a str>,
+    pub operation: &'static str,
+    pub timeout: Duration,
+    pub retry: GithubRetryPolicy,
+    pub extra_headers: &'a [(&'a str, &'a str)],
+    pub body: Option<Vec<u8>>,
 }
 
 /// GET `url` with GitHub REST headers, retrying transient failures.
@@ -97,182 +107,115 @@ pub(crate) async fn github_get(
     request_timeout: Duration,
     retry: GithubRetryPolicy,
 ) -> GithubGetOutcome {
-    let started = Instant::now();
-    let max_attempts = retry.max_attempts.max(1);
-    let mut last: Option<GithubGetOutcome> = None;
-
-    for attempt in 1..=max_attempts {
-        let remaining = retry.budget.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-        let timeout = request_timeout.min(remaining).max(Duration::from_millis(1));
-        let failure = match send_once(client, url, token, timeout, attempt).await {
-            Ok(bytes) => return GithubGetOutcome::Success(bytes),
-            Err(failure) => failure,
-        };
-        last = Some(failure.outcome);
-        let Some(kind) = failure.retryable else {
-            break;
-        };
-        if attempt == max_attempts {
-            break;
-        }
-        let delay = retry_sleep(&retry, attempt, failure.retry_after);
-        let remaining_after = retry.budget.saturating_sub(started.elapsed());
-        if delay >= remaining_after {
-            break;
-        }
-        warn!(
-            attempt,
-            max_attempts,
+    github_request(
+        client,
+        GithubCall {
+            method: Method::GET,
+            url,
+            token,
             operation,
-            cause = %failure.cause,
-            kind = retryable_kind_name(kind),
-            delay_ms = delay.as_millis() as u64,
-            "retrying GitHub API call"
-        );
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-    }
+            timeout: request_timeout,
+            retry,
+            extra_headers: &[],
+            body: None,
+        },
+    )
+    .await
+}
 
-    last.unwrap_or(GithubGetOutcome::Timeout { attempts: 1 })
+/// POST/PATCH/GET with GitHub REST headers, retrying transient failures.
+pub(crate) async fn github_request(client: &reqwest::Client, call: GithubCall<'_>) -> GithubGetOutcome {
+    let started = Instant::now();
+    let remaining = || call.retry.budget.saturating_sub(started.elapsed());
+    let settings = RetrySettings {
+        max_attempts: call.retry.max_attempts,
+        base_delay: call.retry.base_delay,
+        max_delay: call.retry.max_delay,
+        jitter: call.retry.jitter,
+        not_found_base_delay: None,
+        remaining: Some(&remaining),
+        request_timeout: Some(call.timeout),
+    };
+    let outcome = retry_loop(
+        &settings,
+        |_attempt, timeout| {
+            send_once(
+                client,
+                call.method.clone(),
+                call.url,
+                call.token,
+                timeout,
+                call.extra_headers,
+                call.body.clone(),
+            )
+        },
+        |notice| {
+            warn!(
+                attempt = notice.attempt,
+                max_attempts = notice.max_attempts,
+                operation = call.operation,
+                cause = %notice.cause,
+                delay_ms = notice.delay.as_millis() as u64,
+                "retrying GitHub API call"
+            );
+        },
+    )
+    .await;
+    match outcome {
+        SendOutcome::Success(bytes) => GithubGetOutcome::Success(bytes),
+        SendOutcome::Timeout { attempts } => GithubGetOutcome::Timeout { attempts },
+        SendOutcome::Transport { error, .. } => GithubGetOutcome::Transport { error },
+        SendOutcome::Body { error, .. } => GithubGetOutcome::Body { error },
+        SendOutcome::Http { status, body, .. } => GithubGetOutcome::Http { status, body },
+    }
 }
 
 async fn send_once(
     client: &reqwest::Client,
+    method: Method,
     url: &str,
     token: Option<&str>,
     timeout: Duration,
-    attempt: u32,
-) -> Result<Vec<u8>, AttemptFailure> {
+    extra_headers: &[(&str, &str)],
+    body: Option<Vec<u8>>,
+) -> Result<Vec<u8>, crate::http_retry::AttemptFailure> {
     let mut request = client
-        .get(url)
+        .request(method, url)
         .timeout(timeout)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header(reqwest::header::USER_AGENT, "checkleft-cli");
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
     if let Some(token) = token.filter(|token| !token.trim().is_empty()) {
         request = request.bearer_auth(token);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
     }
 
     let response = match request.send().await {
         Ok(response) => response,
-        Err(error) if error.is_timeout() => {
-            return Err(timeout_failure(attempt, "timed out"));
-        }
-        Err(error) => {
-            return Err(transport_failure(error));
-        }
+        Err(error) => return Err(failure_from_send(error)),
     };
 
+    let retry_after = parse_retry_after(response.headers());
     let status = response.status();
     if !status.is_success() {
-        let retry_after = parse_retry_after(response.headers()).filter(|_| status == StatusCode::TOO_MANY_REQUESTS);
-        let retryable = is_retryable_http_status(status).then_some(RetryableKind::Http);
-        return Err(AttemptFailure {
-            outcome: GithubGetOutcome::Http { status },
-            retryable,
-            cause: format!("HTTP {status}"),
-            retry_after,
-        });
+        let body = response.bytes().await.unwrap_or_default().to_vec();
+        return Err(failure_from_http(status, body, retry_after, false));
     }
 
     match response.bytes().await {
         Ok(bytes) => Ok(bytes.to_vec()),
-        Err(error) if error.is_timeout() => Err(timeout_failure(attempt, "timed out reading the response body")),
-        Err(error) => Err(body_failure(error)),
+        Err(error) => Err(failure_from_body(error)),
     }
-}
-
-fn timeout_failure(attempt: u32, cause: &str) -> AttemptFailure {
-    AttemptFailure {
-        outcome: GithubGetOutcome::Timeout { attempts: attempt },
-        retryable: Some(RetryableKind::Timeout),
-        cause: cause.to_owned(),
-        retry_after: None,
-    }
-}
-
-fn transport_failure(error: reqwest::Error) -> AttemptFailure {
-    let retryable = is_retryable_transport(&error).then_some(RetryableKind::Transport);
-    AttemptFailure {
-        cause: format!("transport error: {error}"),
-        outcome: GithubGetOutcome::Transport { error },
-        retryable,
-        retry_after: None,
-    }
-}
-
-fn body_failure(error: reqwest::Error) -> AttemptFailure {
-    let retryable = is_retryable_transport(&error).then_some(RetryableKind::Body);
-    AttemptFailure {
-        cause: format!("response body error: {error}"),
-        outcome: GithubGetOutcome::Body { error },
-        retryable,
-        retry_after: None,
-    }
-}
-
-fn is_retryable_transport(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_request()
-}
-
-fn retryable_kind_name(kind: RetryableKind) -> &'static str {
-    match kind {
-        RetryableKind::Timeout => "timeout",
-        RetryableKind::Transport => "transport",
-        RetryableKind::Body => "body",
-        RetryableKind::Http => "http",
-    }
-}
-
-fn retry_sleep(policy: &GithubRetryPolicy, attempt: u32, retry_after: Option<Duration>) -> Duration {
-    let delay = match retry_after {
-        Some(retry_after) => retry_after.min(policy.max_delay),
-        None => {
-            let exponential = policy
-                .base_delay
-                .saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)));
-            let capped = exponential.min(policy.max_delay);
-            if policy.jitter { jitter(capped) } else { capped }
-        }
-    };
-    delay.min(policy.max_delay)
-}
-
-/// +/- 25% jitter. A zero delay stays zero.
-fn jitter(delay: Duration) -> Duration {
-    if delay.is_zero() {
-        return delay;
-    }
-    let nanos = delay.as_nanos();
-    let span = nanos / 4;
-    let width = span.saturating_mul(2).saturating_add(1);
-    let sample = entropy_nanos() % width;
-    Duration::from_nanos(nanos.saturating_sub(span).saturating_add(sample) as u64)
-}
-
-fn entropy_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| u128::from(duration.subsec_nanos()))
-        .unwrap_or(0)
-}
-
-/// Integer-seconds `Retry-After` only. An HTTP-date value falls through to
-/// exponential backoff.
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
+    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -280,7 +223,8 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{GITHUB_RETRY_MAX_ATTEMPTS, GithubGetOutcome, GithubRetryPolicy, github_get, parse_retry_after};
+    use super::{GITHUB_RETRY_MAX_ATTEMPTS, GithubGetOutcome, GithubRetryPolicy, github_get};
+    use crate::http_retry::parse_retry_after;
 
     struct LogBuf(Arc<Mutex<Vec<u8>>>);
 
@@ -325,7 +269,7 @@ mod tests {
         format!("{}/repos/o/r/pulls", server.uri())
     }
 
-    async fn get(server: &MockServer, timeout: Duration) -> GithubGetOutcome {
+    async fn get_with(server: &MockServer, timeout: Duration, retry: GithubRetryPolicy) -> GithubGetOutcome {
         let client = reqwest::Client::builder().timeout(timeout).build().expect("client");
         github_get(
             &client,
@@ -333,13 +277,17 @@ mod tests {
             Some("token"),
             "looking up the open PR for a branch",
             timeout,
-            retry(),
+            retry,
         )
         .await
     }
 
+    async fn get(server: &MockServer, timeout: Duration) -> GithubGetOutcome {
+        get_with(server, timeout, retry()).await
+    }
+
     #[test]
-    fn parse_retry_after_reads_integer_seconds_and_ignores_http_dates() {
+    fn parse_retry_after_reads_integer_seconds_and_http_dates() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "7".parse().expect("header"));
         assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
@@ -348,7 +296,7 @@ mod tests {
             reqwest::header::RETRY_AFTER,
             "Wed, 21 Oct 2015 07:28:00 GMT".parse().expect("header"),
         );
-        assert_eq!(parse_retry_after(&headers), None);
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
     }
 
     #[tokio::test]
@@ -443,7 +391,7 @@ mod tests {
             .await;
 
         match get(&server, Duration::from_secs(1)).await {
-            GithubGetOutcome::Http { status } => {
+            GithubGetOutcome::Http { status, .. } => {
                 assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
             }
             other => panic!("expected HTTP 404 without retry, got {other:?}"),
@@ -472,5 +420,180 @@ mod tests {
             GithubGetOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
             other => panic!("expected success after 429, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn http_503_honours_nonzero_retry_after_capped_by_max_delay() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "3600"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let policy = GithubRetryPolicy {
+            max_attempts: GITHUB_RETRY_MAX_ATTEMPTS,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(40),
+            budget: Duration::from_secs(2),
+            jitter: false,
+        };
+        let started = Instant::now();
+        match get_with(&server, Duration::from_secs(1), policy).await {
+            GithubGetOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
+            other => panic!("expected success after capped 503 Retry-After, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "503 Retry-After must sleep a nonzero capped delay, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "3600s Retry-After must be capped, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_503_honours_http_date_retry_after_within_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "Wed, 21 Oct 2099 07:28:00 GMT"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let policy = GithubRetryPolicy {
+            max_attempts: GITHUB_RETRY_MAX_ATTEMPTS,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(40),
+            budget: Duration::from_secs(2),
+            jitter: false,
+        };
+        let started = Instant::now();
+        match get_with(&server, Duration::from_secs(1), policy).await {
+            GithubGetOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
+            other => panic!("expected success after HTTP-date Retry-After, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "HTTP-date Retry-After must sleep the capped delay, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "HTTP-date Retry-After must be capped, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_budget_stops_after_first_retryable_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let policy = GithubRetryPolicy {
+            max_attempts: GITHUB_RETRY_MAX_ATTEMPTS,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(8),
+            budget: Duration::from_millis(5),
+            jitter: false,
+        };
+        match get_with(&server, Duration::from_secs(1), policy).await {
+            GithubGetOutcome::Http { status, .. } => {
+                assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("expected HTTP 503 after budget exhaustion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_then_502_stays_a_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(80)))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls"))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let policy = GithubRetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            budget: Duration::from_secs(2),
+            jitter: false,
+        };
+        match get_with(&server, Duration::from_millis(10), policy).await {
+            GithubGetOutcome::Timeout { attempts } => {
+                assert_eq!(attempts, 2);
+            }
+            other => panic!("timeout then 502 must stay a timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_retried_then_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let url = format!("http://{addr}/repos/o/r/pulls");
+        let policy = GithubRetryPolicy {
+            max_attempts: GITHUB_RETRY_MAX_ATTEMPTS,
+            base_delay: Duration::from_millis(15),
+            max_delay: Duration::from_millis(20),
+            budget: Duration::from_secs(2),
+            jitter: false,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let started = Instant::now();
+        match github_get(
+            &client,
+            &url,
+            Some("token"),
+            "looking up the open PR for a branch",
+            Duration::from_secs(1),
+            policy,
+        )
+        .await
+        {
+            GithubGetOutcome::Transport { .. } => {}
+            other => panic!("connection refused must be transport after retries, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "connection-refused must sleep between the three attempts, elapsed={elapsed:?}"
+        );
     }
 }

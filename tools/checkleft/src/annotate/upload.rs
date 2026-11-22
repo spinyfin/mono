@@ -4,9 +4,12 @@ use std::sync::OnceLock;
 use base64::Engine as _;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use reqwest::Method;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
+
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubGetOutcome, GithubRetryPolicy, github_request};
 
 /// How many seconds to wait for each SARIF upload request.
 const UPLOAD_TIMEOUT_SECS: u64 = 30;
@@ -112,36 +115,52 @@ pub async fn upload_sarif(sarif: &Value, ctx: &SarifUploadContext<'_>) -> bool {
         "uploading SARIF to GitHub code scanning"
     );
 
-    let response = match client
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "checkleft-cli")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .bearer_auth(ctx.token)
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
+    let payload = match serde_json::to_vec(&body) {
+        Ok(payload) => payload,
         Err(e) => {
-            warn!("checkleft: SARIF upload failed — network error: {e}");
+            warn!("checkleft: SARIF upload skipped — could not serialize upload body: {e}");
             return false;
         }
     };
-
-    let status = response.status();
-    if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
-        warn!("checkleft: SARIF upload failed — HTTP {}: {}", status, body_text.trim());
-        return false;
-    }
-
-    let bytes = match response.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("checkleft: SARIF upload succeeded but could not read response body: {e}");
+    let bytes = match github_request(
+        &client,
+        GithubCall {
+            method: Method::POST,
+            url: &url,
+            token: Some(ctx.token),
+            operation: "uploading SARIF to GitHub code scanning",
+            timeout: GITHUB_API_TIMEOUT,
+            retry: GithubRetryPolicy::production(),
+            extra_headers: &[
+                ("content-type", "application/json"),
+                ("X-GitHub-Api-Version", "2022-11-28"),
+            ],
+            body: Some(payload),
+        },
+    )
+    .await
+    {
+        GithubGetOutcome::Success(bytes) => bytes,
+        GithubGetOutcome::Timeout { attempts } => {
+            warn!("checkleft: SARIF upload failed — timed out after {attempts} attempts");
+            return false;
+        }
+        GithubGetOutcome::Transport { error } => {
+            warn!("checkleft: SARIF upload failed — network error: {error}");
+            return false;
+        }
+        GithubGetOutcome::Body { error } => {
+            warn!("checkleft: SARIF upload succeeded but could not read response body: {error}");
             eprintln!("checkleft: SARIF upload succeeded (id unknown)");
             return true;
+        }
+        GithubGetOutcome::Http { status, body } => {
+            warn!(
+                "checkleft: SARIF upload failed — HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&body).trim()
+            );
+            return false;
         }
     };
 
@@ -176,30 +195,35 @@ async fn poll_sarif_status(client: &reqwest::Client, base_url: &str, repository:
             tokio::time::sleep(std::time::Duration::from_secs(POLL_DELAY_SECS)).await;
         }
 
-        let response = match client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "checkleft-cli")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(token)
-            .send()
-            .await
+        let bytes = match github_request(
+            client,
+            GithubCall {
+                method: Method::GET,
+                url: &url,
+                token: Some(token),
+                operation: "polling SARIF upload status",
+                timeout: GITHUB_API_TIMEOUT,
+                retry: GithubRetryPolicy::production(),
+                extra_headers: &[("X-GitHub-Api-Version", "2022-11-28")],
+                body: None,
+            },
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("checkleft: SARIF status poll failed: {e}");
+            GithubGetOutcome::Success(bytes) => bytes,
+            GithubGetOutcome::Timeout { attempts } => {
+                warn!("checkleft: SARIF status poll failed: timed out after {attempts} attempts");
                 return;
             }
-        };
-
-        if !response.status().is_success() {
-            warn!("checkleft: SARIF status poll returned HTTP {}", response.status());
-            return;
-        }
-
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(_) => return,
+            GithubGetOutcome::Transport { error } => {
+                warn!("checkleft: SARIF status poll failed: {error}");
+                return;
+            }
+            GithubGetOutcome::Body { .. } => return,
+            GithubGetOutcome::Http { status, .. } => {
+                warn!("checkleft: SARIF status poll returned HTTP {status}");
+                return;
+            }
         };
         let status_resp: SarifStatusResponse = match serde_json::from_slice(&bytes) {
             Ok(s) => s,

@@ -16,10 +16,12 @@
 //! (the default) or fatal (`--annotations-strict`).
 
 use anyhow::{Context, Result, bail};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::annotate::{Annotation, AnnotationLevel, annotation_from_finding, cap_with_log};
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubGetOutcome, GithubRetryPolicy, github_request};
 use crate::output::{CheckResult, Severity};
 
 /// Maximum annotations GitHub accepts in a single check-run create/update request.
@@ -310,7 +312,7 @@ pub async fn post_check_run(
             annotations: first.to_vec(),
         },
     };
-    let bytes = send_json(client.post(&create_url), token, &create_body).await?;
+    let bytes = send_json(&client, Method::POST, &create_url, token, &create_body).await?;
     let created: CheckRunResponse =
         serde_json::from_slice(&bytes).context("parsing GitHub check-run create response")?;
     let id = created.id;
@@ -331,7 +333,7 @@ pub async fn post_check_run(
                 annotations: batch.to_vec(),
             },
         };
-        send_json(client.patch(&update_url), token, &update_body).await?;
+        send_json(&client, Method::PATCH, &update_url, token, &update_body).await?;
         info!(
             check_run_id = id,
             // batch 0 is the create above; PATCH batches start at 1.
@@ -347,29 +349,43 @@ pub async fn post_check_run(
 /// Serialize `body` as JSON, attach the GitHub headers + bearer auth, send, and
 /// return the response bytes — turning any non-2xx status into an `Err` that
 /// carries a truncated response body to aid debugging.
-async fn send_json<B: Serialize>(request: reqwest::RequestBuilder, token: &str, body: &B) -> Result<Vec<u8>> {
+async fn send_json<B: Serialize>(
+    client: &reqwest::Client,
+    method: Method,
+    url: &str,
+    token: &str,
+    body: &B,
+) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(body).context("serializing check-run request body")?;
-    let response = request
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "checkleft-cli")
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .bearer_auth(token)
-        .body(payload)
-        .send()
-        .await
-        .context("sending check-run request to GitHub")?;
-
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .context("reading GitHub check-run response body")?;
-    if !status.is_success() {
-        let snippet = truncate_chars(String::from_utf8_lossy(&bytes).trim(), 500);
-        bail!("GitHub check-run API returned HTTP {status}: {snippet}");
+    match github_request(
+        client,
+        GithubCall {
+            method,
+            url,
+            token: Some(token),
+            operation: "posting a checkleft check run",
+            timeout: GITHUB_API_TIMEOUT,
+            retry: GithubRetryPolicy::production(),
+            extra_headers: &[
+                ("content-type", "application/json"),
+                ("X-GitHub-Api-Version", "2022-11-28"),
+            ],
+            body: Some(payload),
+        },
+    )
+    .await
+    {
+        GithubGetOutcome::Success(bytes) => Ok(bytes),
+        GithubGetOutcome::Timeout { attempts } => {
+            bail!("sending check-run request to GitHub timed out after {attempts} attempts")
+        }
+        GithubGetOutcome::Transport { error } => Err(error).context("sending check-run request to GitHub"),
+        GithubGetOutcome::Body { error } => Err(error).context("reading GitHub check-run response body"),
+        GithubGetOutcome::Http { status, body } => {
+            let snippet = truncate_chars(String::from_utf8_lossy(&body).trim(), 500);
+            bail!("GitHub check-run API returned HTTP {status}: {snippet}");
+        }
     }
-    Ok(bytes.to_vec())
 }
 
 /// Truncate `s` to at most `max_chars` characters, appending `…` when it had to
