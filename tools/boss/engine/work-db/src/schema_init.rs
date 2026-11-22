@@ -192,15 +192,27 @@ impl WorkDb {
 
     /// Escape hatch: open a brand-new connection to this database instead of
     /// borrowing the shared pooled one. For the rare caller that genuinely
-    /// needs an independent connection — e.g. a long-running `VACUUM INTO`
-    /// snapshot that must not hold up every other operation on this `WorkDb`
-    /// for its duration (see `database_backup::take_backup`). Most callers
-    /// want [`Self::connect`], not this.
+    /// needs an independent connection. Most callers want [`Self::connect`],
+    /// not this.
     #[track_caller]
     pub fn connect_new(&self) -> Result<super::db_diagnostics::OwnedConnection> {
-        Ok(super::db_diagnostics::OwnedConnection::new(
+        Ok(super::db_diagnostics::OwnedConnection::new_with_scope(
             Self::open_raw_connection(&self.path, self.memory.as_ref())?,
             self.persona_metrics.clone(),
+            std::panic::Location::caller(),
+            super::db_diagnostics::read_volume::Scope::Query,
+        ))
+    }
+
+    /// Open an independent connection for a whole-file snapshot (`VACUUM INTO`),
+    /// which reads every page by design and must not trigger heavy-read warnings.
+    #[track_caller]
+    pub fn connect_new_for_snapshot(&self) -> Result<super::db_diagnostics::OwnedConnection> {
+        Ok(super::db_diagnostics::OwnedConnection::new_with_scope(
+            Self::open_raw_connection(&self.path, self.memory.as_ref())?,
+            self.persona_metrics.clone(),
+            std::panic::Location::caller(),
+            super::db_diagnostics::read_volume::Scope::WholeFile,
         ))
     }
 
@@ -891,6 +903,12 @@ mod floor_tests {
                 Box::new(|c| {
                     c.execute_batch(super::super::recurring_read_indexes::INDEXES_SQL)
                         .unwrap();
+                }),
+            ),
+            (
+                super::super::review_guide_sources::RETENTION_INDEXES_MIGRATION_ID,
+                Box::new(|c| {
+                    super::super::review_guide_sources::migrate_retention_indexes(c).unwrap();
                 }),
             ),
             (

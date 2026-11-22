@@ -2,6 +2,20 @@
 use super::*;
 use fs4::fs_std::FileExt;
 
+pub(crate) const RETENTION_INDEXES_MIGRATION_ID: &str = "20261122_0515_review_guide_retention_indexes";
+
+pub(crate) fn migrate_retention_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS pr_review_guide_versions_attempt_idx
+             ON pr_review_guide_versions(attempt_id);
+         CREATE INDEX IF NOT EXISTS pr_review_guide_versions_comparison_idx
+             ON pr_review_guide_versions(comparison_id);
+         CREATE INDEX IF NOT EXISTS pr_review_guide_updates_previous_version_idx
+             ON pr_review_guide_updates(previous_version_id);",
+    )?;
+    Ok(())
+}
+
 pub(super) struct SourceRetentionPolicy {
     pub terminal_age_seconds: i64,
     pub recent_comparisons: i64,
@@ -203,5 +217,61 @@ mod lock_tests {
         assert!(packet_store_lock(root.path(), true).unwrap().is_none());
         drop(second);
         assert!(packet_store_lock(root.path(), true).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_pr_review_guide_sources_avoids_quadratic_nested_loop_scans() {
+        let (_dir, db) = crate::test_support::open_db();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO pr_review_guide_source_series
+                 (id, root_task_id, canonical_pr_url, created_at, updated_at)
+                 VALUES ('ser_1', 'task_1', 'https://github.com/o/r/pull/1', ?1, ?1)",
+                [&now],
+            )
+            .unwrap();
+            for i in 0..250 {
+                let cmp_id = format!("cmp_{i}");
+                let att_id = format!("att_{i}");
+                let ver_id = format!("ver_{i}");
+                let sha = format!("{i:040x}");
+                conn.execute(
+                    "INSERT INTO pr_review_guide_source_comparisons
+                     (id, series_id, observation_sequence, observed_base_sha, merge_base_sha,
+                      head_sha, trigger, packet_hash, complete, captured_at)
+                     VALUES (?1, 'ser_1', ?2, 'base', 'base', ?3, 'manual', 'hash', 1, ?4)",
+                    rusqlite::params![cmp_id, i, sha, now],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO pr_review_guide_attempts
+                     (id, series_id, comparison_id, request_epoch, ordinal, status,
+                      prompt_version, created_at)
+                     VALUES (?1, 'ser_1', ?2, 1, 1, 'succeeded', 'v1', ?3)",
+                    rusqlite::params![att_id, cmp_id, now],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO pr_review_guide_versions
+                     (id, series_id, comparison_id, attempt_id, markdown, raw_output,
+                      content_hash, prompt_version, generated_at)
+                     VALUES (?1, 'ser_1', ?2, ?3, 'md', 'raw', 'ch', 'v1', ?4)",
+                    rusqlite::params![ver_id, cmp_id, att_id, now],
+                )
+                .unwrap();
+            }
+        }
+        let ((), measured) = crate::db_diagnostics::read_volume::measure(|| {
+            db.prune_pr_review_guide_sources(SourceRetentionPolicy::default())
+                .unwrap();
+        });
+        assert!(
+            measured.full_scan_steps < 5_000,
+            "prune_pr_review_guide_sources must not scan quadratically over versions/attempts/comparisons; got {} full_scan_steps (top={:?})",
+            measured.full_scan_steps,
+            measured.top_statement()
+        );
     }
 }

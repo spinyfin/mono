@@ -40,6 +40,14 @@ pub(super) fn migrate_merge_queue_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn execution_statuses_sql(terminal: bool) -> String {
+    boss_protocol::ExecutionStatus::ALL
+        .iter()
+        .filter(|status| status.is_terminal() == terminal)
+        .map(|status| format!("'{}'", status.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 /// Every execution status that is not terminal, as the body of an SQL `IN`
 /// list. Unfinished executions are found through the existing status index
 /// `work_executions_ready_idx`, which can seek a list of statuses but not
@@ -48,12 +56,12 @@ pub(super) fn migrate_merge_queue_index(conn: &Connection) -> Result<()> {
 /// the statement that index was built for. Built from the enum so a status
 /// added later is included.
 pub(crate) fn unfinished_execution_statuses_sql() -> String {
-    boss_protocol::ExecutionStatus::ALL
-        .iter()
-        .filter(|status| !status.is_terminal())
-        .map(|status| format!("'{}'", status.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ")
+    execution_statuses_sql(false)
+}
+
+/// Every terminal execution status, as the body of an SQL `IN` list.
+pub(crate) fn terminal_execution_statuses_sql() -> String {
+    execution_statuses_sql(true)
 }
 
 pub(super) const INDEXES_SQL: &str = "
@@ -92,6 +100,58 @@ const ANALYZE_SQL: &str = "
 
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(INDEXES_SQL)?;
-    conn.execute_batch(ANALYZE_SQL)?;
+    // Only analyze the new indexes if `sqlite_stat1` already exists. Running
+    // `ANALYZE <index>` on a never-analyzed database would create `sqlite_stat1`
+    // and suppress the full `ANALYZE` in `refresh_query_planner_stats`.
+    let has_stats: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_stats {
+        conn.execute_batch(ANALYZE_SQL)?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stat_less_upgrade_populates_stat1_for_preexisting_indexes() {
+        let (dir, db) = crate::test_support::open_db();
+        let path = db.path().to_path_buf();
+        let product_id = crate::test_support::create_product(&db);
+        let chore_id = crate::test_support::create_active_chore(&db, &product_id, "t");
+        let _exec = crate::test_support::create_ready_chore_execution(&db, &chore_id);
+        {
+            let conn = db.connect().unwrap();
+            let created: Vec<String> = super::INDEXES_SQL
+                .split("CREATE INDEX IF NOT EXISTS ")
+                .skip(1)
+                .map(|statement| statement.split_whitespace().next().unwrap().to_owned())
+                .collect();
+            for index in &created {
+                conn.execute_batch(&format!("DROP INDEX IF EXISTS {index}")).unwrap();
+            }
+            conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1; DROP TABLE IF EXISTS sqlite_stat4;")
+                .unwrap();
+            conn.execute("DELETE FROM schema_migrations WHERE id = ?1", [super::MIGRATION_ID])
+                .unwrap();
+        }
+        drop(db);
+        let upgraded = crate::WorkDb::open(path).unwrap();
+        let conn = upgraded.connect().unwrap();
+        let ready_stats: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = 'work_executions_ready_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ready_stats > 0,
+            "upgrading a never-analyzed database must still populate sqlite_stat1 for pre-existing indexes"
+        );
+        drop(dir);
+    }
 }

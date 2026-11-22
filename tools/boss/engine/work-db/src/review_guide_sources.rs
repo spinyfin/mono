@@ -16,6 +16,7 @@ const PACKET_ARTIFACT_DIR: &str = "review-guide-sources";
 const MAX_CAPTURE_ATTEMPTS: i64 = 3;
 #[path = "review_guide_source_retention.rs"]
 mod retention;
+pub(crate) use retention::{RETENTION_INDEXES_MIGRATION_ID, migrate_retention_indexes};
 use retention::{SourceRetentionPolicy, packet_store_lock};
 
 /// The lifecycle seam that requested a source capture. Kept with the durable

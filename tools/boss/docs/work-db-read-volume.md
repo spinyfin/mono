@@ -122,9 +122,11 @@ env -u BOSS_EVENTS_SOCKET BOSS_WORKER_POOL_SIZE=0 BOSS_WORK_DB_HEAVY_READ_PAGES=
 
 Place a copy of the database to measure at `/tmp/boss-test-<id>.db` first. The engine derives that path from the socket path and never touches production state. Read `work DB heavy read` and `db read summary` from `/tmp/boss-test-<id>.engine-trace.jsonl`. Never point this at the live database.
 
+Figures in this doc come from a synthetic fixture. To measure a real database, copy it, including its `-wal` file, outside the engine state directory and run the recipe above against the copy. A `VACUUM INTO` backup is compacted and cannot show the original free-page count.
+
 ## Reads that still walk
 
-Measured on the same fixture after the fix. None of these runs more often than every five minutes.
+Measured on the same fixture after the initial index migration. None of these runs more often than every five minutes.
 
 | Read                                                                      | Timer  | Pages per pass |
 | ------------------------------------------------------------------------- | ------ | -------------: |
@@ -132,11 +134,10 @@ Measured on the same fixture after the fix. None of these runs more often than e
 | Positioning-hold recheck (`pre_start_failure.rs`)                         | 300 s  |          7,640 |
 | PR binding repair (`pr_binding.rs`)                                       | 600 s  |          9,960 |
 | Execution retention (`execution_retention.rs`)                            | 3600 s |         57,600 |
-| Review-guide source retention (`review_guide_source_retention.rs`)        | 3600 s |         49,700 |
 | Driver home retention, three sweeps (`executions_runs.rs`, `run_rows.rs`) | 3600 s |    15,300 each |
 | Backup snapshot (`VACUUM INTO`)                                           | 3600 s | the whole file |
 
-The backup reads the whole file by design. The review-guide retention pass is the one to look at next: its delete stepped 5.7 million rows in a nested loop over 2,800 guide versions, so it grows with the square of the guide history.
+The backup reads the whole file by design. (`review_guide_source_retention.rs` previously stepped 5.7 million rows in a nested loop over 2,800 guide versions; migration `20261122_0515_review_guide_retention_indexes` added indexes on `pr_review_guide_versions(attempt_id)`, `pr_review_guide_versions(comparison_id)`, and `pr_review_guide_updates(previous_version_id)` to eliminate the quadratic scans.)
 
 ## Size of the file
 
@@ -154,5 +155,3 @@ Decided worker proposals are kept for 90 days after both the decision and the ow
 Review verdicts, review batch members, final batch verdicts, attention records, operator questions and progression actions retain their referenced proposals indefinitely. This keeps review badges, findings, accepted-report recovery and pending decisions readable. The reference set is built once per delete statement; eligibility and deletion are atomic. The sweep deletes rows, not executions or artifacts, and does not vacuum the live database. Its hourly scan is outside the frequent-read budget; unlike the recurring readers above, retention must inspect historical eligibility.
 
 `proposal_retention_keeps_pending_recent_live_and_referenced_payloads` checks deletion of all four decided states, the strict 90-day boundary, running and recently finished workers, unknown states, missing timestamps, all six reference paths, payload preservation and an idempotent second pass. Other unbounded tables have no retention yet; each needs its own preservation policy before rows can be deleted.
-
-The incident database measurements also require an authorized offline copy outside the engine state directory, which workers must not read. A copy must include committed WAL contents; a compacted backup alone cannot reveal the incident file's original freelist count. The table/index breakdown and original free-page count, and before/after recurring-read measurements on isolated copies of that real-sized database, remain unavailable until that input is supplied. The synthetic measurements above do not satisfy those deliverables.
