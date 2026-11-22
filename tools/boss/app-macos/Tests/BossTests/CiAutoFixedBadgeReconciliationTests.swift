@@ -370,6 +370,74 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
         XCTAssertEqual(model.ciFailureBadge(forPR: prURL), CiFailureBadge(state: .exhausted, attemptsUsed: 3, budget: 3))
     }
 
+    // MARK: - Head replaced under a running attempt
+
+    /// A push replaces a red head while an attempt is fixing it: the engine
+    /// abandons that attempt and clears the failure, and CI then passes on
+    /// the new head. The clear carries the retired row, so the board
+    /// refreshes that follow must not bring "ci failing" back.
+    func testForcePushToGreenHeadStaysClearAcrossBoardRefreshes() {
+        for retiredStatus in ["abandoned", "retriggered", "failed"] {
+            let model = makeModel()
+            let task = badgeTask(status: "in_review")
+            let prURL = task.prURL!
+            model.choresByProductID["product"] = [task]
+            model.applyRemediationPush(makeRow(
+                id: "cir_red", prURL: prURL, status: "running",
+                extra: ["attempts_used": "1", "budget": "3"]
+            ))
+            model.reconcileCIFailureBadges(from: [task])
+            XCTAssertEqual(
+                model.ciFailureBadge(forPR: prURL), CiFailureBadge(state: .inFlight, attemptsUsed: 1, budget: 3)
+            )
+
+            model.applyEventForTest(.ciFailureCleared(
+                productID: "product", workItemID: "task", prURL: prURL,
+                attempt: makeRow(
+                    id: "cir_red", prURL: prURL, status: retiredStatus,
+                    extra: ["attempts_used": "1", "budget": "3", "card_state": "clear"]
+                )
+            ))
+            XCTAssertNil(model.ciFailureBadge(forPR: prURL), retiredStatus)
+            XCTAssertEqual(model.ciRemediations.first { $0.prURL == prURL }?.status, retiredStatus)
+
+            // The clear is followed by board refreshes (the green head's
+            // poll result among them); none of them may re-raise the chip.
+            model.reconcileCIFailureBadges(from: [task])
+            model.reconcileCIFailureBadges(from: [task])
+            XCTAssertNil(model.ciFailureBadge(forPR: prURL), retiredStatus)
+            XCTAssertFalse(model.showsCIAutoFixedBadge(forPR: prURL), "nothing was auto-fixed")
+        }
+    }
+
+    /// The replacement head fails too: the engine opens an attempt for it,
+    /// and the chip stays up across board refreshes.
+    func testFailingReplacementHeadKeepsFailureChipAcrossBoardRefreshes() {
+        let model = makeModel()
+        let task = badgeTask(status: "in_review")
+        let prURL = task.prURL!
+        model.choresByProductID["product"] = [task]
+        model.applyRemediationPush(makeRow(id: "cir_red", prURL: prURL, status: "running", ageMinutes: 20))
+        model.applyEventForTest(.ciFailureCleared(
+            productID: "product", workItemID: "task", prURL: prURL,
+            attempt: makeRow(
+                id: "cir_red", prURL: prURL, status: "abandoned", ageMinutes: 20,
+                extra: ["attempts_used": "1", "budget": "3", "card_state": "clear"]
+            )
+        ))
+        XCTAssertNil(model.ciFailureBadge(forPR: prURL))
+
+        model.applyRemediationPush(makeRow(
+            id: "cir_red_2", prURL: prURL, status: "pending", ageMinutes: 1,
+            extra: ["attempts_used": "2", "budget": "3"]
+        ))
+        model.reconcileCIFailureBadges(from: [task])
+
+        XCTAssertEqual(
+            model.ciFailureBadge(forPR: prURL), CiFailureBadge(state: .inFlight, attemptsUsed: 2, budget: 3)
+        )
+    }
+
     private func makeRow(
         id: String, prURL: String, status: String, finishedAt: String? = nil, kind: String = "ci",
         failureReason: String? = nil, ageMinutes: Int = 10, extra: [String: String] = [:]

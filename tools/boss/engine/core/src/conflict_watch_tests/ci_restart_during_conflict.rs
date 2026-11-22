@@ -210,3 +210,39 @@ async fn yes_answer_during_conflict_resolution_keeps_the_ci_fix_revision_resumab
     assert_eq!(resumed_task.status, TaskStatus::Todo);
     assert_eq!(resumed_task.blocked_reason, None);
 }
+
+/// Conflict detection abandons the CI attempt it pre-empts. The app shows
+/// "ci failing" for as long as it holds that attempt as running, so the
+/// abandoned row has to be published, carrying the cleared card state.
+#[tokio::test]
+async fn conflict_superseding_a_ci_attempt_publishes_the_abandoned_row() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/3080";
+    let (product, chore) = make_in_review(&db, "C-conflict-supersedes-ci", pr);
+    let (ci_attempt, _revision) = ci_fix_revision(&db, &product, &chore, pr);
+    let queue = ConflictRemediationQueue::new(Arc::new(UnfinishedLadder));
+    let publisher = RecordingPublisher::default();
+
+    on_conflict_detected_with(
+        &db,
+        &publisher,
+        ConflictRemediationMode::Deferred(&queue),
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        ConflictDeferralArm::Off,
+    )
+    .await;
+
+    let typed = publisher.typed_events.lock().await.clone();
+    let pushed = typed
+        .iter()
+        .find_map(|(_, event)| match event {
+            FrontendEvent::CiRemediationAbandoned { attempt, .. } if attempt.id == ci_attempt => Some(attempt.clone()),
+            _ => None,
+        })
+        .expect("the superseded CI attempt must be published as abandoned");
+    assert_eq!(pushed.status, "abandoned");
+    assert_eq!(pushed.extra.get("card_state").map(String::as_str), Some("clear"));
+}

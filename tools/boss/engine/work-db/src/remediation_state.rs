@@ -61,6 +61,25 @@ impl WorkDb {
         Ok(ci_card_state_label(exhausted, failing))
     }
 
+    /// The newest CI attempt recorded for this PR, whatever its status. The
+    /// card follows the newest attempt, so this is the row to publish when
+    /// the engine's view of the PR's CI failure changes.
+    pub fn latest_ci_remediation_for_pr(&self, work_item_id: &str, pr_url: &str) -> Result<Option<CiRemediation>> {
+        let conn = self.connect()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM ci_remediations WHERE work_item_id = ?1 AND pr_url = ?2
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![work_item_id, pr_url],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => query_ci_remediation(&conn, &id),
+            None => Ok(None),
+        }
+    }
+
     /// Latest compact attempt per kind for each current, nonterminal PR.
     /// Unlike history, this has no arbitrary row cap: every open card must
     /// recover after a missed push. No diagnosis/log columns are selected.

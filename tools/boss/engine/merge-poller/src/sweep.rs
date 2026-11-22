@@ -2045,23 +2045,16 @@ pub async fn update_pr_poll_state(
     // quiesced (or never armed a side-table signal), no retire fires and the
     // chip is stranded on an earlier head's failure (a prior leak). The poll
     // observes the truth — `fail → success` at the current head — so broadcast
-    // `CiFailureCleared` here as a head-keyed safety net. This is idempotent
+    // `CiFailureCleared` here as a head-keyed safety net. Like every clear it
+    // carries the PR's newest attempt row, so the app's copy of that attempt
+    // cannot keep reading as "still fixing" afterwards. This is idempotent
     // with any retire-path clear that already ran this sweep: the macOS
     // handler simply drops the chip (a no-op if already gone) and leaves the
     // "ci auto-fixed" badge untouched. Restricted to `fail → success` so it
     // never clobbers an active attempt's in-flight badge on `fail → in_progress`
     // (that transition is owned by `on_ci_in_flight_supersedes_failure`, #901).
     if outcome.prior_ci_state.as_deref() == Some("fail") && ci_state == "success" {
-        publisher
-            .publish_frontend_event_on_product(
-                &candidate.product_id,
-                boss_protocol::FrontendEvent::CiFailureCleared {
-                    product_id: candidate.product_id.clone(),
-                    work_item_id: candidate.work_item_id.clone(),
-                    pr_url: candidate.pr_url.clone(),
-                },
-            )
-            .await;
+        crate::remediation_push::publish_ci_failure_cleared(work_db, publisher, candidate).await;
         tracing::info!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,

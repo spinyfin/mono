@@ -613,11 +613,14 @@ extension ChatViewModel {
             // chip for the next 24h (per design Q11).
             ciFailureBadges.removeValue(forKey: prURL)
             recentlyClearedCIPRs[prURL] = Date()
-        case .ciFailureCleared(_, _, let prURL):
-            // Engine cleared `blocked: ci_failure` but found no active
-            // remediation attempt (the prior attempt was already terminal).
+        case .ciFailureCleared(_, _, let prURL, let attempt):
+            // Engine cleared the CI failure without an auto-fix succeeding.
+            // Take its row for the PR's newest attempt first: a board
+            // refresh re-derives the chip from that row, so a copy still
+            // marked running would bring "ci failing" straight back.
             // Clear the failure badge only — do NOT set the auto-fixed badge
             // because the clearance was not driven by an auto-fix.
+            if let attempt { storeRemediationRow(attempt) }
             ciFailureBadges.removeValue(forKey: prURL)
         case .ciRemediationFailed(_, _, _, _, _, let attempt),
              .ciRemediationAbandoned(_, _, _, _, _, let attempt):

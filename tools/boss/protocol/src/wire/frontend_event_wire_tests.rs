@@ -1389,6 +1389,7 @@ fn tag_cases() -> Vec<TagCase> {
                 product_id: "prod_1".into(),
                 work_item_id: "task_1".into(),
                 pr_url: "https://example.test/pr/42".into(),
+                attempt: Some(ci_remediation().list_entry()),
             },
             expected_tag: "ci_failure_cleared",
         },

@@ -928,11 +928,19 @@ pub enum FrontendEvent {
     /// path). Distinct from `CiRemediationSucceeded` because the
     /// clearance was NOT driven by an auto-fix: the UI should clear the
     /// `ci failing` badge but must NOT set the `ci auto-fixed` badge.
+    ///
+    /// `attempt` is the PR's newest CI attempt as the engine now records it
+    /// (absent when the PR never had one). Clients keep the newest attempt
+    /// per PR and treat a `pending`/`running` one as "still failing", so the
+    /// clear must replace their copy: an attempt the engine retired without
+    /// its own lifecycle push would otherwise re-raise the badge.
     #[worker(passthrough)]
     CiFailureCleared {
         product_id: String,
         work_item_id: String,
         pr_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<EngineAttemptListEntry>,
     },
     /// Activity-feed push: a CI-remediation attempt terminated in
     /// `failed`. Emitted when the worker calls
