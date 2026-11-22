@@ -348,6 +348,19 @@ async fn model_less_agy_snapshots_keep_the_launch_model_until_observed_or_mixed(
     assert_eq!(model.as_deref(), Some("gemini-launch"));
     assert_eq!(labels, vec!["gemini-launch".to_owned()]);
 
+    // Live-tail: an observed step appended to the same capture replaces the
+    // launch-model fallback while keeping the earlier model-less row.
+    let mut live_tail = std::fs::read_to_string(&path).unwrap();
+    live_tail.push_str(&step(2, Some("gemini-observed")));
+    std::fs::write(&path, live_tail).unwrap();
+    capture
+        .capture_and_persist(&db, &execution.id, &path, None)
+        .await
+        .unwrap();
+    let (model, labels) = model_of_report(&db);
+    assert_eq!(model.as_deref(), Some("gemini-observed"));
+    assert_eq!(labels, vec!["gemini-observed".to_owned()]);
+
     // An observed model takes precedence over the launch model.
     std::fs::write(&path, step(1, Some("gemini-observed"))).unwrap();
     capture.forget(&execution.id);
