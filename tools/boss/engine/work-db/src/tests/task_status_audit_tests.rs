@@ -712,7 +712,7 @@ fn engine_dispatch_paths_record_their_autostart_changes() {
             Some("1"),
             "0",
             "engine",
-            "start_execution_run_on_host_with_tmux_hosting"
+            task_status_audit::START_EXECUTION_RUN_BASIS
         ))
     );
 

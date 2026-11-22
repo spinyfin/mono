@@ -785,6 +785,9 @@ impl WorkDb {
                 crate::task_status_audit::abandon_cause::DEFERRED.by(actor),
             )?;
         }
+        if let Some(through) = patch.acknowledge_auto_stop_through {
+            super::auto_stop_notice::acknowledge(&tx, id, through, actor, &task.updated_at)?;
+        }
         operation.end()?;
 
         if status_changed && previous_status != task.status {

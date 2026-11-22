@@ -16,6 +16,11 @@ pub(crate) const EXECUTION_ABANDONED_PROPERTY: &str = "execution_abandoned";
 /// without going through a helper in this module.
 pub(crate) const UNATTRIBUTED_WRITE: &str = "unattributed_write";
 
+/// Basis (and therefore `reason_code`) of the ledger rows written when a
+/// run start consumes the item's autostart. Shared with the card-notice
+/// query so renaming a call site cannot silently drop that exclusion.
+pub(crate) const START_EXECUTION_RUN_BASIS: &str = "start_execution_run_on_host_with_tmux_hosting";
+
 /// Why an execution was abandoned. `code` is the stable, machine-readable
 /// reason (never reworded once shipped); `path` names the writer; `detail` is
 /// human-readable diagnostic text that may be reworded.

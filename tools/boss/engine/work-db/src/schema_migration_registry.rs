@@ -552,6 +552,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: spoke_projection::migrate_turn_state,
         },
         Migration {
+            id: crate::auto_stop_notice::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: crate::auto_stop_notice::migrate,
+        },
+        Migration {
             id: task_status_audit::DEFERRED_MIGRATION_ID.into(),
             legacy_version: None,
             apply: task_status_audit::migrate_deferred,
