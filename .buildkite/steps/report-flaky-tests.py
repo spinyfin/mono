@@ -80,7 +80,7 @@ def collect(bep, output):
                 summaries[identity(event['id']['testSummary'])] = event['testSummary']
     tests = []
     for key, summary in sorted(summaries.items()):
-        attempts, cases, log_cases, seen = [], set(), set(), set()
+        attempts, cases, log_cases, seen, unparsed = [], set(), set(), set(), set()
         base = Path('flaky-logs') / hashlib.sha256(repr(key).encode()).hexdigest()[:16]
         for event in results.get(key, []):
             test_id = event['id']['testResult']
@@ -94,16 +94,22 @@ def collect(bep, output):
                       / f"run-{attempt['run']}-shard-{attempt['shard']}-attempt-{attempt['attempt']}")
             # Only a failed attempt's log names what failed: a passing retry
             # prints the same test with `ok`.
+            parsed_uris = set()
             paths, missing = copy_outputs(result.get('testActionOutput', []),
-                                          output, folder, cases, set(),
+                                          output, folder, cases, parsed_uris,
                                           log_cases=log_cases if result['status'] == 'FAILED' else None)
-            seen.update(item.get('uri') for item in result.get('testActionOutput', []))
+            seen.update(parsed_uris, missing)
+            # A log a non-FAILED attempt merely copied can still name a failure
+            # in summary.failed, so summary.failed must be free to parse it.
+            if result['status'] != 'FAILED':
+                unparsed.update(parsed_uris)
             attempt.update(log_paths=paths, missing_outputs=missing)
             attempts.append(attempt)
         summary_logs = []
         for status, field in (('FAILED', 'failed'), ('PASSED', 'passed')):
             paths, missing = copy_outputs(summary.get(field, []), output,
-                                          base / ('summary-' + field), cases, seen, required=True,
+                                          base / ('summary-' + field), cases,
+                                          seen - unparsed if status == 'FAILED' else seen, required=True,
                                           log_cases=log_cases if status == 'FAILED' else None,
                                           any_log_name=status == 'FAILED')
             if paths or missing:

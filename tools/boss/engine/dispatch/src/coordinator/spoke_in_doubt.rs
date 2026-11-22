@@ -41,6 +41,7 @@ impl ExecutionCoordinator {
             "spoke lease unresolved; parked for {}s: {err:#}",
             timing.lease_park_delay.as_secs()
         );
+        let mut parked = true;
         match self
             .work_db
             .park_pre_start_attempt(&execution.id, timing.lease_park_delay, &note)
@@ -54,11 +55,14 @@ impl ExecutionCoordinator {
                 });
             }
             Ok(false) => {}
-            Err(park_err) => tracing::error!(
-                execution_id = %execution.id,
-                error = %format!("{park_err:#}"),
-                "could not park an execution whose spoke lease is in doubt",
-            ),
+            Err(park_err) => {
+                parked = false;
+                tracing::error!(
+                    execution_id = %execution.id,
+                    error = %format!("{park_err:#}"),
+                    "could not park an execution whose spoke lease is in doubt",
+                );
+            }
         }
         tracing::warn!(
             execution_id = %execution.id,
@@ -66,7 +70,12 @@ impl ExecutionCoordinator {
             "spoke lease unresolved; attempt parked without spending the retry budget",
         );
         self.raise_spoke_in_doubt_attention(execution, "workspace lease", &err, timing.attention_after);
-        anyhow::Error::new(SpokeAttemptParked(err))
+        if parked {
+            err.context(SpokeAttemptParked)
+        } else {
+            // The row may still be claimed; let the scheduler's unclaim fallback run.
+            err
+        }
     }
 
     /// Park an attempt that could not reach the host holding its in-doubt
@@ -538,20 +547,15 @@ impl ExecutionCoordinator {
     }
 }
 
-/// Marker attached by [`ExecutionCoordinator::park_in_doubt_spoke_lease`] when
-/// an attempt has been parked without spending the retry budget.
+/// Marker attached by [`ExecutionCoordinator::park_in_doubt_spoke_lease`] as
+/// error context once the attempt has actually been parked without spending the
+/// retry budget. The original error stays in the source chain.
 #[derive(Debug)]
-pub(super) struct SpokeAttemptParked(anyhow::Error);
+pub(super) struct SpokeAttemptParked;
 
 impl std::fmt::Display for SpokeAttemptParked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl std::error::Error for SpokeAttemptParked {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref())
+        f.write_str("attempt parked while the spoke lease is in doubt")
     }
 }
 

@@ -102,6 +102,24 @@ class ReportTest(unittest.TestCase):
             self.assertIn('  //pkg:flaky (2 attempts)', lines)
             self.assertIn('    suite::hangs', lines)
 
+    def test_failed_log_shared_with_a_non_failed_attempt_is_still_parsed(self):
+        # A cached replay can report the failing log under a non-FAILED attempt
+        # while summary.failed lists the same log; its names must still count.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            failed = root / 'failed.log'
+            failed.write_text('test suite::hangs ... FAILED\n\nfailures:\n    suite::hangs\n')
+            events = [dict(id=dict(testResult=dict(label='//pkg:flaky', attempt=1)),
+                           testResult=dict(status='PASSED', cachedLocally=True,
+                                           testActionOutput=[dict(name='test.log', uri=failed.as_uri())])),
+                      dict(id=dict(testSummary=dict(label='//pkg:flaky')),
+                           testSummary=dict(overallStatus='FLAKY', totalRunCount=1,
+                                            failed=[dict(name='test.log', uri=failed.as_uri())]))]
+            bep = root / 'events.json'
+            bep.write_text('\n'.join(map(json.dumps, events)))
+            report = reporter.collect(bep, root)
+            self.assertEqual(report['tests'][0]['test_cases'], ['suite::hangs'])
+
     def test_empty_report_uploads_artifact_without_warning(self):
         with tempfile.TemporaryDirectory() as temp:
             printed = io.StringIO()
