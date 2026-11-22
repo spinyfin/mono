@@ -1159,6 +1159,16 @@ pub async fn compose_worker_spawn(
         // comparison id (see `WorkDb::create_pr_review_guide_execution`).
         append_bazel_caching_rule(compose_review_guide_prompt(work_db, execution, workspace_path)?)
     } else {
+        let review_finding_ids = work_db
+            .assigned_review_finding_ids(&execution.id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "could not load assigned review finding ids for the worker prompt"
+                );
+                Vec::new()
+            });
         compose_execution_prompt(
             ExecutionPromptParams::builder()
                 .review_signal_checks(review_signal_checks)
@@ -1182,6 +1192,7 @@ pub async fn compose_worker_spawn(
                 .merge_order_preservation(&merge_order_preservation)
                 .maybe_bazel_workspace(bazel_workspace)
                 .remote_workspace(remote_workspace)
+                .review_finding_ids(review_finding_ids)
                 .build(),
         )
     };

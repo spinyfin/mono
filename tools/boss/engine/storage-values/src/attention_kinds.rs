@@ -98,6 +98,11 @@ pub const NUDGE_BREAKER_ATTENTION_KIND: &str = "nudge_breaker_tripped";
 /// the old silent drop.
 pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
 
+/// Filed when a review-remediation execution reaches a terminal write without
+/// a complete structured outcome set. Distinct from a storage failure so
+/// Stop/finalize can record the incomplete remediation instead of retrying.
+pub const REVIEW_OUTCOMES_NOT_SUBMITTED_ATTENTION_KIND: &str = "review_outcomes_not_submitted";
+
 /// Attention-item kind filed when a worker's driver reports its own terminal
 /// turn boundary as an unrecoverable error (e.g. Codex's rollout
 /// `task_complete.error`, or a stdout `turn.failed` / fatal `error`

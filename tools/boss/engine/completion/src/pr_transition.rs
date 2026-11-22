@@ -614,6 +614,9 @@ impl WorkerCompletionHandler {
         ) {
             Ok(Some(completion)) => completion,
             Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) if err.is::<crate::work::ReviewRemediationIncomplete>() => {
+                return self.stop_for_missing_review_outcomes(execution_id, &err).await;
+            }
             Err(err) => {
                 tracing::error!(execution_id, source, ?err, "pr completion: failed to record");
                 return StopOutcome::DbError;

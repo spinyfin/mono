@@ -158,6 +158,23 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
         .map(|batch| (batch, batch_verdict(&db, batch)))
         .collect();
 
+    let finding_outcomes = history
+        .iter()
+        .map(|verdict| {
+            let records = db
+                .review_finding_outcomes(&verdict.id)?
+                .iter()
+                .map(finding_outcome_record_json)
+                .collect::<Result<Vec<_>>>()?;
+            let finding_ids = db.review_verdict_finding_ids(&verdict.id)?;
+            Ok(serde_json::json!({
+                "verdict_id": verdict.id,
+                "records": records,
+                "needs_outcomes": !finding_ids.is_empty(),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     if json {
         println!(
             "{}",
@@ -169,6 +186,7 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
                 "latest_informative_verdict": latest_informative.map(verdict_json),
                 "reviewed_head_is_stale": reviewed_head_is_stale,
                 "history": history.iter().map(verdict_json_with_informative_flag).collect::<Vec<_>>(),
+                "finding_outcomes": finding_outcomes,
                 "batch_verdicts": batch_verdicts.iter().map(|(batch, verdict)| serde_json::json!({
                     "batch_id": batch.id,
                     "target_sha": batch.target_sha,
@@ -248,12 +266,58 @@ pub(crate) fn review_show(json: bool, state_root: Option<PathBuf>, work_item: St
         }
     }
 
+    for entry in &finding_outcomes {
+        let Some(verdict_id) = finding_outcome_history_heading(entry) else {
+            continue;
+        };
+        println!("finding outcome history for {verdict_id}:");
+        if entry["records"].as_array().is_some_and(Vec::is_empty) {
+            println!("  no structured outcomes submitted");
+        }
+        for record in entry["records"].as_array().into_iter().flatten() {
+            println!("  {} outcome set:", record["state"].as_str().unwrap_or("unknown"));
+            for finding in record["outcomes"].as_array().into_iter().flatten() {
+                println!(
+                    "  {}: {} — {}{} (execution {})",
+                    finding["finding_id"].as_str().unwrap_or("?"),
+                    finding["outcome"].as_str().unwrap_or("?"),
+                    finding["reason"].as_str().unwrap_or(""),
+                    finding["commit_sha"]
+                        .as_str()
+                        .map(|sha| format!(" commit {sha}"))
+                        .unwrap_or_default(),
+                    record["execution_id"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+
     for (batch, verdict) in &batch_verdicts {
         println!("batch {} verdict (head {}):", batch.id, batch.target_sha);
         print_verdict(verdict);
     }
 
     Ok(())
+}
+
+fn finding_outcome_history_heading(entry: &serde_json::Value) -> Option<&str> {
+    let records_empty = entry["records"].as_array().is_some_and(Vec::is_empty);
+    if records_empty && !entry["needs_outcomes"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    Some(entry["verdict_id"].as_str().unwrap_or("unknown"))
+}
+
+fn finding_outcome_record_json(record: &boss_protocol::WorkerProposal) -> Result<serde_json::Value> {
+    let stored: serde_json::Value = serde_json::from_str(&record.payload_json)?;
+    Ok(serde_json::json!({
+        "execution_id": record.execution_id,
+        "proposal_id": record.id,
+        "state": record.state,
+        "submitted_at": record.created_at,
+        "pr_url": stored["pr_url"],
+        "outcomes": stored["submission"]["outcomes"],
+    }))
 }
 
 /// `bossctl review batches <work-item>` — see [`ReviewAction::Batches`].
@@ -739,5 +803,37 @@ mod tests {
     fn verdict_json_marks_non_informative_outcome() {
         let json = verdict_json_with_informative_flag(&verdict(REVIEW_GATE_OUTCOME_GAVE_UP));
         assert_eq!(json["informative"], serde_json::json!(false));
+    }
+    #[test]
+    fn finding_outcome_heading_skips_clean_and_legacy_and_unquotes_ids() {
+        let clean = serde_json::json!({"verdict_id":"verdict_1","records":[],"needs_outcomes":false});
+        assert_eq!(finding_outcome_history_heading(&clean), None);
+        let missing = serde_json::json!({"verdict_id":"verdict_2","records":[],"needs_outcomes":true});
+        assert_eq!(finding_outcome_history_heading(&missing), Some("verdict_2"));
+        let quoted_display = format!("{}", missing["verdict_id"]);
+        assert_eq!(quoted_display, "\"verdict_2\"");
+    }
+
+    #[test]
+    fn outcome_json_exposes_findings_and_execution_without_encoded_json() {
+        let proposal = boss_protocol::WorkerProposal::builder()
+            .id("outcome")
+            .execution_id("revision-run")
+            .created_at("now")
+            .idempotency_key("outcomes")
+            .kind(boss_protocol::ProposalKind::ReviewOutcomes)
+            .payload_json(
+                serde_json::json!({
+                    "pr_url":"https://github.com/org/repo/pull/42",
+                    "submission":{"outcomes":[{"finding_id":"C1","outcome":"not_fixed","reason":"Needs a decision"}]}
+                })
+                .to_string(),
+            )
+            .build();
+        let json = finding_outcome_record_json(&proposal).unwrap();
+        assert_eq!(json["execution_id"], "revision-run");
+        assert_eq!(json["outcomes"][0]["finding_id"], "C1");
+        assert_eq!(json["outcomes"][0]["outcome"], "not_fixed");
+        assert_eq!(json["outcomes"][0]["reason"], "Needs a decision");
     }
 }

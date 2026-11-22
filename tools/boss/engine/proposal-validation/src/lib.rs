@@ -227,6 +227,17 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                 report: report.unwrap_or_default(),
             })
         }
+        ProposalKind::ReviewOutcomes => {
+            let parsed: boss_protocol::ReviewOutcomesProposalPayload = serde_json::from_value(payload.clone())
+                .map_err(|err| vec![ProposalFieldError::new("outcomes", err.to_string())])?;
+            parsed
+                .validate()
+                .map_err(|err| vec![ProposalFieldError::new("outcomes", err)])?;
+            if payload.to_string().len() > MAX_LONG_FIELD_CHARS {
+                return Err(vec![ProposalFieldError::new("outcomes", "outcome set is too large")]);
+            }
+            to_json(&parsed)
+        }
         ProposalKind::ReviewVerdict => {
             let batch_id = reader.required_text("batch_id", MAX_SHORT_FIELD_CHARS);
             let verdict = reader.required_json_object("verdict", MAX_LONG_FIELD_CHARS);

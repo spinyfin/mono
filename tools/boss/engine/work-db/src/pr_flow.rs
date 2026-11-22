@@ -220,6 +220,19 @@ impl WorkDb {
             );
         }
 
+        let missing_outcomes = match super::review_outcomes::require_complete(&tx, execution_id) {
+            Ok(()) => None,
+            Err(err)
+                if err.is::<super::ReviewRemediationIncomplete>()
+                    && matches!(
+                        target,
+                        WorkerPrCompletionTarget::Done | WorkerPrCompletionTarget::DoneUnmerged
+                    ) =>
+            {
+                Some(err)
+            }
+            Err(err) => return Err(err),
+        };
         let original_lease_id = execution.cube_lease_id.clone();
         let original_workspace_id = execution.cube_workspace_id.clone();
 
@@ -363,6 +376,24 @@ impl WorkDb {
             Self::insert_review_verdict_in_tx(&tx, execution_id, &work_item_id, verdict)?;
         }
 
+        let filed_attention_item = missing_outcomes
+            .map(|err| {
+                super::workitems::insert_attention_item_row(
+                    &tx,
+                    &CreateAttentionItemInput {
+                        execution_id: Some(execution_id.to_owned()),
+                        work_item_id: None,
+                        kind: boss_engine_storage_values::attention_kinds::REVIEW_OUTCOMES_NOT_SUBMITTED_ATTENTION_KIND
+                            .into(),
+                        title: "Review outcomes not submitted".into(),
+                        body_markdown: err.to_string(),
+                        resolved_at: None,
+                        status: None,
+                    },
+                )
+            })
+            .transpose()?;
+
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
@@ -372,7 +403,7 @@ impl WorkDb {
             work_item: task_to_item(updated_task),
             released_lease_id: original_lease_id,
             released_workspace_id: original_workspace_id,
-            filed_attention_item: None,
+            filed_attention_item,
             binding_mismatch: stale_merge,
         }))
     }
@@ -470,6 +501,7 @@ impl WorkDb {
         if execution.status.is_terminal() {
             return Ok(None);
         }
+        super::review_outcomes::require_complete(&tx, execution_id)?;
         if !execution.status.is_live() {
             bail!(
                 "execution {execution_id} cannot complete from worker no-op signal in status `{}`",

@@ -330,6 +330,16 @@ impl WorkDb {
         guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
         pid_is_alive: &dyn Fn(Option<i64>) -> bool,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        self.submit_worker_proposal_prepared(input, guide, pid_is_alive, None)
+    }
+
+    pub(crate) fn submit_worker_proposal_prepared(
+        &self,
+        input: SubmitWorkerProposalInput<'_>,
+        guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
+        pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+        outcomes: Option<&super::review_outcomes::PreparedOutcomes>,
+    ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
         let question_worker = if input.kind == ProposalKind::RunDone {
             let payload: boss_protocol::RunDoneProposalPayload = serde_json::from_str(input.payload_json)?;
             if payload.question.is_some() {
@@ -425,19 +435,28 @@ impl WorkDb {
             // and the `worker_proposals` row it is `applied_ref`-linked from
             // land in the same `INSERT`, so a reader can never observe one
             // without the other.
-            let apply_decision = match apply_policy(input.kind) {
-                ProposalApplyPolicy::AutoApply | ProposalApplyPolicy::Async => Some(apply_in_transaction(
+            let apply_decision = if input.kind == ProposalKind::ReviewOutcomes {
+                Some(super::review_outcomes::accept(
                     &tx,
-                    input.execution_id,
+                    &input,
+                    outcomes,
                     &mut payload_json,
-                    input.kind,
-                    &id,
-                    guide,
-                    question_worker.as_ref(),
-                )?),
-                ProposalApplyPolicy::Gated => None,
-                // Refused above before the transaction opened.
-                ProposalApplyPolicy::Scoped => anyhow::bail!("`{}` is a progression verb", input.kind),
+                )?)
+            } else {
+                match apply_policy(input.kind) {
+                    ProposalApplyPolicy::AutoApply | ProposalApplyPolicy::Async => Some(apply_in_transaction(
+                        &tx,
+                        input.execution_id,
+                        &mut payload_json,
+                        input.kind,
+                        &id,
+                        guide,
+                        question_worker.as_ref(),
+                    )?),
+                    ProposalApplyPolicy::Gated => None,
+                    // Refused above before the transaction opened.
+                    ProposalApplyPolicy::Scoped => anyhow::bail!("`{}` is a progression verb", input.kind),
+                }
             };
             // A review guide is accepted atomically or not at all. Its
             // refusals are state judgements (the attempt is not running, the
@@ -449,7 +468,7 @@ impl WorkDb {
             // before the insert so nothing is stored and the transaction rolls
             // back; the worker's retry is then judged on the engine's state at
             // that moment.
-            if input.kind == ProposalKind::ReviewGuide
+            if matches!(input.kind, ProposalKind::ReviewGuide | ProposalKind::ReviewOutcomes)
                 && let Some(ApplyDecision::Rejected(reason)) = &apply_decision
             {
                 return Ok(Err(ProposalSubmissionError::new(
@@ -1240,6 +1259,7 @@ mod tests {
                     r#"{{"batch_id":"rvb_missing","target_sha":"head_missing","report":{{"batch_id":"rvb_missing","pr_url":"https://github.com/spinyfin/mono/pull/1","target_sha":"head_missing","phase":"pre_merge","summary":"Clean {i}.","coverage":{{"files_inspected":[],"files_omitted":[],"limitations":[]}},"findings":[]}}}}"#
                 )
             }
+            ProposalKind::ReviewOutcomes => r#"{"outcomes":[]}"#.into(),
             ProposalKind::ReviewVerdict => {
                 format!(r#"{{"batch_id":"rvb_missing","verdict":{{"outcome":"approved_{i}"}}}}"#)
             }

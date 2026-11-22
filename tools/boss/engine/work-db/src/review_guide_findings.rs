@@ -44,7 +44,7 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
     reviewed_ids.push(root_id.to_owned());
     let placeholders = vec!["?"; reviewed_ids.len()].join(", ");
     let mut stmt = conn.prepare(&format!(
-        "SELECT p.payload_json, t.id, t.short_id, t.status, t.deleted_at, t.description
+        "SELECT p.payload_json, t.id, t.short_id, t.status, t.deleted_at, t.description, v.id
          FROM pr_review_verdicts v
          LEFT JOIN worker_proposals p ON p.id = v.proposal_id
          LEFT JOIN pr_review_batches b ON b.id = v.batch_id
@@ -62,12 +62,13 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })?;
     let mut text = FindingsText::default();
     for row in rows {
-        let (payload, id, short_id, status, deleted_at, description) = row?;
-        let findings = if let Some(payload) = payload {
+        let (payload, id, short_id, status, deleted_at, description, verdict_id) = row?;
+        let findings: Vec<_> = if let Some(payload) = payload {
             let payload: boss_protocol::ReviewVerdictProposalPayload = serde_json::from_str(&payload)?;
             let verdict: boss_pr_review::SupervisorVerdict = serde_json::from_value(payload.verdict)?;
             text.rejected.extend(
@@ -78,17 +79,20 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             verdict
                 .findings
                 .into_iter()
-                .map(|finding| (finding.severity.as_str().to_owned(), finding.title))
+                .map(|finding| (finding.severity.as_str().to_owned(), finding.title, finding.id))
                 .collect()
         } else {
             legacy_finding_titles(description.as_deref().unwrap_or_default())
+                .into_iter()
+                .map(|(severity, title)| (severity, title, None))
+                .collect()
         };
         if findings.is_empty() {
             continue;
         }
         let label = boss_protocol::short_id_label(short_id).or(id.clone());
-        // Two separate facts. The live badge is the revision's own state and
-        // never depends on the guide. "Resolved" is stricter: the revision
+        // Two separate facts. The live badge uses recorded outcomes (legacy
+        // findings use task status). "Resolved" is stricter: the revision
         // completed successfully (not reopened) and the published guide's
         // head actually contains the head it produced.
         let resolved = match (&id, status.as_deref()) {
@@ -98,8 +102,44 @@ fn query_findings(conn: &Connection, root_id: &str, pr_url: &str) -> Result<Opti
             _ => false,
         };
         let status = if deleted_at.is_some() { None } else { status.as_deref() };
-        for (severity, title) in findings {
-            text.push(&severity, &title, label.as_deref(), status, resolved);
+        let outcomes = super::review_outcomes::outcomes_on_pr(conn, &verdict_id, pr_url)?;
+        for (severity, title, finding_id) in findings {
+            if let Some(finding_id) = finding_id {
+                let outcome = outcomes.iter().find(|outcome| outcome.finding_id == finding_id);
+                let fixed = outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.outcome == boss_protocol::ReviewFindingDisposition::Fixed);
+                let tracked_status = if fixed {
+                    Some("in_review")
+                } else {
+                    status.filter(|status| !matches!(*status, "in_review" | "done"))
+                };
+                text.push(&severity, &title, label.as_deref(), tracked_status, fixed && resolved);
+                if let Some(outcome) = outcome {
+                    let detail = match outcome.outcome {
+                        boss_protocol::ReviewFindingDisposition::Fixed => {
+                            format!("fixed at {}", outcome.commit_sha.as_deref().unwrap_or_default())
+                        }
+                        boss_protocol::ReviewFindingDisposition::NotFixed => {
+                            format!("not fixed: {}", outcome.reason.as_deref().unwrap_or_default())
+                        }
+                        boss_protocol::ReviewFindingDisposition::NotApplicable => {
+                            format!("not applicable: {}", outcome.reason.as_deref().unwrap_or_default())
+                        }
+                    };
+                    text.lines
+                        .last_mut()
+                        .unwrap()
+                        .push_str(&format!(" — {}", escape_markdown_line(&detail)));
+                } else {
+                    text.lines
+                        .last_mut()
+                        .unwrap()
+                        .push_str(" — outcome not submitted for this PR");
+                }
+            } else {
+                text.push(&severity, &title, label.as_deref(), status, resolved);
+            }
         }
     }
     let update = super::review_guide_jobs::guide_updates::status(conn, root_id, pr_url)?;
