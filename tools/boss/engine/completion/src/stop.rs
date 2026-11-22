@@ -5,6 +5,35 @@
 
 use super::*;
 
+/// Outcome of reading a work item's `pr_created` proposals, distinguishing
+/// "nothing to read" from "something present but not usable right now".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PrCreatedProposalLookup {
+    /// The seam is off or no `applied` `pr_created` proposal exists.
+    Absent,
+    /// An applied proposal exists and its PR URL verified.
+    Verified(String),
+    /// An applied proposal exists but was definitively rejected (malformed
+    /// payload, branch or bound-PR mismatch).
+    Unusable,
+    /// An applied proposal exists but could not be verified this pass
+    /// (transient GitHub or database failure); a later pass may succeed.
+    Transient,
+}
+
+/// Result of verifying PR URL candidates against the work item's branches.
+#[derive(Debug, Default)]
+struct PrUrlCandidateVerification {
+    selected: Option<String>,
+    /// Candidates definitively rejected (unparseable or wrong branch).
+    rejected: Vec<String>,
+    /// The repo slug could not be parsed, so nothing was verified.
+    slug_failed: bool,
+    /// At least one candidate could not be verified because of a transient
+    /// API failure.
+    transient: bool,
+}
+
 impl WorkerCompletionHandler {
     /// Handle a worker turn ending for `execution_id`. Returns the outcome
     /// classification so callers can log/test what happened.
@@ -189,14 +218,15 @@ impl WorkerCompletionHandler {
         }
 
         let candidates = entry.candidates();
-        let (selected, rejected_candidates, slug_failed) = self
-            .verify_pr_url_candidates_against_work_item(execution, &candidates, log_ctx)
+        let verification = self
+            .verify_pr_url_candidates_against_work_item(execution, &candidates, log_ctx, "staged")
             .await;
-        if slug_failed {
+        if verification.slug_failed {
             self.staged_pr_urls.forget(execution_id);
             return None;
         }
-        for rejected in rejected_candidates {
+        let selected = verification.selected;
+        for rejected in verification.rejected {
             self.staged_pr_urls.evict_candidate(execution_id, &rejected);
         }
         if let Some(ref url) = selected {
@@ -206,16 +236,20 @@ impl WorkerCompletionHandler {
     }
 
     /// Primary-seam PR resolution: read `applied` `pr_created` proposals for
-    /// `execution` and verify the PR's head branch against GitHub before
-    /// trusting it. Returns `None` when the `pr_created_proposals_seam` gate
-    /// is off, no applied proposal exists, or verification fails/is transient.
-    pub(super) async fn verified_pr_created_proposal_url(
+    /// `execution` and verify them before trusting them. A primary execution's
+    /// proposal URL is branch-verified against GitHub; a revision's must match
+    /// the chain root's bound PR (or, when no PR is bound, be the single
+    /// distinct applied URL). The outcome distinguishes "no applied proposal"
+    /// from "a proposal exists but is unusable / not verifiable this pass" so
+    /// callers can avoid reporting a definitive "no PR" over a transient
+    /// failure and can count legacy-ladder fallbacks accurately.
+    pub(super) async fn pr_created_proposal_lookup(
         &self,
         execution: &crate::work::WorkExecution,
         log_ctx: &str,
-    ) -> Option<String> {
+    ) -> PrCreatedProposalLookup {
         if !self.pr_created_proposals_first() {
-            return None;
+            return PrCreatedProposalLookup::Absent;
         }
         let proposals = match self
             .work_db
@@ -228,27 +262,34 @@ impl WorkerCompletionHandler {
                     ?err,
                     "{log_ctx}: failed to read pr_created proposals; falling back to legacy PR-URL ladder",
                 );
-                return None;
+                return PrCreatedProposalLookup::Transient;
             }
         };
-        let applied_urls: Vec<String> = proposals
+        let mut applied_any = false;
+        let mut applied_urls: Vec<String> = Vec::new();
+        for proposal in proposals
             .into_iter()
             .filter(|p| p.state == boss_protocol::ProposalState::Applied)
-            .filter_map(|p| {
-                serde_json::from_str::<boss_protocol::PrCreatedProposalPayload>(&p.payload_json)
-                    .ok()
-                    .map(|payload| payload.pr_url)
-            })
-            .collect();
+        {
+            applied_any = true;
+            if let Ok(payload) = serde_json::from_str::<boss_protocol::PrCreatedProposalPayload>(&proposal.payload_json)
+                && !applied_urls.contains(&payload.pr_url)
+            {
+                applied_urls.push(payload.pr_url);
+            }
+        }
+        if !applied_any {
+            return PrCreatedProposalLookup::Absent;
+        }
         if applied_urls.is_empty() {
-            return None;
+            return PrCreatedProposalLookup::Unusable;
         }
 
         if execution.kind == ExecutionKind::RevisionImplementation {
             return match self.resolve_bound_pr_url(execution) {
                 Some(bound_url) => {
                     if applied_urls.contains(&bound_url) {
-                        Some(bound_url)
+                        PrCreatedProposalLookup::Verified(bound_url)
                     } else {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -256,25 +297,54 @@ impl WorkerCompletionHandler {
                             bound_pr_url = %bound_url,
                             "{log_ctx}: pr_created proposal URL(s) do not match revision's bound (chain root) PR; ignoring",
                         );
-                        None
+                        PrCreatedProposalLookup::Unusable
                     }
                 }
-                None => applied_urls.into_iter().next(),
+                None if applied_urls.len() == 1 => PrCreatedProposalLookup::Verified(applied_urls.remove(0)),
+                None => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        pr_created_urls = ?applied_urls,
+                        "{log_ctx}: revision has no bound PR and several distinct pr_created URLs; ignoring",
+                    );
+                    PrCreatedProposalLookup::Unusable
+                }
             };
         }
 
-        let (selected, _, _) = self
-            .verify_pr_url_candidates_against_work_item(execution, &applied_urls, log_ctx)
+        let verification = self
+            .verify_pr_url_candidates_against_work_item(execution, &applied_urls, log_ctx, "pr_created proposal")
             .await;
-        selected
+        match verification.selected {
+            Some(url) => PrCreatedProposalLookup::Verified(url),
+            None if verification.transient || verification.slug_failed => PrCreatedProposalLookup::Transient,
+            None => PrCreatedProposalLookup::Unusable,
+        }
     }
 
+    /// Convenience over [`Self::pr_created_proposal_lookup`] for callers that
+    /// only need the verified URL.
+    pub(super) async fn verified_pr_created_proposal_url(
+        &self,
+        execution: &crate::work::WorkExecution,
+        log_ctx: &str,
+    ) -> Option<String> {
+        match self.pr_created_proposal_lookup(execution, log_ctx).await {
+            PrCreatedProposalLookup::Verified(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Verify PR URL `candidates` against the work item's own branches.
+    /// `source` labels where the candidates came from (`"staged"` or
+    /// `"pr_created proposal"`) in logs and the mismatch metric.
     async fn verify_pr_url_candidates_against_work_item(
         &self,
         execution: &crate::work::WorkExecution,
         candidates: &[String],
         log_ctx: &str,
-    ) -> (Option<String>, Vec<String>, bool) {
+        source: &str,
+    ) -> PrUrlCandidateVerification {
         let execution_id = execution.id.as_str();
         let expected_branch = expected_branch_name(
             execution_id,
@@ -292,17 +362,22 @@ impl WorkerCompletionHandler {
                     ?err,
                     "{log_ctx}: cannot parse repo slug; dropping PR URL candidates for safety",
                 );
-                return (None, Vec::new(), true);
+                return PrUrlCandidateVerification {
+                    slug_failed: true,
+                    ..Default::default()
+                };
             }
         };
         let mut own_candidate = None;
         let mut predecessor_candidate = None;
         let mut rejected_candidates = Vec::new();
+        let mut transient = false;
         for candidate_url in candidates {
             let Some(pr_num) = pr_number_from_url(candidate_url) else {
                 tracing::warn!(
                     execution_id,
-                    staged_pr_url = %candidate_url,
+                    source,
+                    pr_url = %candidate_url,
                     "{log_ctx}: cannot parse PR number from PR URL; dropping that candidate for safety",
                 );
                 rejected_candidates.push(candidate_url.clone());
@@ -319,21 +394,26 @@ impl WorkerCompletionHandler {
                 Ok(head_ref) => {
                     tracing::warn!(
                         execution_id,
-                        staged_pr_url = %candidate_url,
-                        staged_pr_branch = %head_ref,
+                        source,
+                        pr_url = %candidate_url,
+                        pr_branch = %head_ref,
                         %expected_branch,
-                        "pr_recheck_staged_branch_mismatch: PR's head branch is not a primary execution branch of this work item; dropping that candidate",
+                        "pr_recheck_branch_mismatch: PR's head branch is not a primary execution branch of this work item; dropping that candidate",
                     );
-                    PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                    if source == "staged" {
+                        PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                    }
                     rejected_candidates.push(candidate_url.clone());
                 }
                 Err(err) => {
                     // Transient API failure: cannot verify this candidate on
                     // this pass, but do NOT discard it. On the next pass the
                     // candidate is still available and verification is retried.
+                    transient = true;
                     tracing::warn!(
                         execution_id,
-                        staged_pr_url = %candidate_url,
+                        source,
+                        pr_url = %candidate_url,
                         ?err,
                         "{log_ctx}: branch verification failed transiently; \
                          keeping PR URL for retry on next pass",
@@ -341,7 +421,12 @@ impl WorkerCompletionHandler {
                 }
             }
         }
-        (own_candidate.or(predecessor_candidate), rejected_candidates, false)
+        PrUrlCandidateVerification {
+            selected: own_candidate.or(predecessor_candidate),
+            rejected: rejected_candidates,
+            slug_failed: false,
+            transient,
+        }
     }
 
     /// Capture-time branch verification, spawned by the `PostToolUse` hook
@@ -411,6 +496,7 @@ impl WorkerCompletionHandler {
         execution_id: &str,
         execution: &crate::work::WorkExecution,
         staged_url: &str,
+        require_head_moved: bool,
     ) {
         let repo_slug = match parse_repo_slug(&execution.repo_remote_url) {
             Ok(slug) => slug,
@@ -443,6 +529,20 @@ impl WorkerCompletionHandler {
                 return;
             }
         };
+        if require_head_moved
+            && execution
+                .pr_head_before
+                .as_deref()
+                .is_none_or(|before| before == head_now)
+        {
+            tracing::info!(
+                execution_id,
+                pr_url = %staged_url,
+                "stop event: PR head has not moved since this execution started; \
+                 revision_stop_contributed_head not stamped from a declaration alone",
+            );
+            return;
+        }
         if let Err(err) = self.work_db.set_revision_stop_contributed_head(execution_id, &head_now) {
             tracing::warn!(
                 execution_id,
@@ -870,7 +970,14 @@ impl WorkerCompletionHandler {
         // `applied` `pr_created` proposal for this execution before consulting
         // the legacy PR-URL ladder (remote/local structured-output artifact,
         // hook staging cache, driver final-message prose, and cold `detect_pr`).
-        if let Some(proposal_url) = on_heap(|| self.verified_pr_created_proposal_url(&execution, "stop event")).await {
+        // Set once a verified proposal was consumed but its finalize was refused,
+        // so the legacy arms below that the same pass falls through to are not
+        // counted as fallbacks: the proposal path did resolve the PR.
+        let mut proposal_consumed = false;
+        if let PrCreatedProposalLookup::Verified(proposal_url) =
+            on_heap(|| self.pr_created_proposal_lookup(&execution, "stop event")).await
+        {
+            proposal_consumed = true;
             self.retire_produce_pr_nudge(execution_id);
             tracing::info!(
                 execution_id,
@@ -879,7 +986,12 @@ impl WorkerCompletionHandler {
             );
             if execution.kind == ExecutionKind::RevisionImplementation {
                 on_heap(|| {
-                    self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &proposal_url)
+                    self.stamp_revision_stop_contributed_head_from_staged_url(
+                        execution_id,
+                        &execution,
+                        &proposal_url,
+                        true,
+                    )
                 })
                 .await;
                 let outcome = on_heap(|| {
@@ -964,7 +1076,9 @@ impl WorkerCompletionHandler {
             // run_done hold or finalization so a later quiet sweep cannot
             // replay a stale `no_pr` intent.
             self.retire_produce_pr_nudge(execution_id);
-            self.record_pr_created_fallback_hit(&execution, "stop_staged", &staged_url);
+            if !proposal_consumed {
+                self.record_pr_created_fallback_hit(&execution, "stop_staged", &staged_url);
+            }
             tracing::info!(
                 execution_id,
                 pr_url = %staged_url,
@@ -985,7 +1099,12 @@ impl WorkerCompletionHandler {
             // than finalizing against stale evidence.
             if execution.kind == ExecutionKind::RevisionImplementation {
                 on_heap(|| {
-                    self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &staged_url)
+                    self.stamp_revision_stop_contributed_head_from_staged_url(
+                        execution_id,
+                        &execution,
+                        &staged_url,
+                        false,
+                    )
                 })
                 .await;
                 // incident-004 AI-3: staged URL + publish arm is not enough.
@@ -1165,7 +1284,9 @@ impl WorkerCompletionHandler {
             && let Some(recovered_url) =
                 on_heap(|| self.verified_staged_pr_url(execution_id, &execution, "stop event (driver fallback)")).await
         {
-            self.record_pr_created_fallback_hit(&execution, "stop_driver_fallback", &recovered_url);
+            if !proposal_consumed {
+                self.record_pr_created_fallback_hit(&execution, "stop_driver_fallback", &recovered_url);
+            }
             tracing::info!(
                 execution_id,
                 pr_url = %recovered_url,
@@ -1871,11 +1992,15 @@ must not be asked to open one",
                 .await;
             }
             PrStatus::Fresh { url } => {
-                self.record_pr_created_fallback_hit(&execution, "stop_detector", &url);
+                if !proposal_consumed {
+                    self.record_pr_created_fallback_hit(&execution, "stop_detector", &url);
+                }
                 (url, WorkerPrCompletionTarget::InReview)
             }
             PrStatus::Merged { url } => {
-                self.record_pr_created_fallback_hit(&execution, "stop_detector", &url);
+                if !proposal_consumed {
+                    self.record_pr_created_fallback_hit(&execution, "stop_detector", &url);
+                }
                 (url, WorkerPrCompletionTarget::Done)
             }
         };

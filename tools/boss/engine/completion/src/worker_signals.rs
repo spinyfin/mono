@@ -625,27 +625,29 @@ impl WorkerCompletionHandler {
         self.feature_flags.is_enabled("worker_proposals") && self.feature_flags.is_enabled("pr_created_proposals_seam")
     }
 
-    /// Whether `execution_id` already carries at least one `applied`
-    /// `pr_created` proposal. Used to keep `record_pr_created_fallback_hit`
-    /// from firing when a proposal did exist (e.g. a revision whose
-    /// `pr_created` finalize was refused by the contribution gate).
-    pub(super) fn has_applied_pr_created_proposal(&self, execution_id: &str) -> bool {
-        self.work_db
-            .list_worker_proposals_for_execution(execution_id, ProposalKind::PrCreated)
-            .is_ok_and(|rows| rows.iter().any(|p| p.state == boss_protocol::ProposalState::Applied))
-    }
-
     /// Count one legacy PR-URL-ladder hit for the `pr_created` seam and log
-    /// a WARN. Fires only when `pr_created_proposals_seam` is on, no applied
-    /// `pr_created` proposal existed for the execution, and the legacy ladder
-    /// (hook staging, artifact, driver prose, or `detect_pr`) resolved a PR.
+    /// a WARN. Callers invoke this only on a path that did not consume a
+    /// verified proposal, so a call means the legacy ladder (hook staging,
+    /// artifact, driver prose, or `detect_pr`) resolved a PR — including when
+    /// an applied proposal existed but was unusable. Counted at most once per
+    /// execution and source: Stop and the merge poller re-enter these arms on
+    /// every pass, and the counter is the exit criterion for deleting the
+    /// ladder, so repeated passes must not inflate it.
     pub(super) fn record_pr_created_fallback_hit(
         &self,
         execution: &crate::work::WorkExecution,
         source: &str,
         pr_url: &str,
     ) {
-        if !self.pr_created_proposals_first() || self.has_applied_pr_created_proposal(&execution.id) {
+        if !self.pr_created_proposals_first() {
+            return;
+        }
+        let first_hit = self
+            .pr_created_fallback_recorded
+            .lock()
+            .expect("pr_created_fallback_recorded mutex poisoned")
+            .insert(format!("{}:{source}", execution.id));
+        if !first_hit {
             return;
         }
         let detail = format!("{source}: {pr_url}");

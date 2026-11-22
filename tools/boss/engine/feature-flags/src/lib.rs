@@ -322,13 +322,12 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         description: "Read pr_created worker_proposals rows before falling back to the legacy PR-URL \
              ladder (hook-stream staging cache, structured-output PR-URL artifact, driver \
              final-message prose, and cold detect_pr reconstruction) in on_stop, recheck_for_pr, \
-             and run_done PR resolution (design: worker-proposal-api-replace-fragile-worker-to-engine-seams.md, \
-             implementation task 12). When on, an execution that carries an applied pr_created \
+             and run_done PR resolution (design: worker-proposal-api-replace-fragile-worker-to-engine-seams.md). When on, an execution that carries an applied pr_created \
              proposal has its PR URL branch-verified against GitHub and used directly without \
              consulting the legacy ladder. When no usable pr_created proposal exists and the legacy \
              ladder resolves a PR URL, worker_proposals.fallback_hit.pr_created increments and a \
              WARN logs as the exit criterion for eventually deleting the legacy fallback. DEFAULT \
-             OFF: enable per operator once the proposal path is validated in staging. Kill switch: \
+             OFF: enable once the proposal path is validated in staging. Kill switch: \
              set false to restore the pre-migration staging/detector-only behavior.",
         category: "completion",
         default_enabled: false,

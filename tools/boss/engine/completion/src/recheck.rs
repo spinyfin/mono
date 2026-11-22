@@ -55,20 +55,10 @@ impl WorkerCompletionHandler {
         // `applied` `pr_created` proposal for this execution before consulting
         // the legacy PR-URL ladder (remote/local structured-output artifact,
         // hook staging cache, SHA-delta, and cold `detect_pr`).
-        if let Some(proposal_url) = self.verified_pr_created_proposal_url(&execution, "pr-recheck").await {
+        if let PrCreatedProposalLookup::Verified(proposal_url) =
+            self.pr_created_proposal_lookup(&execution, "pr-recheck").await
+        {
             self.retire_produce_pr_nudge(execution_id);
-            if execution.kind == ExecutionKind::RevisionImplementation
-                && self.observed_mid_turn(execution_id)
-                && self.should_defer_mid_turn_within_activity_horizon(execution_id)
-            {
-                tracing::info!(
-                    execution_id,
-                    pr_url = %proposal_url,
-                    "pr-recheck: pr_created proposal present for a mid-turn revision; retaining it \
-                     for the worker's own Stop boundary before finalization",
-                );
-                return StopOutcome::AwaitingInput;
-            }
             if execution.kind != ExecutionKind::RevisionImplementation
                 && !self.primary_staged_url_may_finalize(execution_id)
             {
