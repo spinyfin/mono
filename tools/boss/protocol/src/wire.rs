@@ -2947,9 +2947,8 @@ pub enum FrontendRequest {
     },
 
     /// Verify a pending inbox message for its expected purpose and current
-    /// coordinator generation. Reset ids expire when the reset ends; authorization
-    /// ids expire at turn end, after the coalesce bound, on delivery failure, confirmation timeout, or session replacement.
-    /// Replies with [`FrontendEvent::CoordinatorResetRequestStatus`].
+    /// coordinator generation. Reset ids expire when the reset ends; authorization ids expire at turn end, after the coalesce
+    /// bound, on delivery failure, confirmation timeout, or session replacement. Replies with [`FrontendEvent::CoordinatorResetRequestStatus`].
     VerifyCoordinatorResetRequest {
         request_id: String,
         /// False for reset requests, true for credential deliveries.
@@ -2957,15 +2956,9 @@ pub enum FrontendRequest {
         authorization: bool,
     },
 
-    /// Snapshot every engine worker pool's (main, automation, review)
-    /// own claimed-slot bookkeeping — capacity, idle count, and each
-    /// held slot's `worker_id → execution_id` mapping — cross-referenced
-    /// against `LiveWorkerStateRegistry` so a claim with no backing live
-    /// worker is flagged. Read-only. This is the diagnostic surface for
-    /// "pool reports N/M busy but `bossctl agents list` shows fewer live
-    /// workers": before this existed, diagnosing a leaked claim required
-    /// manually diffing `agents list` against `pool_capacity` from
-    /// `dispatch.jsonl` rejections.
+    /// Snapshot every engine worker pool's claimed slots — capacity, idle
+    /// count, and each held slot's `worker_id → execution_id` mapping —
+    /// cross-referenced against `LiveWorkerStateRegistry`. Read-only.
     WorkerPoolSummary,
 
     /// Snapshot the cube workspace pool (proxies `cube --json workspace
@@ -2982,16 +2975,14 @@ pub use events::{FrontendEvent, FrontendEventWorkerVisitor};
 mod invalidation;
 pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePatchItem};
 
-// Snapshot / pool-summary DTOs live in `snapshot_wire` (extracted for file
-// size) and are re-exported so `boss_protocol::{..}` paths are unchanged.
+// Snapshot / pool-summary DTOs: split out to keep this file under the size limit.
 mod snapshot_wire;
 pub use snapshot_wire::{
     FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, TrunkQueueCheckDto,
     WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
 };
 
-// Topic-push payload enum; re-exported as `boss_protocol::TopicEventPayload`
-// next to `PaneCaptureState`.
+// Topic-push payload enum; re-exported as `boss_protocol::TopicEventPayload`.
 mod topic_event_payload;
 pub use topic_event_payload::{PaneCaptureState, TopicEventPayload};
 

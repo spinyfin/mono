@@ -455,3 +455,12 @@ impl ServerState {
         self.topic_broker.publish(TOPIC_BOOTHBY_ACTIVITY, envelope).await;
     }
 }
+
+#[async_trait::async_trait]
+impl boss_engine_runtime::external_tracker::reconcile::WorkInvalidationPublisher for ServerState {
+    async fn publish_work_item_invalidated(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        self.publisher
+            .publish_work_item_changed(product_id, work_item_id, reason)
+            .await;
+    }
+}

@@ -106,8 +106,7 @@ pub(crate) mod handler_helpers;
 mod hook_derived_events;
 mod hosts;
 mod ideas;
-/// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`
-/// directly.
+/// Public so `tests/isolation_guard.rs` can drive `IsolationPaths::derive*`.
 pub mod isolation;
 mod launch_environment;
 mod live_status;
@@ -2505,15 +2504,6 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
         if let Some(f) = self.kick.get() {
             f();
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl boss_engine_runtime::external_tracker::reconcile::WorkInvalidationPublisher for ServerState {
-    async fn publish_work_item_invalidated(&self, product_id: &str, work_item_id: &str, reason: &str) {
-        self.publisher
-            .publish_work_item_changed(product_id, work_item_id, reason)
-            .await;
     }
 }
 
