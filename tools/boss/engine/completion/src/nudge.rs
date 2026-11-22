@@ -1106,6 +1106,7 @@ impl WorkerCompletionHandler {
         }
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
+        self.forget_pr_created_fallback(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);

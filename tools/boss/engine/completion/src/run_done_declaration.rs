@@ -564,6 +564,7 @@ impl WorkerCompletionHandler {
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
+        self.forget_pr_created_fallback(&execution.id);
         self.hold_registry.release(&execution.id);
         self.finish_worker_teardown(
             &execution.id,

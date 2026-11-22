@@ -165,6 +165,8 @@ impl WorkspaceDiffVerifier for StubWorkspaceDiffVerifier {
 #[builder(on(String, into))]
 pub struct StubBranchVerifier {
     pub result: Result<String, String>,
+    #[builder(default)]
+    pub pending_head_ref: bool,
     /// `headRefOid` returned by `fetch_pr_head_oid`. Defaults to a stable
     /// stand-in so tests that don't touch the SHA-delta path don't need to
     /// wire one explicitly. Tests that exercise the gate call
@@ -314,6 +316,9 @@ const DETERMINISTIC_FAILURE_PREFIX: &str = "\u{0}deterministic:";
 #[async_trait]
 impl BranchVerifier for StubBranchVerifier {
     async fn fetch_pr_head_ref(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        if self.pending_head_ref {
+            return std::future::pending().await;
+        }
         self.head_ref_calls
             .lock()
             .expect("head_ref_calls mutex poisoned")

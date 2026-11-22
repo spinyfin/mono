@@ -630,9 +630,11 @@ impl WorkerCompletionHandler {
     /// verified proposal, so a call means the legacy ladder (hook staging,
     /// artifact, driver prose, or `detect_pr`) resolved a PR — including when
     /// an applied proposal existed but was unusable. Counted at most once per
-    /// execution and source: Stop and the merge poller re-enter these arms on
+    /// execution: Stop and the merge poller re-enter these arms on
     /// every pass, and the counter is the exit criterion for deleting the
-    /// ladder, so repeated passes must not inflate it.
+    /// ladder, so repeated passes must not inflate it. This process-local counter
+    /// and its dedup state both reset on engine restart; soak measurements
+    /// must use a single engine lifetime. Terminal cleanup removes the key.
     pub(super) fn record_pr_created_fallback_hit(
         &self,
         execution: &crate::work::WorkExecution,
@@ -646,7 +648,7 @@ impl WorkerCompletionHandler {
             .pr_created_fallback_recorded
             .lock()
             .expect("pr_created_fallback_recorded mutex poisoned")
-            .insert(format!("{}:{source}", execution.id));
+            .insert(execution.id.clone());
         if !first_hit {
             return;
         }
@@ -658,6 +660,13 @@ impl WorkerCompletionHandler {
             "pr_created",
             &detail,
         );
+    }
+
+    pub(super) fn forget_pr_created_fallback(&self, execution_id: &str) {
+        self.pr_created_fallback_recorded
+            .lock()
+            .expect("pr_created_fallback_recorded mutex poisoned")
+            .remove(execution_id);
     }
 
     /// Consume this execution's staged `proposal_channel_error` (if any —

@@ -1494,7 +1494,7 @@ pub struct WorkerCompletionHandler {
     /// re-query GitHub or re-publish attention on every tick.
     #[builder(skip)]
     pr_base_refusal_next_check: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-    /// `execution_id:source` keys already counted by
+    /// Execution ids already counted by
     /// `worker_proposals.fallback_hit.pr_created`, so repeated Stop and
     /// merge-poller passes count one legacy-ladder use once.
     #[builder(skip)]

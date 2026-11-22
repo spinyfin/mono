@@ -24,6 +24,13 @@ impl WorkerCompletionHandler {
     /// the row that triggered it, rather than requiring a post-mortem
     /// to cross-reference this function's own log lines by execution id.
     pub async fn force_release(&self, execution_id: &str) -> ForceReleaseOutcome {
+        if self
+            .work_db
+            .get_execution(execution_id)
+            .is_ok_and(|e| e.status.is_terminal())
+        {
+            self.forget_pr_created_fallback(execution_id);
+        }
         // Pane release first. Idempotent on the registry side; the
         // implementation logs and skips when no slot is mapped.
         //
@@ -312,23 +319,17 @@ impl WorkerCompletionHandler {
     pub(super) fn resolve_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
         match self.work_db.get_work_item(&execution.work_item_id) {
             Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-                boss_engine_storage_values::branch_identity::task_bound_pr_url(&task)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        if execution.kind == ExecutionKind::RevisionImplementation {
-                            // Primary: execution.pr_url is stamped at dispatch time.
-                            // Fallback: walk the parent chain to find the chain root's
-                            // pr_url for executions where execution.pr_url was not set
-                            // (e.g. older executions predating reliable dispatch stamping).
-                            execution
-                                .pr_url
-                                .clone()
-                                .filter(|u| !u.is_empty())
-                                .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
-                        } else {
-                            None
-                        }
-                    })
+                if execution.kind == ExecutionKind::RevisionImplementation {
+                    // Proposal application can populate the revision task's URL.
+                    // Only dispatch state or the chain root can bind a revision.
+                    execution
+                        .pr_url
+                        .clone()
+                        .filter(|url| !url.is_empty())
+                        .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
+                } else {
+                    boss_engine_storage_values::branch_identity::task_bound_pr_url(&task).map(str::to_owned)
+                }
             }
             _ => None,
         }

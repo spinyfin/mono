@@ -330,15 +330,6 @@ async fn revision_proposal_for_a_different_pr_than_the_bound_one_is_ignored() {
         &revision_id,
         "https://github.com/spinyfin/mono/pull/2091",
     );
-    // Applying a proposal binds its URL to the task; clear that so the
-    // revision's bound PR is the chain root's, as when the worker's URL is wrong.
-    db.connect()
-        .unwrap()
-        .execute(
-            "UPDATE tasks SET pr_url = NULL WHERE id = ?1",
-            rusqlite::params![revision_id],
-        )
-        .unwrap();
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
         .with_feature_flags(new_flags(workspace.path(), true))
@@ -389,6 +380,7 @@ async fn run_done_resolution_reports_transient_not_none_found_when_proposal_is_u
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     submit_pr_created(&db, &execution_id, &chore_id, PR_URL);
+    clear_task_pr_url(&db, &chore_id);
     let execution = db.get_execution(&execution_id).unwrap();
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
@@ -399,7 +391,7 @@ async fn run_done_resolution_reports_transient_not_none_found_when_proposal_is_u
     let resolution = handler.resolve_declared_pr_url(&execution).await;
 
     assert!(
-        matches!(resolution, DeclaredPrResolution::Transient { .. }),
+        matches!(resolution, DeclaredPrResolution::Transient { ref detail } if detail.contains("pr_created proposal")),
         "an unverifiable applied proposal must not become a definitive no-PR: {resolution:?}"
     );
     assert_ne!(
@@ -415,6 +407,7 @@ async fn run_done_resolution_uses_verified_proposal_before_the_legacy_ladder() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     submit_pr_created(&db, &execution_id, &chore_id, PR_URL);
+    clear_task_pr_url(&db, &chore_id);
     let execution = db.get_execution(&execution_id).unwrap();
     let detector = StubPrDetector::ok(None);
     let metrics = new_metrics();
@@ -460,7 +453,7 @@ async fn unusable_applied_proposal_still_counts_a_fallback_hit_when_the_legacy_p
 }
 
 #[tokio::test]
-async fn transient_verifier_failure_neither_finalizes_nor_counts_a_fallback_hit() {
+async fn transient_verifier_failure_with_no_legacy_result_keeps_execution_awaiting_input() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     submit_pr_created(&db, &execution_id, &chore_id, PR_URL);
@@ -480,20 +473,28 @@ async fn transient_verifier_failure_neither_finalizes_nor_counts_a_fallback_hit(
 #[tokio::test]
 async fn fallback_hit_is_counted_once_per_execution_across_passes() {
     let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
-    let execution = db.get_execution(&execution_id).unwrap();
+    let (_dir, db, _product_id, _chore_id, execution_id) = revision_fixture(workspace.path(), PARENT_PR, HEAD_BEFORE);
     let metrics = new_metrics();
-    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+    let detector = StubPrDetector::ok_status(PrStatus::Fresh {
+        url: PARENT_PR.to_owned(),
+    });
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(HEAD_BEFORE.into())).await;
+    let handler = TestHarness::new(db.clone(), detector.clone())
         .handler
         .with_feature_flags(new_flags(workspace.path(), true))
-        .with_metrics(metrics.clone());
+        .with_metrics(metrics.clone())
+        .with_branch_verifier(verifier);
 
-    handler.record_pr_created_fallback_hit(&execution, "stop_staged", PR_URL);
-    handler.record_pr_created_fallback_hit(&execution, "stop_staged", PR_URL);
-    assert_eq!(counter(&metrics), Some(1), "repeat passes for one source count once");
-
-    handler.record_pr_created_fallback_hit(&execution, "stop_detector", PR_URL);
-    assert_eq!(counter(&metrics), Some(2), "a distinct source counts separately");
+    handler
+        .staged_pr_urls
+        .record_command_observations(&execution_id, &[PARENT_PR.to_owned()], true);
+    // The unchanged revision head keeps both completion passes live.
+    assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput);
+    assert_eq!(counter(&metrics), Some(1));
+    assert_eq!(handler.recheck_for_pr(&execution_id).await, StopOutcome::AwaitingInput);
+    assert_eq!(detector.calls.lock().unwrap().len(), 0);
+    assert_eq!(counter(&metrics), Some(1));
 }
 
 #[tokio::test]
@@ -524,6 +525,7 @@ async fn nudge_recheck_prefers_the_verified_proposal_url() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     submit_pr_created(&db, &execution_id, &chore_id, PR_URL);
+    clear_task_pr_url(&db, &chore_id);
     let execution = db.get_execution(&execution_id).unwrap();
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
@@ -559,4 +561,139 @@ async fn seam_flag_has_no_effect_while_the_master_proposals_switch_is_off() {
     assert_eq!(outcome, StopOutcome::AwaitingInput);
     assert_eq!(detector.calls.lock().unwrap().len(), 1);
     assert_eq!(counter(&metrics), Some(0));
+}
+
+fn clear_task_pr_url(db: &WorkDb, task_id: &str) {
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_url = NULL WHERE id = ?1", [task_id])
+        .unwrap();
+}
+
+#[tokio::test]
+async fn revision_without_dispatch_url_uses_chain_root_despite_applied_task_binding() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, revision_id, execution_id) = revision_fixture_no_execution_pr_url(workspace.path(), PARENT_PR);
+    submit_pr_created(&db, &execution_id, &revision_id, PR_URL);
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(new_flags(workspace.path(), true));
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert_eq!(handler.resolve_bound_pr_url(&execution).as_deref(), Some(PARENT_PR));
+    assert_eq!(
+        handler.pr_created_proposal_lookup(&execution, "test").await,
+        PrCreatedProposalLookup::Unusable
+    );
+}
+
+#[tokio::test]
+async fn revision_without_bound_pr_accepts_one_distinct_url_but_rejects_several() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, revision_id, execution_id) = revision_fixture_no_execution_pr_url(workspace.path(), PARENT_PR);
+    let root_id = db.get_revision_chain_root_task_id(&revision_id).unwrap();
+    clear_task_pr_url(&db, &root_id);
+    submit_pr_created(&db, &execution_id, &revision_id, PR_URL);
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(new_flags(workspace.path(), true));
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert_eq!(handler.resolve_bound_pr_url(&execution), None);
+    assert_eq!(
+        handler.pr_created_proposal_lookup(&execution, "test").await,
+        PrCreatedProposalLookup::Verified(PR_URL.to_owned())
+    );
+    submit_pr_created(&db, &execution_id, &revision_id, PARENT_PR);
+    assert_eq!(
+        handler.pr_created_proposal_lookup(&execution, "test").await,
+        PrCreatedProposalLookup::Unusable
+    );
+}
+
+#[tokio::test]
+async fn rejected_and_superseded_proposals_fall_through_to_legacy_detection() {
+    for state in ["rejected", "superseded"] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
+        submit_pr_created(&db, &execution_id, &chore_id, PR_URL);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE worker_proposals SET state = ?1 WHERE execution_id = ?2",
+                rusqlite::params![state, execution_id],
+            )
+            .unwrap();
+        clear_task_pr_url(&db, &chore_id);
+        let detector = StubPrDetector::ok_status(PrStatus::Fresh { url: PR_URL.to_owned() });
+        let metrics = new_metrics();
+        let handler = TestHarness::new(db.clone(), detector.clone())
+            .handler
+            .with_feature_flags(new_flags(workspace.path(), true))
+            .with_metrics(metrics.clone());
+        assert_eq!(
+            handler
+                .pr_created_proposal_lookup(&db.get_execution(&execution_id).unwrap(), "test")
+                .await,
+            PrCreatedProposalLookup::Absent
+        );
+        assert_eq!(
+            handler.on_stop(&execution_id).await,
+            StopOutcome::ReviewerEnqueued {
+                pr_url: PR_URL.to_owned()
+            }
+        );
+        assert_eq!(detector.calls.lock().unwrap().len(), 1);
+        assert_eq!(counter(&metrics), Some(1));
+        assert!(
+            handler.pr_created_fallback_recorded.lock().unwrap().is_empty(),
+            "terminal completion must release fallback dedup state"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_done_pending_proposal_verifier_returns_transient_within_network_budget() {
+    use crate::run_done_declaration::{DECLARED_DELIVERY_NETWORK_BUDGET, DeclaredPrResolution};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = fixture(workspace.path());
+    submit_pr_created(&db, &execution_id, &chore_id, PR_URL);
+    clear_task_pr_url(&db, &chore_id);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET run_done_outcome = 'delivered', run_done_declared_at = '1' WHERE id = ?1",
+            [&execution_id],
+        )
+        .unwrap();
+    let execution = db.get_execution(&execution_id).unwrap();
+    let verifier = Arc::new(
+        StubBranchVerifier::builder()
+            .result(Ok(expected_branch(&db, &execution_id)))
+            .pending_head_ref(true)
+            .build(),
+    );
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(new_flags(workspace.path(), true))
+        .with_branch_verifier(verifier);
+    let started = tokio::time::Instant::now();
+    let resolution = handler.resolve_declared_pr_url(&execution).await;
+    assert!(
+        matches!(resolution, DeclaredPrResolution::Transient { ref detail }
+        if detail.contains("pr_created proposal") && detail.contains("did not finish")),
+        "{resolution:?}"
+    );
+    assert_eq!(started.elapsed(), DECLARED_DELIVERY_NETWORK_BUDGET);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        handler
+            .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+            .await,
+        StopOutcome::DetectorFailed
+    );
+    assert_eq!(started.elapsed(), DECLARED_DELIVERY_NETWORK_BUDGET);
+    assert_eq!(
+        db.execution_run_done_outcome(&execution_id).unwrap(),
+        Some(boss_protocol::RunDoneOutcome::Delivered)
+    );
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
 }
