@@ -2438,6 +2438,101 @@ async fn spoke_grok_cancelled_turn_transcript_delta_updates_work_runs_tokens() {
 }
 
 #[tokio::test]
+async fn spoke_grok_final_chunk_usage_replays_after_transient_persist_failure() {
+    use boss_engine_runtime::hub::projection::Custody;
+    use sha2::{Digest, Sha256};
+
+    let mut fx = delivered_with_a_resolvable_pr();
+    let root = boss_engine_driver::transcript_store::transcript_store_root().unwrap();
+    let custody = Arc::new(Custody::new(fx.state.work_db.as_ref().clone(), &root));
+
+    let chunk1 = b"{\"method\":\"session/update\",\"params\":{\"sessionId\":\"s1\",\"update\":{\"sessionUpdate\":\"tool_call\"}}}\n";
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 0,
+        data: chunk1.to_vec(),
+        sha256: Sha256::digest(chunk1).to_vec(),
+        eof: false,
+    }));
+    let chunk2 = br#"{"timestamp":1785193977,"method":"_x.ai/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stopReason":"cancelled","usage":{"inputTokens":13600,"outputTokens":33,"cachedReadTokens":13440,"modelCalls":2,"modelUsage":{"grok-4.6":{"inputTokens":13600,"outputTokens":33,"cachedReadTokens":13440,"totalTokens":13632}}}}}}"#.to_vec();
+    let mut chunk2_nl = chunk2;
+    chunk2_nl.push(b'\n');
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: chunk1.len() as u64,
+        data: chunk2_nl.clone(),
+        sha256: Sha256::digest(&chunk2_nl).to_vec(),
+        eof: true,
+    }));
+
+    fx.state.run_cost_capture.set_persist_blocked_for_test(true);
+
+    let first = tokio::time::timeout(
+        std::time::Duration::from_millis(600),
+        Projector::with_custody(
+            fx.state.work_db.as_ref().clone(),
+            crate::app::spoke_projection::applier(&fx.state),
+            fx.wire.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            ProjectorConfig::default(),
+            custody.clone(),
+        )
+        .drain(),
+    )
+    .await;
+    assert!(
+        first.is_err(),
+        "first drain must hold the cursor while cost persist fails transiently"
+    );
+
+    type UsageRow = (Option<i64>, Option<i64>, Option<String>);
+    let before: UsageRow = fx
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT input_tokens, output_tokens, usage_unavailable
+             FROM work_runs WHERE execution_id = ?1",
+            [&fx.execution_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (before.0, before.1),
+        (None, None),
+        "first drain must not persist tokens while cost persist is failing"
+    );
+
+    fx.state.run_cost_capture.set_persist_blocked_for_test(false);
+
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody,
+    )
+    .drain()
+    .await;
+
+    let after: UsageRow = fx
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT input_tokens, output_tokens, usage_unavailable
+             FROM work_runs WHERE execution_id = ?1",
+            [&fx.execution_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, (Some(160), Some(33), None));
+}
+
+#[tokio::test]
 async fn spoke_usage_unavailable_gap_projects_into_work_runs() {
     use boss_engine_runtime::hub::projection::Custody;
 
@@ -2473,4 +2568,69 @@ async fn spoke_usage_unavailable_gap_projects_into_work_runs() {
         )
         .unwrap();
     assert_eq!(usage_unavailable.as_deref(), Some(reason));
+}
+
+#[tokio::test]
+async fn spoke_usage_unavailable_gap_after_tokens_leaves_captured_usage() {
+    use boss_engine_runtime::hub::projection::Custody;
+    use sha2::{Digest, Sha256};
+
+    let mut fx = delivered_with_a_resolvable_pr();
+    let root = boss_engine_driver::transcript_store::transcript_store_root().unwrap();
+    let custody = Arc::new(Custody::new(fx.state.work_db.as_ref().clone(), &root));
+
+    let chunk = br#"{"timestamp":1785193977,"method":"_x.ai/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stopReason":"cancelled","usage":{"inputTokens":13600,"outputTokens":33,"cachedReadTokens":13440,"modelCalls":2,"modelUsage":{"grok-4.6":{"inputTokens":13600,"outputTokens":33,"cachedReadTokens":13440,"totalTokens":13632}}}}}}"#.to_vec();
+    let mut chunk_nl = chunk;
+    chunk_nl.push(b'\n');
+    fx.receive(record::Body::Transcript(v1::TranscriptDelta {
+        generation: "0-1".into(),
+        offset: 0,
+        data: chunk_nl.clone(),
+        sha256: Sha256::digest(&chunk_nl).to_vec(),
+        eof: true,
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody.clone(),
+    )
+    .drain()
+    .await;
+
+    let reason = boss_engine_driver::grok::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON;
+    fx.receive(record::Body::Gap(v1::Gap {
+        resource: boss_protocol_spoke::USAGE_UNAVAILABLE_GAP_RESOURCE.into(),
+        reason: reason.into(),
+        ..Default::default()
+    }));
+    Projector::with_custody(
+        fx.state.work_db.as_ref().clone(),
+        crate::app::spoke_projection::applier(&fx.state),
+        fx.wire.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        ProjectorConfig::default(),
+        custody,
+    )
+    .drain()
+    .await;
+
+    type UsageRow = (Option<i64>, Option<i64>, Option<String>);
+    let (input_tokens, output_tokens, usage_unavailable): UsageRow = fx
+        .state
+        .work_db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT input_tokens, output_tokens, usage_unavailable
+             FROM work_runs WHERE execution_id = ?1",
+            [&fx.execution_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(input_tokens, Some(160));
+    assert_eq!(output_tokens, Some(33));
+    assert_eq!(usage_unavailable, None);
 }

@@ -1248,7 +1248,9 @@ async fn claude_and_codex_teardown_are_unchanged() {
 }
 
 /// A stalled DB write lock during Grok teardown must not hold back
-/// `kill_session_verified` beyond the advertised settle bound.
+/// `kill_session_verified` beyond the advertised settle bound. Contention is
+/// introduced at the settle/ingest step on a genuine second SQLite connection,
+/// after driver lookup has already succeeded.
 #[tokio::test]
 async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
     use std::time::{Duration, Instant};
@@ -1286,22 +1288,44 @@ async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
     db.set_run_transcript_path_if_unset(&execution_id, updates_path.to_str().unwrap())
         .unwrap();
 
-    let runner = ScriptedGrokTmuxRunner::new("tok-stalled", None);
+    let work_db = Arc::clone(&state.work_db);
+    let (lock_now, lock_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (unlock_now, unlock_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (unlocked_tx, unlocked_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::spawn(move || {
+        let conn = work_db.connect_new().unwrap();
+        if lock_rx.recv().is_err() {
+            return;
+        }
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        // Hold long enough for settle/ingest to observe SQLITE_BUSY, then
+        // release so the detached persist and identity-clear can finish.
+        let _ = unlock_rx.recv_timeout(Duration::from_millis(400));
+        let _ = conn.execute_batch("ROLLBACK;");
+        let _ = unlocked_tx.send(());
+    });
+    let runner = ScriptedGrokTmuxRunner::new(
+        "tok-stalled",
+        Some(Box::new(move || {
+            // Signal without waiting: a blocking handshake here would stall
+            // the current-thread runtime inside send-keys and prevent kill.
+            let _ = lock_now.send(());
+        })),
+    );
     let tmux =
         boss_tmux::Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
             .unwrap();
 
-    // Hold an exclusive write lock on a separate connection so any synchronous
-    // `set_run_cost_snapshot` on the runtime thread would block on SQLite's
-    // busy timeout.
-    let lock_conn = db.connect().unwrap();
-    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-
     let started = Instant::now();
     let _outcome = state.reap_tmux_worker_with(&tmux, &execution_id, &identity).await;
-    let elapsed = started.elapsed();
 
-    let _ = lock_conn.execute_batch("ROLLBACK;");
+    assert!(
+        runner.recorded_escape_at().is_some(),
+        "Grok settle must send Escape even when ingest later stalls: {:?}",
+        runner.calls()
+    );
+    let kill_at = runner.recorded_kill_at().expect("kill-session must still run");
+    let kill_elapsed = kill_at.saturating_duration_since(started);
     assert!(
         runner
             .calls()
@@ -1311,7 +1335,25 @@ async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
         runner.calls()
     );
     assert!(
-        elapsed < Duration::from_millis(1500),
-        "stalled DB must not delay kill-session past the settle bound (elapsed={elapsed:?})"
+        kill_elapsed < Duration::from_millis(1500),
+        "stalled DB must not delay kill-session past the settle bound (kill_elapsed={kill_elapsed:?})"
     );
+
+    let _ = unlock_now.send(());
+    let _ = unlocked_rx.recv();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let fields = read_run_usage_fields(state.work_db.as_ref(), &execution_id);
+        if fields.usage_unavailable.as_deref()
+            == Some(crate::app::tmux_teardown::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON)
+            || fields.input_tokens.is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "eventual Grok usage or usage_unavailable must persist after the lock is released"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

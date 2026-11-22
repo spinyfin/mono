@@ -6,8 +6,10 @@
 //! transcript tailing, tmux `send-keys` transport, and persistence/projection.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use boss_transcript_tail::TranscriptTail;
 use serde_json::Value;
 
 use super::{is_turn_completed, is_turn_end, is_turn_started};
@@ -137,6 +139,71 @@ where
         return None;
     }
     tokio::time::timeout(budget, fut).await.ok()
+}
+
+struct GrokJsonlTail {
+    tail: Option<TranscriptTail>,
+    generation: u64,
+}
+
+/// Generation-aware fold of `events.jsonl` and `updates.jsonl` into [`GrokTurnProgress`].
+///
+/// Local and host teardowns share this adapter so a truncated or rotated
+/// transcript resets the same counters. Callers keep `send_key` and log
+/// wording on their transport.
+pub struct GrokSettleTails {
+    events: GrokJsonlTail,
+    updates: GrokJsonlTail,
+    log_prefix: &'static str,
+}
+
+impl GrokSettleTails {
+    pub fn new(events_path: Option<PathBuf>, updates_path: Option<PathBuf>, log_prefix: &'static str) -> Self {
+        Self {
+            events: GrokJsonlTail {
+                tail: events_path.map(TranscriptTail::new),
+                generation: 0,
+            },
+            updates: GrokJsonlTail {
+                tail: updates_path.map(TranscriptTail::new),
+                generation: 0,
+            },
+            log_prefix,
+        }
+    }
+
+    pub async fn poll(&mut self, progress: &mut GrokTurnProgress) {
+        if let Some(tail) = self.events.tail.as_mut() {
+            let values = poll_tail(tail, self.log_prefix).await;
+            if tail.generation() != self.events.generation {
+                progress.reset_events();
+                self.events.generation = tail.generation();
+            }
+            progress.fold_events(values);
+        }
+        if let Some(tail) = self.updates.tail.as_mut() {
+            let values = poll_tail(tail, self.log_prefix).await;
+            if tail.generation() != self.updates.generation {
+                progress.reset_updates();
+                self.updates.generation = tail.generation();
+            }
+            progress.fold_updates(values);
+        }
+    }
+}
+
+async fn poll_tail(tail: &mut TranscriptTail, log_prefix: &'static str) -> Vec<Value> {
+    match tail.poll().await {
+        Ok(values) => values,
+        Err(error) => {
+            tracing::debug!(
+                path = %tail.path().display(),
+                %error,
+                "{log_prefix}: transcript tail poll failed; treating as no new lines",
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Transport and observability hooks for [`settle_open_turn`].

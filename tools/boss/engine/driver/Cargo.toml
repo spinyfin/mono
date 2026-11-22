@@ -20,10 +20,11 @@ boss-engine-utils = { path = "../utils" }
 boss-engine-worker-bin = { path = "../worker-bin" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
+boss-transcript-tail = { path = "../transcript-tail" }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "time", "fs", "io-util"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

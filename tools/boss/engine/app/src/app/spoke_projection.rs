@@ -165,21 +165,33 @@ impl ServerApplier {
     }
 }
 
-async fn ingest_spoke_transcript_cost(state: &ServerState, execution_id: &str, source: &TranscriptSource) {
-    if !tokio::fs::try_exists(&source.path).await.unwrap_or(false) {
-        return;
+async fn ingest_spoke_transcript_cost(state: &ServerState, execution_id: &str, source: &TranscriptSource) -> Applied {
+    match tokio::fs::try_exists(&source.path).await {
+        Ok(false) => return Applied::Done,
+        Err(error) => {
+            return Applied::Retry(format!(
+                "spoke transcript exists check failed for {}: {error}",
+                source.path.display()
+            ));
+        }
+        Ok(true) => {}
     }
-    if let Err(error) = state
+    match state
         .run_cost_capture
         .capture_and_persist(&state.work_db, execution_id, &source.path, Some(&source.root))
         .await
     {
-        tracing::warn!(
-            execution_id,
-            transcript_path = %source.path.display(),
-            %error,
-            "failed to capture cumulative run cost from spoke transcript",
-        );
+        Ok(_) => Applied::Done,
+        Err(error) if error.is_transient() => Applied::Retry(error.to_string()),
+        Err(error) => {
+            tracing::warn!(
+                execution_id,
+                transcript_path = %source.path.display(),
+                %error,
+                "failed to capture cumulative run cost from spoke transcript",
+            );
+            Applied::Done
+        }
     }
 }
 
@@ -279,7 +291,7 @@ impl ObservationApplier for ServerApplier {
                     return Applied::Retry(format!("{error:#}"));
                 }
                 if state.transcript_path_cache.get(execution_id).as_deref() == Some(path.as_str()) {
-                    ingest_spoke_transcript_cost(&state, execution_id, source).await;
+                    return ingest_spoke_transcript_cost(&state, execution_id, source).await;
                 }
                 return Applied::Done;
             }
@@ -288,8 +300,7 @@ impl ObservationApplier for ServerApplier {
         state
             .record_driver_signal(execution_id, DriverSignalKind::TranscriptPath)
             .await;
-        ingest_spoke_transcript_cost(&state, execution_id, source).await;
-        Applied::Done
+        ingest_spoke_transcript_cost(&state, execution_id, source).await
     }
 
     async fn usage_unavailable(&self, origin: &Origin, reason: &str) -> Applied {

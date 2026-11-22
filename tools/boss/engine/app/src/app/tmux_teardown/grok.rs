@@ -12,8 +12,9 @@
 //! window for `turn_completed` to land and be ingested by [`RunCostCapture`],
 //! and records a specific `usage_unavailable` reason if the bound expires
 //! without `turn_completed`. The deadline covers the whole pre-reap settle,
-//! including path resolution, the initial reads, the interrupt send, polling,
-//! and the final ingest.
+//! including driver lookup, path resolution, the initial reads, the interrupt
+//! send, polling, and the final ingest. Synchronous WorkDb work runs off the
+//! runtime thread; pending persistence is detached so it cannot delay kill.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,12 +23,10 @@ use std::time::Duration;
 use boss_engine_driver::AgentDriver;
 use boss_engine_driver::grok::{
     GROK_TEARDOWN_POLL_INTERVAL, GROK_TEARDOWN_SETTLE_WINDOW, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON, GrokSettleStatus,
-    GrokSettleTransport, GrokTurnProgress, settle_open_turn, timeout_remaining,
+    GrokSettleTails, GrokSettleTransport, GrokTurnProgress, settle_open_turn, timeout_remaining,
 };
-use boss_engine_runtime::transcript_tail::TranscriptTail;
 use boss_engine_storage_values::RunCostSnapshot;
 use boss_tmux::Tmux;
-use serde_json::Value;
 
 use super::*;
 
@@ -41,67 +40,12 @@ struct GrokTelemetryPaths {
     containment_root: Option<Option<PathBuf>>,
 }
 
-struct GrokJsonlTail {
-    tail: Option<TranscriptTail>,
-    generation: u64,
-}
-
-struct GrokSettleTails {
-    events: GrokJsonlTail,
-    updates: GrokJsonlTail,
-}
-
-impl GrokSettleTails {
-    fn new(paths: &GrokTelemetryPaths) -> Self {
-        Self {
-            events: GrokJsonlTail {
-                tail: paths.events_path.as_ref().map(|path| TranscriptTail::new(path.clone())),
-                generation: 0,
-            },
-            updates: GrokJsonlTail {
-                tail: paths
-                    .updates_path
-                    .as_ref()
-                    .map(|path| TranscriptTail::new(path.clone())),
-                generation: 0,
-            },
-        }
-    }
-
-    async fn poll(&mut self, progress: &mut GrokTurnProgress) {
-        if let Some(tail) = self.events.tail.as_mut() {
-            let values = poll_tail(tail).await;
-            if tail.generation() != self.events.generation {
-                progress.reset_events();
-                self.events.generation = tail.generation();
-            }
-            progress.fold_events(values);
-        }
-        if let Some(tail) = self.updates.tail.as_mut() {
-            let values = poll_tail(tail).await;
-            if tail.generation() != self.updates.generation {
-                progress.reset_updates();
-                self.updates.generation = tail.generation();
-            }
-            progress.fold_updates(values);
-        }
-    }
+struct ResolvedGrokTeardown {
+    driver: Arc<dyn AgentDriver>,
+    paths: GrokTelemetryPaths,
 }
 
 impl ServerState {
-    /// Returns whether `execution_id` was launched (or resolves) as a Grok
-    /// worker, using the same spawn-stamp helper every other post-spawn
-    /// driver lookup uses.
-    pub(super) fn is_grok_execution(&self, execution_id: &str) -> bool {
-        self.grok_driver_for_execution(execution_id).is_some()
-    }
-
-    fn grok_driver_for_execution(&self, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
-        let driver =
-            boss_engine_completion::driver_transcript::driver_for_spawned_execution(&self.work_db, execution_id)?;
-        (driver.descriptor().name == boss_engine_driver::grok::TRANSCRIPT_DRIVER_SLUG).then_some(driver)
-    }
-
     #[cfg(test)]
     pub(crate) fn set_grok_teardown_settle_window_for_test(&self, window: Duration) {
         *self.grok_teardown_settle_window_override.lock().unwrap() = Some(window);
@@ -116,32 +60,28 @@ impl ServerState {
     }
 
     /// Best-effort one-shot cost capture for a Grok session whose process is
-    /// already dead/missing when teardown runs, so any `turn_completed` flushed
-    /// just before exit is still ingested.
-    pub(super) async fn capture_grok_cost_if_present(&self, execution_id: &str) {
-        let Some(driver) = self.grok_driver_for_execution(execution_id) else {
+    /// already dead or missing when teardown runs, so any `turn_completed`
+    /// flushed just before exit is still ingested. Bounded by the settle
+    /// window; expiry is logged and does not delay kill/slot release.
+    pub(super) async fn capture_grok_cost_if_present(&self, execution_id: &str, session_name: &str) {
+        let settle_window = self.grok_teardown_settle_window();
+        let deadline = tokio::time::Instant::now() + settle_window;
+        let Some(resolved) = self.resolve_grok_teardown_bounded(execution_id, deadline).await else {
             return;
         };
-        let work_db = self.work_db.clone();
-        let cache = self.transcript_path_cache.clone();
-        let exec_id = execution_id.to_owned();
-        let Ok(paths) = tokio::task::spawn_blocking(move || {
-            resolve_grok_telemetry_paths(&work_db, &cache, &exec_id, driver.as_ref())
-        })
-        .await
-        else {
-            return;
-        };
-        let _ = self.ingest_grok_updates(execution_id, &paths).await;
+        let _ = self
+            .finish_dead_or_missing_capture(execution_id, session_name, &resolved, deadline, settle_window)
+            .await;
     }
 
     /// Ensure an open Grok ACP turn is given a chance to close (via the
     /// driver's interrupt plan / `session/cancel`) and emit `turn_completed`
     /// before `kill_session_verified` destroys the session.
     ///
-    /// Returns an optional `JoinHandle` for a background DB write of
-    /// `usage_unavailable` so `kill_session_verified` is never delayed by SQLite
-    /// contention.
+    /// Driver lookup, path resolution and snapshot writes run off the runtime
+    /// thread under `deadline`. Returns an optional `JoinHandle` for a
+    /// background DB write of `usage_unavailable` so `kill_session_verified`
+    /// is never delayed by SQLite contention.
     pub(super) async fn settle_grok_turn_before_reap(
         &self,
         tmux: &Tmux,
@@ -150,34 +90,46 @@ impl ServerState {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let settle_window = self.grok_teardown_settle_window();
         let deadline = tokio::time::Instant::now() + settle_window;
-        let driver = self.grok_driver_for_execution(execution_id)?;
+        let resolved = self.resolve_grok_teardown_bounded(execution_id, deadline).await?;
+        self.settle_resolved_grok_turn(tmux, execution_id, session_name, resolved, deadline, settle_window)
+            .await
+    }
+
+    async fn resolve_grok_teardown_bounded(
+        &self,
+        execution_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Option<ResolvedGrokTeardown> {
         let work_db = self.work_db.clone();
         let cache = self.transcript_path_cache.clone();
         let exec_id = execution_id.to_owned();
-        let driver_for_paths = Arc::clone(&driver);
-        let paths = match timeout_remaining(
+        match timeout_remaining(
             deadline,
-            tokio::task::spawn_blocking(move || {
-                resolve_grok_telemetry_paths(&work_db, &cache, &exec_id, driver_for_paths.as_ref())
-            }),
+            tokio::task::spawn_blocking(move || resolve_grok_teardown(&work_db, &cache, &exec_id)),
         )
         .await
         {
-            Some(Ok(paths)) => paths,
+            Some(Ok(resolved)) => resolved,
             Some(Err(_)) | None => {
                 tracing::warn!(
                     execution_id,
-                    session = session_name,
-                    settle_window_secs = settle_window.as_secs_f64(),
                     reason = GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
-                    "reap_tmux_worker: resolving Grok telemetry paths timed out; proceeding with reap",
+                    "reap_tmux_worker: resolving Grok teardown context timed out; proceeding with reap",
                 );
-                return Some(
-                    self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON),
-                );
+                None
             }
-        };
+        }
+    }
 
+    async fn settle_resolved_grok_turn(
+        &self,
+        tmux: &Tmux,
+        execution_id: &str,
+        session_name: &str,
+        resolved: ResolvedGrokTeardown,
+        deadline: tokio::time::Instant,
+        settle_window: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         struct LocalSettleTransport<'a> {
             tails: GrokSettleTails,
             tmux: &'a Tmux,
@@ -219,7 +171,11 @@ impl ServerState {
         }
 
         let mut transport = LocalSettleTransport {
-            tails: GrokSettleTails::new(&paths),
+            tails: GrokSettleTails::new(
+                resolved.paths.events_path.clone(),
+                resolved.paths.updates_path.clone(),
+                "reap_tmux_worker",
+            ),
             tmux,
             session_name,
             execution_id,
@@ -227,7 +183,7 @@ impl ServerState {
         let result = settle_open_turn(
             deadline,
             GROK_TEARDOWN_POLL_INTERVAL,
-            driver.interrupt_plan(),
+            resolved.driver.interrupt_plan(),
             &mut transport,
         )
         .await;
@@ -241,7 +197,7 @@ impl ServerState {
                 self.finish_grok_settle_ingest(
                     execution_id,
                     session_name,
-                    &paths,
+                    &resolved.paths,
                     completed,
                     deadline,
                     already_complete,
@@ -250,6 +206,33 @@ impl ServerState {
             }
             GrokSettleStatus::TimedOut => {
                 Some(self.record_grok_teardown_unavailable(execution_id, session_name, &result.progress, settle_window))
+            }
+        }
+    }
+
+    async fn finish_dead_or_missing_capture(
+        &self,
+        execution_id: &str,
+        session_name: &str,
+        resolved: &ResolvedGrokTeardown,
+        deadline: tokio::time::Instant,
+        settle_window: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        match timeout_remaining(deadline, self.ingest_grok_updates(execution_id, &resolved.paths)).await {
+            Some(true) => None,
+            Some(false) => {
+                Some(self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_INGEST_FAILED_REASON))
+            }
+            None => {
+                tracing::warn!(
+                    execution_id,
+                    session = session_name,
+                    settle_window_secs = settle_window.as_secs_f64(),
+                    reason = GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
+                    "reap_tmux_worker: teardown bound expired during dead/missing Grok usage capture; \
+                     proceeding with reap",
+                );
+                Some(self.spawn_persist_grok_usage_unavailable(execution_id, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON))
             }
         }
     }
@@ -337,37 +320,64 @@ impl ServerState {
     }
 
     async fn ingest_grok_updates(&self, execution_id: &str, paths: &GrokTelemetryPaths) -> bool {
-        let Some(updates_path) = paths.updates_path.as_deref() else {
+        let Some(updates_path) = paths.updates_path.clone() else {
             return false;
         };
-        let Some(containment_root) = paths.containment_root.as_ref() else {
+        let Some(containment_root) = paths.containment_root.clone() else {
             return false;
         };
-        if !tokio::fs::try_exists(updates_path).await.unwrap_or(false) {
-            return false;
+        match tokio::fs::try_exists(&updates_path).await {
+            Ok(false) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    execution_id,
+                    transcript_path = %updates_path.display(),
+                    %error,
+                    "reap_tmux_worker: Grok updates.jsonl exists check failed",
+                );
+                return false;
+            }
+            Ok(true) => {}
         }
         let path_str = updates_path.to_string_lossy().into_owned();
         let work_db = self.work_db.clone();
         let exec_id = execution_id.to_owned();
         let _ =
             tokio::task::spawn_blocking(move || work_db.set_run_transcript_path_if_unset(&exec_id, &path_str)).await;
-        match self
-            .run_cost_capture
-            .capture_and_persist(&self.work_db, execution_id, updates_path, containment_root.as_deref())
-            .await
-        {
-            Ok(persisted) => persisted,
-            Err(error) => {
+        let capture = Arc::clone(&self.run_cost_capture);
+        let work_db = self.work_db.clone();
+        let exec_id = execution_id.to_owned();
+        let persist = tokio::task::spawn(async move {
+            capture
+                .capture_and_persist(&work_db, &exec_id, &updates_path, containment_root.as_deref())
+                .await
+        });
+        match persist.await {
+            Ok(Ok(persisted)) => persisted,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     execution_id,
-                    transcript_path = %updates_path.display(),
                     %error,
                     "reap_tmux_worker: failed capturing Grok run cost from updates.jsonl",
                 );
                 false
             }
+            Err(_) => false,
         }
     }
+}
+
+fn resolve_grok_teardown(
+    work_db: &boss_work_db::WorkDb,
+    transcript_path_cache: &boss_engine_runtime::live_status_loop::TranscriptPathCache,
+    execution_id: &str,
+) -> Option<ResolvedGrokTeardown> {
+    let driver = boss_engine_completion::driver_transcript::driver_for_spawned_execution(work_db, execution_id)?;
+    if driver.descriptor().name != boss_engine_driver::grok::TRANSCRIPT_DRIVER_SLUG {
+        return None;
+    }
+    let paths = resolve_grok_telemetry_paths(work_db, transcript_path_cache, execution_id, driver.as_ref());
+    Some(ResolvedGrokTeardown { driver, paths })
 }
 
 fn resolve_grok_telemetry_paths(
@@ -408,19 +418,5 @@ fn resolve_grok_telemetry_paths(
         events_path,
         updates_path,
         containment_root,
-    }
-}
-
-async fn poll_tail(tail: &mut TranscriptTail) -> Vec<Value> {
-    match tail.poll().await {
-        Ok(values) => values,
-        Err(error) => {
-            tracing::debug!(
-                path = %tail.path().display(),
-                %error,
-                "reap_tmux_worker: Grok transcript tail poll failed; treating as no new lines",
-            );
-            Vec::new()
-        }
     }
 }

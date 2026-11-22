@@ -50,6 +50,7 @@ rust_library(
         "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/transcript-tail",
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/worker-bin",

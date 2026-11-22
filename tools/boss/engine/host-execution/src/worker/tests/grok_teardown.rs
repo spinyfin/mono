@@ -148,7 +148,11 @@ async fn grok_stop_times_out_within_bound_when_turn_completed_never_arrives() {
     let stopped = supervisor.execute(&stop_command(), false, 1).await;
     let elapsed = started.elapsed();
     assert_eq!(stopped.code, ResultCode::Ok as i32, "{}", stopped.reason);
-    assert_eq!(stopped.reason, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON);
+    assert!(stopped.reason.is_empty(), "{}", stopped.reason);
+    assert_eq!(
+        stored(&supervisor.store).usage_unavailable_reason.as_deref(),
+        Some(GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON)
+    );
     assert!(
         elapsed >= Duration::from_millis(50),
         "stop should wait out the settle bound (elapsed={elapsed:?})"
@@ -167,6 +171,37 @@ async fn grok_stop_times_out_within_bound_when_turn_completed_never_arrives() {
     assert!(
         !fake.killed.lock().unwrap().is_empty(),
         "session must still be killed after the bound"
+    );
+}
+
+#[tokio::test]
+async fn grok_stop_replay_after_terminal_save_still_reports_usage_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeTmux::default());
+    live(&fake);
+    let (supervisor, _env) = spawned_grok(&root, fake.clone()).await;
+    let (events, updates) = session_files(&supervisor);
+    write_open_turn(&events, &updates);
+    let _guard = override_settle_window(Duration::from_millis(80));
+
+    let first = supervisor.execute(&stop_command(), false, 1).await;
+    assert_eq!(first.code, ResultCode::Ok as i32, "{}", first.reason);
+    let record = stored(&supervisor.store);
+    assert_eq!(record.phase, crate::worker::Phase::Terminal);
+    assert_eq!(
+        record.usage_unavailable_reason.as_deref(),
+        Some(GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON)
+    );
+
+    let replayed = supervisor.execute(&stop_command(), false, 2).await;
+    assert_eq!(replayed.code, ResultCode::Ok as i32, "{}", replayed.reason);
+    assert!(replayed.reason.is_empty(), "{}", replayed.reason);
+    assert_eq!(
+        supervisor
+            .persisted_usage_unavailable(&stop_command().run.unwrap())
+            .unwrap()
+            .as_deref(),
+        Some(GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON)
     );
 }
 

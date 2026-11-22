@@ -224,9 +224,8 @@ impl ServerState {
                         current_command: None,
                     },
                 );
-                if self.is_grok_execution(execution_id) {
-                    self.capture_grok_cost_if_present(execution_id).await;
-                }
+                self.capture_grok_cost_if_present(execution_id, &identity.session_name)
+                    .await;
                 return match reap_worker_process_tree(tmux, &identity.spawn_token).await {
                     Ok(_) => self.finish_tmux_reap(execution_id, identity),
                     Err(err) => {
@@ -284,16 +283,13 @@ impl ServerState {
             &observation,
         );
 
-        let pending_usage_persist = if self.is_grok_execution(execution_id) {
-            if observation.pane_dead == Some(true) {
-                self.capture_grok_cost_if_present(execution_id).await;
-                None
-            } else {
-                self.settle_grok_turn_before_reap(tmux, execution_id, &identity.session_name)
-                    .await
-            }
-        } else {
+        let pending_usage_persist = if observation.pane_dead == Some(true) {
+            self.capture_grok_cost_if_present(execution_id, &identity.session_name)
+                .await;
             None
+        } else {
+            self.settle_grok_turn_before_reap(tmux, execution_id, &identity.session_name)
+                .await
         };
 
         // The shared tmux teardown waits for token-owned processes, including

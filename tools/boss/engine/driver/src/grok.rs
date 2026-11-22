@@ -54,8 +54,8 @@ mod turn_end_recovery;
 
 pub use teardown_settle::{
     EventsTurnState, GROK_TEARDOWN_POLL_INTERVAL, GROK_TEARDOWN_SETTLE_WINDOW, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
-    GrokSettleDecision, GrokSettleResult, GrokSettleStatus, GrokSettleTransport, GrokTurnProgress, UpdatesTurnState,
-    remaining_budget, settle_open_turn, timeout_remaining,
+    GrokSettleDecision, GrokSettleResult, GrokSettleStatus, GrokSettleTails, GrokSettleTransport, GrokTurnProgress,
+    UpdatesTurnState, remaining_budget, settle_open_turn, timeout_remaining,
 };
 pub use turn_end_recovery::{
     is_turn_completed, is_turn_end, is_turn_started, session_files_for_home, session_files_for_run,

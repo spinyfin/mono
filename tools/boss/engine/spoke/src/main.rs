@@ -174,23 +174,27 @@ mod commands {
                 result.code = ResultCode::OutcomeUncertain.into();
             }
             let observed = stamp()?;
-            let mut usage_unavailable_recorded = !matches!(command.body, Some(command::Body::Stop(_)))
-                || result.code != ResultCode::Ok as i32
-                || result.reason.is_empty();
+            let usage_unavailable_reason = match (&command.body, supervisor.as_ref(), command.run.as_ref()) {
+                (Some(command::Body::Stop(_)), Some(supervisor), Some(run)) if result.code == ResultCode::Ok as i32 => {
+                    supervisor.persisted_usage_unavailable(run).ok().flatten()
+                }
+                _ => None,
+            };
+            let mut usage_unavailable_recorded = usage_unavailable_reason.is_none();
             loop {
                 let step = {
                     let mut guard = journal
                         .lock()
                         .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
                     let mut append_err = None;
-                    if !usage_unavailable_recorded {
+                    if !usage_unavailable_recorded && let Some(reason) = usage_unavailable_reason.as_deref() {
                         let gap_record = boss_protocol_spoke::v1::Record {
                             run: command.run.clone(),
                             observed: Some(observed.clone()),
                             body: Some(boss_protocol_spoke::v1::record::Body::Gap(
                                 boss_protocol_spoke::v1::Gap {
                                     resource: boss_protocol_spoke::USAGE_UNAVAILABLE_GAP_RESOURCE.into(),
-                                    reason: result.reason.clone(),
+                                    reason: reason.to_owned(),
                                     ..Default::default()
                                 },
                             )),

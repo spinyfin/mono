@@ -9,11 +9,9 @@ use super::exact_target;
 use boss_engine_driver::DriverRegistry;
 use boss_engine_driver::grok::{
     GROK_TEARDOWN_POLL_INTERVAL, GROK_TEARDOWN_SETTLE_WINDOW, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON, GrokSettleStatus,
-    GrokSettleTransport, GrokTurnProgress, settle_open_turn, timeout_remaining,
+    GrokSettleTails, GrokSettleTransport, GrokTurnProgress, settle_open_turn, timeout_remaining,
 };
 use boss_tmux::Tmux;
-use boss_transcript_tail::TranscriptTail;
-use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
@@ -25,58 +23,10 @@ pub(crate) enum GrokSettleOutcome {
 }
 
 impl GrokSettleOutcome {
-    pub(crate) fn command_reason(self) -> String {
+    pub(crate) fn usage_unavailable_reason(self) -> Option<String> {
         match self {
-            Self::TimedOut => GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON.to_owned(),
-            Self::Skipped | Self::Completed => String::new(),
-        }
-    }
-}
-
-struct HostGrokTails {
-    events: TranscriptTail,
-    events_generation: u64,
-    updates: TranscriptTail,
-    updates_generation: u64,
-}
-
-impl HostGrokTails {
-    fn new(events_path: std::path::PathBuf, updates_path: std::path::PathBuf) -> Self {
-        Self {
-            events: TranscriptTail::new(events_path),
-            events_generation: 0,
-            updates: TranscriptTail::new(updates_path),
-            updates_generation: 0,
-        }
-    }
-
-    async fn poll(&mut self, progress: &mut GrokTurnProgress) {
-        let event_values = poll_tail(&mut self.events).await;
-        if self.events.generation() != self.events_generation {
-            progress.reset_events();
-            self.events_generation = self.events.generation();
-        }
-        progress.fold_events(event_values);
-
-        let update_values = poll_tail(&mut self.updates).await;
-        if self.updates.generation() != self.updates_generation {
-            progress.reset_updates();
-            self.updates_generation = self.updates.generation();
-        }
-        progress.fold_updates(update_values);
-    }
-}
-
-async fn poll_tail(tail: &mut TranscriptTail) -> Vec<Value> {
-    match tail.poll().await {
-        Ok(values) => values,
-        Err(error) => {
-            tracing::debug!(
-                path = %tail.path().display(),
-                %error,
-                "host grok teardown: transcript tail poll failed; treating as no new lines",
-            );
-            Vec::new()
+            Self::TimedOut => Some(GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON.to_owned()),
+            Self::Skipped | Self::Completed => None,
         }
     }
 }
@@ -149,7 +99,7 @@ pub(crate) async fn settle_open_grok_turn(
     };
 
     struct HostSettleTransport<'a> {
-        tails: HostGrokTails,
+        tails: GrokSettleTails,
         tmux: &'a Tmux,
         target: String,
         execution_id: &'a str,
@@ -190,7 +140,7 @@ pub(crate) async fn settle_open_grok_turn(
     }
 
     let mut transport = HostSettleTransport {
-        tails: HostGrokTails::new(session_files.0, session_files.1),
+        tails: GrokSettleTails::new(Some(session_files.0), Some(session_files.1), "host grok teardown"),
         tmux,
         target: exact_target(session),
         execution_id,

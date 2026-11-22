@@ -338,7 +338,8 @@ impl WorkDb {
             "UPDATE work_runs
              SET usage_unavailable = CASE
                      WHEN ?12 = 1 AND ?4 IS NULL THEN COALESCE(?13, 'No provider token usage observed')
-                     WHEN ?12 = 1 OR ?4 IS NOT NULL OR ?13 IS NOT NULL THEN ?13
+                     WHEN ?4 IS NOT NULL THEN ?13
+                     WHEN ?13 IS NOT NULL AND input_tokens IS NULL THEN ?13
                      ELSE usage_unavailable
                  END,
                  model = CASE
