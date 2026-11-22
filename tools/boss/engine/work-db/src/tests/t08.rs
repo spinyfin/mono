@@ -1343,3 +1343,40 @@ fn reconcile_followups_dedupe_on_proposed_name() {
     assert_eq!(group2.id, group.id);
     assert!(created2.is_empty());
 }
+
+#[test]
+fn list_open_attentions_for_product_excludes_terminal_items_and_other_products() {
+    let (db, product_id, project_id, task_id) = fixture();
+
+    // Two open items across different cards/associations in the target product.
+    let (q1, q_group) = db.create_attention(question(&project_id, "docs/x.md", "Q1")).unwrap();
+    let (q2, _) = db.create_attention(question(&project_id, "docs/x.md", "Q2")).unwrap();
+    let (f1, f_group) = db.create_attention(followup(&task_id, "Add index")).unwrap();
+
+    // Answer Q1 -> only Q2 remains open in q_group (which is now partially_answered).
+    db.answer_attention(&q1.id, Some("yes".to_owned()), false, false)
+        .unwrap();
+
+    // Dismissed group should be excluded entirely.
+    let (_d1, d_group) = db
+        .create_attention(question(&project_id, "docs/dismissed.md", "Dismissed Q"))
+        .unwrap();
+    db.dismiss_attention(&d_group.id, None).unwrap();
+
+    // Another product's open attention must not leak in.
+    let other_product = create_test_product_named(&db, "other-product");
+    let other_chore = create_test_chore(&db, other_product.id.clone(), "Other chore");
+    db.create_attention(followup(&other_chore.id, "Other product followup"))
+        .unwrap();
+
+    let open = db.list_open_attentions_for_product(&product_id).unwrap();
+    let ids: Vec<&str> = open.iter().map(|(a, _)| a.id.as_str()).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&q2.id.as_str()));
+    assert!(ids.contains(&f1.id.as_str()));
+
+    let q2_pair = open.iter().find(|(a, _)| a.id == q2.id).unwrap();
+    assert_eq!(q2_pair.1.id, q_group.id);
+    let f1_pair = open.iter().find(|(a, _)| a.id == f1.id).unwrap();
+    assert_eq!(f1_pair.1.id, f_group.id);
+}

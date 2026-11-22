@@ -32,6 +32,15 @@
 //! timeout budget. These are single tunable constants — R1 says start cheap and
 //! upshift to Sonnet only if the measured false-fold rate warrants it.
 
+pub mod brief;
+pub mod prefilter;
+
+pub use brief::{association_context_label, render_attention_brief, render_candidate_brief};
+pub use prefilter::{
+    DEFAULT_PREFILTER_TOP_K, DEFAULT_RECENCY_WINDOW_DAYS, DEFAULT_RECENCY_WINDOW_SECS, PrefilterCandidate,
+    PrefilterConfig, PrefilterResult, prefilter_open_attentions, prefilter_open_attentions_from_db,
+};
+
 use std::time::Duration;
 
 use anyhow::Result;
@@ -197,13 +206,25 @@ pub fn build_user_prompt(input: &DedupInput) -> String {
 
 /// Render one attention item as a compact bullet the model reasons over.
 fn render_attention(attention: &AttentionBrief) -> String {
-    format!(
-        "- id={} kind={} association={}\n  {}\n",
-        attention.attention_id,
-        attention.kind,
-        attention.association,
-        attention.rendered.trim(),
-    )
+    let group = attention.group_id.trim();
+    if group.is_empty() {
+        format!(
+            "- id={} kind={} association={}\n  {}\n",
+            attention.attention_id,
+            attention.kind,
+            attention.association,
+            attention.rendered.trim(),
+        )
+    } else {
+        format!(
+            "- id={} group={} kind={} association={}\n  {}\n",
+            attention.attention_id,
+            group,
+            attention.kind,
+            attention.association,
+            attention.rendered.trim(),
+        )
+    }
 }
 
 /// Render one work item as a compact bullet.
@@ -448,6 +469,7 @@ mod tests {
         assert!(prompt.contains("Candidate notification"));
         assert!(prompt.contains("missing an index on created_at"));
         assert!(prompt.contains("id=A5"));
+        assert!(prompt.contains("group=g_other"));
         assert!(prompt.contains("id=T42"));
         assert!(prompt.contains("Sensibility check: DISABLED"));
     }

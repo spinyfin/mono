@@ -66,6 +66,37 @@ impl WorkDb {
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         list_groups_with_members(&tx, product_id, project_id, task_id, kind, state)
     }
+
+    /// Open `Attention` items (`answer_state = 'open'`) inside non-terminal
+    /// groups (`state IN ('open', 'partially_answered')`) for `product_id`,
+    /// each paired with its parent `AttentionGroup`. Used by the notification
+    /// dedup prefilter (creation and sweep paths) so cross-task and cross-card
+    /// candidates are fetched from one consistent snapshot.
+    pub fn list_open_attentions_for_product(&self, product_id: &str) -> Result<Vec<(Attention, AttentionGroup)>> {
+        let mut connection = self.connect()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let groups = list_groups(&tx, product_id, None, None, None, None)?;
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(&groups.iter().map(|group| &group.id).collect::<Vec<_>>())?;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {ATTN_COLS} FROM attentions
+             WHERE group_id IN (SELECT value FROM json_each(?1))
+               AND answer_state = 'open'
+             ORDER BY group_id, ordinal ASC, id ASC"
+        ))?;
+        let members = collect_rows(stmt.query_map([ids], map_attention)?)?;
+        let group_by_id: HashMap<&str, &AttentionGroup> = groups.iter().map(|g| (g.id.as_str(), g)).collect();
+        Ok(members
+            .into_iter()
+            .filter_map(|member| {
+                group_by_id
+                    .get(member.group_id.as_str())
+                    .map(|group| (member, (*group).clone()))
+            })
+            .collect())
+    }
 }
 
 /// Direct associations only: product tree attentions feed the tracker-sync banner.
