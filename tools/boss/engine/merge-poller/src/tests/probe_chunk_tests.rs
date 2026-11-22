@@ -142,6 +142,52 @@ async fn no_query_exceeds_the_chunk_size() {
     );
 }
 
+/// `CommandMergeProbe::probe_chunked` stamps each chunk with the instant that
+/// chunk started, not the batch start. A later slow chunk therefore cannot
+/// make an early URL look as if it was observed when the batch finished —
+/// and `PassProbe::record_unrecorded` must not be the only writer of those
+/// timestamps.
+#[tokio::test(start_paused = true)]
+async fn probe_chunked_stamps_each_chunk_with_its_own_start() {
+    let queries = Queries::default();
+    let probe = probe_with(fake_github(&queries, |query| {
+        let delay = if queried(query).iter().any(|(_, number)| *number == 1) {
+            Duration::from_secs(5)
+        } else {
+            Duration::ZERO
+        };
+        (delay, output(true, answer(query, open_node), ""))
+    }));
+    let state = PassState::default();
+    let bounded = PassProbe {
+        inner: &probe,
+        state: &state,
+        pass_end: None,
+    };
+    let all = urls(FULL_PROBE_CHUNK_SIZE + 1);
+
+    let _ = bounded.probe_batch(&all).await;
+
+    let observation = state.probe_order.lock().unwrap().observation.clone();
+    let first = observation.per_url[&all[0]];
+    let second = observation.per_url[&all[FULL_PROBE_CHUNK_SIZE]];
+    assert_eq!(
+        first.elapsed(),
+        Duration::from_secs(5),
+        "chunk 1 started when the batch started"
+    );
+    assert_eq!(
+        second.elapsed(),
+        Duration::ZERO,
+        "chunk 2 started after chunk 1 finished, not at the batch start"
+    );
+    assert!(
+        second > first,
+        "URLs in later chunks must carry a later start than URLs in chunk 1"
+    );
+    assert_eq!(observation.oldest_start, Some(first));
+}
+
 /// A chunk whose query never returns spends its own deadline and nothing
 /// more: the chunks after it are still sent and observed, and the trace
 /// reports the chunk that failed.

@@ -46,7 +46,7 @@ async fn initial_request_and_late_refresh_use_remaining_pass_time() {
     let mut snapshot = crate::pass::ProbeSnapshot::new(results);
     tokio::time::sleep(Duration::from_secs(67)).await;
     let late = Instant::now();
-    assert!(snapshot.ensure_fresh(&bounded, urls).await);
+    assert!(snapshot.ensure_fresh(&bounded, &state, urls).await);
     assert_eq!(late.elapsed(), Duration::from_secs(2));
     assert_eq!(snapshot.results.len(), 4);
 }
@@ -283,7 +283,7 @@ async fn known_terminal_urls_precede_open_urls_even_on_refresh() {
     tokio::time::sleep(Duration::from_secs(61)).await;
     assert!(
         snapshot
-            .ensure_fresh(&bounded, || vec![urls()[0].clone(), urls()[3].clone()])
+            .ensure_fresh(&bounded, &state, || vec![urls()[0].clone(), urls()[3].clone()])
             .await
     );
     let calls = calls.lock().unwrap();

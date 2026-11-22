@@ -175,8 +175,13 @@ impl ProbeSnapshot {
     ///
     /// Fresh snapshot → `true` immediately (the overwhelmingly common case,
     /// and free — no clock-driven GitHub traffic). Stale snapshot → re-probe
-    /// and return `true`. Stale snapshot with the per-pass refresh budget
-    /// already spent → `false`, and the caller must stop: writing off a
+    /// the unprocessed remainder and return `true` only if that refresh is
+    /// itself still within [`PROBE_SNAPSHOT_MAX_AGE`]. A refresh ages from
+    /// this pass's oldest contributing chunk start, so a slow later chunk
+    /// cannot hide an early result. If that age already exceeds the max,
+    /// another refresh runs while [`MAX_PROBE_REFRESHES_PER_PASS`] remains;
+    /// once the budget is spent → `false`, and the caller must stop. Never
+    /// authorize a write from a snapshot that is already stale: writing off a
     /// snapshot that old is worse than deferring to the next pass.
     ///
     /// `remaining_urls` is called **only** on the re-probe path and must
@@ -187,61 +192,60 @@ impl ProbeSnapshot {
     /// Nothing is lost by dropping the processed prefix: those entries are
     /// never read again, and every candidate list is rebuilt from the DB next
     /// pass. It is a closure rather than a slice so the common (fresh) case
-    /// allocates nothing.
-    #[cfg(test)]
+    /// allocates nothing. The closure runs at most once: further refreshes
+    /// in the same call reuse that remainder.
     pub(crate) async fn ensure_fresh(
         &mut self,
         probe: &dyn MergeProbe,
-        remaining_urls: impl FnOnce() -> Vec<String>,
-    ) -> bool {
-        self.ensure_fresh_from(probe, None, remaining_urls).await
-    }
-
-    /// Like [`Self::ensure_fresh`], and ages a refresh from this pass's
-    /// chunk-start clock so a slow later chunk cannot hide an early result.
-    pub(crate) async fn ensure_fresh_from(
-        &mut self,
-        probe: &dyn MergeProbe,
-        state: Option<&PassState>,
+        state: &PassState,
         remaining_urls: impl FnOnce() -> Vec<String>,
     ) -> bool {
         self.refreshed_last_call = false;
-        let age = self.taken_at.elapsed();
-        if age <= PROBE_SNAPSHOT_MAX_AGE {
+        if self.taken_at.elapsed() <= PROBE_SNAPSHOT_MAX_AGE {
             return true;
         }
         if self.refreshes_left == 0 {
             tracing::warn!(
-                snapshot_age_ms = age.as_millis(),
+                snapshot_age_ms = self.taken_at.elapsed().as_millis(),
                 max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
                 "merge poller: probe snapshot stale and the per-pass re-probe budget is spent; \
                  abandoning the rest of this pass rather than transitioning off a stale snapshot",
             );
             return false;
         }
-        self.refreshes_left -= 1;
         let urls = remaining_urls();
-        tracing::warn!(
-            snapshot_age_ms = age.as_millis(),
-            max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
-            pr_count = urls.len(),
-            "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
-             before writing further state",
-        );
-        if let Some(state) = state {
+        loop {
+            let age = self.taken_at.elapsed();
+            self.refreshes_left -= 1;
+            tracing::warn!(
+                snapshot_age_ms = age.as_millis(),
+                max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
+                pr_count = urls.len(),
+                "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
+                 before writing further state",
+            );
             state.probe_order.lock().unwrap().observation.clear();
+            // Merge rather than replace: entries for candidates already walked
+            // stay readable for the pass's adaptive-poll observations.
+            // Age from when the oldest refresh chunk started, matching the
+            // initial snapshot: a slow later chunk must not hide an early result.
+            self.results.extend(probe.probe_batch(&urls).await);
+            self.taken_at = state.probe_order.lock().unwrap().observation.taken_at();
+            self.refreshed_last_call = true;
+            let refresh_age = self.taken_at.elapsed();
+            if refresh_age <= PROBE_SNAPSHOT_MAX_AGE {
+                return true;
+            }
+            if self.refreshes_left == 0 {
+                tracing::warn!(
+                    snapshot_age_ms = refresh_age.as_millis(),
+                    max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
+                    "merge poller: probe snapshot stale and the per-pass re-probe budget is spent; \
+                     abandoning the rest of this pass rather than transitioning off a stale snapshot",
+                );
+                return false;
+            }
         }
-        // Merge rather than replace: entries for candidates already walked
-        // stay readable for the pass's adaptive-poll observations.
-        // Age from when the oldest refresh chunk started, matching the
-        // initial snapshot: a slow later chunk must not hide an early result.
-        let fallback = tokio::time::Instant::now();
-        self.results.extend(probe.probe_batch(&urls).await);
-        self.taken_at = state
-            .map(|state| state.probe_order.lock().unwrap().observation.taken_at())
-            .unwrap_or(fallback);
-        self.refreshed_last_call = true;
-        true
     }
 }
 
@@ -281,7 +285,7 @@ async fn ensure_fresh_refreshing_parked<'a>(
     remaining: impl IntoIterator<Item = &'a PendingMergeCheck>,
 ) -> bool {
     let ok = snapshot
-        .ensure_fresh_from(probe, Some(state), || remaining_probe_urls(remaining))
+        .ensure_fresh(probe, state, || remaining_probe_urls(remaining))
         .await;
     if ok && snapshot.refreshed_last_call {
         *parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());

@@ -133,6 +133,52 @@ impl MergeProbe for ChunkingProbe {
     }
 }
 
+/// Like [`ChunkingProbe`], but later chunks of every batch — including a
+/// mid-walk refresh — take longer than [`PROBE_SNAPSHOT_MAX_AGE`]. PR 1 stays
+/// Open: a stale refresh must not authorize a sweep from that result.
+struct AgeingRefreshProbe {
+    stub: Arc<StubProbe>,
+    batches: StdMutex<usize>,
+}
+
+impl AgeingRefreshProbe {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stub: StubProbe::new(),
+            batches: StdMutex::new(0),
+        })
+    }
+
+    fn batch_count(&self) -> usize {
+        *self.batches.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl MergeProbe for AgeingRefreshProbe {
+    async fn probe(&self, url: &str) -> Result<PrLifecycleProbe> {
+        self.stub.probe(url).await
+    }
+
+    async fn probe_batch(&self, urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        *self.batches.lock().unwrap() += 1;
+        let mut out = HashMap::new();
+        for (index, chunk) in urls.chunks(FULL_PROBE_CHUNK_SIZE).enumerate() {
+            let started = Instant::now();
+            let _ = crate::probe_budget::CONTEXT.try_with(|context| {
+                context.order.lock().unwrap().observation.record_chunk(chunk, started);
+            });
+            if index > 0 {
+                tokio::time::advance(PROBE_SNAPSHOT_MAX_AGE + Duration::from_secs(1)).await;
+            }
+            for url in chunk {
+                out.insert(url.clone(), self.stub.probe(url).await.map_err(|err| err.to_string()));
+            }
+        }
+        out
+    }
+}
+
 fn pr(n: u64) -> String {
     format!("https://github.com/foo/bar/pull/{n}")
 }
@@ -554,6 +600,47 @@ async fn a_slow_later_chunk_ages_the_snapshot_from_the_first_chunk_start() {
         is_done(&db, &first),
         "the refresh sees the first PR merge instead of acting on the stale open result"
     );
+}
+
+/// The initial snapshot is already stale, so the walk refreshes. That refresh
+/// answers Open on the first chunk and then spends more than the snapshot max
+/// age on later chunks: the walk must not sweep from that Open result.
+#[tokio::test(start_paused = true)]
+async fn a_slow_refresh_does_not_authorize_writes_from_an_already_stale_snapshot() {
+    let (_dir, db) = open_db();
+    let mono = product(&db, "Mono");
+    let first = row(&db, &mono, 1);
+    for n in 2..=(FULL_PROBE_CHUNK_SIZE as u64 + 1) {
+        row(&db, &mono, n);
+    }
+    let probe = AgeingRefreshProbe::new();
+    let state = PassState::default();
+
+    let outcome = pass(&db, probe.as_ref(), &state).await;
+
+    assert_eq!(
+        probe.batch_count(),
+        1 + usize::from(crate::pass::MAX_PROBE_REFRESHES_PER_PASS),
+        "the initial snapshot and every in-budget refresh are each too old to write from"
+    );
+    assert_eq!(outcome.merged, 0);
+    assert!(
+        !is_done(&db, &first),
+        "the walk must not treat the refresh's early Open result as current"
+    );
+    let timings = state.trace().timings();
+    let open_walk = timings
+        .phases
+        .iter()
+        .find(|phase| phase.phase == PassPhase::OpenWalk)
+        .unwrap();
+    assert_eq!(
+        open_walk.items_done,
+        0,
+        "no open candidate is swept from a refresh that is already stale: {}",
+        timings.breakdown()
+    );
+    assert!(timings.open_walk_truncated());
 }
 
 /// A PR GitHub has not touched for two weeks is watched cheaply, and
