@@ -6,6 +6,8 @@
 //! The packet crate owns pinned source collection and reference validation;
 //! this module owns engine lifetime and reconciliation semantics.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -96,37 +98,53 @@ fn in_flight_captures() -> &'static Mutex<CaptureMap> {
 }
 
 #[cfg(test)]
-type AfterCapturePersistHook = Mutex<Option<Box<dyn FnMut() + Send>>>;
+type AfterCapturePersistHook = Box<dyn FnMut(&CaptureKey)>;
+#[cfg(test)]
+type BeforeInFlightClaimReleaseHook = Box<dyn FnMut(&Arc<Mutex<i64>>)>;
 
 #[cfg(test)]
-fn after_capture_persist_hook() -> &'static AfterCapturePersistHook {
-    static HOOK: OnceLock<AfterCapturePersistHook> = OnceLock::new();
-    HOOK.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static AFTER_CAPTURE_PERSIST: RefCell<Option<AfterCapturePersistHook>> = const { RefCell::new(None) };
+    static BEFORE_IN_FLIGHT_CLAIM_RELEASE: RefCell<Option<BeforeInFlightClaimReleaseHook>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(test)]
-fn set_after_capture_persist_hook(hook: Box<dyn FnMut() + Send>) {
-    *after_capture_persist_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+fn set_after_capture_persist_hook(hook: AfterCapturePersistHook) {
+    AFTER_CAPTURE_PERSIST.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
 #[cfg(test)]
 fn clear_after_capture_persist_hook() {
-    *after_capture_persist_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = None;
+    AFTER_CAPTURE_PERSIST.with(|slot| *slot.borrow_mut() = None);
 }
 
 #[cfg(test)]
-fn run_after_capture_persist() {
-    if let Some(hook) = after_capture_persist_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_mut()
-    {
-        hook();
-    }
+fn run_after_capture_persist(key: &CaptureKey) {
+    AFTER_CAPTURE_PERSIST.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(key);
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_before_in_flight_claim_release_hook(hook: BeforeInFlightClaimReleaseHook) {
+    BEFORE_IN_FLIGHT_CLAIM_RELEASE.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+fn clear_before_in_flight_claim_release_hook() {
+    BEFORE_IN_FLIGHT_CLAIM_RELEASE.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn run_before_in_flight_claim_release(sequence: &Arc<Mutex<i64>>) {
+    BEFORE_IN_FLIGHT_CLAIM_RELEASE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(sequence);
+        }
+    });
 }
 
 pub fn github_source_packet_collector() -> SourcePacketCollector {
@@ -363,34 +381,64 @@ pub fn reconcile_review_guide_source_with_collector(
             }
         },
     };
-    let guard = if let Some(endpoints) = &observed {
-        match work_db.select_probe_pr_review_guide_source_row(
+    let (guard, validate_existing) = if let Some(endpoints) = &observed {
+        let existing_row = match work_db.select_probe_pr_review_guide_source_row(
             &root_task_id,
             &pr_url,
             &endpoints.base_sha,
             &endpoints.head_sha,
             observation_sequence,
         ) {
-            Ok(true) => return None,
-            Ok(false) => {}
+            Ok(existing_row) => existing_row,
             Err(error) => {
                 record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
                 return None;
             }
-        }
-        Some(acquire_in_flight_claim(
-            &root_task_id,
-            &pr_url,
-            endpoints,
-            observation_sequence,
-        )?)
+        };
+        (
+            Some(acquire_in_flight_claim(
+                &root_task_id,
+                &pr_url,
+                endpoints,
+                observation_sequence,
+            )?),
+            existing_row,
+        )
     } else {
-        None
+        (None, false)
     };
     Some(boss_task_scope::spawn(async move {
         // Own the guard before the future is polled, including cancellation.
         let guard = guard;
         boss_gh_telemetry::scope(boss_gh_telemetry::callers::REVIEW_GUIDE_SOURCE_CAPTURE, async move {
+            if validate_existing && let Some(endpoints) = observed.clone() {
+                let probe_db = Arc::clone(&work_db);
+                let probe_root = root_task_id.clone();
+                let probe_url = pr_url.clone();
+                let probe_sequence = observation_sequence;
+                match tokio::task::spawn_blocking(move || {
+                    probe_db.select_probe_pr_review_guide_source_capture(
+                        &probe_root,
+                        &probe_url,
+                        &endpoints.base_sha,
+                        &endpoints.head_sha,
+                        probe_sequence,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(true)) => return,
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => {
+                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                        return;
+                    }
+                    Err(error) => {
+                        record_capture_failure(&work_db, &root_task_id, &pr_url, observation_sequence, error);
+                        return;
+                    }
+                }
+            }
             // Completion may already have pinned the delivered head. Preserve
             // its attribution even when fetching fresh metadata fails.
             if let Some(revision) = &revision
@@ -577,7 +625,6 @@ pub fn reconcile_review_guide_source_with_collector(
             };
             let metadata = Some(metadata);
             let result = (collector.collect)(pr_url.clone(), observed, expected_head_branch, metadata).await;
-            let mut persisted_sequence = None;
             for pass in 0..2 {
                 let observation_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
                 apply_capture_result(
@@ -592,41 +639,24 @@ pub fn reconcile_review_guide_source_with_collector(
                     &result,
                     observation_sequence,
                 );
-                persisted_sequence = Some(observation_sequence);
                 #[cfg(test)]
-                run_after_capture_persist();
-                let latest_sequence = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
-                if latest_sequence == observation_sequence {
-                    let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-                    captures.remove(&guard.key);
-                    guard.active = false;
+                run_after_capture_persist(&guard.key);
+                if let Some(snapshot) = release_in_flight_claim(&mut guard, observation_sequence, pass == 1) {
+                    if snapshot != observation_sequence {
+                        apply_capture_result(
+                            CapturePersistContext {
+                                work_db: &work_db,
+                                feature_flags: &feature_flags,
+                                root_task_id: &root_task_id,
+                                pr_url: &pr_url,
+                            },
+                            trigger,
+                            &rest_identity,
+                            &result,
+                            snapshot,
+                        );
+                    }
                     break;
-                }
-                if pass == 1 {
-                    break;
-                }
-            }
-            if guard.active {
-                let snapshot = {
-                    let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
-                    let snapshot = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
-                    captures.remove(&guard.key);
-                    guard.active = false;
-                    snapshot
-                };
-                if persisted_sequence != Some(snapshot) {
-                    apply_capture_result(
-                        CapturePersistContext {
-                            work_db: &work_db,
-                            feature_flags: &feature_flags,
-                            root_task_id: &root_task_id,
-                            pr_url: &pr_url,
-                        },
-                        trigger,
-                        &rest_identity,
-                        &result,
-                        snapshot,
-                    );
                 }
             }
             drop(guard);
@@ -757,6 +787,30 @@ fn apply_capture_result(
             record_capture_failure(work_db, root_task_id, pr_url, observation_sequence, error);
         }
     }
+}
+
+/// Drop the in-flight claim under the map mutex and return the coalesced
+/// sequence. Map lock then sequence lock, matching [`InFlightGuard::acquire_locked`].
+///
+/// When `force` is false, a newer coalesced sequence leaves the claim in
+/// place so another persist pass can run. An arrival injected after the
+/// equal-sequence read is still snapshotted and returned so it can be
+/// persisted outside the lock.
+fn release_in_flight_claim(guard: &mut InFlightGuard, persisted: i64, force: bool) -> Option<i64> {
+    if !guard.active {
+        return None;
+    }
+    let mut captures = in_flight_captures().lock().unwrap_or_else(|error| error.into_inner());
+    let peeked = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
+    if peeked != persisted && !force {
+        return None;
+    }
+    #[cfg(test)]
+    run_before_in_flight_claim_release(&guard.sequence);
+    let snapshot = *guard.sequence.lock().unwrap_or_else(|error| error.into_inner());
+    captures.remove(&guard.key);
+    guard.active = false;
+    Some(snapshot)
 }
 
 fn acquire_in_flight_claim(

@@ -67,11 +67,22 @@ async fn divergent_probe(existing: bool) {
             .unwrap(),
         1
     );
-    assert!(reconcile_review_guide_source_with_collector(db, flags, request(), collector).is_none());
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {
+        panic!("poller pre-spawn path must not read the packet blob");
+    }));
+    let repeat = reconcile_review_guide_source_with_collector(db, flags, request(), collector)
+        .expect("repeat probe still spawns to validate the stored blob");
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {}));
+    repeat.await.unwrap();
     assert_eq!(
         metadata_calls.load(Ordering::SeqCst),
         1,
-        "repeat probe must not spawn metadata fetch"
+        "repeat probe with a valid blob must not fetch metadata"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        usize::from(!existing),
+        "repeat probe with a valid blob must not re-collect"
     );
 }
 
@@ -159,7 +170,10 @@ async fn coalesced_newer_sequence_is_handed_off_so_an_older_comparison_cannot_wi
     set_after_capture_persist_hook(Box::new({
         let passes = persist_passes.clone();
         let key = key_a.clone();
-        move || {
+        move |fired| {
+            if fired != &key {
+                return;
+            }
             let n = passes.fetch_add(1, Ordering::SeqCst);
             if n < 2 {
                 let sequence = if n == 0 { 3 } else { 5 };
@@ -228,6 +242,110 @@ async fn coalesced_newer_sequence_is_handed_off_so_an_older_comparison_cannot_wi
     assert_eq!(
         watermark, 5,
         "the coalesced sequence must be persisted as the series watermark"
+    );
+}
+
+#[tokio::test]
+async fn poller_recollects_when_a_complete_blob_is_missing() {
+    let (dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "missing complete blob");
+    let url = "https://github.com/acme/widget/pull/91";
+    let packet = source_capture_packet(url, "base", "head");
+    let stored = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap();
+    let PrSourceCapturePersistOutcome::Stored(stored) = stored else {
+        panic!("complete comparison must persist");
+    };
+    std::fs::remove_file(dir.path().join(stored.packet_path.expect("artifact path"))).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let collector = crate::test_support::counting_source_collector(calls.clone(), packet.clone());
+    let flags = Arc::new(FeatureFlagsStore::new(dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {
+        panic!("poller pre-spawn path must not read the packet blob");
+    }));
+    let handle = reconcile_review_guide_source_with_collector(
+        db.clone(),
+        flags,
+        SourceCaptureRequest::builder()
+            .root_task_id(root.clone())
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Poller)
+            .observed(PinnedComparison {
+                base_sha: "base".to_owned(),
+                head_sha: "head".to_owned(),
+            })
+            .build(),
+        collector,
+    )
+    .expect("missing blob must still spawn a capture task");
+    crate::work::test_support::set_before_packet_read_hook(Box::new(|| {}));
+    handle.await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "collector must run after the blob is discarded"
+    );
+    let restored = db.get_latest_pr_review_guide_source_capture(&root).unwrap().unwrap();
+    assert_eq!(restored.packet, packet);
+    assert!(restored.complete);
+}
+
+#[tokio::test]
+async fn coalesced_arrival_after_equal_sequence_read_is_still_persisted() {
+    let (_dir, db) = open_db();
+    let db = Arc::new(db);
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "equal-sequence coalesced arrival");
+    let url = "https://github.com/acme/widget/pull/92";
+    let packet = source_capture_packet(url, "base", "head");
+    let collector = crate::test_support::counting_source_collector(Arc::new(AtomicUsize::new(0)), packet.clone());
+    let flags = Arc::new(FeatureFlagsStore::new(_dir.path().join("flags.toml")));
+    flags.set(REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, true).unwrap();
+    struct ClearReleaseHook;
+    impl Drop for ClearReleaseHook {
+        fn drop(&mut self) {
+            clear_before_in_flight_claim_release_hook();
+        }
+    }
+    let _clear_release_hook = ClearReleaseHook;
+    set_before_in_flight_claim_release_hook(Box::new(|sequence| {
+        let mut latest = sequence.lock().unwrap();
+        *latest = (*latest).max(7);
+    }));
+    let handle = reconcile_review_guide_source_with_collector(
+        db.clone(),
+        flags,
+        SourceCaptureRequest::builder()
+            .root_task_id(root.clone())
+            .pr_url(url)
+            .trigger(PrSourceCaptureTrigger::Poller)
+            .observed(PinnedComparison {
+                base_sha: "base".to_owned(),
+                head_sha: "head".to_owned(),
+            })
+            .observation_sequence(2)
+            .build(),
+        collector,
+    )
+    .expect("capture must start");
+    handle.await.unwrap();
+    clear_before_in_flight_claim_release_hook();
+    let watermark: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT latest_observation_sequence FROM pr_review_guide_source_series WHERE canonical_pr_url = ?1",
+            [url],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        watermark, 7,
+        "a coalesced arrival between the equal-sequence read and claim removal must still raise the watermark"
     );
 }
 use crate::feature_flags::FeatureFlagsStore;

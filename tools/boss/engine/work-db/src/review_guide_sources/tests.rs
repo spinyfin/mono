@@ -493,6 +493,42 @@ fn persist_releases_the_database_lock_while_reading_an_existing_blob() {
 }
 
 #[test]
+fn persist_does_not_overwrite_a_concurrent_complete_upgrade_from_a_stale_snapshot() {
+    let (_dir, db) = open_db();
+    let db = std::sync::Arc::new(db);
+    let mut original = incomplete_packet("base", "head", "first hole");
+    original.omissions.push(SourceOmission {
+        path: Some("src/lib.rs".to_owned()),
+        side: Some(SourceSide::Before),
+        reason: "second hole".to_owned(),
+        terminal: true,
+    });
+    db.persist_pr_review_guide_source_capture("root", 1, PrSourceCaptureTrigger::Creation, &original)
+        .unwrap();
+    let stale_upgrade = incomplete_packet("base", "head", "first hole");
+    crate::test_support::set_before_packet_read_hook(Box::new({
+        let db = db.clone();
+        move || {
+            db.persist_pr_review_guide_source_capture(
+                "root",
+                2,
+                PrSourceCaptureTrigger::Poller,
+                &packet("base", "head"),
+            )
+            .unwrap();
+        }
+    }));
+    db.persist_pr_review_guide_source_capture("root", 3, PrSourceCaptureTrigger::Poller, &stale_upgrade)
+        .unwrap();
+    let stored = db.get_latest_pr_review_guide_source_capture("root").unwrap().unwrap();
+    assert!(
+        stored.complete,
+        "a concurrent complete upgrade must survive a stale incomplete persist"
+    );
+    assert_eq!(stored.omission_count, 0);
+}
+
+#[test]
 fn incomplete_artifacts_recover_for_missing_corrupt_and_identical_replacements() {
     for corrupt in [false, true] {
         for identical in [false, true] {

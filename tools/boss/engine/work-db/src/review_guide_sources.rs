@@ -279,9 +279,7 @@ impl WorkDb {
             }
             let current_meta =
                 capture_metadata_by_endpoints(&tx, &series_id, &packet.observed_base_sha, &packet.head_sha)?;
-            if existing.as_ref().map(|existing| existing.comparison_id.as_str())
-                != current_meta.as_ref().map(|meta| meta.comparison_id.as_str())
-            {
+            if capture_version_changed(existing.as_ref(), current_meta.as_ref()) {
                 tx.commit()?;
                 drop(conn);
                 continue;
@@ -329,6 +327,11 @@ impl WorkDb {
                 }
                 select_comparison(&tx, &series_id, &existing.comparison_id, observation_sequence, &now)?;
                 tx.commit()?;
+                drop(conn);
+                drop(_publication);
+                if let Some(path) = published.as_ref() {
+                    gc_packet_blob(self, &artifact_root, path);
+                }
                 return Ok(PrSourceCapturePersistOutcome::Existing(existing));
             }
 
@@ -894,26 +897,45 @@ fn discard_unreadable_capture(
     meta: &CaptureMetadata,
     error: &LoadPacketError,
 ) -> Result<()> {
-    if let Some(path) = &meta.packet_path {
-        match fs::remove_file(artifact_root.join(path)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
     let mut conn = db.connect()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
-        "UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL WHERE id = ?1 AND selected_comparison_id = ?2",
-        params![series_id, meta.comparison_id],
+        "UPDATE pr_review_guide_source_series SET selected_comparison_id = NULL
+         WHERE id = ?1 AND selected_comparison_id = ?2
+           AND EXISTS (
+               SELECT 1 FROM pr_review_guide_source_comparisons c
+               WHERE c.id = ?2 AND c.packet_hash = ?3 AND c.packet_path IS ?4
+           )",
+        params![series_id, meta.comparison_id, meta.packet_hash, meta.packet_path],
     )?;
-    tx.execute(
-        "DELETE FROM pr_review_guide_source_comparisons WHERE id = ?1",
-        [&meta.comparison_id],
+    let deleted = tx.execute(
+        "DELETE FROM pr_review_guide_source_comparisons
+         WHERE id = ?1 AND packet_hash = ?2 AND packet_path IS ?3",
+        params![meta.comparison_id, meta.packet_hash, meta.packet_path],
     )?;
     tx.commit()?;
-    tracing::warn!(%error, comparison_id = meta.comparison_id, "invalid source artifact; replacing comparison");
+    drop(conn);
+    if deleted > 0 {
+        if let Some(path) = &meta.packet_path {
+            gc_packet_blob(db, artifact_root, path);
+        }
+        tracing::warn!(%error, comparison_id = meta.comparison_id, "invalid source artifact; replacing comparison");
+    }
     Ok(())
+}
+
+fn capture_version_changed(existing: Option<&PrReviewGuideSourceCapture>, current: Option<&CaptureMetadata>) -> bool {
+    match (existing, current) {
+        (None, None) => false,
+        (Some(existing), Some(current)) => {
+            existing.comparison_id != current.comparison_id
+                || existing.packet_hash != current.packet_hash
+                || existing.packet_path != current.packet_path
+                || existing.complete != current.complete
+                || existing.omission_count != current.omission_count
+        }
+        _ => true,
+    }
 }
 
 fn gc_packet_blob(db: &WorkDb, artifact_root: &Path, relative: &str) {
@@ -1050,11 +1072,9 @@ pub(super) fn load_packet(
     expected_hash: &str,
 ) -> std::result::Result<SourcePacket, LoadPacketError> {
     #[cfg(any(test, feature = "test-support"))]
-    BEFORE_PACKET_READ.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
+    if let Some(hook) = BEFORE_PACKET_READ.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
     let Some(packet_path) = packet_path.filter(|path| !path.is_empty()) else {
         return Err(LoadPacketError::Missing { path: None });
     };
