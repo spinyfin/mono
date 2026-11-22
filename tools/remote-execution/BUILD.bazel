@@ -10,6 +10,14 @@ exports_files(
     visibility = ["//.buildkite/steps/tests:__pkg__"],
 )
 
+exports_files(
+    ["root_fs.py"],
+    visibility = [
+        "//tools/remote-execution/grafana:__pkg__",
+        "//tools/remote-execution/prometheus:__pkg__",
+    ],
+)
+
 # The hub's health check against a stub hub: a scheduling hub is healthy, and
 # the eviction loop, missing workers, a queue that does not move and a hub that
 # does not answer are each reported.

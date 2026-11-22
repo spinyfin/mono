@@ -290,7 +290,7 @@ def validate_config(text):
     return config
 
 
-def run_promtool(config_file, promtool_bin=None):
+def run_promtool(config_file, promtool_bin=None, syntax_only=False):
     binary = promtool_bin or os.environ.get("PROMTOOL") or shutil.which("promtool")
     if not binary:
         for candidate in ("/usr/local/bin/promtool", "/usr/bin/promtool"):
@@ -299,7 +299,11 @@ def run_promtool(config_file, promtool_bin=None):
                 break
     if not binary:
         raise FileNotFoundError("promtool binary not found")
-    subprocess.run([binary, "check", "config", str(config_file)], check=True)
+    cmd = [binary, "check", "config"]
+    if syntax_only:
+        cmd.append("--syntax-only")
+    cmd.append(str(config_file))
+    subprocess.run(cmd, check=True)
 
 
 if __name__ == "__main__":

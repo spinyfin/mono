@@ -4,15 +4,17 @@ import os
 from pathlib import Path
 import plistlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-import install
-from validate import validate_config
-
 HERE = Path(__file__).resolve().parent
 NODE_EXPORTER_DIR = HERE.parent / "node_exporter"
+sys.path.append(str(HERE.parent))
+
+import install
+from validate import run_promtool, validate_config
 
 
 class PrometheusConfigTest(unittest.TestCase):
@@ -28,6 +30,14 @@ class PrometheusConfigTest(unittest.TestCase):
             ["headcrash", "anaplian", "arbitrary", "determinist", "rascal", "skaffen", "zakalwe"],
             instances,
         )
+        run_promtool(HERE / "prometheus.yml", syntax_only=True)
+
+    def test_promtool_rejects_invalid_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.yml"
+            bad.write_text("global:\n  scrape_interval: nonsense\n")
+            with self.assertRaises(subprocess.CalledProcessError):
+                run_promtool(bad, syntax_only=True)
 
     def test_rejects_wildcard_and_non_loopback_hub_targets(self):
         bad_configs = [
@@ -95,6 +105,34 @@ class PrometheusConfigTest(unittest.TestCase):
             self.assertEqual(2, reload_service.call_count)
             self.assertFalse((Path(tmp) / ".reload-required").exists())
 
+    def test_ensure_can_reload_requires_yes(self):
+        install.ensure_can_reload(run=lambda *_, **__: subprocess.CompletedProcess([], 0, stdout="yes\n"))
+        with self.assertRaisesRegex(RuntimeError, "CanReload"):
+            install.ensure_can_reload(run=lambda *_, **__: subprocess.CompletedProcess([], 0, stdout="no\n"))
+
+    def test_reload_and_verify_checks_metrics(self):
+        run_reload = Mock()
+        samples = iter([(1.0, 100.0), (1.0, 100.0), (1.0, 105.0)])
+        install.reload_and_verify(
+            run_reload,
+            fetch_metrics=lambda: next(samples),
+            timeout_seconds=5.0,
+            poll_interval=0.1,
+            sleep=lambda _: None,
+            monotonic=iter([0.0, 0.1, 0.2]).__next__,
+        )
+        run_reload.assert_called_once_with()
+
+        with self.assertRaisesRegex(RuntimeError, "did not succeed"):
+            install.reload_and_verify(
+                Mock(),
+                fetch_metrics=lambda: (0.0, 100.0),
+                timeout_seconds=1.0,
+                poll_interval=0.1,
+                sleep=lambda _: None,
+                monotonic=iter([0.0, 1.5]).__next__,
+            )
+
 
 class NodeExporterSetupTest(unittest.TestCase):
     def test_macos_plist_has_keepalive_and_throttle(self):
@@ -127,6 +165,10 @@ class NodeExporterSetupTest(unittest.TestCase):
         self.assertIn("127.0.0.1:9100", setup)
         self.assertIn("prometheus-node-exporter", setup)
         self.assertIn("tailscale", setup)
+        self.assertIn("tailscaled.service", setup)
+        self.assertIn("StartLimitIntervalSec=0", setup)
+        self.assertIn("Restart=always", setup)
+        self.assertIn("daemon-reload", setup)
 
 
 if __name__ == "__main__":

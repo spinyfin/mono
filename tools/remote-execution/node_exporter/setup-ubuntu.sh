@@ -48,6 +48,25 @@ if [[ ! -f "${defaults_file}" ]] || [[ "$(cat "${defaults_file}")" != "${desired
   changed=1
 fi
 
+if [[ "${mode}" == "worker" ]]; then
+  dropin_dir="/etc/systemd/system/prometheus-node-exporter.service.d"
+  dropin_file="${dropin_dir}/tailscale.conf"
+  desired_dropin="[Unit]
+After=tailscaled.service
+Wants=tailscaled.service
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=10"
+  if [[ ! -f "${dropin_file}" ]] || [[ "$(cat "${dropin_file}")" != "${desired_dropin}" ]]; then
+    sudo mkdir -p "${dropin_dir}"
+    printf '%s\n' "${desired_dropin}" | sudo tee "${dropin_file}" >/dev/null
+    sudo systemctl daemon-reload
+    changed=1
+  fi
+fi
+
 sudo systemctl enable --now prometheus-node-exporter.service
 if ((changed == 1)); then
   sudo systemctl restart prometheus-node-exporter.service

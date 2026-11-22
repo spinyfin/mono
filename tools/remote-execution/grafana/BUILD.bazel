@@ -14,5 +14,6 @@ sh_test(
         "publish.sh",
         "test_grafana.py",
         "validate.py",
+        "//tools/remote-execution:root_fs.py",
     ],
 )

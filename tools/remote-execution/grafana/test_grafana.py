@@ -10,10 +10,11 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+HERE = Path(__file__).resolve().parent
+sys.path.append(str(HERE.parent))
+
 import install
 from validate import DASHBOARDS, PROVIDER, canonical, load_bundle, parse, resolve_normalize_target, validate_bundle
-
-HERE = Path(__file__).resolve().parent
 
 
 class DashboardsTest(unittest.TestCase):

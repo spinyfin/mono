@@ -1,6 +1,8 @@
 # Prometheus for the NativeLink hub on this host. The hub pushes its metrics
-# here over OTLP (see OTEL_* in ~bduff/nativelink-macos-hub/hub.env); nothing
-# is scraped except Prometheus itself. Listens on loopback only.
+# here over OTLP (see OTEL_* in ~bduff/nativelink-macos-hub/hub.env), and this
+# config scrapes Prometheus itself, the NativeLink OTLP collector (nativelink),
+# hub pool metrics (nativelink-pool), and per-host node_exporter targets (node).
+# Listens on loopback only.
 #
 # This runs the upstream binary in /usr/local/bin, not Ubuntu's: the Ubuntu
 # package has the OTLP ingestion endpoint compiled out (Debian bug 1080354).
