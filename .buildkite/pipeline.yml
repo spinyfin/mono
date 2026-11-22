@@ -28,8 +28,8 @@ steps:
     command: "bash .buildkite/steps/verify-boss-tag-cache.sh"
     agents:
       queue: "bazel-any"
-      os: "darwin"
-      arch: "arm64"
+      os: "${BOSS_TAG_CACHE_OS:-darwin}"
+      arch: "${BOSS_TAG_CACHE_ARCH:-arm64}"
 
   - label: ":bazel: bazel-build-test"
     key: "bazel-build-test"

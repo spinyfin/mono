@@ -51,7 +51,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 
 ### `verify-boss-tag-cache.sh`
 
-CI operators can set `BOSS_VERIFY_TAG_CACHE=1` when creating a build of a specific commit to enable two diagnostic jobs on macOS arm64 `bazel-any` agents. The jobs rendezvous while running to ensure distinct agents, then the second waits for the first to populate the cache. Both use the normal CI cache configuration, print the derived workspace status, and build and test the version-dependent CLI. Each uploads workspace status, Bazel execution logs, and profiles as artifacts; compare these alongside the action-cache counts and cached-test results in the job logs. These diagnostic jobs are skipped in ordinary builds.
+CI operators can set `BOSS_VERIFY_TAG_CACHE=1` when creating a build of a specific commit to enable two diagnostic jobs on compatible `bazel-any` agents. The default platform is macOS arm64; set `BOSS_TAG_CACHE_OS=linux` and `BOSS_TAG_CACHE_ARCH=amd64` to compare Linux agents instead. The jobs rendezvous while running to ensure distinct agents, then the second waits for the first to populate the cache. Both use the normal CI cache configuration, print the derived workspace status, and build and test the version-dependent CLI. Each uploads workspace status, Bazel execution logs, and profiles as artifacts; compare these alongside the action-cache counts and cached-test results in the job logs. These diagnostic jobs are skipped in ordinary builds.
 
 ### `ci-env.sh`
 
