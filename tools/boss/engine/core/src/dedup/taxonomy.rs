@@ -6,7 +6,7 @@
 //! The query is same-product, non-terminal work items (tasks, chores,
 //! revisions, projects). Overflow is logged, never silently dropped.
 //!
-//! ## R15 settlement
+//! ## R15 (provisional)
 //!
 //! Combined cap K = 48 (24 attentions + 24 work items). The work-item
 //! side applies a most-recently-updated prefilter: each of the four
@@ -14,8 +14,11 @@
 //! unused combined-cap slots fill from the remaining most-recently-updated
 //! items so a product with many tasks and few chores still contributes
 //! chores. Always applying MRU-N is a no-op under the cap and the right
-//! prefilter when a product has 50+ open tasks (revisions multiply the
-//! `tasks` table; a busy product regularly exceeds that threshold).
+//! prefilter if products have 50+ open tasks. The MRU-always policy is
+//! provisional: per-product open-item counts have not been measured, so
+//! whether products regularly exceed that threshold is unconfirmed. The
+//! prefilter is a no-op under the cap, so applying it always is safe in the
+//! meantime.
 //!
 //! Work-item ids use the engine's friendly forms: `T{n}` for every
 //! `tasks`-table row (chores and revisions included) and `P{n}` for
@@ -73,11 +76,13 @@ pub fn load_existing_work_items(db: &WorkDb, product_id: &str, taxonomy_enabled:
         TAXONOMY_PER_KIND_CAP,
         TAXONOMY_WORK_ITEM_CAP,
     )?;
-    for overflow in overflows {
-        tracing::warn!(
+    if !overflows.is_empty() {
+        // Overflow is an expected steady state for a busy product, so one
+        // summary line per call at info rather than a warn per kind.
+        let dropped: Vec<String> = overflows.iter().map(|o| format!("{}={}", o.kind, o.dropped)).collect();
+        tracing::info!(
             product_id,
-            kind = %overflow.kind,
-            dropped = overflow.dropped,
+            dropped = %dropped.join(","),
             per_kind_cap = TAXONOMY_PER_KIND_CAP,
             combined_cap = TAXONOMY_WORK_ITEM_CAP,
             "dedup taxonomy: work-item comparison set overflow; dropped least-recently-updated items"
@@ -104,9 +109,11 @@ pub fn load_existing_work_items_with_caps(
 
 /// Rank and cap a pre-built candidate list. Pure: no DB, no logging.
 ///
-/// Each kind keeps up to `per_kind_cap` most-recently-updated items.
-/// Unused `combined_cap` slots fill from the remaining items, newest
-/// first. Leftovers become [`TaxonomyOverflow`] rows.
+/// Each kind keeps up to `per_kind_cap` most-recently-updated items, in
+/// [`KIND_ORDER`], never exceeding `combined_cap` in total (when the
+/// guarantees do not all fit, earlier kinds in `KIND_ORDER` win). Unused
+/// `combined_cap` slots fill from the remaining items, newest first.
+/// Everything not selected becomes a [`TaxonomyOverflow`] row.
 pub fn select_taxonomy_briefs(
     candidates: Vec<TaxonomyCandidate>,
     per_kind_cap: usize,
@@ -125,7 +132,9 @@ pub fn select_taxonomy_briefs(
             continue;
         };
         items.sort_by(mru_then_id);
-        let take = per_kind_cap.min(items.len());
+        let take = per_kind_cap
+            .min(items.len())
+            .min(combined_cap.saturating_sub(selected.len()));
         selected.extend(items.drain(..take));
         remainder.extend(items);
     }
@@ -154,7 +163,9 @@ pub fn select_taxonomy_briefs(
 
 fn candidates_from_db(db: &WorkDb, product_id: &str) -> Result<Vec<TaxonomyCandidate>> {
     let mut out = Vec::new();
-    for task in db.list_tasks(product_id, None, None, false)? {
+    // Terminal rows are excluded in SQL; the Rust-side checks below are a
+    // guard only.
+    for task in db.list_open_tasks_mru(product_id)? {
         if task.status.is_terminal() {
             continue;
         }
@@ -167,7 +178,7 @@ fn candidates_from_db(db: &WorkDb, product_id: &str) -> Result<Vec<TaxonomyCandi
             brief,
         });
     }
-    for project in db.list_projects(product_id, None)? {
+    for project in db.list_open_projects_mru(product_id)? {
         if project_is_terminal(project.status) {
             continue;
         }
@@ -431,9 +442,9 @@ mod tests {
         // guarantee 2 tasks + 1 chore, then fill 2 more tasks from remainder.
         let mut items = Vec::new();
         for i in 0..8 {
-            items.push(candidate("task", &format!("T{i}"), 100 + i));
+            items.push(candidate("task", &format!("task-{i}"), 100 + i));
         }
-        items.push(candidate("chore", "C1", 50));
+        items.push(candidate("chore", "chore-oldest", 50));
         let (briefs, overflows) = select_taxonomy_briefs(items, 2, 5);
         assert_eq!(briefs.len(), 5);
         let tasks = briefs.iter().filter(|b| b.kind == "task").count();
@@ -447,10 +458,10 @@ mod tests {
             .filter(|b| b.kind == "task")
             .map(|b| b.work_item_id.as_str())
             .collect();
-        assert!(task_ids.contains(&"T7"));
-        assert!(task_ids.contains(&"T6"));
-        assert!(task_ids.contains(&"T5"));
-        assert!(task_ids.contains(&"T4"));
+        assert!(task_ids.contains(&"task-7"));
+        assert!(task_ids.contains(&"task-6"));
+        assert!(task_ids.contains(&"task-5"));
+        assert!(task_ids.contains(&"task-4"));
         assert_eq!(
             overflows,
             vec![TaxonomyOverflow {
@@ -461,11 +472,74 @@ mod tests {
     }
 
     #[test]
+    fn combined_cap_bounds_guaranteed_slots() {
+        let items = vec![
+            candidate("task", "task-a", 4),
+            candidate("chore", "chore-a", 3),
+            candidate("revision", "revision-a", 2),
+            candidate("project", "project-a", 1),
+        ];
+        let (briefs, overflows) = select_taxonomy_briefs(items.clone(), 1, 2);
+        let ids: Vec<_> = briefs.iter().map(|b| b.work_item_id.as_str()).collect();
+        assert_eq!(ids, vec!["task-a", "chore-a"]);
+        let dropped: usize = overflows.iter().map(|o| o.dropped).sum();
+        assert_eq!(dropped, 2);
+
+        let (briefs, overflows) = select_taxonomy_briefs(items, 1, 0);
+        assert!(briefs.is_empty());
+        assert_eq!(overflows.iter().map(|o| o.dropped).sum::<usize>(), 4);
+    }
+
+    #[test]
+    fn output_is_ordered_most_recently_updated_first() {
+        let items = vec![
+            candidate("project", "project-b", 10),
+            candidate("task", "task-b", 30),
+            candidate("chore", "chore-b", 20),
+        ];
+        let (briefs, _) = select_taxonomy_briefs(items, 6, 24);
+        let ids: Vec<_> = briefs.iter().map(|b| b.work_item_id.as_str()).collect();
+        assert_eq!(ids, vec!["task-b", "chore-b", "project-b"]);
+    }
+
+    #[test]
+    fn blocked_and_in_review_included_and_deleted_excluded() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let blocked = create_test_chore_manual(&db, product.id.clone(), "blocked chore");
+        let review = create_test_chore_manual(&db, product.id.clone(), "review chore");
+        let deleted = create_test_chore_manual(&db, product.id.clone(), "deleted chore");
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ?1",
+                rusqlite::params![blocked.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![review.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET deleted_at = '1' WHERE id = ?1",
+                rusqlite::params![deleted.id],
+            )
+            .unwrap();
+        }
+        let briefs = load_existing_work_items(&db, &product.id, true).unwrap();
+        let ids: Vec<_> = briefs.iter().map(|b| b.work_item_id.clone()).collect();
+        assert!(ids.contains(&short_id_label(blocked.short_id).unwrap()), "{ids:?}");
+        assert!(ids.contains(&short_id_label(review.short_id).unwrap()), "{ids:?}");
+        assert!(!ids.contains(&short_id_label(deleted.short_id).unwrap()), "{ids:?}");
+    }
+
+    #[test]
     fn under_cap_keeps_everything_and_reports_no_overflow() {
         let items = vec![
-            candidate("task", "T1", 3),
-            candidate("chore", "C1", 2),
-            candidate("project", "P1", 1),
+            candidate("task", "task-newest", 3),
+            candidate("chore", "chore-mid", 2),
+            candidate("project", "project-oldest", 1),
         ];
         let (briefs, overflows) = select_taxonomy_briefs(items, 6, 24);
         assert_eq!(briefs.len(), 3);
