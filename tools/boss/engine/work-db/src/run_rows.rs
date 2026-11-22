@@ -309,7 +309,9 @@ impl WorkDb {
     /// record cannot erase a value captured by an earlier hook. A snapshot
     /// rebuilt after transcript replacement assigns every field verbatim,
     /// including NULL, so values removed from the new generation cannot
-    /// survive. Cache-write TTL splits additionally carry an observed/known
+    /// survive. The one exception is `model`: it is cleared when the snapshot
+    /// is `model_mixed`, and otherwise falls back to the execution's recorded
+    /// launch model when the snapshot observed none. Cache-write TTL splits additionally carry an observed/known
     /// signal because NULL also means "usage observed but the provider omitted
     /// its TTL breakdown".
     pub fn set_run_cost_snapshot(

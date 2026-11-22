@@ -369,4 +369,34 @@ async fn model_less_agy_snapshots_keep_the_launch_model_until_observed_or_mixed(
         .await
         .unwrap();
     assert_eq!(model_of_report(&db).0, None);
+
+    // A model-less row alongside one observed model keeps the observed model.
+    std::fs::write(&path, format!("{}{}", step(1, None), step(2, Some("gemini-observed")))).unwrap();
+    capture.forget(&execution.id);
+    capture
+        .capture_and_persist(&db, &execution.id, &path, None)
+        .await
+        .unwrap();
+    assert_eq!(model_of_report(&db).0.as_deref(), Some("gemini-observed"));
+    let mut appended = std::fs::read_to_string(&path).unwrap();
+    appended.push_str(&step(3, None));
+    std::fs::write(&path, appended).unwrap();
+    capture
+        .capture_and_persist(&db, &execution.id, &path, None)
+        .await
+        .unwrap();
+    assert_eq!(model_of_report(&db).0.as_deref(), Some("gemini-observed"));
+
+    // A Grok turn spread across several models clears the launch model.
+    let grok = json!({"method":"session/update","params":{"update":{
+        "sessionUpdate":"turn_completed","prompt_id":"p1",
+        "usage":{"inputTokens":10,"cachedReadTokens":0,"outputTokens":5,"modelCalls":2,
+            "modelUsage":{"grok-a":{},"grok-b":{}}}}}});
+    std::fs::write(&path, format!("{grok}\n")).unwrap();
+    capture.forget(&execution.id);
+    capture
+        .capture_and_persist(&db, &execution.id, &path, None)
+        .await
+        .unwrap();
+    assert_eq!(model_of_report(&db).0, None);
 }
