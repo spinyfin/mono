@@ -873,4 +873,39 @@ mod tests {
         assert_eq!(out.body, raw);
         assert!(!out.is_error);
     }
+
+    #[test]
+    fn shell_strings_with_await_or_bash_let_keep_command_and_issues_command() {
+        for command in ["echo await; sleep 999", "let n=1; sleep 999"] {
+            let payload = json!({
+                "name": "exec",
+                "call_id": "c-shell",
+                "input": command,
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+            assert!(call.issues_command, "{command}");
+            assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some(command));
+        }
+    }
+
+    #[test]
+    fn array_object_literal_before_division_recovers_exec_command() {
+        let payload = json!({
+            "name": "exec",
+            "call_id": "c-obj-div",
+            "input": r#"const values = [{} / 2]; await tools.exec_command({cmd:"sleep 999"});"#,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
+    }
 }

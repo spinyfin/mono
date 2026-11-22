@@ -322,13 +322,21 @@ pub fn script_is_compute_only(source: &str) -> bool {
 }
 
 /// Unambiguous JavaScript cell syntax that is not a shell one-liner: a
-/// top-level `await`, a `const`/`let` declaration, or an arrow `=>`.
-/// String, comment and regex bodies are skipped so `echo hi` and
-/// `sleep 5; echo done` stay shell.
+/// statement/expression-positioned `await <expr>`, a `const <ident> =` or
+/// `const`/`let` destructuring declaration, or an arrow `=>`.
+/// String, comment and regex bodies are skipped so `echo await; sleep 999`,
+/// `grep -rn await src`, and bash `let n=1; sleep 999` stay shell.
 fn script_has_unambiguous_js_cell_syntax(source: &str) -> bool {
     let mut lexer = JsLexer::new(source);
-    while let Some((at, ch)) = lexer.next_code() {
-        if ch == '=' && source.get(at + 1..).is_some_and(|rest| rest.starts_with('>')) {
+    loop {
+        let prev = lexer.last;
+        let Some((at, ch)) = lexer.next_code() else {
+            break;
+        };
+        if ch == '='
+            && matches!(prev, LastJsToken::Operand | LastJsToken::Word { .. })
+            && source.get(at + 1..).is_some_and(|rest| rest.starts_with('>'))
+        {
             return true;
         }
         if !js_ident_part(ch) || ch.is_ascii_digit() {
@@ -337,18 +345,104 @@ fn script_has_unambiguous_js_cell_syntax(source: &str) -> bool {
         let rest = &source[at..];
         let ident_len = rest.find(|c: char| !js_ident_part(c)).unwrap_or(rest.len());
         let ident = &rest[..ident_len];
-        if ident == "await" {
-            return true;
+        if ident == "await" && prev_allows_await(source, prev) {
+            let after = rest[ident_len..].trim_start();
+            if after.starts_with('"')
+                || after.starts_with('\'')
+                || after.starts_with('`')
+                || (after.starts_with('/') && !after.starts_with("//") && !after.starts_with("/*"))
+            {
+                return true;
+            }
+            if let Some((_, next)) = lexer.next_code()
+                && (js_ident_part(next) || matches!(next, '(' | '[' | '{' | '+' | '-' | '!' | '~'))
+            {
+                return true;
+            }
+            continue;
         }
-        if (ident == "const" || ident == "let")
+        if ident == "const" && prev_allows_js_decl(source, prev) {
+            if let Some((_, next)) = lexer.next_code() {
+                if matches!(next, '{' | '[') {
+                    return true;
+                }
+                if js_ident_part(next)
+                    && !next.is_ascii_digit()
+                    && let Some((eq_at, '=')) = lexer.next_code()
+                    && !source
+                        .get(eq_at + 1..)
+                        .is_some_and(|tail| tail.starts_with('=') || tail.starts_with('>'))
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+        if ident == "let"
+            && prev_allows_js_decl(source, prev)
             && let Some((_, next)) = lexer.next_code()
-            && js_ident_part(next)
-            && !next.is_ascii_digit()
+            && matches!(next, '{' | '[')
         {
             return true;
         }
     }
     false
+}
+
+fn prev_allows_await(source: &str, prev: LastJsToken) -> bool {
+    match prev {
+        LastJsToken::Start => true,
+        LastJsToken::Punct(ch) => matches!(
+            ch,
+            ';' | '{'
+                | '}'
+                | '='
+                | '('
+                | '['
+                | ','
+                | ':'
+                | '?'
+                | '!'
+                | '~'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '&'
+                | '|'
+                | '^'
+                | '<'
+                | '>'
+        ),
+        LastJsToken::Word { start, end } => matches!(
+            source.get(start..end),
+            Some(
+                "return"
+                    | "yield"
+                    | "throw"
+                    | "case"
+                    | "else"
+                    | "do"
+                    | "await"
+                    | "typeof"
+                    | "void"
+                    | "delete"
+                    | "in"
+                    | "of"
+            )
+        ),
+        LastJsToken::Operand => false,
+    }
+}
+
+fn prev_allows_js_decl(source: &str, prev: LastJsToken) -> bool {
+    match prev {
+        LastJsToken::Start => true,
+        LastJsToken::Punct(ch) => matches!(ch, ';' | '{' | '}' | '('),
+        LastJsToken::Word { start, end } => matches!(source.get(start..end), Some("else")),
+        LastJsToken::Operand => false,
+    }
 }
 
 /// Whether `source` names a command-bearing helper anywhere in code (not only
@@ -594,13 +688,48 @@ impl<'a> JsLexer<'a> {
         }
     }
 
-    /// Whether `{` here opens an object literal (`=`, `(`, `,`, `:`, or
-    /// `return`) rather than a statement block (start, `;`, `{`, `}`, `)`,
-    /// `=>`, `else`/`do` and similar).
+    /// Whether `{` here opens an object literal (expression context such as
+    /// `=`, `(`, `[`, `,`, `:`, `?`, `!`, `&`, `|`, `.`, `return`, `typeof`,
+    /// `void`, etc.) rather than a statement block (start, `;`, `{`, `}`,
+    /// `)`, `=>`, `else`/`do`/`try`/`finally`).
     fn opens_object_literal(&self) -> bool {
         match self.last {
-            LastJsToken::Word { start, end } => matches!(self.source.get(start..end), Some("return")),
-            LastJsToken::Punct(ch) => matches!(ch, '=' | '(' | ',' | ':'),
+            LastJsToken::Word { start, end } => matches!(
+                self.source.get(start..end),
+                Some(
+                    "return"
+                        | "typeof"
+                        | "void"
+                        | "delete"
+                        | "throw"
+                        | "new"
+                        | "yield"
+                        | "await"
+                        | "in"
+                        | "of"
+                        | "case"
+                )
+            ),
+            LastJsToken::Punct(ch) => matches!(
+                ch,
+                '=' | '('
+                    | '['
+                    | ','
+                    | ':'
+                    | '?'
+                    | '!'
+                    | '~'
+                    | '+'
+                    | '-'
+                    | '*'
+                    | '/'
+                    | '%'
+                    | '&'
+                    | '|'
+                    | '^'
+                    | '<'
+                    | '.'
+            ),
             _ => false,
         }
     }
@@ -1382,9 +1511,24 @@ mod tests {
         assert!(script_is_compute_only("const values = [1, 2, 3].map(n => n * 2);"));
         assert!(!script_is_compute_only("echo hi"));
         assert!(!script_is_compute_only("sleep 5; echo done"));
+        assert!(!script_is_compute_only("echo await; sleep 999"));
+        assert!(!script_is_compute_only("grep -rn await src"));
+        assert!(!script_is_compute_only("let n=1; sleep 999"));
         let poll = r#"const p = await tools.write_stdin({session_id:8467,chars:""});"#;
         assert!(!script_is_compute_only(poll));
         assert!(script_is_continuation_only(poll));
+    }
+
+    #[test]
+    fn object_literal_in_array_or_expression_before_division_keeps_later_command_visible() {
+        let array_source = r#"const values = [{} / 2]; await tools.exec_command({cmd:"sleep 999"});"#;
+        assert!(script_issues_command(array_source));
+        assert!(!script_is_compute_only(array_source));
+        assert_eq!(cell_script_command(array_source).as_deref(), Some("sleep 999"));
+
+        let ternary_source = r#"const v = ok ? {a:1} / 2 : 0; await tools.exec_command({cmd:"sleep 999"});"#;
+        assert!(script_issues_command(ternary_source));
+        assert_eq!(cell_script_command(ternary_source).as_deref(), Some("sleep 999"));
     }
 
     #[test]

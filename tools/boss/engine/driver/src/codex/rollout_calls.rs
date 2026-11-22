@@ -627,8 +627,8 @@ impl RolloutCallTracker {
     }
 
     /// Persist the observed session (or an unresolved-poll marker) on a
-    /// self-resolved write_stdin continuation left open, so drain can flag
-    /// it even when `tool_input` has no literal `session_id`.
+    /// self-resolved write_stdin continuation left open, and bind the session
+    /// to that open poll so a subsequent poll of the same session closes it.
     fn remember_open_poll(&mut self, origin: &str, call_id: &str, session_id: Option<&str>) {
         if origin != call_id {
             return;
@@ -639,10 +639,14 @@ impl RolloutCallTracker {
         if call.issues_command || !is_write_stdin_poll(call) {
             return;
         }
-        call.open_poll = Some(match session_id {
-            Some(id) if !id.is_empty() => OpenPoll::Session(id.to_owned()),
+        let open_poll = match session_id {
+            Some(id) if !id.is_empty() => {
+                self.sessions.insert(id.to_owned(), origin.to_owned());
+                OpenPoll::Session(id.to_owned())
+            }
             _ => OpenPoll::Unresolved,
-        });
+        };
+        call.open_poll = Some(open_poll);
     }
 
     /// Whether any call is still open.
@@ -1738,5 +1742,48 @@ mod tests {
             .filter_map(abandoned_call_display)
             .collect();
         assert_eq!(flagged, ["write_stdin session 8467 (no terminal result observed)"]);
+    }
+
+    #[test]
+    fn a_later_write_stdin_terminal_poll_closes_a_self_resolved_running_poll() {
+        let mut tracker = RolloutCallTracker::default();
+        let exec_payload = json!({
+            "name": "exec_command",
+            "call_id": "exec",
+            "arguments": r#"{"cmd":"sleep 2"}"#
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let exec_canonical = boss_engine_codex_rollout::canonical_rollout_tool_call("function_call", &exec_payload)
+            .expect("canonicalises");
+        let exec_call = RolloutToolCall {
+            tool_name: exec_canonical.tool_name,
+            tool_input: exec_canonical.tool_input,
+            issues_command: exec_canonical.issues_command,
+            open_poll: None,
+        };
+        tracker.observe_call("exec", exec_call).unwrap();
+        assert!(matches!(
+            tracker.observe_output("exec", &json!("Process running with session ID 8467")),
+            Ok(OutputDisposition::Completed(_))
+        ));
+
+        tracker
+            .observe_call("poll-1", write_stdin_call("poll-1", 8467))
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("poll-1", &json!("Process running with session ID 8467")),
+            Ok(OutputDisposition::StillRunning { .. })
+        ));
+
+        tracker
+            .observe_call("poll-2", write_stdin_call("poll-2", 8467))
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("poll-2", &json!("Process exited with code 0\nOutput:\n")),
+            Ok(OutputDisposition::Completed(_))
+        ));
+        assert!(tracker.drain_open_calls().is_empty());
     }
 }

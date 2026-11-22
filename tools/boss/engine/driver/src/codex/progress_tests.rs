@@ -2239,3 +2239,112 @@ fn a_background_wait_inside_a_turn_reports_no_turn_boundary() {
         "the turn's Stop is the only turn boundary in the stream: {boundaries:?}"
     );
 }
+
+#[test]
+fn a_direct_write_stdin_running_poll_closed_by_later_terminal_poll_is_not_flagged() {
+    let mut session = cell_harness_session();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call",
+                "name":"exec_command",
+                "call_id":"call-exec",
+                "arguments":"{\"cmd\":\"sleep 2\"}"
+            }
+        }))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-exec",
+                "output":"Process running with session ID 8467"
+            }
+        }))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call",
+                "name":"write_stdin",
+                "call_id":"call-poll-1",
+                "arguments":"{\"session_id\":8467,\"chars\":\"\"}"
+            }
+        }))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-poll-1",
+                "output":"Process running with session ID 8467"
+            }
+        }))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call",
+                "name":"write_stdin",
+                "call_id":"call-poll-2",
+                "arguments":"{\"session_id\":8467,\"chars\":\"\"}"
+            }
+        }))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-poll-2",
+                "output":"Process exited with code 0\nOutput:\n"
+            }
+        }))
+        .unwrap();
+
+    let events = session.normalize_progress_events(&task_complete_event()).unwrap();
+    assert!(
+        matches!(events.as_slice(), [WorkerEvent::Stop { .. }]),
+        "closed direct poll must not emit an unobserved-command notification: {events:?}"
+    );
+}
+
+#[test]
+fn shell_strings_with_await_or_bash_let_are_flagged_at_task_complete_when_unresolved() {
+    for command in ["echo await; sleep 999", "let n=1; sleep 999"] {
+        let mut session = cell_harness_session();
+        let started = session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":"call-shell",
+                    "input":command
+                }
+            }))
+            .unwrap();
+        assert!(
+            matches!(
+                started.as_slice(),
+                [WorkerEvent::PreToolUse { tool_input, .. }]
+                    if tool_input.get("command").and_then(Value::as_str) == Some(command)
+            ),
+            "command must be retained for {command}: {started:?}"
+        );
+        let events = session.normalize_progress_events(&task_complete_event()).unwrap();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+                    if message == &crate::codex::unobserved_command_notification(command)
+            ),
+            "unresolved shell command must be notified for {command}: {events:?}"
+        );
+    }
+}
