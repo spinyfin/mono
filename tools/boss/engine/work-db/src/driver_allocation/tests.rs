@@ -660,10 +660,21 @@ fn design_tier_fails_when_only_grok_is_funded() {
     let err = decide_execution_driver(&db.connect().unwrap(), &task.id, ExecutionKind::TaskImplementation).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("0 share"), "{text}");
-    assert!(
-        !text.contains("launch flag off"),
-        "design-tier refusal must not attach launch-flag exclusions for drivers that were not eligible: {text}",
-    );
+    for eligible_driver in [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE] {
+        assert!(
+            text.contains(&format!("{eligible_driver} excluded: 0% share")),
+            "design-tier refusal must name eligible 0% driver {eligible_driver}: {text}",
+        );
+    }
+    for ineligible_driver in [DRIVER_SLUG_GROK, DRIVER_SLUG_AGY] {
+        assert!(
+            !text.contains(&format!("{ineligible_driver} excluded: 0% share")),
+            "design-tier refusal must not attach 0% exclusions for ineligible driver {ineligible_driver}: {text}",
+        );
+    }
+    let exclusions =
+        DriverTrafficSplit::new(0, 100, 0, 0).zero_share_exclusions_among(&[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE]);
+    assert_eq!(exclusions, vec!["codex excluded: 0% share".to_owned()]);
     assert!(!text.ends_with("; "), "{text}");
 }
 

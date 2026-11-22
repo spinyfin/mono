@@ -12,7 +12,7 @@ Spend, quota, and cost accounting do not appear here. They are a cross-driver co
 
 The repo owner opened allocated `agy` traffic on **2026-11-21 before the ledger criterion was met**. This is an explicit rollout decision, not evidence that the criterion passed. The recorded qualifying count remains 0 / N.
 
-The gate is the driver's split share: **0% is off** for allocated work. A driver above 0% is eligible in proportion to its share. An installation without a configured split still starts with agy at 0%. On upgrade, a driver whose previous launch flag was off is stored at 0% and the remaining shares renormalise to 100%, so allocated routing does not change.
+The gate is the driver's split share: **0% is off** for allocated work. A driver above 0% is eligible in proportion to its share. An installation without a configured split still starts with agy at 0%. On upgrade, a driver whose previous launch flag was off is stored at 0% and the remaining shares renormalise to 100%, so allocated routing does not change; if no enabled driver held a positive share, all shares are zeroed with a warning so allocation continues to fail loudly rather than routing to a disabled driver or falling back to default.
 
 ## Criterion
 
@@ -28,7 +28,7 @@ The criterion is unmet. The evidence table is empty.
 
 ## How the operator controls the gate
 
-`bossctl dispatch traffic-split` shows percentages and 0% exclusion reasons. Settings → Engine → driver split is one bar and one percentage stepper per driver. Work-kind and model requirements can further restrict eligible drivers.
+`bossctl dispatch traffic-split` shows and sets percentages (`--set grok=...,claude=...,codex=...,agy=...` or per-driver flags) and shows 0% exclusion reasons. Settings → Engine → driver split is one bar and one percentage stepper per driver. Work-kind and model requirements can further restrict eligible drivers.
 
 The whole split is stored atomically in one metadata value, survives engine restarts, and is read at each allocation, dispatch claim, and launch composition. A driver at 0% yields `agy excluded: 0% share` in the allocation's `execution_driver_decisions.split_at_decision.exclusions` JSON. If every eligible driver is at 0%, allocation fails loudly; it never revives a zero-share driver. Running workers retain their routing.
 

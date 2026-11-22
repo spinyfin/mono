@@ -480,8 +480,24 @@ enum LiveStatusAction {
 
 #[derive(Subcommand, Debug)]
 enum DispatchAction {
-    /// Show the four-way driver traffic split. 0% is off for allocated work.
-    TrafficSplit,
+    /// Show or set the four-way driver traffic split. 0% is off for allocated work.
+    TrafficSplit {
+        /// Set the four-way split, e.g. `--set grok=10,claude=60,codex=30,agy=0`.
+        #[arg(long, value_name = "DRIVER=PCT,...", conflicts_with_all = ["grok", "claude", "codex", "agy"])]
+        set: Option<String>,
+        /// Set the Grok share percentage (omitted drivers default to 0).
+        #[arg(long)]
+        grok: Option<u8>,
+        /// Set the Claude share percentage (omitted drivers default to 0).
+        #[arg(long)]
+        claude: Option<u8>,
+        /// Set the Codex share percentage (omitted drivers default to 0).
+        #[arg(long)]
+        codex: Option<u8>,
+        /// Set the Antigravity share percentage (omitted drivers default to 0).
+        #[arg(long)]
+        agy: Option<u8>,
+    },
     /// Items without live work, grouped by the reason they are waiting.
     Stuck {
         #[arg(long, default_value = "7d")]
@@ -1515,8 +1531,28 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: DispatchAction::Concurrency { set },
         } => dispatch_concurrency::dispatch_concurrency(&cli.socket_path, cli.json, set).await,
         Command::Dispatch {
-            action: DispatchAction::TrafficSplit,
-        } => traffic_split::run(&cli.socket_path, cli.json).await,
+            action:
+                DispatchAction::TrafficSplit {
+                    set,
+                    grok,
+                    claude,
+                    codex,
+                    agy,
+                },
+        } => {
+            traffic_split::run(
+                &cli.socket_path,
+                cli.json,
+                traffic_split::TrafficSplitArgs {
+                    set,
+                    grok,
+                    claude,
+                    codex,
+                    agy,
+                },
+            )
+            .await
+        }
         Command::Automation {
             action: AutomationAction::Pause { reason },
         } => pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await,

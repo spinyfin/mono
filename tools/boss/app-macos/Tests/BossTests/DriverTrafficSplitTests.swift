@@ -10,12 +10,33 @@ import XCTest
 /// through it without passing through a rejected intermediate.
 final class DriverTrafficSplitTests: XCTestCase {
     @MainActor
-    func testSettingsRowRendersOneBarAndZeroMeansOff() throws {
+    func testSettingsRowHasFourSteppersNoTogglesAndUpdatesSnapshot() throws {
+        let firstSplit = DriverTrafficSplit(grok: 35, claude: 10, codex: 20, agy: 35)
+        let firstPng = try renderAndAssertStructure(
+            split: firstSplit,
+            outputFilename: "driver-split.png"
+        )
+
+        let zeroAgySplit = DriverTrafficSplit(grok: 54, claude: 16, codex: 30, agy: 0)
+        let zeroPng = try renderAndAssertStructure(
+            split: zeroAgySplit,
+            outputFilename: "driver-split-agy-zero.png"
+        )
+        XCTAssertNotEqual(firstPng, zeroPng, "Second snapshot must reflect the updated 0% Antigravity split")
+    }
+
+    @MainActor
+    private func renderAndAssertStructure(
+        split: DriverTrafficSplit,
+        outputFilename: String
+    ) throws -> Data {
         let model = ChatViewModel(socketPath: "/tmp/boss-driver-split-\(UUID().uuidString).sock")
-        model.driverTrafficSplit = DriverTrafficSplit(grok: 35, claude: 10, codex: 20, agy: 35)
-        let view = DriverTrafficSplitRow().environmentObject(model)
-            .padding(16).frame(width: 540)
-            .background(Color(nsColor: .windowBackgroundColor))
+        model.driverTrafficSplit = split
+        let view = AnyView(
+            DriverTrafficSplitRow().environmentObject(model)
+                .padding(16).frame(width: 540)
+                .background(Color(nsColor: .windowBackgroundColor))
+        )
         let host = NSHostingView(rootView: view)
         host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(x: 0, y: 0, width: 540, height: 400)
@@ -25,22 +46,29 @@ final class DriverTrafficSplitTests: XCTestCase {
         XCTAssertLessThan(height, 360)
         host.frame.size.height = height
         host.layoutSubtreeIfNeeded()
+
+        var stepperCount = 0
+        var toggleCount = 0
+        func walkViews(_ view: NSView) {
+            if view is NSStepper {
+                stepperCount += 1
+            } else if view is NSButton {
+                toggleCount += 1
+            }
+            for child in view.subviews {
+                walkViews(child)
+            }
+        }
+        walkViews(host)
+        XCTAssertEqual(toggleCount, 0, "DriverTrafficSplitRow must have no launch-flag toggles")
+        XCTAssertEqual(stepperCount, 4, "DriverTrafficSplitRow must render one stepper per driver")
+
         let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
         host.cacheDisplay(in: host.bounds, to: bitmap)
         let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
         let output = try XCTUnwrap(ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"])
-        try png.write(to: URL(fileURLWithPath: output).appendingPathComponent("driver-split.png"))
-
-        model.driverTrafficSplit = DriverTrafficSplit(grok: 54, claude: 16, codex: 30, agy: 0)
-        host.layoutSubtreeIfNeeded()
-        let zeroHeight = host.fittingSize.height
-        XCTAssertLessThan(zeroHeight, 360)
-        host.frame.size.height = zeroHeight
-        host.layoutSubtreeIfNeeded()
-        let zeroBitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
-        host.cacheDisplay(in: host.bounds, to: zeroBitmap)
-        let zeroPng = try XCTUnwrap(zeroBitmap.representation(using: .png, properties: [:]))
-        try zeroPng.write(to: URL(fileURLWithPath: output).appendingPathComponent("driver-split-agy-zero.png"))
+        try png.write(to: URL(fileURLWithPath: output).appendingPathComponent(outputFilename))
+        return png
     }
     /// The shipped starting point: everything on the engine's default
     /// driver, nothing on Grok or Antigravity.

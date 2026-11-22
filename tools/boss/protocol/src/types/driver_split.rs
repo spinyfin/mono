@@ -105,7 +105,10 @@ impl DriverTrafficSplit {
         }
     }
 
-    /// Drivers at 0% are named even when they hold no share by default.
+    /// Returns one `"{driver} excluded: 0% share"` line for each driver at
+    /// 0%, regardless of work-kind eligibility. Use
+    /// [`Self::zero_share_exclusions_among`] when eligibility has already
+    /// narrowed the candidate set.
     pub fn zero_share_exclusions(&self) -> Vec<String> {
         Self::DRIVERS_IN_BUCKET_ORDER
             .into_iter()

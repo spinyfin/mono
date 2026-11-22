@@ -74,11 +74,24 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     };
     let shares = DriverTrafficSplit::new(legacy.grok, legacy.claude, legacy.codex, legacy.agy);
+    if shares.validate().is_err() {
+        return Ok(());
+    }
     let eligible: Vec<&str> = DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER
         .into_iter()
         .filter(|driver| legacy.launch_enabled.enabled(driver))
         .collect();
-    let folded = shares.renormalised_over(&eligible).unwrap_or_default();
+    let folded = match shares.renormalised_over(&eligible) {
+        Ok(split) => split,
+        Err(err) => {
+            tracing::warn!(
+                legacy = %raw,
+                %err,
+                "fold migration: no enabled driver held a positive share; zeroing all shares so allocation fails loudly instead of routing to a disabled driver or falling back to default"
+            );
+            DriverTrafficSplit::new(0, 0, 0, 0)
+        }
+    };
     if serde_json::to_string(&folded)? == raw {
         return Ok(());
     }
@@ -153,7 +166,28 @@ mod tests {
     }
 
     #[test]
-    fn every_flag_closed_falls_back_to_the_default_split() {
+    fn sole_funded_driver_off_writes_all_zero_and_fails_loudly() {
+        for raw in [
+            r#"{"grok":0,"claude":100,"codex":0,"agy":0,"launch_enabled":{"claude":false,"codex":true,"grok":true,"agy":true}}"#,
+            r#"{"grok":0,"claude":0,"codex":0,"agy":100,"launch_enabled":{"claude":true,"codex":true,"grok":true,"agy":false}}"#,
+        ] {
+            let (_dir, db) = open_db();
+            db.set_metadata(METADATA_KEY, raw).unwrap();
+            mark_pending(&db);
+            db.init().unwrap();
+            let stored = db.get_metadata(METADATA_KEY).unwrap().unwrap();
+            assert!(!stored.contains("launch_enabled"), "{stored}");
+            assert_eq!(
+                serde_json::from_str::<DriverTrafficSplit>(&stored).unwrap(),
+                DriverTrafficSplit::new(0, 0, 0, 0)
+            );
+            let err = db.get_driver_traffic_split().unwrap_err();
+            assert!(err.to_string().contains("got 0:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn every_flag_closed_writes_all_zero_and_fails_loudly() {
         let (_dir, db) = open_db();
         db.set_metadata(
             METADATA_KEY,
@@ -162,13 +196,27 @@ mod tests {
         .unwrap();
         mark_pending(&db);
         db.init().unwrap();
-        assert_eq!(db.get_driver_traffic_split().unwrap(), DriverTrafficSplit::default());
+        let stored = db.get_metadata(METADATA_KEY).unwrap().unwrap();
+        assert!(!stored.contains("launch_enabled"), "{stored}");
+        assert_eq!(
+            serde_json::from_str::<DriverTrafficSplit>(&stored).unwrap(),
+            DriverTrafficSplit::new(0, 0, 0, 0)
+        );
+        let err = db.get_driver_traffic_split().unwrap_err();
+        assert!(err.to_string().contains("got 0:"), "{err}");
     }
 
     #[test]
-    fn malformed_rows_and_historical_decisions_are_left_alone() {
+    fn malformed_rows_invalid_totals_and_historical_decisions_are_left_alone() {
         let (_dir, db) = open_db();
-        for raw in ["not json", "null", "[]", "42", r#"{"grok":10}"#] {
+        for raw in [
+            "not json",
+            "null",
+            "[]",
+            "42",
+            r#"{"grok":10}"#,
+            r#"{"grok":50,"claude":50,"codex":50,"agy":0,"launch_enabled":{"agy":false}}"#,
+        ] {
             db.set_metadata(METADATA_KEY, raw).unwrap();
             mark_pending(&db);
             db.init().unwrap();

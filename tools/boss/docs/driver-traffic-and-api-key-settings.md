@@ -13,8 +13,7 @@ restrictions can narrow the eligible set further. The split survives
 restarts and applies to new and queued allocations; explicit pins remain
 available for a driver at 0%.
 
-`bossctl dispatch traffic-split` shows the percentages (also available with
-`--json`). Connected sessions receive the updated split. Allocation snapshots in
+`bossctl dispatch traffic-split` shows and sets the percentages (with `--set grok=10,claude=60,codex=30,agy=0` or per-driver `--grok`/`--claude`/`--codex`/`--agy` flags, plus `--json`). Connected sessions receive the updated split. Allocation snapshots in
 `execution_driver_decisions.split_at_decision` include an `exclusions` array
 such as `agy excluded: 0% share` when a driver holds no share, including when
 allocation is refused because every eligible driver is at 0%.
