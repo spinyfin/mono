@@ -78,7 +78,11 @@ pub use hooks::{
     AuthorizationProbeReport, adapter_path, attestation_path, hooks_file_path, install_authorization, policy_path,
     probe_authorization, verify_attestation, verify_startup_authorization,
 };
-pub use transcript::transcript_has_live_background_task;
+pub use transcript::{
+    BackgroundTaskLiveness, BackgroundTaskScan, BackgroundTaskScanCache, LIVE_BACKGROUND_TASK_HORIZON_SECS,
+    MAX_TRANSCRIPT_SCAN_BATCH_BYTES, poll_live_background_task, poll_live_background_task_with_batch,
+    reader_has_live_background_task, transcript_has_live_background_task,
+};
 
 // ---------------------------------------------------------------------------
 // Descriptor
