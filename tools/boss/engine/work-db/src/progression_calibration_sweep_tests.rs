@@ -17,6 +17,19 @@ fn nights_and_weekends_do_not_determine_nomination_latency() {
             .unwrap();
         }
     }
+    // Dense PR-poll and deferral writes in the weekend gap must not shrink the
+    // p99: they are the same properties stuck-report ageing ignores.
+    for hour in 1..70 {
+        let stamp = NOW - 15 * DAY + 30 + hour * 3600;
+        for property in ["pr_mergeable_state", "ci_required_state", "deferred"] {
+            conn.execute(
+                "INSERT INTO task_status_audit(work_item_id,property,old_value,new_value,actor,changed_at,basis)
+                VALUES ('burst',?1,'old','new','engine',?2,'observed')",
+                params![property, stamp],
+            )
+            .unwrap();
+        }
+    }
     drop(conn);
     let report = db.calibrate_progression(NOW).unwrap();
     assert_eq!(report.inputs["ledger_interval_p99_secs"], 3 * DAY as u64 - 30);

@@ -562,6 +562,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking::migrate,
         },
         Migration {
+            id: task_status_audit::PR_OBSERVATION_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: task_status_audit::migrate_pr_observations,
+        },
+        Migration {
             id: task_status_audit::MIGRATION_ID.into(),
             legacy_version: None,
             apply: task_status_audit::migrate,

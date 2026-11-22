@@ -101,8 +101,11 @@ pub(super) fn build(
         let failure_basis = latest_basis(conn, &id, "blocked_reason")?;
         let basis: String = conn
             .query_row(
-                "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 AND property <> 'deferred'
+                &format!(
+                    "SELECT basis FROM task_status_audit WHERE work_item_id = ?1 AND property NOT IN {}
                  ORDER BY id DESC LIMIT 1",
+                    super::task_status_audit::REPORT_IGNORED_PROPERTIES
+                ),
                 [&id],
                 |r| r.get(0),
             )
@@ -119,10 +122,13 @@ pub(super) fn build(
         };
         let (mut changed_at, mut legacy): (i64, bool) = conn
             .query_row(
-                "SELECT CAST(changed_at AS INTEGER), age_is_lower_bound
+                &format!(
+                    "SELECT CAST(changed_at AS INTEGER), age_is_lower_bound
              FROM task_status_audit WHERE work_item_id = ?1
-             AND (property = ?2 OR (?2 IS NULL AND property <> 'deferred'))
+             AND (property = ?2 OR (?2 IS NULL AND property NOT IN {}))
              ORDER BY id DESC LIMIT 1",
+                    super::task_status_audit::REPORT_IGNORED_PROPERTIES
+                ),
                 params![id, age_property],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -484,6 +490,11 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
         return Ok("S14_worker_recovery".into());
     }
     if task.status == TaskStatus::InReview {
+        if task.pr_mergeable_state.as_deref() == Some("conflicting")
+            && !super::conflict_deferral::has_open_deferral(conn, &task.id)?
+        {
+            return Ok("S5_merge_conflict".into());
+        }
         if task.ci_required_state.as_deref() == Some("fail") {
             return Ok("S6_ci_failure".into());
         }

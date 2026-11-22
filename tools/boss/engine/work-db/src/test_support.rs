@@ -6,6 +6,16 @@ use boss_protocol::QueueCiEvidence;
 mod db_template;
 pub(crate) use db_template::{open_memory_db, seed_new_file_db};
 
+/// Change a fixture's schema with the same dependent-view lifecycle as startup
+/// migrations. This also supports deliberately hiding a table to test read
+/// failures, then restoring it without leaving invalid view definitions.
+pub fn execute_schema_change(db: &WorkDb, sql: &str) -> anyhow::Result<()> {
+    let conn = db.connect()?;
+    super::progression_candidates::drop_views(&conn)?;
+    conn.execute_batch(sql)?;
+    super::progression_candidates::migrate_views(&conn)
+}
+
 /// Run a synchronization callback while holding the database connection.
 /// The callback must not call another operation on this database.
 pub fn with_connection_held(db: &WorkDb, callback: impl FnOnce()) {

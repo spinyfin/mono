@@ -5,6 +5,7 @@ use super::*;
 pub(super) const MIGRATION_ID: &str = "20261029_0314_task_status_audit";
 pub(super) const DEFERRED_MIGRATION_ID: &str = "20261112_1900_task_deferred_audit";
 pub(super) const EXECUTION_ABANDON_MIGRATION_ID: &str = "20261118_1530_execution_abandon_audit";
+pub(super) const PR_OBSERVATION_MIGRATION_ID: &str = "20261121_1651_task_pr_observation_audit";
 
 /// `task_status_audit.property` of a `work_executions` transition to
 /// `abandoned`. `old_value` is the execution's previous status, `new_value` is
@@ -370,6 +371,27 @@ pub(super) fn migrate_deferred(conn: &Connection) -> Result<()> {
         [],
     )?;
     install_property_triggers(conn, "deferred")
+}
+
+/// Owner deferral and PR polling do not change the report's task-state age.
+pub(crate) const REPORT_IGNORED_PROPERTIES: &str = "('deferred','pr_mergeable_state','ci_required_state')";
+
+/// Record PR observations so progression can age the condition itself rather
+/// than the last unrelated task edit. Existing observations have unknown age.
+pub(super) fn migrate_pr_observations(conn: &Connection) -> Result<()> {
+    for property in ["pr_mergeable_state", "ci_required_state"] {
+        conn.execute_batch(&format!(
+            "INSERT INTO task_status_audit
+                (work_item_id, property, new_value, actor, changed_at, basis, age_is_lower_bound)
+             SELECT id, '{property}', {property}, 'engine', strftime('%s','now'), 'unknown_legacy', 1
+             FROM tasks t WHERE t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived')
+               AND t.{property} IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM task_status_audit a
+                               WHERE a.work_item_id = t.id AND a.property = '{property}');"
+        ))?;
+        install_property_triggers(conn, property)?;
+    }
+    Ok(())
 }
 
 /// Columns this module adds to the ledger for enriched history.

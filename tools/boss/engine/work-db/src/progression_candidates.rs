@@ -62,9 +62,9 @@
 //!    `dependency_held`.
 //! 5. **Stuck long enough.** In one of the stuck states the enumeration marks as
 //!    progression-eligible ([`stuck_kind_sql`]) continuously for at least
-//!    `progression.stuck_after`, measured from the task status ledger exactly as
-//!    the stuck report ages it; or the grace was waived since the item entered
-//!    that state (`tasks.progression_grace_waived_at`).
+//!    `progression.stuck_after`, measured from relevant task status transitions,
+//!    ignoring excursions shorter than the progression recovery tolerance; or the
+//!    grace was waived since the item entered that state (`tasks.progression_grace_waived_at`).
 //! 6. **Cooldown and budget.** No progression run within the fallback
 //!    `progression.cooldown` (6 hours by default; four times that, capped at 24
 //!    hours, after a `no_changes_needed` run) unless that run has an event that
@@ -259,6 +259,14 @@ fn human_held_sql(a: &str) -> String {
     )
 }
 
+/// How [`classify_sql`] decides whether an attention (or conflict-deferral)
+/// predicate held. Live rows use today's open status; historical snapshots
+/// evaluate the same predicates at an event timestamp.
+enum ClassifyAttention<'a> {
+    Live,
+    At(&'a str),
+}
+
 /// The stuck state an item is in, as the `S<n>_...` code the stuck report uses
 /// (its `classification` prefix; `root` is the alias of the item's chain-root
 /// task, joined by the caller), or NULL when the item is in no state a
@@ -267,19 +275,62 @@ fn human_held_sql(a: &str) -> String {
 /// mergeable (`S18`), or simply healthy. The branches follow the order of
 /// `stuck_report::classification` so the two never classify one item two ways.
 fn stuck_kind_sql(a: &str, root: &str) -> String {
+    classify_sql(a, root, ClassifyAttention::Live, true)
+}
+
+fn classify_sql(a: &str, root: &str, attention: ClassifyAttention<'_>, include_cycle: bool) -> String {
+    let attention_open = |predicate: &str| match attention {
+        ClassifyAttention::Live => open_attention_sql(a, predicate),
+        ClassifyAttention::At(at) => format!(
+            "EXISTS (SELECT 1 FROM work_attention_items wa
+                     WHERE ({predicate})
+                       AND (wa.work_item_id = {a}.id
+                            OR wa.execution_id IN (SELECT id FROM work_executions WHERE work_item_id = {a}.id))
+                       AND CAST(wa.created_at AS INTEGER) <= {at}
+                       AND (wa.resolved_at IS NULL OR CAST(wa.resolved_at AS INTEGER) > {at}))"
+        ),
+    };
     let chain_root_ci = format!("{root}.ci_required_state");
-    let not_positioning_held = crate::dispatch_helpers::not_positioning_held_sql(a);
-    let trunk_queue = open_attention_sql(a, "wa.kind LIKE 'trunk_queue_%'");
-    let abandoned = open_attention_sql(a, "wa.kind = 'abandoned_branch_no_pr'");
-    let recovery = open_attention_sql(
-        a,
-        "wa.kind IN ('worker_recovery_permanent_error', 'worker_recovery_exhausted')",
-    );
-    let review_churn = open_attention_sql(a, "wa.kind = 'churn_guard_parked'");
+    let positioning_hold = boss_engine_storage_values::attention_kinds::WORKSPACE_POSITIONING_REFUSED;
+    let not_positioning_held = match attention {
+        ClassifyAttention::Live => crate::dispatch_helpers::not_positioning_held_sql(a),
+        ClassifyAttention::At(at) => format!(
+            "(COALESCE({a}.blocked_reason, '') <> '{positioning_hold}'
+              AND NOT EXISTS (SELECT 1 FROM work_attention_items ph
+                              WHERE ph.work_item_id = {a}.id AND ph.kind = '{positioning_hold}'
+                                AND CAST(ph.created_at AS INTEGER) <= {at}
+                                AND (ph.resolved_at IS NULL OR CAST(ph.resolved_at AS INTEGER) > {at})))"
+        ),
+    };
+    let deferred_status = crate::conflict_deferral::CONFLICT_STATUS_DEFERRED;
+    let open_deferral = match attention {
+        ClassifyAttention::At(at) => format!(
+            "EXISTS (SELECT 1 FROM conflict_resolutions cr
+                     WHERE cr.work_item_id = {a}.id
+                       AND (cr.status = '{deferred_status}' OR cr.deferral_end_reason IS NOT NULL)
+                       AND CAST(cr.created_at AS INTEGER) <= {at}
+                       AND (cr.status = '{deferred_status}'
+                            OR CAST(COALESCE(cr.finished_at, cr.created_at) AS INTEGER) > {at}))"
+        ),
+        ClassifyAttention::Live => format!(
+            "EXISTS (SELECT 1 FROM conflict_resolutions cr
+                     WHERE cr.work_item_id = {a}.id AND cr.status = '{deferred_status}')"
+        ),
+    };
+    let cycle_branch = if include_cycle {
+        format!(
+            "WHEN {a}.id IN (SELECT work_item_id FROM progression_dependency_cycles) THEN 'S4_dependency_cycle'\n           "
+        )
+    } else {
+        String::new()
+    };
+    let trunk_queue = attention_open("wa.kind LIKE 'trunk_queue_%'");
+    let abandoned = attention_open("wa.kind = 'abandoned_branch_no_pr'");
+    let recovery = attention_open("wa.kind IN ('worker_recovery_permanent_error', 'worker_recovery_exhausted')");
+    let review_churn = attention_open("wa.kind = 'churn_guard_parked'");
     format!(
         "CASE
-           WHEN {a}.id IN (SELECT work_item_id FROM progression_dependency_cycles) THEN 'S4_dependency_cycle'
-           WHEN {a}.dispatch_failed_reason IS NOT NULL THEN
+           {cycle_branch}WHEN {a}.dispatch_failed_reason IS NOT NULL THEN
                CASE {a}.dispatch_failed_reason
                    WHEN 'churn_guard' THEN 'S2_churn_guard'
                    WHEN 'deliberate_park' THEN 'S3_deliberate_park'
@@ -298,10 +349,13 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
                    WHEN {a}.blocked_reason = 'pr_binding_unresolved' THEN 'S11_pr_binding'
                    ELSE NULL
                END
-           WHEN {a}.deferred = 1 OR ({a}.status = 'todo' AND {a}.autostart = 0) THEN NULL
+           WHEN CAST({a}.deferred AS INTEGER) = 1
+                OR ({a}.status = 'todo' AND CAST({a}.autostart AS INTEGER) = 0) THEN NULL
            WHEN {trunk_queue} THEN NULL
            WHEN {a}.pr_url IS NULL AND {abandoned} THEN 'S22_abandoned_branch'
            WHEN {recovery} THEN 'S14_worker_recovery'
+           WHEN {a}.status = 'in_review' AND {a}.pr_mergeable_state = 'conflicting'
+                AND NOT ({open_deferral}) THEN 'S5_merge_conflict'
            WHEN {a}.status = 'in_review' AND {a}.ci_required_state = 'fail' THEN 'S6_ci_failure'
            WHEN {a}.status = 'in_review' AND {review_churn} THEN 'S16_review_churn'
            ELSE NULL
@@ -309,24 +363,132 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
     )
 }
 
-/// When the item's current stuck state began, read from the task status ledger
-/// the way the stuck report ages it: a failure from its own latest observation
-/// (an unrelated edit must not make a week-old blocker look new), anything else
-/// from the latest ledger event, and `updated_at` for a row the ledger has never
-/// seen.
+/// Reconstruct the current stuck episode from the fields that determine its
+/// kind, including ledger-carried `deferred`/`autostart` and attention (and
+/// conflict-deferral) lifecycle events. Brief excursions outside that kind do
+/// not end an episode until they last as long as the progression recovery
+/// tolerance. Cycle membership is present-day graph health: age it from the
+/// newest `blocks` edge among the cycle rather than from unrelated ledger
+/// history. Ledger id breaks ties between changes made in the same second.
 fn stuck_since_sql(a: &str) -> String {
-    let age_property = format!(
-        "CASE WHEN {a}.dispatch_failed_reason IS NOT NULL THEN 'dispatch_failed_reason'
-              WHEN {a}.blocked_reason IS NOT NULL THEN 'blocked_reason' END"
+    let properties = [
+        "status",
+        "blocked_reason",
+        "dispatch_failed_reason",
+        "pr_mergeable_state",
+        "ci_required_state",
+        "deferred",
+        "autostart",
+    ];
+    // Carry event ids rather than values: NULL is a real clear. Attention and
+    // deferral lifecycle rows share this window so they inherit the last
+    // ledger write at or before their timestamp instead of today's task row.
+    let carried = properties
+        .iter()
+        .map(|p| {
+            format!(
+                "MAX(CASE WHEN property = '{p}' THEN id END)
+               OVER (ORDER BY changed_at, kind_ord, id) AS {p}_id,
+             FIRST_VALUE(CASE WHEN property = '{p}' THEN old_value END)
+               OVER (ORDER BY (property = '{p}') DESC, id) AS initial_{p}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let joins = properties
+        .iter()
+        .map(|p| format!("LEFT JOIN task_status_audit v_{p} ON v_{p}.id = event.{p}_id"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let ledger_values = properties
+        .iter()
+        .map(|property| {
+            format!(
+                "CASE WHEN event.{property}_id IS NOT NULL THEN v_{property}.new_value
+              ELSE event.initial_{property}
+         END AS {property}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let quoted_properties = properties
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let historical_kind = classify_sql("snapshot", "root", ClassifyAttention::At("snapshot.changed_at"), false);
+    let current_kind = stuck_kind_sql(a, "root");
+    let debounce = boss_engine_storage_values::progression::STUCK_EPISODE_RECOVERY_SECS;
+    let deferred_status = crate::conflict_deferral::CONFLICT_STATUS_DEFERRED;
+    let cycle_since = format!(
+        "COALESCE((SELECT MAX(CAST(d.created_at AS INTEGER))
+          FROM work_item_dependencies d
+          WHERE d.relation = 'blocks'
+            AND (d.dependent_id = {a}.id OR d.prerequisite_id = {a}.id)
+            AND d.dependent_id IN (SELECT work_item_id FROM progression_dependency_cycles)
+            AND d.prerequisite_id IN (SELECT work_item_id FROM progression_dependency_cycles)), {NOW})"
     );
     format!(
-        "COALESCE(
-           (SELECT CAST(la.changed_at AS INTEGER) FROM task_status_audit la
-            WHERE la.work_item_id = {a}.id
-              AND (la.property = ({age_property}) OR (({age_property}) IS NULL AND la.property <> 'deferred'))
-            ORDER BY la.id DESC LIMIT 1),
-           NULLIF(CAST({a}.updated_at AS INTEGER), 0),
-           {NOW})"
+        "CASE WHEN ({current_kind}) IS NULL THEN COALESCE(CAST({a}.updated_at AS INTEGER), {NOW})
+         WHEN ({current_kind}) = 'S4_dependency_cycle' THEN {cycle_since}
+         ELSE COALESCE((WITH current AS MATERIALIZED (
+             SELECT ({current_kind}) AS kind
+         ), history AS MATERIALIZED (
+             SELECT id, property, old_value, new_value, CAST(changed_at AS INTEGER) AS changed_at
+             FROM task_status_audit WHERE work_item_id = {a}.id AND property IN ({quoted_properties})
+         ), extra AS (
+             SELECT CAST(wa.created_at AS INTEGER) AS changed_at, 1 AS kind_ord
+             FROM work_attention_items wa
+             WHERE CAST(wa.created_at AS INTEGER) IS NOT NULL
+               AND (wa.work_item_id = {a}.id
+                    OR wa.execution_id IN (SELECT id FROM work_executions WHERE work_item_id = {a}.id))
+             UNION ALL
+             SELECT CAST(wa.resolved_at AS INTEGER), 2
+             FROM work_attention_items wa
+             WHERE wa.resolved_at IS NOT NULL
+               AND (wa.work_item_id = {a}.id
+                    OR wa.execution_id IN (SELECT id FROM work_executions WHERE work_item_id = {a}.id))
+             UNION ALL
+             SELECT CAST(cr.created_at AS INTEGER), 1
+             FROM conflict_resolutions cr
+             WHERE cr.work_item_id = {a}.id
+               AND (cr.status = '{deferred_status}' OR cr.deferral_end_reason IS NOT NULL)
+             UNION ALL
+             SELECT CAST(cr.finished_at AS INTEGER), 2
+             FROM conflict_resolutions cr
+             WHERE cr.work_item_id = {a}.id AND cr.finished_at IS NOT NULL
+               AND cr.deferral_end_reason IS NOT NULL
+         ), stream AS (
+             SELECT id, changed_at, 0 AS kind_ord, property, old_value, new_value FROM history
+             UNION ALL
+             SELECT 0, changed_at, kind_ord, NULL, NULL, NULL FROM extra
+              WHERE changed_at IS NOT NULL
+         ), carried AS (
+             SELECT *, {carried} FROM stream
+         ), snapshot AS MATERIALIZED (
+             SELECT event.changed_at AS changed_at, event.kind_ord AS kind_ord,
+                    event.id AS event_id, {ledger_values},
+                    {a}.id AS id, {a}.kind AS kind, {a}.pr_url AS pr_url
+             FROM carried event {joins}
+         ), kinds AS (
+             SELECT ROW_NUMBER() OVER (ORDER BY snapshot.changed_at, snapshot.kind_ord, snapshot.event_id) AS seq,
+                    snapshot.changed_at, ({historical_kind}) IS current.kind AS is_current
+             FROM current CROSS JOIN snapshot
+         ), changes AS (
+             SELECT *, is_current IS NOT LAG(is_current) OVER (ORDER BY seq) AS changed FROM kinds
+         ), grouped AS (
+             SELECT *, SUM(changed) OVER (ORDER BY seq) AS episode FROM changes
+         ), episodes AS (
+             SELECT episode, is_current, MIN(changed_at) AS began FROM grouped GROUP BY episode
+         ), durations AS (
+             SELECT *, LEAD(began, 1, {NOW}) OVER (ORDER BY episode) AS ended FROM episodes
+         ), marked AS (
+             SELECT *, MAX(CASE WHEN NOT is_current AND ended - began >= {debounce} THEN episode END)
+                       OVER () AS reset_episode FROM durations
+         )
+         SELECT MIN(began) FROM marked
+         WHERE is_current AND episode > COALESCE(reset_episode, -1)),
+         NULLIF(CAST({a}.updated_at AS INTEGER), 0), {NOW}) END"
     )
 }
 

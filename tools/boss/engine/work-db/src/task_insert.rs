@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(row.human_driven, 0);
         assert_eq!(row.design_reasoning_effort_xhigh, 0);
         assert_eq!(row.created_via, CREATED_VIA_UNKNOWN);
-        assert_eq!(audit_count(&conn, &id), 5);
+        assert_eq!(audit_count(&conn, &id), 7);
         assert_eq!(
             insert_ledger(&conn, &id, "status"),
             (

@@ -611,12 +611,11 @@ async fn execution_read_failure_schedules_a_retry() {
     let (state, _dir) = test_server_state();
     seed_tmux_hosted_live_run(&state, 1, "read-failure-session", "read-failure-token");
     // Make the execution query fail, then restore the table to model recovery.
-    state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute_batch("ALTER TABLE work_executions RENAME TO unavailable_executions;")
-        .unwrap();
+    boss_work_db::test_support::execute_schema_change(
+        &state.work_db,
+        "ALTER TABLE work_executions RENAME TO unavailable_executions;",
+    )
+    .unwrap();
     let sink = make_session_sink();
     state.register_app_session("session-app".into(), sink.clone()).await;
     let pass = tokio::spawn({
@@ -643,12 +642,11 @@ async fn execution_read_failure_schedules_a_retry() {
             .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
-    state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute_batch("ALTER TABLE unavailable_executions RENAME TO work_executions;")
-        .unwrap();
+    boss_work_db::test_support::execute_schema_change(
+        &state.work_db,
+        "ALTER TABLE unavailable_executions RENAME TO work_executions;",
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -656,12 +654,11 @@ async fn app_requested_execution_read_failure_schedules_a_retry() {
     let (state, _dir) = test_server_state();
     let run_id = seed_tmux_hosted_live_run(&state, 1, "read-failure-session", "read-failure-token");
     // Make the execution query fail, then restore the table to model recovery.
-    state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute_batch("ALTER TABLE work_executions RENAME TO unavailable_executions;")
-        .unwrap();
+    boss_work_db::test_support::execute_schema_change(
+        &state.work_db,
+        "ALTER TABLE work_executions RENAME TO unavailable_executions;",
+    )
+    .unwrap();
     let sink = make_session_sink();
     state.register_app_session("session-app".into(), sink.clone()).await;
     assert!(!state.viewer_reattach_retry_scheduled.load(Ordering::Relaxed));
@@ -685,12 +682,11 @@ async fn app_requested_execution_read_failure_schedules_a_retry() {
             .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
-    state
-        .work_db
-        .connect()
-        .unwrap()
-        .execute_batch("ALTER TABLE unavailable_executions RENAME TO work_executions;")
-        .unwrap();
+    boss_work_db::test_support::execute_schema_change(
+        &state.work_db,
+        "ALTER TABLE unavailable_executions RENAME TO work_executions;",
+    )
+    .unwrap();
 }
 
 #[tokio::test]
