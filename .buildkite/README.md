@@ -151,7 +151,28 @@ Each `steps/*.sh` script can be run directly from the repo root. To reproduce ba
 bazel test //... --config=ci
 ```
 
-The CI config is in `.bazelrc.ci`.
+The CI config is in `.ci.bazelrc`.
+
+### Diffing Bazel execution logs to diagnose cache misses
+
+Every Bazel step sourcing `ci-env.sh` records a natively zstd-compressed compact execution log (`--execution_log_compact_file`) for each `build`, `test`, `run`, or `coverage` invocation under `bazel-execlogs/<job-id>/<seq>-<subcommand>.bin.zst` and uploads it as a Buildkite artifact (`01-build.bin.zst` is `ci-env.sh`'s `//tools/repobin:repobin` build; subsequent numbers are the step's own invocations). The flag does not alter action keys or cacheability, and `ci-env.sh` skips adding it when a caller already passes `--execution_log_*` (such as `verify-boss-tag-cache.sh`).
+
+To find why actions missed the cache between two builds of the same commit:
+
+1. Download the matching `.bin.zst` artifact from both Buildkite jobs (for example `02-build.bin.zst` or `03-test.bin.zst`).
+2. From a `bazelbuild/bazel` checkout, convert and align both compact logs with Bazel's execlog parser, then diff the text output:
+
+```sh
+bazel run //src/tools/execlog:parser -- \
+  --log_path=/path/to/build-a/03-test.bin.zst \
+  --log_path=/path/to/build-b/03-test.bin.zst \
+  --output_path=/tmp/build-a.txt \
+  --output_path=/tmp/build-b.txt
+
+diff -u /tmp/build-a.txt /tmp/build-b.txt
+```
+
+Look for spawns whose `cache_hit` flipped from `true` to `false`, and compare their `inputs` digests, `command_args`, and `environment_variables` in the diff.
 
 ## Required checks (branch protection)
 

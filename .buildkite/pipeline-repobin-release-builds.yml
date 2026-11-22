@@ -7,6 +7,8 @@ steps:
   - label: ":rust: repobin-release (linux)"
     key: "repobin-release-linux"
     command: ".buildkite/steps/repobin-release.sh linux"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux
@@ -16,6 +18,8 @@ steps:
   - label: ":apple: repobin-release (darwin)"
     key: "repobin-release-darwin"
     command: ".buildkite/steps/repobin-release.sh darwin"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: darwin

@@ -45,6 +45,7 @@ steps:
           limit: 1
     timeout_in_minutes: 60
     artifact_paths:
+      - "bazel-execlogs/**/*"
       - "bazel-out/**/extra_action_outputs/**/*"
       - "bazel-testlogs/**/test.log"
       - "bazel-testlogs/**/test.xml"
@@ -67,6 +68,8 @@ steps:
         - signal_reason: agent_stop
           limit: 1
     timeout_in_minutes: 60
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
     notify:
@@ -86,6 +89,8 @@ steps:
         - signal_reason: agent_stop
           limit: 1
     timeout_in_minutes: 30
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
@@ -97,6 +102,8 @@ steps:
     if: build.branch == "main" && (build.source == "schedule" || build.source == "ui" || build.source == "api")
     command: ".buildkite/steps/boss-release.sh"
     timeout_in_minutes: 90
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "bazel-build-test"
       - "mac-app-build"

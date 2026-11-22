@@ -259,6 +259,18 @@ _ci_run_bazel() {
   return "$rc"
 }
 
+# Per-job directory for Bazel compact execution logs (`--execution_log_compact_file`).
+# Each `bazel` invocation gets its own sequence-numbered `.bin.zst` file so
+# multiple invocations in one step (e.g. repobin build, `bazel build`, `bazel test`)
+# never overwrite each other. Placed under `bazel-execlogs/` (gitignored via
+# `/bazel-*` and ignored by Bazel via `.bazelignore`) so Buildkite `artifact_paths`
+# uploads them automatically even if a step fails or overrides `EXIT` traps.
+CI_EXECLOG_ROOT="$(pwd -P)/bazel-execlogs"
+CI_EXECLOG_DIR="${CI_EXECLOG_ROOT}/${BUILDKITE_JOB_ID:-local-$$}"
+rm -rf "$CI_EXECLOG_ROOT"
+mkdir -p "$CI_EXECLOG_DIR"
+CI_EXECLOG_SEQ=0
+
 # Wrap bazel and pass in ci configuration (CI_BAZEL_FLAGS, above).
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
 # cache after an Xcode upgrade) and recovers by running `bazel clean --expunge`
@@ -267,10 +279,31 @@ bazel() {
   local subcommand="$1"
   shift
 
-  local tmplog
-  tmplog=$(mktemp)
+  local execlog_flag=()
+  case "$subcommand" in
+    build|test|run|coverage)
+      local has_execlog=0 arg
+      for arg in "$@"; do
+        case "$arg" in
+          --execution_log_compact_file|--execution_log_compact_file=*|\
+          --execution_log_json_file|--execution_log_json_file=*|\
+          --execution_log_binary_file|--execution_log_binary_file=*)
+            has_execlog=1
+            break
+            ;;
+        esac
+      done
+      if (( !has_execlog )); then
+        CI_EXECLOG_SEQ=$((CI_EXECLOG_SEQ + 1))
+        execlog_flag=("--execution_log_compact_file=$(printf '%s/%02d-%s.bin.zst' "$CI_EXECLOG_DIR" "$CI_EXECLOG_SEQ" "$subcommand")")
+      fi
+      ;;
+  esac
 
-  if _ci_run_bazel "$tmplog" "$subcommand" "$@"; then
+  local tmplog
+  tmplog=$(mktemp "${TMPDIR:-/tmp}/ci-bazel-log.XXXXXX")
+
+  if _ci_run_bazel "$tmplog" "$subcommand" ${execlog_flag[@]+"${execlog_flag[@]}"} "$@"; then
     rm -f "$tmplog" "$tmplog.watchdog"
     return 0
   fi
@@ -280,7 +313,7 @@ bazel() {
     echo "--- Xcode version mismatch detected in disk cache; running bazel clean --expunge and retrying"
     command bazel $BAZEL_STARTUP_FLAGS clean --expunge
     rm -f "$tmplog" "$tmplog.watchdog"
-    _ci_run_bazel "$tmplog" "$subcommand" "$@"
+    _ci_run_bazel "$tmplog" "$subcommand" ${execlog_flag[@]+"${execlog_flag[@]}"} "$@"
     return $?
   fi
 

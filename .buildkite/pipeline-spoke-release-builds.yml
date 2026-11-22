@@ -15,6 +15,8 @@ steps:
   - label: ":apple: spoke-release (macos-arm64)"
     key: "spoke-release-macos-arm64"
     command: ".buildkite/steps/spoke-release.sh build"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: darwin
@@ -24,6 +26,8 @@ steps:
   - label: ":linux: spoke-release (linux-amd64)"
     key: "spoke-release-linux-amd64"
     command: ".buildkite/steps/spoke-release.sh build"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux
