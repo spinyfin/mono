@@ -25,6 +25,8 @@ steps:
   - label: ":mag: spoke-release (prepare)"
     key: "spoke-release-prepare"
     command: ".buildkite/steps/spoke-release.sh prepare"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux

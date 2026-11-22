@@ -155,14 +155,16 @@ The CI config is in `.ci.bazelrc`.
 
 ### Diffing Bazel execution logs to diagnose cache misses
 
-Every Bazel step sourcing `ci-env.sh` records a natively zstd-compressed compact execution log (`--execution_log_compact_file`) for each `build`, `test`, `run`, or `coverage` invocation under `bazel-execlogs/<job-id>/<seq>-<subcommand>.bin.zst` and uploads it as a Buildkite artifact (`01-build.bin.zst` is `ci-env.sh`'s `//tools/repobin:repobin` build; subsequent numbers are the step's own invocations). The flag does not alter action keys or cacheability, and `ci-env.sh` skips adding it when a caller already passes `--execution_log_*` (such as `verify-boss-tag-cache.sh`).
+Every Bazel step sourcing `ci-env.sh` records a natively zstd-compressed compact execution log (`--execution_log_compact_file`) for each `build`, `test`, `run`, or `coverage` invocation under `bazel-execlogs/<job-id>/<seq>-<subcommand>.bin.zst` and uploads it as a Buildkite artifact (`01-build.bin.zst` is `ci-env.sh`'s `//tools/repobin:repobin` build; subsequent numbers are the step's own invocations, including `bazel` processes spawned by repobin and checkleft via a PATH shim). The flag does not alter action keys or cacheability, and `ci-env.sh` skips adding it when a caller already passes `--execution_log_*` (such as `verify-boss-tag-cache.sh`). Prepare, publish, and diagnostic steps that source `ci-env.sh` upload the same `bazel-execlogs/**/*` path.
 
 To find why actions missed the cache between two builds of the same commit:
 
 1. Download the matching `.bin.zst` artifact from both Buildkite jobs (for example `02-build.bin.zst` or `03-test.bin.zst`).
-2. From a `bazelbuild/bazel` checkout, convert and align both compact logs with Bazel's execlog parser, then diff the text output:
+2. Check out `bazelbuild/bazel` at tag `9.1.0` (the pin in `.bazelversion`) and convert both compact logs with that tree's `//src/tools/execlog:parser`. The parser auto-detects the compact/zstd format from the file bytes, so the `.bin.zst` artifacts are passed in directly:
 
 ```sh
+git clone --depth 1 --branch 9.1.0 https://github.com/bazelbuild/bazel.git
+cd bazel
 bazel run //src/tools/execlog:parser -- \
   --log_path=/path/to/build-a/03-test.bin.zst \
   --log_path=/path/to/build-b/03-test.bin.zst \

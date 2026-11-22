@@ -50,6 +50,8 @@ steps:
   - label: ":mag: changelog-release (prepare)"
     key: "changelog-release-prepare"
     command: ".buildkite/steps/changelog-release.sh prepare"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux

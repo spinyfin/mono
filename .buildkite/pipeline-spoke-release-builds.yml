@@ -37,6 +37,8 @@ steps:
   - label: ":white_check_mark: spoke-release (publish)"
     key: "spoke-release-publish"
     command: ".buildkite/steps/spoke-release.sh publish"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "spoke-release-macos-arm64"
       - "spoke-release-linux-amd64"

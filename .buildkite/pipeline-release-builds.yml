@@ -28,6 +28,8 @@ steps:
   - label: ":white_check_mark: release (publish)"
     key: "release-publish"
     command: ".buildkite/steps/release-release.sh publish"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "release-linux"
       - "release-darwin"

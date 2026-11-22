@@ -26,6 +26,8 @@ steps:
     if: build.env("BOSS_VERIFY_TAG_CACHE") == "1"
     parallelism: 2
     command: "bash .buildkite/steps/verify-boss-tag-cache.sh"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: "bazel-any"
       os: "${BOSS_TAG_CACHE_OS:-darwin}"

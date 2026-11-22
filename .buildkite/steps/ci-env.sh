@@ -226,8 +226,15 @@ _ci_remote_on_term() {
 _ci_run_bazel() {
   local tmplog="$1" subcommand="$2"
   shift 2
+  # Absolute interpreter captured by _ci_execlog_setup so this hop does not
+  # re-enter the PATH bazel shim (the shim covers Command::new("bazel") and
+  # other subprocesses that never call this function).
+  local bazel_bin="${CI_REAL_BAZEL:-}"
+  if [[ -z "$bazel_bin" ]]; then
+    bazel_bin="$(command -v bazel)"
+  fi
   if [[ "$CI_REMOTE_EXECUTION" != "on" ]]; then
-    command bazel \
+    "$bazel_bin" \
       $BAZEL_STARTUP_FLAGS \
       "$subcommand" \
       $CI_BAZEL_FLAGS \
@@ -241,7 +248,7 @@ _ci_run_bazel() {
   mkfifo "$fifo"
   tee "$tmplog" <"$fifo" &
   tee_pid=$!
-  command bazel \
+  "$bazel_bin" \
     $BAZEL_STARTUP_FLAGS \
     "$subcommand" \
     $CI_BAZEL_FLAGS \
@@ -259,17 +266,11 @@ _ci_run_bazel() {
   return "$rc"
 }
 
-# Per-job directory for Bazel compact execution logs (`--execution_log_compact_file`).
-# Each `bazel` invocation gets its own sequence-numbered `.bin.zst` file so
-# multiple invocations in one step (e.g. repobin build, `bazel build`, `bazel test`)
-# never overwrite each other. Placed under `bazel-execlogs/` (gitignored via
-# `/bazel-*` and ignored by Bazel via `.bazelignore`) so Buildkite `artifact_paths`
-# uploads them automatically even if a step fails or overrides `EXIT` traps.
-CI_EXECLOG_ROOT="$(pwd -P)/bazel-execlogs"
-CI_EXECLOG_DIR="${CI_EXECLOG_ROOT}/${BUILDKITE_JOB_ID:-local-$$}"
-rm -rf "$CI_EXECLOG_ROOT"
-mkdir -p "$CI_EXECLOG_DIR"
-CI_EXECLOG_SEQ=0
+# Per-job compact execution logs. Shared with PATH-wrapper subprocesses via
+# ci-execlog.sh (unique filenames, sibling-job cleanup, no wipe on re-source).
+# shellcheck source=ci-execlog.sh
+source "$(dirname "${BASH_SOURCE[0]}")/ci-execlog.sh"
+_ci_execlog_setup "$(dirname "${BASH_SOURCE[0]}")/ci-execlog.sh"
 
 # Wrap bazel and pass in ci configuration (CI_BAZEL_FLAGS, above).
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
@@ -279,26 +280,11 @@ bazel() {
   local subcommand="$1"
   shift
 
-  local execlog_flag=()
-  case "$subcommand" in
-    build|test|run|coverage)
-      local has_execlog=0 arg
-      for arg in "$@"; do
-        case "$arg" in
-          --execution_log_compact_file|--execution_log_compact_file=*|\
-          --execution_log_json_file|--execution_log_json_file=*|\
-          --execution_log_binary_file|--execution_log_binary_file=*)
-            has_execlog=1
-            break
-            ;;
-        esac
-      done
-      if (( !has_execlog )); then
-        CI_EXECLOG_SEQ=$((CI_EXECLOG_SEQ + 1))
-        execlog_flag=("--execution_log_compact_file=$(printf '%s/%02d-%s.bin.zst' "$CI_EXECLOG_DIR" "$CI_EXECLOG_SEQ" "$subcommand")")
-      fi
-      ;;
-  esac
+  local execlog_flag=() flag
+  flag="$(_ci_execlog_flag_for "$subcommand" "$@")"
+  if [[ -n "$flag" ]]; then
+    execlog_flag=("$flag")
+  fi
 
   local tmplog
   tmplog=$(mktemp "${TMPDIR:-/tmp}/ci-bazel-log.XXXXXX")
@@ -308,11 +294,22 @@ bazel() {
     return 0
   fi
 
-  # Check for Xcode version mismatch (stale disk cache after Xcode upgrade).
+  # Check for Xcode version mismatch (stale disk cache after an Xcode upgrade).
   if grep -qE "xcode-locator.*failed|Xcode version.*is not available" "$tmplog" 2>/dev/null; then
     echo "--- Xcode version mismatch detected in disk cache; running bazel clean --expunge and retrying"
-    command bazel $BAZEL_STARTUP_FLAGS clean --expunge
+    local bazel_bin="${CI_REAL_BAZEL:-}"
+    if [[ -z "$bazel_bin" ]]; then
+      bazel_bin="$(command -v bazel)"
+    fi
+    "$bazel_bin" $BAZEL_STARTUP_FLAGS clean --expunge
     rm -f "$tmplog" "$tmplog.watchdog"
+    # Fresh filename: the first attempt already wrote (or began writing) the
+    # previous path, and one-file-per-invocation requires the retry to keep it.
+    execlog_flag=()
+    flag="$(_ci_execlog_flag_for "$subcommand" "$@")"
+    if [[ -n "$flag" ]]; then
+      execlog_flag=("$flag")
+    fi
     _ci_run_bazel "$tmplog" "$subcommand" ${execlog_flag[@]+"${execlog_flag[@]}"} "$@"
     return $?
   fi

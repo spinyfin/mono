@@ -29,6 +29,8 @@ steps:
   - label: ":white_check_mark: repobin-release (publish)"
     key: "repobin-release-publish"
     command: ".buildkite/steps/repobin-release.sh publish"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "repobin-release-linux"
       - "repobin-release-darwin"

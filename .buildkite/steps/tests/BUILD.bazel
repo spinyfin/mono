@@ -104,6 +104,10 @@ sh_test(
     size = "small",
     srcs = ["execlog_config_test.sh"],
     data = [
+        "//:.bazelignore",
+        "//.buildkite:pipeline_ymls",
         "//.buildkite/steps:ci-env.sh",
+        "//.buildkite/steps:ci-execlog.sh",
+        "//.buildkite/steps:step_scripts",
     ],
 )

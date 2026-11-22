@@ -51,6 +51,8 @@ steps:
   - label: ":white_check_mark: checkleft-release (publish)"
     key: "checkleft-release-publish"
     command: ".buildkite/steps/checkleft-release.sh publish"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "checkleft-release-linux"
       - "checkleft-release-musl"
