@@ -1024,12 +1024,9 @@ impl WorkerPool {
         inner.workers.iter().filter_map(|w| w.execution_id.clone()).collect()
     }
 
-    /// Format a worker id for slot `slot_id`. Inverse of
-    /// [`slot_id_from_worker_id`]; both sides of the
-    /// engine-owns-allocation refactor lean on this string format
-    /// being stable so `worker-{N}` and slot N stay 1:1.
+    /// Format a valid legacy slot through the shared pool-aware codec.
     pub fn worker_id_for_slot(slot_id: u8) -> String {
-        format!("worker-{}", slot_id)
+        worker_id_for_slot(slot_id)
     }
 
     /// Number of slots whose execution already has a workspace lease.
@@ -1097,43 +1094,10 @@ impl WorkerPool {
     }
 }
 
-/// Parse the trailing 1-indexed slot number out of a worker id.
-/// Regular-pool `worker-{N}` ids map directly to slot N.
-/// Automation-pool `auto-worker-{N}` ids map to slot
-/// `N + MAX_WORKER_POOL_SIZE`; review-pool `review-{N}` ids map to
-/// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE`; progression-pool
-/// `progression-{N}` ids map to slot
-/// `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE`,
-/// so the four pools occupy disjoint slot ranges. With the current geometry
-/// (`MAX_WORKER_POOL_SIZE = 16`) that is `1..=16` interactive (Bridge
-/// Crew 1..=8, Lower Decks 9..=16), `17..=24` automation, `25..=40`
-/// review, `41..=44` progression — so "auto-worker-1" → slot 17,
-/// "review-1" → slot 25, "progression-1" → slot 41, never colliding with
-/// another pool's range. Every boundary is derived from
-/// the pool-size constants, so bumping [`WORKER_PAGE_COUNT`] shifts the
-/// automation/review ranges up in lock-step on both the engine and app.
-///
-/// Returns `None` for ids that don't match any recognised shape
-/// or whose suffix isn't a positive `u8`. Callers should treat
-/// `None` as a programming error — the only producer is
-/// [`WorkerPool::claim_worker`].
+/// Decode a valid legacy worker ID using the protocol's frozen slot ranges.
+/// Rejects out-of-range ordinals instead of aliasing another pool.
 pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
-    if let Some(suffix) = worker_id.strip_prefix(PROGRESSION_WORKER_ID_PREFIX) {
-        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
-        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE).ok();
-    }
-    if let Some(suffix) = worker_id.strip_prefix(REVIEW_WORKER_ID_PREFIX) {
-        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
-        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE).ok();
-    }
-    if let Some(suffix) = worker_id.strip_prefix(AUTOMATION_WORKER_ID_PREFIX) {
-        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
-        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE).ok();
-    }
-    if let Some(suffix) = worker_id.strip_prefix("worker-") {
-        return suffix.parse::<u8>().ok().filter(|n| *n >= 1);
-    }
-    None
+    boss_protocol::worker_identity::WorkerSlotIdentity::from_legacy_worker_id(worker_id)?.to_legacy_slot()
 }
 
 pub use boss_engine_storage_values::pool_policy::{
@@ -1141,36 +1105,15 @@ pub use boss_engine_storage_values::pool_policy::{
     pool_driver_slug_for_execution_kind,
 };
 
-/// Derive the canonical worker-id string for a pane slot id.
-/// Inverse of [`slot_id_from_worker_id`]: regular-pool slots
-/// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`; automation-pool
-/// slots (MAX_WORKER_POOL_SIZE < slot ≤ MAX_WORKER_POOL_SIZE +
-/// MAX_AUTOMATION_POOL_SIZE) produce `"auto-worker-{M}"`; review-pool
-/// slots (the next [`MAX_REVIEW_POOL_SIZE`]) produce `"review-{M}"`, and
-/// progression-pool slots (beyond that) produce `"progression-{M}"`, where M
-/// is the slot's offset from the start of the owning pool's range. Callers that
-/// release a pane slot must use this instead of
-/// [`WorkerPool::worker_id_for_slot`] to ensure the release is
-/// routed to the correct pool.
+/// Format a valid legacy slot using the shared protocol codec.
+///
+/// # Panics
+/// Panics for zero or unallocated slots (45 through 199). Use the protocol's
+/// checked codec when accepting untrusted numbers.
 pub fn worker_id_for_slot(slot_id: u8) -> String {
-    let slot = slot_id as usize;
-    if slot <= MAX_WORKER_POOL_SIZE {
-        format!("worker-{}", slot_id)
-    } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE {
-        format!("{}{}", AUTOMATION_WORKER_ID_PREFIX, slot - MAX_WORKER_POOL_SIZE)
-    } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE {
-        format!(
-            "{}{}",
-            REVIEW_WORKER_ID_PREFIX,
-            slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE
-        )
-    } else {
-        format!(
-            "{}{}",
-            PROGRESSION_WORKER_ID_PREFIX,
-            slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE - MAX_REVIEW_POOL_SIZE
-        )
-    }
+    boss_protocol::worker_identity::WorkerSlotIdentity::from_legacy_slot(slot_id)
+        .and_then(|identity| identity.to_legacy_worker_id())
+        .expect("invalid legacy worker slot")
 }
 
 /// Human-readable page label for an interactive/main-pool `slot_id`, or
@@ -2395,6 +2338,19 @@ mod tests {
                 back.starts_with(AUTOMATION_WORKER_ID_PREFIX),
                 "slot {slot} must produce an automation-pool worker_id, got {back:?}"
             );
+        }
+    }
+
+    #[test]
+    fn shared_legacy_codec_preserves_remote_slots_and_rejects_pool_overflow() {
+        for slot in 200..=255 {
+            let id = format!("worker-{slot}");
+            assert_eq!(worker_id_for_slot(slot), id);
+            assert_eq!(WorkerPool::worker_id_for_slot(slot), id);
+            assert_eq!(slot_id_from_worker_id(&id), Some(slot));
+        }
+        for id in ["worker-17", "worker-32", "auto-worker-9", "review-17", "progression-5"] {
+            assert_eq!(slot_id_from_worker_id(id), None);
         }
     }
 
