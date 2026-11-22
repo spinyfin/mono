@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -160,6 +161,13 @@ class CaptureTest(unittest.TestCase):
         self.assertFalse(missing.exists())
         self.assertEqual(capture.call_count, 1)
         self.assertEqual(capture.call_args.args[0], 11)
+
+    def test_pre_deadline_wait_exits_when_wrapper_is_gone(self):
+        gone = subprocess.Popen(["/usr/bin/true"])
+        gone.wait()
+        started = time.monotonic()
+        self.assertFalse(capture_stacks.wait_until_deadline_or_wrapper_exit(30, gone.pid))
+        self.assertLess(time.monotonic() - started, 2)
 
 
 if __name__ == "__main__":

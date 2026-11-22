@@ -60,6 +60,18 @@ These samples have different waits and are not fixed by checking connection owne
 - **Watchdog startup ownership:** `cleanup_guard_test`'s startup-kill case can lose the launcher before it announces a child, so stack capture never runs. That is a launch/watchdog protocol gap, not a WorkDb lock.
 - **UpdateCore observer ordering:** `RelaunchHelperTests.testEarlyExitIsRecordedAsProcessExited` can observe `observerUnavailable` instead of the helper's exit code. The Swift helper does not use WorkDb.
 - **Linux timeout backtraces:** the hermetic wrapper still `exec`s the test on non-darwin hosts, so a Linux timeout has no stack dump. macOS capture is the delivered diagnostic.
+- **Remote executor deadline capture (before pre-deadline sampling):** NativeLink may SIGKILL the action root at the Bazel deadline without TERM, then collect outputs as soon as that process exits. Capture from a TERM trap or from the independent watchdog after the root is gone is then too late.
+
+## Remote executor deadline probes
+
+Earlier probes, run when capture happened only on TERM or from the watchdog after the action root was gone, showed that a real NativeLink deadline retained nothing:
+
+- `--config=remote-tests --test_timeout=30` of `//tools/test-sandbox:timeout_capture_fixture` returned TIMEOUT at 30.1 seconds (invocation `9a372d50-53b4-4ee1-ad1f-aba7868fdacb`). `test.log` contained only `timeout capture fixture ready`; `test.outputs` was empty, with no capture pointer or thread summary.
+- A preceding 10-second probe of the same target also returned TIMEOUT with no capture output.
+
+Those runs do not establish whether the executor delivered TERM to the wrapper. They do show that late capture is not retained.
+
+After sampling shortly before `TEST_TIMEOUT` while the action is still alive, the same 30-second remote probe returned TIMEOUT at 30.0 seconds (invocation `10a4eba7-1f1f-4ca9-b265-add6a2352f8c`) with `capturing test thread backtraces before deadline` in `test.log`, a per-thread summary naming `PyThread_acquire_lock_timed` / `__psynch_cvwait` on the fixture's Python, and a populated `test.outputs/timeout-82882/` tree (`processes.txt`, `threads-82882.txt`, `complete`).
 
 ## CI evidence window
 

@@ -160,5 +160,28 @@ def main():
             lock.close()
 
 
+def wait_until_deadline_or_wrapper_exit(delay, wrapper_pid):
+    """True if the wrapper is still alive at the deadline; False if it died first."""
+    deadline = time.monotonic() + delay
+    while time.monotonic() < deadline:
+        try:
+            os.kill(wrapper_pid, 0)
+        except OSError:
+            return False
+        time.sleep(0.2)
+    try:
+        os.kill(wrapper_pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--before-deadline":
+        delay = int(sys.argv[2])
+        wrapper_pid = int(sys.argv[3])
+        sys.argv = [sys.argv[0]] + sys.argv[4:]
+        if not wait_until_deadline_or_wrapper_exit(delay, wrapper_pid):
+            sys.exit(0)
+        print("capturing test thread backtraces before deadline", file=sys.stderr, flush=True)
     main()

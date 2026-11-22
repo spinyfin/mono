@@ -399,6 +399,95 @@ run_sigint_forwarding_case() {
   assert_no_marker_process "${marker}" "INT"
 }
 
+# Capture must finish while the test is still alive, before any TERM, so a
+# remote executor that SIGKILLs the wrapper at the deadline still has reports
+# in the undeclared-output tree it collects from the live action.
+run_pre_deadline_capture_case() {
+  local inner_pid=""
+  local inner_root=""
+  local marker="cleanup-$$-PREDEADLINE"
+  local outputs="${TEST_UNDECLARED_OUTPUTS_DIR:?}/outputs-${marker}"
+  local log="${TEST_TMPDIR}/stderr-${marker}"
+  mkdir "${outputs}"
+
+  set -m
+  TEST_TIMEOUT=5 TEST_UNDECLARED_OUTPUTS_DIR="${outputs}" \
+    "${wrapper}" "${child}" "${marker}" 2>"${log}" &
+  inner_pid=$!
+  set +m
+
+  for _ in {1..400}; do
+    for candidate in /private/tmp/mono-test.*; do
+      if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/cleanup-child-marker" ]]; then
+        read -r candidate_marker <"${candidate}/cleanup-child-marker" || continue
+        if [[ "${candidate_marker}" == "${marker}" ]]; then
+          inner_root="${candidate}"
+          break 2
+        fi
+      fi
+    done
+    sleep 0.05
+  done
+
+  if [[ -z "${inner_root}" ]]; then
+    kill -TERM "${inner_pid}" 2>/dev/null || true
+    wait "${inner_pid}" 2>/dev/null || true
+    printf '%s\n' "inner wrapper did not start for pre-deadline capture" >&2
+    return 1
+  fi
+
+  read -r child_pid descendant_pid <"${inner_root}/cleanup-child-pids"
+  local report=""
+  for _ in {1..400}; do
+    report="${outputs}/timeout-${child_pid}/complete"
+    if [[ -s "${report}" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  cat "${log}" >&2
+  [[ -s "${outputs}/timeout-${child_pid}/complete" ]] || {
+    printf '%s\n' "pre-deadline capture did not complete while the test was live" >&2
+    kill -TERM "${inner_pid}" 2>/dev/null || true
+    wait "${inner_pid}" 2>/dev/null || true
+    return 1
+  }
+  kill -0 "${child_pid}" 2>/dev/null || {
+    printf '%s\n' "pre-deadline capture ran only after the test had already exited" >&2
+    wait "${inner_pid}" 2>/dev/null || true
+    return 1
+  }
+  grep -q "capturing test thread backtraces before deadline" "${log}"
+  local pid
+  for pid in "${child_pid}" "${descendant_pid}"; do
+    report="${outputs}/timeout-${child_pid}/threads-${pid}.txt"
+    [[ -s "${report}" ]] || {
+      printf 'missing pre-deadline thread backtraces: %s\n' "${report}" >&2
+      kill -TERM "${inner_pid}" 2>/dev/null || true
+      wait "${inner_pid}" 2>/dev/null || true
+      return 1
+    }
+    grep -q 'Call graph:' "${report}"
+    grep -q 'Thread_' "${report}"
+  done
+
+  kill -TERM "${inner_pid}" 2>/dev/null || true
+  wait "${inner_pid}" 2>/dev/null || true
+  for _ in {1..200}; do
+    if [[ ! -e "${inner_root}" ]] && ! kill -0 "${child_pid}" 2>/dev/null &&
+      ! kill -0 "${descendant_pid}" 2>/dev/null &&
+      [[ -z "$(marker_processes "${marker}")" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  [[ ! -e "${inner_root}" ]] || {
+    printf 'sandbox root survived pre-deadline capture: %s\n' "${inner_root}" >&2
+    return 1
+  }
+  assert_no_marker_process "${marker}" "pre-deadline capture"
+}
+
 # A hook path outside the supervisor's private directory must be ignored: the
 # wrapper runs the test normally and creates nothing at that path.
 run_unbound_hook_case() {
@@ -437,4 +526,5 @@ run_dead_watchdog_case
 run_cancel_before_ready_case TERM
 run_cancel_before_ready_case HUP
 run_sigint_forwarding_case
+run_pre_deadline_capture_case
 run_unbound_hook_case

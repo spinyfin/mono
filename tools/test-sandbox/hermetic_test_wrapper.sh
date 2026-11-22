@@ -104,6 +104,7 @@ unset \
 
 child_pid=""
 watchdog_pid=""
+pre_deadline_pid=""
 cancelled=""
 
 capture_child_stacks() {
@@ -111,6 +112,44 @@ capture_child_stacks() {
     MONO_CAPTURE_TEST_HOLD="${capture_hold}" "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
       "${child_pid}" "${runtime_bin}" "${capture_bin}" || \
       printf 'could not capture test thread backtraces for %s\n' "${child_pid}" >&2
+  fi
+}
+
+# Remote executors (NativeLink on the macOS workers) may SIGKILL the action
+# root at the Bazel deadline without a TERM the wrapper can trap, then collect
+# stdout/stderr and undeclared outputs as soon as that process exits. Capture
+# from a TERM trap or from the watchdog after the root is gone is then too
+# late: the worker has already taken the empty output tree. Sample while the
+# action is still alive, shortly before TEST_TIMEOUT, so the reports are on
+# disk when the executor collects them. Local process-wrapper TERM still
+# recaptures if this timer has not fired; the capture lock keeps that a no-op
+# when it has.
+start_pre_deadline_capture() {
+  local timeout lead delay
+  [[ "${OSTYPE:-}" == darwin* ]] || return 0
+  timeout="${TEST_TIMEOUT:-}"
+  [[ "${timeout}" =~ ^[1-9][0-9]*$ ]] || return 0
+  lead=8
+  if (( timeout <= lead + 2 )); then
+    lead=$((timeout / 2))
+  fi
+  (( lead >= 1 && timeout > lead )) || return 0
+  delay=$((timeout - lead))
+  # Close the watchdog lifeline in this child: an inherited write end would
+  # keep the watchdog waiting if this shell is SIGKILLed before the timer
+  # fires. Python argv does not carry the wrapper's test marker, so a
+  # pid-only SIGKILL of this shell cannot leave a marker-matching sleeper.
+  "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
+    --before-deadline "${delay}" "$$" "${child_pid}" "${runtime_bin}" "${capture_bin}" \
+    8<&- 9<&- 12<&- &
+  pre_deadline_pid=$!
+}
+
+stop_pre_deadline_capture() {
+  if [[ -n "${pre_deadline_pid}" ]]; then
+    kill "${pre_deadline_pid}" 2>/dev/null || true
+    wait "${pre_deadline_pid}" 2>/dev/null || true
+    pre_deadline_pid=""
   fi
 }
 
@@ -178,6 +217,7 @@ release_watchdog() {
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
+  stop_pre_deadline_capture
   if [[ -n "${child_pid}" ]] && ! terminate_child_group && [[ "${status}" == "0" ]]; then
     status=1
   fi
@@ -605,6 +645,7 @@ os._exit(127)' \
   /usr/bin/sandbox-exec -f "${profile}" "$@" 0<&0 8<&- 9<&- 12<&- &
 child_pid=$!
 exit_if_cancelled
+start_pre_deadline_capture
 
 set +e
 wait "${child_pid}"
