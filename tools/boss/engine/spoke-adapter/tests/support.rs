@@ -1,5 +1,7 @@
 //! A real hub (stream manager over mTLS gRPC, work database, command outbox)
 //! and a scripted spoke on the other end of a real stream.
+mod liveness;
+mod observed_outbox;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -340,8 +342,10 @@ impl SpawnComposer for Composer {
 pub struct Fixture {
     pub db: Arc<WorkDb>,
     pub signals: Arc<PromptSignals>,
+    pub stop_submissions: Arc<AtomicU64>,
     pub provider: Arc<SpokeHostAdapterProvider>,
     pub manager: StreamManager,
+    frozen_liveness: bool,
     legacy: Arc<Legacy>,
     dialer: Endpoint,
     server: tokio::task::JoinHandle<()>,
@@ -368,6 +372,17 @@ impl Fixture {
 
     /// A hub that offers `contracts` instead of the first-release set.
     pub async fn with_hub_contracts(config: SpokeAdapterConfig, contracts: Contracts) -> Self {
+        Self::build(config, contracts, Duration::from_secs(2)).await
+    }
+
+    /// A fixture that drains the immediate first pulse before returning a peer,
+    /// then keeps periodic pulses beyond the test's explicit clock advances.
+    /// The pulse timeout is unchanged.
+    pub async fn with_frozen_liveness(config: SpokeAdapterConfig) -> Self {
+        Self::build(config, Contracts::first_release(), Duration::from_secs(3600)).await
+    }
+
+    async fn build(config: SpokeAdapterConfig, contracts: Contracts, pulse_interval: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("work.db")).unwrap());
         let mut params = CertificateParams::default();
@@ -394,7 +409,11 @@ impl Fixture {
             db: Arc::clone(&db),
             state: Mutex::new(HashMap::new()),
         });
-        let outbox = WorkDbOutbox::new(Arc::clone(&db));
+        let stop_submissions = Arc::new(AtomicU64::new(0));
+        let outbox = observed_outbox::ObservedOutbox {
+            inner: WorkDbOutbox::new(Arc::clone(&db)),
+            stops: Arc::clone(&stop_submissions),
+        };
         let manager = StreamManager::new(
             Config::builder()
                 .hub_id("hub")
@@ -403,7 +422,7 @@ impl Fixture {
                 .max_hosts(4)
                 .max_pending(8)
                 .hello_timeout(Duration::from_secs(2))
-                .pulse_interval(Duration::from_secs(2))
+                .pulse_interval(pulse_interval)
                 .pulse_timeout(Duration::from_secs(1))
                 .contracts(contracts)
                 .build(),
@@ -436,7 +455,10 @@ impl Fixture {
             .tls_config(tls)
             .unwrap();
         let legacy = Arc::new(Legacy::default());
-        let signals = Arc::new(PromptSignals(std::sync::atomic::AtomicBool::new(true)));
+        let signals = Arc::new(PromptSignals(
+            std::sync::atomic::AtomicBool::new(true),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
         let provider = SpokeHostAdapterProvider::new(
             Arc::new(LegacyProvider(Arc::clone(&legacy))),
             manager.clone(),
@@ -447,9 +469,11 @@ impl Fixture {
         );
         Self::builder()
             .signals(signals)
+            .stop_submissions(stop_submissions)
             .db(db)
             .provider(Arc::new(provider))
             .manager(manager)
+            .frozen_liveness(pulse_interval == Duration::from_secs(3600))
             .legacy(legacy)
             .dialer(dialer)
             .server(server)
@@ -674,6 +698,8 @@ impl Fixture {
         let next_record = Arc::new(AtomicU64::new(last_record + 1));
         let journal = welcome.command_journal_id;
         let script = Arc::new(Mutex::new(script));
+        let liveness = Arc::new(liveness::Startup::default());
+        let task_liveness = Arc::clone(&liveness);
         let (task_seen, task_next, task_journal, task_tx) =
             (Arc::clone(&seen), Arc::clone(&next_record), journal.clone(), tx.clone());
         let task = tokio::spawn(async move {
@@ -682,6 +708,10 @@ impl Fixture {
                 match frame.body {
                     Some(hub_frame::Body::Pulse(pulse)) => {
                         let _ = tx.send(frame_of(spoke_frame::Body::PulseReply(pulse))).await;
+                        task_liveness.pulse_replied.store(true, Ordering::SeqCst);
+                    }
+                    Some(hub_frame::Body::RecordReceipt(cursor)) => {
+                        task_liveness.received.store(cursor.through, Ordering::SeqCst);
                     }
                     Some(hub_frame::Body::Command(command)) => {
                         seen.lock().unwrap().push(command.clone());
@@ -707,13 +737,18 @@ impl Fixture {
                 }
             }
         });
-        Peer {
-            tx,
-            seen,
-            next_record,
-            journal,
-            task,
+        let peer = Peer::builder()
+            .tx(tx)
+            .seen(seen)
+            .next_record(next_record)
+            .journal(journal)
+            .task(task)
+            .liveness(liveness)
+            .build();
+        if self.frozen_liveness {
+            peer.settle_initial_pulse().await;
         }
+        peer
     }
 }
 
@@ -742,12 +777,15 @@ fn result_record(sequence: u64, run: Option<Run>, result: CommandResult) -> Reco
 /// How the scripted spoke answers a command: `None` stays silent.
 pub type Script = Box<dyn FnMut(&Command) -> Option<CommandResult> + Send>;
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct Peer {
     tx: mpsc::Sender<SpokeFrame>,
     seen: Arc<Mutex<Vec<Command>>>,
     next_record: Arc<AtomicU64>,
     pub journal: String,
     task: tokio::task::JoinHandle<()>,
+    liveness: Arc<liveness::Startup>,
 }
 
 impl Peer {
@@ -758,6 +796,10 @@ impl Peer {
 
     pub fn commands(&self) -> Vec<Command> {
         self.seen.lock().unwrap().clone()
+    }
+
+    pub fn last_record(&self) -> u64 {
+        self.next_record.load(Ordering::SeqCst) - 1
     }
 
     pub async fn wait_for_command(&self, count: usize) -> Vec<Command> {
@@ -880,7 +922,7 @@ pub fn work_item() -> WorkItem {
     )
 }
 
-pub struct PromptSignals(pub std::sync::atomic::AtomicBool);
+pub struct PromptSignals(pub std::sync::atomic::AtomicBool, pub std::sync::atomic::AtomicUsize);
 impl boss_execution_contracts::DriverSignals for PromptSignals {
     fn has_driver_signal_for_run(&self, _: &str) -> bool {
         true
@@ -889,6 +931,7 @@ impl boss_execution_contracts::DriverSignals for PromptSignals {
         Some("session_start".into())
     }
     fn has_prompt_accepted_for_run(&self, _: &str) -> bool {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.0.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn commit_never_started_reap(&self, _: u8, _: &str) -> boss_execution_contracts::NeverStartedReap {
