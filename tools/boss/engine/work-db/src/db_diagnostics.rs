@@ -236,6 +236,11 @@ impl OwnedConnection {
             scope,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn caller(&self) -> &'static Location<'static> {
+        self.observation.caller
+    }
 }
 
 impl std::ops::Deref for OwnedConnection {

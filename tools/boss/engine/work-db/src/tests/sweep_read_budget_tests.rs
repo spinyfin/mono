@@ -58,6 +58,27 @@ INSERT INTO work_comments(id, artifact_kind, artifact_id, doc_version, anchor_js
                           plain_text_projection_version, created_at, updated_at)
 SELECT printf('cmt_%05d', n), 'pr_doc', 'doc' || (n % 300), 'v1', '{}', (SELECT k1 FROM fill), 'human', 'resolved', 1,
        '1760000000', '1760000000' FROM s;
+WITH RECURSIVE g(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM g WHERE n < 499)
+INSERT INTO pr_review_guide_source_series(id, root_task_id, canonical_pr_url, created_at, updated_at)
+SELECT printf('gser_%04d', n), printf('task_g_%04d', n), printf('https://github.com/o/r/pull/%d', n + 1),
+       '1760000000', '1760000000' FROM g;
+WITH RECURSIVE g(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM g WHERE n < 499)
+INSERT INTO pr_review_guide_source_comparisons(id, series_id, observation_sequence, observed_base_sha, merge_base_sha,
+                                               head_sha, trigger, packet_hash, complete, captured_at)
+SELECT printf('gcmp_%04d', n), printf('gser_%04d', n), 1, 'base', 'base', printf('%040x', n), 'manual', 'hash', 1,
+       CASE WHEN n % 5 = 0 THEN '1700000000' ELSE '1900000000' END FROM g;
+WITH RECURSIVE g(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM g WHERE n < 499)
+INSERT INTO pr_review_guide_attempts(id, series_id, comparison_id, request_epoch, ordinal, status, prompt_version, created_at)
+SELECT printf('gatt_%04d', n), printf('gser_%04d', n), printf('gcmp_%04d', n), 1, 1, 'succeeded', 'v1',
+       CASE WHEN n % 5 = 0 THEN '1700000000' ELSE '1900000000' END FROM g;
+WITH RECURSIVE g(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM g WHERE n < 499)
+INSERT INTO pr_review_guide_versions(id, series_id, comparison_id, attempt_id, markdown, raw_output, content_hash,
+                                     prompt_version, generated_at)
+SELECT printf('gver_%04d', n), printf('gser_%04d', n), printf('gcmp_%04d', n), printf('gatt_%04d', n),
+       'md', 'raw', 'ch', 'v1', CASE WHEN n % 5 = 0 THEN '1700000000' ELSE '1900000000' END FROM g;
+WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 499)
+INSERT INTO pr_review_guide_updates(attempt_id, previous_version_id)
+SELECT printf('gatt_%04d', n), printf('gver_%04d', n - 1) FROM g;
 DROP TABLE fill;
 "#;
 
@@ -66,6 +87,9 @@ DROP TABLE fill;
 /// either fails by an order of magnitude; an indexed read of the live rows
 /// stays well inside it.
 const READ_BUDGET_PAGES: u64 = 2500;
+/// Hourly scans that intentionally read the full execution stock (e.g.
+/// driver-home retention classifying live vs terminal `driver_runtime_state`).
+const HOURLY_STOCK_BUDGET_PAGES: u64 = 10_000;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -136,141 +160,206 @@ fn fixture(label: &str, statistics: Statistics) -> Fixture {
     }
 }
 
-type Read = (&'static str, &'static str, fn(&WorkDb));
+type Read = (&'static str, &'static str, u64, fn(&WorkDb));
 
-/// The recurring reads, with the timer that drives each.
+/// The recurring reads, with the timer that drives each and its page budget.
 fn recurring_reads() -> Vec<Read> {
     vec![
-        ("review verdict applier", "10 s", |db| {
+        ("review verdict applier", "10 s", READ_BUDGET_PAGES, |db| {
             db.list_proposed_review_verdicts().unwrap();
         }),
-        ("scheduler beat: unexplained waits", "15 s", |db| {
+        ("scheduler beat: unexplained waits", "15 s", READ_BUDGET_PAGES, |db| {
             db.list_unexplained_dispatch_waits().unwrap();
         }),
-        ("scheduler beat: queued displays", "15 s", |db| {
+        ("scheduler beat: queued displays", "15 s", READ_BUDGET_PAGES, |db| {
             db.queued_displays(boss_engine_utils::epoch_time::now_epoch_secs(), &HashMap::new())
                 .unwrap();
         }),
-        ("scheduler beat: ready executions", "15 s", |db| {
+        ("scheduler beat: ready executions", "15 s", READ_BUDGET_PAGES, |db| {
             db.list_ready_executions().unwrap();
         }),
-        ("dependency unblock: blocked candidates", "30 s", |db| {
-            db.list_dependency_blocked_candidates().unwrap();
-        }),
-        ("dependency unblock: stuck autostart", "30 s", |db| {
+        (
+            "dependency unblock: blocked candidates",
+            "30 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.list_dependency_blocked_candidates().unwrap();
+            },
+        ),
+        ("dependency unblock: stuck autostart", "30 s", READ_BUDGET_PAGES, |db| {
             db.promote_todo_autostart_stuck_executions().unwrap();
         }),
-        ("merge poller: pending merge check", "60 s", |db| {
+        ("merge poller: pending merge check", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_chores_pending_merge_check().unwrap();
         }),
-        ("merge poller: blocked on merge conflict", "60 s", |db| {
-            db.list_chores_blocked_on_merge_conflict().unwrap();
-        }),
-        ("merge poller: blocked on CI failure", "60 s", |db| {
+        (
+            "merge poller: blocked on merge conflict",
+            "60 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.list_chores_blocked_on_merge_conflict().unwrap();
+            },
+        ),
+        ("merge poller: blocked on CI failure", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_chores_blocked_on_ci_failure().unwrap();
         }),
-        ("merge poller: blocked with PR", "60 s", |db| {
+        ("merge poller: blocked with PR", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_chores_blocked_other_with_pr().unwrap();
         }),
-        ("merge poller: stranded remediation", "60 s", |db| {
+        ("merge poller: stranded remediation", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_chores_stranded_blocked_remediation().unwrap();
         }),
-        ("merge poller: merges in flight", "60 s", |db| {
+        ("merge poller: merges in flight", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_work_item_ids_with_pending_merge().unwrap();
         }),
-        ("merge poller: merge queue members", "60 s", |db| {
+        ("merge poller: merge queue members", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_work_item_ids_in_merge_queue().unwrap();
         }),
-        ("merge poller: review admission", "60 s", |db| {
+        ("merge poller: review admission", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_tasks_awaiting_pre_merge_review_admission().unwrap();
         }),
-        ("merge poller: pending PR detection", "60 s", |db| {
+        ("merge poller: pending PR detection", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_executions_pending_pr_detection().unwrap();
         }),
-        ("merge poller: late PR detection", "60 s", |db| {
+        ("merge poller: late PR detection", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_recently_terminal_executions_pending_pr_detection(3600).unwrap();
         }),
-        ("merge poller: stalled reviewer", "60 s", |db| {
+        ("merge poller: stalled reviewer", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_tasks_with_stalled_reviewer(600).unwrap();
         }),
-        ("orphan sweep", "60 s", |db| {
+        ("orphan sweep", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_orphan_active_candidates(300).unwrap();
         }),
-        ("review recovery", "60 s", |db| {
+        ("review recovery", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_dead_pr_review_candidates().unwrap();
         }),
-        ("pane-death sweep: live shells", "60 s", |db| {
+        ("pane-death sweep: live shells", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_non_terminal_executions_with_local_shell_pid().unwrap();
         }),
-        ("pane-death sweep: recent terminal", "60 s", |db| {
+        ("pane-death sweep: recent terminal", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_recent_terminal_execution_refs_with_local_shell_pid(
                 3600,
                 boss_engine_utils::epoch_time::now_epoch_secs(),
             )
             .unwrap();
         }),
-        ("lease release", "60 s", |db| {
+        ("lease release", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_terminal_executions_holding_lease().unwrap();
         }),
-        ("lost workspace sweep", "60 s", |db| {
+        ("lost workspace sweep", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_non_terminal_executions_with_workspace().unwrap();
         }),
-        ("answer-agent completion", "60 s", |db| {
+        ("answer-agent completion", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_live_answer_agent_executions().unwrap();
         }),
-        ("stranded answering", "60 s", |db| {
+        ("stranded answering", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_answering_comments().unwrap();
         }),
-        ("remote lease reconcile: live runs", "60 s", |db| {
+        ("remote lease reconcile: live runs", "60 s", READ_BUDGET_PAGES, |db| {
             db.list_live_remote_runs().unwrap();
         }),
-        ("remote lease reconcile: cleanup runs", "60 s", |db| {
-            db.terminal_remote_cleanup_runs().unwrap();
-        }),
-        ("attention reconcile", "300 s", |db| {
+        (
+            "remote lease reconcile: cleanup runs",
+            "60 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.terminal_remote_cleanup_runs().unwrap();
+            },
+        ),
+        ("attention reconcile", "300 s", READ_BUDGET_PAGES, |db| {
             db.reconcile_stale_attention_signals().unwrap();
         }),
-        ("abandoned branch sweep: pushed branches", "300 s", |db| {
-            db.list_abandoned_pushed_branch_candidates(600, 86400).unwrap();
-        }),
-        ("abandoned branch sweep: bookmarks", "300 s", |db| {
+        (
+            "abandoned branch sweep: pushed branches",
+            "300 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.list_abandoned_pushed_branch_candidates(600, 86400).unwrap();
+            },
+        ),
+        ("abandoned branch sweep: bookmarks", "300 s", READ_BUDGET_PAGES, |db| {
             db.terminal_bookmark_executions(600, 86400).unwrap();
         }),
-        ("proposal expiry", "3600 s", |db| {
+        ("preserved-work cleanup: superseded", "300 s", READ_BUDGET_PAGES, |db| {
+            db.list_superseded_preserved(50, &[]).unwrap();
+        }),
+        (
+            "preserved-work cleanup: closed chain",
+            "300 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.list_closed_chain_preserved(14 * 24 * 60 * 60, 50, &[]).unwrap();
+            },
+        ),
+        ("positioning-hold recheck", "300 s", READ_BUDGET_PAGES, |db| {
+            db.list_positioning_holds().unwrap();
+        }),
+        ("PR binding repair", "600 s", READ_BUDGET_PAGES, |db| {
+            db.list_pr_binding_repair_candidates().unwrap();
+        }),
+        ("proposal expiry", "3600 s", READ_BUDGET_PAGES, |db| {
             db.expire_stale_in_flight_proposals().unwrap();
         }),
-        ("startup: stranded executions", "start", |db| {
+        ("execution retention", "3600 s", READ_BUDGET_PAGES, |db| {
+            db.prune_terminal_executions(
+                crate::ExecutionRetentionPolicy::default(),
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+                false,
+            )
+            .unwrap();
+        }),
+        ("review-guide source retention", "3600 s", READ_BUDGET_PAGES, |db| {
+            db.prune_pr_review_guide_sources(crate::review_guide_sources::SourceRetentionPolicy::default())
+                .unwrap();
+        }),
+        (
+            "driver-home retention: transcript backfill",
+            "3600 s",
+            READ_BUDGET_PAGES,
+            |db| {
+                db.backfill_durable_transcript_paths().unwrap();
+            },
+        ),
+        (
+            "driver-home retention: runtime states",
+            "3600 s",
+            HOURLY_STOCK_BUDGET_PAGES,
+            |db| {
+                db.list_executions_with_driver_runtime_state().unwrap();
+            },
+        ),
+        ("startup: stranded executions", "start", READ_BUDGET_PAGES, |db| {
             db.abandon_stranded_executions_on_closed_work_items().unwrap();
         }),
     ]
 }
 
-fn measure_all(fixture: &Fixture) -> Vec<(&'static str, &'static str, Measured)> {
+fn measure_all(fixture: &Fixture) -> Vec<(&'static str, &'static str, u64, Measured)> {
     // The first statement on a connection reads the whole schema.
     fixture.db.get_metadata("warm").unwrap();
     recurring_reads()
         .into_iter()
-        .map(|(name, every, read)| {
+        .map(|(name, every, budget, read)| {
             let ((), measured) = measure(|| read(&fixture.db));
-            (name, every, measured)
+            (name, every, budget, measured)
         })
         .collect()
 }
 
-fn report(label: &str, fixture: &Fixture, results: &[(&'static str, &'static str, Measured)]) {
+fn report(label: &str, fixture: &Fixture, results: &[(&'static str, &'static str, u64, Measured)]) {
     let mut tables: Vec<_> = fixture.table_pages.iter().collect();
     tables.sort();
     println!("sweep_read_budget {label}: table pages {tables:?}");
-    for (name, every, measured) in results {
+    for (name, every, budget, measured) in results {
         let top = measured
             .top_statement()
             .map_or_else(String::new, |top| format!(" top=[{:.90}]", top.sql));
         println!(
-            "sweep_read_budget {label}: pages={:<6} full_scan_steps={:<6} statements={:<4} every={every:<5} {name}{top}",
-            measured.pages, measured.full_scan_steps, measured.statements
+            "sweep_read_budget {label}: pages={:<6} budget={:<6} full_scan_steps={:<6} statements={:<4} every={every:<5} {name}{top}",
+            measured.pages, budget, measured.full_scan_steps, measured.statements
         );
     }
-    let total: u64 = results.iter().map(|(_, _, measured)| measured.pages).sum();
+    let total: u64 = results.iter().map(|(_, _, _, measured)| measured.pages).sum();
     println!("sweep_read_budget {label}: one pass of every read = {total} pages");
 }
 
@@ -322,13 +411,13 @@ fn assert_remote_reconcile_covers_history_and_live_tail(label: &str, db: &WorkDb
     );
 }
 
-fn assert_within_budget(label: &str, results: &[(&'static str, &'static str, Measured)]) {
+fn assert_within_budget(label: &str, results: &[(&'static str, &'static str, u64, Measured)]) {
     let over: Vec<String> = results
         .iter()
-        .filter(|(_, _, measured)| measured.pages > READ_BUDGET_PAGES)
-        .map(|(name, _, measured)| {
+        .filter(|(_, _, budget, measured)| measured.pages > *budget)
+        .map(|(name, _, budget, measured)| {
             format!(
-                "{name}: {} pages, top statement {:?}",
+                "{name}: {} pages (budget {budget}), top statement {:?}",
                 measured.pages,
                 measured.top_statement().map(|top| top.sql.as_str()).unwrap_or("")
             )
@@ -336,7 +425,7 @@ fn assert_within_budget(label: &str, results: &[(&'static str, &'static str, Mea
         .collect();
     assert!(
         over.is_empty(),
-        "{label}: recurring reads over the {READ_BUDGET_PAGES}-page budget (a table walk):\n{}",
+        "{label}: recurring reads over budget (a table walk):\n{}",
         over.join("\n")
     );
 }

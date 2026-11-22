@@ -216,7 +216,31 @@ impl WorkDb {
             // upkeep, and the row re-enters this listing once un-parked.
             let upkeep = super::parking::upkeep_eligible_task_sql("t");
             let mut stmt = conn.prepare(&format!(
-                "SELECT t.id, t.product_id, t.status, t.pr_url, t.origin_pr_number, t.doc_branch,
+                "WITH shared_prs(pr_url) AS (
+                     SELECT pr_url FROM tasks INDEXED BY tasks_pr_url_live_non_revision_idx
+                     WHERE pr_url IS NOT NULL AND pr_url != ''
+                       AND deleted_at IS NULL AND kind != 'revision'
+                     GROUP BY pr_url HAVING COUNT(*) > 1
+                 ),
+                 candidate_tasks(id) AS (
+                     SELECT id FROM tasks INDEXED BY tasks_open_pr_idx
+                     WHERE status NOT IN ('done', 'archived')
+                       AND deleted_at IS NULL
+                       AND pr_url IS NOT NULL AND pr_url != ''
+                     UNION
+                     SELECT id FROM tasks INDEXED BY tasks_origin_pr_url_idx
+                     WHERE deleted_at IS NULL
+                       AND origin_pr_number IS NOT NULL
+                       AND pr_url IS NOT NULL AND pr_url != ''
+                       AND COALESCE(last_status_actor, '') = 'engine'
+                     UNION
+                     SELECT t.id FROM tasks t INDEXED BY tasks_pr_url_live_non_revision_idx
+                     JOIN shared_prs sp ON sp.pr_url = t.pr_url
+                     WHERE t.pr_url IS NOT NULL AND t.pr_url != ''
+                       AND t.deleted_at IS NULL AND t.kind != 'revision'
+                       AND COALESCE(t.last_status_actor, '') = 'engine'
+                 )
+                 SELECT t.id, t.product_id, t.status, t.pr_url, t.origin_pr_number, t.doc_branch,
                     we.id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix,
                     {BOUND_TO_ORIGIN_SQL} AS bound_to_origin,
                     {SHARED_PR_SQL} AS shared,
@@ -229,8 +253,9 @@ impl WorkDb {
                           'waiting_human', 'waiting_review', 'waiting_merge'
                         )
                     ) AS live_review
-             FROM tasks t
-             JOIN work_executions we ON we.id = (
+             FROM candidate_tasks ct
+             CROSS JOIN tasks t ON t.id = ct.id
+             CROSS JOIN work_executions we ON we.id = (
                SELECT latest.id
                FROM work_executions latest
                WHERE latest.work_item_id = t.id

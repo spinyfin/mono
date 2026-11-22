@@ -159,9 +159,13 @@ impl WorkDb {
              JOIN tasks root ON root.id = r.cycle_root_id
              ORDER BY t.id",
             walk = cycle_root_walk_cte(&format!(
-                "((t.deleted_at IS NULL AND COALESCE(t.blocked_reason, '') = '{refused}')
-                      OR EXISTS (SELECT 1 FROM work_attention_items a
-                                 WHERE a.work_item_id = t.id AND a.kind = '{refused}' AND a.status = 'open'))"
+                "t.id IN (
+                     SELECT t2.id FROM tasks t2 INDEXED BY tasks_positioning_refused_idx
+                     WHERE t2.deleted_at IS NULL AND t2.blocked_reason = '{refused}'
+                     UNION
+                     SELECT a.work_item_id FROM work_attention_items a INDEXED BY work_attention_items_open_kind_idx
+                     WHERE a.kind = '{refused}' AND a.status = 'open'
+                 )"
             )),
         );
         let mut stmt = conn.prepare(&sql)?;

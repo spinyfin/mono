@@ -16,7 +16,7 @@ pub(crate) fn migrate_retention_indexes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(super) struct SourceRetentionPolicy {
+pub(crate) struct SourceRetentionPolicy {
     pub terminal_age_seconds: i64,
     pub recent_comparisons: i64,
 }
@@ -63,9 +63,26 @@ pub(super) fn packet_store_lock(root: &Path, exclusive: bool) -> Result<Option<P
     Ok(Some(PacketStoreLock(file)))
 }
 
+const VERSION_DELETE_SQL: &str = "DELETE FROM pr_review_guide_versions WHERE id IN (
+    SELECT v.id FROM pr_review_guide_versions v
+    JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
+    JOIN pr_review_guide_source_series s ON s.id = v.series_id
+    LEFT JOIN tasks t ON t.id = s.root_task_id
+    WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
+      AND CAST(c.captured_at AS INTEGER) < ?1
+      AND CAST(v.generated_at AS INTEGER) < ?1
+      AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
+      AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
+          JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
+          WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
+      -- The readable version is never collected, whatever the lifecycle,
+      -- until its root is deleted.
+      AND (s.readable_version_id IS NOT v.id OR t.id IS NULL OR t.deleted_at IS NOT NULL)
+)";
+
 #[work_db_boundary::instrument]
 impl WorkDb {
-    pub(super) fn prune_pr_review_guide_sources(&self, policy: SourceRetentionPolicy) -> Result<()> {
+    pub(crate) fn prune_pr_review_guide_sources(&self, policy: SourceRetentionPolicy) -> Result<()> {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let cutoff = now - policy.terminal_age_seconds;
         let mut conn = self.connect()?;
@@ -77,25 +94,7 @@ impl WorkDb {
         // live/recent attempts independently of the source packet's age.
         // Versions that still have comments keep the comparison (RESTRICT) and therefore
         // the on-disk packet. Active series are untouched here.
-        tx.execute(
-            "DELETE FROM pr_review_guide_versions WHERE id IN (
-                SELECT v.id FROM pr_review_guide_versions v
-                JOIN pr_review_guide_source_comparisons c ON c.id = v.comparison_id
-                JOIN pr_review_guide_source_series s ON s.id = v.series_id
-                LEFT JOIN tasks t ON t.id = s.root_task_id
-                WHERE (t.id IS NULL OR t.deleted_at IS NOT NULL OR t.status IN ('done', 'archived'))
-                  AND CAST(c.captured_at AS INTEGER) < ?1
-                  AND CAST(v.generated_at AS INTEGER) < ?1
-                  AND NOT EXISTS (SELECT 1 FROM work_comments w WHERE w.guide_version_id = v.id)
-                  AND NOT EXISTS (SELECT 1 FROM pr_review_guide_updates u
-                      JOIN pr_review_guide_attempts a ON a.id = u.attempt_id
-                      WHERE u.previous_version_id = v.id AND a.status IN ('queued', 'running'))
-                  -- The readable version is never collected, whatever the lifecycle,
-                  -- until its root is deleted.
-                  AND (s.readable_version_id IS NOT v.id OR t.id IS NULL OR t.deleted_at IS NOT NULL)
-            )",
-            [cutoff],
-        )?;
+        tx.execute(VERSION_DELETE_SQL, [cutoff])?;
         tx.execute(
             "UPDATE pr_review_guide_source_series SET readable_version_id = NULL
              WHERE readable_version_id IS NOT NULL
@@ -222,46 +221,73 @@ mod lock_tests {
     #[test]
     fn prune_pr_review_guide_sources_avoids_quadratic_nested_loop_scans() {
         let (_dir, db) = crate::test_support::open_db();
-        let now = boss_engine_utils::epoch_time::now_epoch_secs().to_string();
+        let aged = (boss_engine_utils::epoch_time::now_epoch_secs() - 40 * 24 * 60 * 60).to_string();
         {
             let conn = db.connect().unwrap();
             conn.execute(
                 "INSERT INTO pr_review_guide_source_series
                  (id, root_task_id, canonical_pr_url, created_at, updated_at)
-                 VALUES ('ser_1', 'task_1', 'https://github.com/o/r/pull/1', ?1, ?1)",
-                [&now],
+                 VALUES ('ser_1', 'task_1', 'https://github.com/o/r/pull/1', ?1, ?1),
+                        ('ser_2', 'task_2', 'https://github.com/o/r/pull/2', ?1, ?1)",
+                [&aged],
             )
             .unwrap();
             for i in 0..250 {
+                let ser_id = if i == 2 { "ser_2" } else { "ser_1" };
                 let cmp_id = format!("cmp_{i}");
                 let att_id = format!("att_{i}");
                 let ver_id = format!("ver_{i}");
                 let sha = format!("{i:040x}");
+                let att_status = match i {
+                    1 => "queued",
+                    2 => "running",
+                    _ => "succeeded",
+                };
                 conn.execute(
                     "INSERT INTO pr_review_guide_source_comparisons
                      (id, series_id, observation_sequence, observed_base_sha, merge_base_sha,
                       head_sha, trigger, packet_hash, complete, captured_at)
-                     VALUES (?1, 'ser_1', ?2, 'base', 'base', ?3, 'manual', 'hash', 1, ?4)",
-                    rusqlite::params![cmp_id, i, sha, now],
+                     VALUES (?1, ?2, ?3, 'base', 'base', ?4, 'manual', 'hash', 1, ?5)",
+                    rusqlite::params![cmp_id, ser_id, i, sha, aged],
                 )
                 .unwrap();
                 conn.execute(
                     "INSERT INTO pr_review_guide_attempts
                      (id, series_id, comparison_id, request_epoch, ordinal, status,
                       prompt_version, created_at)
-                     VALUES (?1, 'ser_1', ?2, 1, 1, 'succeeded', 'v1', ?3)",
-                    rusqlite::params![att_id, cmp_id, now],
+                     VALUES (?1, ?2, ?3, 1, 1, ?4, 'v1', ?5)",
+                    rusqlite::params![att_id, ser_id, cmp_id, att_status, aged],
                 )
                 .unwrap();
                 conn.execute(
                     "INSERT INTO pr_review_guide_versions
                      (id, series_id, comparison_id, attempt_id, markdown, raw_output,
                       content_hash, prompt_version, generated_at)
-                     VALUES (?1, 'ser_1', ?2, ?3, 'md', 'raw', 'ch', 'v1', ?4)",
-                    rusqlite::params![ver_id, cmp_id, att_id, now],
+                     VALUES (?1, ?2, ?3, ?4, 'md', 'raw', 'ch', 'v1', ?5)",
+                    rusqlite::params![ver_id, ser_id, cmp_id, att_id, aged],
                 )
                 .unwrap();
+                if i > 0 {
+                    conn.execute(
+                        "INSERT INTO pr_review_guide_updates (attempt_id, previous_version_id)
+                         VALUES (?1, ?2)",
+                        rusqlite::params![att_id, format!("ver_{}", i - 1)],
+                    )
+                    .unwrap();
+                }
             }
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {VERSION_DELETE_SQL}"))
+                .unwrap()
+                .query_map([0i64], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("pr_review_guide_updates_previous_version_idx")),
+                "version DELETE must seek pr_review_guide_updates_previous_version_idx: {plan:#?}"
+            );
         }
         let ((), measured) = crate::db_diagnostics::read_volume::measure(|| {
             db.prune_pr_review_guide_sources(SourceRetentionPolicy::default())
@@ -272,6 +298,20 @@ mod lock_tests {
             "prune_pr_review_guide_sources must not scan quadratically over versions/attempts/comparisons; got {} full_scan_steps (top={:?})",
             measured.full_scan_steps,
             measured.top_statement()
+        );
+        let remaining: Vec<String> = db
+            .connect()
+            .unwrap()
+            .prepare("SELECT id FROM pr_review_guide_versions ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["ver_0", "ver_1"],
+            "aged versions without queued/running updates must be deleted, leaving only pinned versions"
         );
     }
 }

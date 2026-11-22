@@ -22,6 +22,7 @@
 use super::{Connection, Result};
 
 pub(super) const MIGRATION_ID: &str = "20261121_1800_recurring_read_indexes";
+pub(super) const PERIODIC_SWEEP_MIGRATION_ID: &str = "20261122_0630_work_db_periodic_sweep_indexes";
 
 /// Partial index of live rows with a durable merge-queue projection, so the
 /// merge poller's per-pass membership read follows the live queue.
@@ -48,6 +49,7 @@ fn execution_statuses_sql(terminal: bool) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
 /// Every execution status that is not terminal, as the body of an SQL `IN`
 /// list. Unfinished executions are found through the existing status index
 /// `work_executions_ready_idx`, which can seek a list of statuses but not
@@ -99,7 +101,62 @@ const ANALYZE_SQL: &str = "
     ANALYZE work_runs_local_shell_ended_idx;";
 
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(INDEXES_SQL)?;
+    apply_with_stat1_guard(conn, INDEXES_SQL, ANALYZE_SQL)
+}
+
+pub(super) const PERIODIC_SWEEP_INDEXES_SQL: &str = "
+    CREATE INDEX IF NOT EXISTS tasks_positioning_refused_idx
+        ON tasks(id)
+        WHERE deleted_at IS NULL AND blocked_reason = 'workspace_positioning_refused';
+    CREATE INDEX IF NOT EXISTS tasks_open_pr_idx
+        ON tasks(id)
+        WHERE status NOT IN ('done', 'archived')
+          AND deleted_at IS NULL
+          AND pr_url IS NOT NULL AND pr_url != '';
+    CREATE INDEX IF NOT EXISTS tasks_pr_url_live_non_revision_idx
+        ON tasks(pr_url)
+        WHERE pr_url IS NOT NULL AND pr_url != ''
+          AND deleted_at IS NULL AND kind != 'revision';
+    CREATE INDEX IF NOT EXISTS tasks_origin_pr_url_idx
+        ON tasks(id)
+        WHERE deleted_at IS NULL AND origin_pr_number IS NOT NULL
+          AND pr_url IS NOT NULL AND pr_url != '';
+    CREATE INDEX IF NOT EXISTS work_executions_preserved_commit_idx
+        ON work_executions(id)
+        WHERE preserved_commit_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS work_executions_never_started_prunable_idx
+        ON work_executions(work_item_id, created_at, id)
+        WHERE started_at IS NULL
+          AND status IN ('abandoned', 'failed', 'orphaned', 'cancelled');
+    CREATE INDEX IF NOT EXISTS execution_bookmarks_recovered_from_idx
+        ON execution_bookmarks(execution_id, recovered_from)
+        WHERE recovered_from IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS execution_bookmarks_archive_cleanup_idx
+        ON execution_bookmarks(execution_id)
+        WHERE archive_cleanup_pending = 1;
+    CREATE INDEX IF NOT EXISTS work_runs_ephemeral_transcript_idx
+        ON work_runs(id)
+        WHERE transcript_path IS NOT NULL
+          AND (instr(transcript_path, '/boss-grok-homes/') > 0
+            OR instr(transcript_path, '/boss-codex-homes/') > 0);";
+
+const PERIODIC_SWEEP_ANALYZE_SQL: &str = "
+    ANALYZE tasks_positioning_refused_idx;
+    ANALYZE tasks_open_pr_idx;
+    ANALYZE tasks_pr_url_live_non_revision_idx;
+    ANALYZE tasks_origin_pr_url_idx;
+    ANALYZE work_executions_preserved_commit_idx;
+    ANALYZE work_executions_never_started_prunable_idx;
+    ANALYZE execution_bookmarks_recovered_from_idx;
+    ANALYZE execution_bookmarks_archive_cleanup_idx;
+    ANALYZE work_runs_ephemeral_transcript_idx;";
+
+pub(super) fn migrate_periodic_sweep(conn: &Connection) -> Result<()> {
+    apply_with_stat1_guard(conn, PERIODIC_SWEEP_INDEXES_SQL, PERIODIC_SWEEP_ANALYZE_SQL)
+}
+
+fn apply_with_stat1_guard(conn: &Connection, indexes_sql: &str, analyze_sql: &str) -> Result<()> {
+    conn.execute_batch(indexes_sql)?;
     // Only analyze the new indexes if `sqlite_stat1` already exists. Running
     // `ANALYZE <index>` on a never-analyzed database would create `sqlite_stat1`
     // and suppress the full `ANALYZE` in `refresh_query_planner_stats`.
@@ -109,7 +166,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     if has_stats {
-        conn.execute_batch(ANALYZE_SQL)?;
+        conn.execute_batch(analyze_sql)?;
     }
     Ok(())
 }

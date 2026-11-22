@@ -906,6 +906,13 @@ mod floor_tests {
                 }),
             ),
             (
+                super::super::recurring_read_indexes::PERIODIC_SWEEP_MIGRATION_ID,
+                Box::new(|c| {
+                    c.execute_batch(super::super::recurring_read_indexes::PERIODIC_SWEEP_INDEXES_SQL)
+                        .unwrap();
+                }),
+            ),
+            (
                 super::super::review_guide_sources::RETENTION_INDEXES_MIGRATION_ID,
                 Box::new(|c| {
                     super::super::review_guide_sources::migrate_retention_indexes(c).unwrap();

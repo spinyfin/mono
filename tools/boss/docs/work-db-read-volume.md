@@ -77,6 +77,11 @@ Several statements were rewritten or pinned so the plan does not depend on plann
 
 The migration analyzes only the indexes it creates. Building them reads each of the four tables once, on the first start after the upgrade.
 
+Two follow-up migrations cover the periodic and retention sweeps:
+
+- `20261122_0515_review_guide_retention_indexes` (`tools/boss/engine/work-db/src/review_guide_source_retention.rs`) adds `pr_review_guide_versions_attempt_idx`, `pr_review_guide_versions_comparison_idx`, and `pr_review_guide_updates_previous_version_idx` so the `NOT EXISTS` checks in `prune_pr_review_guide_sources` seek by index (`139` pages in `sweep_read_budget_tests` over 500 seeded guide series/versions).
+- `20261122_0630_work_db_periodic_sweep_indexes` (`tools/boss/engine/work-db/src/recurring_read_indexes.rs`) adds nine partial indexes (`tasks_positioning_refused_idx`, `tasks_open_pr_idx`, `tasks_pr_url_live_non_revision_idx`, `tasks_origin_pr_url_idx`, `work_executions_preserved_commit_idx`, `work_executions_never_started_prunable_idx`, `execution_bookmarks_recovered_from_idx`, `execution_bookmarks_archive_cleanup_idx`, and `work_runs_ephemeral_transcript_idx`). On the fixture, preserved-work cleanup reads `1` page per pass, positioning-hold recheck reads `43` pages, PR binding repair reads `509` pages, steady-state execution retention reads `63` pages, and durable transcript-path backfill reads `1` page.
+
 ### Result on the fixture
 
 Same fixture, same isolated engine, idle, no app, no workers. Pages are 4 KiB.
@@ -126,18 +131,14 @@ Figures in this doc come from a synthetic fixture. To measure a real database, c
 
 ## Reads that still walk
 
-Measured on the same fixture after the initial index migration. None of these runs more often than every five minutes.
+Measured on the same fixture after migration `20261122_0630_work_db_periodic_sweep_indexes`. Both run hourly (`3600 s`):
 
-| Read                                                                      | Timer  | Pages per pass |
-| ------------------------------------------------------------------------- | ------ | -------------: |
-| Preserved-work cleanup (`preserved_cleanup.rs`, two reads)                | 300 s  |     8,700 each |
-| Positioning-hold recheck (`pre_start_failure.rs`)                         | 300 s  |          7,640 |
-| PR binding repair (`pr_binding.rs`)                                       | 600 s  |          9,960 |
-| Execution retention (`execution_retention.rs`)                            | 3600 s |         57,600 |
-| Driver home retention, three sweeps (`executions_runs.rs`, `run_rows.rs`) | 3600 s |    15,300 each |
-| Backup snapshot (`VACUUM INTO`)                                           | 3600 s | the whole file |
+| Read                                                                                      | Timer  | Pages per pass |
+| ----------------------------------------------------------------------------------------- | ------ | -------------: |
+| Driver home retention: `list_executions_with_driver_runtime_state` (`executions_runs.rs`) | 3600 s |          7,836 |
+| Backup snapshot (`VACUUM INTO`)                                                           | 3600 s | the whole file |
 
-The backup reads the whole file by design. (`review_guide_source_retention.rs` previously stepped 5.7 million rows in a nested loop over 2,800 guide versions; migration `20261122_0515_review_guide_retention_indexes` added indexes on `pr_review_guide_versions(attempt_id)`, `pr_review_guide_versions(comparison_id)`, and `pr_review_guide_updates(previous_version_id)` to eliminate the quadratic scans.)
+Both read the full stock by design: `list_executions_with_driver_runtime_state` classifies live vs terminal `driver_runtime_state` blobs across executions (budgeted at `10,000` pages in `sweep_read_budget_tests`), and the backup copies the whole file through `WorkDb::connect_new_for_snapshot()` (`Scope::WholeFile`).
 
 ## Size of the file
 

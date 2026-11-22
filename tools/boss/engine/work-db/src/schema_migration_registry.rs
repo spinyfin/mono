@@ -617,6 +617,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: board_projection_schema::refine_triggers,
         },
         Migration {
+            id: recurring_read_indexes::PERIODIC_SWEEP_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: recurring_read_indexes::migrate_periodic_sweep,
+        },
+        Migration {
             id: "20261029_0735_work_executions_item_kind_status_finished_idx".into(),
             legacy_version: None,
             apply: |conn| {

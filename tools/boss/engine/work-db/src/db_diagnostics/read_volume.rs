@@ -340,6 +340,14 @@ fn warrants_warning(pages: u64, scope: Scope) -> bool {
     scope == Scope::Query && pages >= heavy_hold_pages()
 }
 
+#[cfg(test)]
+pub(super) fn was_warned(caller: &'static Location<'static>) -> bool {
+    WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&caller)
+}
+
 /// Record a finished hold. Call after the connection has been released: this
 /// takes its own small locks and may log.
 pub(crate) fn record(
