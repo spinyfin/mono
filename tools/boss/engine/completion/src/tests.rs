@@ -2142,6 +2142,8 @@ mod nudge_delivery;
 #[cfg(test)]
 mod nudge_staged_pr;
 #[cfg(test)]
+mod pr_created_seam;
+#[cfg(test)]
 mod revision_delivery;
 #[cfg(test)]
 mod status_ledger;

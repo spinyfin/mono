@@ -288,13 +288,32 @@ impl WorkDb {
     /// pinned workspace, which spawns `git` and so happens above storage; use
     /// [`Self::submit_worker_proposal_with_guide`] for that kind. Submitting
     /// one here is an error and stores nothing.
+    ///
+    /// Equivalent to [`Self::submit_worker_proposal_with_flags`] with
+    /// `pr_created_proposals_seam_enabled: false` — the pre-migration apply
+    /// behaviour (see [`proposal_apply::apply_pr_created`]'s doc). Test-only
+    /// convenience; production submits go through the guide+liveness variant
+    /// with the live flag value.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn submit_worker_proposal(
         &self,
         input: SubmitWorkerProposalInput<'_>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-        self.submit_worker_proposal_with_liveness(input, &|_| false)
+        self.submit_worker_proposal_with_flags(input, false)
+    }
+
+    /// See [`Self::submit_worker_proposal`]. `pr_created_proposals_seam_enabled`
+    /// is the caller's already-composed `worker_proposals && pr_created_proposals_seam`
+    /// value; only [`proposal_apply::apply_pr_created`] reads it, and every
+    /// other proposal kind ignores it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn submit_worker_proposal_with_flags(
+        &self,
+        input: SubmitWorkerProposalInput<'_>,
+        pr_created_proposals_seam_enabled: bool,
+    ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+        self.submit_worker_proposal_with_guide_and_liveness(input, None, &|_| false, pr_created_proposals_seam_enabled)
     }
 
     /// Submit a non-guide proposal with an injected worker-liveness observation.
@@ -303,7 +322,7 @@ impl WorkDb {
         input: SubmitWorkerProposalInput<'_>,
         pid_is_alive: &dyn Fn(Option<i64>) -> bool,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-        self.submit_worker_proposal_with_guide_and_liveness(input, None, pid_is_alive)
+        self.submit_worker_proposal_with_guide_and_liveness(input, None, pid_is_alive, false)
     }
 
     /// [`Self::submit_worker_proposal`] for a submission whose review-guide
@@ -320,15 +339,19 @@ impl WorkDb {
         input: SubmitWorkerProposalInput<'_>,
         guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-        self.submit_worker_proposal_with_guide_and_liveness(input, guide, &|_| false)
+        self.submit_worker_proposal_with_guide_and_liveness(input, guide, &|_| false, false)
     }
 
     /// Observe question-worker liveness before applying a validated submission.
+    /// `pr_created_proposals_seam_enabled` is the caller's composed
+    /// `worker_proposals && pr_created_proposals_seam` value; only
+    /// [`proposal_apply::apply_pr_created`] reads it.
     pub fn submit_worker_proposal_with_guide_and_liveness(
         &self,
         input: SubmitWorkerProposalInput<'_>,
         guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
         pid_is_alive: &dyn Fn(Option<i64>) -> bool,
+        pr_created_proposals_seam_enabled: bool,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
         let question_worker = if input.kind == ProposalKind::RunDone {
             let payload: boss_protocol::RunDoneProposalPayload = serde_json::from_str(input.payload_json)?;
@@ -432,8 +455,11 @@ impl WorkDb {
                     &mut payload_json,
                     input.kind,
                     &id,
-                    guide,
-                    question_worker.as_ref(),
+                    crate::proposal_apply::ApplyTransactionContext {
+                        prepared_guide: guide,
+                        question_worker: question_worker.as_ref(),
+                        pr_created_proposals_seam_enabled,
+                    },
                 )?),
                 ProposalApplyPolicy::Gated => None,
                 // Refused above before the transaction opened.
@@ -2490,10 +2516,15 @@ mod tests {
         assert_eq!(outcome.proposal.state, ProposalState::Applied);
     }
 
-    /// An already-bound `pr_url` is left alone (opportunistic "set if not
-    /// set" semantics, mirroring `WorkDb::reconciler_attach_pr_url`) — the
-    /// proposal still applies, since the URL/repo/branch it declared were
-    /// themselves valid.
+    /// A declaration must not replace an existing binding. Rejecting it keeps
+    /// the durable proposal state aligned with the completion reader, which
+    /// must never finalize against a URL the applier declined to bind. This
+    /// hardening is gated on `pr_created_proposals_seam` (see
+    /// `proposal_apply::apply_pr_created`'s doc) — call
+    /// `submit_worker_proposal_with_flags` directly with the flag on so this
+    /// test actually exercises the hardened branch, rather than the
+    /// pre-migration one `submit_worker_proposal` (and every other test
+    /// using the `submit` helper) reproduces.
     #[test]
     fn pr_created_does_not_overwrite_an_already_bound_pr_url() {
         let (_dir, db) = open_db();
@@ -2506,16 +2537,20 @@ mod tests {
             )
             .unwrap();
 
-        let outcome = submit(
-            &db,
-            &execution_id,
-            &chore_id,
-            ProposalKind::PrCreated,
-            r#"{"pr_url":"https://github.com/spinyfin/mono/pull/2"}"#,
-            "key-1",
-        )
-        .unwrap();
-        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        let outcome = db
+            .submit_worker_proposal_with_flags(
+                SubmitWorkerProposalInput {
+                    execution_id: &execution_id,
+                    work_item_id: &chore_id,
+                    kind: ProposalKind::PrCreated,
+                    payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/2"}"#,
+                    idempotency_key: "key-1",
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.proposal.state, ProposalState::Rejected);
 
         let pr_url = match db.get_work_item(&chore_id).unwrap() {
             boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.pr_url,

@@ -52,8 +52,8 @@ use async_trait::async_trait;
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK, AUTOMATION_OUTCOME_SKIPPED, Attention,
     AttentionGroup, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX,
-    CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, ProposalKind, ProposalState, ReasoningMode,
-    TaskKind,
+    CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, PrCreatedProposalPayload, ProposalKind,
+    ProposalState, ReasoningMode, TaskKind,
 };
 
 use crate::automation_triage::TriageDecision;
@@ -314,6 +314,13 @@ crate::register_counter!(
      because no worker_proposals row of kind automation_outcome existed for the execution \
      (automation_outcome_proposals_seam on).",
 );
+crate::register_counter!(
+    PR_CREATED_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.pr_created",
+    "finalize_pr_transition finalized via the legacy staging-cache / driver-final-message / \
+     cold-reconstruction ladder instead of a pr_created worker_proposals row \
+     (pr_created_proposals_seam on).",
+);
 
 // The run-done gate and its backstop. Together these are the soak
 // instrumentation for the declaration: `GATE_HELD` counts runs the health-alone
@@ -375,6 +382,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
     registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
     registry.register_counter(&AUTOMATION_OUTCOME_FALLBACK_HIT);
+    registry.register_counter(&PR_CREATED_FALLBACK_HIT);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -2074,6 +2082,14 @@ Declare it with `\"$BOSS_BIN\" propose done --outcome no-changes-needed --summar
 verified>\"`; that is the sanctioned way to close this run with no PR.",
     worker_wait_nudge_directive!()
 );
+
+/// `source` value `WorkerCompletionHandler::on_stop_inner` passes to
+/// `WorkerCompletionHandler::finalize_pr_transition` when the `pr_created`
+/// worker-proposal row supplied the URL.
+pub(crate) const PR_CREATED_PROPOSAL_STOP_SOURCE: &str = "stop_proposal";
+/// Mirrors [`PR_CREATED_PROPOSAL_STOP_SOURCE`] for
+/// `WorkerCompletionHandler::recheck_for_pr`'s merge-poller sweep.
+pub(crate) const PR_CREATED_PROPOSAL_RECHECK_SOURCE: &str = "pr_recheck_proposal";
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot

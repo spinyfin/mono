@@ -170,6 +170,18 @@ pub enum ApplyDecision {
     Staged(ApplyOutcome),
 }
 
+/// Call-site extras for [`apply_in_transaction`] that would otherwise
+/// overflow clippy's argument cap. `pr_created_proposals_seam_enabled` is
+/// read only by [`apply_pr_created`] — every other kind ignores it. It is
+/// the caller's composed `worker_proposals && pr_created_proposals_seam`
+/// value, not a raw flag lookup: [`apply_in_transaction`] has no
+/// `FeatureFlagsStore` of its own to query.
+pub(crate) struct ApplyTransactionContext<'a> {
+    pub prepared_guide: Option<&'a Result<super::review_guide_submission::PreparedGuide>>,
+    pub question_worker: Option<&'a super::stuck_report::QuestionWorkerObservation>,
+    pub pr_created_proposals_seam_enabled: bool,
+}
+
 /// Auto-apply `kind` inside `tx` — the same transaction
 /// [`WorkDb::submit_worker_proposal`] inserts the `worker_proposals` row in.
 /// Only called for kinds whose [`apply_policy`] is
@@ -187,8 +199,7 @@ pub(super) fn apply_in_transaction(
     payload_json: &mut String,
     kind: ProposalKind,
     proposal_id: &str,
-    prepared_guide: Option<&Result<super::review_guide_submission::PreparedGuide>>,
-    question_worker: Option<&super::stuck_report::QuestionWorkerObservation>,
+    ctx: ApplyTransactionContext<'_>,
 ) -> Result<ApplyDecision> {
     match kind {
         ProposalKind::Attention => apply_attention(tx, execution_id, payload_json).map(ApplyDecision::Applied),
@@ -198,12 +209,16 @@ pub(super) fn apply_in_transaction(
         ProposalKind::Blocked => apply_blocked(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::DeferredScope => apply_deferred_scope(tx, execution_id, payload_json).map(ApplyDecision::Applied),
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
-        ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
-        ProposalKind::ReviewGuide => {
-            super::review_guide_submission::accept(tx, execution_id, prepared_guide.context("missing prepared guide")?)
+        ProposalKind::PrCreated => {
+            apply_pr_created(tx, execution_id, payload_json, ctx.pr_created_proposals_seam_enabled)
         }
+        ProposalKind::ReviewGuide => super::review_guide_submission::accept(
+            tx,
+            execution_id,
+            ctx.prepared_guide.context("missing prepared guide")?,
+        ),
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
-        ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id, question_worker),
+        ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id, ctx.question_worker),
         ProposalKind::Wait => apply_wait(payload_json).map(ApplyDecision::Applied),
         ProposalKind::ReviewVerdict => apply_review_verdict(tx, execution_id, payload_json, proposal_id),
         ProposalKind::FollowupTask => anyhow::bail!(
@@ -946,18 +961,24 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 /// inside a DB transaction. The branch check here is therefore a pure,
 /// synchronous string comparison against the worker-supplied `branch` field;
 /// when the worker omits it, only the URL/repo check runs. The full
-/// network-verified check stays at Stop-time finalization (implementation
-/// task 12), which reads this proposal row instead of the in-memory
-/// `StagedPrUrlCache`.
+/// network-verified check stays at Stop-time finalization, which reads this
+/// proposal row instead of the in-memory `StagedPrUrlCache`.
 ///
-/// On success, binds the PR to the work item by opportunistically attaching
-/// `pr_url` to the task — mirroring [`WorkDb::reconciler_attach_pr_url`]'s
-/// "set if not already set" semantics rather than
-/// [`WorkDb::record_worker_pr_completion`]'s full completion cascade (status
-/// transition, execution finalization, run-summary capture): that heavier
-/// lifting belongs to Stop-time finalization (task 12), not to a proposal
-/// applier that only knows "a worker declared a PR" and has not yet driven
-/// the execution to completion.
+/// With `pr_created_proposals_seam_enabled` true: a declaration that names a
+/// different PR than the task's existing binding is rejected; non-revision
+/// tasks are stamped with the declared URL; revision tasks are never stamped
+/// because their chain root owns the binding. With it false, this applier
+/// reproduces the pre-migration behaviour exactly, so the flag is a genuine
+/// kill switch: a conflicting declaration only warns and still applies
+/// (never rejects), and every task kind — including revisions — is stamped.
+/// `worker_proposals` (the master flag gating whether `pr_created` can be
+/// submitted at all) is independent of this per-seam flag.
+///
+/// This remains narrower than [`WorkDb::record_worker_pr_completion`]'s
+/// full completion cascade (status transition, execution finalization, and
+/// run-summary capture): that heavier lifting belongs to Stop-time
+/// finalization, not to a proposal applier that only knows a worker declared
+/// a PR.
 ///
 /// An execution whose work item is not a task (e.g. an `automation_triage`
 /// execution, whose `work_item_id` is the automation id) is a typed
@@ -965,7 +986,12 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 /// from the wrong execution kind is a normal policy refusal the caller is
 /// meant to see via `boss propose --list`, not an engine fault that aborts
 /// the whole submission (leaving no durable proposal row at all).
-fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str) -> Result<ApplyDecision> {
+fn apply_pr_created(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    payload_json: &str,
+    pr_created_proposals_seam_enabled: bool,
+) -> Result<ApplyDecision> {
     let payload: PrCreatedProposalPayload =
         serde_json::from_str(payload_json).context("pr_created proposal payload_json did not deserialize")?;
 
@@ -1018,6 +1044,16 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
     if let Some(existing) = task.pr_url.as_deref().filter(|s| !s.is_empty())
         && existing != payload.pr_url
     {
+        if pr_created_proposals_seam_enabled {
+            return Ok(ApplyDecision::Rejected(format!(
+                "task {} is already bound to {existing}; refusing to replace it with declared PR {}",
+                task.id, payload.pr_url
+            )));
+        }
+        // Pre-migration behaviour: `pr_created_proposals_seam` is off, so
+        // this is a legacy caller reaching a hardened applier ahead of the
+        // seam's own rollout. Warn and keep the existing binding instead of
+        // rejecting — see this function's doc.
         tracing::warn!(
             execution_id,
             task_id = %task.id,
@@ -1028,11 +1064,18 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
         );
     }
 
-    tx.execute(
-        "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
-         WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
-        params![task.id, payload.pr_url, now_string()],
-    )?;
+    // Revision tasks do not own a PR: the chain root's `pr_url` is the source
+    // of truth, so this task row must remain NULL (see `pr_flow.rs`) — but
+    // only once the seam is actually on; see this function's doc for why the
+    // pre-migration behaviour (stamp unconditionally) still runs when it's off.
+    let skip_stamp_for_revision = pr_created_proposals_seam_enabled && task.kind == TaskKind::Revision;
+    if !skip_stamp_for_revision {
+        tx.execute(
+            "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
+            params![task.id, payload.pr_url, now_string()],
+        )?;
+    }
 
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(task.id),
@@ -1397,6 +1440,163 @@ mod tests {
         assert_eq!(after.pr_url.as_deref(), Some(url));
     }
 
+    /// With the seam on, a revision declaration still applies, but the
+    /// revision row is never stamped: the chain root owns the PR binding.
+    #[test]
+    fn revision_pr_created_does_not_stamp_when_seam_enabled() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let root = crate::test_support::create_test_chore(&db, product.id, "Root");
+        let root_id = root.id.clone();
+        let url = "https://github.com/spinyfin/mono/pull/77";
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = ?2, status = 'in_review' WHERE id = ?1",
+                params![&root_id, url],
+            )
+            .unwrap();
+        let revision = db
+            .create_revision(
+                boss_protocol::CreateRevisionInput::builder()
+                    .parent_task_id(root_id.clone())
+                    .description("Address review findings")
+                    .build(),
+                &crate::FakePrStateChecker::always(crate::PrOpenState::Open),
+            )
+            .unwrap();
+        let execution = db.list_executions(Some(&revision.id)).unwrap().pop().unwrap();
+        let outcome = db
+            .submit_worker_proposal_with_flags(
+                SubmitWorkerProposalInput {
+                    execution_id: &execution.id,
+                    work_item_id: &revision.id,
+                    kind: ProposalKind::PrCreated,
+                    payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/77"}"#,
+                    idempotency_key: "revision-pr-seam-on",
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        let after = query_task(&db.connect().unwrap(), &revision.id).unwrap().unwrap();
+        assert!(
+            after.pr_url.is_none(),
+            "revision tasks never own a PR URL when the seam is on"
+        );
+        let root_after = query_task(&db.connect().unwrap(), &root_id).unwrap().unwrap();
+        assert_eq!(root_after.pr_url.as_deref(), Some(url));
+    }
+
+    /// With the seam off — `submit_worker_proposal`'s default, matching how
+    /// every other kind's tests submit — a `pr_created` declaration that
+    /// conflicts with the task's existing binding must reproduce the exact
+    /// pre-migration behaviour: warn and keep the existing binding,
+    /// `Applied`, never `Rejected`. See `apply_pr_created`'s doc for why
+    /// this specific inertness matters: `worker_proposals` (the flag
+    /// gating whether `pr_created` can be submitted) is independent of
+    /// this per-seam flag.
+    #[test]
+    fn pr_created_conflicting_binding_warns_and_applies_when_seam_disabled() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id, "Ship it");
+        let execution = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
+
+        let first = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &chore.id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/1"}"#,
+                idempotency_key: "pr-1",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.proposal.state, ProposalState::Applied);
+
+        let second = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &chore.id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/2"}"#,
+                idempotency_key: "pr-2",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.proposal.state,
+            ProposalState::Applied,
+            "seam off must reproduce the pre-migration behaviour: warn, not reject"
+        );
+
+        let after = query_task(&db.connect().unwrap(), &chore.id).unwrap().unwrap();
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/1"),
+            "the original binding must survive; the conflicting URL is never written"
+        );
+    }
+
+    /// With the seam on, the same conflicting declaration must be a typed
+    /// `Rejected` disposition. Uses `submit_worker_proposal_with_flags`
+    /// directly (see its doc) rather than injecting a `FeatureFlagsStore`:
+    /// `WorkDb` has no store of its own to query, so the flag's live value
+    /// is always passed in by the caller that resolved it.
+    #[test]
+    fn pr_created_conflicting_binding_rejected_when_seam_enabled() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id, "Ship it");
+        let execution = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
+
+        let first = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &chore.id,
+                kind: ProposalKind::PrCreated,
+                payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/1"}"#,
+                idempotency_key: "pr-1",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.proposal.state, ProposalState::Applied);
+
+        let second = db
+            .submit_worker_proposal_with_flags(
+                SubmitWorkerProposalInput {
+                    execution_id: &execution.id,
+                    work_item_id: &chore.id,
+                    kind: ProposalKind::PrCreated,
+                    payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/2"}"#,
+                    idempotency_key: "pr-2",
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.proposal.state, ProposalState::Rejected);
+        assert!(
+            second
+                .proposal
+                .decision_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already bound to"),
+            "decision_reason should name the conflict: {:?}",
+            second.proposal.decision_reason
+        );
+
+        let after = query_task(&db.connect().unwrap(), &chore.id).unwrap().unwrap();
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/1"),
+            "the original binding must survive a rejected conflicting declaration"
+        );
+    }
+
     /// Binding a PR via `pr_created` must stamp `updated_at`, mirroring
     /// `WorkDb::reconciler_attach_pr_url`'s "set if not already set"
     /// semantics — downstream sorting and drift reconcilers key off it.
@@ -1589,8 +1789,11 @@ mod tests {
             &mut "{}".to_owned(),
             ProposalKind::FollowupTask,
             "prp_missing",
-            None,
-            None,
+            ApplyTransactionContext {
+                prepared_guide: None,
+                question_worker: None,
+                pr_created_proposals_seam_enabled: false,
+            },
         )
         .expect_err("no applier exists for FollowupTask; this must be an error, not a panic");
         assert!(

@@ -51,6 +51,70 @@ impl WorkerCompletionHandler {
         if execution.kind == ExecutionKind::PrReview {
             return StopOutcome::AlreadyTerminal;
         }
+        // Proposal-first read, mirroring `on_stop_inner`. Matters even more
+        // for this poller sweep than for Stop: the staging cache is
+        // in-memory, so an engine restart between the worker's push and its
+        // own Stop loses a hook-captured URL entirely, while the
+        // `pr_created` proposal row is durable and still readable on the
+        // next sweep.
+        let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam");
+        let (proposed_pr_url, pr_created_proposal_row_existed) = if pr_created_proposals_first {
+            self.pr_created_from_proposal(&execution).await
+        } else {
+            (None, false)
+        };
+        if let Some(proposed_pr_url) = proposed_pr_url {
+            // A verified declared PR is the progress the produce-a-PR
+            // fingerprint exists to detect. Retire that cycle before any
+            // deferral or finalization, matching the staged-URL arm.
+            self.retire_produce_pr_nudge(execution_id);
+            // As with the staged-URL arm below, a merge-poller sweep must
+            // not turn a revision's mid-turn push into implicit completion.
+            if execution.kind == ExecutionKind::RevisionImplementation
+                && self.should_defer_staged_pr_recheck(execution_id)
+            {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposed_pr_url,
+                    "pr-recheck: proposal PR URL present for a mid-turn revision; retaining it \
+                     for the worker's own Stop boundary before finalization",
+                );
+                return StopOutcome::AwaitingInput;
+            }
+            // The declaration remains required for a primary (non-revision)
+            // execution: a declared PR URL is evidence the PR exists, never
+            // that the worker declared the run over. Mirrors
+            // `on_stop_inner`'s identical proposal-arm gate and the staged-URL
+            // arm below.
+            if execution.kind != ExecutionKind::RevisionImplementation
+                && !self.primary_staged_url_may_finalize(execution_id)
+            {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposed_pr_url,
+                    "pr-recheck: pr_created proposal URL present but no `delivered` run_done \
+                     declaration yet; declaration remains required — deferring proposal \
+                     finalization",
+                );
+                return self.await_run_done_declaration(&execution, &proposed_pr_url).await;
+            }
+            tracing::info!(
+                execution_id,
+                pr_url = %proposed_pr_url,
+                "pr-recheck: using PR URL from pr_created worker-proposal row; skipping the staging \
+                 cache / cold-reconstruction ladder",
+            );
+            let staged_outcome = self
+                .finalize_pr_transition(
+                    execution_id,
+                    proposed_pr_url,
+                    WorkerPrCompletionTarget::InReview,
+                    PR_CREATED_PROPOSAL_RECHECK_SOURCE,
+                )
+                .await;
+            return staged_outcome;
+        }
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable after restart.
         let _ = self
@@ -144,7 +208,7 @@ impl WorkerCompletionHandler {
                 "pr-recheck: using PR URL captured from worker hook stream (primary path); skipping detector",
             );
             PR_URL_CAPTURE_PRIMARY_HIT.inc(&self.metrics);
-            return self
+            let staged_outcome = self
                 .finalize_pr_transition(
                     execution_id,
                     staged_url,
@@ -152,6 +216,13 @@ impl WorkerCompletionHandler {
                     "pr_recheck_staged",
                 )
                 .await;
+            self.record_pr_created_fallback_after_success(
+                &execution,
+                "pr_recheck_staged",
+                pr_created_proposal_row_existed,
+                &staged_outcome,
+            );
+            return staged_outcome;
         }
         if !staged_armed {
             tracing::debug!(
@@ -221,7 +292,7 @@ impl WorkerCompletionHandler {
                         "pr-recheck: revision_stop_contributed_head matches current head — \
                          finalising (transient on_stop_inner failure recovery)",
                     );
-                    return self
+                    let sha_outcome = self
                         .finalize_pr_transition(
                             execution_id,
                             pr_url,
@@ -229,6 +300,13 @@ impl WorkerCompletionHandler {
                             "pr_recheck_sha_delta",
                         )
                         .await;
+                    self.record_pr_created_fallback_after_success(
+                        &execution,
+                        "pr_recheck_sha_delta",
+                        pr_created_proposal_row_existed,
+                        &sha_outcome,
+                    );
+                    return sha_outcome;
                 }
                 // Head moved but revision_stop_contributed_head doesn't
                 // match (or was never set). This could be a genuine
@@ -270,7 +348,7 @@ impl WorkerCompletionHandler {
                     "pr-recheck: SHA-delta gate: bound PR head moved since last Stop — \
                      finalising without cold-path detector",
                 );
-                return self
+                let sha_outcome = self
                     .finalize_pr_transition(
                         execution_id,
                         pr_url,
@@ -278,6 +356,13 @@ impl WorkerCompletionHandler {
                         "pr_recheck_sha_delta",
                     )
                     .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "pr_recheck_sha_delta",
+                    pr_created_proposal_row_existed,
+                    &sha_outcome,
+                );
+                return sha_outcome;
             }
             ShaDeltaGateOutcome::NoContribution { pr_url, head_now: _ } => {
                 // Bound PR did not advance during this run. For most resumes
@@ -393,8 +478,16 @@ impl WorkerCompletionHandler {
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
-        self.finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
-            .await
+        let outcome = self
+            .finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
+            .await;
+        self.record_pr_created_fallback_after_success(
+            &execution,
+            "pr_recheck",
+            pr_created_proposal_row_existed,
+            &outcome,
+        );
+        outcome
     }
 
     /// True when the staged-URL recheck must not finalize yet: a revision
@@ -545,7 +638,7 @@ impl WorkerCompletionHandler {
                 }
             }
         }
-        match self
+        let outcome = match self
             .work_db
             .bind_pr_to_active_task_from_terminal_execution(&candidate.work_item_id, &pr_url)
         {
@@ -568,6 +661,25 @@ impl WorkerCompletionHandler {
                 );
                 StopOutcome::DbError
             }
+        };
+        // This sweep still finalizes through the cold `detect_pr` ladder; it
+        // never uses a `pr_created` proposal as the URL source the way
+        // `on_stop_inner` and `recheck_for_pr` do. It runs for a TERMINAL
+        // execution recovering a task-row-only bind (see this method's doc),
+        // a narrower shape than the live-execution finalization the proposal
+        // read is designed to short-circuit. The fallback counter is still
+        // this seam's exit criterion for deleting the legacy ladder, so an
+        // uncounted finalization here would under-report. Look up whether a
+        // `pr_created` row exists so the recorded reason matches the row,
+        // even though this sweep does not read the proposal for a URL.
+        if let Ok(execution) = self.work_db.get_execution(&candidate.execution_id) {
+            let row_existed = self
+                .work_db
+                .list_worker_proposals_for_execution(&candidate.execution_id, ProposalKind::PrCreated)
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false);
+            self.record_pr_created_fallback_after_success(&execution, "pr_recheck_late", row_existed, &outcome);
         }
+        outcome
     }
 }

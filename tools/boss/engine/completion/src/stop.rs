@@ -789,6 +789,67 @@ impl WorkerCompletionHandler {
             return StopOutcome::DeferredForProbeTurn;
         }
 
+        let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("pr_created_proposals_seam");
+        let (proposed_pr_url, pr_created_proposal_row_existed) = if pr_created_proposals_first {
+            on_heap(|| self.pr_created_from_proposal(&execution)).await
+        } else {
+            (None, false)
+        };
+        if let Some(proposed_pr_url) = proposed_pr_url {
+            tracing::info!(
+                execution_id,
+                pr_url = %proposed_pr_url,
+                "stop event: using PR URL from pr_created worker-proposal row; skipping the staging \
+                 cache / cold-reconstruction ladder",
+            );
+            // A verified declared PR is the progress the produce-a-PR
+            // fingerprint exists to detect. Retire that cycle before the
+            // run_done hold or finalization, matching the staged-URL arm.
+            self.retire_produce_pr_nudge(execution_id);
+            if execution.kind == ExecutionKind::RevisionImplementation {
+                on_heap(|| {
+                    self.stamp_revision_stop_contributed_head_from_staged_url(
+                        execution_id,
+                        &execution,
+                        &proposed_pr_url,
+                    )
+                })
+                .await;
+            } else if !self.primary_staged_url_may_finalize(execution_id) {
+                // A declared PR URL is evidence the PR exists, never that
+                // the worker declared the run over. Same gate the staged-URL
+                // arm below enforces for a primary execution.
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposed_pr_url,
+                    "stop event: pr_created proposal URL present but no `delivered` run_done \
+                     declaration yet; declaration remains required — deferring proposal \
+                     finalization",
+                );
+                return on_heap(|| self.await_run_done_declaration(&execution, &proposed_pr_url)).await;
+            }
+            let proposal_outcome = on_heap(|| {
+                self.finalize_pr_transition(
+                    execution_id,
+                    proposed_pr_url.clone(),
+                    WorkerPrCompletionTarget::InReview,
+                    PR_CREATED_PROPOSAL_STOP_SOURCE,
+                )
+            })
+            .await;
+            if execution.kind != ExecutionKind::RevisionImplementation
+                || !matches!(proposal_outcome, StopOutcome::AwaitingInput)
+            {
+                return proposal_outcome;
+            }
+            tracing::info!(
+                execution_id,
+                pr_url = %proposed_pr_url,
+                "stop event: proposal-URL finalize refused by revision contribution gate; falling through to SHA-delta / no-op / nudge path (incident-004 AI-3)",
+            );
+        }
+
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable off-host.
         let _ = on_heap(|| {
@@ -868,6 +929,12 @@ impl WorkerCompletionHandler {
                     )
                 })
                 .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "stop_staged",
+                    pr_created_proposal_row_existed,
+                    &staged_outcome,
+                );
                 if !matches!(staged_outcome, StopOutcome::AwaitingInput) {
                     return staged_outcome;
                 }
@@ -893,7 +960,7 @@ impl WorkerCompletionHandler {
                     );
                     return on_heap(|| self.await_run_done_declaration(&execution, &staged_url)).await;
                 }
-                return on_heap(|| {
+                let staged_outcome = on_heap(|| {
                     self.finalize_pr_transition(
                         execution_id,
                         staged_url,
@@ -902,6 +969,13 @@ impl WorkerCompletionHandler {
                     )
                 })
                 .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "stop_staged",
+                    pr_created_proposal_row_existed,
+                    &staged_outcome,
+                );
+                return staged_outcome;
             }
         }
 
@@ -1036,7 +1110,7 @@ impl WorkerCompletionHandler {
                 pr_url = %recovered_url,
                 "stop event: using PR URL recovered by the driver's final-message producer; skipping detector",
             );
-            return on_heap(|| {
+            let driver_outcome = on_heap(|| {
                 self.finalize_pr_transition(
                     execution_id,
                     recovered_url,
@@ -1045,6 +1119,13 @@ impl WorkerCompletionHandler {
                 )
             })
             .await;
+            self.record_pr_created_fallback_after_success(
+                &execution,
+                "stop_driver_fallback",
+                pr_created_proposal_row_existed,
+                &driver_outcome,
+            );
+            return driver_outcome;
         }
 
         // Resume-bounce SHA-delta gate: when the chore already has a
@@ -1081,7 +1162,7 @@ impl WorkerCompletionHandler {
                                  recheck_for_pr transient-failure recovery may not fire",
                             );
                         }
-                        return on_heap(|| {
+                        let sha_outcome = on_heap(|| {
                             self.finalize_pr_transition(
                                 execution_id,
                                 pr_url,
@@ -1090,6 +1171,13 @@ impl WorkerCompletionHandler {
                             )
                         })
                         .await;
+                        self.record_pr_created_fallback_after_success(
+                            &execution,
+                            "stop_sha_delta",
+                            pr_created_proposal_row_existed,
+                            &sha_outcome,
+                        );
+                        return sha_outcome;
                     }
                     // already_stop_seen=true with no push evidence: parent pushed.
                     // Absorb the head into the baseline and fall through to the
@@ -1195,7 +1283,7 @@ impl WorkerCompletionHandler {
                     })
                     .await;
                 }
-                return on_heap(|| {
+                let sha_outcome = on_heap(|| {
                     self.finalize_pr_transition(
                         execution_id,
                         pr_url,
@@ -1204,6 +1292,13 @@ impl WorkerCompletionHandler {
                     )
                 })
                 .await;
+                self.record_pr_created_fallback_after_success(
+                    &execution,
+                    "stop_sha_delta",
+                    pr_created_proposal_row_existed,
+                    &sha_outcome,
+                );
+                return sha_outcome;
             }
             ShaDeltaGateOutcome::NoContribution { pr_url, head_now: _ } => {
                 // Before nudging, check whether the blocking signal (conflict /
@@ -1738,6 +1833,8 @@ must not be asked to open one",
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
-        on_heap(|| self.finalize_pr_transition(execution_id, pr_url, target, "stop")).await
+        let outcome = on_heap(|| self.finalize_pr_transition(execution_id, pr_url, target, "stop")).await;
+        self.record_pr_created_fallback_after_success(&execution, "stop", pr_created_proposal_row_existed, &outcome);
+        outcome
     }
 }

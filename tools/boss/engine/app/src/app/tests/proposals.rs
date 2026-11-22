@@ -238,6 +238,7 @@ mod chore_questions;
 mod dismissal;
 mod force_launched_resume;
 mod multiple_choice;
+mod pr_created_seam;
 mod prerequisites;
 
 #[tokio::test]

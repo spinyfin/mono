@@ -58,6 +58,17 @@ pub fn submit_worker_proposal(
     db: &WorkDb,
     input: SubmitWorkerProposalInput<'_>,
 ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
+    submit_worker_proposal_with_flags(db, input, false)
+}
+
+/// See [`submit_worker_proposal`]. `pr_created_proposals_seam_enabled` is
+/// the caller's composed `worker_proposals && pr_created_proposals_seam`
+/// value; only `apply_pr_created` reads it.
+pub fn submit_worker_proposal_with_flags(
+    db: &WorkDb,
+    input: SubmitWorkerProposalInput<'_>,
+    pr_created_proposals_seam_enabled: bool,
+) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
     let guide = (input.kind == ProposalKind::ReviewGuide).then(|| {
         db.load_review_guide_for_validation(input.execution_id, input.payload_json)
             .map(|guide| {
@@ -67,9 +78,12 @@ pub fn submit_worker_proposal(
                 guide.validated(validation)
             })
     });
-    db.submit_worker_proposal_with_guide_and_liveness(input, guide.as_ref(), &|pid| {
-        crate::durable_liveness::probe_recorded_pid(pid).is_alive()
-    })
+    db.submit_worker_proposal_with_guide_and_liveness(
+        input,
+        guide.as_ref(),
+        &|pid| crate::durable_liveness::probe_recorded_pid(pid).is_alive(),
+        pr_created_proposals_seam_enabled,
+    )
 }
 
 /// What [`recover_orphaned_submissions`] did.
