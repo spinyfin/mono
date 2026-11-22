@@ -247,8 +247,30 @@ impl WorkerCompletionHandler {
     /// — both network-capable and both honouring the stamped declaration —
     /// finalize it. That keeps the module's rule that a GitHub hang can never
     /// hold a slot indefinitely, without binding anything unverified.
-    async fn resolve_declared_pr_url(&self, execution: &crate::work::WorkExecution) -> DeclaredPrResolution {
+    pub(super) async fn resolve_declared_pr_url(&self, execution: &crate::work::WorkExecution) -> DeclaredPrResolution {
         let mut transient_detail: Option<String> = None;
+        match tokio::time::timeout(
+            DECLARED_DELIVERY_NETWORK_BUDGET,
+            self.pr_created_proposal_lookup(execution, "run_done"),
+        )
+        .await
+        {
+            Ok(PrCreatedProposalLookup::Verified(url)) => {
+                return self.resolve_verified_pr_state(execution, url).await;
+            }
+            Ok(PrCreatedProposalLookup::Absent | PrCreatedProposalLookup::Unusable) => {}
+            // An applied proposal exists but could not be verified this pass:
+            // never let the legacy ladder turn that into a definitive "no PR".
+            Ok(PrCreatedProposalLookup::Transient) => {
+                transient_detail = Some("the applied pr_created proposal could not be verified this pass".to_owned());
+            }
+            Err(_) => {
+                transient_detail = Some(format!(
+                    "verification of the applied pr_created proposal did not finish within {}s",
+                    DECLARED_DELIVERY_NETWORK_BUDGET.as_secs()
+                ));
+            }
+        }
         let stored_url = self.resolve_bound_pr_url(execution);
         if let Some(url) = stored_url.clone() {
             if execution.kind == ExecutionKind::RevisionImplementation {
@@ -287,6 +309,7 @@ impl WorkerCompletionHandler {
             .await
             {
                 Ok(Some(url)) => {
+                    self.record_pr_created_fallback_hit(execution, "run_done_staged", &url);
                     return self.resolve_verified_pr_state(execution, url).await;
                 }
                 Ok(None) => {
@@ -325,8 +348,14 @@ impl WorkerCompletionHandler {
             )
         };
         match detected {
-            Ok(Ok(PrStatus::Fresh { url })) => self.resolve_declared_pr_base(execution, url, false).await,
-            Ok(Ok(PrStatus::Merged { url })) => self.resolve_declared_pr_base(execution, url, true).await,
+            Ok(Ok(PrStatus::Fresh { url })) => {
+                self.record_pr_created_fallback_hit(execution, "run_done_detector", &url);
+                self.resolve_declared_pr_base(execution, url, false).await
+            }
+            Ok(Ok(PrStatus::Merged { url })) => {
+                self.record_pr_created_fallback_hit(execution, "run_done_detector", &url);
+                self.resolve_declared_pr_base(execution, url, true).await
+            }
             Ok(Ok(
                 status @ (PrStatus::None
                 | PrStatus::Closed { .. }
@@ -535,6 +564,7 @@ impl WorkerCompletionHandler {
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
+        self.forget_pr_created_fallback(&execution.id);
         self.hold_registry.release(&execution.id);
         self.finish_worker_teardown(
             &execution.id,

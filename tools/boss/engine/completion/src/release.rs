@@ -24,6 +24,13 @@ impl WorkerCompletionHandler {
     /// the row that triggered it, rather than requiring a post-mortem
     /// to cross-reference this function's own log lines by execution id.
     pub async fn force_release(&self, execution_id: &str) -> ForceReleaseOutcome {
+        if self
+            .work_db
+            .get_execution(execution_id)
+            .is_ok_and(|e| e.status.is_terminal())
+        {
+            self.forget_pr_created_fallback(execution_id);
+        }
         // Pane release first. Idempotent on the registry side; the
         // implementation logs and skips when no slot is mapped.
         //
@@ -296,40 +303,14 @@ impl WorkerCompletionHandler {
             .await;
     }
 
-    /// Resolve the PR already bound to this execution's chore, if any.
-    /// Mirrors [`Self::evaluate_sha_delta_gate`]'s resolution: the
-    /// chore's own structured `pr_url` is authoritative (it is set by
-    /// whichever sibling execution opened the PR — for a
-    /// `ci_remediation` exec that is the `chore_implementation` exec
-    /// that shipped the original change). `revision_implementation`
-    /// chores carry `pr_url = NULL` by design, so for that kind we fall
-    /// back to `execution.pr_url` (the chain root's PR, stamped at
-    /// dispatch).
+    /// Resolve the PR bound to this execution through the shared binding policy used by the SHA-delta gate,
+    /// execution snapshots and PR status. Revisions use dispatch state or the
+    /// chain root; ordinary tasks use their own structured PR URL.
     ///
-    /// Used by the nudge path to decide whether a "produce a PR" nudge
-    /// is even appropriate: when a PR is already bound the worker must
-    /// be pointed at the existing branch, never told to `gh pr create`.
+    /// Used by the nudge path to point workers at an existing PR branch.
     pub(super) fn resolve_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
         match self.work_db.get_work_item(&execution.work_item_id) {
-            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-                boss_engine_storage_values::branch_identity::task_bound_pr_url(&task)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        if execution.kind == ExecutionKind::RevisionImplementation {
-                            // Primary: execution.pr_url is stamped at dispatch time.
-                            // Fallback: walk the parent chain to find the chain root's
-                            // pr_url for executions where execution.pr_url was not set
-                            // (e.g. older executions predating reliable dispatch stamping).
-                            execution
-                                .pr_url
-                                .clone()
-                                .filter(|u| !u.is_empty())
-                                .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
-                        } else {
-                            None
-                        }
-                    })
-            }
+            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => self.work_db.execution_bound_pr_url(&task, execution),
             _ => None,
         }
     }

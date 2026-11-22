@@ -153,6 +153,20 @@ const SHARED_PR_SQL: &str = "EXISTS (
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Resolve the PR an execution is permitted to update. Revisions use only
+    /// dispatch state or their chain root, never their own task URL.
+    pub fn execution_bound_pr_url(&self, task: &Task, execution: &WorkExecution) -> Option<String> {
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            execution
+                .pr_url
+                .clone()
+                .filter(|url| !url.is_empty())
+                .or_else(|| self.get_revision_chain_root_pr_url(&task.id))
+        } else {
+            boss_engine_storage_values::branch_identity::task_bound_pr_url(task).map(str::to_owned)
+        }
+    }
+
     /// Expected branch names ([`boss_engine_storage_values::branch_identity::expected_branch_name`]) of
     /// every primary implementation execution of `work_item_id`, newest first.
     /// A PR head matching any of them belongs to the work item: a resumed

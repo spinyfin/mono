@@ -248,6 +248,7 @@ impl WorkerCompletionHandler {
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
+        self.forget_pr_created_fallback(&execution.id);
         self.hold_registry.release(&execution.id);
         on_heap(|| {
             self.finish_worker_teardown(
@@ -499,6 +500,7 @@ impl WorkerCompletionHandler {
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
+        self.forget_pr_created_fallback(&execution.id);
         self.hold_registry.release(&execution.id);
         crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
         // The driver reported its process already dead, but "already dead"

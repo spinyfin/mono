@@ -51,6 +51,39 @@ impl WorkerCompletionHandler {
         if execution.kind == ExecutionKind::PrReview {
             return StopOutcome::AlreadyTerminal;
         }
+        // Proposals-first seam (`pr_created_proposals_seam`): read any
+        // `applied` `pr_created` proposal for this execution before consulting
+        // the legacy PR-URL ladder (remote/local structured-output artifact,
+        // hook staging cache, SHA-delta, and cold `detect_pr`).
+        if let PrCreatedProposalLookup::Verified(proposal_url) =
+            self.pr_created_proposal_lookup(&execution, "pr-recheck").await
+        {
+            self.retire_produce_pr_nudge(execution_id);
+            if execution.kind != ExecutionKind::RevisionImplementation
+                && !self.primary_staged_url_may_finalize(execution_id)
+            {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposal_url,
+                    "pr-recheck: pr_created proposal present but no `delivered` run_done \
+                     declaration yet; declaration remains required — deferring finalization",
+                );
+                return self.await_run_done_declaration(&execution, &proposal_url).await;
+            }
+            tracing::info!(
+                execution_id,
+                pr_url = %proposal_url,
+                "pr-recheck: using PR URL from pr_created proposal (primary seam); skipping legacy PR-URL ladder",
+            );
+            return self
+                .finalize_pr_transition(
+                    execution_id,
+                    proposal_url,
+                    WorkerPrCompletionTarget::InReview,
+                    "pr_recheck_pr_created_proposal",
+                )
+                .await;
+        }
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable after restart.
         let _ = self
@@ -105,6 +138,7 @@ impl WorkerCompletionHandler {
             // deferral or finalization so a later `recheck_background_nudge`
             // cannot replay a stale `no_pr` intent.
             self.retire_produce_pr_nudge(execution_id);
+            self.record_pr_created_fallback_hit(&execution, "pr_recheck_staged", &staged_url);
             if execution.kind == ExecutionKind::RevisionImplementation
                 && self.should_defer_staged_pr_recheck(execution_id)
             {
@@ -390,8 +424,14 @@ impl WorkerCompletionHandler {
             }
             PrStatus::Stale { url, reason } => return StopOutcome::StalePr { pr_url: url, reason },
             PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
-            PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
-            PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
+            PrStatus::Fresh { url } => {
+                self.record_pr_created_fallback_hit(&execution, "pr_recheck_detector", &url);
+                (url, WorkerPrCompletionTarget::InReview)
+            }
+            PrStatus::Merged { url } => {
+                self.record_pr_created_fallback_hit(&execution, "pr_recheck_detector", &url);
+                (url, WorkerPrCompletionTarget::Done)
+            }
         };
         self.finalize_pr_transition(execution_id, pr_url, target, "pr_recheck")
             .await

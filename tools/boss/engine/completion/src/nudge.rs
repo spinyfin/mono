@@ -949,7 +949,16 @@ impl WorkerCompletionHandler {
     /// Verified staged PR URL, else the work-item/execution bound URL.
     /// Unverified staged candidates are not progress: they may be a
     /// captured URL from an unrelated `gh pr view`.
-    async fn current_verified_or_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
+    pub(super) async fn current_verified_or_bound_pr_url(
+        &self,
+        execution: &crate::work::WorkExecution,
+    ) -> Option<String> {
+        if let Some(url) = self
+            .verified_pr_created_proposal_url(execution, "background-nudge-recheck")
+            .await
+        {
+            return Some(url);
+        }
         if let Some(url) = self
             .verified_staged_pr_url(&execution.id, execution, "background-nudge-recheck")
             .await
@@ -1097,6 +1106,7 @@ impl WorkerCompletionHandler {
         }
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
+        self.forget_pr_created_fallback(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);

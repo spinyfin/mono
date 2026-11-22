@@ -41,21 +41,7 @@ impl WorkerCompletionHandler {
     /// The bound PR for an execution: its repo slug, number and URL.
     async fn locate_bound_pr(&self, execution: &boss_protocol::WorkExecution) -> Result<Option<(String, u64, String)>> {
         let bound_pr_url = match self.work_db.get_work_item(&execution.work_item_id)? {
-            WorkItem::Task(task) | WorkItem::Chore(task) => {
-                boss_engine_storage_values::branch_identity::task_bound_pr_url(&task)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        if execution.kind == ExecutionKind::RevisionImplementation {
-                            execution
-                                .pr_url
-                                .clone()
-                                .filter(|u| !u.is_empty())
-                                .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
-                        } else {
-                            None
-                        }
-                    })
-            }
+            WorkItem::Task(task) | WorkItem::Chore(task) => self.work_db.execution_bound_pr_url(&task, execution),
             _ => None,
         };
         let Some(bound_pr_url) = bound_pr_url else {

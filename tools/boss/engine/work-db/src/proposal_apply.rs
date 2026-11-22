@@ -950,7 +950,7 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 /// task 12), which reads this proposal row instead of the in-memory
 /// `StagedPrUrlCache`.
 ///
-/// On success, binds the PR to the work item by opportunistically attaching
+/// For primary implementations, binds the PR to the work item by opportunistically attaching
 /// `pr_url` to the task — mirroring [`WorkDb::reconciler_attach_pr_url`]'s
 /// "set if not already set" semantics rather than
 /// [`WorkDb::record_worker_pr_completion`]'s full completion cascade (status
@@ -1028,11 +1028,14 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
         );
     }
 
-    tx.execute(
-        "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
-         WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
-        params![task.id, payload.pr_url, now_string()],
-    )?;
+    // Revision tasks never own the PR; dispatch state and the chain root do.
+    if execution.kind != ExecutionKind::RevisionImplementation {
+        tx.execute(
+            "UPDATE tasks SET pr_url = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND deleted_at IS NULL AND (pr_url IS NULL OR pr_url = '')",
+            params![task.id, payload.pr_url, now_string()],
+        )?;
+    }
 
     Ok(ApplyDecision::Applied(ApplyOutcome {
         applied_ref: Some(task.id),
@@ -1394,7 +1397,8 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.proposal.state, ProposalState::Applied);
         let after = query_task(&db.connect().unwrap(), &revision.id).unwrap().unwrap();
-        assert_eq!(after.pr_url.as_deref(), Some(url));
+        assert_eq!(after.pr_url, None, "revision tasks never own the PR binding");
+        assert_eq!(db.get_revision_chain_root_pr_url(&revision.id).as_deref(), Some(url));
     }
 
     /// Binding a PR via `pr_created` must stamp `updated_at`, mirroring

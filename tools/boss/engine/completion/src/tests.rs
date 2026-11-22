@@ -165,12 +165,17 @@ impl WorkspaceDiffVerifier for StubWorkspaceDiffVerifier {
 #[builder(on(String, into))]
 pub struct StubBranchVerifier {
     pub result: Result<String, String>,
+    #[builder(default)]
+    pub pending_head_ref: bool,
     /// `headRefOid` returned by `fetch_pr_head_oid`. Defaults to a stable
     /// stand-in so tests that don't touch the SHA-delta path don't need to
     /// wire one explicitly. Tests that exercise the gate call
     /// [`StubBranchVerifier::set_head_oid`] to override.
     #[builder(default = Mutex::new(Ok("oid_unknown".to_owned())))]
     pub head_oid_result: Mutex<Result<String, String>>,
+    /// Per-PR heads distinguish unrelated PR movement from revision contribution.
+    #[builder(default = Mutex::new(HashMap::new()))]
+    pub head_oid_by_pr: Mutex<HashMap<u64, String>>,
     /// `headRefOid` returned by the direct, teardown-time REST read. This is
     /// deliberately independent from `head_oid_result`: an ordinary
     /// SHA-delta read can fail without making the later fresh finalization
@@ -314,6 +319,9 @@ const DETERMINISTIC_FAILURE_PREFIX: &str = "\u{0}deterministic:";
 #[async_trait]
 impl BranchVerifier for StubBranchVerifier {
     async fn fetch_pr_head_ref(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        if self.pending_head_ref {
+            return std::future::pending().await;
+        }
         self.head_ref_calls
             .lock()
             .expect("head_ref_calls mutex poisoned")
@@ -333,6 +341,9 @@ impl BranchVerifier for StubBranchVerifier {
     }
 
     async fn fetch_pr_head_oid(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        if let Some(oid) = self.head_oid_by_pr.lock().await.get(&_pr_number) {
+            return Ok(oid.clone());
+        }
         let guard = self.head_oid_result.lock().await;
         match &*guard {
             Ok(oid) => Ok(oid.clone()),
@@ -2141,6 +2152,8 @@ mod no_op_recovery;
 mod nudge_delivery;
 #[cfg(test)]
 mod nudge_staged_pr;
+#[cfg(test)]
+mod pr_created_proposal;
 #[cfg(test)]
 mod revision_delivery;
 #[cfg(test)]

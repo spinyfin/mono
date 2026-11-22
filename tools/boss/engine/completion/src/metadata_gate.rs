@@ -731,8 +731,8 @@ impl WorkerCompletionHandler {
         execution_id: &str,
         execution: &crate::work::WorkExecution,
     ) -> ShaDeltaGateOutcome {
-        // The chore-bound PR URL is the only authoritative identifier
-        // permitted here. No branch search.
+        // Use the shared binding policy, including dispatch/chain-root binding
+        // for revisions. No branch search.
         let work_item = match self.work_db.get_work_item(&execution.work_item_id) {
             Ok(item) => item,
             Err(err) => {
@@ -747,28 +747,8 @@ impl WorkerCompletionHandler {
         };
         let bound_pr_url = match work_item {
             WorkItem::Task(task) | WorkItem::Chore(task) => {
-                // Primary: the task's own pr_url (structured field only).
-                // Fallback for revision_implementation: use execution.pr_url
-                // (set to the chain root's PR URL at dispatch time), because
-                // revision tasks always have task.pr_url = NULL by design.
-                let from_task =
-                    boss_engine_storage_values::branch_identity::task_bound_pr_url(&task).map(str::to_owned);
-                match from_task {
+                match self.work_db.execution_bound_pr_url(&task, execution) {
                     Some(url) => url,
-                    None if execution.kind == ExecutionKind::RevisionImplementation => {
-                        // Primary: execution.pr_url stamped at dispatch time.
-                        // Fallback: chain-root lookup for executions where it
-                        // was not stamped.
-                        match execution
-                            .pr_url
-                            .clone()
-                            .filter(|u| !u.is_empty())
-                            .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
-                        {
-                            Some(url) => url,
-                            None => return ShaDeltaGateOutcome::Inapplicable,
-                        }
-                    }
                     None => return ShaDeltaGateOutcome::Inapplicable,
                 }
             }

@@ -318,6 +318,22 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "pr_created_proposals_seam",
+        description: "Read pr_created worker_proposals rows before falling back to the legacy PR-URL \
+             ladder (hook-stream staging cache, structured-output PR-URL artifact, driver \
+             final-message prose, and cold detect_pr reconstruction) in on_stop, recheck_for_pr, \
+             and run_done PR resolution (design: worker-proposal-api-replace-fragile-worker-to-engine-seams.md). When on, an execution that carries an applied pr_created \
+             proposal has its PR URL branch-verified against GitHub and used directly without \
+             consulting the legacy ladder. When no usable pr_created proposal exists and the legacy \
+             ladder resolves a PR URL, worker_proposals.fallback_hit.pr_created increments and a \
+             WARN logs as the exit criterion for eventually deleting the legacy fallback. DEFAULT \
+             OFF: enable once the proposal path is validated in staging. Kill switch: \
+             set false to restore the pre-migration staging/detector-only behavior.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "run_done_proposals_seam",
         description: "Make run completion wait for the worker's own `boss propose done` declaration instead \
              of inferring it from the bound PR's state (design: \
@@ -1007,6 +1023,30 @@ mod tests {
         let store2 = make_store(&tmp);
         store2.load().unwrap();
         assert!(store2.is_enabled("automation_outcome_proposals_seam"));
+    }
+
+    #[test]
+    fn pr_created_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("pr_created_proposals_seam"),
+            "pr_created_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "pr_created_proposals_seam")
+            .expect("pr_created_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "completion");
+
+        store.set("pr_created_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("pr_created_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("pr_created_proposals_seam"));
     }
 
     #[test]

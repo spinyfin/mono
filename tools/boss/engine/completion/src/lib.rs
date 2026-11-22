@@ -161,6 +161,7 @@ mod release;
 mod remediation;
 mod run_done_declaration;
 mod stop;
+use stop::PrCreatedProposalLookup;
 mod teardown;
 mod worker_signals;
 
@@ -314,6 +315,13 @@ crate::register_counter!(
      because no worker_proposals row of kind automation_outcome existed for the execution \
      (automation_outcome_proposals_seam on).",
 );
+crate::register_counter!(
+    PR_CREATED_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.pr_created",
+    "Completion PR resolution fell back to the legacy PR-URL ladder (hook staging, artifact, \
+     driver prose, or detect_pr) because no usable pr_created worker_proposals row existed \
+     for the execution (pr_created_proposals_seam on).",
+);
 
 // The run-done gate and its backstop. Together these are the soak
 // instrumentation for the declaration: `GATE_HELD` counts runs the health-alone
@@ -375,6 +383,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
     registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
     registry.register_counter(&AUTOMATION_OUTCOME_FALLBACK_HIT);
+    registry.register_counter(&PR_CREATED_FALLBACK_HIT);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -1485,6 +1494,11 @@ pub struct WorkerCompletionHandler {
     /// re-query GitHub or re-publish attention on every tick.
     #[builder(skip)]
     pr_base_refusal_next_check: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Execution ids already counted by
+    /// `worker_proposals.fallback_hit.pr_created`, so repeated Stop and
+    /// merge-poller passes count one legacy-ladder use once.
+    #[builder(skip)]
+    pr_created_fallback_recorded: std::sync::Mutex<std::collections::HashSet<String>>,
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
     /// Verifies the worker's recorded workspace is genuinely empty before a

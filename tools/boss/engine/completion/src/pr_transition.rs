@@ -648,6 +648,7 @@ impl WorkerCompletionHandler {
         self.nudge_breaker.forget(execution_id);
         self.build_wait_tracker.forget(execution_id);
         self.background_children_tracker.forget(execution_id);
+        self.forget_pr_created_fallback(execution_id);
         self.hold_registry.release(execution_id);
         // Stop → pr_transition termination path: the call above just moved
         // the execution to `completed` (see `record_worker_pr_completion`),

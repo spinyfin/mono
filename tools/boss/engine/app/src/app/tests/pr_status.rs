@@ -607,6 +607,14 @@ async fn status_and_body_resolve_pr_via_chain_root_for_revision_execution() {
         WorkItem::Task(task) => assert!(task.pr_url.is_none(), "revision tasks never own a pr_url"),
         other => panic!("expected a task, got {other:?}"),
     }
+    // Ignore a stale binding left by proposal application in an older engine.
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision.id, "https://github.com/example/repo/pull/99"],
+        )
+        .unwrap();
 
     // Create the execution WITHOUT `execution.pr_url` (the older-dispatch
     // shape the design doc calls out), forcing resolution all the way to the
@@ -638,7 +646,7 @@ async fn status_and_body_resolve_pr_via_chain_root_for_revision_execution() {
     assert_eq!(
         status.pr_url.as_deref(),
         Some(pr_url.as_str()),
-        "must resolve via the chain-root fallback, not the revision's own (NULL) pr_url"
+        "must resolve via the chain-root fallback, not the revision's stale pr_url"
     );
     assert_eq!(status.mergeable.as_deref(), Some("mergeable"));
     assert_eq!(status.head_sha.as_deref(), Some("root-sha"));

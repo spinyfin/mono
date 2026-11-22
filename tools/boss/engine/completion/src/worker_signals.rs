@@ -619,6 +619,56 @@ impl WorkerCompletionHandler {
         );
     }
 
+    /// Whether the `pr_created` proposal seam is active (master kill switch
+    /// `worker_proposals` plus per-seam `pr_created_proposals_seam`).
+    pub(super) fn pr_created_proposals_first(&self) -> bool {
+        self.feature_flags.is_enabled("worker_proposals") && self.feature_flags.is_enabled("pr_created_proposals_seam")
+    }
+
+    /// Count one legacy PR-URL-ladder hit for the `pr_created` seam and log
+    /// a WARN. Callers invoke this only on a path that did not consume a
+    /// verified proposal, so a call means the legacy ladder (hook staging,
+    /// artifact, driver prose, or `detect_pr`) resolved a PR — including when
+    /// an applied proposal existed but was unusable. Counted at most once per
+    /// execution: Stop and the merge poller re-enter these arms on
+    /// every pass, and the counter is the exit criterion for deleting the
+    /// ladder, so repeated passes must not inflate it. This process-local counter
+    /// and its dedup state both reset on engine restart; soak measurements
+    /// must use a single engine lifetime. Terminal cleanup removes the key.
+    pub(super) fn record_pr_created_fallback_hit(
+        &self,
+        execution: &crate::work::WorkExecution,
+        source: &str,
+        pr_url: &str,
+    ) {
+        if !self.pr_created_proposals_first() {
+            return;
+        }
+        let first_hit = self
+            .pr_created_fallback_recorded
+            .lock()
+            .expect("pr_created_fallback_recorded mutex poisoned")
+            .insert(execution.id.clone());
+        if !first_hit {
+            return;
+        }
+        let detail = format!("{source}: {pr_url}");
+        self.record_proposal_fallback_hit_no_row(
+            execution,
+            &PR_CREATED_FALLBACK_HIT,
+            "pr_created_proposals_seam",
+            "pr_created",
+            &detail,
+        );
+    }
+
+    pub(super) fn forget_pr_created_fallback(&self, execution_id: &str) {
+        self.pr_created_fallback_recorded
+            .lock()
+            .expect("pr_created_fallback_recorded mutex poisoned")
+            .remove(execution_id);
+    }
+
     /// Consume this execution's staged `proposal_channel_error` (if any —
     /// see [`crate::proposal_channel_error`]), file an attention for it, and
     /// increment `worker_proposals.channel_error`. Design §"Failure
