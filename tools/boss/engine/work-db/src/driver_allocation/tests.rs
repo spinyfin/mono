@@ -3,8 +3,8 @@
 //! The end-to-end cases deliberately go through `create_ready_chore_execution`
 //! (which funnels into `insert_execution`) rather than calling
 //! `decide_execution_driver` directly, so they exercise the same path real
-//! insertion takes: decide, persist, read back. `dispatch_tests` covers
-//! revalidation when a queued execution is claimed or launched (`launch_tests`).
+//! insertion takes: decide, persist, read back. `launch_tests` covers
+//! revalidation when a queued execution is claimed or launched.
 
 use super::*;
 use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
@@ -1206,4 +1206,17 @@ fn legacy_percentage_decision_rows_still_read_back() {
         Some(DRIVER_SLUG_CODEX),
         "a legacy decision must still route",
     );
+}
+
+#[test]
+fn share_write_repairs_invalid_persisted_split() {
+    for raw in [r#"{"grok":50,"claude":50,"codex":50,"agy":0}"#, "not json"] {
+        let (_dir, db) = open_db();
+        db.set_metadata(METADATA_KEY_DRIVER_TRAFFIC_SPLIT, raw).unwrap();
+        assert!(db.get_driver_traffic_split().is_err());
+        let incoming = DriverTrafficSplit::new(0, 40, 30, 30);
+        let repaired = db.set_driver_traffic_split(incoming).unwrap();
+        assert_eq!(repaired, DriverTrafficSplit::new(0, 40, 30, 30));
+        assert_eq!(db.get_driver_traffic_split().unwrap(), repaired);
+    }
 }

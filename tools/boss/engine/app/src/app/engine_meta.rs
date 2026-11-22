@@ -741,7 +741,6 @@ async fn reply_driver_traffic_split(
         server_state,
         sink,
         request_id,
-        session_id,
         ..
     } = ctx;
     match result {
@@ -753,18 +752,10 @@ async fn reply_driver_traffic_split(
                 FrontendEvent::DriverTrafficSplitResult { split: applied },
             );
             let envelope = FrontendEventEnvelope::push(FrontendEvent::DriverTrafficSplitResult { split: applied });
-            let sinks = {
-                let inner = server_state.topic_broker.inner.lock().await;
-                inner
-                    .sinks
-                    .iter()
-                    .filter(|(id, _)| id.as_str() != session_id)
-                    .map(|(_, other)| other.clone())
-                    .collect::<Vec<_>>()
-            };
-            for other in sinks {
-                let _ = other.enqueue(envelope.clone());
-            }
+            server_state
+                .topic_broker
+                .publish(boss_protocol::TOPIC_DRIVER_TRAFFIC_SPLIT, envelope)
+                .await;
         }
         Err(err) => {
             log_driver_traffic_split(proposed, Some(&err));

@@ -462,6 +462,7 @@ mod create_revision_actor;
 mod dispatch_focus;
 mod dispatch_pause;
 mod driver_start_signal;
+mod driver_traffic_split;
 mod engine_health_report;
 mod engine_pool_config;
 mod invalidation_routing;

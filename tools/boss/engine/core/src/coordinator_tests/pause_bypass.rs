@@ -717,6 +717,14 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
             .any(|item| item.kind == crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND),
         "{attention:?}"
     );
+    let refusal_attention = attention
+        .iter()
+        .find(|item| item.kind == crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND)
+        .unwrap();
+    assert!(
+        refusal_attention.body_markdown.contains("--enable"),
+        "{refusal_attention:?}"
+    );
     let boss_protocol::WorkItem::Chore(task) = db.get_work_item(&chore.id).unwrap() else {
         panic!("expected a chore");
     };

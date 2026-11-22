@@ -16,6 +16,9 @@ pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
 /// out on this topic so subscribed frontends update without polling.
 pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
 
+/// Configured driver shares and launch flags after either setter.
+pub const TOPIC_DRIVER_TRAFFIC_SPLIT: &str = "driver.traffic_split";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }
