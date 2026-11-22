@@ -1179,12 +1179,48 @@ async fn late_recovery_dedupes_an_identical_open_base_refusal() {
         branch_naming: BranchNaming::BossExecPrefix,
         worker_branch_prefix: None,
     };
-    for _ in 0..2 {
-        assert!(matches!(
-            handler.recheck_for_pr_late(&candidate).await,
-            StopOutcome::PrBaseRefused { .. }
-        ));
-    }
+    assert!(matches!(
+        handler.recheck_for_pr_late(&candidate).await,
+        StopOutcome::PrBaseRefused { .. }
+    ));
+    // `upsert_work_item_attention` reuses the open row and stamps
+    // `last_raised_at` without inserting. A skip that still re-raises
+    // would keep the row count at one; a frozen sentinel is what
+    // proves the second pass did not write.
+    const LAST_RAISED_SENTINEL: &str = "1";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_attention_items SET last_raised_at = ?1
+             WHERE work_item_id = ?2 AND kind = ?3 AND status = 'open'",
+            rusqlite::params![
+                LAST_RAISED_SENTINEL,
+                work_item_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        handler.recheck_for_pr_late(&candidate).await,
+        StopOutcome::PrBaseRefused { .. }
+    ));
+    let last_raised_at: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT last_raised_at FROM work_attention_items
+             WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open'",
+            rusqlite::params![
+                work_item_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        last_raised_at, LAST_RAISED_SENTINEL,
+        "an identical open refusal must not re-stamp last_raised_at"
+    );
     let open: Vec<_> = db
         .list_attention_items_for_work_item(&work_item_id)
         .unwrap()
