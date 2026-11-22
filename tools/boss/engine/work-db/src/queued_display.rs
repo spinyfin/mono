@@ -217,13 +217,17 @@ impl WorkDb {
     /// Heartbeat projection, including future deadlines that the dispatchable
     /// queue deliberately excludes. Callers publish only changed displays.
     /// Unexpired, same-epoch, cacheable snapshots from `previous` are reused.
+    ///
+    /// The whole pass is one read snapshot and writes nothing, so it is safe
+    /// on a read-only connection and must never take the write lock the
+    /// connection's default transaction would.
     pub fn queued_displays(
         &self,
         now: i64,
         previous: &HashMap<String, QueuedDisplaySnapshot>,
     ) -> Result<HashMap<String, QueuedDisplaySnapshot>> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let items = {
             let mut stmt = tx.prepare(
                 // Driven from the pending executions, which are few, through

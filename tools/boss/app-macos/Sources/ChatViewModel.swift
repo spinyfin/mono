@@ -179,6 +179,10 @@ final class ChatViewModel: ObservableObject {
     /// `work_error` (refusal) arrives, or the connection drops. Drives the
     /// card's disabled-buttons state so a double click cannot answer twice.
     @Published var operatorAnswerInFlightByTaskID: [String: String] = [:]
+    /// Task id → the answer being timed from its click to the card
+    /// repainting. Not published: no view reads it. See
+    /// `ChatViewModel+OperatorAnswerTiming.swift`.
+    var operatorAnswerTimingByTaskID: [String: OperatorAnswerTiming] = [:]
     /// Task id → user-readable reason the last answer attempt was
     /// refused. Cleared by the next attempt or when a task update
     /// closes or replaces the question.

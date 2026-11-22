@@ -97,6 +97,7 @@ impl ExecutionCoordinator {
             cube_lease_timeout: CUBE_LEASE_TIMEOUT,
             driving_runs: std::sync::Mutex::new(DrivingRuns::default()),
             in_doubt_sweep_active: AtomicBool::new(false),
+            queued_display_reader: std::sync::OnceLock::new(),
         }
     }
 

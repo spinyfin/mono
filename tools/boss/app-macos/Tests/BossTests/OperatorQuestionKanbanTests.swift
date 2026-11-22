@@ -581,6 +581,70 @@ final class OperatorQuestionKanbanTests: XCTestCase {
         XCTAssertEqual(model.workSections(in: .doing).map(\.title), ["Queued"])
     }
 
+    /// The click-to-board path on the app side: the engine's reply alone moves
+    /// the card, in the same main-actor turn it arrives in. It must not wait
+    /// for the coalesced board refetch or any timer.
+    func testAnswerReplyMovesTheCardWithoutWaitingForARefetch() throws {
+        let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
+        let task = awaiting(id: "task_q")
+        model.choresByProductID = ["prod_test": [task]]
+        var sent: [[String: Any]] = []
+        model.engine.outboundRecorder = { sent.append($0) }
+        XCTAssertEqual(model.workSections(in: .doing).map(\.title), ["Needs Attention"])
+
+        let clicked = ContinuousClock.now
+        XCTAssertTrue(model.answerOperatorQuestion(for: task, answer: .yesNo(true)))
+        let timing = try XCTUnwrap(model.operatorAnswerTimingByTaskID["task_q"])
+        XCTAssertEqual(timing.questionID, "oq_1")
+        XCTAssertEqual(timing.requestID, model.operatorAnswerInFlightByTaskID["task_q"])
+        XCTAssertNil(timing.replyAppliedAt)
+
+        var answered = task
+        answered.status = "todo"
+        answered.blockedReason = nil
+        answered.blockedDetail = nil
+        answered.operatorQuestion = nil
+        answered.autostart = true
+        model.applyEventForTest(.workItemUpdated(item: .chore(answered)))
+
+        // No await between the reply and these reads: nothing is deferred.
+        let sections = model.workSections(in: .doing)
+        let elapsed = clicked.duration(to: .now)
+        XCTAssertEqual(sections.map(\.title), ["Queued"])
+        XCTAssertEqual(sections[0].items.map(\.id), ["task_q"])
+        let snapshot = WorkCardSnapshot.build(
+            task: try XCTUnwrap(model.task(withID: "task_q")), context: WorkCardSnapshotContext(column: .doing))
+        XCTAssertNil(WorkBoardCardOperatorQuestionSlice(snapshot: snapshot))
+        XCTAssertNil(model.operatorAnswerInFlightByTaskID["task_q"])
+        XCTAssertLessThan(elapsed, .milliseconds(300))
+        XCTAssertEqual(sent.compactMap { $0["type"] as? String }, ["answer_operator_question"],
+            "the card moved on the reply alone: no board refetch was needed")
+        XCTAssertTrue(model.pendingWorkTreeRefetchTasks.isEmpty)
+
+        // The reply hop is recorded; the card reporting it repainted ends the timing.
+        XCTAssertNotNil(model.operatorAnswerTimingByTaskID["task_q"]?.replyAppliedAt)
+        model.recordOperatorQuestionCardCleared(taskID: "task_q")
+        XCTAssertNil(model.operatorAnswerTimingByTaskID["task_q"])
+    }
+
+    func testQuestionBlockLeavingTheViewBeforeTheReplyDoesNotEndTheTiming() {
+        let model = makeModel()
+        model.engine.simulateConnectedForTesting = true
+        let task = awaiting(id: "task_q")
+        model.choresByProductID = ["prod_test": [task]]
+        XCTAssertTrue(model.answerOperatorQuestion(for: task, answer: .yesNo(true)))
+
+        // Scrolled off screen while the question is still open.
+        model.recordOperatorQuestionCardCleared(taskID: "task_q")
+        XCTAssertNotNil(model.operatorAnswerTimingByTaskID["task_q"])
+
+        model.handleOperatorQuestionError(
+            message: "This question no longer exists.",
+            requestId: model.operatorAnswerInFlightByTaskID["task_q"])
+        XCTAssertNil(model.operatorAnswerTimingByTaskID["task_q"], "a refusal has no repaint to wait for")
+    }
+
     func testUnrelatedUpdateKeepsAnswerPendingUntilItsRefusalArrives() {
         let model = makeModel()
         let task = awaiting(id: "task_q")

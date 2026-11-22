@@ -97,6 +97,7 @@ extension ChatViewModel {
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
             operatorAnswerInFlightByTaskID.removeAll()
+            operatorAnswerTimingByTaskID.removeAll()
             attentionRequestGroupByRequestID.removeAll()
             // An archive in flight gets no reply either; drop its pending
             // mark so the row is not stuck reading "Archiving…".

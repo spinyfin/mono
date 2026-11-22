@@ -198,7 +198,8 @@ struct WorkBoardCardItem: View {
                     onAnswerOperatorQuestion: { answer in
                         model.answerOperatorQuestion(for: task, answer: answer)
                     },
-                    onDismissOperatorQuestion: { model.dismissOperatorQuestion(for: task) }
+                    onDismissOperatorQuestion: { model.dismissOperatorQuestion(for: task) },
+                    onOperatorQuestionCleared: { model.recordOperatorQuestionCardCleared(taskID: task.id) }
                 )
                 // `WorkBoardCardView` is `Equatable` over its snapshot and
                 // keyed revision-hover boolean: without `.equatable()`, every
@@ -500,6 +501,9 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// question. Only called when `snapshot.operatorQuestion` is non-nil.
     var onAnswerOperatorQuestion: ((OperatorAnswer) -> Void)? = nil
     var onDismissOperatorQuestion: (() -> Void)? = nil
+    /// Invoked when the question block leaves the card: the hop that shows
+    /// the board repainted after an answer.
+    var onOperatorQuestionCleared: (() -> Void)? = nil
 
     @State private var isHovered: Bool = false
 
@@ -538,6 +542,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             if let operatorQuestion = WorkBoardCardOperatorQuestionSlice(snapshot: snap) {
                 WorkBoardCardOperatorQuestion(slice: operatorQuestion, onAnswer: onAnswerOperatorQuestion, onDismiss: onDismissOperatorQuestion)
                     .equatable()
+                    .onDisappear { onOperatorQuestionCleared?() }
             }
             WorkBoardCardBadgeStrip(
                 slice: WorkBoardCardBadgeStripSlice(snapshot: snap),
