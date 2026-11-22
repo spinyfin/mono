@@ -230,6 +230,7 @@ impl CostAccumulator {
             provider_usage_json: (!self.provider_usage.is_empty())
                 .then(|| serde_json::to_string(&self.provider_usage).expect("usage objects serialize")),
             full_replacement: false,
+            model_mixed: false,
             usage_unavailable: None,
             model: self.model.clone(),
             output_tokens: saw_usage.then(|| sum(|usage| usage.output_tokens)),

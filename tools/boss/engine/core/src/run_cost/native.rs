@@ -61,13 +61,18 @@ impl NativeUsage {
         };
         let models: std::collections::BTreeSet<_> =
             self.records.values().filter_map(|row| row.model.as_deref()).collect();
-        let model = (models.len() == 1 && self.records.values().all(|row| row.model.is_some()))
-            .then(|| (*models.first().unwrap()).to_owned());
+        // A single-record multi-model turn (Grok `modelUsage` with several keys)
+        // carries its own mixed flag because its names are not kept per row.
+        let model_mixed = models.len() > 1 || self.records.values().any(|row| row.model_mixed);
+        // Exactly one observed model is reported even when other rows omit
+        // the model: the transcript did name it.
+        let model = (models.len() == 1 && !model_mixed).then(|| (*models.first().unwrap()).to_owned());
         let input_tokens = sum(|row| row.input_tokens);
         let output_tokens = sum(|row| row.output_tokens);
         let cache_read_tokens = sum(|row| row.cache_read_tokens);
         Some(RunCostSnapshot {
             full_replacement: true,
+            model_mixed,
             model,
             input_tokens,
             output_tokens,
@@ -106,6 +111,7 @@ fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {
         .and_then(|(input, cached)| input.checked_sub(cached))
         .filter(|n| *n >= 0);
     let models = usage.get("modelUsage").and_then(Value::as_object);
+    let model_mixed = models.is_some_and(|models| models.len() > 1);
     let model = models
         .filter(|models| models.len() == 1)
         .and_then(|models| models.keys().next())
@@ -114,6 +120,7 @@ fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {
         format!("grok:{id}"),
         RunCostSnapshot {
             model,
+            model_mixed,
             input_tokens,
             cache_read_tokens,
             // reasoningTokens is already included in outputTokens.
