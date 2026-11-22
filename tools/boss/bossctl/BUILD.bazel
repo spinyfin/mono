@@ -24,6 +24,7 @@ rust_binary(
         "src/probe.rs",
         "src/progression.rs",
         "src/proposals.rs",
+        "src/quarantine.rs",
         "src/review.rs",
         "src/selected_product.rs",
         "src/stream_integrity.rs",

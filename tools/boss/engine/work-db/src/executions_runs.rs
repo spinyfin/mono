@@ -122,7 +122,11 @@ impl WorkDb {
     /// callers shouldn't try to reap a row that's already done.
     pub fn mark_execution_orphaned(&self, execution_id: &str, reason: &str) -> Result<WorkExecution> {
         if self.is_execution_quarantined(execution_id)? {
-            bail!("historical local worker is quarantined; rollback/drain and restart required before orphan recovery");
+            bail!(
+                "execution {execution_id} is held as an unverified local worker (no complete tmux identity, \
+                 process not proven dead), so it is not reaped as orphaned. Cancel it to release the hold; \
+                 `bossctl dispatch quarantine status` shows the evidence"
+            );
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

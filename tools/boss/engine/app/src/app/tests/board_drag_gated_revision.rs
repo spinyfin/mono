@@ -5,13 +5,13 @@
 use super::*;
 use crate::app::work_items::handle_move_work_item_on_board;
 use boss_engine_runtime::test_support::{
-    create_spawned_execution, create_test_chore_manual, create_test_product_with_repo,
+    create_old_execution, create_spawned_execution, create_test_chore_manual, create_test_product_with_repo,
 };
 use boss_protocol::{
     BoardColumn, BoardDropTarget, CreateRevisionInput, ExecutionKind, FrontendRequest, Task, TaskStatus, WorkItem,
     WorkItemPatch,
 };
-use boss_work_db::{PrOpenState, StaticPrStateChecker};
+use boss_work_db::{LocalWorkerQuarantine, PrOpenState, StaticPrStateChecker};
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
     Dispatch::builder()
@@ -344,22 +344,53 @@ async fn chore_gated_on_in_review_prerequisite_dropped_on_doing_is_refused() {
 async fn quarantined_drop_restores_block_and_surfaces_explicit_start_error() {
     let (state, _dir) = test_server_state_with_fakes();
     let (_, _, task) = seed_ci_fix_behind_in_review_revision(&state);
+    // Admission rechecks durable evidence, so the hold must name a real
+    // non-terminal historical run without a tmux identity or recorded pid.
+    let held_execution = create_old_execution(&state.work_db, &task.id);
+    state
+        .work_db
+        .start_execution_run(
+            &held_execution,
+            "worker-1",
+            "repo",
+            "lease",
+            "workspace",
+            "/tmp/workspace",
+        )
+        .unwrap();
     state
         .work_db
         .update_work_item(
             &task.id,
             WorkItemPatch::builder()
+                .status("blocked")
+                .blocked_reason("worker_failed")
                 .blocked_detail("worker exited before producing a PR")
                 .build(),
         )
         .unwrap();
+    // Keep the failed attempt newest so the board requests a fresh start;
+    // the older unidentified worker must still prevent that admission.
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET created_at = 0 WHERE id = ?1",
+            [&held_execution],
+        )
+        .unwrap();
+    assert!(crate::app::handler_helpers::work_item_needs_dispatch(
+        &state.work_db,
+        &task.id
+    ));
     let before = task_row(&state, &task.id);
     let executions_before = state.work_db.list_executions(Some(&task.id)).unwrap();
     state
         .work_db
         .set_metadata(
             "local_worker_startup_quarantine",
-            &serde_json::json!({"executions": {"historical": task.id}, "scan_error": null}).to_string(),
+            &serde_json::json!({"executions": {held_execution.clone(): task.id}, "scan_error": null}).to_string(),
         )
         .unwrap();
     state.work_db.precheck_dispatch_repo(&task.id).unwrap();
@@ -392,7 +423,77 @@ async fn quarantined_drop_restores_block_and_surfaces_explicit_start_error() {
     assert_eq!(after.blocked_detail, before.blocked_detail);
     let executions_after = state.work_db.list_executions(Some(&task.id)).unwrap();
     assert_eq!(executions_after.len(), executions_before.len());
-    assert!(executions_after.iter().all(|execution| execution.status.is_terminal()));
+    for before in &executions_before {
+        let after = executions_after
+            .iter()
+            .find(|execution| execution.id == before.id)
+            .unwrap();
+        assert_eq!(
+            after.status, before.status,
+            "the refused drop must preserve every execution"
+        );
+    }
+    assert!(state.work_db.is_execution_quarantined(&held_execution).unwrap());
+    assert!(
+        !state
+            .work_db
+            .get_execution(&held_execution)
+            .unwrap()
+            .status
+            .is_terminal()
+    );
+}
+
+/// A stored unreadable-inventory pause used to refuse every board drop to
+/// Doing until restart. Board admission re-judges first, so a now-readable
+/// inventory lifts the pause and the drop dispatches.
+#[tokio::test]
+async fn board_drop_retries_an_unreadable_inventory_without_a_restart() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product = create_test_product_with_repo(
+        &state.work_db,
+        "BoardDropReadableInventory",
+        Some("git@example.com:board/readable-inventory.git"),
+    );
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Drop after a readable inventory");
+    state
+        .work_db
+        .write_local_worker_quarantine(&LocalWorkerQuarantine {
+            executions: Default::default(),
+            scan_error: Some("inventory unreadable".to_owned()),
+        })
+        .unwrap();
+    assert!(state.work_db.local_dispatch_quarantine_reason().unwrap().is_some());
+
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(
+        dispatch(&state, &sink, "readable-inventory-drop"),
+        drop_on_doing(&chore.id),
+    )
+    .await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemUpdated { item } => {
+            let (WorkItem::Task(t) | WorkItem::Chore(t)) = item else {
+                panic!("expected a task row in the drop response");
+            };
+            assert_eq!(t.id, chore.id);
+            assert_eq!(t.status, TaskStatus::Active, "the drop must land the card in Doing");
+        }
+        other => panic!("expected WorkItemUpdated after the pause lifted, got: {other:?}"),
+    }
+    assert!(state.work_db.local_dispatch_quarantine_reason().unwrap().is_none());
+    let fresh: Vec<_> = state
+        .work_db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .filter(|execution| !execution.status.is_terminal())
+        .collect();
+    assert_eq!(
+        fresh.len(),
+        1,
+        "the drop must dispatch after re-reading the inventory; got {fresh:?}"
+    );
 }
 
 #[tokio::test]

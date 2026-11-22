@@ -585,7 +585,7 @@ pub enum Stage {
     /// Also emitted one step earlier, by `boss_engine::orphan_sweep`, when
     /// the pause holds a redispatch the sweep would otherwise have minted.
     /// That sweep creates executions through
-    /// `WorkDb::request_execution_with_live_check` directly, and creating
+    /// `request_execution_after_rejudging_holds`, and creating
     /// one is already destructive — it marks the predecessor `abandoned` —
     /// so waiting for the spawn chokepoint to refuse it would be too late
     /// to save the work. Those events carry

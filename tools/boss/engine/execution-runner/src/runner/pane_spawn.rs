@@ -1349,9 +1349,13 @@ impl ExecutionRunner for PaneSpawnRunner {
             Ok(Some(_))
         );
         let pool = spawner.attributed_pool_label(execution, has_source_automation);
+        // Re-checked here because host selection ran earlier: an unreadable
+        // run inventory refuses every local spawn, a held worker only its own
+        // work item's.
         if let Some(reason) = self.work_db.local_dispatch_quarantine_reason()? {
             return Err(anyhow!(reason));
         }
+        self.work_db.ensure_work_item_not_quarantined(&execution.work_item_id)?;
         let tmux_host = self
             .tmux_worker_host(slot_id, &execution.id)
             .context("local dispatch requires a tmux worker host")?;

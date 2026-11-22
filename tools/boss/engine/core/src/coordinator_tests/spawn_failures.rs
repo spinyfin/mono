@@ -1231,6 +1231,28 @@ async fn viewer_abort_failure_retains_the_workspace_and_records_the_reason() {
         "unconfirmed teardown must not request a replacement execution; got {executions:#?}"
     );
 
+    // Reconstruct the identity a real spawn would have written before the
+    // viewer-abort failure was recorded. The production intent write now
+    // refuses terminal rows so a late spawn cannot recreate a session after
+    // the pane-attach deadline has already orphaned the execution.
+    {
+        let conn = db.connect().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE work_runs
+                 SET tmux_server_label = ?2,
+                     tmux_session_name = ?3,
+                     tmux_spawn_token = ?4,
+                     tmux_spawn_state = 'intended'
+                 WHERE execution_id = ?1",
+                rusqlite::params![&execution_id, "boss", "boss-unreaped", "tok-unreaped"],
+            )
+            .unwrap();
+        assert!(
+            updated > 0,
+            "failed spawn still has a work_runs row to attach identity to"
+        );
+    }
     assert!(
         db.record_tmux_session_created_for_execution(&execution_id, "tok-unreaped", 4242)
             .unwrap(),

@@ -310,6 +310,19 @@ pub trait LifecycleServices: Send + Sync {
 
     fn probe_pid(&self, pid: i32) -> PidStatus;
 
+    /// Re-judge the hold on local workers the engine could not verify, and
+    /// release whatever no longer needs it (the worker's process is proven
+    /// gone, its execution went terminal, or the run inventory became
+    /// readable again). The coordinator calls this before admission, host
+    /// selection, and the active-dispatch rescan; the orphan-sweep pass
+    /// calls it on every tick. A hold never outlives its cause by more than
+    /// one of those decisions or one sweep interval, and never needs an
+    /// engine restart to lift.
+    ///
+    /// The default does nothing: it suits a coordinator with no local worker
+    /// processes to verify.
+    fn reevaluate_local_worker_holds(&self) {}
+
     async fn reattach_remote_runs(
         &self,
         provider: &dyn HostAdapterProvider,

@@ -642,7 +642,7 @@ async fn serve_scoped(
     server_state.execution_coordinator.set_startup_recovery_pending(true);
     let local_quarantine =
         boss_engine_runtime::local_worker_quarantine::quarantine_historical_local_workers(&server_state.work_db)
-            .context("establishing historical local worker quarantine before startup recovery")?;
+            .context("judging unverified local workers before startup recovery")?;
 
     server_state
         .execution_coordinator
@@ -1506,7 +1506,13 @@ async fn serve_scoped(
             boss_engine_runtime::run_reconcile::RunReconcileVerdict::Unknown,
         );
     }
-    for id in &local_quarantine.dead_execution_ids {
+    // A spawn that never reached tmux has no worker to find, however live
+    // its workspace lease still looks.
+    for id in local_quarantine
+        .dead_execution_ids
+        .iter()
+        .chain(&local_quarantine.never_started_execution_ids)
+    {
         probe_report.verdicts.insert(
             id.clone(),
             boss_engine_runtime::run_reconcile::RunReconcileVerdict::Dead,
@@ -1556,15 +1562,41 @@ async fn serve_scoped(
     //
     // See docs/post-crash-recovery.md for the full flow.
     for (execution_id, verdict) in &probe_report.verdicts {
-        match server_state.work_db.reap_startup_dead_execution(execution_id, verdict) {
+        let never_started = local_quarantine.never_started_execution_ids.contains(execution_id);
+        let reaped = if never_started {
+            server_state.work_db.reap_startup_dead_execution_because(
+                execution_id,
+                verdict,
+                boss_engine_runtime::local_worker_quarantine::SPAWN_NEVER_REACHED_TMUX_REASON,
+            )
+        } else {
+            server_state.work_db.reap_startup_dead_execution(execution_id, verdict)
+        };
+        match reaped {
             Ok(None) => continue,
             Ok(Some(execution)) => {
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
                     cube_workspace_id = ?execution.cube_workspace_id,
+                    never_started,
+                    reason = execution.last_error.as_deref().unwrap_or_default(),
                     "startup reaper: marked execution orphaned (workspace preserved for re-lease)",
                 );
+                if never_started {
+                    server_state
+                        .dispatch_events
+                        .emit(
+                            boss_dispatch_events::DispatchEvent::new(
+                                boss_dispatch_events::Stage::ExecutionLivenessReconcile,
+                                boss_dispatch_events::Outcome::Ok,
+                                &execution.id,
+                            )
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({ "reason": "spawn_never_reached_tmux" })),
+                        )
+                        .await;
+                }
                 // App-crash-reconciliation termination path (engine
                 // startup reaper): tear down any driver-owned state
                 // outside the workspace.

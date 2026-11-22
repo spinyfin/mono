@@ -38,6 +38,7 @@ mod pause;
 mod probe;
 mod progression;
 mod proposals;
+mod quarantine;
 mod review;
 mod selected_product;
 mod stream_integrity;
@@ -661,6 +662,17 @@ enum DispatchAction {
         /// scheduler so newly-available capacity is used right away.
         #[arg(long)]
         set: Option<usize>,
+    },
+    /// Inspect and release the hold on local workers the engine could not
+    /// verify: a non-terminal execution whose local run has no complete tmux
+    /// identity and whose process is not proven dead. Such an execution holds
+    /// only its own work item, and the engine lifts the hold itself when the
+    /// execution goes terminal or the process is proven gone. Reads and
+    /// writes `state.db` directly, so it works with the engine down, and a
+    /// release takes effect on the next dispatch decision without a restart.
+    Quarantine {
+        #[command(subcommand)]
+        action: quarantine::QuarantineAction,
     },
 }
 
@@ -1517,6 +1529,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Dispatch {
             action: DispatchAction::TrafficSplit,
         } => traffic_split::run(&cli.socket_path, cli.json).await,
+        Command::Dispatch {
+            action: DispatchAction::Quarantine { action },
+        } => quarantine::run(cli.json, action),
         Command::Automation {
             action: AutomationAction::Pause { reason },
         } => pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
