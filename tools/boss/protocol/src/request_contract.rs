@@ -513,7 +513,6 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::SetCodexSolPercentage { .. }
         | R::SetDispatchConcurrency { .. }
         | R::SetDispatchPaused { .. }
-        | R::SetDriverLaunchFlag { .. }
         | R::SetDriverTrafficSplit { .. }
         | R::SetFeatureFlag { .. }
         | R::SetHostEnabled { .. }

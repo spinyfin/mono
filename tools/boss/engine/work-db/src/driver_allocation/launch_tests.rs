@@ -13,12 +13,11 @@ fn legacy_split_opens_agy_at_its_configured_share() {
     )
     .unwrap();
     let split = db.get_driver_traffic_split().unwrap();
-    assert!(split.launch_enabled.agy);
+    assert_eq!(split.agy, 35);
     let eligible = eligible_drivers_for(&TaskKind::Chore, &ExecutionKind::ChoreImplementation, None, false);
-    let launch_eligible = filter_launch_enabled(&split, &eligible);
     let mut counts = std::collections::BTreeMap::new();
     for i in 0..10_000 {
-        let driver = allocate_among(split, &format!("launch-sample-{i}"), &TaskKind::Chore, &launch_eligible).unwrap();
+        let driver = allocate_among(split, &format!("launch-sample-{i}"), &TaskKind::Chore, &eligible).unwrap();
         *counts.entry(driver).or_insert(0) += 1;
     }
     assert!((3300..3700).contains(&counts["agy"]), "{counts:?}");
@@ -28,12 +27,12 @@ fn legacy_split_opens_agy_at_its_configured_share() {
 }
 
 #[test]
-fn launch_flags_persist_and_revalidate_queued_allocations_with_auditable_exclusions() {
+fn zero_share_reallocates_queued_work_and_records_the_exclusion() {
     let (dir, db) = open_db();
     let mut split = DriverTrafficSplit::new(0, 0, 0, 100);
     db.set_driver_traffic_split(split).unwrap();
     let product = create_test_product(&db);
-    let chore = create_test_chore(&db, &product.id, "launch gate");
+    let chore = create_test_chore(&db, &product.id, "zero share gate");
     let execution = create_ready_chore_execution(&db, &chore.id);
     assert_eq!(
         db.get_execution_driver_decision(&execution.id)
@@ -44,8 +43,7 @@ fn launch_flags_persist_and_revalidate_queued_allocations_with_auditable_exclusi
         Some("agy")
     );
 
-    split = DriverTrafficSplit::new(35, 10, 20, 35);
-    split.launch_enabled.agy = false;
+    split = DriverTrafficSplit::new(54, 16, 30, 0);
     db.set_driver_traffic_split(split).unwrap();
     drop(db);
     let db = WorkDb::open_existing(dir.path().join("state.db")).unwrap();
@@ -56,44 +54,24 @@ fn launch_flags_persist_and_revalidate_queued_allocations_with_auditable_exclusi
     ));
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_ne!(decision.driver.as_deref(), Some("agy"));
-    let snapshot: String = db
-        .connect()
-        .unwrap()
-        .query_row(
-            "SELECT split_at_decision FROM execution_driver_decisions WHERE execution_id=?1",
-            [&execution.id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-    assert_eq!(
-        snapshot["exclusions"],
-        serde_json::json!(["agy excluded: launch flag off"])
-    );
-    assert_eq!(snapshot["launch_enabled"]["agy"], false);
+    let snapshot = decision_snapshot(&db, &execution.id);
+    assert_eq!(snapshot["exclusions"], serde_json::json!(["agy excluded: 0% share"]));
+    assert!(snapshot.get("launch_enabled").is_none());
     let actual = super::tests::allocated_drivers(&db, &product.id, 200);
     assert!(actual.iter().all(|driver| driver.as_deref() != Some("agy")));
-
-    split.launch_enabled.agy = true;
-    db.set_driver_traffic_split(split).unwrap();
-    drop(db);
-    let db = WorkDb::open_existing(dir.path().join("state.db")).unwrap();
-    assert!(db.get_driver_traffic_split().unwrap().launch_enabled.agy);
 }
 
 #[test]
-fn closed_flag_preserves_explicit_canaries_and_reports_all_disabled_failure() {
+fn zero_share_preserves_explicit_canaries() {
     let (_dir, db) = open_db();
-    let mut split = DriverTrafficSplit::new(0, 0, 0, 100);
-    split.launch_enabled.agy = false;
+    let split = DriverTrafficSplit::new(54, 16, 30, 0);
     db.set_driver_traffic_split(split).unwrap();
     let product = create_test_product(&db);
     let chore = crate::test_support::create_test_chore_manual(&db, &product.id, "explicit canary");
-    let err =
-        decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap_err();
-    assert!(err.to_string().contains("agy excluded: launch flag off"));
-    let refused = err.downcast_ref::<DriverAllocationRefused>().unwrap();
-    assert_eq!(refused.split_at_decision, Some(split));
+    let decision =
+        decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap();
+    assert_eq!(decision.reason, REASON_ALLOCATION);
+    assert_ne!(decision.driver.as_deref(), Some("agy"));
     db.connect()
         .unwrap()
         .execute("UPDATE tasks SET driver='agy' WHERE id=?1", [&chore.id])
@@ -118,79 +96,56 @@ fn decision_snapshot(db: &WorkDb, execution_id: &str) -> serde_json::Value {
 }
 
 #[test]
-fn insertion_records_launch_exclusions_when_the_only_funded_driver_is_closed() {
+fn insertion_records_zero_share_exclusions() {
     let (_dir, db) = open_db();
-    let mut split = DriverTrafficSplit::new(0, 0, 0, 100);
-    split.launch_enabled.agy = false;
+    let split = DriverTrafficSplit::new(54, 16, 30, 0);
     db.set_driver_traffic_split(split).unwrap();
     let product = create_test_product(&db);
-    let chore = crate::test_support::create_test_chore_manual(&db, &product.id, "agy closed");
+    let chore = crate::test_support::create_test_chore_manual(&db, &product.id, "agy at zero");
     let execution = create_ready_chore_execution(&db, &chore.id);
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.reason, REASON_ALLOCATION_FAILED);
-    assert_eq!(decision.driver, None);
+    assert_eq!(decision.reason, REASON_ALLOCATION);
+    assert_ne!(decision.driver.as_deref(), Some("agy"));
     assert_eq!(decision.split_at_decision, Some(split));
     let snapshot = decision_snapshot(&db, &execution.id);
-    assert_eq!(
-        snapshot["exclusions"],
-        serde_json::json!(["agy excluded: launch flag off"])
-    );
-    assert_eq!(snapshot["launch_enabled"]["agy"], false);
+    assert_eq!(snapshot["exclusions"], serde_json::json!(["agy excluded: 0% share"]));
 }
 
 #[test]
-fn claim_records_a_failed_decision_when_a_later_flag_change_makes_allocation_impossible() {
+fn claim_records_a_failed_decision_when_every_eligible_driver_is_at_zero() {
     let (_dir, db) = open_db();
     let mut split = DriverTrafficSplit::new(0, 0, 0, 100);
     db.set_driver_traffic_split(split).unwrap();
     let product = create_test_product(&db);
-    let chore = create_test_chore(&db, &product.id, "queued then closed");
-    let execution = create_ready_chore_execution(&db, &chore.id);
-    assert_eq!(
-        db.get_execution_driver_decision(&execution.id)
-            .unwrap()
-            .unwrap()
-            .driver
-            .as_deref(),
-        Some("agy")
-    );
-    split.launch_enabled.agy = false;
+    let chore = create_test_chore(&db, &product.id, "queued then unfunded kind");
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&chore.id)
+                .kind(ExecutionKind::ConflictResolution)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    split = DriverTrafficSplit::new(0, 0, 100, 0);
     db.set_driver_traffic_split(split).unwrap();
     let err = db.claim_execution_for_dispatch(&execution.id).unwrap_err();
     assert!(err.downcast_ref::<DriverAllocationRefused>().is_some(), "{err}");
-    assert!(err.to_string().contains("agy excluded: launch flag off"), "{err}");
+    assert!(err.to_string().contains("claude excluded: 0% share"), "{err}");
     assert_eq!(db.get_execution(&execution.id).unwrap().status, ExecutionStatus::Ready);
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_eq!(decision.reason, REASON_ALLOCATION_FAILED);
     assert_eq!(decision.driver, None);
     assert_eq!(decision.split_at_decision, Some(split));
     let snapshot = decision_snapshot(&db, &execution.id);
-    assert_eq!(
-        snapshot["exclusions"],
-        serde_json::json!(["agy excluded: launch flag off"])
+    assert!(
+        snapshot["exclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "claude excluded: 0% share"),
+        "{snapshot}"
     );
-}
-
-#[test]
-fn launch_flag_and_share_writers_do_not_clobber_each_other() {
-    let (_dir, db) = open_db();
-    let mut stale = DriverTrafficSplit::new(35, 10, 20, 35);
-    db.set_driver_traffic_split(stale).unwrap();
-    db.set_driver_launch_flag("agy", false).unwrap();
-    stale.grok = 40;
-    stale.claude = 5;
-    stale.launch_enabled.agy = true;
-    let applied = db.set_driver_traffic_shares(stale).unwrap();
-    assert!(!applied.launch_enabled.agy);
-    assert_eq!(applied.grok, 40);
-    assert_eq!(applied.claude, 5);
-    db.set_driver_launch_flag("claude", false).unwrap();
-    db.set_driver_launch_flag("agy", true).unwrap();
-    let stored = db.get_driver_traffic_split().unwrap();
-    assert!(stored.launch_enabled.agy);
-    assert!(!stored.launch_enabled.claude);
-    assert!(stored.launch_enabled.codex);
-    assert_eq!(stored.grok, 40);
 }
 
 #[test]

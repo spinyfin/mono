@@ -123,8 +123,8 @@ fn unparseable_or_invalid_persisted_split_fails_loudly() {
 }
 
 /// Code-level eligibility is the dispatch capability gate ∩
-/// `launch_implemented()`. Persisted `launch_enabled` flags are applied
-/// later, after the current split is read. Asserted against `check_dispatch`
+/// `launch_implemented()`. A 0% share is applied by the bucket line after
+/// the current split is read. Asserted against `check_dispatch`
 /// for every kind, so a `KindRequirements` or `CapabilitySet` change moves
 /// both together or fails here.
 ///
@@ -660,10 +660,21 @@ fn design_tier_fails_when_only_grok_is_funded() {
     let err = decide_execution_driver(&db.connect().unwrap(), &task.id, ExecutionKind::TaskImplementation).unwrap_err();
     let text = err.to_string();
     assert!(text.contains("0 share"), "{text}");
-    assert!(
-        !text.contains("launch flag off"),
-        "design-tier refusal must not attach launch-flag exclusions for drivers that were not eligible: {text}",
-    );
+    for eligible_driver in [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE] {
+        assert!(
+            text.contains(&format!("{eligible_driver} excluded: 0% share")),
+            "design-tier refusal must name eligible 0% driver {eligible_driver}: {text}",
+        );
+    }
+    for ineligible_driver in [DRIVER_SLUG_GROK, DRIVER_SLUG_AGY] {
+        assert!(
+            !text.contains(&format!("{ineligible_driver} excluded: 0% share")),
+            "design-tier refusal must not attach 0% exclusions for ineligible driver {ineligible_driver}: {text}",
+        );
+    }
+    let exclusions =
+        DriverTrafficSplit::new(0, 100, 0, 0).zero_share_exclusions_among(&[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE]);
+    assert_eq!(exclusions, vec!["codex excluded: 0% share".to_owned()]);
     assert!(!text.ends_with("; "), "{text}");
 }
 
@@ -700,13 +711,12 @@ fn allocation_renormalises_four_shares_and_never_revives_zero_agy() {
     assert!(err.to_string().contains("agy=0"));
 }
 
-/// Old shares are redistributed among launchable drivers.
+/// A driver at 0% receives no allocated rows; the other shares still land.
 #[test]
-fn disabled_agy_share_is_redistributed() {
+fn zero_agy_share_receives_no_allocated_rows() {
     let (_dir, db) = open_db();
-    let mut split = DriverTrafficSplit::new(10, 20, 30, 40);
-    split.launch_enabled.agy = false;
-    db.set_driver_traffic_split(split).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 70, 0))
+        .unwrap();
     let product = create_test_product(&db);
     let drivers = allocated_drivers(&db, &product.id, 200);
     for slug in &drivers {
@@ -788,9 +798,9 @@ fn unavailable_driver_shares_never_enable_zero_share_candidates() {
     assert!(allocate_among(no_agy, "task_zero", &TaskKind::Chore, &[DRIVER_SLUG_CLAUDE]).is_err());
 }
 
-/// An old agy-only share fails instead of selecting a zero-share default.
+/// agy at 0% is unreachable through allocation; pinning it still works.
 #[test]
-fn agy_at_one_hundred_fails_when_launch_flag_off() {
+fn agy_at_zero_is_unreachable_unless_pinned() {
     assert!(
         boss_engine_driver::DriverRegistry::default()
             .get(DRIVER_SLUG_AGY)
@@ -798,14 +808,21 @@ fn agy_at_one_hundred_fails_when_launch_flag_off() {
         "agy must be registered for a 100% share to be reachable",
     );
     let (_dir, db) = open_db();
-    let mut split = DriverTrafficSplit::new(0, 0, 0, 100);
-    split.launch_enabled.agy = false;
-    db.set_driver_traffic_split(split).unwrap();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 50, 50, 0))
+        .unwrap();
     let product = create_test_product(&db);
-    let chore = crate::test_support::create_test_chore_manual(&db, &product.id, "agy 100 registered");
-    let err =
-        decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap_err();
-    assert!(err.to_string().contains("0 share"), "{err}");
+    let chore = crate::test_support::create_test_chore_manual(&db, &product.id, "agy at zero");
+    let decision =
+        decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap();
+    assert_ne!(decision.driver.as_deref(), Some("agy"));
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET driver='agy' WHERE id=?1", [&chore.id])
+        .unwrap();
+    let pinned =
+        decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap();
+    assert_eq!(pinned.reason, REASON_EXPLICIT);
+    assert_eq!(pinned.driver.as_deref(), Some("agy"));
 }
 
 /// Restricting to a subset keeps allocation inside that subset for every
@@ -854,8 +871,8 @@ fn a_driver_at_zero_receives_no_rows_end_to_end() {
 
 /// Three of four at zero: every eligible row goes to the funded registered driver.
 #[test]
-fn sole_funded_driver_is_allocated_only_when_launch_flag_is_on() {
-    for (mut split, expected) in [
+fn sole_funded_driver_receives_every_allocated_row() {
+    for (split, expected) in [
         (DriverTrafficSplit::new(100, 0, 0, 0), DRIVER_SLUG_GROK),
         (DriverTrafficSplit::new(0, 100, 0, 0), DRIVER_SLUG_CLAUDE),
         (DriverTrafficSplit::new(0, 0, 100, 0), DRIVER_SLUG_CODEX),
@@ -863,30 +880,22 @@ fn sole_funded_driver_is_allocated_only_when_launch_flag_is_on() {
     ] {
         let (_dir, db) = open_db();
         let product = create_test_product(&db);
-        for enabled in [true, false] {
-            split.launch_enabled.set(expected, enabled).unwrap();
-            db.set_driver_traffic_split(split).unwrap();
-            for i in 0..50 {
-                let chore = crate::test_support::create_test_chore_manual(
-                    &db,
-                    &product.id,
-                    format!("sole share {enabled} {i}"),
-                );
-                let result =
-                    decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation);
-                if enabled {
-                    let decision = result.unwrap();
-                    assert_eq!(decision.reason, REASON_ALLOCATION);
-                    assert_eq!(decision.driver.as_deref(), Some(expected), "under {split:?}");
-                } else {
-                    let error = result.unwrap_err().to_string();
-                    assert!(error.contains("0 share"), "{error}");
-                    assert!(
-                        error.contains(&format!("{expected} excluded: launch flag off")),
-                        "{error}"
-                    );
-                }
-            }
+        db.set_driver_traffic_split(split).unwrap();
+        for i in 0..50 {
+            let chore = crate::test_support::create_test_chore_manual(&db, &product.id, format!("sole share {i}"));
+            let decision =
+                decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation).unwrap();
+            assert_eq!(decision.reason, REASON_ALLOCATION);
+            assert_eq!(decision.driver.as_deref(), Some(expected), "under {split:?}");
+            assert!(
+                decision
+                    .split_at_decision
+                    .unwrap()
+                    .zero_share_exclusions()
+                    .iter()
+                    .all(|line| !line.starts_with(&format!("{expected} "))),
+                "{decision:?}"
+            );
         }
     }
 }

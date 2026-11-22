@@ -10,8 +10,8 @@
 //! pane command (`pane_command`) with its `PaneMonitorSpec`. The pane runs
 //! the shared initial-brief launcher, which withholds the brief until the
 //! CLI's startup log shows the rendered posture and the guard hooks loaded.
-//! Measured pane controls are live. Allocated traffic follows the persisted
-//! per-driver launch flag and traffic split. Retention preserves transcript
+//! Measured pane controls are live. Allocated traffic follows the
+//! traffic split (0% is off). Retention preserves transcript
 //! evidence in the per-run HOME.
 //!
 //! Qualified against `agy` 1.5.7 or later. `auto_approve` hook verdicts
@@ -122,7 +122,7 @@ const AGY_AGENT_RULES_PREAMBLE: &str =
 /// the Antigravity driver design. Per-run `HOME` provisioning, permission
 /// rendering, PreToolUse authorization, hook progress observation, transcript
 /// access, pane controls, and the interactive pane command are live.
-/// Allocated traffic follows the persisted per-driver launch flag and traffic split.
+/// Allocated traffic follows the traffic split (0% is off).
 /// Retention preserves per-run transcript evidence.
 #[derive(Default)]
 pub struct AgyDriver {

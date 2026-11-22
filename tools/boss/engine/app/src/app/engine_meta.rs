@@ -705,19 +705,8 @@ pub(super) async fn handle_set_driver_traffic_split(ctx: Dispatch, req: Frontend
     let FrontendRequest::SetDriverTrafficSplit { split } = req else {
         unreachable!()
     };
-    // Share writes keep the stored launch flags, so a stale Settings
-    // snapshot cannot reopen a driver another writer just closed.
-    let result = ctx.work_db.set_driver_traffic_shares(split);
+    let result = ctx.work_db.set_driver_traffic_split(split);
     reply_driver_traffic_split(ctx, split, result).await;
-}
-
-pub(super) async fn handle_set_driver_launch_flag(ctx: Dispatch, req: FrontendRequest) {
-    let FrontendRequest::SetDriverLaunchFlag { driver, enabled } = req else {
-        unreachable!()
-    };
-    let result = ctx.work_db.set_driver_launch_flag(&driver, enabled);
-    let proposed = result.as_ref().ok().copied().unwrap_or_default();
-    reply_driver_traffic_split(ctx, proposed, result).await;
 }
 
 fn log_driver_traffic_split(split: DriverTrafficSplit, err: Option<&dyn std::fmt::Display>) {
@@ -727,11 +716,7 @@ fn log_driver_traffic_split(split: DriverTrafficSplit, err: Option<&dyn std::fmt
             claude = split.claude,
             codex = split.codex,
             agy = split.agy,
-            launch_enabled_grok = split.launch_enabled.grok,
-            launch_enabled_claude = split.launch_enabled.claude,
-            launch_enabled_codex = split.launch_enabled.codex,
-            launch_enabled_agy = split.launch_enabled.agy,
-            launch_exclusions = ?split.launch_exclusions(),
+            zero_share_exclusions = ?split.zero_share_exclusions(),
             %err,
             "driver_traffic_split: rejected",
         );
@@ -741,11 +726,7 @@ fn log_driver_traffic_split(split: DriverTrafficSplit, err: Option<&dyn std::fmt
             claude = split.claude,
             codex = split.codex,
             agy = split.agy,
-            launch_enabled_grok = split.launch_enabled.grok,
-            launch_enabled_claude = split.launch_enabled.claude,
-            launch_enabled_codex = split.launch_enabled.codex,
-            launch_enabled_agy = split.launch_enabled.agy,
-            launch_exclusions = ?split.launch_exclusions(),
+            zero_share_exclusions = ?split.zero_share_exclusions(),
             "driver_traffic_split: updated",
         );
     }

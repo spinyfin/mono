@@ -324,7 +324,6 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::SendInputToWorker { .. } => Box::pin(panes::handle_send_input_to_worker(ctx, r)),
         r @ FrontendRequest::SetAutomationPaused { .. } => Box::pin(engine_meta::handle_set_automation_paused(ctx, r)),
         r @ FrontendRequest::SetCiBudget { .. } => Box::pin(ci_remediation::handle_set_ci_budget(ctx, r)),
-        r @ FrontendRequest::SetDriverLaunchFlag { .. } => Box::pin(engine_meta::handle_set_driver_launch_flag(ctx, r)),
         r @ FrontendRequest::SetDriverTrafficSplit { .. } => {
             Box::pin(engine_meta::handle_set_driver_traffic_split(ctx, r))
         }

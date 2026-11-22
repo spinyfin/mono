@@ -38,37 +38,10 @@ struct DriverTrafficSplit: Equatable, Sendable {
     var claude: Int
     var codex: Int
     var agy: Int
-    var launchEnabled: [String: Bool] = ["claude": true, "codex": true, "grok": true, "agy": true]
-
-    func launchIsEnabled(_ driver: DriverSlug) -> Bool {
-        launchEnabled[driver.rawValue] ?? false
-    }
-
-    /// Matches the engine's cumulative-flooring allocation after launch flags.
-    /// Work-kind and model restrictions can further narrow this split.
-    var effectiveLaunchSplit: DriverTrafficSplit? {
-        let eligible = DriverSlug.allCases.filter { launchIsEnabled($0) }
-        let eligibleTotal = eligible.reduce(0) { $0 + share(for: $1) }
-        guard eligibleTotal > 0 else { return nil }
-        var result = DriverTrafficSplit(grok: 0, claude: 0, codex: 0, agy: 0, launchEnabled: launchEnabled)
-        var cumulative = 0
-        var previous = 0
-        for driver in eligible {
-            cumulative += share(for: driver)
-            let end = cumulative * 100 / eligibleTotal
-            result = result.settingShare(end - previous, for: driver)
-            previous = end
-        }
-        return result
-    }
-
-    var launchExclusions: [String] {
-        DriverSlug.allCases.filter { !launchIsEnabled($0) }
-            .map { "\($0.rawValue) excluded: launch flag off" }
-    }
 
     /// The engine's default and the behaviour-preserving state: everything on
     /// `claude` (the engine's default driver), nothing on the other drivers.
+    /// A share of 0 is off for allocated work.
     static let engineDefault = DriverTrafficSplit(grok: 0, claude: 100, codex: 0, agy: 0)
 
     var total: Int { grok + claude + codex + agy }

@@ -2007,7 +2007,7 @@ pub trait AgentDriver: Send + Sync {
             .unwrap_or_default()
     }
 
-    /// Whether launch is implemented. Only skeletons opt out; rollout uses persisted launch flags.
+    /// Whether launch is implemented. Only skeletons opt out; rollout uses the split share (0% = off).
     fn launch_implemented(&self) -> bool {
         true
     }

@@ -39,6 +39,11 @@ pub const DRIVER_SLUG_AGY: &str = "agy";
 /// A four-way allocation of eligible dispatch traffic. Shares are whole
 /// percentage points and MUST sum to exactly 100 — see the module doc.
 ///
+/// A share of **0 is off**: that driver receives no allocated work. Any
+/// share above 0 is eligible in proportion to its share. Explicit per-item
+/// or product pins still route to a driver at 0%. Older stored JSON may
+/// still carry a `launch_enabled` object; it is ignored on decode.
+///
 /// [`Default`] is `claude = 100`, with `grok`, `codex`, and `agy` at zero. That
 /// is the behaviour-preserving state: `claude` is
 /// `boss_engine_effort::ENGINE_DEFAULT_DRIVER`, so an engine that has never
@@ -54,53 +59,6 @@ pub struct DriverTrafficSplit {
     pub grok: u8,
     /// Share routed to the `agy` (Antigravity) driver.
     pub agy: u8,
-    /// Per-driver gate for allocated work, persisted with the split; explicit pins ignore it.
-    /// Older stored splits open all implemented drivers, including Antigravity.
-    #[serde(default)]
-    pub launch_enabled: DriverLaunchFlags,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DriverLaunchFlags {
-    pub claude: bool,
-    pub codex: bool,
-    pub grok: bool,
-    pub agy: bool,
-}
-
-impl Default for DriverLaunchFlags {
-    fn default() -> Self {
-        Self {
-            claude: true,
-            codex: true,
-            grok: true,
-            agy: true,
-        }
-    }
-}
-
-impl DriverLaunchFlags {
-    pub fn enabled(&self, driver: &str) -> bool {
-        match driver {
-            DRIVER_SLUG_CLAUDE => self.claude,
-            DRIVER_SLUG_CODEX => self.codex,
-            DRIVER_SLUG_GROK => self.grok,
-            DRIVER_SLUG_AGY => self.agy,
-            _ => false,
-        }
-    }
-
-    pub fn set(&mut self, driver: &str, enabled: bool) -> Result<(), String> {
-        let flag = match driver {
-            DRIVER_SLUG_CLAUDE => &mut self.claude,
-            DRIVER_SLUG_CODEX => &mut self.codex,
-            DRIVER_SLUG_GROK => &mut self.grok,
-            DRIVER_SLUG_AGY => &mut self.agy,
-            _ => return Err(format!("unknown driver: {driver}")),
-        };
-        *flag = enabled;
-        Ok(())
-    }
 }
 
 impl Default for DriverTrafficSplit {
@@ -110,7 +68,6 @@ impl Default for DriverTrafficSplit {
             codex: 0,
             grok: 0,
             agy: 0,
-            launch_enabled: DriverLaunchFlags::default(),
         }
     }
 }
@@ -145,28 +102,38 @@ impl DriverTrafficSplit {
             codex,
             grok,
             agy,
-            launch_enabled: DriverLaunchFlags::default(),
         }
     }
 
-    /// Launch exclusions are shown even when a disabled driver has zero share.
-    pub fn launch_exclusions(&self) -> Vec<String> {
+    /// Returns one `"{driver} excluded: 0% share"` line for each driver at
+    /// 0%, regardless of work-kind eligibility. Use
+    /// [`Self::zero_share_exclusions_among`] when eligibility has already
+    /// narrowed the candidate set.
+    pub fn zero_share_exclusions(&self) -> Vec<String> {
         Self::DRIVERS_IN_BUCKET_ORDER
             .into_iter()
-            .filter(|driver| !self.launch_enabled.enabled(driver))
-            .map(|driver| format!("{driver} excluded: launch flag off"))
+            .filter(|driver| self.share_for(driver) == Some(0))
+            .map(|driver| format!("{driver} excluded: 0% share"))
             .collect()
     }
 
-    /// Effective split after launch flags, before work-kind and model restrictions.
-    pub fn effective_launch_split(&self) -> Result<Self, EligibleAllocationError> {
-        let eligible: Vec<_> = Self::DRIVERS_IN_BUCKET_ORDER
-            .into_iter()
-            .filter(|driver| self.launch_enabled.enabled(driver))
-            .collect();
+    /// 0% exclusions among `eligible` only, so an error names the shares
+    /// that actually removed a candidate rather than ineligible kinds.
+    pub fn zero_share_exclusions_among(&self, eligible: &[&str]) -> Vec<String> {
+        eligible
+            .iter()
+            .copied()
+            .filter(|driver| self.share_for(driver) == Some(0))
+            .map(|driver| format!("{driver} excluded: 0% share"))
+            .collect()
+    }
+
+    /// Redistribute this split over `eligible` by cumulative flooring.
+    /// Drivers outside `eligible` land at 0. A 0 share stays 0.
+    pub fn renormalised_over(&self, eligible: &[&str]) -> Result<Self, EligibleAllocationError> {
         let mut result = Self::new(0, 0, 0, 0);
         let mut previous = 0;
-        for (driver, end) in self.boundaries_over(&eligible)? {
+        for (driver, end) in self.boundaries_over(eligible)? {
             let share = end - previous;
             match driver {
                 DRIVER_SLUG_CLAUDE => result.claude = share,
@@ -177,7 +144,6 @@ impl DriverTrafficSplit {
             }
             previous = end;
         }
-        result.launch_enabled = self.launch_enabled;
         Ok(result)
     }
 
@@ -394,25 +360,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launch_flags_default_open_and_effective_split_is_explicit() {
-        let mut split: DriverTrafficSplit =
-            serde_json::from_str(r#"{"grok":35,"claude":10,"codex":20,"agy":35}"#).unwrap();
-        assert_eq!(split.effective_launch_split().unwrap(), split);
-        split.launch_enabled.set("agy", false).unwrap();
-        assert_eq!(split.launch_exclusions(), ["agy excluded: launch flag off"]);
-        let effective = split.effective_launch_split().unwrap();
+    fn zero_share_is_the_off_gate_and_legacy_launch_enabled_is_ignored() {
+        let split: DriverTrafficSplit = serde_json::from_str(
+            r#"{"grok":35,"claude":10,"codex":20,"agy":35,"launch_enabled":{"claude":true,"codex":true,"grok":true,"agy":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(split, DriverTrafficSplit::new(35, 10, 20, 35));
+        assert!(split.zero_share_exclusions().is_empty());
+        let folded = split
+            .renormalised_over(&[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK])
+            .unwrap();
+        assert_eq!((folded.codex, folded.claude, folded.grok, folded.agy), (30, 16, 54, 0));
+        assert_eq!(folded.zero_share_exclusions(), ["agy excluded: 0% share"]);
         assert_eq!(
-            (effective.codex, effective.claude, effective.grok, effective.agy),
-            (30, 16, 54, 0)
+            folded.zero_share_exclusions_among(&[DRIVER_SLUG_AGY, DRIVER_SLUG_CLAUDE]),
+            ["agy excluded: 0% share"]
         );
-        assert_eq!(split.agy, 35);
         let encoded = serde_json::to_string(&split).unwrap();
+        assert!(!encoded.contains("launch_enabled"), "{encoded}");
         assert_eq!(serde_json::from_str::<DriverTrafficSplit>(&encoded).unwrap(), split);
-        assert!(split.launch_enabled.set("unknown", true).is_err());
-        for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
-            split.launch_enabled.set(driver, false).unwrap();
-        }
-        assert!(split.effective_launch_split().is_err());
+        assert!(
+            DriverTrafficSplit::new(0, 0, 0, 100)
+                .renormalised_over(&[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK])
+                .is_err()
+        );
     }
 
     /// `(driver, share)` pairs, derived from `boundaries_over`'s cumulative
