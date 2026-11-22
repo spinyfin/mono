@@ -289,6 +289,48 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Operator-visible body for a PR that merged into a non-default base.
+    /// Completers and sweeps share this string so later passes can match the
+    /// same row by the `{pr_url}:` prefix.
+    pub fn merged_unsupported_base_detail(pr_url: &str, reason: &str) -> String {
+        format!(
+            "{pr_url}: {reason}. The PR has merged into a branch other than the repository default, \
+             so it cannot be retargeted and is not a deliverable. The work item is unfinished and \
+             dependents stay blocked."
+        )
+    }
+
+    /// Open or resolved `pr_merged_unsupported_base` whose body is for this
+    /// exact PR URL (`{pr_url}:` prefix). A shorter URL such as `/pull/8`
+    /// must not match `/pull/80`. A list failure is treated as not recorded
+    /// so a later pass still files.
+    pub fn already_recorded_merged_unsupported_base(&self, work_item_id: &str, pr_url: &str) -> bool {
+        use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
+        let prefix = format!("{pr_url}:");
+        self.list_attention_items_for_work_item(work_item_id)
+            .ok()
+            .into_iter()
+            .flatten()
+            .any(|item| item.kind == PR_MERGED_UNSUPPORTED_BASE && item.body_markdown.starts_with(&prefix))
+    }
+
+    /// File `pr_merged_unsupported_base` unless an open or resolved row for
+    /// this exact PR URL already exists (including a human-resolved row,
+    /// which must not be re-created).
+    pub fn file_merged_unsupported_base_attention(&self, work_item_id: &str, pr_url: &str, reason: &str) -> Result<()> {
+        use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
+        if self.already_recorded_merged_unsupported_base(work_item_id, pr_url) {
+            return Ok(());
+        }
+        self.upsert_work_item_attention(
+            work_item_id,
+            PR_MERGED_UNSUPPORTED_BASE,
+            "PR merged into an unsupported base",
+            &Self::merged_unsupported_base_detail(pr_url, reason),
+        )?;
+        Ok(())
+    }
+
     /// File (idempotently) the operator-visible attention item raised when
     /// `boss_engine::orphan_sweep` or `boss_engine::pr_review_recovery` trips the
     /// shared churn guard and parks a work item instead of auto-redispatching

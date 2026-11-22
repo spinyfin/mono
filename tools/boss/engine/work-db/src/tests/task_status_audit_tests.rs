@@ -1009,6 +1009,81 @@ fn upgrade_refreshes_blocked_reason_trigger_for_repeated_dialog_failures() {
     assert_eq!(basis, "blocking_dialog_on_screen");
 }
 
+#[test]
+fn upgrade_refreshes_blocked_reason_trigger_for_repeated_merged_unsupported_base_failures() {
+    let (_dir, path) = disk_db_path("merged-base-audit-upgrade");
+    let task_id = {
+        let db = WorkDb::open(path.clone()).unwrap();
+        let product = create_test_product_named(&db, "Merged-base upgrade");
+        let task = create_test_chore_manual(&db, &product.id, "Blocked worker");
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET blocked_reason = 'worker_failed' WHERE id = ?1",
+            [&task.id],
+        )
+        .unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'task_status_audit_update_blocked_reason'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_sql = sql.replace("'merged_unsupported_base',", "");
+        assert_ne!(sql, old_sql);
+        conn.execute_batch("DROP TRIGGER task_status_audit_update_blocked_reason")
+            .unwrap();
+        conn.execute_batch(&old_sql).unwrap();
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE id = ?1",
+            ["20261121_1800_refresh_blocked_reason_audit_trigger_merged_base"],
+        )
+        .unwrap();
+        task.id
+    };
+    let db = WorkDb::open(path).unwrap();
+    let conn = db.connect().unwrap();
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'task_status_audit_update_blocked_reason'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for basis in crate::pr_flow::WorkerFailureBasis::ALL {
+        assert!(
+            sql.contains(&format!("'{}'", basis.as_str())),
+            "missing {}",
+            basis.as_str()
+        );
+    }
+    let count = || -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM task_status_audit WHERE work_item_id = ?1 AND property = 'blocked_reason'",
+            [&task_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let before = count();
+    task_status_audit::execute(
+        &conn,
+        "merged_unsupported_base",
+        "engine",
+        "UPDATE tasks SET blocked_reason = 'worker_failed' WHERE id = ?1",
+        [&task_id],
+    )
+    .unwrap();
+    assert_eq!(count(), before + 1);
+    let (old_value, new_value, basis): (String, String, String) = conn.query_row(
+        "SELECT old_value, new_value, basis FROM task_status_audit WHERE work_item_id = ?1 AND property = 'blocked_reason' ORDER BY id DESC LIMIT 1",
+        [&task_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(old_value, "worker_failed");
+    assert_eq!(new_value, "worker_failed");
+    assert_eq!(basis, "merged_unsupported_base");
+}
+
 // ── Execution abandonment history ──────────────────────────────────────────
 //
 // Every engine write that moves an execution to `abandoned` must leave a

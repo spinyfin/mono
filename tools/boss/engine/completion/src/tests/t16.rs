@@ -1260,6 +1260,134 @@ async fn late_recovery_merged_refusal_is_probed_once() {
     );
 }
 
+/// A first terminalization that hits a database error must not leak the
+/// slot: the pending-finalize retry still fails the live execution.
+#[tokio::test]
+async fn merged_refusal_retries_failure_after_a_terminalization_db_error() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_merged_fail BEFORE UPDATE OF status ON work_executions
+             WHEN NEW.status = 'failed'
+             BEGIN SELECT RAISE(ABORT, 'injected terminalization failure'); END;",
+        )
+        .unwrap();
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+        .handler
+        .with_branch_verifier(two_pr_verifier(&execution_id))
+        .with_pr_state_checker(Arc::new(
+            FakePrStateChecker::always(PrOpenState::Merged).with_base(PrBaseVerdict::Refused("feature base".into())),
+        ));
+    let first = handler
+        .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::Done, "test")
+        .await;
+    assert!(matches!(first, StopOutcome::DbError), "{first:?}");
+    assert!(db.get_execution(&execution_id).unwrap().status.is_live());
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.kind == boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE
+                    && item.status == "open"
+            })
+    );
+    db.connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_merged_fail")
+        .unwrap();
+    let retry = handler
+        .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::Done, "test")
+        .await;
+    assert!(
+        matches!(retry, StopOutcome::MergedUnsupportedBaseRefused { .. }),
+        "{retry:?}"
+    );
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+}
+
+/// An existing open or resolved merged-unsupported-base row must still fail
+/// a live execution so the worker slot is released.
+#[tokio::test]
+async fn existing_merged_refusal_row_still_fails_a_live_execution() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    for resolved in [false, true] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+        db.file_merged_unsupported_base_attention(&chore_id, OWN_PR, "feature base")
+            .unwrap();
+        if resolved {
+            db.resolve_external_tracker_attention(
+                &chore_id,
+                boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE,
+            )
+            .unwrap();
+        }
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(Some(OWN_PR)))
+            .handler
+            .with_branch_verifier(two_pr_verifier(&execution_id))
+            .with_pr_state_checker(Arc::new(
+                FakePrStateChecker::always(PrOpenState::Merged)
+                    .with_base(PrBaseVerdict::Refused("feature base".into())),
+            ));
+        let outcome = handler
+            .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::Done, "test")
+            .await;
+        assert!(
+            matches!(outcome, StopOutcome::MergedUnsupportedBaseRefused { .. }),
+            "resolved={resolved}: {outcome:?}"
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Failed,
+            "resolved={resolved}"
+        );
+        let open = db
+            .list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE
+                    && item.status == "open"
+            })
+            .count();
+        assert_eq!(open, usize::from(!resolved), "resolved={resolved}");
+    }
+}
+
+/// Late recovery skips its GitHub probe for a recorded refusal on a
+/// non-live execution, and still fails a live one without re-probing.
+#[tokio::test]
+async fn late_recovery_recorded_refusal_fails_a_live_execution_without_reprobe() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, work_item_id, execution_id) = followup_fixture(workspace.path());
+    db.file_merged_unsupported_base_attention(&work_item_id, OWN_PR, "feature/parent")
+        .unwrap();
+    let checker = Arc::new(CountingRefusedMergedChecker(std::sync::atomic::AtomicUsize::new(0)));
+    let handler = TestHarness::new(
+        db.clone(),
+        StubPrDetector::ok_status(PrStatus::Merged { url: OWN_PR.into() }),
+    )
+    .handler
+    .with_pr_state_checker(checker.clone());
+    let candidate = crate::work::LatePrCandidate {
+        execution_id: execution_id.clone(),
+        work_item_id: work_item_id.clone(),
+        repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+        branch_naming: BranchNaming::BossExecPrefix,
+        worker_branch_prefix: None,
+    };
+    assert!(matches!(
+        handler.recheck_for_pr_late(&candidate).await,
+        StopOutcome::MergedUnsupportedBaseRefused { .. }
+    ));
+    assert_eq!(checker.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+}
+
 struct CountingBaseChecker(std::sync::atomic::AtomicUsize);
 impl crate::work::PrStateChecker for CountingBaseChecker {
     fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {

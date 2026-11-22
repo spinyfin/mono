@@ -476,8 +476,26 @@ impl WorkerCompletionHandler {
         // retargeted: file a `pr_merged_unsupported_base` attention, leave the
         // work unbound, and fail a still-live execution. Closed-unmerged PRs
         // never reach this arm. An already-recorded row for this PR skips the
-        // base probe so a late-recovery pass does not re-log or re-upsert.
+        // base probe for a non-live execution so a late-recovery pass does
+        // not re-log or re-upsert. A live execution still runs the failure
+        // write (without re-probing).
         if merged && self.already_recorded_merged_unsupported_base(&candidate.work_item_id, &pr_url) {
+            let execution = match self.work_db.get_execution(&candidate.execution_id) {
+                Ok(execution) => execution,
+                Err(err) => {
+                    tracing::error!(
+                        execution_id = %candidate.execution_id,
+                        ?err,
+                        "pr-recheck-late: execution lookup failed while skipping a recorded merged-base refusal"
+                    );
+                    return StopOutcome::DbError;
+                }
+            };
+            if execution.status.is_live() {
+                return self
+                    .refuse_merged_unsupported_base(&execution, &pr_url, "already recorded", "pr_recheck_late")
+                    .await;
+            }
             tracing::info!(
                 execution_id = %candidate.execution_id,
                 work_item_id = %candidate.work_item_id,

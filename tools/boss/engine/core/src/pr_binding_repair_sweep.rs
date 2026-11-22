@@ -428,7 +428,15 @@ async fn repair_candidate(
                 "pr-binding-repair sweep: PR on the execution's branch targets a non-default base; clearing the foreign binding",
             );
             if merged {
-                file_merged_unsupported_base_attention(work_db, &candidate.task_id, &own_pr_url, &reason);
+                if let Err(err) =
+                    work_db.file_merged_unsupported_base_attention(&candidate.task_id, &own_pr_url, &reason)
+                {
+                    tracing::warn!(
+                        task_id = %candidate.task_id,
+                        ?err,
+                        "pr-binding-repair sweep: failed to file merged-unsupported-base attention",
+                    );
+                }
                 return park_unresolved(work_db, candidate, "", None, outcome);
             }
             let detail = format!(
@@ -580,6 +588,15 @@ fn park_unresolved(
                 bound_pr_url = %candidate.bound_pr_url,
                 "pr-binding-repair sweep: cleared a binding to a PR this row did not open; no PR on its own branch — parked visibly",
             );
+            if let Err(err) =
+                work_db.resolve_external_tracker_attention(&candidate.task_id, ATTENTION_KIND_PR_BINDING_REPAIR)
+            {
+                tracing::warn!(
+                    task_id = %candidate.task_id,
+                    ?err,
+                    "pr-binding-repair sweep: failed to resolve leftover repair warning after parking",
+                );
+            }
             if let Some(kind) = attention_kind {
                 upsert_attention(
                     work_db,
@@ -606,36 +623,6 @@ fn file_attention(work_db: &WorkDb, candidate: &PrBindingRepairCandidate, body: 
         "Bound to a PR this work item did not open",
         body,
     );
-}
-
-fn file_merged_unsupported_base_attention(work_db: &WorkDb, work_item_id: &str, pr_url: &str, reason: &str) {
-    use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
-    let already = work_db
-        .list_attention_items_for_work_item(work_item_id)
-        .ok()
-        .into_iter()
-        .flatten()
-        .any(|item| item.kind == PR_MERGED_UNSUPPORTED_BASE && item.body_markdown.contains(pr_url));
-    if already {
-        return;
-    }
-    let detail = format!(
-        "{pr_url}: {reason}. The PR has merged into a branch other than the repository default, \
-         so it cannot be retargeted and is not a deliverable. The work item is unfinished and \
-         dependents stay blocked."
-    );
-    if let Err(err) = work_db.upsert_external_tracker_attention(
-        work_item_id,
-        PR_MERGED_UNSUPPORTED_BASE,
-        "PR merged into an unsupported base",
-        &detail,
-    ) {
-        tracing::warn!(
-            work_item_id,
-            ?err,
-            "pr-binding-repair sweep: failed to file merged-unsupported-base attention",
-        );
-    }
 }
 
 fn upsert_attention(work_db: &WorkDb, candidate: &PrBindingRepairCandidate, kind: &str, title: &str, body: &str) {
@@ -1052,6 +1039,54 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|a| a.kind == ATTENTION_KIND_PR_BINDING_UNRESOLVED)
+        );
+    }
+
+    #[tokio::test]
+    async fn parking_clears_a_prior_repair_warning() {
+        let (_dir, db) = open_db();
+        let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.upsert_external_tracker_attention(
+            &task_id,
+            ATTENTION_KIND_PR_BINDING_REPAIR,
+            "Bound to a PR this work item did not open",
+            "prior repair warning",
+        )
+        .unwrap();
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
+        let outcome = run_one_pass(
+            &db,
+            &FixedDetector(PrStatus::None, StdMutex::default()),
+            &verifier,
+            Arc::new(FakePrStateChecker::always(PrOpenState::Open)),
+            &RecordingDocRefresher::default(),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert_eq!(outcome.unresolved, 1, "{outcome:?}");
+        assert!(
+            db.list_attention_items_for_work_item(&task_id)
+                .unwrap()
+                .iter()
+                .all(|a| a.kind != ATTENTION_KIND_PR_BINDING_REPAIR || a.status != "open"),
+            "parking must resolve the leftover repair warning"
+        );
+        db.update_work_item(
+            &task_id,
+            crate::work::WorkItemPatch {
+                pr_url: Some(OWN.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.reconcile_stale_attention_signals().unwrap();
+        assert!(
+            db.list_attention_items_for_work_item(&task_id)
+                .unwrap()
+                .iter()
+                .all(|a| a.status != "open"),
+            "manual bind must leave no open attention: {:?}",
+            db.list_attention_items_for_work_item(&task_id).unwrap()
         );
     }
 

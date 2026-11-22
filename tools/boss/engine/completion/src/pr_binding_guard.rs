@@ -126,8 +126,12 @@ impl WorkerCompletionHandler {
     /// cannot be retargeted. Fail the live execution (releasing the slot),
     /// file a `pr_merged_unsupported_base` attention naming the unsupported
     /// base, and leave the work item unfinished so dependents stay blocked.
-    /// A later pass that sees an open or already-resolved row for this PR
-    /// URL does not re-probe, re-log, or re-upsert.
+    /// An already-recorded row for this PR skips the error log and the
+    /// attention upsert. `guard_pr_base` and declared-delivery callers have
+    /// already probed GitHub; `recheck_for_pr_late` skips its probe only
+    /// for a non-live execution. A live execution is always failed, even
+    /// when the attention already exists; a database error from that write
+    /// is returned as [`StopOutcome::DbError`].
     pub(super) async fn refuse_merged_unsupported_base(
         &self,
         execution: &crate::work::WorkExecution,
@@ -135,29 +139,28 @@ impl WorkerCompletionHandler {
         reason: &str,
         source: &str,
     ) -> StopOutcome {
-        use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
-        let detail = merged_unsupported_base_detail(pr_url, reason);
-        if self.already_recorded_merged_unsupported_base(&execution.work_item_id, pr_url) {
+        let detail = crate::work::WorkDb::merged_unsupported_base_detail(pr_url, reason);
+        let already = self
+            .work_db
+            .already_recorded_merged_unsupported_base(&execution.work_item_id, pr_url);
+        if already {
             tracing::info!(
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
                 pr_url,
                 source,
-                "PR base guard: merged unsupported-base refusal already recorded; skipping re-probe side effects",
+                "PR base guard: merged unsupported-base refusal already recorded; skipping log and attention upsert",
             );
-            return StopOutcome::MergedUnsupportedBaseRefused {
-                pr_url: pr_url.to_owned(),
-                detail,
-            };
+        } else {
+            tracing::error!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                pr_url,
+                source,
+                %reason,
+                "PR base guard: refusing a PR merged into a non-default base",
+            );
         }
-        tracing::error!(
-            execution_id = %execution.id,
-            work_item_id = %execution.work_item_id,
-            pr_url,
-            source,
-            %reason,
-            "PR base guard: refusing a PR merged into a non-default base",
-        );
         self.resolve_pr_base_refusal_attention(&execution.id);
         if let Err(err) = self.work_db.resolve_external_tracker_attention(
             &execution.work_item_id,
@@ -169,12 +172,10 @@ impl WorkerCompletionHandler {
                 "PR base guard: failed to resolve leftover work-item base-refusal attention",
             );
         }
-        if let Err(err) = self.work_db.upsert_work_item_attention(
-            &execution.work_item_id,
-            PR_MERGED_UNSUPPORTED_BASE,
-            "PR merged into an unsupported base",
-            &detail,
-        ) {
+        if let Err(err) = self
+            .work_db
+            .file_merged_unsupported_base_attention(&execution.work_item_id, pr_url, reason)
+        {
             tracing::warn!(
                 execution_id = %execution.id,
                 ?err,
@@ -197,7 +198,8 @@ impl WorkerCompletionHandler {
     /// Open or resolved `pr_merged_unsupported_base` for this work item and
     /// PR URL. A human-resolved row must not be re-created on the next pass.
     pub(super) fn already_recorded_merged_unsupported_base(&self, work_item_id: &str, pr_url: &str) -> bool {
-        already_recorded_merged_unsupported_base(&self.work_db, work_item_id, pr_url)
+        self.work_db
+            .already_recorded_merged_unsupported_base(work_item_id, pr_url)
     }
 
     pub(super) async fn record_pr_base_refusal(
@@ -442,26 +444,4 @@ impl WorkerCompletionHandler {
             );
         }
     }
-}
-
-pub(crate) fn merged_unsupported_base_detail(pr_url: &str, reason: &str) -> String {
-    format!(
-        "{pr_url}: {reason}. The PR has merged into a branch other than the repository default, \
-         so it cannot be retargeted and is not a deliverable. The work item is unfinished and \
-         dependents stay blocked."
-    )
-}
-
-pub(crate) fn already_recorded_merged_unsupported_base(
-    work_db: &crate::work::WorkDb,
-    work_item_id: &str,
-    pr_url: &str,
-) -> bool {
-    use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
-    work_db
-        .list_attention_items_for_work_item(work_item_id)
-        .ok()
-        .into_iter()
-        .flatten()
-        .any(|item| item.kind == PR_MERGED_UNSUPPORTED_BASE && item.body_markdown.contains(pr_url))
 }
