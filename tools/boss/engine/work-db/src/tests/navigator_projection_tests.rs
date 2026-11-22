@@ -5,8 +5,8 @@ use super::board_projection_tests::check;
 use super::*;
 use crate::board_projection::{CachedProjection, Refresh};
 use boss_protocol::{
-    NavigatorAction, NavigatorActivityKind, NavigatorCommandKind, NavigatorHumanAction, NavigatorProjection,
-    NavigatorReason, NavigatorRoot, NavigatorSection, NavigatorWait, ReviewSection,
+    CreateAttentionItemInput, NavigatorAction, NavigatorActivityKind, NavigatorCommandKind, NavigatorHumanAction,
+    NavigatorProjection, NavigatorReason, NavigatorRoot, NavigatorSection, NavigatorWait, ReviewSection,
 };
 
 const PR: &str = "https://github.com/spinyfin/mono/pull/7";
@@ -1060,4 +1060,127 @@ fn a_new_unreviewed_head_drops_ready_on_both_surfaces() {
     assert_eq!(card(&model, &root).review_section, Some(ReviewSection::AiReview));
     assert_eq!(row(&model, &root).section, NavigatorSection::Backlog);
     assert_eq!(waiting(&model, &root), NavigatorWait::ReviewQueued);
+}
+
+/// A no-op / pure-rebase skip stamps `last_reviewed_sha` to the new head
+/// without a matching verdict. Ready must still admit it.
+#[test]
+fn a_noop_skipped_head_after_a_clean_verdict_stays_ready_on_both_surfaces() {
+    let db = WorkDb::open(temp_db_path("navigator-ready-skipped-head")).unwrap();
+    let product = make_revision_product(&db, "navigator-ready-skipped-head");
+    let root = in_review_named(&db, &product, "ready", PR);
+    reviewed_clean_pr(&db, &root);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_head_sha = 'head-2' WHERE id = ?1", [&root])
+        .unwrap();
+    db.stamp_skipped_review_head(&root, Some("head-2")).unwrap();
+    let mut model = None;
+    step(&db, &product, &mut model);
+    assert_eq!(card(&model, &root).ai_review_state.as_deref(), Some("review_closed"));
+    assert_eq!(card(&model, &root).review_section, Some(ReviewSection::Ready));
+    assert_eq!(row(&model, &root).section, NavigatorSection::Ready);
+}
+
+/// Cycle-capped heads skip the reviewer and never get a verdict for the new
+/// SHA. Ready must still admit them.
+#[test]
+fn a_cycle_capped_head_stays_ready_on_both_surfaces() {
+    let db = WorkDb::open(temp_db_path("navigator-ready-cycle-cap")).unwrap();
+    let product = make_revision_product(&db, "navigator-ready-cycle-cap");
+    let root = in_review_named(&db, &product, "ready", PR);
+    reviewed_clean_pr(&db, &root);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_head_sha = 'head-2' WHERE id = ?1", [&root])
+        .unwrap();
+    db.create_attention_item(
+        CreateAttentionItemInput::builder()
+            .kind("pr_review_cycle_bound")
+            .title("cycle limit")
+            .body_markdown("capped")
+            .work_item_id(&root)
+            .build(),
+    )
+    .unwrap();
+    let mut model = None;
+    step(&db, &product, &mut model);
+    assert_eq!(card(&model, &root).ai_review_state.as_deref(), Some("review_closed"));
+    assert_eq!(card(&model, &root).review_section, Some(ReviewSection::Ready));
+    assert_eq!(row(&model, &root).section, NavigatorSection::Ready);
+}
+
+/// A findings revision that delivered without moving the head is closed, not
+/// due another review.
+#[test]
+fn a_delivered_unmoved_findings_revision_reaches_ready_on_both_surfaces() {
+    let db = WorkDb::open(temp_db_path("navigator-ready-unmoved-findings")).unwrap();
+    let product = make_revision_product(&db, "navigator-ready-unmoved-findings");
+    let root = in_review_named(&db, &product, "ready", PR);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_head_sha = ?2, ci_required_state = 'success', pr_mergeable_state = 'mergeable'
+             WHERE id = ?1",
+            params![root, HEAD],
+        )
+        .unwrap();
+    let revision = insert_revision_row(&db, &product, &root);
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+        WorkDb::insert_review_verdict_in_tx(
+            &conn,
+            &execution.id,
+            &root,
+            &crate::ReviewVerdictInput {
+                head_sha: Some(HEAD.to_owned()),
+                findings_count: 2,
+                revision_warranted: true,
+                gate_outcome: "completed_with_findings",
+            },
+        )
+        .unwrap();
+    }
+    db.set_review_verdict_revision_task_id(&execution.id, &revision)
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET status = 'in_review' WHERE id = ?1", [&revision])
+        .unwrap();
+    let fix = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&revision)
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = '100',
+                    pr_head_after = NULL WHERE id = ?1",
+            [&fix.id],
+        )
+        .unwrap();
+    let mut model = None;
+    step(&db, &product, &mut model);
+    assert_eq!(card(&model, &root).ai_review_state.as_deref(), Some("review_closed"));
+    assert_eq!(card(&model, &root).review_section, Some(ReviewSection::Ready));
+    assert_eq!(row(&model, &root).section, NavigatorSection::Ready);
 }

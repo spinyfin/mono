@@ -2359,6 +2359,33 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Record that automatic review of `head_sha` was skipped, without
+    /// consuming a review-cycle slot.
+    ///
+    /// Completion's no-op / pure-rebase skip advances to `in_review` with no
+    /// verdict for the new head. Stamping `last_reviewed_sha` is how the
+    /// current-head projection tells that skip apart from a head that still
+    /// needs a review. An empty `head_sha` is a no-op so a failed head fetch
+    /// cannot wipe a real last-reviewed value.
+    pub fn stamp_skipped_review_head(&self, task_id: &str, head_sha: Option<&str>) -> Result<()> {
+        let Some(sha) = head_sha.filter(|s| !s.is_empty()) else {
+            return Ok(());
+        };
+        let conn = self.connect()?;
+        let rows = conn.execute(
+            "UPDATE tasks
+             SET last_reviewed_sha = ?2,
+                 updated_at        = ?3
+             WHERE id = ?1
+               AND deleted_at IS NULL",
+            params![task_id, sha, now_string()],
+        )?;
+        if rows == 0 {
+            bail!("unknown or deleted task: {task_id}");
+        }
+        Ok(())
+    }
+
     /// Resolve the task id whose `review_cycle` / `last_reviewed_sha`
     /// columns should record a completed reviewer pass triggered by
     /// `task_id`'s completion.
