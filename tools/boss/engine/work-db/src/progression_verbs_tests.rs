@@ -46,6 +46,15 @@ impl Fx {
         create_test_chore_manual(&self.db, &self.product, name).id
     }
 
+    fn independent_neighbour(&self, item: &str, name: &str) -> String {
+        let id = self.chore(name);
+        self.sql(&format!(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{item}', '{id}', 'merge_order', '1')"
+        ));
+        id
+    }
+
     fn task(&self, id: &str) -> Task {
         match self.db.get_work_item(id).unwrap() {
             WorkItem::Task(task) | WorkItem::Chore(task) => task,
@@ -432,16 +441,19 @@ fn precursor_is_refused_while_work_is_live_on_the_item() {
 fn depend_adds_an_edge_inside_the_neighbourhood_and_refuses_outside_it() {
     let fx = fx();
     let item = fx.pr_item("Item", "fail");
+    let prerequisite = fx.independent_neighbour(&item, "Independent prerequisite");
     let revision = fx.revision_of(&item, "Its revision", "blocked");
     let outside = fx.chore("Two hops away");
     let run = fx.run(&item, FINGERPRINT, STUCK);
 
-    let target = fx.applied(&run, ProposalKind::Depend, json!({"on": revision}));
+    let cycle = fx.refused(&run, ProposalKind::Depend, json!({"on": revision}));
+    assert!(cycle.contains("dependency cycle"), "{cycle}");
+    let target = fx.applied(&run, ProposalKind::Depend, json!({"on": prerequisite}));
 
-    assert_eq!(target, revision);
+    assert_eq!(target, prerequisite);
     assert_progression_status(&fx, &item);
     assert!(
-        crate::work_dependencies::query_edge(&fx.db.connect().unwrap(), &item, &revision, "blocks")
+        crate::work_dependencies::query_edge(&fx.db.connect().unwrap(), &item, &prerequisite, "blocks")
             .unwrap()
             .is_some()
     );
@@ -451,7 +463,7 @@ fn depend_adds_an_edge_inside_the_neighbourhood_and_refuses_outside_it() {
             "depend".into(),
             FINGERPRINT.into(),
             STUCK.into(),
-            revision.clone(),
+            prerequisite.clone(),
             run.clone()
         )]
     );
@@ -1704,8 +1716,8 @@ fn question_is_refused_or_withdrawn_when_work_resumes() {
 fn changing_the_dependency_subject_does_not_bypass_the_fingerprint_rule() {
     let fx = fx();
     let item = fx.pr_item("Parent", "fail");
-    let first = fx.revision_of(&item, "First", "blocked");
-    let second = fx.revision_of(&item, "Second", "blocked");
+    let first = fx.independent_neighbour(&item, "First");
+    let second = fx.independent_neighbour(&item, "Second");
     let run = fx.run(&item, FINGERPRINT, STUCK);
     fx.applied(&run, ProposalKind::Depend, json!({"on": first}));
     let refusal = fx.refused(&run, ProposalKind::Depend, json!({"on": second}));

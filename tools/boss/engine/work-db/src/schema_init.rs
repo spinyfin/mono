@@ -85,6 +85,7 @@ impl WorkDb {
         super::progression_candidates::drop_views(&tx)?;
         let known = registry::all();
         migrations::apply(&tx, &known, version)?;
+        super::work_dependencies::cycle::rebuild_members(&tx)?;
         // Required runtime data, not a historical migration. Capability
         // discovery remains outside DB startup (no processes or network).
         super::host_storage::ensure_local_host(&tx)?;
@@ -926,6 +927,10 @@ mod floor_tests {
             (
                 "20261029_1430_critical_requests",
                 Box::new(|c| super::super::critical_requests::migrate(c).unwrap()),
+            ),
+            (
+                super::super::work_dependencies::cycle::MIGRATION_ID,
+                Box::new(|c| super::super::work_dependencies::cycle::migrate(c).unwrap()),
             ),
             (
                 execution_bookmarks::HAS_RECOVERY_HEAD_MIGRATION_ID,

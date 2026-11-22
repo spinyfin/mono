@@ -689,3 +689,33 @@ These are bite-sized so each fits in a single worker session.
 - Auto-derived edges from `ordinal` ordering.
 - A dedicated graph-view UI (the list view in card detail covers v1 use cases).
 - `--force` overrides on dispatch / manual move while gated.
+
+### Revisions, prerequisites, and follow-on work
+
+A revision must finish while its PR is still open. Independent work that can
+land first may be a blocking prerequisite of the revision. Work split out of
+that revision which needs the revision's PR to land is **follow-on work**, not
+a blocking prerequisite: it lands after the PR and must never block the revision.
+Use the follow-up proposal flow for that work, with any dependency pointing
+from the follow-on task to the original PR's root. Do not approve a prerequisite
+split and then link that prerequisite back to the original PR.
+
+Cycle checks include revision-to-parent links and carry a revision's external
+prerequisites to its PR root. This catches both orders of adding the edges:
+revision → split-out work followed by split-out work → PR root, or the reverse.
+Same-PR sequencing remains directed and can release at `in_review`; it is not
+an external prerequisite that must merge first. Non-blocking `merge_order`
+edges do not participate.
+
+Dependency writes, question creation, and approval reject a cycle before storing
+an edge. The check walks only from the new edge's endpoints, following `blocks`
+rows, revision parents, and a revision's external prerequisites onto its PR
+root. A rejected approval leaves the question unanswered and its transaction
+unchanged. Existing cycles remain gated and are reported as
+`S4_dependency_cycle` by progression and the stuck report, including when a
+member is archived. Membership is stored when a `blocks` edge changes and
+looked up by primary key on board, GetWorkTree, task-runtime, and queued-display
+reads; those paths do not rebuild the graph. A `waiting_dependency` execution
+in the cycle does not count as live progress. Repair requires an explicit
+correction of the dependency; diagnosis never drops edges, archives the
+dependent, or satisfies the cycle.

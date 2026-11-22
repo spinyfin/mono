@@ -163,6 +163,7 @@ const DROP_VIEWS: &str = "DROP VIEW IF EXISTS progression_candidates;
          DROP VIEW IF EXISTS progression_candidate_clauses;
          DROP VIEW IF EXISTS progression_real_candidates;
          DROP VIEW IF EXISTS progression_dependency_waiting;
+         DROP VIEW IF EXISTS progression_dependency_cycles;
          DROP VIEW IF EXISTS progression_candidate_base;
          DROP VIEW IF EXISTS progression_run_state;
          DROP VIEW IF EXISTS progression_live_tasks;
@@ -277,6 +278,7 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
     let review_churn = open_attention_sql(a, "wa.kind = 'churn_guard_parked'");
     format!(
         "CASE
+           WHEN {a}.id IN (SELECT work_item_id FROM progression_dependency_cycles) THEN 'S4_dependency_cycle'
            WHEN {a}.dispatch_failed_reason IS NOT NULL THEN
                CASE {a}.dispatch_failed_reason
                    WHEN 'churn_guard' THEN 'S2_churn_guard'
@@ -480,6 +482,8 @@ fn dependency_waiting_view_sql() -> &'static str {
                 OR t.deleted_at IS NOT NULL OR t.status = 'archived' OR p.status = 'archived')
          UNION
          SELECT dependent_id FROM reach WHERE dependent_id = prerequisite_id
+         UNION
+         SELECT work_item_id FROM progression_dependency_cycles
      )
      SELECT work_item_id FROM waiting
      EXCEPT
@@ -669,8 +673,11 @@ fn views_sql() -> String {
     let run_state = run_state_select(&cooldown);
     let prereq_edges = prereq_task_edges_sql();
     let dependency_waiting = dependency_waiting_view_sql();
+    let dependency_cycles = crate::work_dependencies::cycle::members_sql();
     format!(
         "{DROP_VIEWS}
+
+         CREATE VIEW progression_dependency_cycles AS {dependency_cycles};
 
          -- Open `blocks` edges, including project members for cycle detection.
          CREATE VIEW progression_prereq_task_edges AS
@@ -714,6 +721,9 @@ fn views_sql() -> String {
              JOIN work_executions e ON e.work_item_id = p.dependent_id
                AND e.status = 'waiting_dependency'
              JOIN progression_family_keys dk ON dk.task_id = p.dependent_id
+             WHERE dk.family_key NOT IN (
+                 SELECT ck.family_key FROM progression_family_keys ck
+                 JOIN progression_dependency_cycles c ON c.work_item_id = ck.task_id)
          )
          SELECT family_key FROM live;
 
@@ -1174,7 +1184,7 @@ pub(crate) fn run_states(conn: &Connection) -> Result<std::collections::HashMap<
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Two clause facts the stuck report shares with the sweep.
+/// Clause facts the stuck report shares with the sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SharedClauses {
     /// Clause 1: the item is neither parked nor waiting on a human.
@@ -1182,6 +1192,7 @@ pub(crate) struct SharedClauses {
     /// An open prerequisite is live, parked, or a progression candidate
     /// (clause 4's raw test, without the item's own `blocked_reason` guard).
     pub dependency_held: bool,
+    pub dependency_cycle: bool,
 }
 
 /// [`SharedClauses`] for every open item, read in one pass over the clause view.
@@ -1191,13 +1202,14 @@ pub(crate) struct SharedClauses {
 /// not an open task.
 pub(crate) fn shared_clauses(conn: &Connection) -> Result<std::collections::HashMap<String, SharedClauses>> {
     let mut stmt =
-        conn.prepare("SELECT work_item_id, c1_eligible, dependency_held FROM progression_candidate_clauses")?;
+        conn.prepare("SELECT work_item_id, c1_eligible, dependency_held, COALESCE(stuck_kind = 'S4_dependency_cycle', 0) FROM progression_candidate_clauses")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             SharedClauses {
                 eligible: row.get(1)?,
                 dependency_held: row.get(2)?,
+                dependency_cycle: row.get(3)?,
             },
         ))
     })?;

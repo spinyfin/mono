@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 
-mod cycle;
+pub(crate) mod cycle;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use boss_protocol::WorkItemDependency;
@@ -60,7 +60,11 @@ pub fn insert_edge(
             return Ok((edge, EdgeInsertOutcome::AlreadyExists));
         }
         cycle::validate(conn, dependent_id, prerequisite_id, relation)?;
-        insert_validated_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)
+        let inserted = insert_validated_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)?;
+        if relation == RELATION_BLOCKS && inserted.1 == EdgeInsertOutcome::Inserted {
+            cycle::rebuild_members(conn)?;
+        }
+        Ok(inserted)
     })();
     if result.is_err() {
         conn.execute_batch("ROLLBACK TO dependency_edge_insert")?;
@@ -101,7 +105,11 @@ pub fn delete_edge(conn: &Connection, dependent_id: &str, prerequisite_id: &str,
          WHERE dependent_id = ?1 AND prerequisite_id = ?2 AND relation = ?3",
         params![dependent_id, prerequisite_id, relation],
     )?;
-    Ok(rows > 0)
+    let removed = rows > 0;
+    if removed && relation == RELATION_BLOCKS {
+        cycle::rebuild_members(conn)?;
+    }
+    Ok(removed)
 }
 
 /// All edges that name `work_item_id` as either endpoint. Useful
@@ -199,46 +207,11 @@ pub fn query_edge(
     .map_err(Into::into)
 }
 
-/// True if inserting a **`blocks`** `(dependent_id → prerequisite_id)`
-/// edge would close a cycle. Walks the existing edge graph forward from
-/// `prerequisite_id`; if `dependent_id` is reachable, the new edge
-/// would form a cycle. Designed to run inside the same transaction
-/// as the upcoming insert so a concurrent writer sees the proposed
-/// row before adding its own.
-///
-/// The walk is **scoped to `relation='blocks'`** on both legs: a cycle
-/// only matters for the dispatch-gating graph, which is `blocks`-only.
-/// A non-blocking `merge_order` edge must never be able to manufacture a
-/// false cycle that rejects a legitimate `blocks` prerequisite — e.g. a
-/// `merge_order` A→B plus a later `blocks` B→A is perfectly valid and
-/// must be allowed (the two relations are independent graphs).
+/// Whether a new blocking edge closes a dependency or revision-PR cycle.
+/// Non-blocking relations never participate. Same-PR revision sequencing
+/// remains valid; an external prerequisite must not wait for that PR to merge.
 pub fn would_create_cycle(conn: &Connection, dependent_id: &str, prerequisite_id: &str) -> Result<bool> {
-    if dependent_id == prerequisite_id {
-        return Ok(true);
-    }
-    // The proposed edge says: `prerequisite_id → dependent_id` is
-    // already implied (they share a future ordering). We walk forward
-    // from `prerequisite_id` (i.e. its own prerequisites and their
-    // prerequisites, recursively); if we ever reach `dependent_id`,
-    // the new edge would close a loop.
-    let exists: Option<i64> = conn
-        .query_row(
-            "WITH RECURSIVE forward(id) AS (
-                SELECT prerequisite_id
-                FROM work_item_dependencies
-                WHERE dependent_id = ?1 AND relation = 'blocks'
-              UNION
-                SELECT d.prerequisite_id
-                FROM work_item_dependencies d
-                JOIN forward f ON d.dependent_id = f.id
-                WHERE d.relation = 'blocks'
-            )
-            SELECT 1 FROM forward WHERE id = ?2 LIMIT 1",
-            params![prerequisite_id, dependent_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    Ok(exists.is_some())
+    Ok(cycle::path(conn, dependent_id, prerequisite_id)?.is_some())
 }
 
 fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemDependency> {
@@ -406,21 +379,28 @@ fn dead_same_chain_revision_writer(
 /// this predicate.
 pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;
-    let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
+    let (cyclic, prerequisites) = cycle::prerequisites(conn, work_item_id)?;
+    // Membership is stored on edge writes. This read is an indexed lookup plus
+    // the item's own `blocks` rows, not a whole-graph CTE.
+    // A structural cycle is never satisfied by archived/dead writers. Keep the
+    // dispatcher and unblock sweep gated until the graph is explicitly repaired.
+    if cyclic {
+        return Ok(prerequisites);
+    }
     let mut gating = Vec::new();
-    for edge in edges {
+    for prerequisite_id in prerequisites {
         // Conflict fixes wait for writers to stop, not for their successful
         // delivery. A failed writer must not strand the branch's rebase.
         if dependent_kind.as_deref() == Some("revision")
             && let Some(waiting) =
-                crate::revision_sequencing::conflict_writer_gate(conn, work_item_id, &edge.prerequisite_id)?
+                crate::revision_sequencing::conflict_writer_gate(conn, work_item_id, &prerequisite_id)?
         {
             if waiting {
-                gating.push(edge.prerequisite_id);
+                gating.push(prerequisite_id);
             }
             continue;
         }
-        let status = lookup_work_item_status_for_gating(conn, &edge.prerequisite_id)?;
+        let status = lookup_work_item_status_for_gating(conn, &prerequisite_id)?;
         match status {
             Some(s) if status_satisfies_for_dependent(&s, dependent_kind.as_deref()) => {
                 // The `in_review` relaxation exists so a revision can push to
@@ -429,22 +409,17 @@ pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<S
                 // actually land before the revision runs.
                 if dependent_kind.as_deref() == Some("revision")
                     && s == "in_review"
-                    && (!same_revision_chain(conn, work_item_id, &edge.prerequisite_id)?
-                        || crate::is_live_chain_writer(conn, &edge.prerequisite_id)?)
+                    && (!same_revision_chain(conn, work_item_id, &prerequisite_id)?
+                        || crate::is_live_chain_writer(conn, &prerequisite_id)?)
                 {
-                    gating.push(edge.prerequisite_id);
+                    gating.push(prerequisite_id);
                 }
             }
             _ => {
-                if dead_same_chain_revision_writer(
-                    conn,
-                    dependent_kind.as_deref(),
-                    work_item_id,
-                    &edge.prerequisite_id,
-                )? {
+                if dead_same_chain_revision_writer(conn, dependent_kind.as_deref(), work_item_id, &prerequisite_id)? {
                     continue;
                 }
-                gating.push(edge.prerequisite_id);
+                gating.push(prerequisite_id);
             }
         }
     }
@@ -515,30 +490,19 @@ mod tests {
     fn fresh_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE work_item_dependencies (
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, name TEXT, kind TEXT NOT NULL DEFAULT 'chore',
+                parent_task_id TEXT, status TEXT NOT NULL, deleted_at TEXT
+            );
+            CREATE TABLE work_item_dependencies (
                 dependent_id     TEXT NOT NULL,
                 prerequisite_id  TEXT NOT NULL,
                 relation         TEXT NOT NULL DEFAULT 'blocks',
                 created_at       TEXT NOT NULL,
                 PRIMARY KEY (dependent_id, prerequisite_id, relation),
                 CHECK (dependent_id <> prerequisite_id)
-            );",
-        )
-        .unwrap();
-        conn
-    }
-
-    /// Like [`fresh_db`], plus a minimal `tasks` table so
-    /// [`gating_prereqs_for`] can look up prerequisite kind/status.
-    fn fresh_db_with_tasks() -> Connection {
-        let conn = fresh_db();
-        conn.execute_batch(
-            "CREATE TABLE tasks (
-                id          TEXT PRIMARY KEY,
-                kind        TEXT NOT NULL DEFAULT 'chore',
-                status      TEXT NOT NULL,
-                deleted_at  TEXT
-            );",
+            );
+            CREATE TABLE dependency_cycle_members (work_item_id TEXT PRIMARY KEY NOT NULL);",
         )
         .unwrap();
         conn
@@ -735,7 +699,7 @@ mod tests {
     /// transitively through the sweep/cascade integration tests.
     #[test]
     fn gating_prereqs_for_excludes_a_tombstoned_archived_prereq() {
-        let conn = fresh_db_with_tasks();
+        let conn = fresh_db();
         conn.execute(
             "INSERT INTO tasks (id, kind, status, deleted_at) VALUES ('task_dependent', 'chore', 'todo', NULL)",
             [],
@@ -759,7 +723,7 @@ mod tests {
     /// `status = 'archived'` is exempt.
     #[test]
     fn gating_prereqs_for_still_gates_on_a_missing_prerequisite_row() {
-        let conn = fresh_db_with_tasks();
+        let conn = fresh_db();
         conn.execute(
             "INSERT INTO tasks (id, kind, status, deleted_at) VALUES ('task_dependent', 'chore', 'todo', NULL)",
             [],
