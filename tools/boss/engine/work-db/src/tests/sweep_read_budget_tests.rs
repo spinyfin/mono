@@ -108,7 +108,7 @@ fn fixture(label: &str, statistics: Statistics) -> Fixture {
                     .skip(1)
                     .map(|statement| statement.split_whitespace().next().unwrap().to_owned())
                     .collect();
-                assert!(created.len() >= 8, "{created:?}");
+                assert_eq!(created.len(), 7, "{created:?}");
                 for index in &created {
                     conn.execute_batch(&format!("DROP INDEX {index}")).unwrap();
                 }

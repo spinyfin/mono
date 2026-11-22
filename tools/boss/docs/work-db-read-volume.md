@@ -54,7 +54,7 @@ The app's work-tree requests do not trigger these reads. They run on separate re
 
 ## The fix
 
-Migration `20261121_1800_recurring_read_indexes` (`tools/boss/engine/work-db/src/recurring_read_indexes.rs`) adds eight indexes. Six are partial, so they hold only live rows and stay a few pages however much history accumulates; `tasks_status_idx` and `work_executions_finished_at_idx` cover every row.
+Migration `20261121_1800_recurring_read_indexes` (`tools/boss/engine/work-db/src/recurring_read_indexes.rs`) adds seven indexes. Five are partial, so they hold only live rows and stay a few pages however much history accumulates; `tasks_status_idx` and `work_executions_finished_at_idx` cover every row.
 
 | Index                                | Serves                                                          |
 | ------------------------------------ | --------------------------------------------------------------- |
@@ -64,7 +64,6 @@ Migration `20261121_1800_recurring_read_indexes` (`tools/boss/engine/work-db/src
 | `work_executions_terminal_lease_idx` | finished executions still holding a workspace lease             |
 | `work_executions_finished_at_idx`    | finished-time windows written as `CAST(finished_at AS INTEGER)` |
 | `worker_proposals_undecided_idx`     | undecided proposals by kind, oldest first                       |
-| `work_runs_remote_host_idx`          | runs on a remote host                                           |
 | `work_runs_local_shell_ended_idx`    | local runs with a shell pid, by end time                        |
 
 Several statements were rewritten or pinned so the plan does not depend on planner statistics:
@@ -148,4 +147,6 @@ Three facts from the code, and one measurement the engine now takes for itself:
 - Nothing prunes `task_status_audit`, `worker_proposals`, started `work_executions` and their `work_runs`, `work_attention_items`, `comment_thread_entries`, `editorial_actions`, `planner_runs`, `automation_runs`, `progression_actions` or the `spoke_effects` and `spoke_applied_writes` ledgers.
 - Which of those accounts for a given file is what `database size report` answers: it lists the largest tables and indexes by bytes, measured from a backup snapshot so the walk never touches the live database, with the live file's page and free-page counts next to it.
 
-Retention for the unpruned tables is a separate decision. It deletes history people read, so it needs a retention design per table and the size report from a real database to say which tables are worth one.
+Retention design and implementation for the unpruned tables require an owner decision on history lifetime. In particular, `worker_proposals` is not just an ingress log: `review_guide_findings.rs` and `review_badge.rs` still read verdict payloads, and `review_batches.rs` recovers accepted reports through proposal pointers. The preservation test in `execution_retention.rs` deliberately keeps executions that own accepted reports. Deleting every decided proposal on a terminal execution after an arbitrary age would remove that history. Before implementing deletion, choose the diagnostic and review-history lifetime and whether referenced payloads remain indefinitely or move to a durable archive; then specify eligibility and preservation tests per table. No retention policy or deletion sweep for these tables is implemented here.
+
+The incident database measurements also require an authorized offline copy outside the engine state directory, which workers must not read. A copy must include committed WAL contents; a compacted backup alone cannot reveal the incident file's original freelist count. The table/index breakdown and original free-page count, and before/after recurring-read measurements on isolated copies of that real-sized database, remain unavailable until that input is supplied. The synthetic measurements above do not satisfy those deliverables.

@@ -10,7 +10,7 @@
 //! Summed over the timers, an idle engine would re-read its database several
 //! times a minute.
 //!
-//! Six of the eight are partial: they hold only the live rows, so they stay
+//! Five of the seven are partial: they hold only the live rows, so they stay
 //! a few pages however much history accumulates. A partial index can only
 //! serve a statement whose `WHERE` repeats its predicate, literal for
 //! literal, so keep the two in step. Where the planner still prefers a wider
@@ -57,9 +57,6 @@ pub(super) const INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS worker_proposals_undecided_idx
         ON worker_proposals(kind, created_at, id)
         WHERE state = 'proposed';
-    CREATE INDEX IF NOT EXISTS work_runs_remote_host_idx
-        ON work_runs(execution_id, created_at, id)
-        WHERE host_id != 'local';
     CREATE INDEX IF NOT EXISTS work_runs_local_shell_ended_idx
         ON work_runs(CAST(COALESCE(finished_at, created_at) AS INTEGER))
         WHERE host_id = 'local' AND shell_pid > 0;";
@@ -74,7 +71,6 @@ const ANALYZE_SQL: &str = "
     ANALYZE work_executions_finished_at_idx;
     ANALYZE work_executions_terminal_lease_idx;
     ANALYZE worker_proposals_undecided_idx;
-    ANALYZE work_runs_remote_host_idx;
     ANALYZE work_runs_local_shell_ended_idx;";
 
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
