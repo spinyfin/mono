@@ -15,6 +15,7 @@ pub mod exclusion;
 pub mod external;
 pub mod fix;
 pub mod github_app_auth;
+pub(crate) mod github_http;
 pub mod glob_scope;
 pub(crate) mod http_retry;
 pub mod input;

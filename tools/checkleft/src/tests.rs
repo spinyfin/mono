@@ -1057,7 +1057,7 @@ async fn resolve_pr_description_marks_known_pr_body_failure_unavailable() {
         Some("42"),
         &CiEnvironment::default(),
         &vcs,
-        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        GithubApiContext::testing(&server.uri(), Duration::from_secs(1)),
         Some("token"),
     )
     .await
@@ -1075,7 +1075,7 @@ async fn resolve_pr_description_without_github_token_is_not_applicable() {
         Some("42"),
         &CiEnvironment::default(),
         &vcs,
-        GithubApiContext::new("http://127.0.0.1:9", Duration::from_secs(1)),
+        GithubApiContext::testing("http://127.0.0.1:9", Duration::from_secs(1)),
         None,
     )
     .await
@@ -1103,7 +1103,7 @@ async fn resolve_pr_description_marks_empty_branch_lookup_not_applicable() {
         None,
         &env,
         &vcs,
-        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        GithubApiContext::testing(&server.uri(), Duration::from_secs(1)),
         Some("token"),
     )
     .await
@@ -1132,7 +1132,7 @@ async fn resolve_pr_description_marks_failed_branch_lookup_unavailable() {
             None,
             &env,
             &vcs,
-            GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+            GithubApiContext::testing(&server.uri(), Duration::from_secs(1)),
             Some("token"),
         )
         .await
@@ -1169,7 +1169,7 @@ async fn resolve_pr_description_marks_partial_merge_queue_fetch_unavailable() {
         None,
         &env,
         &vcs,
-        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        GithubApiContext::testing(&server.uri(), Duration::from_secs(1)),
         Some("token"),
     )
     .await
@@ -1196,7 +1196,7 @@ async fn resolve_pr_description_treats_empty_pr_body_as_resolved() {
         Some("42"),
         &CiEnvironment::default(),
         &vcs,
-        GithubApiContext::new(&server.uri(), Duration::from_secs(1)),
+        GithubApiContext::testing(&server.uri(), Duration::from_secs(1)),
         Some("token"),
     )
     .await

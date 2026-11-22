@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::external::timeout::{CheckDeadline, output_with_timeout};
-use crate::http_retry::{GetRetryPolicy, get_bytes_with_retry};
+use crate::http_retry::{GET_MAX_RETRY_DELAY, GetRetryPolicy, get_bytes_with_retry};
 
 const VERSION: &str = "24.8.0";
 
@@ -80,6 +80,7 @@ pub(super) fn provision(check_id: &str, deadline: CheckDeadline) -> Result<PathB
                         let policy = GetRetryPolicy {
                             max_attempts: 4,
                             base_delay: Duration::from_millis(500),
+                            max_delay: GET_MAX_RETRY_DELAY,
                             not_found_base_delay: None,
                             remaining: Some(&remaining),
                         };

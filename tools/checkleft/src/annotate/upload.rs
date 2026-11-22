@@ -1,15 +1,17 @@
 use std::io::Write as _;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use base64::Engine as _;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use reqwest::Method;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
 
-/// How many seconds to wait for each SARIF upload request.
-const UPLOAD_TIMEOUT_SECS: u64 = 30;
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubOutcome, GithubRetryPolicy, github_request};
+
 /// Maximum status poll attempts after a successful upload.
 const POLL_ATTEMPTS: u32 = 3;
 /// Seconds between status poll attempts.
@@ -65,6 +67,15 @@ fn ensure_rustls_provider() {
 /// Returns `true` when the upload was accepted by GitHub (HTTP 202), `false`
 /// when it was skipped or failed non-fatally.
 pub async fn upload_sarif(sarif: &Value, ctx: &SarifUploadContext<'_>) -> bool {
+    upload_sarif_with(sarif, ctx, GITHUB_API_TIMEOUT, GithubRetryPolicy::production()).await
+}
+
+async fn upload_sarif_with(
+    sarif: &Value,
+    ctx: &SarifUploadContext<'_>,
+    timeout: Duration,
+    retry: GithubRetryPolicy,
+) -> bool {
     let sarif_json = match serde_json::to_string(sarif) {
         Ok(j) => j,
         Err(e) => {
@@ -83,10 +94,7 @@ pub async fn upload_sarif(sarif: &Value, ctx: &SarifUploadContext<'_>) -> bool {
 
     ensure_rustls_provider();
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(UPLOAD_TIMEOUT_SECS))
-        .build()
-    {
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(c) => c,
         Err(e) => {
             warn!("checkleft: SARIF upload skipped — HTTP client error: {e}");
@@ -112,36 +120,52 @@ pub async fn upload_sarif(sarif: &Value, ctx: &SarifUploadContext<'_>) -> bool {
         "uploading SARIF to GitHub code scanning"
     );
 
-    let response = match client
-        .post(&url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header(reqwest::header::USER_AGENT, "checkleft-cli")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .bearer_auth(ctx.token)
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
+    let payload = match serde_json::to_vec(&body) {
+        Ok(payload) => payload,
         Err(e) => {
-            warn!("checkleft: SARIF upload failed — network error: {e}");
+            warn!("checkleft: SARIF upload skipped — could not serialize upload body: {e}");
             return false;
         }
     };
-
-    let status = response.status();
-    if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
-        warn!("checkleft: SARIF upload failed — HTTP {}: {}", status, body_text.trim());
-        return false;
-    }
-
-    let bytes = match response.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("checkleft: SARIF upload succeeded but could not read response body: {e}");
+    let bytes = match github_request(
+        &client,
+        GithubCall {
+            method: Method::POST,
+            url: &url,
+            token: Some(ctx.token),
+            operation: "uploading SARIF to GitHub code scanning",
+            timeout,
+            retry,
+            extra_headers: &[
+                ("content-type", "application/json"),
+                ("X-GitHub-Api-Version", "2022-11-28"),
+            ],
+            body: Some(payload),
+        },
+    )
+    .await
+    {
+        GithubOutcome::Success(bytes) => bytes,
+        GithubOutcome::Timeout { attempts } => {
+            warn!("checkleft: SARIF upload failed — timed out after {attempts} attempts");
+            return false;
+        }
+        GithubOutcome::Transport { error } => {
+            warn!("checkleft: SARIF upload failed — network error: {error}");
+            return false;
+        }
+        GithubOutcome::Body { error } => {
+            warn!("checkleft: SARIF upload succeeded but could not read response body: {error}");
             eprintln!("checkleft: SARIF upload succeeded (id unknown)");
             return true;
+        }
+        GithubOutcome::Http { status, body } => {
+            warn!(
+                "checkleft: SARIF upload failed — HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&body).trim()
+            );
+            return false;
         }
     };
 
@@ -173,33 +197,38 @@ async fn poll_sarif_status(client: &reqwest::Client, base_url: &str, repository:
 
     for attempt in 0..POLL_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(POLL_DELAY_SECS)).await;
+            tokio::time::sleep(Duration::from_secs(POLL_DELAY_SECS)).await;
         }
 
-        let response = match client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::USER_AGENT, "checkleft-cli")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(token)
-            .send()
-            .await
+        let bytes = match github_request(
+            client,
+            GithubCall {
+                method: Method::GET,
+                url: &url,
+                token: Some(token),
+                operation: "polling SARIF upload status",
+                timeout: GITHUB_API_TIMEOUT,
+                retry: GithubRetryPolicy::production(),
+                extra_headers: &[("X-GitHub-Api-Version", "2022-11-28")],
+                body: None,
+            },
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("checkleft: SARIF status poll failed: {e}");
+            GithubOutcome::Success(bytes) => bytes,
+            GithubOutcome::Timeout { attempts } => {
+                warn!("checkleft: SARIF status poll failed: timed out after {attempts} attempts");
                 return;
             }
-        };
-
-        if !response.status().is_success() {
-            warn!("checkleft: SARIF status poll returned HTTP {}", response.status());
-            return;
-        }
-
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(_) => return,
+            GithubOutcome::Transport { error } => {
+                warn!("checkleft: SARIF status poll failed: {error}");
+                return;
+            }
+            GithubOutcome::Body { .. } => return,
+            GithubOutcome::Http { status, .. } => {
+                warn!("checkleft: SARIF status poll returned HTTP {status}");
+                return;
+            }
         };
         let status_resp: SarifStatusResponse = match serde_json::from_slice(&bytes) {
             Ok(s) => s,
@@ -268,6 +297,53 @@ mod tests {
         };
         let ok = upload_sarif(&sarif, &ctx).await;
         assert!(ok, "upload should succeed against mock server");
+    }
+
+    #[tokio::test]
+    async fn accepted_upload_with_stalled_body_returns_true() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut requests = 0;
+            listener.set_nonblocking(false).expect("blocking");
+            let (mut socket, _) = listener.accept().expect("accept");
+            requests += 1;
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf);
+            socket
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 100\r\n\r\n{")
+                .expect("write");
+            socket.flush().expect("flush");
+            let _ = done_rx.recv();
+            drop(socket);
+            listener.set_nonblocking(true).expect("nonblocking");
+            if listener.accept().is_ok() {
+                requests += 1;
+            }
+            requests
+        });
+
+        let base_url = format!("http://{addr}");
+        let sarif = serde_json::json!({"version": "2.1.0", "runs": []});
+        let ctx = SarifUploadContext {
+            base_url: &base_url,
+            repository: "o/r",
+            token: "tok",
+            commit_sha: "deadbeef",
+            git_ref: "refs/heads/main",
+        };
+        let ok = upload_sarif_with(&sarif, &ctx, Duration::from_millis(100), GithubRetryPolicy::for_tests()).await;
+        done_tx.send(()).expect("signal");
+        assert!(ok, "accepted SARIF upload with stalled body must report success");
+        assert_eq!(
+            server.join().expect("server"),
+            1,
+            "accepted SARIF upload must not be replayed"
+        );
     }
 
     #[test]
