@@ -112,9 +112,9 @@ impl PrStatusRefreshBudget {
 /// questions. A `revision_implementation` execution's task never owns a PR
 /// by design — `task.pr_url` is always NULL for `kind = 'revision'` — so
 /// the bound PR, and the row the merge poller actually polls, belong to the
-/// chain root instead. Mirrors the fallback chain already used by
-/// `completion::execution_started` / `completion::metadata_gate`:
-/// `task_bound_pr_url` -> `execution.pr_url` -> chain-root `pr_url`.
+/// chain root instead. Uses the shared execution binding policy:
+/// revisions resolve through `execution.pr_url` then chain-root `pr_url`,
+/// ignoring the revision task URL.
 /// Without this, every revision worker (the largest population of `boss pr
 /// status`/`boss pr body` callers) reads/writes a row that never has PR
 /// state on it.
@@ -124,29 +124,15 @@ struct EffectivePr {
 }
 
 fn resolve_effective_pr(work_db: &WorkDb, task: &Task, execution: &boss_work_db::WorkExecution) -> EffectivePr {
-    if let Some(url) = boss_execution_runner::task_bound_pr_url(task) {
-        return EffectivePr {
-            status_task_id: task.id.clone(),
-            pr_url: Some(url.to_owned()),
-        };
-    }
-    if execution.kind == ExecutionKind::RevisionImplementation {
-        let pr_url = execution
-            .pr_url
-            .clone()
-            .filter(|u| !u.is_empty())
-            .or_else(|| work_db.get_revision_chain_root_pr_url(&task.id));
-        if pr_url.is_some() {
-            let status_task_id = work_db
-                .get_revision_chain_root_task_id(&task.id)
-                .unwrap_or_else(|| task.id.clone());
-            return EffectivePr { status_task_id, pr_url };
-        }
-    }
-    EffectivePr {
-        status_task_id: task.id.clone(),
-        pr_url: None,
-    }
+    let pr_url = work_db.execution_bound_pr_url(task, execution);
+    let status_task_id = if execution.kind == ExecutionKind::RevisionImplementation && pr_url.is_some() {
+        work_db
+            .get_revision_chain_root_task_id(&task.id)
+            .unwrap_or_else(|| task.id.clone())
+    } else {
+        task.id.clone()
+    };
+    EffectivePr { status_task_id, pr_url }
 }
 
 pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {

@@ -173,6 +173,9 @@ pub struct StubBranchVerifier {
     /// [`StubBranchVerifier::set_head_oid`] to override.
     #[builder(default = Mutex::new(Ok("oid_unknown".to_owned())))]
     pub head_oid_result: Mutex<Result<String, String>>,
+    /// Per-PR heads distinguish unrelated PR movement from revision contribution.
+    #[builder(default = Mutex::new(HashMap::new()))]
+    pub head_oid_by_pr: Mutex<HashMap<u64, String>>,
     /// `headRefOid` returned by the direct, teardown-time REST read. This is
     /// deliberately independent from `head_oid_result`: an ordinary
     /// SHA-delta read can fail without making the later fresh finalization
@@ -338,6 +341,9 @@ impl BranchVerifier for StubBranchVerifier {
     }
 
     async fn fetch_pr_head_oid(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        if let Some(oid) = self.head_oid_by_pr.lock().await.get(&_pr_number) {
+            return Ok(oid.clone());
+        }
         let guard = self.head_oid_result.lock().await;
         match &*guard {
             Ok(oid) => Ok(oid.clone()),

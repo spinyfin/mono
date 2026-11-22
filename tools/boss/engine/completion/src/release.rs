@@ -303,34 +303,14 @@ impl WorkerCompletionHandler {
             .await;
     }
 
-    /// Resolve the PR already bound to this execution's chore, if any.
-    /// Mirrors [`Self::evaluate_sha_delta_gate`]'s resolution: the
-    /// chore's own structured `pr_url` is authoritative (it is set by
-    /// whichever sibling execution opened the PR — for a
-    /// `ci_remediation` exec that is the `chore_implementation` exec
-    /// that shipped the original change). `revision_implementation`
-    /// chores carry `pr_url = NULL` by design, so for that kind we fall
-    /// back to `execution.pr_url` (the chain root's PR, stamped at
-    /// dispatch).
+    /// Resolve the PR bound to this execution through the shared binding policy used by the SHA-delta gate,
+    /// execution snapshots and PR status. Revisions use dispatch state or the
+    /// chain root; ordinary tasks use their own structured PR URL.
     ///
-    /// Used by the nudge path to decide whether a "produce a PR" nudge
-    /// is even appropriate: when a PR is already bound the worker must
-    /// be pointed at the existing branch, never told to `gh pr create`.
+    /// Used by the nudge path to point workers at an existing PR branch.
     pub(super) fn resolve_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
         match self.work_db.get_work_item(&execution.work_item_id) {
-            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-                if execution.kind == ExecutionKind::RevisionImplementation {
-                    // Proposal application can populate the revision task's URL.
-                    // Only dispatch state or the chain root can bind a revision.
-                    execution
-                        .pr_url
-                        .clone()
-                        .filter(|url| !url.is_empty())
-                        .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
-                } else {
-                    boss_engine_storage_values::branch_identity::task_bound_pr_url(&task).map(str::to_owned)
-                }
-            }
+            Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => self.work_db.execution_bound_pr_url(&task, execution),
             _ => None,
         }
     }

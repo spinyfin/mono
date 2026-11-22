@@ -321,25 +321,69 @@ async fn revision_proposal_without_head_movement_cannot_finalize_on_a_declaratio
 }
 
 #[tokio::test]
-async fn revision_proposal_for_a_different_pr_than_the_bound_one_is_ignored() {
-    let workspace = tempdir().unwrap();
-    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), PARENT_PR, HEAD_BEFORE);
-    submit_pr_created(
-        &db,
-        &execution_id,
-        &revision_id,
-        "https://github.com/spinyfin/mono/pull/2091",
-    );
-    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
-        .handler
-        .with_feature_flags(new_flags(workspace.path(), true))
-        .with_metrics(new_metrics());
-    let execution = db.get_execution(&execution_id).unwrap();
-
-    assert_eq!(
-        handler.pr_created_proposal_lookup(&execution, "test").await,
-        PrCreatedProposalLookup::Unusable
-    );
+async fn revision_proposal_for_a_different_pr_cannot_finalize_through_sha_delta() {
+    for stale_task_binding in [false, true] {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _, revision_id, execution_id) = revision_fixture(workspace.path(), PARENT_PR, HEAD_BEFORE);
+        let wrong_pr = "https://github.com/spinyfin/mono/pull/2091";
+        submit_pr_created(&db, &execution_id, &revision_id, wrong_pr);
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(task) => assert!(task.pr_url.is_none(), "proposals must not bind revision tasks"),
+            other => panic!("expected revision task, got {other:?}"),
+        }
+        if stale_task_binding {
+            // A URL left by an older applier must not override dispatch state.
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+                    rusqlite::params![revision_id, wrong_pr],
+                )
+                .unwrap();
+        }
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier
+            .head_oid_by_pr
+            .lock()
+            .await
+            .extend([(2090, HEAD_BEFORE.to_owned()), (2091, HEAD_AFTER.to_owned())]);
+        let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+            .handler
+            .with_feature_flags(new_flags(workspace.path(), true))
+            .with_metrics(new_metrics())
+            .with_branch_verifier(verifier);
+        handler.on_execution_started(&execution_id).await;
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.pr_head_before.as_deref(), Some(HEAD_BEFORE));
+        assert_eq!(
+            handler.pr_created_proposal_lookup(&execution, "test").await,
+            PrCreatedProposalLookup::Unusable
+        );
+        for outcome in [
+            handler.on_stop(&execution_id).await,
+            handler.recheck_for_pr(&execution_id).await,
+        ] {
+            assert!(
+                !matches!(
+                    outcome,
+                    StopOutcome::PrDetected { .. } | StopOutcome::ReviewerEnqueued { .. }
+                ),
+                "unrelated PR movement cannot finalize a revision: {outcome:?}"
+            );
+        }
+        assert_eq!(db.get_revision_stop_contributed_head(&execution_id).unwrap(), None);
+        assert!(
+            db.list_executions(None)
+                .unwrap()
+                .iter()
+                .all(|execution| execution.kind != ExecutionKind::PrReview),
+            "an unrelated PR must not enqueue a reviewer"
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(task) => assert_ne!(task.status, TaskStatus::InReview),
+            other => panic!("expected revision task, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -571,10 +615,17 @@ fn clear_task_pr_url(db: &WorkDb, task_id: &str) {
 }
 
 #[tokio::test]
-async fn revision_without_dispatch_url_uses_chain_root_despite_applied_task_binding() {
+async fn revision_without_dispatch_url_uses_chain_root_despite_stale_task_binding() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _, revision_id, execution_id) = revision_fixture_no_execution_pr_url(workspace.path(), PARENT_PR);
     submit_pr_created(&db, &execution_id, &revision_id, PR_URL);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![revision_id, PR_URL],
+        )
+        .unwrap();
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
         .with_feature_flags(new_flags(workspace.path(), true));
