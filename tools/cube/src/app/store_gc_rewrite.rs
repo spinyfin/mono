@@ -274,6 +274,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_heads_exclude_the_concurrent_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let heads = dir.path().join(".jj/repo/op_heads/heads");
+        fs::create_dir_all(&heads).unwrap();
+        for name in ["second", "lock", "first"] {
+            fs::write(heads.join(name), b"").unwrap();
+        }
+        assert_eq!(op_heads(dir.path()).unwrap(), ["first", "second"]);
+    }
+
+    #[test]
     fn prepared_heads_refuse_concurrent_progress_and_publish_only_the_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let heads = dir.path().join(".jj/repo/op_heads/heads");

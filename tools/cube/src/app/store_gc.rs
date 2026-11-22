@@ -393,6 +393,8 @@ fn op_heads(source: &Path) -> Result<Vec<String>> {
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()
         .map_err(CubeError::Io)?;
+    // Jujutsu can hold its lock here while publishing an operation head.
+    heads.retain(|head| head != "lock");
     // Directory order is arbitrary; sorted heads give a stable verification order.
     heads.sort();
     Ok(heads)

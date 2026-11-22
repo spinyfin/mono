@@ -16,6 +16,7 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/completion:__pkg__",
+        "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/host-execution:__pkg__",
     ],
     deps = all_crate_deps(normal = True),

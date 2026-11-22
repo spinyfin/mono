@@ -11,12 +11,13 @@
 /// running destructors.
 pub struct ProcessGroupChild {
     child: std::process::Child,
+    lifeline: Option<std::process::ChildStdin>,
 }
 
 impl ProcessGroupChild {
     /// Wrap a child that already leads its own process group or session.
     pub fn from_leader(child: std::process::Child) -> Self {
-        Self { child }
+        Self { child, lifeline: None }
     }
 }
 
@@ -36,14 +37,56 @@ impl std::ops::DerefMut for ProcessGroupChild {
 
 impl Drop for ProcessGroupChild {
     fn drop(&mut self) {
-        let pid = self.child.id() as i32;
-        // SAFETY: `pid` is a process-group (or session) leader this helper
-        // spawned; `-pid` targets that group only, never the test runner.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+        // A reaped leader's group id may already belong to another process.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let pid = self.child.id() as i32;
+            // SAFETY: the unreaped child owns this group id; a negative pid
+            // signals that group, never the test runner's group.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            let _ = self.child.wait();
         }
-        let _ = self.child.wait();
+        drop(self.lifeline.take());
     }
+}
+
+/// Spawn a command beneath a group-leading supervisor. Configure arguments,
+/// environment, directory and output streams on the supplied command. Stdin
+/// is reserved for the parent lifeline; the supervised program sees EOF.
+/// Closing the lifeline kills the whole group even without Rust destructors.
+pub fn spawn_supervised(
+    program: impl AsRef<std::ffi::OsStr>,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> ProcessGroupChild {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new("python3");
+    command
+        .args([
+            "-I",
+            "-c",
+            r#"
+import os, select, signal, subprocess, sys
+child = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL)
+while True:
+    if select.select([sys.stdin], [], [], 0.05)[0]:
+        os.killpg(os.getpid(), signal.SIGKILL)
+    status = child.poll()
+    if status is not None:
+        sys.exit(status if status >= 0 else 128 - status)
+"#,
+        ])
+        .arg(program);
+    configure(&mut command);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn supervised command");
+    // Child::wait closes stdin. Keep the lifeline independent so waiting for
+    // a normal exit does not request termination.
+    let lifeline = child.stdin.take();
+    ProcessGroupChild { child, lifeline }
 }
 
 /// Python that leads a new process group, then waits until stdin closes
@@ -117,6 +160,64 @@ mod process_group_child_tests {
     fn pid_is_alive(pid: u32) -> bool {
         // SAFETY: signal 0 only checks existence.
         unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    fn assert_exits_on_eof(mut child: super::ProcessGroupChild) {
+        drop(child.stdin.take());
+        drop(child.lifeline.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "lifeline EOF must stop child");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn group_sleeper_exits_on_stdin_eof() {
+        assert_exits_on_eof(spawn_group_leader_sleeper());
+    }
+
+    #[test]
+    fn session_sleeper_exits_on_stdin_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_exits_on_eof(spawn_setsid_sleeper(dir.path(), |_| {}));
+    }
+
+    #[test]
+    fn supervised_command_exits_on_lifeline_eof() {
+        use std::io::BufRead;
+        let mut child = super::spawn_supervised("python3", |command| {
+            command
+                .args([
+                    "-u",
+                    "-c",
+                    "import os,time; print(os.getpid(), flush=True); time.sleep(300)",
+                ])
+                .stdout(std::process::Stdio::piped());
+        });
+        let mut pid = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut pid)
+            .unwrap();
+        let pid: u32 = pid.trim().parse().unwrap();
+        assert!(pid_is_alive(pid));
+        assert_exits_on_eof(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_is_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "supervised descendant survived EOF"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn supervised_command_preserves_exit_status() {
+        let mut child = super::spawn_supervised("python3", |command| {
+            command.args(["-c", "import sys; sys.exit(42)"]);
+        });
+        assert_eq!(child.wait().unwrap().code(), Some(42));
     }
 
     #[test]

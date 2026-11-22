@@ -109,6 +109,7 @@ rust_test(
         "//tools/boss/engine/pr-review",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/test-process",
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/worker-bin",

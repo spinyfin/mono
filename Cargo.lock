@@ -899,6 +899,7 @@ dependencies = [
  "boss-engine-codex-hook-trust",
  "boss-engine-codex-rollout",
  "boss-engine-structured-output",
+ "boss-engine-test-process",
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-engine-worker-bin",
