@@ -9,6 +9,7 @@ extension ChatViewModel {
     func loadExecutions(taskId: String) {
         executionsByTaskID[taskId] = nil
         executionsLoadFailureByTaskID.removeValue(forKey: taskId)
+        executionsStaleTaskIDs.remove(taskId)
         executionsInFlightTaskIDs.insert(taskId)
         engine.sendListExecutions(taskId: taskId)
     }

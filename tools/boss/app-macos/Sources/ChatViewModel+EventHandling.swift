@@ -123,6 +123,10 @@ extension ChatViewModel {
                 message: "Connection to the engine was lost before it could answer — try the move again.",
                 includeMovesWithoutCheck: false
             )
+            // History now stays registered across tab switches, so a drop
+            // cannot wait for the next activation to recover. Clear the
+            // in-flight set and cached rows; reconnect reloads them.
+            noteExecutionsDisconnected()
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, let itemIDs, let invalidationClass):
             executionLabelsInvalidatedHandler?()

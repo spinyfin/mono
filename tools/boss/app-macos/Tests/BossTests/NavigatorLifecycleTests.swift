@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import XCTest
 @testable import Boss
 
@@ -119,15 +120,21 @@ final class NavigatorLifecycleTests: XCTestCase {
         let consumer = WorkExecutionsConsumer()
         var list = WorkExecutionsList(model: model, taskIDs: ["root"], transcriptTaskID: "root", isActive: false)
         list.updateConsumer(consumer)
-        XCTAssertTrue(model.executionsConsumerTokensByTaskID.isEmpty)
+        XCTAssertEqual(consumer.registered, ["root"], "Hidden History still prefetches")
+        XCTAssertTrue(model.hasOpenExecutionsConsumer(taskID: "root"))
+        XCTAssertFalse(model.hasLiveExecutionsConsumer(taskID: "root"))
         list.isActive = true
         list.updateConsumer(consumer)
         XCTAssertEqual(consumer.registered, ["root"])
+        XCTAssertTrue(model.hasLiveExecutionsConsumer(taskID: "root"))
         list = WorkExecutionsList(model: model, taskIDs: ["root", "revision"], transcriptTaskID: "root")
         list.updateConsumer(consumer)
         XCTAssertEqual(consumer.registered, ["root", "revision"])
         list.isActive = false
         list.updateConsumer(consumer)
+        XCTAssertTrue(model.hasOpenExecutionsConsumer(taskID: "root"))
+        XCTAssertFalse(model.hasLiveExecutionsConsumer(taskID: "root"))
+        consumer.update(taskIDs: [], model: model)
         XCTAssertTrue(model.executionsConsumerTokensByTaskID.isEmpty)
     }
 
@@ -145,6 +152,7 @@ final class NavigatorLifecycleTests: XCTestCase {
         let consumer = WorkExecutionsConsumer()
         history.executionsList.updateConsumer(consumer)
         XCTAssertEqual(requests, 1, "Prefetch before History is selected")
+        XCTAssertFalse(model.hasLiveExecutionsConsumer(taskID: "root"))
         let viewer = UUID()
         model.beginExecutionsConsumer(taskID: "root", token: viewer)
         XCTAssertEqual(requests, 1, "Share the pending request")
@@ -158,6 +166,85 @@ final class NavigatorLifecycleTests: XCTestCase {
         model.endExecutionsConsumer(taskID: "root", token: viewer)
         consumer.update(taskIDs: [], model: model)
         XCTAssertNil(model.executionsByTaskID["root"], "Closing the detail releases its cache")
+    }
+
+    func testHistoryPrefetchMountsWhileActivitySelected() {
+        let model = NavigatorTestFixture.model([root()])
+        model.selectWorkCard("root")
+        model.setWorkViewMode(.navigator)
+        model.navigator.tab = .activity
+        var requests = 0
+        model.engine.outboundRecorder = { payload in
+            if payload["type"] as? String == "list_executions" { requests += 1 }
+        }
+        let host = NSHostingView(rootView: WorkNavigatorDetail(
+            model: model, registry: .navigator(workspace: nil)
+        ))
+        host.frame = NSRect(x: 0, y: 0, width: 1000, height: 700)
+        host.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(requests, 1, "The mounted History body must prefetch while Activity is selected")
+        XCTAssertTrue(model.hasOpenExecutionsConsumer(taskID: "root"))
+        XCTAssertFalse(model.hasLiveExecutionsConsumer(taskID: "root"))
+        withExtendedLifetime(host) {}
+    }
+
+    func testHistoryPrefetchReloadsAfterWorkError() {
+        let model = NavigatorTestFixture.model([root()])
+        var requests = 0
+        model.engine.outboundRecorder = { payload in
+            if payload["type"] as? String == "list_executions" { requests += 1 }
+        }
+        let token = UUID()
+        model.beginExecutionsConsumer(taskID: "root", token: token, live: false)
+        XCTAssertEqual(requests, 1)
+        model.applyEventForTest(.workError(message: "engine busy", requestId: nil))
+        XCTAssertTrue(model.executionsInFlightTaskIDs.isEmpty)
+        XCTAssertNotNil(model.executionsLoadFailureByTaskID["root"])
+        model.beginExecutionsConsumer(taskID: "root", token: token, live: false)
+        XCTAssertEqual(requests, 2, "A WorkError must clear in-flight so begin re-requests")
+    }
+
+    func testHistoryPrefetchReconnectReloadsLostReply() {
+        let model = NavigatorTestFixture.model([root()])
+        var requests = 0
+        model.engine.outboundRecorder = { payload in
+            if payload["type"] as? String == "list_executions" { requests += 1 }
+        }
+        model.beginExecutionsConsumer(taskID: "root", token: UUID(), live: false)
+        XCTAssertEqual(requests, 1)
+        XCTAssertTrue(model.executionsInFlightTaskIDs.contains("root"))
+        model.applyEventForTest(.disconnected)
+        XCTAssertTrue(model.executionsInFlightTaskIDs.isEmpty)
+        XCTAssertNil(model.executionsByTaskID["root"])
+        model.engine.simulateConnectedForTesting = true
+        model.applyEventForTest(.connected)
+        XCTAssertEqual(requests, 2, "Reconnect must re-issue a prefetch whose reply was lost")
+        XCTAssertTrue(model.executionsInFlightTaskIDs.contains("root"))
+        model.applyEventForTest(.executionsList(taskId: "root", executions: []))
+        XCTAssertNotNil(model.executionsByTaskID["root"])
+    }
+
+    func testHistoryPrefetchReconnectReloadsAfterMissedChanges() {
+        let model = NavigatorTestFixture.model([root()])
+        var requests = 0
+        model.engine.outboundRecorder = { payload in
+            if payload["type"] as? String == "list_executions" { requests += 1 }
+        }
+        model.beginExecutionsConsumer(taskID: "root", token: UUID(), live: false)
+        model.applyEventForTest(.executionsList(taskId: "root", executions: []))
+        XCTAssertEqual(requests, 1)
+        XCTAssertNotNil(model.executionsByTaskID["root"])
+        model.applyEventForTest(.disconnected)
+        XCTAssertNil(model.executionsByTaskID["root"], "Disconnect must not keep pre-drop rows as loaded")
+        XCTAssertTrue(model.executionsStaleTaskIDs.contains("root"))
+        model.engine.simulateConnectedForTesting = true
+        model.applyEventForTest(.connected)
+        XCTAssertEqual(requests, 2, "Reconnect must reload registered consumers after missed changes")
+        model.applyEventForTest(.executionsList(taskId: "root", executions: []))
+        XCTAssertNotNil(model.executionsByTaskID["root"])
+        XCTAssertFalse(model.executionsStaleTaskIDs.contains("root"))
     }
 
     func testRejectedStartAndRetryNeverQueueExecution() {
