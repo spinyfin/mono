@@ -103,6 +103,15 @@ run_wrapper_suite() {
   _ci_execlog_setup "$execlog_sh"
   [[ -f bazel-execlogs/job-42/01-build.bin.zst ]] || fail "re-setup deleted this job's logs"
   grep -qxF 'keep' bazel-execlogs/job-42/01-build.bin.zst || fail "re-setup truncated this job's logs"
+
+  printf 'hello' > bazel-execlogs/job-42/02-test.bin.zst
+  summary="$(_ci_execlog_print_summary)"
+  [[ "$summary" == *"job=job-42 files=2 total_bytes=10"* ]] \
+    || fail "summary missing expected job/files/total_bytes: ${summary}"
+  [[ "$summary" == *"01-build.bin.zst: 5 bytes"* ]] \
+    || fail "summary missing 01-build.bin.zst bytes: ${summary}"
+  [[ "$summary" == *"02-test.bin.zst: 5 bytes"* ]] \
+    || fail "summary missing 02-test.bin.zst bytes: ${summary}"
 }
 
 run_wrapper_suite

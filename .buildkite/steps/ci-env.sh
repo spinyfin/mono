@@ -197,8 +197,13 @@ if [[ "$CI_REMOTE_EXECUTION" == "on" ]]; then
   }
   ci_remote_watchdog_loop_tree "$$" "$CI_REMOTE_WATCHDOG_REASON_FILE" "${CI_BAZEL_REMOTE_EXECUTOR}" &
   CI_REMOTE_STEP_WATCHDOG_PID=$!
-  trap '_ci_remote_cleanup_step_watchdog' EXIT
 fi
+
+_ci_on_exit() {
+  _ci_remote_cleanup_step_watchdog
+  _ci_execlog_print_summary
+}
+trap '_ci_on_exit' EXIT
 
 _ci_remote_on_term() {
   local msg probed
@@ -216,6 +221,7 @@ _ci_remote_on_term() {
       "${BUILDKITE_LABEL:-A step} was killed (SIGTERM) while remote execution was on: ${probed}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\"." || true
   fi
   _ci_remote_cleanup_step_watchdog
+  _ci_execlog_print_summary
   exit 143
 }
 
@@ -303,8 +309,9 @@ bazel() {
     fi
     "$bazel_bin" $BAZEL_STARTUP_FLAGS clean --expunge
     rm -f "$tmplog" "$tmplog.watchdog"
-    # Fresh filename: the first attempt already wrote (or began writing) the
-    # previous path, and one-file-per-invocation requires the retry to keep it.
+    # Allocate a new path: the first attempt already wrote (or began writing)
+    # its log, and each Bazel invocation gets its own file, so the retry must
+    # not reuse it.
     execlog_flag=()
     flag="$(_ci_execlog_flag_for "$subcommand" "$@")"
     if [[ -n "$flag" ]]; then

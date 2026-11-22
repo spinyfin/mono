@@ -159,3 +159,22 @@ _ci_execlog_setup() {
 
   export CI_EXECLOG_SETUP_DONE=1
 }
+
+# Print per-job compressed execution-log byte totals to CI output.
+_ci_execlog_print_summary() {
+  local f bytes total=0 count=0
+  local -a lines=()
+  [[ -n "${CI_EXECLOG_DIR:-}" && -d "${CI_EXECLOG_DIR}" ]] || return 0
+  for f in "${CI_EXECLOG_DIR}"/*.bin.zst; do
+    [[ -f "$f" ]] || continue
+    bytes="$(command -p wc -c < "$f")"
+    bytes="${bytes//[[:space:]]/}"
+    total=$((total + bytes))
+    count=$((count + 1))
+    lines+=("  ${f##*/}: ${bytes} bytes")
+  done
+  echo "--- [ci-execlog] job=${BUILDKITE_JOB_ID:-local} files=${count} total_bytes=${total}"
+  for f in ${lines[@]+"${lines[@]}"}; do
+    echo "$f"
+  done
+}
