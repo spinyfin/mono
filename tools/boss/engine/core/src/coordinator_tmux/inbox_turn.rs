@@ -7,12 +7,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub struct TurnObserver {
     pub(super) file: tokio::fs::File,
-    pub(super) message_id: String,
+    pub(super) message_ids: Vec<String>,
 }
 
 impl TurnObserver {
     pub async fn wait(self) {
-        let mut descendants = HashSet::from([self.message_id]);
+        let mut descendants = self.message_ids.into_iter().collect::<HashSet<_>>();
         let mut reader = BufReader::new(self.file);
         let mut line = Vec::new();
         loop {
@@ -53,7 +53,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let observer = TurnObserver {
             file: tokio::fs::File::open(&path).await.unwrap(),
-            message_id: "request".into(),
+            message_ids: vec!["request".into()],
         };
         let mut wait = Box::pin(observer.wait());
         let mut writer = tokio::fs::OpenOptions::new().append(true).open(&path).await.unwrap();
@@ -82,7 +82,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let observer = TurnObserver {
             file: tokio::fs::File::open(&path).await.unwrap(),
-            message_id: "request".into(),
+            message_ids: vec!["request".into()],
         };
         let answer =
             json!({"type":"assistant", "uuid":"answer", "parentUuid":"request", "message":{"stop_reason":"end_turn"}});

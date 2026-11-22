@@ -98,7 +98,11 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    tags = ["manual"],
+    # Runs on the machine that has the host tmux and its libraries: a copy of the client's tmux shipped to a worker cannot load libutf8proc/libevent/ncurses.
+    tags = [
+        "manual",
+        "no-remote-exec",
+    ],
     deps = [
         "//tools/boss/engine/host-enrollment",
         "//tools/boss/engine/host-execution",

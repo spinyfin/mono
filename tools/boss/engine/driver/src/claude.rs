@@ -792,6 +792,11 @@ impl AgentDriver for ClaudeDriver {
                 "Claude Code".into(),
                 "auto mode on".into(),
                 "bypass permissions on".into(),
+                // Footer under the default permission mode, which is what
+                // `--permission-mode auto` degrades to for a model that does
+                // not support auto mode. It can be the only Claude-specific
+                // text on screen once the startup banner has scrolled away.
+                "manual mode on".into(),
                 // Footer under the forced dontAsk mode (answer agent).
                 "don't ask on".into(),
                 "/effort".into(),
@@ -1550,6 +1555,7 @@ mod tests {
                 "Claude Code",
                 "auto mode on",
                 "bypass permissions on",
+                "manual mode on",
                 "don't ask on",
                 "/effort"
             ]

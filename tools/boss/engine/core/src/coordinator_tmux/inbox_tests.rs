@@ -8,6 +8,13 @@ fn claude_attribution_is_allowed_but_merged_drafts_and_other_messages_are_not() 
     assert!(!input_record_matches(&record, "other", "Write the handoff."));
     record["message"]["content"] = json!("operator draft Write the handoff.");
     assert!(!input_record_matches(&record, "message", "Write the handoff."));
+    // Newer Claude releases assign their own uuid; `origin.msg_id` correlates.
+    let own_uuid = json!({"type":"user", "uuid":"claude-assigned", "origin":{"kind":"peer", "msg_id":"message"},
+        "message":{"content":"Another Claude session sent a message:\nWrite the handoff.\n\nClaude attribution."}});
+    assert!(input_record_matches(&own_uuid, "message", "Write the handoff."));
+    assert!(!input_record_matches(&own_uuid, "other", "Write the handoff."));
+    let unattributed = json!({"type":"user", "uuid":"claude-assigned", "message":{"content":"Write the handoff."}});
+    assert!(!input_record_matches(&unattributed, "message", "Write the handoff."));
 }
 
 #[tokio::test]
