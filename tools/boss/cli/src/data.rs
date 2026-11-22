@@ -965,13 +965,16 @@ fn print_review_guide_run(ctx: &RunContext, run: &ReviewGuideRun) -> Result<(), 
     print_entity(ctx, run, || {
         println!("Review-guide run: {}", run.execution_id);
         println!(
-            "Attempt: {}  status={}  epoch={}",
-            run.attempt_id, run.status, run.request_epoch
+            "Attempt: {}  status={}  epoch={}  retries={}",
+            run.attempt_id, run.status, run.request_epoch, run.retries
         );
         println!("Series: {}", run.series_id);
         match &run.version_id {
             Some(version_id) => println!("Version: {version_id}"),
             None => println!("Version: (none published)"),
+        }
+        if let Some(error) = &run.error {
+            println!("Error: {error}");
         }
         println!("PR URL: {}", run.source.canonical_pr_url);
         println!("Comparison: {}", run.source.comparison_id);

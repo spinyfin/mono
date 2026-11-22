@@ -40,6 +40,7 @@ async fn deferred_scope_proposals_first_flag_skips_legacy_marker_when_a_proposal
     flags.load().unwrap();
     flags.set("worker_proposals", true).unwrap();
     flags.set("deferred_scope_proposals_seam", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
 
@@ -96,6 +97,7 @@ async fn deferred_scope_proposals_first_flag_falls_back_to_the_legacy_marker_and
     flags.load().unwrap();
     flags.set("worker_proposals", true).unwrap();
     flags.set("deferred_scope_proposals_seam", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
 
@@ -249,6 +251,7 @@ async fn followup_proposals_first_flag_dedupes_the_proposal_covered_item_but_sti
     flags.load().unwrap();
     flags.set("worker_proposals", true).unwrap();
     flags.set("followup_proposals_seam", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
 
@@ -307,6 +310,7 @@ async fn followup_proposals_first_flag_falls_back_to_legacy_detection_and_counts
     flags.load().unwrap();
     flags.set("worker_proposals", true).unwrap();
     flags.set("followup_proposals_seam", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
     let metrics = Arc::new(Registry::new());
     register_metrics(&metrics);
 

@@ -716,18 +716,25 @@ impl FeatureFlagsStore {
         )
     }
 
+    /// Override `name` in memory without writing the TOML file.
+    /// Fixtures that construct a store at an unwritable path use this so
+    /// default-on flags can be pinned off hermetically. Returns `Err` if
+    /// `name` is not a registered flag.
+    pub fn set_in_memory(&self, name: &str, enabled: bool) -> Result<()> {
+        if !REGISTRY.iter().any(|spec| spec.name == name) {
+            anyhow::bail!("unknown feature flag: {name}");
+        }
+        let mut guard = self.state.lock().expect("feature-flags lock poisoned");
+        guard.insert(name.to_owned(), enabled);
+        Ok(())
+    }
+
     /// Override `name` to `enabled` and atomically persist the new
     /// state to disk. Returns `Err` if `name` is not a registered
     /// flag (the debug pane sends only registered names, so this is
     /// effectively a programming-error path).
     pub fn set(&self, name: &str, enabled: bool) -> Result<()> {
-        if !REGISTRY.iter().any(|spec| spec.name == name) {
-            anyhow::bail!("unknown feature flag: {name}");
-        }
-        {
-            let mut guard = self.state.lock().expect("feature-flags lock poisoned");
-            guard.insert(name.to_owned(), enabled);
-        }
+        self.set_in_memory(name, enabled)?;
         self.write_to_disk()
     }
 
@@ -825,6 +832,16 @@ mod tests {
         let store = make_store(&tmp);
         let err = store.set("not_a_real_flag", true).unwrap_err();
         assert!(err.to_string().contains("not_a_real_flag"));
+    }
+
+    #[test]
+    fn set_in_memory_does_not_write_the_file() {
+        let store = FeatureFlagsStore::new(std::path::PathBuf::new());
+        store.set_in_memory("review_guide_source_capture", false).unwrap();
+        store.set_in_memory("review_guide_generation", false).unwrap();
+        assert!(!store.is_enabled("review_guide_source_capture"));
+        assert!(!store.is_enabled("review_guide_generation"));
+        assert!(!std::path::Path::new(".toml.tmp").exists());
     }
 
     #[test]

@@ -1618,8 +1618,8 @@ pub enum FrontendEvent {
         version_id: String,
         content: Option<ReviewGuideVersion>,
     },
-    /// Response to [`FrontendRequest::GetReviewGuideRun`]. Operator
-    /// inspection of one review-guide generation: phase timestamps and
+    /// Response to [`FrontendRequest::GetReviewGuideRun`]. Diagnostic
+    /// inspection of one review-guide generation run: phase timestamps and
     /// source/prompt/model identities. Unknown or non-guide executions
     /// reply `WorkError` instead.
     #[worker(passthrough)]

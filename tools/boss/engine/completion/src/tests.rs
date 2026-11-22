@@ -622,12 +622,7 @@ impl TestHarness {
         let flags = Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             flags_dir.path().join("feature-flags.toml"),
         ));
-        flags
-            .set(crate::review_guide_capture::REVIEW_GUIDE_SOURCE_CAPTURE_FLAG, false)
-            .unwrap();
-        flags
-            .set(crate::review_guide_capture::REVIEW_GUIDE_GENERATION_FLAG, false)
-            .unwrap();
+        crate::review_guide_capture::pin_review_guide_flags_off(&flags);
         let handler = WorkerCompletionHandler::new(
             db,
             detector,

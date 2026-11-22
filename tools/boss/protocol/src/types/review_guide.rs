@@ -3,7 +3,7 @@
 //! `RetryReviewGuide` RPC surface. Board/task detail replies use
 //! [`ReviewGuideSummary`] alone; only an opened viewer fetches
 //! [`ReviewGuideVersion`]'s full Markdown; [`ReviewGuideRun`] is the
-//! operator inspection payload. See
+//! diagnostic inspection payload for one generation run. See
 //! `tools/boss/docs/designs/automatic-pr-review-guides.md`.
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,11 @@ pub struct ReviewGuideSummary {
     /// `lifecycle` is not `"failed"` or the attempt stored no error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Latest bound `pr_review_guide` execution id for this series, when
+    /// one exists. Survives after the worker pane is gone, unlike
+    /// `bossctl agents list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 
 /// One immutable, validated guide version's full content. Returned by
@@ -70,6 +75,10 @@ pub struct ReviewGuideAttempt {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Bound `pr_review_guide` execution id, when the attempt has been
+    /// dispatched. Absent while the attempt is still queued and unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     /// Provider usage objects keyed by provider and transcript/message identity.
     /// Absent categories remain absent; no usage observation is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,10 +92,12 @@ pub struct ReviewGuideFindings {
     pub addendum_markdown: String,
 }
 
-/// Operator inspection of one review-guide generation run. Returned by
-/// `GetReviewGuideRun`. Phase timestamps are the durable columns on the
-/// attempt (`created_at` / `started_at` / `finished_at`) and version
-/// (`generated_at`); source identity is the pinned comparison packet.
+/// Diagnostic inspection of one review-guide generation run: phase
+/// timestamps and source/prompt/model identities. Returned by
+/// `GetReviewGuideRun`. Timestamps are the durable attempt
+/// (`created_at` / `started_at` / `finished_at`) and version
+/// (`generated_at`) columns; they are not independent phase clocks.
+/// Source identity is the pinned comparison packet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ReviewGuideRun {
@@ -97,10 +108,23 @@ pub struct ReviewGuideRun {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    /// Attempt failure text when `status` is `"failed"` (or cancelled with
+    /// a stored reason). Absent on a successful publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// How many times this attempt has been recorded as failed. Zero is
+    /// omitted on the wire.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    #[builder(default)]
+    pub retries: i64,
     pub source: ReviewGuideRunSource,
     pub prompt_version: String,
     pub model: ReviewGuideRunModel,
     pub timings: ReviewGuideRunTimings,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 /// Pinned comparison identity for [`ReviewGuideRun`].
@@ -128,22 +152,30 @@ pub struct ReviewGuideRunModel {
     pub effort: Option<String>,
 }
 
-/// Separate phase timestamps for [`ReviewGuideRun`].
+/// Durable attempt/version stamps for [`ReviewGuideRun`]. These are not
+/// independent phase clocks: bind-to-finish includes launch delay, and
+/// on success `finished_at` equals `published_at` because both are
+/// written with the same `now`. Source duration is not available.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ReviewGuideRunTimings {
-    /// `pr_review_guide_source_comparisons.captured_at`.
+    /// `pr_review_guide_source_comparisons.captured_at`. Packet capture
+    /// time; there is no separate source-start timestamp.
     pub source_captured_at: String,
     /// `pr_review_guide_attempts.created_at` — when the attempt was queued.
     pub queued_at: String,
-    /// `pr_review_guide_attempts.started_at`.
+    /// `pr_review_guide_attempts.started_at`. Stamped when the ready
+    /// execution is bound, before the worker launches, so bind-to-finish
+    /// includes scheduler/launch delay as well as model time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
-    /// `pr_review_guide_attempts.finished_at`.
+    /// `pr_review_guide_attempts.finished_at`. Terminal stamp of the
+    /// attempt (success, failure, cancel, or supersede).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
-    /// `pr_review_guide_versions.generated_at` — publication of the immutable
-    /// version, when one exists.
+    /// `pr_review_guide_versions.generated_at`. On a successful publish
+    /// this equals `finished_at` (same `now`); the derived publication
+    /// interval is therefore always zero and is not a measured phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
 }
@@ -180,5 +212,68 @@ mod tests {
             assert_eq!(root_task_id, "root");
             assert_eq!(idempotency_token, token);
         }
+    }
+
+    #[test]
+    fn review_guide_run_omits_zero_retries_and_keeps_error() {
+        let run = crate::ReviewGuideRun::builder()
+            .execution_id("exec_1")
+            .attempt_id("prga_1")
+            .series_id("prgs_1")
+            .request_epoch(1)
+            .status("failed")
+            .error("model refused")
+            .retries(1)
+            .source(
+                crate::ReviewGuideRunSource::builder()
+                    .comparison_id("prgc_1")
+                    .canonical_pr_url("https://github.com/acme/widget/pull/4")
+                    .observed_base_sha("base")
+                    .merge_base_sha("base")
+                    .head_sha("head")
+                    .packet_hash("abc")
+                    .build(),
+            )
+            .prompt_version("review-guide-v12")
+            .model(crate::ReviewGuideRunModel::default())
+            .timings(
+                crate::ReviewGuideRunTimings::builder()
+                    .source_captured_at("1")
+                    .queued_at("2")
+                    .build(),
+            )
+            .build();
+        let encoded = serde_json::to_value(&run).unwrap();
+        assert_eq!(encoded["error"], "model refused");
+        assert_eq!(encoded["retries"], 1);
+
+        let succeeded = crate::ReviewGuideRun::builder()
+            .execution_id("exec_1")
+            .attempt_id("prga_1")
+            .series_id("prgs_1")
+            .request_epoch(1)
+            .status("succeeded")
+            .source(
+                crate::ReviewGuideRunSource::builder()
+                    .comparison_id("prgc_1")
+                    .canonical_pr_url("https://github.com/acme/widget/pull/4")
+                    .observed_base_sha("base")
+                    .merge_base_sha("base")
+                    .head_sha("head")
+                    .packet_hash("abc")
+                    .build(),
+            )
+            .prompt_version("review-guide-v12")
+            .model(crate::ReviewGuideRunModel::default())
+            .timings(
+                crate::ReviewGuideRunTimings::builder()
+                    .source_captured_at("1")
+                    .queued_at("2")
+                    .build(),
+            )
+            .build();
+        let encoded = serde_json::to_value(&succeeded).unwrap();
+        assert!(encoded.get("error").is_none());
+        assert!(encoded.get("retries").is_none());
     }
 }

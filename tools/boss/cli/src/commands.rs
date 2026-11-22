@@ -2340,7 +2340,7 @@ pub(crate) struct ByExecArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ReviewGuideCommand {
-    /// Inspect one review-guide generation run: phase timings and
+    /// Inspect one review-guide generation run: phase timestamps and
     /// source, prompt, and model identities. Engine RPC over
     /// `GetReviewGuideRun`. JSON with `--json`.
     Show(ReviewGuideShowArgs),
@@ -2348,8 +2348,9 @@ pub(crate) enum ReviewGuideCommand {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ReviewGuideShowArgs {
-    /// The review-guide execution id (`exec_…`), as shown on the worker
-    /// pane and in `bossctl agents status` while the job is generating.
+    /// The review-guide execution id (`exec_…`) from `bossctl agents list`
+    /// then `bossctl agents status <slot-or-name>`, or the PR's root task
+    /// id after the job has finished.
     pub(crate) execution_id: String,
 }
 

@@ -416,6 +416,7 @@ async fn run_one_pass_uses_injected_enqueuer_for_pending_review() {
     ));
     flags.load().unwrap();
     flags.set("review_batch_fanout", true).unwrap();
+    crate::review_guide_capture::pin_review_guide_flags_off(&flags);
     let enqueuer = Arc::new(DeferredEnqueuer::default());
     // Arc forwarding is the same path used by the production scheduling loop.
     let handler = Arc::new(

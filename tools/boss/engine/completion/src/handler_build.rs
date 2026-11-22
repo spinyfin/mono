@@ -39,7 +39,17 @@ impl WorkerCompletionHandler {
             staged_revision_pushes: Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new()),
             staged_proposal_channel_errors: Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new()),
             staged_unobserved_commands: Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new()),
-            feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new())),
+            feature_flags: {
+                let store = Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new()));
+                // Production `app.rs` always replaces this store via
+                // `with_feature_flags`. Under test / test-support the empty-path
+                // default would otherwise inherit registry default-on for both
+                // review-guide flags and allocate GitHub collection in fixtures
+                // that never call `with_feature_flags`.
+                #[cfg(any(test, feature = "test-support"))]
+                crate::review_guide_capture::pin_review_guide_flags_off(&store);
+                store
+            },
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             merge_queue_timeline: None,
             branch_verifier_overridden: false,
@@ -365,9 +375,11 @@ impl WorkerCompletionHandler {
     /// handler so engine-wide flag toggles are observed by the
     /// completion path. `app.rs` calls this once at startup with the
     /// store loaded from `~/Library/Application Support/Boss/feature-flags.toml`.
-    /// Tests that don't invoke it get the default store (every flag
-    /// at its registry default). `TestHarness` pins the review-guide
-    /// flags off so ordinary completion tests stay hermetic.
+    /// Tests that don't invoke it keep the store from [`Self::new`]: under
+    /// test / test-support both review-guide flags are pinned off; every
+    /// other flag stays at its registry default. Fixtures that replace the
+    /// store must pin those two flags off unless the test is exercising
+    /// capture.
     pub fn with_feature_flags(mut self, flags: Arc<crate::feature_flags::FeatureFlagsStore>) -> Self {
         self.feature_flags = flags;
         self

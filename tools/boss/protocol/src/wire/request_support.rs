@@ -1,7 +1,5 @@
-//! Request-side support types for [`super::FrontendRequest`]: list
-//! predicates, unpopulate preservation, and serde defaults. Split out of
-//! `wire.rs` (and re-exported from it) to keep that module under the
-//! file-size limit; these are plain data carriers.
+//! Request-side list predicates, preservation result types, and serde
+//! defaults for [`super::FrontendRequest`]. Re-exported by the wire module.
 
 use serde::{Deserialize, Serialize};
 

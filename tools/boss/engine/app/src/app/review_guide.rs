@@ -208,7 +208,34 @@ fn load_review_guide_run(
     work_db: &boss_work_db::WorkDb,
     execution_id: &str,
 ) -> anyhow::Result<boss_protocol::ReviewGuideRun> {
-    let execution = work_db.get_execution(execution_id)?;
+    match work_db.get_execution(execution_id) {
+        Ok(execution) => load_review_guide_run_from_execution(work_db, execution_id, execution),
+        Err(err) => match load_latest_review_guide_run_for_root(work_db, execution_id)? {
+            Some(run) => Ok(run),
+            None => Err(err),
+        },
+    }
+}
+
+fn load_latest_review_guide_run_for_root(
+    work_db: &boss_work_db::WorkDb,
+    root_task_id: &str,
+) -> anyhow::Result<Option<boss_protocol::ReviewGuideRun>> {
+    let Some(summary) = work_db.get_pr_review_guide_summary_for_root(root_task_id)? else {
+        return Ok(None);
+    };
+    let Some(bound_execution_id) = summary.execution_id else {
+        anyhow::bail!("no review-guide execution is bound for this PR yet");
+    };
+    let execution = work_db.get_execution(&bound_execution_id)?;
+    load_review_guide_run_from_execution(work_db, &bound_execution_id, execution).map(Some)
+}
+
+fn load_review_guide_run_from_execution(
+    work_db: &boss_work_db::WorkDb,
+    execution_id: &str,
+    execution: boss_protocol::WorkExecution,
+) -> anyhow::Result<boss_protocol::ReviewGuideRun> {
     anyhow::ensure!(
         execution.kind == boss_protocol::ExecutionKind::PrReviewGuide,
         "execution {execution_id} is not a review-guide run"
@@ -238,6 +265,8 @@ fn wire_run(
         .request_epoch(attempt.request_epoch)
         .status(attempt.status)
         .maybe_version_id(version_id)
+        .maybe_error(attempt.error)
+        .retries(attempt.retries)
         .source(
             boss_protocol::ReviewGuideRunSource::builder()
                 .comparison_id(capture.comparison_id)
@@ -380,6 +409,7 @@ fn wire_attempt(attempt: boss_work_db::PrReviewGuideAttempt) -> boss_protocol::R
         .request_epoch(attempt.request_epoch)
         .status(attempt.status)
         .maybe_error(attempt.error)
+        .maybe_execution_id(attempt.execution_id)
         .maybe_provider_usage_json(attempt.provider_usage_json)
         .build()
 }

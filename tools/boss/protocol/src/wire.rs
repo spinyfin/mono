@@ -938,12 +938,12 @@ pub enum FrontendRequest {
         version_id: String,
     },
 
-    /// Operator inspection of one review-guide generation run, keyed by
-    /// its `pr_review_guide` execution id. Emits source/queue/generation/
-    /// publication timestamps and source, prompt, and model identities.
-    /// Replies with [`FrontendEvent::ReviewGuideRun`], or
-    /// [`FrontendEvent::WorkError`] when the execution is unknown or is
-    /// not a review-guide run.
+    /// Diagnostic inspection of one review-guide generation run: phase
+    /// timestamps and source/prompt/model identities. Keyed by the
+    /// `pr_review_guide` execution id, or by the PR's root task id (latest
+    /// bound guide execution on that root). Replies with
+    /// [`FrontendEvent::ReviewGuideRun`], or [`FrontendEvent::WorkError`]
+    /// when the id is unknown or is not a review-guide run.
     GetReviewGuideRun {
         execution_id: String,
     },

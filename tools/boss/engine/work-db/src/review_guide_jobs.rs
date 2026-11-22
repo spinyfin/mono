@@ -134,6 +134,8 @@ pub struct PrReviewGuideSummary {
     pub selected_comparison_id: Option<String>,
     pub readable_version_id: Option<String>,
     pub error: Option<String>,
+    /// Latest attempt's bound `pr_review_guide` execution id, when one exists.
+    pub execution_id: Option<String>,
 }
 
 /// One guide re-enqueued by [`WorkDb::reenqueue_pre_start_failed_review_guides`].
@@ -1440,7 +1442,11 @@ fn query_pr_review_guide_summary_for_root(
         &format!(
             "SELECT s.id, s.root_task_id, s.canonical_pr_url, s.guide_lifecycle, s.request_epoch,
                 s.selected_comparison_id, s.readable_version_id,
-                {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL}
+                {REVIEW_GUIDE_LATEST_TERMINAL_ERROR_SQL},
+                (SELECT a.execution_id FROM pr_review_guide_attempts a
+                 WHERE a.series_id = s.id
+                 ORDER BY a.request_epoch DESC, a.ordinal DESC, a.created_at DESC, a.id DESC
+                 LIMIT 1)
          FROM pr_review_guide_source_series s
          WHERE s.root_task_id = ?1 AND (?2 IS NULL OR s.canonical_pr_url = ?2) AND (?3 IS NULL OR s.id = ?3)
          ORDER BY s.latest_observation_sequence DESC, s.id DESC LIMIT 1"
@@ -1456,6 +1462,7 @@ fn query_pr_review_guide_summary_for_root(
                 selected_comparison_id: row.get(5)?,
                 readable_version_id: row.get(6)?,
                 error: row.get(7)?,
+                execution_id: row.get(8)?,
             })
         },
     )
@@ -1473,6 +1480,7 @@ pub fn to_wire_review_guide_summary(summary: PrReviewGuideSummary) -> boss_proto
         .maybe_selected_comparison_id(summary.selected_comparison_id)
         .maybe_readable_version_id(summary.readable_version_id)
         .maybe_error(summary.error)
+        .maybe_execution_id(summary.execution_id)
         .build()
 }
 

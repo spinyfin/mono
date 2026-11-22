@@ -119,8 +119,8 @@ fn seed_ready_guide(server_state: &ServerState) -> (String, String, String) {
 
 /// Seed a published guide whose attempt is bound to an execution, with spawn
 /// config stamped — the inspection RPC's happy path. Returns
-/// `(execution_id, attempt_id, version_id)`.
-fn seed_inspectable_guide(server_state: &ServerState) -> (String, String, String) {
+/// `(root_task_id, execution_id, attempt_id, version_id)`.
+fn seed_inspectable_guide(server_state: &ServerState) -> (String, String, String, String) {
     let db = &server_state.work_db;
     let product = create_product(db);
     let root = create_active_chore(db, &product, "inspectable guide root");
@@ -152,7 +152,34 @@ fn seed_inspectable_guide(server_state: &ServerState) -> (String, String, String
     else {
         panic!("expected the seed attempt to publish")
     };
-    (execution.id, attempt.id, version.id)
+    (root, execution.id, attempt.id, version.id)
+}
+
+/// Bound attempt that failed after launch — inspection must surface `error`
+/// and `retries`.
+fn seed_failed_guide(server_state: &ServerState) -> (String, String) {
+    let db = &server_state.work_db;
+    let product = create_product(db);
+    let root = create_active_chore(db, &product, "failed guide root");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget' WHERE id = ?1",
+            [&root],
+        )
+        .unwrap();
+    let (series_id, comparison_id) = seed_review_guide_series(db, &root);
+    let attempt = db
+        .create_pr_review_guide_attempt(&series_id, &comparison_id, "review-guide-v12")
+        .unwrap();
+    let execution = db
+        .create_pr_review_guide_execution(&comparison_id, "https://github.com/acme/widget")
+        .unwrap();
+    db.bind_pr_review_guide_attempt_execution(&attempt.id, &execution.id)
+        .unwrap();
+    db.fail_pr_review_guide_attempt(&attempt.id, "model refused the session")
+        .unwrap();
+    (execution.id, attempt.id)
 }
 
 #[tokio::test]
@@ -199,7 +226,7 @@ async fn summary_and_content_reflect_a_ready_guide() {
 #[tokio::test]
 async fn run_inspection_emits_phase_timings_and_identities() {
     let (server_state, _dir) = test_server_state();
-    let (execution_id, attempt_id, version_id) = seed_inspectable_guide(&server_state);
+    let (root, execution_id, attempt_id, version_id) = seed_inspectable_guide(&server_state);
 
     let event = get_run(&server_state, &execution_id).await;
     let FrontendEvent::ReviewGuideRun { run } = event else {
@@ -209,6 +236,8 @@ async fn run_inspection_emits_phase_timings_and_identities() {
     assert_eq!(run.attempt_id, attempt_id);
     assert_eq!(run.version_id.as_deref(), Some(version_id.as_str()));
     assert_eq!(run.status, "succeeded");
+    assert!(run.error.is_none());
+    assert_eq!(run.retries, 0);
     assert_eq!(run.prompt_version, "review-guide-v12");
     assert_eq!(run.model.driver.as_deref(), Some("codex"));
     assert_eq!(run.model.model.as_deref(), Some("gpt-6-astra"));
@@ -223,6 +252,37 @@ async fn run_inspection_emits_phase_timings_and_identities() {
     assert!(run.timings.started_at.is_some());
     assert!(run.timings.finished_at.is_some());
     assert!(run.timings.published_at.is_some());
+
+    let event = get_summary(&server_state, &root).await;
+    let FrontendEvent::ReviewGuideSummary { summary } = event else {
+        panic!("expected ReviewGuideSummary, got {event:?}");
+    };
+    let summary = summary.expect("a published guide must report a summary");
+    assert_eq!(summary.execution_id.as_deref(), Some(execution_id.as_str()));
+
+    let by_root = get_run(&server_state, &root).await;
+    let FrontendEvent::ReviewGuideRun { run: by_root_run } = by_root else {
+        panic!("expected ReviewGuideRun for a root task id, got {by_root:?}");
+    };
+    assert_eq!(by_root_run.execution_id, execution_id);
+    assert_eq!(by_root_run.attempt_id, attempt_id);
+}
+
+#[tokio::test]
+async fn run_inspection_includes_attempt_error_and_retries_on_failure() {
+    let (server_state, _dir) = test_server_state();
+    let (execution_id, attempt_id) = seed_failed_guide(&server_state);
+
+    let event = get_run(&server_state, &execution_id).await;
+    let FrontendEvent::ReviewGuideRun { run } = event else {
+        panic!("expected ReviewGuideRun, got {event:?}");
+    };
+    assert_eq!(run.execution_id, execution_id);
+    assert_eq!(run.attempt_id, attempt_id);
+    assert_eq!(run.status, "failed");
+    assert_eq!(run.error.as_deref(), Some("model refused the session"));
+    assert_eq!(run.retries, 1);
+    assert!(run.version_id.is_none());
 }
 
 #[tokio::test]
@@ -307,6 +367,7 @@ async fn retry_creates_a_fresh_attempt_and_repeats_idempotently() {
     assert_eq!(bound.len(), 1);
     assert_eq!(bound[0].id, first_attempt.id);
     let execution_id = bound[0].execution_id.clone().expect("retry must bind an execution");
+    assert_eq!(first_attempt.execution_id.as_deref(), Some(execution_id.as_str()));
     assert_eq!(first_attempt.status, "running");
 
     // A repeated call with the SAME idempotency token must return the
