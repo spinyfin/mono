@@ -317,7 +317,8 @@ async fn stop_is_token_verified_and_leaves_siblings() {
 /// hosts (including remote macOS workers) `hermetic_test_wrapper.sh` seals
 /// `PATH` to the audited runtime without it. `install_fixture_claude` writes
 /// the fixture into the private home's `.nix-profile/bin` and prepends that
-/// directory to `PATH` before any test starts a private `tmux` server.
+/// directory to `PATH` before a fixture-dependent test starts its private
+/// `tmux` server.
 /// `FIXTURE_MODE=exit` makes it quit without reading the brief; otherwise it
 /// satisfies the relay's readiness markers, shows the paste placeholder once it
 /// has read a whole paste (the relay sends Return only then), and appends every
@@ -359,8 +360,9 @@ fn install_fixture_claude() {
             } else {
                 format!("{}:{old_path}", bin.display())
             };
-            // SAFETY: called once inside `live_tmux` before any test spawns a
-            // tmux server or reads `PATH` concurrently.
+            // SAFETY: environment reads and process spawns in this test binary
+            // use std (including tokio's std-backed process spawning), which
+            // serializes them with set_var. No foreign code reads getenv here.
             unsafe { std::env::set_var("PATH", new_path) };
         }
     });
