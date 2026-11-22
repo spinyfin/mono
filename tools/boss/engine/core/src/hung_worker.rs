@@ -7,8 +7,18 @@ use crate::driver::ProgressFidelity;
 use crate::semantic_progress::{SemanticProgressCheckpoint, SemanticToolCondition, SemanticTurnCondition};
 use boss_protocol::{LiveWorkerState, WorkerActivity};
 
-pub(crate) const FIRST_RESPONSE_SECS: i64 = 600;
-pub(crate) const NEXT_RESPONSE_SECS: i64 = 900;
+pub const FIRST_RESPONSE_SECS: i64 = 600;
+pub const NEXT_RESPONSE_SECS: i64 = 900;
+
+/// Threshold (seconds) before a silent in-turn worker is flagged as hung.
+pub fn hang_threshold_secs(checkpoint: Option<&SemanticProgressCheckpoint>, signals: HungSignals) -> i64 {
+    let yielded = checkpoint.is_some_and(|c| c.tool_condition == SemanticToolCondition::Yielded);
+    if yielded || signals.tool_completed_since_prompt {
+        NEXT_RESPONSE_SECS
+    } else {
+        FIRST_RESPONSE_SECS
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HungSignals {
@@ -25,6 +35,7 @@ pub fn hung_since(
     signals: HungSignals,
     now: i64,
 ) -> Option<String> {
+    let threshold = hang_threshold_secs(checkpoint, signals);
     let checkpoint = checkpoint?;
     let yielded = checkpoint.tool_condition == SemanticToolCondition::Yielded;
     if signals.held
@@ -39,11 +50,6 @@ pub fn hung_since(
     if checkpoint.turn_condition != SemanticTurnCondition::InTurn {
         return None;
     }
-    let threshold = if yielded || signals.tool_completed_since_prompt {
-        NEXT_RESPONSE_SECS
-    } else {
-        FIRST_RESPONSE_SECS
-    };
     // Yielded commands stay protected from destructive stale-worker reaping.
     // For this warning only, control has returned to the model. The shared
     // classifier uses a strict cutoff; subtract one second for this inclusive boundary.

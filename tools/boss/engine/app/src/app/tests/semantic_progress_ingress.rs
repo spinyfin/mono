@@ -948,10 +948,28 @@ mod hung_workers {
     async fn agy_with_exited_background_task_is_flagged_despite_unmatched_running_row() {
         let (state, dir) = test_server_state();
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        let (exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(RUNNING_TRANSCRIPT));
-        state
-            .agy_background_tasks
-            .force_liveness(&exec_id, boss_engine_driver::agy::BackgroundTaskLiveness::Exited);
+        let task_log_path = dir.path().join("task-2.log");
+        {
+            let file = std::fs::File::create(&task_log_path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60))
+                .unwrap();
+        }
+        let transcript = format!(
+            "{}\n{}\n{}\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"gh pr checks --watch"}}]}"#,
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!(
+                    "Tool is running as a background task with task id: cid-1/task-2\nTask logs are available at: file://{}\n",
+                    task_log_path.display()
+                ),
+            }),
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for background task."}"#,
+        );
+        let (_exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(&transcript));
 
         let mut previous = HashMap::new();
         assert!(state.refresh_hung_workers(&mut previous));

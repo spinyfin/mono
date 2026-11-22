@@ -911,8 +911,8 @@ struct ServerState {
     /// run lacks the field. See [`TranscriptPathCache`] for why this
     /// is the structural fix for the 2026-05-12 incident.
     transcript_path_cache: Arc<boss_engine_runtime::live_status_loop::TranscriptPathCache>,
-    #[builder(default = Arc::new(boss_engine_driver::agy::BackgroundTaskScanCache::new()))]
-    agy_background_tasks: Arc<boss_engine_driver::agy::BackgroundTaskScanCache>,
+    #[builder(default = Arc::new(boss_engine_completion::agy_background_task::BackgroundTaskScanCache::new()))]
+    agy_background_tasks: Arc<boss_engine_completion::agy_background_task::BackgroundTaskScanCache>,
     /// Incremental transcript tails and cumulative raw usage per execution.
     /// The dispatcher snapshots these counters to `work_runs` before any
     /// completion gate, preserving spend for runs that become orphaned.

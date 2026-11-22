@@ -100,20 +100,7 @@ pub mod raw {
         cursor: &Cursor,
         max_bytes: usize,
     ) -> Result<Chunk, TailError> {
-        let containment = root
-            .map(|root| {
-                let (canonical_root, root_identity, file_identity) = verify_initial_containment(path, root)?;
-                if cursor.root_identity.is_some_and(|old| old != root_identity) {
-                    return Err(TailError::Containment("transcript root changed identity".into()));
-                }
-                Ok(TranscriptContainment {
-                    root: root.into(),
-                    canonical_root,
-                    root_identity,
-                    file_identity,
-                })
-            })
-            .transpose()?;
+        let containment = check_root_containment(path, root, cursor.root_identity)?;
         let mut file = open_no_follow(path).await?;
         let metadata = file.metadata().await?;
         if let Some(containment) = &containment {
@@ -126,18 +113,11 @@ pub mod raw {
             ));
         }
         let identity = file_identity(&metadata);
-        let mut next = cursor.clone();
-        let replaced = cursor.identity.is_some_and(|old| old != identity)
-            || metadata.len() < cursor.offset
-            || match &cursor.checkpoint {
-                Some(checkpoint) => !checkpoint_matches(&mut file, checkpoint).await?,
-                None => cursor.offset != 0,
-            };
-        if replaced {
-            next.offset = 0;
-            next.generation += 1;
-        }
-        let offset = next.offset;
+        let checkpoint_ok = match &cursor.checkpoint {
+            Some(checkpoint) => checkpoint_matches(&mut file, checkpoint).await?,
+            None => cursor.offset == 0,
+        };
+        let (mut next, offset, replaced) = prepare_next_cursor(cursor, &metadata, identity, checkpoint_ok);
         file.seek(SeekFrom::Start(offset)).await?;
         let count = metadata.len().saturating_sub(offset).min(max_bytes as u64);
         let mut data = Vec::with_capacity(count as usize);
@@ -156,6 +136,91 @@ pub mod raw {
             previous_size: cursor.observed_size,
             observed_size: metadata.len(),
         })
+    }
+
+    /// Synchronous counterpart to [`read_contained`] for callers on non-async
+    /// threads (such as periodic worker-liveness sweeps).
+    pub fn read_contained_sync(
+        path: &Path,
+        root: Option<&Path>,
+        cursor: &Cursor,
+        max_bytes: usize,
+    ) -> Result<Chunk, TailError> {
+        use std::io::{Read, Seek};
+
+        let containment = check_root_containment(path, root, cursor.root_identity)?;
+        let mut file = open_no_follow_sync(path)?;
+        let metadata = file.metadata()?;
+        if let Some(containment) = &containment {
+            verify_opened_containment_sync(path, containment, &metadata)?;
+        }
+        let named = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() || !same_file_identity(&metadata, &named) {
+            return Err(TailError::Containment(
+                "transcript must be a single-link regular file".into(),
+            ));
+        }
+        let identity = file_identity(&metadata);
+        let checkpoint_ok = match &cursor.checkpoint {
+            Some(checkpoint) => checkpoint_matches_sync(&mut file, checkpoint)?,
+            None => cursor.offset == 0,
+        };
+        let (mut next, offset, replaced) = prepare_next_cursor(cursor, &metadata, identity, checkpoint_ok);
+        file.seek(SeekFrom::Start(offset))?;
+        let count = metadata.len().saturating_sub(offset).min(max_bytes as u64);
+        let mut data = Vec::with_capacity(count as usize);
+        (&mut file).take(count).read_to_end(&mut data)?;
+        next.offset += data.len() as u64;
+        next.identity = Some(identity);
+        next.root_identity = containment.map(|c| c.root_identity);
+        next.observed_size = metadata.len();
+        next.checkpoint = read_checkpoint_sync(&mut file, next.offset)?;
+        Ok(Chunk {
+            eof: next.offset == metadata.len(),
+            cursor: next,
+            offset,
+            data,
+            replaced,
+            previous_size: cursor.observed_size,
+            observed_size: metadata.len(),
+        })
+    }
+
+    fn prepare_next_cursor(
+        cursor: &Cursor,
+        metadata: &std::fs::Metadata,
+        identity: FileIdentity,
+        checkpoint_ok: bool,
+    ) -> (Cursor, u64, bool) {
+        let mut next = cursor.clone();
+        let replaced =
+            cursor.identity.is_some_and(|old| old != identity) || metadata.len() < cursor.offset || !checkpoint_ok;
+        if replaced {
+            next.offset = 0;
+            next.generation += 1;
+        }
+        let offset = next.offset;
+        (next, offset, replaced)
+    }
+
+    fn check_root_containment(
+        path: &Path,
+        root: Option<&Path>,
+        expected_root_identity: Option<FileIdentity>,
+    ) -> Result<Option<TranscriptContainment>, TailError> {
+        root.map(|root| {
+            let (canonical_root, root_identity, file_identity) = verify_initial_containment(path, root)?;
+            if expected_root_identity.is_some_and(|old| old != root_identity) {
+                return Err(TailError::Containment("transcript root changed identity".into()));
+            }
+            Ok(TranscriptContainment {
+                root: root.into(),
+                canonical_root,
+                root_identity,
+                file_identity,
+            })
+        })
+        .transpose()
     }
 }
 
@@ -383,6 +448,34 @@ async fn checkpoint_matches(file: &mut fs::File, checkpoint: &FileCheckpoint) ->
     }
 }
 
+fn checkpoint_matches_sync(file: &mut std::fs::File, checkpoint: &FileCheckpoint) -> io::Result<bool> {
+    use std::io::{Read, Seek};
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut current_prefix = vec![0; checkpoint.prefix.len()];
+    if let Err(error) = file.read_exact(&mut current_prefix) {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if current_prefix != checkpoint.prefix {
+        return Ok(false);
+    }
+    if checkpoint.suffix_start == 0 {
+        return Ok(true);
+    }
+
+    file.seek(SeekFrom::Start(checkpoint.suffix_start))?;
+    let mut current_suffix = vec![0; checkpoint.suffix.len()];
+    match file.read_exact(&mut current_suffix) {
+        Ok(_) => Ok(current_suffix == checkpoint.suffix),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 async fn read_checkpoint(file: &mut fs::File, offset: u64) -> io::Result<Option<FileCheckpoint>> {
     if offset == 0 {
         return Ok(None);
@@ -399,6 +492,33 @@ async fn read_checkpoint(file: &mut fs::File, offset: u64) -> io::Result<Option<
         file.seek(SeekFrom::Start(suffix_start)).await?;
         let mut suffix = vec![0; length as usize];
         file.read_exact(&mut suffix).await?;
+        suffix
+    };
+    Ok(Some(FileCheckpoint {
+        prefix,
+        suffix_start,
+        suffix,
+    }))
+}
+
+fn read_checkpoint_sync(file: &mut std::fs::File, offset: u64) -> io::Result<Option<FileCheckpoint>> {
+    use std::io::{Read, Seek};
+
+    if offset == 0 {
+        return Ok(None);
+    }
+    let length = offset.min(CHECKPOINT_BYTES);
+    file.seek(SeekFrom::Start(0))?;
+    let mut prefix = vec![0; length as usize];
+    file.read_exact(&mut prefix)?;
+
+    let suffix_start = offset - length;
+    let suffix = if suffix_start == 0 {
+        prefix.clone()
+    } else {
+        file.seek(SeekFrom::Start(suffix_start))?;
+        let mut suffix = vec![0; length as usize];
+        file.read_exact(&mut suffix)?;
         suffix
     };
     Ok(Some(FileCheckpoint {
@@ -443,48 +563,65 @@ async fn open_no_follow(path: &Path) -> io::Result<fs::File> {
     options.open(path).await
 }
 
-async fn verify_opened_containment(
-    path: &Path,
+fn open_no_follow_sync(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn validate_root_containment(
     containment: &TranscriptContainment,
-    opened: &std::fs::Metadata,
+    root_meta: &std::fs::Metadata,
+    canonical_root: &Path,
 ) -> Result<(), TailError> {
-    let root_meta = fs::symlink_metadata(&containment.root).await?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(TailError::Containment(format!(
             "root {} was replaced",
             containment.root.display()
         )));
     }
-    let canonical_root = fs::canonicalize(&containment.root).await?;
     if canonical_root != containment.canonical_root {
         return Err(TailError::Containment(format!(
             "root {} changed identity",
             containment.root.display()
         )));
     }
-    if file_identity(&root_meta) != containment.root_identity {
+    if file_identity(root_meta) != containment.root_identity {
         return Err(TailError::Containment(format!(
             "root {} was replaced in place",
             containment.root.display()
         )));
     }
+    Ok(())
+}
 
-    let path_meta = fs::symlink_metadata(path).await?;
+fn validate_file_containment(
+    path: &Path,
+    containment: &TranscriptContainment,
+    canonical_root: &Path,
+    path_meta: &std::fs::Metadata,
+    canonical_path: &Path,
+    opened: &std::fs::Metadata,
+) -> Result<(), TailError> {
     if path_meta.file_type().is_symlink() || !path_meta.is_file() || !opened.is_file() {
         return Err(TailError::Containment(format!(
             "path {} is no longer a real file",
             path.display()
         )));
     }
-    let canonical_path = fs::canonicalize(path).await?;
-    if !canonical_path.starts_with(&canonical_root) {
+    if !canonical_path.starts_with(canonical_root) {
         return Err(TailError::Containment(format!(
             "path {} escaped root {}",
             canonical_path.display(),
             canonical_root.display()
         )));
     }
-    if !same_file_identity(opened, &path_meta) {
+    if !same_file_identity(opened, path_meta) {
         return Err(TailError::Containment(format!(
             "opened file {} differs from the persisted path",
             path.display()
@@ -497,6 +634,32 @@ async fn verify_opened_containment(
         )));
     }
     Ok(())
+}
+
+async fn verify_opened_containment(
+    path: &Path,
+    containment: &TranscriptContainment,
+    opened: &std::fs::Metadata,
+) -> Result<(), TailError> {
+    let root_meta = fs::symlink_metadata(&containment.root).await?;
+    let canonical_root = fs::canonicalize(&containment.root).await?;
+    validate_root_containment(containment, &root_meta, &canonical_root)?;
+    let path_meta = fs::symlink_metadata(path).await?;
+    let canonical_path = fs::canonicalize(path).await?;
+    validate_file_containment(path, containment, &canonical_root, &path_meta, &canonical_path, opened)
+}
+
+fn verify_opened_containment_sync(
+    path: &Path,
+    containment: &TranscriptContainment,
+    opened: &std::fs::Metadata,
+) -> Result<(), TailError> {
+    let root_meta = std::fs::symlink_metadata(&containment.root)?;
+    let canonical_root = std::fs::canonicalize(&containment.root)?;
+    validate_root_containment(containment, &root_meta, &canonical_root)?;
+    let path_meta = std::fs::symlink_metadata(path)?;
+    let canonical_path = std::fs::canonicalize(path)?;
+    validate_file_containment(path, containment, &canonical_root, &path_meta, &canonical_path, opened)
 }
 
 #[cfg(unix)]
