@@ -433,6 +433,11 @@ def emit(decision, reason=None):
         r#"
 def conversation_scratch_path(candidate, cwd, payload):
     # The root comes from engine-owned hook wiring, never the payload.
+    # POSIX bracket classes Python's glob does not model (`[[:`, `[^`) can
+    # expand to a name the worker created as a link out of scratch, so those
+    # spellings keep the data-dir check.
+    if "[[:" in candidate or "[^" in candidate:
+        return False
     base = conversation_scratch_base(os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
     return conversation_scratch_contains(canonical(candidate, cwd), base)
 
@@ -470,6 +475,7 @@ def main():
 
     raw_command = ""
     tokens = []
+    creates_link = False
     if tool == "Bash":
         command = tool_input.get("command")
         if not isinstance(command, str):
@@ -486,6 +492,24 @@ def main():
         except Exception:
             tokens = command.split()
         candidates.extend(tokens)
+        # Creating a link inside the conversation allowance is how a later
+        # (or same-command) read walks out of scratch. Do not skip scratch
+        # operands of `ln` / `cp -s` / `cp -l`.
+        for part in re.split(r"[;&|]+", command):
+            words = part.split()
+            if not words:
+                continue
+            prog = os.path.basename(words[0])
+            if prog == "ln":
+                creates_link = True
+                break
+            if prog == "cp" and any(
+                w in ("-s", "--symbolic-link", "-l", "--link")
+                or (w.startswith("-") and not w.startswith("--") and ("s" in w[1:] or "l" in w[1:]))
+                for w in words[1:]
+            ):
+                creates_link = True
+                break
         # Worker shells do not inherit BOSS_DATA_DIR. Any expansion of
         # $BOSS_DATA_DIR or ${BOSS_DATA_DIR} is therefore empty or
         # attacker-controlled, while expandvars still resolves this process's
@@ -512,7 +536,7 @@ def main():
     scratch_candidates = []
     for candidate in candidates:
         try:
-            if conversation_scratch_path(candidate, cwd, payload):
+            if not creates_link and conversation_scratch_path(candidate, cwd, payload):
                 scratch_candidates.append(candidate)
                 continue
             if is_inside(canonical(candidate, cwd), data_dir):

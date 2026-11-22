@@ -139,3 +139,38 @@ fn conversation_allowance_is_scoped_in_both_path_and_substring_checks() {
         "block"
     );
 }
+
+#[test]
+fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("Boss state");
+    let sessions = data.join("executions/run/transcripts/agy/sessions");
+    std::fs::create_dir_all(sessions.join("c1/scratch")).unwrap();
+    std::fs::write(data.join("state.db"), "secret\n").unwrap();
+    let brain = tmp.path().join("brain");
+    std::os::unix::fs::symlink(&sessions, &brain).unwrap();
+    std::os::unix::fs::symlink(&data, sessions.join("c1/scratch/up")).unwrap();
+    let scratch = brain.join("c1/scratch");
+    for command in [
+        format!("ln -s ../../../../../../.. {}/climb", scratch.display()),
+        format!("cat {}/[[:lower:]]p/state.db", scratch.display()),
+        format!(
+            "ln -s ../../../../../../.. {}/climb && cat {}/climb/state.db",
+            scratch.display(),
+            scratch.display()
+        ),
+    ] {
+        assert_eq!(
+            verdict(
+                &data,
+                &brain,
+                json!({
+                    "session_id": "c1", "tool_name": "Bash",
+                    "tool_input": {"command": command}
+                })
+            ),
+            "block",
+            "{command}"
+        );
+    }
+}

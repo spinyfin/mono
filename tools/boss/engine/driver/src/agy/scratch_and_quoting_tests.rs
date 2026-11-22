@@ -381,6 +381,8 @@ fn quoted_heredoc_and_single_quoted_python_bodies_are_data() {
     let fx = Fixture::new("run-quoted-python");
     fx.install(WorkerKind::Standard);
     seed_conversation(&fx);
+    fs::write(fx.workspace().join("script.py"), "print(1)\n").unwrap();
+    fs::write(fx.workspace().join("script<name.py"), "print(1)\n").unwrap();
     let scratch = conversation_dir(&fx).join("scratch");
     let scratch = scratch.display().to_string();
     let body = python_body(&scratch);
@@ -528,4 +530,138 @@ fn shell_bodies_are_still_inspected_and_python_bodies_are_not_run_as_shell() {
         assert_command_denied(&fx, command);
     }
     assert_command_allowed(&fx, "python3 -c 'print(`1`)  # not shell'");
+}
+
+fn relative_from(from_dir: &Path, to: &Path) -> PathBuf {
+    let from = fs::canonicalize(from_dir).unwrap();
+    let to = if to.exists() {
+        fs::canonicalize(to).unwrap()
+    } else {
+        to.to_path_buf()
+    };
+    let mut cursor = from.as_path();
+    let mut up = PathBuf::new();
+    loop {
+        if to.starts_with(cursor) {
+            return up.join(to.strip_prefix(cursor).unwrap());
+        }
+        match cursor.parent() {
+            Some(parent) => {
+                up.push("..");
+                cursor = parent;
+            }
+            None => return up.join(&to),
+        }
+    }
+}
+
+#[test]
+fn same_command_symlink_in_scratch_cannot_reach_protected_state() {
+    let fx = Fixture::new("run-scratch-ln-same");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let to_data = relative_from(&scratch, &data);
+    let to_hooks = relative_from(&scratch, &hooks);
+    let home_scratch = format!("$HOME/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch");
+    for command in [
+        format!(
+            "ln -s {} {}/up && cat {}/up/state.db",
+            to_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "ln -s {} {}/hooks && cat {}/hooks",
+            to_hooks.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "ln -s {} {home_scratch}/up && cat {home_scratch}/up/state.db",
+            to_data.display(),
+        ),
+        format!("ln -s {} {}/up", to_data.display(), scratch.display()),
+        format!("cp -s {} {}/up", to_data.display(), scratch.display()),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn two_command_bracket_glob_cannot_read_through_scratch_link() {
+    let fx = Fixture::new("run-scratch-ln-two");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    std::os::unix::fs::symlink(&data, scratch.join("up")).unwrap();
+    std::os::unix::fs::symlink(&hooks, scratch.join("hooks.json")).unwrap();
+    for command in [
+        format!("cat {}/[[:lower:]]p/state.db", scratch.display()),
+        format!("cat {}/[[:lower:]]ooks.json", scratch.display()),
+        format!("cat $HOME/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch/[[:lower:]]p/state.db"),
+        format!("cat ~/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch/[[:lower:]]ooks.json"),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn python_bodies_cannot_open_settings_hooks_or_other_conversations() {
+    let fx = Fixture::new("run-python-body-scan");
+    fx.install(WorkerKind::Standard);
+    seed_conversation(&fx);
+    let settings = fx.process_home.join(".gemini/antigravity-cli/settings.json");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let other = brain(&fx).join("c2/scratch/x.py");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::write(&other, "print(1)\n").unwrap();
+    let scratch = conversation_dir(&fx).join("scratch");
+    fs::write(scratch.join("lib.rs"), "fn main() {}\n").unwrap();
+    for command in [
+        format!("python3 -c 'print(open(\"{}\").read())'", settings.display()),
+        format!("python3 -c 'print(open(\"{}\").read())'", hooks.display()),
+        format!("python3 -c 'print(open(\"{}\").read())'", other.display()),
+        format!("python3 - <<'PY'\nprint(open(\"{}\").read())\nPY", settings.display()),
+        format!("python3 - <<'PY'\nprint(open(\"{}\").read())\nPY", other.display()),
+        "python3 -c 'print(open(\"~/.gemini/antigravity-cli/settings.json\").read())'".to_owned(),
+        "python3 -c 'print(open(\"$HOME/.gemini/config/hooks.json\").read())'".to_owned(),
+        "python3 -c 'print(open(\"$HOME/.gemini/antigravity-cli/brain/c2/scratch/x.py\").read())'".to_owned(),
+    ] {
+        let reason = assert_command_denied(&fx, &command);
+        assert!(
+            reason.contains("protected") || reason.contains("denied"),
+            "{command}: {reason}"
+        );
+    }
+    assert_command_allowed(
+        &fx,
+        &format!("python3 -c 'print(open(\"{}/lib.rs\").read())'", scratch.display()),
+    );
+    assert_command_allowed(
+        &fx,
+        &format!(
+            "python3 - <<'PY'\nprint(open(\"{}/lib.rs\").read())\nPY",
+            scratch.display()
+        ),
+    );
+}
+
+#[test]
+fn unquoted_heredoc_apostrophe_does_not_hide_arithmetic() {
+    let fx = Fixture::new("run-unquoted-apostrophe");
+    fx.install(WorkerKind::Standard);
+    let reason = assert_command_denied(&fx, "cat <<EOF\ndon't\nEOF\nx='a''[$(id)]'\n(( x ))");
+    assert!(
+        reason.contains("cannot be inspected") || reason.contains("denied") || reason.contains("substitution"),
+        "{reason}"
+    );
 }
