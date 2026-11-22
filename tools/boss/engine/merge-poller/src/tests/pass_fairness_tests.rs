@@ -13,7 +13,7 @@
 
 use crate::work::{LatePrCandidate, ReviewBatchDispatch};
 use boss_observation_contracts::ReviewBatchEnqueuer;
-use boss_protocol::{FrontendEvent, WorkExecution};
+use boss_protocol::FrontendEvent;
 
 use super::*;
 
@@ -553,14 +553,7 @@ impl CompletionRequests for SlowRecheckHandler {
         0
     }
     async fn force_release(&self, _execution_id: &str) {}
-    async fn record_parent_pr_merge_cancellation(
-        &self,
-        _execution: &WorkExecution,
-        _prior_status: ExecutionStatus,
-        _chain_root_id: &str,
-    ) {
-    }
-    async fn force_stop_execution(&self, _execution_id: &str) {}
+    async fn force_stop_execution_as(&self, _execution_id: &str, _actor: boss_protocol::StatusActor, _reason: &str) {}
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {
         tokio::time::sleep(UPKEEP).await;
         self.calls.rechecked.lock().unwrap().push(execution_id.to_owned());
