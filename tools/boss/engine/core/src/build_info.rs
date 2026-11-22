@@ -12,9 +12,8 @@
 //! values to this library through [`install_provenance`] as the first
 //! thing it does at startup. Until (or unless) that happens the readers
 //! return the same `"unknown"` / `false` placeholders a Cargo (non-Bazel)
-//! build gets. [`version_string`] (the `--version` text) uses the
-//! installed provenance version, which on a tagged release is the same
-//! `1.0.N` the CLI leaf crate reports.
+//! build gets. `--version` is handled in the `engine` binary crate via
+//! `boss_build_info::version_string`, before `engine_lib` runs.
 //!
 //! Why a hand-off instead of a plain dependency: a Rust crate's compiled
 //! output changes whenever its source changes, and the stamped source
@@ -112,18 +111,6 @@ static PROVENANCE: ProvenanceCell = ProvenanceCell::new();
 /// recompiling the library or re-executing its tests (see module docs).
 pub fn install_provenance(provenance: Provenance) -> Result<(), Provenance> {
     PROVENANCE.install(provenance)
-}
-
-/// Format the canonical `--version` string for a bundled Boss binary.
-///
-/// Output: `<name> <version>`, e.g. `boss-engine 1.0.4` on a stamped
-/// release build (after [`install_provenance`]), `boss-engine 0.0.0-dev`
-/// on an unstamped engine binary, `boss-engine unknown` in library
-/// tests that never install provenance. The value is not compiled into
-/// this crate: a new `boss-v*` tag relinks the engine binary without
-/// recompiling `engine_lib`.
-pub fn version_string(binary_name: &str) -> String {
-    format!("{binary_name} {}", PROVENANCE.get().version)
 }
 
 /// Stamped Boss version for forensic surfaces: `1.0.N` on a release
@@ -351,17 +338,6 @@ mod tests {
         assert_eq!(stamped_or_unknown("unknown"), "unknown");
         assert_eq!(stamped_or_unknown("1.0.694"), "1.0.694");
         assert_eq!(stamped_or_unknown("1.0.694-dev-abc"), "1.0.694-dev-abc");
-    }
-
-    #[test]
-    fn version_string_is_placeholder_when_unstamped() {
-        // engine_lib_test never installs provenance, so this is the
-        // unstamped placeholder. The engine binary installs provenance
-        // before --version (0.0.0-dev unstamped, 1.0.N on a tagged
-        // release). A --stamp embed of the CLI leaf crate is covered by
-        // //tools/boss/installer:build_info_stamp_test.
-        let s = version_string("boss-engine");
-        assert_eq!(s, "boss-engine unknown");
     }
 
     #[test]

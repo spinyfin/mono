@@ -1,8 +1,8 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
-rust_binary(
-    name = "bossctl",
+rust_library(
+    name = "bossctl_lib",
     srcs = [
         "src/agents.rs",
         "src/agents_tests.rs",
@@ -18,8 +18,8 @@ rust_binary(
         "src/focus.rs",
         "src/homes.rs",
         "src/hosts.rs",
+        "src/lib.rs",
         "src/logs.rs",
-        "src/main.rs",
         "src/pause.rs",
         "src/probe.rs",
         "src/progression.rs",
@@ -33,17 +33,13 @@ rust_binary(
         "src/work_wait.rs",
         "src/work_wait_tests.rs",
     ],
+    crate_name = "bossctl",
+    crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    # Version comes from the boss_build_info leaf crate, not from this
-    # crate's own compile. stamp = 0 so --config=release does not feed
-    # stable-status.txt into this rustc action; a new tag recompiles the
-    # leaf and relinks this binary.
-    stamp = 0,
-    visibility = ["//visibility:public"],
+    visibility = ["//tools/boss/engine/core:__pkg__"],
     deps = [
         "//tools/boss/backoff",
-        "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/command-runner",
         "//tools/boss/engine/core:engine_lib",
@@ -55,18 +51,35 @@ rust_binary(
     ] + all_crate_deps(normal = True),
 )
 
+rust_binary(
+    name = "bossctl",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    edition = "2024",
+    # Version comes from the boss_build_info leaf crate, not from this
+    # crate's own compile. stamp = 0 so --config=release does not feed
+    # stable-status.txt into this rustc action; a new tag recompiles the
+    # leaf and relinks this binary over the cached bossctl_lib.
+    stamp = 0,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":bossctl_lib",
+        "//tools/boss/build-info",
+    ],
+)
+
 rust_test(
     name = "bossctl_test",
     size = "small",
-    crate = ":bossctl",
+    crate = ":bossctl_lib",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
     deps = [
         "//tools/boss/backoff",
-        "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/command-runner",
         "//tools/boss/engine/core:engine_lib",

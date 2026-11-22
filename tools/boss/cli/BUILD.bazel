@@ -33,14 +33,35 @@ rust_library(
     ),
 )
 
+rust_library(
+    name = "boss_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "boss",
+    crate_root = "src/lib.rs",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/boss/engine/core:__pkg__"],
+    deps = [
+        "//lib/rust/git_utils",
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/engine/editorial",
+        "//tools/boss/engine/utils",
+        "//tools/boss/github",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(normal = True),
+)
+
 rust_binary(
     name = "boss",
-    srcs = glob(["src/**/*.rs"]),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
     # Version comes from the boss_build_info leaf crate, not from this
     # crate's own compile. stamp = 0 so --config=release does not feed
     # stable-status.txt into this rustc action; a new tag recompiles the
-    # leaf and relinks this binary.
+    # leaf and relinks this binary over the cached boss_lib.
     stamp = 0,
     visibility = [
         "//tools/boss/engine/spoke-worker-api:__pkg__",
@@ -51,15 +72,9 @@ rust_binary(
         "//tools/boss/installer:__pkg__",
     ],
     deps = [
-        "//lib/rust/git_utils",
+        ":boss_lib",
         "//tools/boss/build-info",
-        "//tools/boss/client",
-        "//tools/boss/engine/core:engine_lib",
-        "//tools/boss/engine/editorial",
-        "//tools/boss/engine/utils",
-        "//tools/boss/github",
-        "//tools/boss/protocol",
-    ] + all_crate_deps(normal = True),
+    ],
 )
 
 rust_test(
@@ -73,10 +88,10 @@ rust_test(
         "//tools/boss/app-macos:handoff_prompt_source",
         "//tools/boss/engine/core:handoff_reset_prompt_source",
     ],
-    crate = ":boss",
+    crate = ":boss_lib",
     # rustc_env $(execpath) expansion requires these as declared
     # prerequisites of the test rule; compile_data alone is not enough
-    # when `crate =` wraps the production binary.
+    # when `crate =` wraps the library.
     data = [
         "//tools/boss/app-macos:handoff_prompt_source",
         "//tools/boss/engine/core:handoff_reset_prompt_source",
@@ -89,9 +104,9 @@ rust_test(
         "HANDOFF_SYSTEM_PROMPT": "$(execpath //tools/boss/app-macos:handoff_prompt_source)",
         "HANDOFF_RESET_PROMPT": "$(execpath //tools/boss/engine/core:handoff_reset_prompt_source)",
     },
+    visibility = ["//tools/boss/engine/core:__pkg__"],
     deps = [
         "//lib/rust/git_utils",
-        "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
         "//tools/boss/engine/editorial",

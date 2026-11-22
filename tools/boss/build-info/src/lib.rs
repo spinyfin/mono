@@ -4,13 +4,12 @@
 //! (`//tools/boss/installer:build_info_rs`) embeds the tag-derived
 //! release version when `--stamp` / `--config=release` is set, so the
 //! crate's compiled `.rlib` changes on every new `boss-v*` tag. Anything
-//! that compiles against it recompiles too. That is why `engine_lib` /
-//! `runtime` / `app` never depend on this crate: the `engine` binary
-//! links it (and `boss_build_provenance`) and hands values through
-//! `boss_engine::build_info` at startup. `boss` and `bossctl` do depend
-//! on it — they are the CLI binaries, and a new tag recompiles this
-//! crate plus those two binary crates and relinks, not the engine
-//! libraries.
+//! that compiles against it recompiles too. That is why `engine_lib`,
+//! `runtime`, `app`, `boss_lib`, and `bossctl_lib` never depend on this
+//! crate: the `engine`, `boss`, and `bossctl` binaries are thin 1-file
+//! crates that link it (and, for `engine`, `boss_build_provenance`), so
+//! a new tag recompiles only this leaf crate and relinks those
+//! binaries, leaving all library crates cached.
 //!
 //! Unstamped (`--nostamp`, the default) compiles the constant
 //! `0.0.0-dev` placeholder so a new tag does not change this crate's
@@ -86,15 +85,12 @@ mod tests {
     }
 
     #[test]
-    fn version_is_placeholder_or_fixture() {
-        // Unstamped Bazel: 0.0.0-dev. Cargo: unknown. Always-stamped
-        // sibling crate (build-info-stamped): the 1.0.42 fixture.
-        let v = version();
-        assert!(
-            v == "0.0.0-dev" || v == "unknown" || v == "1.0.42",
-            "unexpected stamped version {v}"
-        );
-        assert_ne!(v, "0.0.0");
-        assert!(!v.is_empty());
+    fn version_matches_expected_stamp() {
+        // Under Bazel, each test target passes BOSS_EXPECTED_VERSION
+        // ("0.0.0-dev" for unstamped build-info_test, "1.0.42" for
+        // build-info-stamped_test). Under Cargo (unset), build.rs
+        // provides "unknown".
+        let expected = option_env!("BOSS_EXPECTED_VERSION").unwrap_or("unknown");
+        assert_eq!(version(), expected);
     }
 }

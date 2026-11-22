@@ -34,7 +34,6 @@ rust_library(
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/cli:__pkg__",
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/installer:__pkg__",
     ],
 )
 
@@ -43,6 +42,9 @@ rust_test(
     size = "small",
     crate = ":build-info",
     edition = "2024",
+    rustc_env = {
+        "BOSS_EXPECTED_VERSION": "0.0.0-dev",
+    },
 )
 
 # Always-stamped sibling, used only by build_info_stamp_test / the
@@ -69,6 +71,9 @@ rust_test(
     size = "small",
     crate = ":build-info-stamped",
     edition = "2024",
+    rustc_env = {
+        "BOSS_EXPECTED_VERSION": "1.0.42",
+    },
 )
 
 # Production (follows --stamp) and always-stamped probes. stamp = 0 so

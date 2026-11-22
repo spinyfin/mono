@@ -790,10 +790,14 @@ sh_test(
 # legitimately links build-info).
 genquery(
     name = "engine_lib_test_stamped_deps",
-    expression = 'filter("//tools/boss/(build-provenance:|build-info:|installer:build_provenance_rs|installer:build_info_rs)", deps(set(//tools/boss/engine/core:engine_lib_test //tools/boss/engine/core:engine_lib))) + filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(//tools/boss/engine/app:app_test))',
+    expression = 'filter("//tools/boss/(build-provenance:|build-info:|installer:build_provenance_rs|installer:build_info_rs)", deps(set(//tools/boss/engine/core:engine_lib_test //tools/boss/engine/core:engine_lib //tools/boss/cli:boss_lib //tools/boss/cli:boss_test //tools/boss/bossctl:bossctl_lib //tools/boss/bossctl:bossctl_test))) + filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(//tools/boss/engine/app:app_test))',
     scope = [
         ":engine_lib_test",
         ":engine_lib",
+        "//tools/boss/cli:boss_lib",
+        "//tools/boss/cli:boss_test",
+        "//tools/boss/bossctl:bossctl_lib",
+        "//tools/boss/bossctl:bossctl_test",
         "//tools/boss/engine/app:app_test",
     ],
 )
@@ -806,6 +810,21 @@ genquery(
     scope = [":engine"],
 )
 
+# Guard: bundled production binaries must keep stamp = 0 so --config=release
+# does not feed stable-status.txt directly into their rustc actions.
+genquery(
+    name = "bundled_binaries_default_stamp",
+    expression = 'attr("stamp", "^-1$", set(//tools/boss/cli:boss //tools/boss/bossctl:bossctl //tools/boss/engine/core:engine //tools/cube:cube //tools/repobin:repobin //tools/boss/event-shim:boss-event))',
+    scope = [
+        "//tools/boss/cli:boss",
+        "//tools/boss/bossctl",
+        ":engine",
+        "//tools/cube",
+        "//tools/repobin",
+        "//tools/boss/event-shim:boss-event",
+    ],
+)
+
 sh_test(
     name = "stamped_provenance_isolation_test",
     size = "small",
@@ -813,10 +832,12 @@ sh_test(
     args = [
         "$(location :engine_lib_test_stamped_deps)",
         "$(location :engine_binary_stamped_deps)",
+        "$(location :bundled_binaries_default_stamp)",
         "$(location //:.bazelrc)",
         "$(location //:.ci.bazelrc)",
     ],
     data = [
+        ":bundled_binaries_default_stamp",
         ":engine_binary_stamped_deps",
         ":engine_lib_test_stamped_deps",
         "//:.bazelrc",
