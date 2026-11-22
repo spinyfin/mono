@@ -180,7 +180,8 @@ fn exec_command(parsed_input: &Value) -> Option<String> {
 
 /// Whether a cell script is positively identified as starting no command: a
 /// `write_stdin` poll of an existing session, or a compute-only cell that
-/// uses cell builtins or known non-shell `tools.*` helpers.
+/// uses cell builtins, known non-shell `tools.*` helpers, or unambiguous
+/// JavaScript cell syntax with no command-bearing tool.
 fn is_non_command_cell(source: &str) -> bool {
     cell::script_is_continuation_only(source) || cell::script_is_compute_only(source)
 }
@@ -463,6 +464,8 @@ mod tests {
             "const v = `a ${1 + 1} b`;\ntext(v);",
             r#"await tools.view_image({path:"/tmp/image.png"});"#,
             r#"await tools.apply_patch("*** Begin Patch\n*** End Patch");"#,
+            "await new Promise(r => setTimeout(r, 5000));",
+            "const values = [1, 2, 3].map(n => n * 2);",
         ] {
             let call = canonical_exec_script(source);
             assert!(!call.issues_command, "script: {source}");
@@ -474,6 +477,32 @@ mod tests {
         assert!(canonical_exec_script("const t = tools; text(t);").issues_command);
         assert!(canonical_exec_script(r#"text(await tools.unknown_helper({}));"#).issues_command);
         assert!(canonical_exec_script("echo hi").issues_command);
+        assert!(canonical_exec_script("sleep 5; echo done").issues_command);
+    }
+
+    #[test]
+    fn write_stdin_mixed_with_computed_or_aliased_tools_access_issues_a_command() {
+        assert!(
+            canonical_exec_script(concat!(
+                r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+                r#" await tools["exec_command"]({cmd:"sleep 999"});"#,
+            ))
+            .issues_command
+        );
+        assert!(
+            canonical_exec_script(concat!(
+                r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+                " const t = tools; await t[n]();",
+            ))
+            .issues_command
+        );
+        assert!(
+            canonical_exec_script(concat!(
+                r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+                r#" await tools.unknown_helper({});"#,
+            ))
+            .issues_command
+        );
     }
 
     #[test]
@@ -499,6 +528,17 @@ mod tests {
         assert_recovers_sleep_999(concat!(
             r#"await tools.write_stdin({session_id:8467,chars:""});"#,
             " const n = {a:1} / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" if (x) {} /\/*/.test(s); "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " for (const n of xs) { n++; }\n",
+            "/`/.test(out) && text(\"x\"); ",
             r#"await tools.exec_command({cmd:"sleep 999"});"#,
         ));
     }

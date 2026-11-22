@@ -567,16 +567,40 @@ impl RolloutCallTracker {
                 // session id even when this output is not a cell envelope.
                 // Completing that origin requires positive terminal evidence;
                 // a bare running chunk, unified-exec "still running" prose,
-                // or a poll error must leave it open.
-                if origin != call_id {
+                // or a poll error must leave it open. The same check applies
+                // when a non-command write_stdin poll resolves to itself
+                // (sessions were drained at an earlier turn boundary):
+                // "Process running" is not a terminal result.
+                let self_resolved_write_stdin = origin == call_id
+                    && self
+                        .calls
+                        .get(call_id)
+                        .is_some_and(|call| !call.issues_command && is_write_stdin_poll(call));
+                if origin != call_id || self_resolved_write_stdin {
                     match command_output_kind(output) {
                         CommandOutputKind::Terminal => {}
                         CommandOutputKind::Running => {
-                            self.calls.remove(call_id);
+                            if origin != call_id {
+                                self.calls.remove(call_id);
+                            } else {
+                                self.remember_open_poll(
+                                    &origin,
+                                    call_id,
+                                    session_id.as_deref().or(call_session_id.as_deref()),
+                                );
+                            }
                             return Ok(OutputDisposition::StillRunning { cell_id: None });
                         }
                         CommandOutputKind::Unconfirmed => {
-                            self.calls.remove(call_id);
+                            if origin != call_id {
+                                self.calls.remove(call_id);
+                            } else {
+                                self.remember_open_poll(
+                                    &origin,
+                                    call_id,
+                                    session_id.as_deref().or(call_session_id.as_deref()),
+                                );
+                            }
                             let call = self
                                 .calls
                                 .get(&origin)
@@ -1649,6 +1673,20 @@ mod tests {
         let mut tracker = RolloutCallTracker::default();
         tracker
             .observe_call(
+                "wrap",
+                cell_exec("wrap", r#"text(await tools.exec_command({cmd:"slow build"}));"#),
+            )
+            .unwrap();
+        tracker.observe_output("wrap", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let first: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(first, ["slow build"]);
+
+        tracker
+            .observe_call(
                 "poll",
                 cell_exec(
                     "poll",
@@ -1663,6 +1701,22 @@ mod tests {
             .filter_map(abandoned_call_display)
             .collect();
         assert_eq!(flagged, ["write_stdin poll (no terminal result observed)"]);
+    }
+
+    #[test]
+    fn a_self_resolved_direct_write_stdin_running_poll_stays_open() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("poll", write_stdin_call("poll", 8467)).unwrap();
+        assert!(matches!(
+            tracker.observe_output("poll", &json!("Process running with session ID 8467")),
+            Ok(OutputDisposition::StillRunning { .. })
+        ));
+        let flagged: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(flagged, ["write_stdin session 8467 (no terminal result observed)"]);
     }
 
     #[test]

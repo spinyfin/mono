@@ -274,11 +274,13 @@ pub fn script_issues_command(source: &str) -> bool {
 /// Whether `source` is a cell that only polls an existing shell session.
 ///
 /// A wrapper that starts a command and then polls it with `write_stdin` is
-/// command-bearing, not this. A plain argv/string `exec` input (`echo hi`)
-/// is also not this: it never mentions `write_stdin` and still issues a
-/// command.
+/// command-bearing, not this — including when the command is reached through
+/// computed `tools[...]` access, an unknown `tools.*` member, or a `tools`
+/// alias, which [`script_issues_command`] does not see. A plain argv/string
+/// `exec` input (`echo hi`) is also not this: it never mentions `write_stdin`
+/// and still issues a command.
 pub fn script_is_continuation_only(source: &str) -> bool {
-    find_js_call(source, "write_stdin").is_some() && !script_issues_command(source)
+    find_js_call(source, "write_stdin").is_some() && !script_mentions_command_tool(source)
 }
 
 /// Cell builtins that compute, print or stash data without running a command.
@@ -293,23 +295,60 @@ const NON_COMMAND_CELL_TOOLS: &[&str] = &["write_stdin", "apply_patch", "view_im
 
 /// Whether `source` is positively a cell script that runs no command: it
 /// calls a cell builtin (`text`, `load`, `store`, `notify`) or a known
-/// non-shell `tools.*` helper, and never reaches a command-bearing tool
-/// (`exec_command`, `shell`, computed `tools[...]`, an unknown `tools.*`
-/// name, or a `tools` alias).
+/// non-shell `tools.*` helper, or it is unambiguous JavaScript cell syntax
+/// (`await`, a `const`/`let` declaration, or `=>`) with no `write_stdin`
+/// poll, and it never reaches a command-bearing tool (`exec_command`,
+/// `shell`, computed `tools[...]`, an unknown `tools.*` name, or a `tools`
+/// alias).
 ///
 /// Such a cell is ordinary code-mode work, not a shell command, so it must not
 /// be announced or drained as one with its JavaScript as the "command". A
-/// string that does not look like a cell (`echo hi`) is not this.
+/// string that does not look like a cell (`echo hi`, `sleep 5; echo done`)
+/// is not this.
 pub fn script_is_compute_only(source: &str) -> bool {
     if script_mentions_command_tool(source) {
         return false;
     }
-    CELL_BUILTIN_CALLS
+    if CELL_BUILTIN_CALLS
         .iter()
         .any(|name| find_js_call(source, name).is_some())
         || NON_COMMAND_CELL_TOOLS
             .iter()
             .any(|name| *name != "write_stdin" && find_js_call(source, name).is_some())
+    {
+        return true;
+    }
+    find_js_call(source, "write_stdin").is_none() && script_has_unambiguous_js_cell_syntax(source)
+}
+
+/// Unambiguous JavaScript cell syntax that is not a shell one-liner: a
+/// top-level `await`, a `const`/`let` declaration, or an arrow `=>`.
+/// String, comment and regex bodies are skipped so `echo hi` and
+/// `sleep 5; echo done` stay shell.
+fn script_has_unambiguous_js_cell_syntax(source: &str) -> bool {
+    let mut lexer = JsLexer::new(source);
+    while let Some((at, ch)) = lexer.next_code() {
+        if ch == '=' && source.get(at + 1..).is_some_and(|rest| rest.starts_with('>')) {
+            return true;
+        }
+        if !js_ident_part(ch) || ch.is_ascii_digit() {
+            continue;
+        }
+        let rest = &source[at..];
+        let ident_len = rest.find(|c: char| !js_ident_part(c)).unwrap_or(rest.len());
+        let ident = &rest[..ident_len];
+        if ident == "await" {
+            return true;
+        }
+        if (ident == "const" || ident == "let")
+            && let Some((_, next)) = lexer.next_code()
+            && js_ident_part(next)
+            && !next.is_ascii_digit()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `source` names a command-bearing helper anywhere in code (not only
@@ -475,13 +514,23 @@ fn js_ident_boundary_at(source: &str, at: usize) -> bool {
 }
 
 /// Last significant token seen by [`JsLexer`], used only to tell a regex
-/// literal from division.
+/// literal from division, and a `{` from an object literal vs a statement
+/// block.
 #[derive(Clone, Copy)]
 enum LastJsToken {
     Start,
     Word { start: usize, end: usize },
     Operand,
-    RegexPunct,
+    Punct(char),
+}
+
+/// An unmatched `{` still open in [`JsLexer`]: a template `${` substitution,
+/// an object literal, or a statement block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenFrame {
+    Template,
+    Object,
+    Block,
 }
 
 /// A single forward pass over JavaScript cell source that yields only *code*:
@@ -499,9 +548,11 @@ struct JsLexer<'a> {
     source: &'a str,
     chars: Peekable<std::str::CharIndices<'a>>,
     last: LastJsToken,
-    depth: usize,
-    /// Brace depth at which each open template `${` substitution began.
-    template_depths: Vec<usize>,
+    /// Unmatched `{` frames, innermost last. A template `${` is closed by
+    /// returning to template text; an object literal's `}` is an operand so
+    /// `/` after `{a:1}` is division; a statement block's `}` leaves
+    /// regex-allowed state so a `/` starting the next statement is a regex.
+    frames: Vec<OpenFrame>,
 }
 
 impl<'a> JsLexer<'a> {
@@ -510,8 +561,7 @@ impl<'a> JsLexer<'a> {
             source,
             chars: source.char_indices().peekable(),
             last: LastJsToken::Start,
-            depth: 0,
-            template_depths: Vec::new(),
+            frames: Vec::new(),
         }
     }
 
@@ -521,7 +571,7 @@ impl<'a> JsLexer<'a> {
     /// identifier, number, string or closing bracket.
     fn regex_allowed(&self) -> bool {
         match self.last {
-            LastJsToken::Start | LastJsToken::RegexPunct => true,
+            LastJsToken::Start | LastJsToken::Punct(_) => true,
             LastJsToken::Word { start, end } => matches!(
                 self.source.get(start..end),
                 Some(
@@ -544,6 +594,17 @@ impl<'a> JsLexer<'a> {
         }
     }
 
+    /// Whether `{` here opens an object literal (`=`, `(`, `,`, `:`, or
+    /// `return`) rather than a statement block (start, `;`, `{`, `}`, `)`,
+    /// `=>`, `else`/`do` and similar).
+    fn opens_object_literal(&self) -> bool {
+        match self.last {
+            LastJsToken::Word { start, end } => matches!(self.source.get(start..end), Some("return")),
+            LastJsToken::Punct(ch) => matches!(ch, '=' | '(' | ',' | ':'),
+            _ => false,
+        }
+    }
+
     /// Skip template-literal text up to the closing backtick, or up to and
     /// including a `${` that opens a code substitution.
     fn skip_template_text(&mut self) {
@@ -561,9 +622,8 @@ impl<'a> JsLexer<'a> {
                 }
                 '$' if self.chars.peek().map(|&(_, next)| next) == Some('{') => {
                     self.chars.next();
-                    self.template_depths.push(self.depth);
-                    self.depth += 1;
-                    self.last = LastJsToken::RegexPunct;
+                    self.frames.push(OpenFrame::Template);
+                    self.last = LastJsToken::Punct('{');
                     return;
                 }
                 _ => {}
@@ -588,7 +648,7 @@ impl<'a> JsLexer<'a> {
                         self.last = LastJsToken::Operand;
                     }
                     _ => {
-                        self.last = LastJsToken::RegexPunct;
+                        self.last = LastJsToken::Punct('/');
                         return Some((at, ch));
                     }
                 },
@@ -599,22 +659,31 @@ impl<'a> JsLexer<'a> {
                 '`' => self.skip_template_text(),
                 ch if ch.is_whitespace() => {}
                 '{' => {
-                    self.depth += 1;
-                    self.last = LastJsToken::RegexPunct;
+                    self.frames.push(if self.opens_object_literal() {
+                        OpenFrame::Object
+                    } else {
+                        OpenFrame::Block
+                    });
+                    self.last = LastJsToken::Punct('{');
                     return Some((at, ch));
                 }
                 '}' => {
-                    self.depth = self.depth.saturating_sub(1);
-                    if self.template_depths.last() == Some(&self.depth) {
-                        self.template_depths.pop();
-                        self.skip_template_text();
-                    } else {
-                        // Closing a block or object is an operand, so `/`
-                        // after `}` is division rather than a regex that
-                        // would skip later commands. Unclear slashes fail
-                        // toward division so a later command stays visible.
-                        self.last = LastJsToken::Operand;
-                        return Some((at, ch));
+                    match self.frames.pop() {
+                        Some(OpenFrame::Template) => self.skip_template_text(),
+                        kind => {
+                            // An object literal's `}` is an operand, so `/`
+                            // after `{a:1}` is division. A statement block's
+                            // `}` is regex-allowed, so a `/` starting the next
+                            // statement is a regex (and its body is skipped)
+                            // rather than code that can open a comment or
+                            // template.
+                            self.last = if kind == Some(OpenFrame::Object) {
+                                LastJsToken::Operand
+                            } else {
+                                LastJsToken::Punct('}')
+                            };
+                            return Some((at, ch));
+                        }
                     }
                 }
                 ')' | ']' => {
@@ -638,7 +707,7 @@ impl<'a> JsLexer<'a> {
                     return Some((at, ch));
                 }
                 ch if ch.is_ascii() => {
-                    self.last = LastJsToken::RegexPunct;
+                    self.last = LastJsToken::Punct(ch);
                     return Some((at, ch));
                 }
                 // Non-ASCII punctuation is not a reliable regex opener; fail
@@ -1169,6 +1238,29 @@ mod tests {
     }
 
     #[test]
+    fn division_after_a_regex_with_a_comment_lookalike_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\nconst r = s.replace(/\\/*/g, \"\");\n",
+            r#"const half = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn division_after_a_regex_with_escaped_slashes_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const u = url.replace(/\/\//g, "/"); const n = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
     fn division_after_a_block_comment_does_not_hide_a_later_exec_command() {
         let source = concat!(
             r#"await tools.write_stdin({session_id:8467,chars:""});"#,
@@ -1235,6 +1327,31 @@ mod tests {
     }
 
     #[test]
+    fn a_regex_after_a_block_with_a_comment_lookalike_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" if (x) {} /\/*/.test(s); "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_regex_after_a_block_with_a_backtick_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " for (const n of xs) { n++; }\n",
+            "/`/.test(out) && text(\"x\"); ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
     fn a_non_shell_tools_cell_without_a_builtin_is_compute_only() {
         let source = r#"await tools.view_image({path:"/tmp/image.png"});"#;
         assert!(script_is_compute_only(source));
@@ -1257,6 +1374,36 @@ mod tests {
         assert!(script_is_compute_only(
             r#"await tools.apply_patch("*** Begin Patch\n*** End Patch");"#
         ));
+    }
+
+    #[test]
+    fn helper_free_javascript_cells_are_compute_only() {
+        assert!(script_is_compute_only("await new Promise(r => setTimeout(r, 5000));"));
+        assert!(script_is_compute_only("const values = [1, 2, 3].map(n => n * 2);"));
+        assert!(!script_is_compute_only("echo hi"));
+        assert!(!script_is_compute_only("sleep 5; echo done"));
+        let poll = r#"const p = await tools.write_stdin({session_id:8467,chars:""});"#;
+        assert!(!script_is_compute_only(poll));
+        assert!(script_is_continuation_only(poll));
+    }
+
+    #[test]
+    fn write_stdin_with_computed_or_aliased_tools_access_is_not_a_continuation() {
+        let computed = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" await tools["exec_command"]({cmd:"sleep 999"});"#,
+        );
+        assert!(!script_is_continuation_only(computed));
+        let alias = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const t = tools; await t[n]();",
+        );
+        assert!(!script_is_continuation_only(alias));
+        let unknown = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" await tools.unknown_helper({});"#,
+        );
+        assert!(!script_is_continuation_only(unknown));
     }
 
     #[test]

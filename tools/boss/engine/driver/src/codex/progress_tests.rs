@@ -809,6 +809,47 @@ fn a_non_shell_tools_cell_emits_no_unobserved_command_at_task_complete() {
 }
 
 #[test]
+fn a_helper_free_compute_cell_emits_no_unobserved_command_at_task_complete() {
+    for (call_id, script) in [
+        ("call-timeout", "await new Promise(r => setTimeout(r, 5000));"),
+        ("call-map", "const values = [1, 2, 3].map(n => n * 2);"),
+    ] {
+        let mut session = cell_harness_session();
+        session
+            .normalize_progress_events(&cell_exec_call(call_id, script))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_completed_output(call_id, "ok"))
+            .unwrap();
+        let boundary = session.normalize_progress_events(&task_complete_event()).unwrap();
+        assert!(
+            matches!(boundary.as_slice(), [WorkerEvent::Stop { .. }]),
+            "helper-free compute must not drain as an unobserved command ({script}): {boundary:?}"
+        );
+    }
+}
+
+#[test]
+fn a_plain_echo_hi_cell_is_still_flagged_unobserved_at_task_complete() {
+    let mut session = cell_harness_session();
+    session
+        .normalize_progress_events(&cell_exec_call("call-echo", "echo hi"))
+        .unwrap();
+    session
+        .normalize_progress_events(&cell_completed_output("call-echo", "hi\n"))
+        .unwrap();
+    let boundary = session.normalize_progress_events(&task_complete_event()).unwrap();
+    assert!(
+        matches!(
+            boundary.as_slice(),
+            [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+                if message == &crate::codex::unobserved_command_notification("echo hi")
+        ),
+        "a shell one-liner must still issue a command: {boundary:?}"
+    );
+}
+
+#[test]
 fn a_cross_turn_poll_is_flagged_unobserved_at_the_second_task_complete() {
     let mut session = cell_harness_session();
     session
@@ -847,6 +888,92 @@ fn a_cross_turn_poll_is_flagged_unobserved_at_the_second_task_complete() {
                 )
         ),
         "turn 2 must flag the self-resolved poll: {second:?}"
+    );
+}
+
+#[test]
+fn a_cross_turn_dynamic_session_poll_that_yields_is_flagged_at_the_second_task_complete() {
+    let mut session = cell_harness_session();
+    session
+        .normalize_progress_events(&cell_exec_call(
+            "call-wrap",
+            r#"text(await tools.exec_command({cmd:"slow build"}));"#,
+        ))
+        .unwrap();
+    session
+        .normalize_progress_events(&cell_completed_output("call-wrap", P6_RUNNING_CHUNK))
+        .unwrap();
+    session.normalize_progress_events(&task_complete_event()).unwrap();
+
+    session.normalize_progress_events(&task_started_event()).unwrap();
+    session
+        .normalize_progress_events(&cell_exec_call(
+            "call-poll",
+            r#"text(await tools.write_stdin({session_id: load("run").session_id, chars:""}));"#,
+        ))
+        .unwrap();
+    session
+        .normalize_progress_events(&cell_yield_output("call-poll", 3))
+        .unwrap();
+    let second = session.normalize_progress_events(&task_complete_event()).unwrap();
+    assert!(
+        matches!(
+            second.as_slice(),
+            [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+                if message == &crate::codex::unobserved_command_notification(
+                    "write_stdin poll (no terminal result observed)"
+                )
+        ),
+        "turn 2 must flag a yielded dynamic-session poll: {second:?}"
+    );
+}
+
+#[test]
+fn a_self_resolved_direct_write_stdin_running_poll_is_flagged_at_the_second_task_complete() {
+    let mut session = cell_harness_session();
+    session
+        .normalize_progress_events(&cell_exec_call(
+            "call-wrap",
+            r#"text(await tools.exec_command({cmd:"slow build"}));"#,
+        ))
+        .unwrap();
+    session
+        .normalize_progress_events(&cell_completed_output("call-wrap", P6_RUNNING_CHUNK))
+        .unwrap();
+    session.normalize_progress_events(&task_complete_event()).unwrap();
+
+    session.normalize_progress_events(&task_started_event()).unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call",
+                "name":"write_stdin",
+                "call_id":"call-poll",
+                "arguments":"{\"session_id\":8467,\"chars\":\"\"}"
+            }
+        }))
+        .unwrap();
+    session
+        .normalize_progress_events(&json!({
+            "type":"response_item",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-poll",
+                "output":"Process running with session ID 8467"
+            }
+        }))
+        .unwrap();
+    let second = session.normalize_progress_events(&task_complete_event()).unwrap();
+    assert!(
+        matches!(
+            second.as_slice(),
+            [WorkerEvent::Notification { message, .. }, WorkerEvent::Stop { .. }]
+                if message == &crate::codex::unobserved_command_notification(
+                    "write_stdin session 8467 (no terminal result observed)"
+                )
+        ),
+        "a self-resolved direct write_stdin running poll must stay drainable: {second:?}"
     );
 }
 
