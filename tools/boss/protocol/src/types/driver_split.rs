@@ -54,6 +54,53 @@ pub struct DriverTrafficSplit {
     pub grok: u8,
     /// Share routed to the `agy` (Antigravity) driver.
     pub agy: u8,
+    /// Per-driver gate for allocated work, persisted with the split; explicit pins ignore it.
+    /// Older stored splits open all implemented drivers, including Antigravity.
+    #[serde(default)]
+    pub launch_enabled: DriverLaunchFlags,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverLaunchFlags {
+    pub claude: bool,
+    pub codex: bool,
+    pub grok: bool,
+    pub agy: bool,
+}
+
+impl Default for DriverLaunchFlags {
+    fn default() -> Self {
+        Self {
+            claude: true,
+            codex: true,
+            grok: true,
+            agy: true,
+        }
+    }
+}
+
+impl DriverLaunchFlags {
+    pub fn enabled(&self, driver: &str) -> bool {
+        match driver {
+            DRIVER_SLUG_CLAUDE => self.claude,
+            DRIVER_SLUG_CODEX => self.codex,
+            DRIVER_SLUG_GROK => self.grok,
+            DRIVER_SLUG_AGY => self.agy,
+            _ => false,
+        }
+    }
+
+    pub fn set(&mut self, driver: &str, enabled: bool) -> Result<(), String> {
+        let flag = match driver {
+            DRIVER_SLUG_CLAUDE => &mut self.claude,
+            DRIVER_SLUG_CODEX => &mut self.codex,
+            DRIVER_SLUG_GROK => &mut self.grok,
+            DRIVER_SLUG_AGY => &mut self.agy,
+            _ => return Err(format!("unknown driver: {driver}")),
+        };
+        *flag = enabled;
+        Ok(())
+    }
 }
 
 impl Default for DriverTrafficSplit {
@@ -63,6 +110,7 @@ impl Default for DriverTrafficSplit {
             codex: 0,
             grok: 0,
             agy: 0,
+            launch_enabled: DriverLaunchFlags::default(),
         }
     }
 }
@@ -97,7 +145,40 @@ impl DriverTrafficSplit {
             codex,
             grok,
             agy,
+            launch_enabled: DriverLaunchFlags::default(),
         }
+    }
+
+    /// Launch exclusions are shown even when a disabled driver has zero share.
+    pub fn launch_exclusions(&self) -> Vec<String> {
+        Self::DRIVERS_IN_BUCKET_ORDER
+            .into_iter()
+            .filter(|driver| !self.launch_enabled.enabled(driver))
+            .map(|driver| format!("{driver} excluded: launch flag off"))
+            .collect()
+    }
+
+    /// Effective split after launch flags, before work-kind and model restrictions.
+    pub fn effective_launch_split(&self) -> Result<Self, EligibleAllocationError> {
+        let eligible: Vec<_> = Self::DRIVERS_IN_BUCKET_ORDER
+            .into_iter()
+            .filter(|driver| self.launch_enabled.enabled(driver))
+            .collect();
+        let mut result = Self::new(0, 0, 0, 0);
+        let mut previous = 0;
+        for (driver, end) in self.boundaries_over(&eligible)? {
+            let share = end - previous;
+            match driver {
+                DRIVER_SLUG_CLAUDE => result.claude = share,
+                DRIVER_SLUG_CODEX => result.codex = share,
+                DRIVER_SLUG_GROK => result.grok = share,
+                DRIVER_SLUG_AGY => result.agy = share,
+                _ => unreachable!(),
+            }
+            previous = end;
+        }
+        result.launch_enabled = self.launch_enabled;
+        Ok(result)
     }
 
     /// Sum of the four shares, in `u16` so a bad split (e.g. `100/100/100/100`)
@@ -311,6 +392,28 @@ pub enum EligibleAllocationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_flags_default_open_and_effective_split_is_explicit() {
+        let mut split: DriverTrafficSplit =
+            serde_json::from_str(r#"{"grok":35,"claude":10,"codex":20,"agy":35}"#).unwrap();
+        assert_eq!(split.effective_launch_split().unwrap(), split);
+        split.launch_enabled.set("agy", false).unwrap();
+        assert_eq!(split.launch_exclusions(), ["agy excluded: launch flag off"]);
+        let effective = split.effective_launch_split().unwrap();
+        assert_eq!(
+            (effective.codex, effective.claude, effective.grok, effective.agy),
+            (30, 16, 54, 0)
+        );
+        assert_eq!(split.agy, 35);
+        let encoded = serde_json::to_string(&split).unwrap();
+        assert_eq!(serde_json::from_str::<DriverTrafficSplit>(&encoded).unwrap(), split);
+        assert!(split.launch_enabled.set("unknown", true).is_err());
+        for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
+            split.launch_enabled.set(driver, false).unwrap();
+        }
+        assert!(split.effective_launch_split().is_err());
+    }
 
     /// `(driver, share)` pairs, derived from `boundaries_over`'s cumulative
     /// ends via consecutive differences. Test-only: nothing in production

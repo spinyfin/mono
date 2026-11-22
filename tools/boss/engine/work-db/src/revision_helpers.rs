@@ -1952,7 +1952,10 @@ pub fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Resul
                 error = %format!("{err:#}"),
                 "driver allocation refused at insert; recording the refusal so dispatch fails this execution visibly",
             );
-            DriverDecision::allocation_failed()
+            DriverDecision::allocation_failed(
+                err.downcast_ref::<DriverAllocationRefused>()
+                    .and_then(|refused| refused.split_at_decision),
+            )
         }
         Err(err) => return Err(err),
     };

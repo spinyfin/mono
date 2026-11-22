@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Boss
 
@@ -7,6 +9,46 @@ import XCTest
 /// ever produce a valid split, and that every valid split is reachable
 /// through it without passing through a rejected intermediate.
 final class DriverTrafficSplitTests: XCTestCase {
+    @MainActor
+    func testLaunchFlagSettingsRender() throws {
+        let model = ChatViewModel(socketPath: "/tmp/boss-launch-flags-\(UUID().uuidString).sock")
+        model.driverTrafficSplit = DriverTrafficSplit(grok: 35, claude: 10, codex: 20, agy: 35)
+        for enabled in [true, false] {
+            model.driverTrafficSplit.launchEnabled["agy"] = enabled
+            let view = DriverTrafficSplitRow().environmentObject(model)
+                .padding(16).frame(width: 540)
+                .background(Color(nsColor: .windowBackgroundColor))
+            let host = NSHostingView(rootView: view)
+            host.appearance = NSAppearance(named: .aqua)
+            host.frame = NSRect(x: 0, y: 0, width: 540, height: 700)
+            host.layoutSubtreeIfNeeded()
+            let height = host.fittingSize.height
+            XCTAssertGreaterThan(height, 300)
+            XCTAssertLessThan(height, 700)
+            host.frame.size.height = height
+            host.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+            let output = try XCTUnwrap(ProcessInfo.processInfo.environment["TEST_UNDECLARED_OUTPUTS_DIR"])
+            try png.write(to: URL(fileURLWithPath: output).appendingPathComponent("driver-launch-\(enabled ? "on" : "off").png"))
+        }
+    }
+
+    func testLaunchFlagsExposeRedistributionAndSurviveShareEdits() {
+        var split = DriverTrafficSplit(grok: 35, claude: 10, codex: 20, agy: 35)
+        XCTAssertEqual(split.effectiveLaunchSplit, split)
+        split.launchEnabled["agy"] = false
+        XCTAssertEqual(split.launchExclusions, ["agy excluded: launch flag off"])
+        XCTAssertEqual(split.agy, 35)
+        XCTAssertEqual(split.effectiveLaunchSplit?.agy, 0)
+        XCTAssertEqual(split.effectiveLaunchSplit?.codex, 30)
+        XCTAssertEqual(split.effectiveLaunchSplit?.claude, 16)
+        XCTAssertEqual(split.effectiveLaunchSplit?.grok, 54)
+        XCTAssertFalse(split.adjusting(.codex, to: 50).launchIsEnabled(.agy))
+        for driver in DriverSlug.allCases { split.launchEnabled[driver.rawValue] = false }
+        XCTAssertNil(split.effectiveLaunchSplit)
+    }
     /// The shipped starting point: everything on the engine's default
     /// driver, nothing on Grok or Antigravity.
     func testEngineDefaultIsAllClaude() {

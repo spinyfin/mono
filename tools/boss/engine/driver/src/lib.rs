@@ -1986,8 +1986,8 @@ pub trait AgentDriver: Send + Sync {
             .unwrap_or_default()
     }
 
-    /// Whether unpinned traffic can launch on this driver. Skeletons opt out.
-    fn launch_ready(&self) -> bool {
+    /// Whether launch is implemented. Only skeletons opt out; rollout uses persisted launch flags.
+    fn launch_implemented(&self) -> bool {
         true
     }
 

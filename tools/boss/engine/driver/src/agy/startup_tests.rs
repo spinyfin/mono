@@ -41,7 +41,7 @@ fn startup_accepts_attested_chain_without_session_start() {
     assert!(report.ok);
     assert_eq!(report.positive_decision, "auto_approve");
     assert_eq!(report.denied_decision, "deny");
-    assert!(!crate::AgentDriver::launch_ready(&crate::agy::AgyDriver::default()));
+    assert!(crate::AgentDriver::launch_implemented(&crate::agy::AgyDriver::default()));
 }
 
 #[test]

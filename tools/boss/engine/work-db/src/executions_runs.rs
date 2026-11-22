@@ -889,8 +889,21 @@ impl WorkDb {
         if updated > 0 {
             // Queued executions may predate a driver being set to zero.
             // An allocation error rolls back the claim instead of spawning
-            // on an excluded driver or leaving a stranded claimed row.
-            crate::driver_allocation::dispatch::refresh_execution_driver_decision_conn(&tx, execution_id)?;
+            // on an excluded driver or leaving a stranded claimed row. The
+            // failed-decision audit is committed without the claim so the
+            // row stays `ready` and still names the launch exclusions.
+            match crate::driver_allocation::dispatch::refresh_execution_driver_decision_conn(&tx, execution_id) {
+                Ok(_) => {}
+                Err(err) if err.downcast_ref::<crate::DriverAllocationRefused>().is_some() => {
+                    tx.execute(
+                        "UPDATE work_executions SET status = 'ready' WHERE id = ?1 AND status = 'claimed'",
+                        [execution_id],
+                    )?;
+                    tx.commit()?;
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            }
         }
         tx.commit()?;
         if updated > 0 {

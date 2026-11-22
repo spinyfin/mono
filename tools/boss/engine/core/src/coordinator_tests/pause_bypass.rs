@@ -666,9 +666,10 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
     let chore = create_test_chore(&db, product.id.clone(), "Queued before share change");
     db.reconcile_product_executions(&product.id).unwrap();
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    // The whole share moves to a driver that cannot launch work.
-    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 0, 0, 100))
-        .unwrap();
+    // The whole share moves to a driver whose allocated launches are disabled.
+    let mut split = boss_protocol::DriverTrafficSplit::new(0, 0, 0, 100);
+    split.launch_enabled.agy = false;
+    db.set_driver_traffic_split(split).unwrap();
 
     let runner = Arc::new(FakeExecutionRunner::default());
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
@@ -687,6 +688,14 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
 
     let failed = db.get_execution(&execution.id).unwrap();
     assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("agy excluded: launch flag off")),
+        "{:?}",
+        failed.last_error
+    );
     assert!(
         failed.last_error.as_deref().is_some_and(|e| e.contains("0 share")),
         "{:?}",

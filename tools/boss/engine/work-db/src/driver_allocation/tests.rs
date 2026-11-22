@@ -4,7 +4,7 @@
 //! (which funnels into `insert_execution`) rather than calling
 //! `decide_execution_driver` directly, so they exercise the same path real
 //! insertion takes: decide, persist, read back. `dispatch_tests` covers
-//! revalidation when a queued execution is claimed or launched.
+//! revalidation when a queued execution is claimed or launched (`launch_tests`).
 
 use super::*;
 use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
@@ -31,7 +31,7 @@ fn set_task_kind(db: &WorkDb, work_item_id: &str, kind: &TaskKind) {
 }
 
 /// Every driver an eligible row was allocated to across `count` fresh chores.
-fn allocated_drivers(db: &WorkDb, product_id: &str, count: usize) -> Vec<Option<String>> {
+pub(super) fn allocated_drivers(db: &WorkDb, product_id: &str, count: usize) -> Vec<Option<String>> {
     (0..count)
         .map(|i| {
             let chore = create_test_chore(db, product_id, format!("chore {i}"));
@@ -122,10 +122,11 @@ fn unparseable_or_invalid_persisted_split_fails_loudly() {
     }
 }
 
-/// Eligibility combines driver launch readiness with the dispatch capability
-/// gate. Asserted against `check_dispatch` for every kind, so a
-/// `KindRequirements` or `CapabilitySet` change moves both together or
-/// fails here.
+/// Code-level eligibility is the dispatch capability gate ∩
+/// `launch_implemented()`. Persisted `launch_enabled` flags are applied
+/// later, after the current split is read. Asserted against `check_dispatch`
+/// for every kind, so a `KindRequirements` or `CapabilitySet` change moves
+/// both together or fails here.
 ///
 /// Exercised at `ChoreImplementation` — the execution kind every real
 /// allocation site in this file's other tests actually produces
@@ -134,7 +135,7 @@ fn unparseable_or_invalid_persisted_split_fails_loudly() {
 /// (`ConflictResolution` / `CiRemediation`) are covered separately by
 /// `conflict_resolution_and_ci_remediation_are_never_allocated`.
 #[test]
-fn eligibility_requires_launch_readiness_and_the_dispatch_gate() {
+fn eligibility_requires_the_capability_gate_and_launch_implemented() {
     let registry = boss_engine_driver::DriverRegistry::default();
     let execution_kind = ExecutionKind::ChoreImplementation;
     for kind in TaskKind::ALL {
@@ -147,8 +148,8 @@ fn eligibility_requires_launch_readiness_and_the_dispatch_gate() {
                 .is_some_and(|resolver| resolver.check_dispatch(kind, Some(&execution_kind)).is_ok());
             assert_eq!(
                 eligible.contains(&driver),
-                gate_ok && registry.get(driver).is_some_and(|driver| driver.launch_ready()),
-                "{driver} eligibility for {kind} must require both readiness and the gate",
+                gate_ok && registry.get(driver).is_some_and(|driver| driver.launch_implemented()),
+                "{driver} eligibility for {kind} must require the capability gate and launch_implemented()",
             );
         }
     }
@@ -657,7 +658,13 @@ fn design_tier_fails_when_only_grok_is_funded() {
     set_task_kind(&db, &task.id, &TaskKind::Design);
 
     let err = decide_execution_driver(&db.connect().unwrap(), &task.id, ExecutionKind::TaskImplementation).unwrap_err();
-    assert!(err.to_string().contains("0 share"), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("0 share"), "{text}");
+    assert!(
+        !text.contains("launch flag off"),
+        "design-tier refusal must not attach launch-flag exclusions for drivers that were not eligible: {text}",
+    );
+    assert!(!text.ends_with("; "), "{text}");
 }
 
 /// An empty eligible set is an error too, never the engine default.
@@ -695,10 +702,11 @@ fn allocation_renormalises_four_shares_and_never_revives_zero_agy() {
 
 /// Old shares are redistributed among launchable drivers.
 #[test]
-fn unready_agy_share_is_redistributed() {
+fn disabled_agy_share_is_redistributed() {
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(10, 20, 30, 40))
-        .unwrap();
+    let mut split = DriverTrafficSplit::new(10, 20, 30, 40);
+    split.launch_enabled.agy = false;
+    db.set_driver_traffic_split(split).unwrap();
     let product = create_test_product(&db);
     let drivers = allocated_drivers(&db, &product.id, 200);
     for slug in &drivers {
@@ -782,7 +790,7 @@ fn unavailable_driver_shares_never_enable_zero_share_candidates() {
 
 /// An old agy-only share fails instead of selecting a zero-share default.
 #[test]
-fn agy_at_one_hundred_fails_when_not_launch_ready() {
+fn agy_at_one_hundred_fails_when_launch_flag_off() {
     assert!(
         boss_engine_driver::DriverRegistry::default()
             .get(DRIVER_SLUG_AGY)
@@ -790,8 +798,9 @@ fn agy_at_one_hundred_fails_when_not_launch_ready() {
         "agy must be registered for a 100% share to be reachable",
     );
     let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
-        .unwrap();
+    let mut split = DriverTrafficSplit::new(0, 0, 0, 100);
+    split.launch_enabled.agy = false;
+    db.set_driver_traffic_split(split).unwrap();
     let product = create_test_product(&db);
     let chore = crate::test_support::create_test_chore_manual(&db, &product.id, "agy 100 registered");
     let err =
@@ -845,25 +854,38 @@ fn a_driver_at_zero_receives_no_rows_end_to_end() {
 
 /// Three of four at zero: every eligible row goes to the funded registered driver.
 #[test]
-fn sole_funded_driver_is_allocated_only_when_launch_ready() {
-    for (split, expected) in [
+fn sole_funded_driver_is_allocated_only_when_launch_flag_is_on() {
+    for (mut split, expected) in [
         (DriverTrafficSplit::new(100, 0, 0, 0), DRIVER_SLUG_GROK),
         (DriverTrafficSplit::new(0, 100, 0, 0), DRIVER_SLUG_CLAUDE),
         (DriverTrafficSplit::new(0, 0, 100, 0), DRIVER_SLUG_CODEX),
         (DriverTrafficSplit::new(0, 0, 0, 100), DRIVER_SLUG_AGY),
     ] {
         let (_dir, db) = open_db();
-        db.set_driver_traffic_split(split).unwrap();
         let product = create_test_product(&db);
-        for i in 0..50 {
-            let chore = crate::test_support::create_test_chore_manual(&db, &product.id, format!("sole share {i}"));
-            let result = decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation);
-            if expected == DRIVER_SLUG_AGY {
-                assert!(result.unwrap_err().to_string().contains("0 share"));
-            } else {
-                let decision = result.unwrap();
-                assert_eq!(decision.reason, REASON_ALLOCATION);
-                assert_eq!(decision.driver.as_deref(), Some(expected), "under {split:?}");
+        for enabled in [true, false] {
+            split.launch_enabled.set(expected, enabled).unwrap();
+            db.set_driver_traffic_split(split).unwrap();
+            for i in 0..50 {
+                let chore = crate::test_support::create_test_chore_manual(
+                    &db,
+                    &product.id,
+                    format!("sole share {enabled} {i}"),
+                );
+                let result =
+                    decide_execution_driver(&db.connect().unwrap(), &chore.id, ExecutionKind::ChoreImplementation);
+                if enabled {
+                    let decision = result.unwrap();
+                    assert_eq!(decision.reason, REASON_ALLOCATION);
+                    assert_eq!(decision.driver.as_deref(), Some(expected), "under {split:?}");
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("0 share"), "{error}");
+                    assert!(
+                        error.contains(&format!("{expected} excluded: launch flag off")),
+                        "{error}"
+                    );
+                }
             }
         }
     }

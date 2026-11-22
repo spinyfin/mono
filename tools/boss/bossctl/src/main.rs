@@ -480,8 +480,13 @@ enum LiveStatusAction {
 
 #[derive(Subcommand, Debug)]
 enum DispatchAction {
-    /// Show the engine's current persisted driver traffic percentages.
-    TrafficSplit,
+    /// Show configured/effective shares and launch flags, or enable/disable a driver.
+    TrafficSplit {
+        #[arg(long, value_parser = ["claude", "codex", "grok", "agy"], conflicts_with = "disable")]
+        enable: Option<String>,
+        #[arg(long, value_parser = ["claude", "codex", "grok", "agy"])]
+        disable: Option<String>,
+    },
     /// Items without live work, grouped by the reason they are waiting.
     Stuck {
         #[arg(long, default_value = "7d")]
@@ -1515,8 +1520,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: DispatchAction::Concurrency { set },
         } => dispatch_concurrency::dispatch_concurrency(&cli.socket_path, cli.json, set).await,
         Command::Dispatch {
-            action: DispatchAction::TrafficSplit,
-        } => traffic_split::run(&cli.socket_path, cli.json).await,
+            action: DispatchAction::TrafficSplit { enable, disable },
+        } => traffic_split::run(&cli.socket_path, cli.json, enable, disable).await,
         Command::Automation {
             action: AutomationAction::Pause { reason },
         } => pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
