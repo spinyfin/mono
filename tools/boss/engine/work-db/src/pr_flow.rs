@@ -169,6 +169,16 @@ fn retain_known_poll_value<'a>(prior: Option<&'a str>, incoming: &'a str) -> &'a
     incoming
 }
 
+/// Optional trailing inputs for the inner worker PR-completion write,
+/// grouped so that method stays under clippy's `too_many_arguments` threshold.
+#[derive(Debug, Default, bon::Builder)]
+struct WorkerPrCompletionExtras<'a> {
+    pr_head_after: Option<&'a str>,
+    result_summary: Option<&'a str>,
+    review_verdict: Option<ReviewVerdictInput>,
+    superseded_by_pr: Option<&'a str>,
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
@@ -205,11 +215,12 @@ impl WorkDb {
         self.record_worker_pr_completion_inner(
             execution_id,
             pr_url,
-            pr_head_after,
-            result_summary,
             target,
-            review_verdict,
-            None,
+            WorkerPrCompletionExtras::builder()
+                .maybe_pr_head_after(pr_head_after)
+                .maybe_result_summary(result_summary)
+                .maybe_review_verdict(review_verdict)
+                .build(),
         )
     }
 
@@ -225,25 +236,27 @@ impl WorkDb {
         self.record_worker_pr_completion_inner(
             execution_id,
             pr_url,
-            None,
-            result_summary,
             WorkerPrCompletionTarget::DoneUnmerged,
-            None,
-            Some(superseded_by_pr),
+            WorkerPrCompletionExtras::builder()
+                .maybe_result_summary(result_summary)
+                .superseded_by_pr(superseded_by_pr)
+                .build(),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_worker_pr_completion_inner(
         &self,
         execution_id: &str,
         pr_url: &str,
-        pr_head_after: Option<&str>,
-        result_summary: Option<&str>,
         target: WorkerPrCompletionTarget,
-        review_verdict: Option<ReviewVerdictInput>,
-        superseded_by_pr: Option<&str>,
+        extras: WorkerPrCompletionExtras<'_>,
     ) -> Result<Option<WorkerPrCompletion>> {
+        let WorkerPrCompletionExtras {
+            pr_head_after,
+            result_summary,
+            review_verdict,
+            superseded_by_pr,
+        } = extras;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;

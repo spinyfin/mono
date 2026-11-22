@@ -584,11 +584,9 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// Serialise a payload struct to its canonical stored form.
-///
-/// Infallible in practice: every payload struct is a plain `Serialize` of
-/// owned `String`s and enums with no map keys that could fail. The fallback
-/// keeps the signature total rather than panicking inside an RPC handler.
+/// Shape check for `run_done.superseded_by`: a GitHub PR URL, `owner/repo#N`,
+/// `#N`, or a bare PR number. Resolution against the execution's repo and
+/// rejection of the closed PR itself happen at delivery finalization.
 fn is_pr_reference(text: &str) -> bool {
     if text.is_empty() || text.chars().any(char::is_whitespace) {
         return false;
@@ -611,6 +609,11 @@ fn is_pr_reference(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) && text != "0"
 }
 
+/// Serialise a payload struct to its canonical stored form.
+///
+/// Infallible in practice: every payload struct is a plain `Serialize` of
+/// owned `String`s and enums with no map keys that could fail. The fallback
+/// keeps the signature total rather than panicking inside an RPC handler.
 fn to_json<T: serde::Serialize>(payload: &T) -> String {
     serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned())
 }
