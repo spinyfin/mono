@@ -234,3 +234,189 @@ fn thousands_of_observations_keep_the_original_conflict_episode() {
         instructions.load(std::sync::atomic::Ordering::Relaxed)
     );
 }
+
+fn open_attention_at(f: &Fixture, id: &str, kind: &str, opened: i64) -> String {
+    let attention = f.db.upsert_work_item_attention(id, kind, "title", "body").unwrap();
+    f.sql(&format!(
+        "UPDATE work_attention_items SET created_at = {opened}, last_raised_at = {opened} WHERE id = '{attention}'"
+    ));
+    attention
+}
+
+fn resolve_attention_at(f: &Fixture, id: &str, kind: &str, attention: &str, closed: i64) {
+    crate::dispatch_helpers::resolve_attention_kind_in_tx(&f.db.connect().unwrap(), id, kind).unwrap();
+    f.sql(&format!(
+        "UPDATE work_attention_items SET resolved_at = {closed} WHERE id = '{attention}'"
+    ));
+}
+
+fn review_conflict_since(f: &Fixture, name: &str, hours: i64) -> String {
+    let id = f.chore(name);
+    f.stick(&id, "status = 'in_review', autostart = 1", hours);
+    transition_at(f, &id, "pr_mergeable_state = 'conflicting'", now() - hours * HOUR);
+    id
+}
+
+#[test]
+fn resolving_a_long_recovery_hold_starts_a_fresh_conflict_episode() {
+    let debounce = boss_engine_storage_values::progression::STUCK_EPISODE_RECOVERY_SECS;
+    let f = fixture();
+    let id = review_conflict_since(&f, "Recovery then conflict", 4);
+    let opened = now() - 3 * HOUR;
+    let closed = now() - 60;
+    let attention = open_attention_at(&f, &id, "worker_recovery_exhausted", opened);
+    resolve_attention_at(&f, &id, "worker_recovery_exhausted", &attention, closed);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
+    assert!((f.clauses(&id).stuck_since - closed).abs() < 5);
+    f.assert_candidate(&id, false);
+    assert!(closed - opened > debounce);
+}
+
+#[test]
+fn a_short_recovery_hold_preserves_the_conflict_episode() {
+    let debounce = boss_engine_storage_values::progression::STUCK_EPISODE_RECOVERY_SECS;
+    let f = fixture();
+    let id = review_conflict_since(&f, "Brief recovery blip", 4);
+    let began = f.clauses(&id).stuck_since;
+    let opened = now() - 30;
+    let closed = opened + 10;
+    let attention = open_attention_at(&f, &id, "worker_recovery_exhausted", opened);
+    resolve_attention_at(&f, &id, "worker_recovery_exhausted", &attention, closed);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
+    assert_eq!(f.clauses(&id).stuck_since, began);
+    f.assert_candidate(&id, true);
+    assert!(closed - opened < debounce);
+}
+
+#[test]
+fn releasing_a_long_deferral_starts_a_fresh_conflict_episode() {
+    let f = fixture();
+    let id = review_conflict_since(&f, "Deferred then released", 4);
+    transition_at(&f, &id, "deferred = 1", now() - 3 * HOUR);
+    transition_at(&f, &id, "deferred = 0", now() - 60);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
+    assert!((f.clauses(&id).stuck_since - (now() - 60)).abs() < 5);
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn releasing_a_long_manual_start_hold_starts_a_fresh_conflict_episode() {
+    let f = fixture();
+    let id = review_conflict_since(&f, "Manual start then released", 4);
+    transition_at(&f, &id, "status = 'todo', autostart = 0", now() - 3 * HOUR);
+    transition_at(&f, &id, "status = 'in_review', autostart = 1", now() - 60);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
+    assert!((f.clauses(&id).stuck_since - (now() - 60)).abs() < 5);
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn resolving_a_long_trunk_queue_hold_starts_a_fresh_conflict_episode() {
+    let f = fixture();
+    let id = review_conflict_since(&f, "Trunk queue then conflict", 4);
+    let opened = now() - 3 * HOUR;
+    let closed = now() - 60;
+    let attention = open_attention_at(&f, &id, "trunk_queue_waiting", opened);
+    resolve_attention_at(&f, &id, "trunk_queue_waiting", &attention, closed);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
+    assert!((f.clauses(&id).stuck_since - closed).abs() < 5);
+    f.assert_candidate(&id, false);
+}
+
+#[test]
+fn a_new_dependency_cycle_ages_from_the_joining_edge() {
+    let f = fixture();
+    let first = f.chore("Cycle A");
+    let second = f.chore("Cycle B");
+    f.stick(&first, "status = 'blocked', blocked_reason = 'dependency'", 8);
+    f.stick(&second, "status = 'blocked', blocked_reason = 'dependency'", 8);
+    f.sql(&format!(
+        "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+         VALUES ('{first}', '{second}', 'blocks', '{}'),
+                ('{second}', '{first}', 'blocks', '{}')",
+        now() - 8 * HOUR,
+        now() - HOUR
+    ));
+    assert_eq!(f.clauses(&first).stuck_kind.as_deref(), Some("S4_dependency_cycle"));
+    assert!((f.clauses(&first).stuck_since - (now() - HOUR)).abs() < 5);
+    f.assert_candidate(&first, false);
+}
+
+#[test]
+fn review_churn_keeps_its_age_across_pending_to_success_ci() {
+    let f = fixture();
+    let id = f.chore("Churn CI poll");
+    f.stick(&id, "status = 'in_review'", 8);
+    open_attention_at(&f, &id, "churn_guard_parked", now() - 4 * HOUR);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S16_review_churn"));
+    let began = f.clauses(&id).stuck_since;
+    assert!((now() - began - 4 * HOUR).abs() < 5);
+    f.assert_candidate(&id, true);
+    f.db.update_task_pr_poll_state(
+        &id,
+        PrPollStateInput {
+            ci_required_state: "pending",
+            pr_mergeable_state: "mergeable",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(f.clauses(&id).stuck_since, began);
+    f.assert_candidate(&id, true);
+    f.db.update_task_pr_poll_state(
+        &id,
+        PrPollStateInput {
+            ci_required_state: "success",
+            pr_mergeable_state: "mergeable",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S16_review_churn"));
+    assert_eq!(f.clauses(&id).stuck_since, began);
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn an_open_conflict_deferral_is_not_the_merge_conflict_kind() {
+    let f = fixture();
+    let id = f.chore("Deferred review conflict");
+    f.sql(&format!(
+        "UPDATE tasks SET pr_url = 'https://github.com/o/r/pull/7' WHERE id = '{id}'"
+    ));
+    f.stick(&id, "status = 'in_review', autostart = 1", 5);
+    f.db.update_task_pr_poll_state(
+        &id,
+        PrPollStateInput {
+            ci_required_state: "success",
+            review_required_state: "approved",
+            pr_mergeable_state: "conflicting",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    f.age(&id, 3 * HOUR);
+    assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
+    f.assert_candidate(&id, true);
+    f.db.record_conflict_deferral(
+        ConflictResolutionInsertInput::builder()
+            .product_id(f.product_id(&id))
+            .work_item_id(&id)
+            .pr_url("https://github.com/o/r/pull/7")
+            .pr_number(7)
+            .head_branch("feature")
+            .base_branch("main")
+            .base_sha_at_trigger("base-1")
+            .head_sha_before("head-1")
+            .build(),
+    )
+    .unwrap();
+    assert!(f.clauses(&id).stuck_kind.is_none());
+    f.assert_candidate(&id, false);
+    let conn = f.db.connect().unwrap();
+    let task = query_task(&conn, &id).unwrap().unwrap();
+    assert_eq!(
+        crate::stuck_report::classification(&conn, &task, None).unwrap(),
+        "awaiting_merge:conflict_deferred"
+    );
+}

@@ -6,13 +6,13 @@ Ships off. Turning it on is an operator decision: see [Turning it on](#turning-i
 
 ## What a deferred conflict looks like
 
-| Where                        | What you see                                                                                                                                                                                                                      |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Review card                  | The red `conflicts` chip, as for any conflicting PR. When nothing but the merge is left, the status line reads "Waiting — conflicted; the conflict will be resolved when a merge is requested" (wait reason `conflict_deferred`). |
-| Work item                    | Still `in_review`, not blocked. `pr_mergeable_state` stays `conflicting`. No conflict revision exists.                                                                                                                            |
-| `boss engine conflicts list` | One row with status `deferred` and `deferral_arm = deferred`. `--status deferred` lists every PR being held.                                                                                                                      |
-| Stuck report                 | `awaiting_merge:conflict_deferred`, or `review_without_live_work:conflict_deferred` when the review itself has stalled. The bucket is the one the item would be in anyway.                                                        |
-| Progression                  | A `deferred` row is not an in-flight attempt, so it never hides a stuck item from the progression sweep. The brief lists it under "Conflict resolutions".                                                                         |
+| Where                        | What you see                                                                                                                                                                                                                               |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Review card                  | The red `conflicts` chip, as for any conflicting PR. When nothing but the merge is left, the status line reads "Waiting — conflicted; the conflict will be resolved when a merge is requested" (wait reason `conflict_deferred`).          |
+| Work item                    | Still `in_review`, not blocked. `pr_mergeable_state` stays `conflicting`. No conflict revision exists.                                                                                                                                     |
+| `boss engine conflicts list` | One row with status `deferred` and `deferral_arm = deferred`. `--status deferred` lists every PR being held.                                                                                                                               |
+| Stuck report                 | `awaiting_merge:conflict_deferred`, or `review_without_live_work:conflict_deferred` when the review itself has stalled. The bucket is the one the item would be in anyway: an open deferral is not the merge-conflict stuck kind.          |
+| Progression                  | A `deferred` row is not an in-flight attempt, so it never hides a stuck item from the progression sweep. An open deferral also keeps the item out of the merge-conflict progression kind. The brief lists it under "Conflict resolutions". |
 
 A deferred PR is never reported clean, and a deferred conflict is never forgotten: every later merge-poller pass re-reads the PR and re-asks whether the conflict should still wait.
 

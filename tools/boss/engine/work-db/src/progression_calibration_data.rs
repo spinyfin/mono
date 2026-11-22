@@ -87,15 +87,19 @@ pub(super) fn measure(conn: &Connection, now: i64, create_window_secs: i64) -> R
     }
     let mut intervals = samples(
         conn,
-        // `deferred` is a classification flag, not a progression-state write.
-        // Exclude it so toggling future-scope does not shift ledger_interval_p99_secs,
-        // matching stuck-report ageing which also ignores those rows.
-        "WITH writes AS (
+        // Owner deferral and PR polling do not change the report's task-state age.
+        // Exclude the same properties stuck-report ageing ignores
+        // (`REPORT_IGNORED_PROPERTIES`) so poll observations do not shrink
+        // ledger_interval_p99_secs.
+        &format!(
+            "WITH writes AS (
         SELECT DISTINCT CAST(changed_at AS INTEGER) AS stamp FROM task_status_audit
-        WHERE age_is_lower_bound=0 AND property<>'deferred'
+        WHERE age_is_lower_bound=0 AND property NOT IN {}
         AND CAST(changed_at AS INTEGER)>=?1 AND CAST(changed_at AS INTEGER)<?2),
         gaps AS (SELECT stamp-LAG(stamp) OVER (ORDER BY stamp) AS gap FROM writes)
         SELECT gap FROM gaps WHERE gap IS NOT NULL",
+            super::task_status_audit::REPORT_IGNORED_PROPERTIES
+        ),
         start,
         end,
     )?;

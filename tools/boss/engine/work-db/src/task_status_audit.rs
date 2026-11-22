@@ -5,6 +5,7 @@ use super::*;
 pub(super) const MIGRATION_ID: &str = "20261029_0314_task_status_audit";
 pub(super) const DEFERRED_MIGRATION_ID: &str = "20261112_1900_task_deferred_audit";
 pub(super) const EXECUTION_ABANDON_MIGRATION_ID: &str = "20261118_1530_execution_abandon_audit";
+pub(super) const PR_OBSERVATION_MIGRATION_ID: &str = "20261121_1651_task_pr_observation_audit";
 
 /// `task_status_audit.property` of a `work_executions` transition to
 /// `abandoned`. `old_value` is the execution's previous status, `new_value` is

@@ -1074,7 +1074,7 @@ mod floor_tests {
                 Box::new(|c| task_status_audit::migrate_execution_abandon(c).unwrap()),
             ),
             (
-                "20261121_1651_task_pr_observation_audit",
+                task_status_audit::PR_OBSERVATION_MIGRATION_ID,
                 Box::new(|c| task_status_audit::migrate_pr_observations(c).unwrap()),
             ),
             (

@@ -490,8 +490,10 @@ pub(super) fn classification(conn: &Connection, task: &Task, wait: Option<&str>)
         return Ok("S14_worker_recovery".into());
     }
     if task.status == TaskStatus::InReview {
-        if task.pr_mergeable_state.as_deref() == Some("conflicting") {
-            return Ok(format!("S5_merge_conflict{}", conflict_deferred_suffix(conn, task)?));
+        if task.pr_mergeable_state.as_deref() == Some("conflicting")
+            && !super::conflict_deferral::has_open_deferral(conn, &task.id)?
+        {
+            return Ok("S5_merge_conflict".into());
         }
         if task.ci_required_state.as_deref() == Some("fail") {
             return Ok("S6_ci_failure".into());

@@ -685,14 +685,30 @@ fn repeated_merge_conflict_block_blips_preserve_the_review_episode() {
     f.stick(&id, "status = 'in_review'", 3);
     transition_at(&f, &id, "pr_mergeable_state = 'conflicting'", now() - 3 * HOUR);
     let began = f.clauses(&id).stuck_since;
+    let debounce = boss_engine_storage_values::progression::STUCK_EPISODE_RECOVERY_SECS;
     for index in 0..9 {
         let at = now() - 1800 + index * 120;
-        transition_at(&f, &id, "status = 'blocked', blocked_reason = 'merge_conflict'", at);
-        assert_eq!(f.clauses(&id).stuck_since, began);
-        transition_at(&f, &id, "status = 'in_review', blocked_reason = NULL", at + 10);
+        transition_at(&f, &id, "status = 'in_review', blocked_reason = NULL", at);
+        transition_at(&f, &id, "pr_mergeable_state = 'mergeable'", at);
+        assert!(f.clauses(&id).stuck_kind.is_none(), "blip {index} must leave S5");
+        transition_at(
+            &f,
+            &id,
+            "status = 'blocked', blocked_reason = 'merge_conflict'",
+            at + 10,
+        );
+        assert_eq!(f.clauses(&id).stuck_kind.as_deref(), Some("S5_merge_conflict"));
         assert_eq!(f.clauses(&id).stuck_since, began);
         f.assert_candidate(&id, true);
     }
+    let recovered = now() - 300;
+    transition_at(&f, &id, "status = 'in_review', blocked_reason = NULL", recovered);
+    transition_at(&f, &id, "pr_mergeable_state = 'mergeable'", recovered);
+    assert!(f.clauses(&id).stuck_kind.is_none());
+    let returned = recovered + debounce;
+    transition_at(&f, &id, "pr_mergeable_state = 'conflicting'", returned);
+    assert_eq!(f.clauses(&id).stuck_since, returned);
+    f.assert_candidate(&id, false);
 }
 
 #[test]

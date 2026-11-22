@@ -438,7 +438,7 @@ fn upgrading_existing_tasks_backfills_once_and_preserves_known_dispatch_age() {
                     task_status_audit::MIGRATION_ID,
                     task_status_audit::DEFERRED_MIGRATION_ID,
                     task_status_audit::EXECUTION_ABANDON_MIGRATION_ID,
-                    "20261121_1651_task_pr_observation_audit",
+                    task_status_audit::PR_OBSERVATION_MIGRATION_ID,
                 ],
             )
             .unwrap();
@@ -1595,7 +1595,7 @@ fn upgrading_keeps_old_ledger_rows_unattributed_and_records_new_abandonments() {
         "DELETE FROM schema_migrations WHERE id IN (?1, ?2)",
         [
             task_status_audit::EXECUTION_ABANDON_MIGRATION_ID,
-            "20261121_1651_task_pr_observation_audit",
+            task_status_audit::PR_OBSERVATION_MIGRATION_ID,
         ],
     )
     .unwrap();
