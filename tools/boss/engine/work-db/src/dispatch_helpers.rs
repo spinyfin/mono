@@ -726,7 +726,7 @@ pub(crate) fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
          FROM work_executions
          WHERE work_item_id = ?1 AND kind <> 'progression'
          ORDER BY created_at DESC, id DESC
@@ -755,7 +755,7 @@ pub(crate) fn query_live_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
          FROM work_executions
          WHERE work_item_id = ?1
            AND kind != 'progression'
@@ -785,7 +785,7 @@ pub(crate) fn query_last_non_abandoned_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state, driver, model, effort_level, pr_head_after, last_error, created_via
          FROM work_executions
          WHERE work_item_id = ?1
            AND status != 'abandoned'
@@ -901,6 +901,7 @@ pub fn reconcile_work_item_execution(
         let created = insert_execution(
             conn,
             CreateExecutionInput::builder()
+                .created_via("reconcile_work_item_execution")
                 .work_item_id(work_item_id)
                 .kind(kind.clone())
                 .status(effective_status.clone())
@@ -1632,6 +1633,7 @@ pub fn reconcile_revision_execution(
             let created = insert_execution(
                 conn,
                 CreateExecutionInput::builder()
+                    .created_via("reconcile_revision_execution")
                     .work_item_id(task.id.clone())
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(effective_status)
@@ -1763,6 +1765,7 @@ fn request_execution_in_tx_body<F: FnOnce(&str) -> bool>(
         explicit_start,
         audit_actor: _,
         audit_basis,
+        created_via,
         // Placement is a coordinator concern. The coordinator validates and
         // installs this onto the one execution after this transaction has
         // created or refreshed it; it must never become a work-item field.
@@ -2343,6 +2346,7 @@ fn request_execution_in_tx_body<F: FnOnce(&str) -> bool>(
     insert_execution(
         conn,
         CreateExecutionInput::builder()
+            .created_via(created_via.as_deref().unwrap_or("request_execution"))
             .work_item_id(work_item_id)
             .kind(kind)
             .status(ExecutionStatus::Ready)
@@ -2466,6 +2470,7 @@ pub(crate) fn request_pr_review_in_tx(
         insert_execution(
             conn,
             CreateExecutionInput::builder()
+                .created_via("request_pr_review_execution")
                 .work_item_id(work_item_id.to_owned())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

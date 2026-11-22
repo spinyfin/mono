@@ -13,6 +13,7 @@ fn preserved_execution(db: &WorkDb, work_item_id: &str, finished_secs_ago: i64) 
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

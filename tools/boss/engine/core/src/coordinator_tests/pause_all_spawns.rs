@@ -37,6 +37,7 @@ fn ready_review_pool_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionK
     }
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id.to_owned())
             .kind(kind)
             .status(ExecutionStatus::Ready)

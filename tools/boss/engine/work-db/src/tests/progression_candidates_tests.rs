@@ -67,6 +67,7 @@ impl Fixture {
         self.db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(id)
                     .kind(kind)
                     .status(status)

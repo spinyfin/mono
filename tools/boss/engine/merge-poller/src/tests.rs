@@ -442,6 +442,7 @@ pub fn make_abandoned_chore_with_workspace(db: &WorkDb, name: &str) -> (String, 
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -476,6 +477,7 @@ pub fn make_blocked_ci_chore_with_live_worker(db: &WorkDb, name: &str, pr: &str)
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

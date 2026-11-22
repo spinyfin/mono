@@ -159,6 +159,7 @@ fn list_abandoned_excludes_work_item_with_a_live_execution() {
     // running when this sweep pass runs.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -186,6 +187,7 @@ fn bind_pr_to_task_from_terminal_execution_refuses_work_item_with_live_execution
     // query and the bind call — the bind itself must also refuse.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)

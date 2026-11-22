@@ -1104,14 +1104,11 @@ fn insert_progression_execution(conn: &Connection, work_item_id: &str) -> Result
     let execution = insert_execution(
         conn,
         CreateExecutionInput::builder()
+            .created_via(CREATED_VIA_PROGRESSION_SWEEP)
             .work_item_id(work_item_id)
             .kind(ExecutionKind::Progression)
             .status(ExecutionStatus::Ready)
             .build(),
-    )?;
-    conn.execute(
-        "UPDATE work_executions SET created_via = ?2 WHERE id = ?1",
-        params![execution.id, CREATED_VIA_PROGRESSION_SWEEP],
     )?;
     conn.execute(
         "UPDATE tasks SET progression_grace_waived_at = NULL WHERE id = ?1",

@@ -27,6 +27,7 @@ fn completed_revision_is_not_redispatched_while_new_head_review_is_running() {
         let review = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(if review_on_root { root } else { revision.clone() })
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Running)
@@ -130,6 +131,7 @@ fn completed_revision_is_not_redispatched_while_completion_is_being_consumed() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)

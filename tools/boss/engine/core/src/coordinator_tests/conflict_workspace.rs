@@ -63,6 +63,7 @@ async fn scheduling_refusal_survives(structured: bool) {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&revision)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -162,6 +163,7 @@ async fn scheduling_refusal_survives(structured: bool) {
     let next = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(next_revision)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -307,6 +309,7 @@ async fn conflict_revision_fixture(db: &Arc<WorkDb>, blocker: Option<&str>) -> (
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&revision)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

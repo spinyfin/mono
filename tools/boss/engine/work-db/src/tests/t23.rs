@@ -341,6 +341,7 @@ fn advance_moves_active_task_with_pr_to_in_review() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -374,6 +375,7 @@ fn advance_moves_dropped_duplicate_head_to_in_review() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -405,6 +407,7 @@ fn advance_refuses_without_review_result() {
     let chore_id = active_chore_with_pr(&db, "advance-no-result", "https://github.com/spinyfin/mono/pull/903");
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id.clone())
             .kind(ExecutionKind::PrReview)
             .status(ExecutionStatus::Failed)
@@ -471,6 +474,7 @@ fn advance_with_verdict_source_finds_a_verdict_keyed_by_the_cycle_root() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)

@@ -200,7 +200,10 @@ async fn list_task_field_audit_replies_with_the_flag_rows() {
 
     work_items::handle_list_task_field_audit(
         dispatch(&state, &sink, "req-list"),
-        FrontendRequest::ListTaskFieldAudit { id: chore.id.clone() },
+        FrontendRequest::ListTaskFieldAudit {
+            id: chore.id.clone(),
+            include_status: false,
+        },
     )
     .await;
 

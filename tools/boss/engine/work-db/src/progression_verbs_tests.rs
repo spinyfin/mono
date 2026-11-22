@@ -91,6 +91,7 @@ impl Fx {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(item)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Running)
@@ -415,6 +416,7 @@ fn precursor_is_refused_while_work_is_live_on_the_item() {
     fx.db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Running)
@@ -531,6 +533,7 @@ fn redispatch_on_a_deliberate_park_clears_the_stamp_and_resolves_its_attention_i
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Failed)
@@ -618,6 +621,7 @@ fn redispatch_is_refused_for_live_work_questions_refusals_unknown_provenance_and
     fx.db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&busy)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Running)
@@ -734,6 +738,7 @@ fn redispatch_is_bounded_across_fingerprints_until_a_work_run_completes() {
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Completed)
@@ -899,6 +904,7 @@ fn archive_revision_refuses_non_revisions_the_item_itself_live_work_and_a_red_pa
     fx.db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&live)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Running)
@@ -1063,6 +1069,7 @@ fn a_verb_needs_a_live_progression_run_with_a_recorded_episode() {
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Running)
@@ -1079,6 +1086,7 @@ fn a_verb_needs_a_live_progression_run_with_a_recorded_episode() {
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::Progression)
                 .status(ExecutionStatus::Running)
@@ -1216,6 +1224,7 @@ fn a_bare_blocked_and_a_question_without_a_criterion_are_refused_for_a_progressi
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Running)
@@ -1524,6 +1533,7 @@ fn an_answer_to_a_worker_question_does_not_prompt_progression() {
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Running)
@@ -1554,6 +1564,7 @@ fn declared_blocker(fx: &Fx, item: &str) -> String {
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Running)
@@ -1661,6 +1672,7 @@ fn question_is_refused_or_withdrawn_when_work_resumes() {
                 fx.db
                     .create_execution(
                         CreateExecutionInput::builder()
+                            .created_via("test")
                             .work_item_id(&item)
                             .kind(ExecutionKind::TaskImplementation)
                             .status(status.clone())

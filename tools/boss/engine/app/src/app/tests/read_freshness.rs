@@ -9,6 +9,7 @@ async fn execution_history_uses_its_admitted_connection() {
         .work_db
         .create_execution(
             boss_work_db::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task.id.clone())
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Ready)

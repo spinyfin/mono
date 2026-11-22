@@ -74,6 +74,7 @@ fn fresh_pr() -> String {
 fn execution(db: &WorkDb, id: &str, kind: ExecutionKind, status: ExecutionStatus) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(id.to_owned())
             .kind(kind)
             .status(status)
@@ -331,6 +332,7 @@ fn seed_waiting_writer(db: &WorkDb, product: &str) -> String {
         .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(id.clone())
             .kind(ExecutionKind::RevisionImplementation)
             .status(ExecutionStatus::WaitingDependency)

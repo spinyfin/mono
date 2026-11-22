@@ -94,6 +94,7 @@ async fn clean_verdict_advances_the_origin_to_review_without_a_revision() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

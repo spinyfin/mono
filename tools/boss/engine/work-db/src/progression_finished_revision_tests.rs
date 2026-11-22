@@ -40,6 +40,7 @@ fn finished_revision_can_be_archived_without_green_ci() {
         fx.db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&revision)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Completed)
@@ -75,6 +76,7 @@ fn restarted_in_review_revision_cannot_be_retired_or_duplicated_by_progression()
         fx.db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&revision)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(status)
@@ -107,6 +109,7 @@ fn archive_preserves_finished_revisions_with_live_read_only_executions() {
         fx.db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&revision)
                     .kind(kind)
                     .status(ExecutionStatus::Running)

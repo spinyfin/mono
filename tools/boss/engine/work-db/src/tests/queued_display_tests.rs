@@ -7,6 +7,7 @@ fn pending(db: &WorkDb, item: &str) -> WorkExecution {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Ready)
@@ -170,6 +171,7 @@ fn spawn_completed_run_does_not_hide_orphaned_predecessor() {
     let previous = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item)
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Ready)

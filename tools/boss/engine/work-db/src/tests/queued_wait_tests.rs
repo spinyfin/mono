@@ -15,6 +15,7 @@ fn db() -> WorkDb {
 fn pending(db: &WorkDb, work_item_id: &str, kind: ExecutionKind, status: ExecutionStatus) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id)
             .kind(kind)
             .status(status)

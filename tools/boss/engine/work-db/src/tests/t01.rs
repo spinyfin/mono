@@ -1,5 +1,17 @@
 use super::*;
 
+fn create_test_exec(db: &WorkDb, work_item_id: &str, kind: ExecutionKind, status: ExecutionStatus) -> WorkExecution {
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .created_via("test")
+            .work_item_id(work_item_id.to_owned())
+            .kind(kind)
+            .status(status)
+            .build(),
+    )
+    .unwrap()
+}
+
 /// `list_tasks` (and therefore `boss task list` / `ListTasks`) must return
 /// chore and revision rows — never silently drop them. Narrow kind-only
 /// verbs (`list_chores`, `list_revisions`) remain available; the general
@@ -635,6 +647,7 @@ fn creates_and_lists_execution_entities() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task.id.clone())
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Ready)
@@ -757,6 +770,7 @@ fn execution_requires_repo_remote_url_snapshot() {
     let err = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(product.id.clone())
                 .kind(ExecutionKind::ProjectDesign)
                 .build(),
@@ -770,6 +784,7 @@ fn execution_requires_repo_remote_url_snapshot() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(product.id.clone())
                 .kind(ExecutionKind::ProjectDesign)
                 .repo_remote_url("git@github.com:spinyfin/mono.git")
@@ -1889,24 +1904,18 @@ fn cancel_execution_superseded_live_does_not_demote() {
     )
     .unwrap();
 
-    let exec_old = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Running)
-                .build(),
-        )
-        .unwrap();
-    let exec_new = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Running)
-                .build(),
-        )
-        .unwrap();
+    let exec_old = create_test_exec(
+        &db,
+        &chore.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Running,
+    );
+    let exec_new = create_test_exec(
+        &db,
+        &chore.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Running,
+    );
     assert_eq!(
         db.latest_execution_for_work_item(&chore.id).unwrap().unwrap().id,
         exec_new.id
@@ -1949,15 +1958,12 @@ fn cancel_execution_preserves_in_review_and_done_status() {
 
     let product = create_test_product(&db);
     let chore = create_test_chore(&db, product.id.clone(), "Has PR");
-    let execution = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Running)
-                .build(),
-        )
-        .unwrap();
+    let execution = create_test_exec(
+        &db,
+        &chore.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Running,
+    );
     // The worker opened a PR before the human asked to cancel.
     db.update_work_item(
         &chore.id,
@@ -2025,15 +2031,12 @@ fn cancel_execution_queued_only_accepts_ready_refuses_running() {
         "a never-started cancel with record_failure_reason must persist last_error",
     );
 
-    let running = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id)
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Running)
-                .build(),
-        )
-        .unwrap();
+    let running = create_test_exec(
+        &db,
+        &chore.id,
+        ExecutionKind::ChoreImplementation,
+        ExecutionStatus::Running,
+    );
     let err = db
         .cancel_execution_with(
             &running.id,
@@ -2083,15 +2086,7 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
 
     // Reviewer enqueued but not yet dispatched (`ready`). Nothing is reviewing,
     // so the badge must stay off.
-    let review = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::PrReview)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let review = create_test_exec(&db, &chore.id, ExecutionKind::PrReview, ExecutionStatus::Ready);
 
     let tree = db.get_work_tree(&product.id).unwrap();
     let card = tree
@@ -2178,15 +2173,7 @@ fn ai_reviewing_badge_shows_after_reviewer_pane_spawn() {
         .unwrap();
     }
 
-    let review = db
-        .create_execution(
-            CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::PrReview)
-                .status(ExecutionStatus::Ready)
-                .build(),
-        )
-        .unwrap();
+    let review = create_test_exec(&db, &chore.id, ExecutionKind::PrReview, ExecutionStatus::Ready);
 
     // Dispatch: `start_execution_run` → `running`.
     let (_, run) = db
@@ -2337,6 +2324,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
     // status so the reconcile sees "latest execution is terminal."
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Failed)
@@ -2374,6 +2362,7 @@ fn reconcile_skips_active_chore_with_live_execution() {
     // is paused but the slot is still owned.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::WaitingHuman)
@@ -2413,6 +2402,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
     let stale = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingHuman)

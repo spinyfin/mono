@@ -693,6 +693,7 @@ async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_all
         .db()
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(s.stalled().work_item_id)
                 .kind(s.stalled().kind)
                 .status(ExecutionStatus::Ready)
@@ -742,6 +743,7 @@ async fn inline_reconcile_fails_loudly_when_preservation_cannot_proceed_then_all
         .db()
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(s.stalled().work_item_id)
                 .kind(s.stalled().kind)
                 .status(ExecutionStatus::Ready)

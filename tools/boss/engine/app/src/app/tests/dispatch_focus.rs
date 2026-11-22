@@ -127,6 +127,7 @@ async fn held_count_counts_out_of_scope_rows_once_focus_mode_is_recorded() {
             .work_db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(task.id)
                     .kind(ExecutionKind::TaskImplementation)
                     .status(ExecutionStatus::Ready)
@@ -287,6 +288,7 @@ async fn restart_with_focus_seeds_queue_order_without_out_of_scope_rows() {
             .work_db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(task.id.clone())
                     .kind(ExecutionKind::TaskImplementation)
                     .status(ExecutionStatus::Ready)

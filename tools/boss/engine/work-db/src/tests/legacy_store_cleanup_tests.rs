@@ -60,6 +60,7 @@ fn recorded_execution(db: &WorkDb, work_item_id: &str, host_id: &str, repo_path:
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

@@ -1741,6 +1741,7 @@ pub(crate) async fn run_task_executions(
                 client
                     .send_request(&FrontendRequest::ListTaskFieldAudit {
                         id: work_item_id.clone(),
+                        include_status: true,
                     })
                     .await,
             );

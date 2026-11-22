@@ -119,6 +119,7 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         insert_execution(
             conn,
             CreateExecutionInput::builder()
+                .created_via("execution_recovery_rearm")
                 .work_item_id(id)
                 .kind(kind)
                 .status(ExecutionStatus::WaitingDependency)
@@ -387,6 +388,7 @@ mod tests {
                 let failed = db
                     .create_execution(
                         CreateExecutionInput::builder()
+                            .created_via("test")
                             .work_item_id(id.clone())
                             .kind(kind.clone())
                             .status(ExecutionStatus::Failed)
@@ -461,6 +463,7 @@ mod tests {
             let pending = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(id.clone())
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::WaitingDependency)
@@ -470,6 +473,7 @@ mod tests {
             let failed = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(id.clone())
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::Failed)

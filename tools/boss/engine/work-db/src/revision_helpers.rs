@@ -1909,8 +1909,8 @@ pub fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Resul
             id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
             created_at, started_at, finished_at, prefer_is_soft, pr_url, worker_branch_prefix,
-            allow_dirty, branch_naming
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            allow_dirty, branch_naming, created_via
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             id,
             input.work_item_id,
@@ -1931,6 +1931,7 @@ pub fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Resul
             worker_branch_prefix,
             allow_dirty,
             branch_naming_json,
+            input.created_via,
         ],
     )?;
 

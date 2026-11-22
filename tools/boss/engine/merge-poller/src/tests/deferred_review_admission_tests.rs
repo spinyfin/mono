@@ -339,6 +339,7 @@ fn held_revision(db: &WorkDb, root_id: &str, launched: bool) -> String {
     let implementation = db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .build(),

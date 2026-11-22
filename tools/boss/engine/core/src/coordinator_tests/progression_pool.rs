@@ -49,6 +49,7 @@ impl Fixture {
         self.db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Ready)
@@ -115,6 +116,7 @@ async fn progression_routes_to_its_own_pool_whatever_produced_the_item_it_is_bou
     let progression =
         f.db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(produced.id.clone())
                 .kind(ExecutionKind::Progression)
                 .status(ExecutionStatus::Ready)

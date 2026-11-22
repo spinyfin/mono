@@ -614,6 +614,7 @@ async fn status_and_body_resolve_pr_via_chain_root_for_revision_execution() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -790,6 +791,7 @@ async fn status_refresh_from_a_revision_worker_invalidates_the_chain_root() {
     let revision_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

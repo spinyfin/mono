@@ -144,6 +144,7 @@ impl Fx {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(id)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Ready)
@@ -254,6 +255,7 @@ impl Fx {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(item)
                     .kind(ExecutionKind::TaskImplementation)
                     .status(ExecutionStatus::Failed)
@@ -638,6 +640,7 @@ fn slot_collisions_back_off_without_filing_a_question_and_retry_after_backoff() 
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&id)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Ready)
@@ -688,6 +691,7 @@ fn failed_runs_with_driver_sessions_still_file_the_infrastructure_question() {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&id)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Ready)

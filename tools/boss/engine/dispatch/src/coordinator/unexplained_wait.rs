@@ -217,6 +217,7 @@ mod tests {
     fn pending(db: &WorkDb, chore: &str, status: ExecutionStatus) -> WorkExecution {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(status)

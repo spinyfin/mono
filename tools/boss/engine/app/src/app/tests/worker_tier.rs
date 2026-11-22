@@ -117,6 +117,7 @@ async fn progression_gate_is_unconditional_and_precedes_proposal_dispatch() {
         .work_db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item.id)
                 .kind(boss_protocol::ExecutionKind::TaskImplementation)
                 .status(boss_protocol::ExecutionStatus::Ready)
@@ -243,6 +244,7 @@ async fn progression_verbs_apply_in_scope_and_are_refused_outside_it_and_to_work
         .work_db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item.id)
                 .kind(boss_protocol::ExecutionKind::Progression)
                 .status(boss_protocol::ExecutionStatus::Running)
@@ -1057,6 +1059,7 @@ async fn worker_and_progression_peers_are_refused_park_even_with_the_tier_gate_o
         .work_db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&id)
                 .kind(boss_protocol::ExecutionKind::TaskImplementation)
                 .status(boss_protocol::ExecutionStatus::Ready)
@@ -1217,6 +1220,7 @@ fn progression_connection_allows_reads_and_denies_worker_only_writes() {
         .work_db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item.id)
                 .kind(boss_protocol::ExecutionKind::TaskImplementation)
                 .status(boss_protocol::ExecutionStatus::Ready)

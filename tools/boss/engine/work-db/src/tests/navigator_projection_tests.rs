@@ -70,6 +70,7 @@ fn exec(db: &WorkDb, id: &str, kind: ExecutionKind, status: &str, run: Option<&s
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(id)
                 .kind(kind)
                 .status(ExecutionStatus::Ready)
@@ -124,6 +125,7 @@ fn reviewed_clean_pr(db: &WorkDb, root: &str) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -646,6 +648,7 @@ fn spawn_live(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> String {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(kind)
                 .status(ExecutionStatus::Ready)
@@ -841,6 +844,7 @@ fn active_spawn_and_readopted_runs_are_working() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

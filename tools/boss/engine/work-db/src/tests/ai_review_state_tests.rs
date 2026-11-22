@@ -33,6 +33,7 @@ fn ai_review_state_rolls_up_from_last_completed_revision_on_chain_root() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -109,6 +110,7 @@ fn ai_review_state_uses_current_head_root_verdict_when_terminal_revision_has_non
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -239,6 +241,7 @@ fn ai_review_state_ignores_a_stale_open_pr_review_died_attention() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -312,6 +315,7 @@ fn ai_review_state_shows_completed_review_after_an_earlier_failed_attempt() {
     let failed = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -321,6 +325,7 @@ fn ai_review_state_shows_completed_review_after_an_earlier_failed_attempt() {
     let completed = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -374,6 +379,7 @@ fn ai_review_state_is_not_reviewed_when_every_review_attempt_failed() {
     let failed = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -415,6 +421,7 @@ fn ai_review_state_reviewing_matches_ai_reviewing_flag() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -456,6 +463,7 @@ fn ai_review_state_marks_a_queued_reviewer_distinctly() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::PrReview)
             .status(ExecutionStatus::Ready)
@@ -480,6 +488,7 @@ fn ai_review_state_treats_gave_up_verdict_as_not_reviewed() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -552,6 +561,7 @@ fn ai_reviewing_attributes_cycle_root_running_review_to_held_revision() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -601,6 +611,7 @@ fn ai_reviewing_attributes_own_running_review_to_held_revision() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -656,6 +667,7 @@ fn ai_reviewing_attributes_cycle_root_running_review_to_nested_held_revision() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -702,6 +714,7 @@ fn ai_review_state_prefers_live_reviewing_over_stale_verdict_when_in_review() {
     let old_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -733,6 +746,7 @@ fn ai_review_state_prefers_live_reviewing_over_stale_verdict_when_in_review() {
     let fresh = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

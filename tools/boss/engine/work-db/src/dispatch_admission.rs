@@ -254,6 +254,7 @@ fn latest_revision_implementation_status_sql(item: &str) -> String {
     format!(
         "(SELECT e.status FROM work_executions e JOIN tasks t ON t.id = e.work_item_id
           WHERE e.work_item_id = {item} AND t.kind = 'revision' AND e.kind = 'revision_implementation'
+            AND e.status != 'abandoned'
           ORDER BY e.created_at DESC, e.id DESC LIMIT 1)"
     )
 }
@@ -683,6 +684,7 @@ mod deliberate_parked_fact_tests {
     fn abandoned_execution(db: &crate::WorkDb, work_item_id: &str) -> String {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Abandoned)

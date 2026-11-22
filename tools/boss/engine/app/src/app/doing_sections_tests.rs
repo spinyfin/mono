@@ -210,6 +210,7 @@ fn a_revision_held_for_ai_review_is_reviewing_without_a_worker_of_its_own() {
     let implementation = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -233,6 +234,7 @@ fn a_revision_held_for_ai_review_is_reviewing_without_a_worker_of_its_own() {
     let review = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)

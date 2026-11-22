@@ -121,6 +121,7 @@ fn claim_records_a_failed_decision_when_every_eligible_driver_is_at_zero() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&chore.id)
                 .kind(ExecutionKind::ConflictResolution)
                 .status(ExecutionStatus::Ready)
@@ -195,6 +196,7 @@ fn every_dispatch_kind_respects_zero_share_or_its_explicit_pool_policy() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&chore.id)
                     .kind(kind.clone())
                     .status(ExecutionStatus::Ready)
@@ -226,6 +228,7 @@ fn failed_reallocation_rolls_back_the_claim_and_records_the_failed_decision() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&chore.id)
                 .kind(ExecutionKind::ConflictResolution)
                 .status(ExecutionStatus::Ready)

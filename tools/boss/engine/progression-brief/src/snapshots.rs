@@ -341,6 +341,7 @@ fn start_then_fail(f: &Fixture, name: &str, basis: WorkerFailureBasis, detail: &
     let execution =
         f.db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -620,6 +621,7 @@ fn progression_run(f: &Fixture, id: &str) -> String {
     let execution =
         f.db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(id)
                 .kind(ExecutionKind::Progression)
                 .status(ExecutionStatus::Ready)
@@ -766,6 +768,7 @@ impl Fixture {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(item)
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -953,6 +956,7 @@ fn prior_progression_episodes_are_persisted_once_and_compared() {
         let execution =
             f.db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&id)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Ready)
@@ -1097,6 +1101,7 @@ fn episode_metadata_for_removed_executions_is_pruned_on_next_write() {
     let execution =
         f.db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&id)
                 .kind(ExecutionKind::Progression)
                 .status(ExecutionStatus::Ready)

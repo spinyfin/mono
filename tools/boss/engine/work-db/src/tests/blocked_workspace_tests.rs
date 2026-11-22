@@ -141,6 +141,7 @@ fn read_only_reviews_never_inherit_a_recovery_predecessor() {
         let prior = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(kind.clone())
                     .status(ExecutionStatus::Ready)
@@ -168,6 +169,7 @@ fn read_only_reviews_never_inherit_a_recovery_predecessor() {
         let next = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(kind.clone())
                     .status(ExecutionStatus::Ready)

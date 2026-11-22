@@ -633,6 +633,7 @@ fn queue_continuation_execution(
     insert_execution(
         conn,
         CreateExecutionInput::builder()
+            .created_via("prerequisite_question_restart")
             .work_item_id(&task.id)
             .kind(kind)
             .status(status)

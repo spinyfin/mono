@@ -39,6 +39,7 @@ fn list_in_flight_executions_filters_by_status_and_lease() {
     let chore_c = create_test_chore(&db, product.id.clone(), "Already done");
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_c.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Completed)
@@ -69,6 +70,7 @@ fn list_terminal_executions_holding_lease_filters_terminal_with_lease() {
     let leftover = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_a.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)
@@ -87,6 +89,7 @@ fn list_terminal_executions_holding_lease_filters_terminal_with_lease() {
     let chore_c = create_test_chore(&db, product.id.clone(), "Done and released");
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_c.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Completed)
@@ -111,6 +114,7 @@ fn record_pre_start_failure_keeps_a_recorded_lease() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -318,6 +322,7 @@ fn request_execution_marks_existing_stale_when_no_live_worker() {
     let stale = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -359,6 +364,7 @@ async fn request_execution_stale_redispatch_publishes_execution_terminal() {
     let stale = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -475,6 +481,7 @@ fn request_execution_requeues_stale_ci_remediation_drag_to_doing() {
     let ci_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::CiRemediation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -562,6 +569,7 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
     let ci_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::CiRemediation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -618,6 +626,7 @@ fn request_execution_suppressed_when_older_execution_is_live() {
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -629,6 +638,7 @@ fn request_execution_suppressed_when_older_execution_is_live() {
     let phantom = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Orphaned)
@@ -685,6 +695,7 @@ fn request_execution_redispatches_when_live_execution_not_claimed() {
     let dead = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -727,6 +738,7 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -736,6 +748,7 @@ fn task_runtime_follows_live_execution_not_newer_terminal() {
     // Newer terminal phantom that detaches the card under the bug.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Orphaned)
@@ -770,6 +783,7 @@ fn task_runtime_prefers_completed_over_abandoned_duplicate() {
     let completed = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)
@@ -781,6 +795,7 @@ fn task_runtime_prefers_completed_over_abandoned_duplicate() {
     let abandoned = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Abandoned)
@@ -920,6 +935,7 @@ fn mark_execution_orphaned_errors_on_already_terminal() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)
@@ -1117,6 +1133,7 @@ fn request_execution_is_idempotent_when_existing_run_is_live() {
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -1331,6 +1348,7 @@ fn cancel_running_execution_demotes_active_task() {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1387,6 +1405,7 @@ fn stopping_superseded_execution_does_not_demote_row() {
     let exec_old = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1397,6 +1416,7 @@ fn stopping_superseded_execution_does_not_demote_row() {
     let exec_new = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1468,6 +1488,7 @@ fn rescan_redispatches_active_chore_with_terminal_execution() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Failed)
@@ -1697,6 +1718,7 @@ fn rescan_skips_no_autostart_active_chore() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Failed)
@@ -1778,6 +1800,7 @@ fn make_chore_execution_962(db: &WorkDb, label: &str) -> String {
     let chore = create_test_chore_manual(db, product.id.clone(), format!("Chore-{label}"));
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)
@@ -1876,6 +1899,7 @@ fn cancel_exec_with_other_live_exec_does_not_demote_task() {
     let exec_a = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1887,6 +1911,7 @@ fn cancel_exec_with_other_live_exec_does_not_demote_task() {
     let _exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)

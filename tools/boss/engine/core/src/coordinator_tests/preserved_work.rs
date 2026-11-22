@@ -513,6 +513,7 @@ async fn pre_start_teardown_then_retry_preserves_later_unpublished_edits() {
     let successor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(execution.work_item_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

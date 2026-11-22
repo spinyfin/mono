@@ -1,5 +1,6 @@
 use super::*;
 mod merge_evidence_tests;
+mod revision_redispatch_tests;
 
 use crate::test_support::*;
 /// Returns the `:memory:` sentinel so `WorkDb::open` allocates a
@@ -93,6 +94,7 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task.id.clone())
                 .kind(ExecutionKind::TaskImplementation)
                 .status(ExecutionStatus::Ready)
@@ -199,6 +201,7 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
         .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(task.id)
             .kind(ExecutionKind::TaskImplementation)
             .status(ExecutionStatus::Ready)
@@ -283,6 +286,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

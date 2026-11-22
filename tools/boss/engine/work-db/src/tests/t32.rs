@@ -659,6 +659,7 @@ fn reconcile_does_not_remint_beside_a_live_or_claimed_execution() {
         let duplicate = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)

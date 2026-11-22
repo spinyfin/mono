@@ -33,6 +33,7 @@ fn held_revision(label: &str) -> HeldRevision {
     let implementation = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -99,6 +100,7 @@ fn start_review_batch_for_target(held: &HeldRevision, target_sha: &str) -> Strin
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&held.root_id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -187,6 +189,7 @@ fn a_running_review_execution_on_the_revision_itself_counts() {
         .db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(held.revision_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -215,6 +218,7 @@ fn a_revision_being_implemented_again_is_not_under_review() {
     held.db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(held.revision_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

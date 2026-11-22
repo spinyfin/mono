@@ -47,6 +47,7 @@ async fn legacy_recovery_respects_live_ownership_but_not_completed_history() {
             .unwrap();
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&root.id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Failed)
@@ -191,6 +192,7 @@ async fn memberless_failed_review_does_not_preempt_stale_batch_readmission() {
     let legacy = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&root.id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Failed)

@@ -53,6 +53,7 @@ impl Fixture {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Ready)
@@ -148,6 +149,7 @@ fn progression_dedup_still_sees_another_live_progression_run() {
     let live =
         f.db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&item_id)
                 .kind(ExecutionKind::Progression)
                 .status(ExecutionStatus::WaitingHuman)

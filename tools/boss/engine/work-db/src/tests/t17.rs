@@ -8,6 +8,7 @@ use super::*;
 fn seed_ready_execution(db: &WorkDb, chore_id: &str) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id)
             .kind(ExecutionKind::TaskImplementation)
             .status(ExecutionStatus::Ready)
@@ -145,6 +146,7 @@ fn queued_wait_payload_preserves_holds_and_clears_the_blocker() {
     let blocker_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&blocker.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -271,6 +273,7 @@ fn queued_wait_chain_hold_survives_claimed_blocker_and_clears_when_terminal() {
     let blocker_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&blocker.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

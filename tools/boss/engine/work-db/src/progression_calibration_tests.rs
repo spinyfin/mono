@@ -56,6 +56,7 @@ fn seed(db: &WorkDb) {
         let run = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&task)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Completed)
@@ -431,6 +432,7 @@ fn resolved_ci_and_overlapping_work_invalidate_even_continuous_heads() {
                 let run = db
                     .create_execution(
                         CreateExecutionInput::builder()
+                            .created_via("test")
                             .work_item_id(if exclusion == "revision_run" { &revision } else { &item })
                             .kind(if exclusion == "human_wait" {
                                 ExecutionKind::Progression
@@ -645,6 +647,7 @@ fn revision_execution(db: &WorkDb, product: &str, started: bool) -> String {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&revision)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Failed)

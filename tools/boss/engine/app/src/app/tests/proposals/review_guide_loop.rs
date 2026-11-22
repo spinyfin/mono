@@ -105,6 +105,7 @@ async fn revision_delivery_automatically_regenerates_guide_and_preserves_feedbac
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task_id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

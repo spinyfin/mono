@@ -166,6 +166,7 @@ fn mark_chore_pr_merged_lowers_a_review_phase_positioning_hold() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Claimed)

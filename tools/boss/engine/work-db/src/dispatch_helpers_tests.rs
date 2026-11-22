@@ -525,6 +525,7 @@ fn reconcile_revision_backfills_pr_url_on_existing_execution() {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -683,6 +684,7 @@ fn parent_close_reconcile_records_its_own_abandonment_cause() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::WaitingDependency)
@@ -734,6 +736,7 @@ fn parent_close_sweep_records_its_own_abandonment_cause() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -796,6 +799,7 @@ fn retired_spawning_attempt_gate_records_its_own_abandonment_cause() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::WaitingDependency)

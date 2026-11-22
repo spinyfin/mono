@@ -1054,6 +1054,7 @@ fn diagnose_wait_line_reports_the_engines_reason() {
     let execution = |work_item_id: &str, status| {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(status)
@@ -1233,6 +1234,7 @@ fn diagnose_header_reports_current_execution_state() {
     let execution = |work_item_id: &str, status| {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(status)

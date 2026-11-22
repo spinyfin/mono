@@ -485,19 +485,35 @@ impl WorkDb {
     /// `autostart` changes, every execution abandonment, and the status moves
     /// that happened in the same operation as one of those.
     pub fn list_task_field_audit(&self, work_item_id: &str) -> Result<Vec<boss_protocol::TaskFieldAuditRow>> {
+        self.list_task_field_audit_with_status(work_item_id, false)
+    }
+
+    /// Like [`Self::list_task_field_audit`], optionally including all
+    /// `property = 'status'` transitions (not just those correlated with a flag
+    /// or abandonment operation).
+    pub fn list_task_field_audit_with_status(
+        &self,
+        work_item_id: &str,
+        include_status: bool,
+    ) -> Result<Vec<boss_protocol::TaskFieldAuditRow>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let status_clause = if include_status {
+            "property = 'status'"
+        } else {
+            "(property = 'status' AND operation_id IS NOT NULL AND operation_id IN (
+                        SELECT operation_id FROM task_status_audit
+                        WHERE work_item_id = ?1 AND property IN (?2, ?3, ?4)))"
+        };
+        let sql = format!(
             "SELECT property, old_value, new_value, actor, basis, changed_at, age_is_lower_bound,
                     reason_code, detail, operation_id, execution_id, failure_stamp, failure_error,
                     execution_ever_ran, item_ever_ran
              FROM task_status_audit a
              WHERE work_item_id = ?1
-               AND (property IN (?2, ?3, ?4)
-                    OR (property = 'status' AND operation_id IS NOT NULL AND operation_id IN (
-                        SELECT operation_id FROM task_status_audit
-                        WHERE work_item_id = ?1 AND property IN (?2, ?3, ?4))))
-             ORDER BY id",
-        )?;
+               AND (property IN (?2, ?3, ?4) OR {status_clause})
+             ORDER BY id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
                 params![

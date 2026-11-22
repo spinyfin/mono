@@ -226,6 +226,7 @@ fn make_held_revision(db: &WorkDb, cycle_root_id: &str, cycle_root_pr_url: &str,
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -266,6 +267,7 @@ fn clean_verdict_advances_both_cycle_root_and_the_held_revision_it_reviewed() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -330,6 +332,7 @@ fn clean_verdict_does_not_advance_a_revision_with_a_different_contributed_head()
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -386,6 +389,7 @@ fn clean_verdict_does_not_advance_revision_when_only_an_older_execution_matches(
     let later = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Completed)
@@ -402,6 +406,7 @@ fn clean_verdict_does_not_advance_revision_when_only_an_older_execution_matches(
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -463,6 +468,7 @@ fn clean_verdict_advances_a_revision_nested_under_another_revision() {
     let r2_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(r2_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -486,6 +492,7 @@ fn clean_verdict_advances_a_revision_nested_under_another_revision() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -546,6 +553,7 @@ fn clean_verdict_does_not_release_a_deletion_signoff_hold() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -610,6 +618,7 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
         let supervisor = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -619,6 +628,7 @@ fn qualifying_findings_on_an_open_origin_create_a_revision() {
         let claude = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -745,6 +755,7 @@ fn qualifying_findings_on_a_merged_origin_create_a_followup() {
         let supervisor = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -754,6 +765,7 @@ fn qualifying_findings_on_a_merged_origin_create_a_followup() {
         let claude = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -833,6 +845,7 @@ fn merge_during_apply_creates_a_followup_instead_of_discarding_findings() {
         let supervisor = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -842,6 +855,7 @@ fn merge_during_apply_creates_a_followup_instead_of_discarding_findings() {
         let claude = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -907,6 +921,7 @@ fn reapplying_a_merged_followup_returns_the_same_work_item() {
         let supervisor = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -916,6 +931,7 @@ fn reapplying_a_merged_followup_returns_the_same_work_item() {
         let claude = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Completed)
@@ -1001,6 +1017,7 @@ fn reapplying_a_post_merge_followup_seeded_under_the_legacy_created_via_returns_
     let post_merge_reviewer = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -1090,6 +1107,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
     let clean_supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(clean_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1125,6 +1143,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
     let findings_supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(findings_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1134,6 +1153,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
     let findings_claude = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(findings_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -1177,6 +1197,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
     let applied_supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(applied_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1263,6 +1284,7 @@ fn verdict_citing_an_unreported_role_is_rejected() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1338,6 +1360,7 @@ fn stage_clean_verdict_with_key(
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root_id.to_owned())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1372,6 +1395,7 @@ fn stage_findings_verdict(db: &WorkDb, cycle_root_id: &str, target_sha: &str) ->
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root_id.to_owned())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1381,6 +1405,7 @@ fn stage_findings_verdict(db: &WorkDb, cycle_root_id: &str, target_sha: &str) ->
     let claude = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root_id.to_owned())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -1486,6 +1511,7 @@ fn tombstone_cancels_the_orphaned_revision_ready_execution() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1495,6 +1521,7 @@ fn tombstone_cancels_the_orphaned_revision_ready_execution() {
     let claude = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -1815,6 +1842,7 @@ fn sweep_counts_a_proposal_superseded_during_apply() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(superseded_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -1891,6 +1919,7 @@ fn post_merge_verdict_materialises_a_followup_despite_matching_the_prior_reviewe
     let post_merge_reviewer = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -1996,6 +2025,7 @@ fn assert_post_merge_followup_membership(in_project: bool) {
     let post_merge_reviewer = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)
@@ -2118,6 +2148,7 @@ fn supervising_batch_on_held_root(db: &WorkDb, target_sha: &str) -> (String, bos
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -2129,6 +2160,7 @@ fn supervising_batch_on_held_root(db: &WorkDb, target_sha: &str) -> (String, bos
     let claude = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)

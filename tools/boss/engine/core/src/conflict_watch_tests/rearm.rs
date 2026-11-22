@@ -723,6 +723,7 @@ async fn rearm_keeps_blocked_revision_with_running_execution() {
     let revision = create_active_chore(&db, &product, "blocked revision, worker still running");
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(revision.clone())
             .kind(ExecutionKind::RevisionImplementation)
             .status(ExecutionStatus::Running)

@@ -60,6 +60,7 @@ async fn explicit_review_start_dispatches_every_member_outside_focus() {
             .work_db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&sibling)
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)
@@ -138,6 +139,7 @@ async fn diagnosed_bypass_and_guide_refusal_commands_pass_cli_and_engine() {
             .work_db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&root)
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)

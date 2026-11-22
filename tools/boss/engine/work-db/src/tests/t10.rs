@@ -454,6 +454,7 @@ fn make_live_helper_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKi
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(kind)
                 .status(ExecutionStatus::Ready)
@@ -674,6 +675,7 @@ fn parked_active_chore(db: &WorkDb, label: &str) -> (String, String) {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Abandoned)
@@ -753,6 +755,7 @@ fn reconcile_revision_does_not_remint_a_blocked_declaration() {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Abandoned)
@@ -790,6 +793,7 @@ fn unparked_active_chore(db: &WorkDb, label: &str) -> (String, String) {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Abandoned)
@@ -849,6 +853,7 @@ fn reconcile_revision_reminted_an_unblocked_declaration() {
         .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(revision_id.clone())
             .kind(ExecutionKind::RevisionImplementation)
             .status(ExecutionStatus::Abandoned)
@@ -896,6 +901,7 @@ fn assert_converted_followup_dispatch(blocked: bool, sweep: bool) {
     let predecessor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Abandoned)

@@ -130,6 +130,7 @@ fn board_projection_runtime_and_structural_sequence_matches_every_field() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&root)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -243,6 +244,7 @@ fn board_projection_cross_product_dependencies_and_chain_holds_follow_their_inpu
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&dependent)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingDependency)
@@ -272,6 +274,7 @@ fn board_projection_cross_product_dependencies_and_chain_holds_follow_their_inpu
     let blocker = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&prerequisite)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -309,6 +312,7 @@ fn board_projection_review_evidence_and_metadata_sequences_match_complete_projec
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&root)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -405,6 +409,7 @@ fn board_projection_large_ready_backlog_stays_incremental() {
         let task = create_test_chore_manual(&db, product.clone(), format!("ready {i}")).id;
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -567,6 +572,7 @@ fn board_projection_snapshot_preserves_cached_runtime_expiry() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -659,6 +665,7 @@ fn wait_inputs_refresh_the_board_after_attention_pause_parking_and_batch_writes(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)

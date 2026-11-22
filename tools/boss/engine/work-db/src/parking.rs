@@ -1503,6 +1503,7 @@ mod tests {
         let pending_exec = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(pending_rev.clone())
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Ready)
@@ -1586,6 +1587,7 @@ mod tests {
         let rev_exec = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(pending_rev.clone())
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Ready)
@@ -1623,6 +1625,7 @@ mod tests {
             let execution = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(task.id.clone())
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(status)

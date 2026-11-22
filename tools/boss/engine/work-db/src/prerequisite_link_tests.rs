@@ -584,6 +584,7 @@ fn answering_a_stored_link_rechecks_chain_and_owner_liveness_without_adding_edge
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&asking.id)
                     .kind(ExecutionKind::RevisionImplementation)
                     .repo_remote_url("git@github.com:acme/widget.git")
@@ -658,6 +659,7 @@ fn yes_on_stored_link(db: &WorkDb, asking: &Task, target: &Task) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&asking.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .repo_remote_url(crate::test_support::TEST_REPO_REMOTE_URL)
@@ -715,6 +717,7 @@ fn linking_to_a_task_waiting_on_its_own_question_does_not_restart_it() {
     let target_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&target.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .repo_remote_url(crate::test_support::TEST_REPO_REMOTE_URL)

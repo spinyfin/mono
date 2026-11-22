@@ -313,6 +313,7 @@ async fn live_writer_on_the_chain_skips_the_candidate_without_marking_it_checked
     let execution = db
         .create_execution(
             crate::work::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&work_item_id)
                 .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(boss_protocol::ExecutionStatus::Running)

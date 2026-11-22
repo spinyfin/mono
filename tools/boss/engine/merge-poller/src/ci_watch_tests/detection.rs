@@ -521,6 +521,7 @@ async fn pending_conflict_with_queued_revision_preempts_ci() {
         .unwrap();
     db.create_execution(
         crate::work::CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(revision.id.clone())
             .kind(crate::work::ExecutionKind::RevisionImplementation)
             .status(crate::work::ExecutionStatus::Ready)

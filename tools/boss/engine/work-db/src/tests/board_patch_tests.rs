@@ -107,6 +107,7 @@ fn board() -> Board {
     db.delete_work_item(&deleted).unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(queued_chore.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)

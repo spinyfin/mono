@@ -44,6 +44,7 @@ async fn legacy_churn_stop_retains_its_scheduling_error_and_recovers() {
     }
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(&revision.id)
             .kind(ExecutionKind::RevisionImplementation)
             .status(ExecutionStatus::Failed)
@@ -330,6 +331,7 @@ async fn workspace_recovery_waits_for_live_writer_before_positioning() {
     let writer = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&chore)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -852,6 +854,7 @@ fn churn_stop_with_failed_revision(
     let execution = db
         .create_execution(
             crate::work::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&revision.id)
                 .kind(boss_protocol::ExecutionKind::RevisionImplementation)
                 .status(boss_protocol::ExecutionStatus::Failed)

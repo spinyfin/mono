@@ -28,6 +28,7 @@ async fn a_ready_revision_waits_while_the_engine_rebases_its_chain() {
     let revision = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_rebase_hold")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
