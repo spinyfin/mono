@@ -27,15 +27,15 @@ log stream --predicate 'subsystem == "dev.spinyfin.bossmacapp" AND category == "
 
 Engine log, message prefix `operator answer`:
 
-| Line                                            | `elapsed_ms` measures                                                                                                                                                                                   |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `operator answer handler entered`               | Socket receipt to handler start. A session runs one mutation at a time, so this is time spent behind the session's earlier requests.                                                                    |
-| `operator answer durable write completed`       | The answer's transaction, including any wait for the database connection.                                                                                                                               |
-| `operator answer board publication completed`   | Execution reconcile plus fan-out of the invalidation push.                                                                                                                                              |
-| `operator answer: launched the work it created` | The inline launch of the run the answer created or resumed. Only logged for an answer that launches (a run with force-launch lineage, or an architectural-mismatch answer). The reply is sent after it. |
-| `operator answer reply enqueued`                | Socket receipt to the reply entering the session's outbound queue: the engine's total.                                                                                                                  |
-| `operator answer reply socket write completed`  | Socket receipt to the reply frame leaving the socket. The gap from `reply enqueued` is outbound queue time.                                                                                             |
-| `operator answer refused`                       | The transaction that refused the answer.                                                                                                                                                                |
+| Line                                            | `elapsed_ms` measures                                                                                                                                                                                                                                         |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operator answer handler entered`               | Socket receipt to handler start. A session runs one mutation at a time, so this is time spent behind the session's earlier requests.                                                                                                                          |
+| `operator answer durable write completed`       | The answer's transaction, including any wait for the database connection.                                                                                                                                                                                     |
+| `operator answer board publication completed`   | Execution reconcile plus fan-out of the invalidation push.                                                                                                                                                                                                    |
+| `operator answer: launched the work it created` | The launch of the run the answer created or resumed. Only logged for an answer that launches (a run with force-launch lineage, or an architectural-mismatch answer). The reply does not wait for cube or spawn; this line is logged when the launch finishes. |
+| `operator answer reply enqueued`                | Socket receipt to the reply entering the session's outbound queue: the engine's total.                                                                                                                                                                        |
+| `operator answer reply socket write completed`  | Socket receipt to the reply frame leaving the socket. The gap from `reply enqueued` is outbound queue time.                                                                                                                                                   |
+| `operator answer refused`                       | The transaction that refused the answer.                                                                                                                                                                                                                      |
 
 ## Reading a slow answer
 
@@ -46,8 +46,8 @@ Engine log, message prefix `operator answer`:
   `work DB connection lock timing` with the same `request_id`; its `wait_ms`
   is the time queued, and the holder logs its own line with `held_ms`, its
   `verb` or `background` name, and the `caller` that took the connection.
-- **Large `launched the work it created`**: the reply waited for a workspace
-  lease and a worker spawn.
+- **Large `launched the work it created`**: workspace lease and worker spawn
+  were slow. The card has already moved; this line is the launch finishing.
 - **Large gap between the engine's `reply socket write completed` and the app's
   `answer reply applied`**: the app's main thread was busy.
 - **Large `since_reply` on `question card cleared`**: the model had the answer
@@ -62,9 +62,12 @@ Reads that feed the board do not take the connection mutations use:
   blocks the session's mutations.
 - The scheduler heartbeat's queued-display pass, which recomputes the label of
   every queued card in one read transaction, runs on its own read-only
-  connection (`ExecutionCoordinator::queued_display_db`). It used to read
-  through the shared connection inside a write-locking transaction, so an
-  answer that arrived mid-pass waited for the whole pass.
+  connection (`ExecutionCoordinator::queued_display_db`) because it holds that
+  connection for a read transaction over every queued card, and on the shared
+  connection that time would be added to every mutation that arrives mid-pass.
+- Launching the run an answer created or resumed (workspace lease, pane spawn)
+  finishes off the session handler, so the card clears while that launch is
+  still in flight.
 
 A new read that walks many cards belongs on a read-only connection
 (`WorkDb::reader`) for the same reason: on the shared connection its duration

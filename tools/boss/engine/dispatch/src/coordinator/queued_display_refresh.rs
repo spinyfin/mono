@@ -7,11 +7,12 @@ impl ExecutionCoordinator {
     /// The pass recomputes the runtime of every queued card inside one read
     /// transaction, so it holds its connection for as long as that takes: a
     /// time that grows with the queue and with the cost of each card's reads.
-    /// On the connection every mutation shares, each write that arrived during
-    /// a pass waited for the pass to end, including a person's answer to a
-    /// question card. An independent WAL reader has its own lock and never
-    /// blocks the writer. An in-memory database has no second connection to
-    /// open, so it keeps reading through the one it has.
+    /// It therefore runs on its own read-only WAL connection: on the shared
+    /// connection that hold would be added to every mutation that arrives
+    /// mid-pass, including a person's answer to a question card. An
+    /// independent WAL reader has its own lock and never blocks the writer.
+    /// An in-memory database has no second connection to open, so it keeps
+    /// reading through the one it has.
     pub fn queued_display_db(&self) -> Arc<WorkDb> {
         if let Some(reader) = self.queued_display_reader.get() {
             return reader.clone();

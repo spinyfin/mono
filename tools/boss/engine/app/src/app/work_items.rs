@@ -9,6 +9,8 @@ use crate::app::handler_helpers::{BoardRefusal, board_dispatch_refusal, send_ref
 use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
 
 use super::*;
+use std::future::Future;
+
 use boss_protocol::{BoardRefusalCode, WorkItemPatch};
 
 /// Resolve the caller tier for a work-item write that may carry a
@@ -204,6 +206,47 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             let mut changed = vec![work_item_id(&item)];
             changed.extend(outcome.prerequisite_work_item_id);
             changed.extend(outcome.touched_work_item_ids);
+            if let Some(dispatch_id) = outcome.dispatch_work_item_id {
+                let launch_started = Instant::now();
+                let coordinator = server_state.execution_coordinator.clone();
+                let launch_request_id = request_id.clone();
+                // The answer is committed and the execution it created or
+                // resumed is marked operator-forced. Launching is best-effort:
+                // when it cannot launch now (a writer is live on the PR, the
+                // pool is at its hard cap, preflight, a predecessor lease)
+                // the flag stays until the work is admitted or cancelled, and
+                // the drain dispatches it as operator-forced once it is ready.
+                //
+                // First poll takes the dispatch reservation on this task so
+                // the invalidation kick cannot defer the row as pool-exhausted
+                // first. Cube lease and pane spawn stay off the handler.
+                let mut launch = Box::pin(async move {
+                    match coordinator.launch_answered_work(&dispatch_id).await {
+                        Ok(worker) => tracing::info!(
+                            request_id = %launch_request_id,
+                            work_item_id = %dispatch_id,
+                            launched = worker.is_some(),
+                            elapsed_ms = elapsed_ms(launch_started),
+                            "operator answer: launched the work it created",
+                        ),
+                        Err(err) => tracing::warn!(
+                            request_id = %launch_request_id,
+                            work_item_id = %dispatch_id,
+                            error = %format!("{err:#}"),
+                            elapsed_ms = elapsed_ms(launch_started),
+                            "operator answer: could not launch the work it created; operator-forced admission is kept",
+                        ),
+                    }
+                });
+                let finished = std::future::poll_fn(|cx| match launch.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => std::task::Poll::Ready(true),
+                    std::task::Poll::Pending => std::task::Poll::Ready(false),
+                })
+                .await;
+                if !finished {
+                    boss_task_scope::spawn(launch);
+                }
+            }
             let publication_started = Instant::now();
             let revision = publish_work_invalidation(
                 &server_state,
@@ -220,35 +263,6 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             )
             .await;
             tracing::info!(%request_id, verb, elapsed_ms = elapsed_ms(publication_started), "operator answer board publication completed");
-            if let Some(dispatch_id) = outcome.dispatch_work_item_id {
-                let launch_started = Instant::now();
-                // The answer is committed and the execution it created or
-                // resumed is marked operator-forced. Launching is best-effort:
-                // when it cannot launch now (a writer is live on the PR, the
-                // pool is at its hard cap, preflight, a predecessor lease)
-                // the flag stays until the work is admitted or cancelled, and
-                // the drain dispatches it as operator-forced once it is ready.
-                match server_state
-                    .execution_coordinator
-                    .launch_answered_work(&dispatch_id)
-                    .await
-                {
-                    Ok(worker) => tracing::info!(
-                        %request_id,
-                        work_item_id = %dispatch_id,
-                        launched = worker.is_some(),
-                        elapsed_ms = elapsed_ms(launch_started),
-                        "operator answer: launched the work it created",
-                    ),
-                    Err(err) => tracing::warn!(
-                        %request_id,
-                        work_item_id = %dispatch_id,
-                        error = %format!("{err:#}"),
-                        elapsed_ms = elapsed_ms(launch_started),
-                        "operator answer: could not launch the work it created; operator-forced admission is kept",
-                    ),
-                }
-            }
             let delivered = sink.enqueue_response_awaiting_delivery(FrontendEventEnvelope::response_with_revision(
                 request_id.clone(),
                 revision,

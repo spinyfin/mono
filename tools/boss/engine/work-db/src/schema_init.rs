@@ -232,11 +232,17 @@ impl WorkDb {
 
     /// Independent WAL reader for bulk inspection. In-memory test databases
     /// keep their anchor; production file databases never share the writer mutex.
+    ///
+    /// Uses the shared connection's busy timeout. WAL recovery or a
+    /// RESTART/TRUNCATE checkpoint can busy a reader, and the inspection
+    /// opener's 250 ms is shorter than a heartbeat tick.
     pub fn reader(&self) -> Result<Self> {
         if self.memory.is_some() {
             return Ok(self.clone());
         }
-        Self::open_read_only(self.path.clone())
+        let reader = Self::open_read_only(self.path.clone())?;
+        reader.connect()?.busy_timeout(super::SQLITE_BUSY_TIMEOUT)?;
+        Ok(reader)
     }
 
     /// Attach a CLI command to initialized state. Only engine startup runs

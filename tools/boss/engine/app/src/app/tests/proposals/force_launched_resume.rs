@@ -382,18 +382,29 @@ async fn force_launched_resume_starts_after_predecessor_lease_clears() {
         answer_question(&state, &task_id, true).await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
-    let resume = resume_execution(&state, &task_id, &asking);
+    let resume_id = resume_execution(&state, &task_id, &asking).id;
+    let resume = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let execution = state.work_db.get_execution(&resume_id).unwrap();
+            if execution.dispatch_wait_reason.as_deref() == Some("awaiting_predecessor_preservation") {
+                return execution;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the asking run still holds its cube lease: {:?}",
+            state.work_db.get_execution(&resume_id).unwrap()
+        )
+    });
     assert_eq!(resume.status, ExecutionStatus::Ready);
     assert!(
         state
             .work_db
             .execution_has_operator_forced_admission(&resume.id)
             .unwrap()
-    );
-    assert_eq!(
-        resume.dispatch_wait_reason.as_deref(),
-        Some("awaiting_predecessor_preservation"),
-        "the asking run still holds its cube lease: {resume:?}"
     );
 
     release_finished_execution_lease(&state.work_db, &asking);
