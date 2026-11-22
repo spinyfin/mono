@@ -1211,7 +1211,7 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
         // summarizer could read.
         if matches!(server_state.work_db.spoke_assignment_for_execution(run_id), Ok(Some(_)))
             && let Ok(Some(slug)) = server_state.work_db.get_execution_driver_slug(run_id)
-            && let Ok(driver) = boss_engine_driver::DriverRegistry::default().require(&slug)
+            && let Ok(driver) = boss_engine_driver::DriverRegistry::shared().require(&slug)
         {
             super::spoke_projection::start_summary_slot(server_state, slot_id, run_id, driver);
         }
@@ -1513,7 +1513,7 @@ fn pr_url_capture_feed_for_execution(
         return None;
     }
 
-    let registry = DriverRegistry::default();
+    let registry = DriverRegistry::shared();
     match server_state.work_db.get_execution_driver_slug(execution_id) {
         Ok(Some(slug)) => match registry.get(&slug) {
             Some(driver) => driver.pr_url_capture_feed(tool_name, tool_input, tool_response),
@@ -1612,7 +1612,7 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
         }
     };
 
-    let registry = DriverRegistry::default();
+    let registry = DriverRegistry::shared();
     let Some(driver) = registry.get(&driver_slug) else {
         // An unregistered slug (e.g. a task/product configured with a
         // `driver` that has no `DriverRegistry` entry yet) is exactly the

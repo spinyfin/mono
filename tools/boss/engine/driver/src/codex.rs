@@ -2185,6 +2185,10 @@ impl AgentDriver for CodexDriver {
         ProgressFidelity::Rich
     }
 
+    fn progress_ingress_kind(&self) -> crate::ProgressIngressKind {
+        crate::ProgressIngressKind::AgentJsonlFile
+    }
+
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
         // Pane-hosted Codex stdout belongs to Ghostty's pty master; the engine
         // cannot read it from `shell_pid`. Codex independently writes a raw

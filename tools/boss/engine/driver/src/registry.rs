@@ -2,12 +2,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{
-    AgentDriver, AgyDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngress,
-    ProgressObservationConfig, WorkerProcessLifetime,
+    AgentDriver, AgyDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngressKind,
+    WorkerProcessLifetime,
 };
 
 /// A driver slug the current binary's [`DriverRegistry`] does not recognise.
@@ -77,18 +76,8 @@ impl Default for DriverRegistry {
 /// `StdoutJsonl`-declaring test drivers to exercise that still-supported
 /// generic ingress kind in isolation from any real driver.
 fn refuse_stdout_jsonl_ingress(slug: &str, driver: &dyn AgentDriver) {
-    let probe_config = ProgressObservationConfig {
-        events_socket_path: PathBuf::new(),
-        lease_id: String::new(),
-        run_id: String::new(),
-        workspace_path: PathBuf::new(),
-        forwarder_binary: PathBuf::new(),
-    };
     assert!(
-        !matches!(
-            driver.progress_observation_wiring(&probe_config),
-            ProgressIngress::StdoutJsonl
-        ),
+        driver.progress_ingress_kind() != ProgressIngressKind::StdoutJsonl,
         "driver '{slug}' declared ProgressIngress::StdoutJsonl at registration; the engine-spawned \
          stdout-JSONL topology was intentionally discontinued and production ingress activation does \
          not wire it up — see tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md"
@@ -175,6 +164,17 @@ fn refuse_inconsistent_interrupt_declaration(slug: &str, driver: &dyn AgentDrive
 }
 
 impl DriverRegistry {
+    /// Process-wide default registry, built once on first use.
+    ///
+    /// Per-event call sites (hook handling, transcript lookup) use this
+    /// instead of rebuilding [`Self::default`] and re-running its
+    /// registration guards on every call. Callers that need to extend the
+    /// registry with [`Self::with_driver`] still build their own.
+    pub fn shared() -> &'static DriverRegistry {
+        static SHARED: std::sync::OnceLock<DriverRegistry> = std::sync::OnceLock::new();
+        SHARED.get_or_init(DriverRegistry::default)
+    }
+
     /// Register (or replace) the driver for `slug`. Chainable.
     ///
     /// Lets a caller extend the default registry — e.g. tests that need a
@@ -274,6 +274,66 @@ mod tests {
     use super::*;
     use crate::test_support::{StubDriver, stub_descriptor};
     use crate::{Capability, CapabilitySet, SpawnRequest};
+
+    /// `progress_ingress_kind` must match the variant the wiring returns for
+    /// a real config, since callers classify drivers with it instead of
+    /// building the wiring.
+    #[test]
+    fn ingress_kind_agrees_with_wiring_for_every_builtin_driver() {
+        let reg = DriverRegistry::default();
+        let tmp = std::env::temp_dir();
+        for slug in ["claude", "codex", "grok", "agy"] {
+            let driver = reg.require(slug).unwrap();
+            let config = crate::ProgressObservationConfig {
+                events_socket_path: tmp.join("events.sock"),
+                lease_id: "lease".into(),
+                run_id: format!("run-{slug}"),
+                workspace_path: tmp.join("ws"),
+                forwarder_binary: tmp.join("boss-event"),
+            };
+            assert_eq!(
+                driver.progress_ingress_kind(),
+                driver.progress_observation_wiring(&config).kind(),
+                "driver '{slug}'"
+            );
+        }
+    }
+
+    /// Minimal subscriber that records whether any ERROR event fired.
+    struct ErrorCapture(Arc<std::sync::atomic::AtomicBool>);
+
+    impl tracing::Subscriber for ErrorCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Building the registry must not probe drivers with a placeholder
+    /// config: agy's wiring logs an ERROR for a config it cannot honour.
+    #[test]
+    fn building_registry_logs_no_error() {
+        let saw_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let subscriber = ErrorCapture(saw_error.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = DriverRegistry::default();
+        });
+        assert!(
+            !saw_error.load(std::sync::atomic::Ordering::SeqCst),
+            "DriverRegistry::default() emitted an ERROR-level event"
+        );
+    }
 
     #[test]
     fn default_registry_contains_claude() {

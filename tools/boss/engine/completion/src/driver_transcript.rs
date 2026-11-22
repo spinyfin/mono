@@ -101,7 +101,7 @@ pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<
 /// silently relabel the run as a different driver.
 pub fn driver_for_spawned_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
     match work_db.launched_driver_slug(execution_id) {
-        Ok(Some(slug)) if !slug.trim().is_empty() => match DriverRegistry::default().require(&slug) {
+        Ok(Some(slug)) if !slug.trim().is_empty() => match DriverRegistry::shared().require(&slug) {
             Ok(driver) => return Some(driver),
             Err(err) => {
                 tracing::warn!(
@@ -139,14 +139,14 @@ pub fn driver_for_spawned_execution(work_db: &WorkDb, execution_id: &str) -> Opt
         return require_driver_slug(execution_id, &slug);
     }
     driver_for_execution(work_db, execution_id).or_else(|| {
-        DriverRegistry::default()
+        DriverRegistry::shared()
             .require(crate::effort::ENGINE_DEFAULT_DRIVER)
             .ok()
     })
 }
 
 fn require_driver_slug(execution_id: &str, slug: &str) -> Option<Arc<dyn AgentDriver>> {
-    match DriverRegistry::default().require(slug) {
+    match DriverRegistry::shared().require(slug) {
         Ok(driver) => Some(driver),
         Err(err) => {
             tracing::warn!(

@@ -29,22 +29,11 @@ const VIEWER_REATTACH_RETRY_MAX_ATTEMPTS: u32 = 4;
 /// Whether `driver` observes its worker by tailing a JSONL file, the same
 /// derivation `spawn_flow::start_worker` makes at spawn time.
 ///
-/// Only the [`boss_engine_driver::ProgressIngress`] *variant* is read, and every
-/// driver picks its variant from its own identity rather than from the config
-/// it is handed, so this is a classification probe: the run id is real
-/// (Codex derives its rollout directory from it) and the rest of the config
-/// is empty because nothing here reads the wiring it would produce.
-fn driver_tails_a_progress_file(driver: &dyn boss_engine_driver::AgentDriver, run_id: &str) -> bool {
-    matches!(
-        driver.progress_observation_wiring(&boss_engine_driver::ProgressObservationConfig {
-            events_socket_path: std::path::PathBuf::new(),
-            lease_id: String::new(),
-            run_id: run_id.to_owned(),
-            workspace_path: std::path::PathBuf::new(),
-            forwarder_binary: std::path::PathBuf::new(),
-        }),
-        boss_engine_driver::ProgressIngress::AgentJsonlFile(_),
-    )
+/// Only the ingress *kind* is read, which a driver declares from its own
+/// identity ([`boss_engine_driver::AgentDriver::progress_ingress_kind`]); no
+/// run config is built.
+fn driver_tails_a_progress_file(driver: &dyn boss_engine_driver::AgentDriver) -> bool {
+    driver.progress_ingress_kind() == boss_engine_driver::ProgressIngressKind::AgentJsonlFile
 }
 
 /// What [`ServerState::readopt_progress_ingress`] did, for the dispatch
@@ -648,10 +637,7 @@ impl ServerState {
                 // nothing will release. That is an attention item, not a log
                 // line. Only a driver that never tails a file gets to be
                 // merely `Unknown`.
-                if driver
-                    .as_deref()
-                    .is_some_and(|driver| driver_tails_a_progress_file(driver, run_id))
-                {
+                if driver.as_deref().is_some_and(driver_tails_a_progress_file) {
                     self.file_ingress_readoption_attention(
                         execution,
                         "this run recorded no progress-ingress checkpoint, so there is no rollout \

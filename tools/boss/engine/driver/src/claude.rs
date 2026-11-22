@@ -958,6 +958,10 @@ impl AgentDriver for ClaudeDriver {
         ProgressFidelity::Rich
     }
 
+    fn progress_ingress_kind(&self) -> crate::ProgressIngressKind {
+        crate::ProgressIngressKind::HookCallback
+    }
+
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
         // Inline-prefixed env vars (see `forwarder_command`): setting them here
         // rather than relying on env inheritance from the worker pane through

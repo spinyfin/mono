@@ -139,6 +139,9 @@ impl AgentDriver for CodexShapedDriver {
         ProgressFidelity::Rich
     }
 
+    fn progress_ingress_kind(&self) -> boss_engine_driver::ProgressIngressKind {
+        boss_engine_driver::ProgressIngressKind::StdoutJsonl
+    }
     fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressIngress {
         ProgressIngress::StdoutJsonl
     }
