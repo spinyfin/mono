@@ -157,8 +157,11 @@ build:ci-remote-linux --grpc_keepalive_timeout=20s
 build:ci-remote-linux --noremote_local_fallback
 build:ci-remote-linux --remote_cache_compression
 # The tag that routes the build: every action asks for a worker whose
-# OSFamily is linux, and the Linux scheduler offers an action only to workers
-# that declare that value. The property is part of each action's cache key, so
+# OSFamily is linux, and the scheduler offers an action only to workers that
+# declare that value. The macOS and the Linux workers share one scheduler,
+# which treats an action with no OSFamily as a macOS action
+# (tools/remote-execution/README.md, "Routing"), so this line is what keeps a
+# Linux build off the Macs. The property is part of each action's cache key, so
 # a step that executes remotely and one that builds on the agent do not share
 # results, in either the remote cache or the disk cache.
 build:ci-remote-linux --remote_default_exec_properties=OSFamily=linux

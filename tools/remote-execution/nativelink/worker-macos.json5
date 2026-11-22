@@ -107,8 +107,18 @@
         max_inflight_tasks: "${NL_WORKER_SLOTS}",
         platform_properties: {
           cpu_count: { values: ["${NL_WORKER_SLOTS}"] },
-          OSFamily: { values: [""] },
+          // The hub offers this worker the actions whose OSFamily is
+          // "macos": the ones a client tagged so, and every action that
+          // arrived with no OSFamily (hub.json5, property_modifier).
+          OSFamily: { values: ["macos"] },
           "container-image": { values: [""] },
+          // Names this worker. Nothing asks for it in normal use. A build
+          // that adds --remote_default_exec_properties=worker-host=<name>
+          // runs only on that worker, which is how one worker is checked by
+          // itself. The hub does not list the key, so it is compared only
+          // against workers that declare it: every worker, on either
+          // operating system, must declare it.
+          "worker-host": { values: ["${NL_WORKER_NAME}"] },
         },
       },
     },

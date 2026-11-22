@@ -147,6 +147,36 @@ grep -q -x 'EnvironmentFile=%h/nativelink-macos-hub/hub.env' "$health_unit" ||
 # ---------------------------------------------------------------------------
 
 # JSON log lines, which is the only format the check counts events in.
+# ---------------------------------------------------------------------------
+# Routing. One scheduler serves the macOS and the Linux workers, and the
+# OSFamily property is all that keeps an action on the right operating system.
+# ---------------------------------------------------------------------------
+
+# Exact matching: with any other type a worker is offered actions whose
+# OSFamily differs from its own.
+settings "$hub" | grep -q -x 'OSFamily: "exact",' ||
+  fail "hub.json5 must match OSFamily exactly: it is what keeps a macOS action off a Linux worker"
+# Every action gets an OSFamily before it is scheduled: the client's, or
+# "macos". The order matters. "add" overwrites, so the client's value is moved
+# aside first and put back afterwards; in any other order a Linux action is
+# scheduled as a macOS one, or an untagged action is offered to every worker.
+expected_modifications='{ replace: { name: "OSFamily", new_name: "requested-OSFamily" } },
+{ add: { name: "OSFamily", value: "macos" } },
+{ replace: { name: "requested-OSFamily", new_name: "OSFamily" } },'
+actual_modifications="$(settings "$hub" | sed -n '/^modifications: \[$/,/^\],$/p' | sed '1d;$d')"
+if [[ "$actual_modifications" != "$expected_modifications" ]]; then
+  fail "hub.json5's property_modifier must default OSFamily to macos in three steps (move aside, add, put back); found: ${actual_modifications}"
+fi
+# The macOS worker declares the value the default routes to, and a name a
+# build can pin. The key is one the hub does not list, so it restricts only
+# workers that declare it.
+settings "$worker" | grep -q -x 'OSFamily: { values: \["macos"\] },' ||
+  fail "worker-macos.json5 must declare OSFamily macos: the hub schedules an untagged action as a macOS action"
+settings "$worker" | grep -q -x -F '"worker-host": { values: ["${NL_WORKER_NAME}"] },' ||
+  fail "worker-macos.json5 must declare worker-host as its own name: a build pinned to one worker can otherwise land on the worker that declares none"
+grep -q -x '## Routing' "$readme" ||
+  fail "README.md must keep its \"Routing\" section: hub.json5, the units and the Linux runbook point at it"
+
 grep -q -x 'Environment=NL_LOG=json' "$hub_unit" ||
   fail "the hub's unit must set NL_LOG=json: hub-health.sh reads that format"
 # The journal of the unit the hub runs as.

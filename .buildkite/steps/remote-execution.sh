@@ -57,8 +57,8 @@
 #          Bazel's linux-sandbox when it leaves the agent, so the isolation
 #          boundary is the sandbox each Linux worker runs every action in
 #          (tools/test-sandbox/linux_remote_action_sandbox.sh). The config
-#          also tags every action OSFamily=linux, the property the Linux
-#          scheduler matches workers on.
+#          also tags every action OSFamily=linux, the property the scheduler
+#          routes on: an action without it is scheduled as a macOS action.
 #
 # A malformed endpoint is an error, not a fallback: a typo on an agent would
 # otherwise leave that agent building locally for good with nothing to show it.
