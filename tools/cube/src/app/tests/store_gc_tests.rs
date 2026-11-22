@@ -1262,7 +1262,7 @@ pub(super) fn gc_index_command(source: &std::path::Path, args: &[&str]) -> Expec
     };
     let mut command = vec!["--ignore-working-copy", "--repository", repo.to_str().unwrap()];
     command.extend_from_slice(args);
-    ExpectedCommand::ok(source.to_path_buf(), "jj", &command, "")
+    ExpectedCommand::ok(repo.to_path_buf(), "jj", &command, "")
 }
 
 pub(super) fn fresh_index_command(source: &std::path::Path) -> ExpectedCommand {

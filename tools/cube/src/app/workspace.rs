@@ -8,7 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::cli::WorkspaceCommand;
-use crate::command_runner::{CommandInvocation, CommandRunner};
+use crate::command_runner::{CommandInvocation, CommandRunner, JjGate};
 use crate::lock::RepoLock;
 use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::setup::StepStatus;
@@ -261,7 +261,7 @@ pub(super) fn run_workspace(
             // Kick a background pool-wide gc pass at most once per 24h.
             maybe_trigger_pool_gc(runner, &mut store, database_path, leased_at_epoch_s)?;
 
-            let _maintenance = crate::command_runner::JjGate::shared_for_database_with_runner(database_path, runner)?;
+            let mut maintenance = Some(JjGate::shared_for_database_with_runner(database_path, runner)?);
             let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
             let mut candidates = discover_workspaces(&repo_record)?;
             store.sync_workspaces(&repo, &candidates)?;
@@ -1107,7 +1107,8 @@ pub(super) fn run_workspace(
                         .maybe_reclaim(lease_reclaim_report.as_ref())
                         .build(),
                 );
-                let new_candidate = auto_create_workspace(runner, database_path, &repo_record, &candidates)?;
+                let new_candidate =
+                    auto_create_workspace(runner, database_path, &repo_record, &candidates, &mut maintenance)?;
                 let new_id = new_candidate.workspace_id.clone();
                 candidates.push(new_candidate);
                 store.sync_workspaces(&repo, &candidates)?;
@@ -1260,7 +1261,8 @@ pub(super) fn run_workspace(
                     None,
                 )?;
                 store.sync_workspaces(&repo, &retry_candidates)?;
-                let new_candidate = auto_create_workspace(runner, database_path, &repo_record, &retry_candidates)?;
+                let new_candidate =
+                    auto_create_workspace(runner, database_path, &repo_record, &retry_candidates, &mut maintenance)?;
                 let new_id = new_candidate.workspace_id.clone();
                 retry_candidates.push(new_candidate);
                 store.sync_workspaces(&repo, &retry_candidates)?;
@@ -1396,6 +1398,7 @@ pub(super) fn run_workspace(
                 // and means "there was nothing to relieve".
                 "disk_pressure": disk_relief,
             });
+            drop(maintenance);
             RunResult::new(message, payload)
         }
         WorkspaceCommand::Release {

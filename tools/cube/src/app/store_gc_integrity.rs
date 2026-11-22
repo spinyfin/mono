@@ -220,7 +220,14 @@ impl GcIndex {
             command.extend(["--at-operation", head]);
         }
         command.extend_from_slice(args);
-        let mut invocation = RealCommandRunner::invocation(&self.source, "jj", &command);
+        let mut invocation = RealCommandRunner::invocation(repo, "jj", &command);
+        if repo == self.scratch {
+            // Loading a copied repo can allocate a secure-config directory.
+            // Keep both cwd discovery and configuration inside the scratch.
+            for name in ["HOME", "XDG_CONFIG_HOME"] {
+                invocation.env.push((name.into(), path.to_string()));
+            }
+        }
         invocation.env.push((JJ_GATE_HELD_ENV.to_owned(), "1".to_owned()));
         runner.run_with_timeout(&invocation, timeout)?;
         Ok(())

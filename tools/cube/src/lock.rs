@@ -6,7 +6,17 @@ use fs4::fs_std::FileExt;
 use crate::app::CubeError;
 
 pub struct RepoLock {
-    _file: File,
+    file: Option<File>,
+}
+
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            // Closing alone leaves flock held while another thread's forked
+            // child retains a duplicate descriptor before exec.
+            let _ = FileExt::unlock(file);
+        }
+    }
 }
 
 /// The jj repo directory shared by every workspace of the store `cwd` belongs
@@ -28,9 +38,14 @@ pub fn shared_repo_dir(cwd: &Path) -> Result<PathBuf, CubeError> {
 }
 
 impl RepoLock {
+    /// Own an already-held shared or exclusive lock and unlock it on drop.
+    pub(crate) fn from_locked_file(file: File) -> Self {
+        Self { file: Some(file) }
+    }
+
     /// Transfer the locked file to a detached child without a lock-free gap.
-    pub(crate) fn into_file(self) -> File {
-        self._file
+    pub(crate) fn into_file(mut self) -> File {
+        self.file.take().expect("locked file")
     }
 
     /// Serialize git remote changes and temporary-remote fetches across processes
@@ -77,7 +92,7 @@ impl RepoLock {
         } else if !FileExt::try_lock_exclusive(&file).map_err(io_error)? {
             return Ok(None);
         }
-        Ok(Some(Self { _file: file }))
+        Ok(Some(Self::from_locked_file(file)))
     }
 }
 
@@ -114,6 +129,29 @@ mod tests {
         let lock = RepoLock::acquire(&lock_path).unwrap();
         drop(lock);
         let _again = RepoLock::acquire(&lock_path).unwrap();
+    }
+
+    #[test]
+    fn drop_releases_even_with_a_duplicated_descriptor() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("repo.lock");
+        let held = RepoLock::acquire(&lock_path).unwrap();
+        // A concurrent process spawn can inherit the descriptor between fork
+        // and exec; closing only the parent's copy does not release flock.
+        let inherited = held.file.as_ref().unwrap().try_clone().unwrap();
+        drop(held);
+        assert!(RepoLock::try_acquire(&lock_path).unwrap().is_some());
+        drop(inherited);
+    }
+
+    #[test]
+    fn into_file_preserves_the_lock_until_the_receiver_releases_it() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("repo.lock");
+        let held = RepoLock::acquire(&lock_path).unwrap().into_file();
+        assert!(RepoLock::try_acquire(&lock_path).unwrap().is_none());
+        FileExt::unlock(&held).unwrap();
+        assert!(RepoLock::try_acquire(&lock_path).unwrap().is_some());
     }
 
     #[test]
