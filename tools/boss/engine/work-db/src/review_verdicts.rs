@@ -146,6 +146,53 @@ pub(crate) fn unproductive_completed_pr_review_sql_for(alias: &str) -> String {
     )
 }
 
+/// SQL boolean over a `work_executions` row aliased `alias`: a `pr_review`
+/// attempt that did not yield a durable judgement — a dead terminal status or a
+/// completed give-up ([`unproductive_completed_pr_review_sql_for`]). The one
+/// definition of "dead review attempt" shared by the recovery sweep's candidate
+/// list, its churn count and the board's review-readiness projection.
+pub(crate) fn dead_pr_review_attempt_sql(alias: &str) -> String {
+    format!(
+        "({alias}.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {})",
+        unproductive_completed_pr_review_sql_for(alias)
+    )
+}
+
+/// SQL boolean over `work_executions` row `alias`: no later `pr_review`
+/// attempt of the same work item exists, so `alias` is the item's newest
+/// review. `later` is a free alias for the inner row.
+pub(crate) fn latest_pr_review_attempt_sql(alias: &str, later: &str) -> String {
+    format!(
+        "NOT EXISTS (
+            SELECT 1 FROM work_executions {later}
+            WHERE {later}.work_item_id = {alias}.work_item_id
+              AND {later}.kind = 'pr_review'
+              AND ({later}.created_at > {alias}.created_at
+                   OR ({later}.created_at = {alias}.created_at AND {later}.id > {alias}.id))
+        )"
+    )
+}
+
+/// SQL boolean over a `tasks` row aliased `task`: the review recovery sweep may
+/// act on it — live, not done/archived, not parked, not held by a positioning
+/// refusal, and not routed through batch admission by a deferred marker.
+pub(crate) fn dead_review_recovery_eligible_sql(task: &str) -> String {
+    let upkeep = super::parking::upkeep_eligible_task_sql(task);
+    let not_held = super::dispatch_helpers::not_positioning_held_sql(task);
+    format!(
+        "({task}.deleted_at IS NULL
+          AND {task}.status NOT IN ('done', 'archived')
+          AND {upkeep}
+          AND {not_held}
+          AND NOT EXISTS (
+              SELECT 1 FROM work_attention_items ai
+              WHERE ai.work_item_id = {task}.id
+                AND ai.kind = 'pr_review_admission_deferred'
+                AND ai.status = 'open'
+          ))"
+    )
+}
+
 /// What `boss_engine::completion::WorkerCompletionHandler::finalize_pr_review_pass`
 /// knows about a completed reviewer pass at the moment it calls
 /// [`WorkDb::record_worker_pr_completion`]. Written into `pr_review_verdicts`
@@ -223,15 +270,21 @@ fn map_review_verdict(row: &rusqlite::Row) -> rusqlite::Result<ReviewVerdict> {
 /// [`WorkDb::latest_review_verdict`] and
 /// [`WorkDb::already_reviewed_at_head_in_tx`] so both read the same query
 /// against either a fresh connection or an already-open transaction.
+///
+/// Skip outcomes ([`SKIPPED_GATE_OUTCOMES`]) record why no review will run at a
+/// head; they are not review results. They are excluded so a skip never
+/// displaces the real verdict as "latest" (which would, for example, make an
+/// already-reviewed head look unreviewed).
 fn latest_review_verdict_in(conn: &rusqlite::Connection, work_item_id: &str) -> Result<Option<ReviewVerdict>> {
     conn.query_row(
         "SELECT id, execution_id, work_item_id, head_sha, findings_count,
                 revision_warranted, gate_outcome, revision_task_id, created_at
          FROM pr_review_verdicts
          WHERE work_item_id = ?1
+           AND gate_outcome NOT IN (?2, ?3)
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
-        params![work_item_id],
+        params![work_item_id, SKIPPED_GATE_OUTCOMES[0], SKIPPED_GATE_OUTCOMES[1]],
         map_review_verdict,
     )
     .optional()

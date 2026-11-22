@@ -18,8 +18,26 @@ pub(super) enum ReviewKey {
 /// filter: a revision never links to itself as its own findings revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentHeadReview {
+    /// The verdict-derived state. When [`Self::due_dependent`] is set this is
+    /// a placeholder; read [`Self::state_when`].
     pub state: &'static str,
     pub findings_revision_id: Option<String>,
+    /// No verdict settles the head, so its state depends on whether a review
+    /// is still due. That is volatile (attention items, batches, parking and a
+    /// time window — none of them versioned by the board review cache), so it
+    /// is resolved per pass by [`fetch_review_due`], never cached.
+    pub due_dependent: bool,
+}
+
+impl CurrentHeadReview {
+    /// The state this head shows given whether a review is still due.
+    pub fn state_when(&self, review_due: bool) -> &'static str {
+        match (self.due_dependent, review_due) {
+            (false, _) => self.state,
+            (true, true) => AI_REVIEW_STATE_NOT_REVIEWED,
+            (true, false) => AI_REVIEW_STATE_REVIEW_NOT_REQUIRED,
+        }
+    }
 }
 
 /// The verdict-derived review projection of one PR owner, shared by every
@@ -32,19 +50,44 @@ pub struct OwnerReview {
 }
 
 /// Resolve against the observed PR head, across legacy revision-owned and
-/// modern cycle-root verdicts. Missing heads and late old-head results never
-/// establish a clean review. This is a single batched query for the tree.
+/// modern cycle-root verdicts, including whether a review is still due. Used
+/// where no cache is involved; see [`fetch_verdict_heads`] and
+/// [`fetch_review_due`] for the two halves the cached board reads separately.
+///
+/// Only owners with a bound PR produce an entry.
+pub(super) fn fetch_current_heads(
+    conn: &Connection,
+    ids: &[String],
+    key: ReviewKey,
+) -> Result<HashMap<String, CurrentHeadReview>> {
+    let mut heads = fetch_verdict_heads(conn, ids, key)?;
+    let dependent: Vec<String> = heads
+        .iter()
+        .filter(|(_, head)| head.due_dependent)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let due = fetch_review_due(conn, &dependent, key)?;
+    for (id, head) in &mut heads {
+        if head.due_dependent {
+            head.state = head.state_when(due.contains(id));
+            head.due_dependent = false;
+        }
+    }
+    Ok(heads)
+}
+
+/// The verdict-derived half of the current-head projection. Every input is
+/// versioned by the board review cache epoch, so the result may be cached.
 ///
 /// A findings verdict whose findings revision has delivered without moving the
 /// head the verdict reviewed (it edited the PR title/body, or justified no
 /// change) no longer counts as unresolved: nothing will ever re-review that
 /// unchanged head, so the badge would otherwise stay orange forever. It
-/// resolves to `not_reviewed`, the same state a commit-based fix shows until
-/// its new head is reviewed. A newer verdict for the same head still wins
-/// because it is selected before this check.
-///
-/// Only owners with a bound PR produce an entry.
-pub(super) fn fetch_current_heads(
+/// resolves to `review_not_required` once a skip verdict records that no review
+/// will run at that head, and to `not_reviewed` until then, the same state a
+/// commit-based fix shows until its new head is reviewed. A newer verdict for
+/// the same head still wins because it is selected before this check.
+pub(super) fn fetch_verdict_heads(
     conn: &Connection,
     ids: &[String],
     key: ReviewKey,
@@ -69,10 +112,15 @@ pub(super) fn fetch_current_heads(
     })?;
     let mut result = HashMap::new();
     for row in rows {
-        let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved, review_due) = row?;
+        let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved, skipped_at_head) = row?;
+        let mut due_dependent = false;
         let (state, findings_revision_id) = match outcome.as_deref() {
             Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS) if revision_delivered_unmoved => {
-                (AI_REVIEW_STATE_NOT_REVIEWED, None)
+                if skipped_at_head {
+                    (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None)
+                } else {
+                    (AI_REVIEW_STATE_NOT_REVIEWED, None)
+                }
             }
             Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS | REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED) => {
                 (AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS, revision)
@@ -89,18 +137,46 @@ pub(super) fn fetch_current_heads(
             Some(REVIEW_GATE_OUTCOME_SKIPPED_NOOP | REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP) => {
                 (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None)
             }
-            _ if review_due => (AI_REVIEW_STATE_NOT_REVIEWED, None),
-            _ => (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None),
+            _ => {
+                due_dependent = true;
+                (AI_REVIEW_STATE_NOT_REVIEWED, None)
+            }
         };
         result.insert(
             id,
             CurrentHeadReview {
                 state,
                 findings_revision_id,
+                due_dependent,
             },
         );
     }
     Ok(result)
+}
+
+/// Owners (or cards, for [`ReviewKey::Card`]) whose current head still has a
+/// review due: one running, queued or admitted, one the engine will recover or
+/// re-admit, or the head not yet known. Read live on every pass because its
+/// inputs are not versioned by the board review cache.
+pub(super) fn fetch_review_due(
+    conn: &Connection,
+    ids: &[String],
+    key: ReviewKey,
+) -> Result<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let family = review_family_cte(&placeholders, key);
+    let due = review_due_sql();
+    let sql = format!(
+        "{family}
+         SELECT o.card FROM owners o JOIN tasks root ON root.id = o.id
+         WHERE NULLIF(root.pr_url, '') IS NOT NULL AND ({due})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Keep historical evidence separate from current-head state: delivering a
@@ -377,6 +453,18 @@ fn badge_presentation(
             "AI review passed for the current PR head. CI, mergeability, or work in progress still prevent readiness."
                 .into(),
         ),
+        // A card with a PR is never "not required" by kind (that is decided
+        // before any history exists), so for it this means the engine has
+        // nothing running or scheduled for the head — the head may be
+        // unreviewed. Say that rather than claim review was unnecessary.
+        AI_REVIEW_STATE_REVIEW_NOT_REQUIRED if history.is_some() => (
+            "No AI review scheduled".into(),
+            "minus.circle",
+            "No AI review of the current PR head is running or scheduled: it was skipped as unchanged or capped, \
+             its automatic review attempts are spent or failed, or a push made one unnecessary. \
+             This does not mean the head was reviewed."
+                .into(),
+        ),
         AI_REVIEW_STATE_REVIEW_NOT_REQUIRED => (
             "AI review not required".into(),
             "minus.circle",
@@ -508,59 +596,83 @@ fn current_head_gate_outcomes_sql() -> String {
         .join(",")
 }
 
-/// Production SQL for [`fetch_current_heads`]. Exposed so the query-plan test
-/// can `EXPLAIN` the same statement the board runs.
-pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
-    let informative_outcomes = informative_gate_outcomes_sql();
-    let all_outcomes = current_head_gate_outcomes_sql();
-    let family = review_family_cte(placeholders, key);
+/// SQL boolean over `root` (a PR owner's `tasks` row) and the `family` CTE:
+/// the current head still has a review coming — or one the engine will
+/// recover — so "not reviewed" is a wait, not a final answer. The recovery
+/// terms are built from the same fragments the recovery sweep queries with
+/// (`dead_pr_review_attempt_sql`, `latest_pr_review_attempt_sql`,
+/// `dead_review_recovery_eligible_sql`, `pre_merge_batch_owns_review_recovery_sql`),
+/// so the projection and the scheduler cannot drift apart.
+fn review_due_sql() -> String {
     let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("root.id");
+    let batch_owns = super::review_batches::pre_merge_batch_owns_review_recovery_sql("root.id");
     let none_started = super::review_batches::NO_BATCH_MEMBER_STARTED;
     let cap = super::review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS;
     let stale_head = super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD;
-    let unproductive_we = super::review_verdicts::unproductive_completed_pr_review_sql_for("we");
-    let unproductive_we3 = super::review_verdicts::unproductive_completed_pr_review_sql_for("we3");
-    let upkeep = super::parking::upkeep_eligible_task_sql("root");
-    let not_held = super::dispatch_helpers::not_positioning_held_sql("root");
+    let dead_we = super::review_verdicts::dead_pr_review_attempt_sql("we");
+    let dead_we3 = super::review_verdicts::dead_pr_review_attempt_sql("we3");
+    let latest_we = super::review_verdicts::latest_pr_review_attempt_sql("we", "we2");
+    let eligible = super::review_verdicts::dead_review_recovery_eligible_sql("root");
     let churn_cutoff = boss_engine_utils::epoch_time::now_epoch_secs() - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
     let churn_threshold = ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
     let latest_dead_pr_review = format!(
         "EXISTS(SELECT 1 FROM work_executions we
-                WHERE we.work_item_id = root.id
-                  AND we.kind = 'pr_review'
-                  AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {unproductive_we})
-                  AND NOT EXISTS(SELECT 1 FROM work_executions we2
-                                 WHERE we2.work_item_id = root.id
-                                   AND we2.kind = 'pr_review'
-                                   AND (we2.created_at > we.created_at
-                                        OR (we2.created_at = we.created_at AND we2.id > we.id))))"
+                WHERE we.work_item_id = root.id AND we.kind = 'pr_review'
+                  AND {dead_we} AND {latest_we})"
     );
     let recoverable_dead_pr_review = format!(
-        "({latest_dead_pr_review}
-          AND root.deleted_at IS NULL
-          AND root.status NOT IN ('done', 'archived')
-          AND {upkeep}
-          AND {not_held}
-          AND NOT EXISTS(SELECT 1 FROM pr_review_batch_members m
-                         JOIN work_executions we ON we.id = m.execution_id
-                         WHERE we.work_item_id = root.id
-                           AND we.kind = 'pr_review'
-                           AND NOT EXISTS(SELECT 1 FROM work_executions we2
-                                          WHERE we2.work_item_id = root.id
-                                            AND we2.kind = 'pr_review'
-                                            AND (we2.created_at > we.created_at
-                                                 OR (we2.created_at = we.created_at AND we2.id > we.id))))
-          AND NOT EXISTS(SELECT 1 FROM pr_review_batches b
-                         WHERE b.id = (SELECT latest.id FROM pr_review_batches latest
-                                       WHERE latest.cycle_root_id = root.id AND latest.phase = 'pre_merge'
-                                       ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC LIMIT 1)
-                           AND b.status != 'completed')
+        "(EXISTS(SELECT 1 FROM work_executions we
+                 WHERE we.work_item_id = root.id AND we.kind = 'pr_review'
+                   AND {dead_we} AND {latest_we}
+                   AND NOT EXISTS(SELECT 1 FROM pr_review_batch_members m WHERE m.execution_id = we.id))
+          AND {eligible}
+          AND NOT {batch_owns}
           AND (SELECT COUNT(*) FROM work_executions we3
                WHERE we3.work_item_id = root.id
                  AND we3.kind = 'pr_review'
                  AND CAST(we3.created_at AS INTEGER) >= {churn_cutoff}
-                 AND (we3.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {unproductive_we3})) < {churn_threshold})"
+                 AND {dead_we3}) < {churn_threshold})"
     );
+    format!(
+        "(NULLIF(root.pr_head_sha, '') IS NULL AND NOT {latest_dead_pr_review})
+         OR (root.status = 'active' AND root.parked_at IS NULL AND root.deleted_at IS NULL)
+         OR EXISTS(SELECT 1 FROM family f JOIN work_executions we ON we.work_item_id = f.id
+                   WHERE f.root = root.id AND we.kind = 'pr_review'
+                     AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned'))
+         OR EXISTS(SELECT 1 FROM pr_review_batches b
+                   WHERE b.cycle_root_id = root.id AND b.phase = 'pre_merge'
+                     AND b.status NOT IN ('completed', 'failed'))
+         OR EXISTS(SELECT 1 FROM family f JOIN work_attention_items ai ON ai.work_item_id = f.id
+                   WHERE f.root = root.id
+                     AND ai.kind = 'pr_review_admission_deferred'
+                     AND ai.status = 'open')
+         OR {needs_readmission}
+         OR EXISTS(SELECT 1 FROM pr_review_batches b
+                   WHERE b.id = (SELECT latest.id FROM pr_review_batches latest
+                                 WHERE latest.cycle_root_id = root.id AND latest.phase = 'pre_merge'
+                                 ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC LIMIT 1)
+                     AND b.status = 'failed'
+                     AND b.target_sha = NULLIF(root.pr_head_sha, '')
+                     AND b.generation >= {cap}
+                     AND NOT EXISTS(SELECT 1 FROM pr_review_verdicts v2
+                                    WHERE v2.batch_id = b.id AND v2.gate_outcome != '{stale_head}')
+                     AND {none_started})
+         OR {recoverable_dead_pr_review}"
+    )
+}
+
+/// Production SQL for [`fetch_verdict_heads`]. Exposed so the query-plan test
+/// can `EXPLAIN` the same statement the board runs. Every input is covered by
+/// the board review cache epoch; volatile readiness is [`review_due_sql`].
+pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
+    let informative_outcomes = informative_gate_outcomes_sql();
+    let all_outcomes = current_head_gate_outcomes_sql();
+    let skipped_outcomes = super::review_verdicts::SKIPPED_GATE_OUTCOMES
+        .iter()
+        .map(|outcome| format!("'{outcome}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let family = review_family_cte(placeholders, key);
     format!(
         "{family}
          SELECT o.card, v.gate_outcome, v.revision_task_id,
@@ -577,32 +689,11 @@ pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
                                                      AND e.kind = 'revision_implementation'
                                                    ORDER BY e.finished_at DESC, e.id DESC LIMIT 1)
                                       AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha))),
-                (
-                    (NULLIF(root.pr_head_sha, '') IS NULL AND NOT {latest_dead_pr_review})
-                    OR (root.status = 'active' AND root.parked_at IS NULL AND root.deleted_at IS NULL)
-                    OR EXISTS(SELECT 1 FROM family f JOIN work_executions we ON we.work_item_id = f.id
-                              WHERE f.root = root.id AND we.kind = 'pr_review'
-                                AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned'))
-                    OR EXISTS(SELECT 1 FROM pr_review_batches b
-                              WHERE b.cycle_root_id = root.id AND b.phase = 'pre_merge'
-                                AND b.status NOT IN ('completed', 'failed'))
-                    OR EXISTS(SELECT 1 FROM family f JOIN work_attention_items ai ON ai.work_item_id = f.id
-                              WHERE f.root = root.id
-                                AND ai.kind = 'pr_review_admission_deferred'
-                                AND ai.status = 'open')
-                    OR {needs_readmission}
-                    OR EXISTS(SELECT 1 FROM pr_review_batches b
-                              WHERE b.id = (SELECT latest.id FROM pr_review_batches latest
-                                            WHERE latest.cycle_root_id = root.id AND latest.phase = 'pre_merge'
-                                            ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC LIMIT 1)
-                                AND b.status = 'failed'
-                                AND b.target_sha = NULLIF(root.pr_head_sha, '')
-                                AND b.generation >= {cap}
-                                AND NOT EXISTS(SELECT 1 FROM pr_review_verdicts v2
-                                               WHERE v2.batch_id = b.id AND v2.gate_outcome != '{stale_head}')
-                                AND {none_started})
-                    OR {recoverable_dead_pr_review}
-                ) AS review_due
+                EXISTS(SELECT 1 FROM pr_review_verdicts sk
+                       JOIN family f ON f.id = sk.work_item_id AND f.root = root.id
+                       WHERE sk.head_sha = NULLIF(root.pr_head_sha, '')
+                         AND sk.gate_outcome IN ({skipped_outcomes})
+                         AND sk.created_at >= v.created_at)
          FROM owners o JOIN tasks root ON root.id = o.id
          LEFT JOIN pr_review_verdicts v ON v.id = (
              SELECT rv.id FROM pr_review_verdicts rv

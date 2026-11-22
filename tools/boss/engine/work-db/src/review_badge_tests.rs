@@ -79,7 +79,7 @@ fn review_badge_labels_and_icons_cover_every_state() {
         ),
         ("reviewed_all_clear", "AI review: clean", "checkmark.seal.fill"),
         ("reviewed_clean_pending", "AI review: clean", "checkmark.seal.fill"),
-        ("review_not_required", "AI review not required", "minus.circle"),
+        ("review_not_required", "No AI review scheduled", "minus.circle"),
     ] {
         let badge = badge_presentation(state, None, Some(&history), "card");
         assert_eq!(badge.label, label, "{state}");

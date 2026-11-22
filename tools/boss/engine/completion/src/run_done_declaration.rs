@@ -1025,7 +1025,7 @@ fn release_pending_review_hold_unconditional(work_db: &crate::work::WorkDb, work
 /// [`super::pr_transition::WorkerCompletionHandler::finalize_pr_transition`].
 /// Shares the exact pure-rebase and no-op skip rules that gate uses
 /// ([`super::finalize_passes::pure_rebase_skip_gate`],
-/// [`super::finalize_passes::noop_skip_reason`]) so the two completion paths
+/// [`super::finalize_passes::noop_skip_outcome`]) so the two completion paths
 /// can never silently diverge on the same input.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
@@ -1068,7 +1068,7 @@ pub(super) async fn maybe_enqueue_declared_delivery_reviewer(
     // `finalize_pr_transition` runs it: `pure_rebase_skip_gate` first (it is
     // independent of `review_cycle` / `last_reviewed_sha`, so it also
     // catches a pure rebase landing before the PR's very first review),
-    // then `noop_skip_reason` for the sha_unchanged / empty_diff /
+    // then `noop_skip_outcome` for the sha_unchanged / empty_diff /
     // trivial_diff rules.
     let pure_rebase_gate =
         super::finalize_passes::pure_rebase_skip_gate(work_db, branch_verifier, pr_url, execution, &cycle_root_id)

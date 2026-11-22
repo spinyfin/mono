@@ -302,7 +302,7 @@ impl WorkerCompletionHandler {
                     // conflict/CI-fix attempt row rather than
                     // `review_cycle`/`last_reviewed_sha`, so it also catches a
                     // pure rebase that lands before the PR's very first review
-                    // — a case `check_noop_skip`'s rule 1 always treats as
+                    // — a case `check_noop_skip_outcome`'s rule 1 always treats as
                     // "never skip" (right for genuinely new content, wrong for
                     // a rebase that contributes none). It is a no-op for any
                     // producer that isn't a conflict-resolution / CI-fix push.

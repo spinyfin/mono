@@ -715,3 +715,61 @@ fn review_attach_emits_cache_counts_and_subsegments() {
             .is_some()
     );
 }
+
+/// `review_due` reads inputs the cache epoch does not version (attention
+/// items, batches, parking). A warm cache must still see each change, so the
+/// cached board never disagrees with the uncached one about whether a review
+/// is coming.
+#[test]
+fn warm_cache_follows_volatile_review_due_inputs() {
+    let board = Board::new("review-cache-due");
+    let root = board.in_review_chore(7);
+    board.observe(&root, "h1", "success", "mergeable");
+    // No verdict at the head and nothing scheduled: nothing is coming.
+    assert_eq!(board.assert_equivalent().misses, 1);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    // Warm: the owner is served from the cache.
+    assert_eq!(board.assert_equivalent().misses, 0);
+
+    // An open admission-deferred attention item makes a review due, with no
+    // epoch moving.
+    board.sql(
+        "INSERT INTO work_attention_items(id, work_item_id, kind, status, title, body_markdown, created_at)
+         VALUES ('due-1', ?1, 'pr_review_admission_deferred', 'open', 't', 'b', '1')",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Resolving it ends the wait, still without a recompute.
+    board.sql(
+        "UPDATE work_attention_items SET status = 'resolved' WHERE id = 'due-1'",
+        &[],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+
+    // A non-terminal review batch makes one due.
+    board.sql(
+        "INSERT INTO pr_review_batches(id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at, generation, explicit)
+         VALUES ('due-batch', ?1, 'b', '{}', '1', 'pre_merge', 7, 'https://github.com/spinyfin/mono/pull/7', 'collecting', 'h1', '1', 1, 0)",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    board.sql(
+        "UPDATE pr_review_batches SET status = 'completed' WHERE id = 'due-batch'",
+        &[],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+}

@@ -989,12 +989,13 @@ impl WorkDb {
     /// died," not "is a pr_review the single most recent row of any kind."
     pub fn list_dead_pr_review_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
-        let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
-        let upkeep = super::parking::upkeep_eligible_task_sql("t");
-        let not_held = super::dispatch_helpers::not_positioning_held_sql("t");
+        let eligible = super::review_verdicts::dead_review_recovery_eligible_sql("t");
+        let dead = super::review_verdicts::dead_pr_review_attempt_sql("we");
+        let latest = super::review_verdicts::latest_pr_review_attempt_sql("we", "we2");
         // Releasing a never-started batch abandons its leaves and removes
-        // their membership rows. The deferred marker routes those roots back
-        // through batch admission rather than minting a legacy reviewer.
+        // their membership rows. The deferred marker (part of `eligible`)
+        // routes those roots back through batch admission rather than minting
+        // a legacy reviewer.
         let sql = format!(
             // Read once a minute. Open tasks come from the partial index
             // `tasks_open_idx`, then each one's reviews; left to itself the
@@ -1002,29 +1003,11 @@ impl WorkDb {
             "SELECT t.id, we.id, we.status
              FROM tasks t INDEXED BY tasks_open_idx
              CROSS JOIN work_executions we ON we.work_item_id = t.id
-             WHERE t.deleted_at IS NULL
-               AND t.status NOT IN ('done', 'archived')
-               AND {upkeep}
-               AND {not_held}
+             WHERE {eligible}
                AND t.pr_url IS NOT NULL AND t.pr_url != ''
                AND we.kind = 'pr_review'
-               AND NOT EXISTS (
-                   SELECT 1 FROM work_attention_items ai
-                   WHERE ai.work_item_id = t.id
-                     AND ai.kind = 'pr_review_admission_deferred'
-                     AND ai.status = 'open'
-               )
-               AND (
-                   we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
-                   OR {unproductive_completed}
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM work_executions we2
-                   WHERE we2.work_item_id = t.id
-                     AND we2.kind = 'pr_review'
-                     AND (we2.created_at > we.created_at
-                          OR (we2.created_at = we.created_at AND we2.id > we.id))
-               )
+               AND {dead}
+               AND {latest}
              ORDER BY t.updated_at ASC, t.id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1206,14 +1189,13 @@ impl WorkDb {
         since_epoch_secs: i64,
     ) -> Result<i64> {
         let conn = self.connect()?;
-        let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let dead = super::review_verdicts::dead_pr_review_attempt_sql("we");
         let sql = format!(
             "SELECT COUNT(*) FROM work_executions we
              WHERE we.work_item_id = ?1
                AND we.kind = 'pr_review'
                AND CAST(we.created_at AS INTEGER) >= ?2
-               AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
-                    OR {unproductive_completed})"
+               AND {dead}"
         );
         conn.query_row(&sql, params![work_item_id, since_epoch_secs], |row| row.get(0))
             .map_err(Into::into)
@@ -1228,14 +1210,13 @@ impl WorkDb {
         since_epoch_secs: i64,
     ) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        let unproductive_completed = super::review_verdicts::unproductive_completed_pr_review_sql();
+        let dead = super::review_verdicts::dead_pr_review_attempt_sql("we");
         let sql = format!(
             "SELECT we.id FROM work_executions we
              WHERE we.work_item_id = ?1
                AND we.kind = 'pr_review'
                AND CAST(we.created_at AS INTEGER) >= ?2
-               AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
-                    OR {unproductive_completed})
+               AND {dead}
              ORDER BY we.created_at DESC, we.id DESC"
         );
         let mut stmt = conn.prepare(&sql)?;

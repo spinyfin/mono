@@ -324,7 +324,7 @@ fn classification_statements_do_not_grow_with_the_cards_classified() {
     for (branch, whole, half, cards, bound) in [
         ("queued", whole.queued, half.queued, 87, 5),
         ("idle active", whole.idle_active, half.idle_active, 60, 9),
-        ("review", whole.review, half.review, 130, 8),
+        ("review", whole.review, half.review, 130, 9),
     ] {
         assert_eq!(
             whole.cards, cards,
@@ -708,18 +708,19 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
             percentile(&mut annotation_ms, 50),
         );
         if product == PRODUCT {
-            // 277 cards with nothing pending are named with 23 statements
-            // (the extra one is the positioning-hold lookup); one card at a
+            // 277 cards with nothing pending are named with 24 statements
+            // (one is the positioning-hold lookup, one the live review-due
+            // read that the board review cache cannot version); one card at a
             // time they took 1,717.
             assert_eq!(annotated, 277, "cards named on the seeded board");
-            assert_eq!(annotation_statements, 23, "statements to name {annotated} cards");
+            assert_eq!(annotation_statements, 24, "statements to name {annotated} cards");
             // The epoch read, three point queries plus the queued-display
             // predecessor lookup for each of the 60 cards waiting on a
-            // dependency (never cached), and the annotation: 264 statements.
-            assert_eq!(statements, 1 + 240 + 23);
+            // dependency (never cached), and the annotation: 265 statements.
+            assert_eq!(statements, 1 + 240 + 24);
         } else {
-            // 30 cards, 10 statements; one card at a time it was 141.
-            assert_eq!((annotated, annotation_statements, statements), (30, 9, 10));
+            // 30 cards, 11 statements; one card at a time it was 141.
+            assert_eq!((annotated, annotation_statements, statements), (30, 10, 11));
         }
     }
 
@@ -742,10 +743,11 @@ fn board_and_heartbeat_statements_on_the_seeded_board() {
     );
     assert_eq!(unexplained, 11, "the seed's unclassified queued cards");
     // 88 pending executions are projected one by one. The 239 items with
-    // nothing pending are read with one statement and named with 23
-    // (the extra one is the positioning-hold lookup), where one item at a
+    // nothing pending are read with one statement and named with 24
+    // (the extras are the positioning-hold lookup and the live review-due
+    // read), where one item at a
     // time the whole pass ran 2,606 statements.
     assert_eq!((cost.pending_executions, cost.unscheduled_items), (88, 239));
-    assert_eq!(cost.classified.statements(), 23, "{:?}", cost.classified);
+    assert_eq!(cost.classified.statements(), 24, "{:?}", cost.classified);
     assert!(cost.statements <= 300, "{} statements", cost.statements);
 }

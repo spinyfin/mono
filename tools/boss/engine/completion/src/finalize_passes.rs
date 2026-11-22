@@ -15,7 +15,7 @@ enum AssistantTurnRead {
 /// Result of [`WorkerCompletionHandler::check_pure_rebase_skip`].
 /// `post_head` carries the PR's current head OID whenever the gate got as
 /// far as fetching it, regardless of whether the gate ultimately skipped —
-/// so the caller can pass it to [`WorkerCompletionHandler::check_noop_skip`]
+/// so the caller can pass it to [`WorkerCompletionHandler::check_noop_skip_outcome`]
 /// and avoid a second, identical `fetch_pr_head_oid` round trip for the
 /// same PR.
 pub(super) struct PureRebaseGateOutcome {
@@ -2075,13 +2075,13 @@ impl WorkerCompletionHandler {
     /// against, or any GitHub call fails (fail open: an unproven predicate
     /// must never suppress a real review). `post_head` is populated
     /// whenever this gate got as far as fetching the PR's current head
-    /// OID, so [`Self::check_noop_skip`] can reuse it instead of issuing a
+    /// OID, so [`Self::check_noop_skip_outcome`] can reuse it instead of issuing a
     /// second, identical `fetch_pr_head_oid` call.
     ///
     /// Deliberately independent of `review_cycle` / `last_reviewed_sha`
-    /// (unlike [`Self::check_noop_skip`]) so it also covers a
+    /// (unlike [`Self::check_noop_skip_outcome`]) so it also covers a
     /// conflict/CI-fix push that lands before the PR's very first review —
-    /// `check_noop_skip`'s rule 1 always treats that as "never skip", which
+    /// `check_noop_skip_outcome`'s rule 1 always treats that as "never skip", which
     /// is right for genuinely new content but wrong for a rebase that
     /// contributes none.
     ///
@@ -2289,7 +2289,7 @@ pub(super) async fn pure_rebase_skip_gate(
         }
     };
     if post_head == pre_head {
-        // Nothing pushed this round — `check_noop_skip`'s
+        // Nothing pushed this round — `check_noop_skip_outcome`'s
         // `sha_unchanged` rule covers this once it also has a
         // `last_reviewed_sha` to compare against.
         return PureRebaseGateOutcome::no_skip_with_head(post_head);
@@ -2391,7 +2391,7 @@ pub(super) struct NoopSkipOutcome {
 }
 
 /// Free-function body of [`WorkerCompletionHandler::check_noop_skip_outcome`] — see
-/// `check_noop_skip`'s doc for the four-rule description. Shared with the
+/// `check_noop_skip_outcome`'s doc for the four-rule description. Shared with the
 /// declared-delivery completion path
 /// ([`super::run_done_declaration::maybe_enqueue_declared_delivery_reviewer`])
 /// so a future change to the skip rules cannot silently apply to only one of
