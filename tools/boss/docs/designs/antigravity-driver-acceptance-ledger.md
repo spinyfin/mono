@@ -12,7 +12,7 @@ Spend, quota, and cost accounting do not appear here. They are a cross-driver co
 
 The repo owner opened allocated `agy` traffic on **2026-11-21 before the ledger criterion was met**. This is an explicit rollout decision, not evidence that the criterion passed. The recorded qualifying count remains 0 / N.
 
-The gate is now the persisted per-driver `launch_enabled` flag alongside the traffic split. Existing splits without flags default to enabled for all implemented drivers, including `agy`, so the already-configured 35% agy share takes effect when this ships. No production database edit is required. An installation without a configured split still starts with agy at 0%.
+The gate is the driver's split share: **0% is off** for allocated work. A driver above 0% is eligible in proportion to its share. An installation without a configured split still starts with agy at 0%. On upgrade, a driver whose previous launch flag was off is stored at 0% and the remaining shares renormalise to 100%, so allocated routing does not change.
 
 ## Criterion
 
@@ -28,13 +28,13 @@ The criterion is unmet. The evidence table is empty.
 
 ## How the operator controls the gate
 
-`bossctl dispatch traffic-split` shows configured percentages, launch flags, effective percentages after launch exclusions, and exclusion reasons. `bossctl dispatch traffic-split --disable agy` closes allocated traffic while retaining its configured share; `--enable agy` reopens it. Settings → Engine → driver split exposes the same flags and configured/effective split. Work-kind and model requirements can further restrict eligible drivers.
+`bossctl dispatch traffic-split` shows percentages and 0% exclusion reasons. Settings → Engine → driver split is one bar and one percentage stepper per driver. Work-kind and model requirements can further restrict eligible drivers.
 
-The whole split and its flags are stored atomically in one metadata value, survive engine restarts, and are read at each allocation, dispatch claim, and launch composition. A closed launch flag yields `agy excluded: launch flag off` in the allocation's `execution_driver_decisions.split_at_decision.exclusions` JSON. Remaining shares are renormalised visibly. If no enabled eligible driver has a non-zero share, allocation fails loudly; it never revives a zero-share driver. Running workers retain their routing.
+The whole split is stored atomically in one metadata value, survives engine restarts, and is read at each allocation, dispatch claim, and launch composition. A driver at 0% yields `agy excluded: 0% share` in the allocation's `execution_driver_decisions.split_at_decision.exclusions` JSON. If every eligible driver is at 0%, allocation fails loudly; it never revives a zero-share driver. Running workers retain their routing.
 
-Explicit task/product pins still route when they clear the capability gate, allowing canaries while allocated launches are disabled. Pool-bound work retains its fixed-driver policy. The code-level `launch_implemented` bit only distinguishes unimplemented skeletons; rollout never requires a code edit.
+Explicit task/product pins still route when they clear the capability gate, allowing canaries while a driver is at 0%. Pool-bound work retains its fixed-driver policy. The code-level `launch_implemented` bit only distinguishes unimplemented skeletons; an unimplemented driver shows as unavailable rather than as a second control.
 
-The original zero-share rollout came from [mono#3565](https://github.com/spinyfin/mono/pull/3565). Zero still means zero: a launch flag does not raise a configured share. The owner controls both the share and whether allocated launches are enabled. Filling the evidence table changes neither setting automatically.
+The original zero-share rollout came from [mono#3565](https://github.com/spinyfin/mono/pull/3565). Zero still means zero. Filling the evidence table does not change the configured share.
 
 ## Evidence
 

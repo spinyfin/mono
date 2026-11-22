@@ -1389,9 +1389,7 @@ final class EngineClient: @unchecked Sendable {
                 return true
             }
             let decoded = DriverTrafficSplit(
-                grok: grok, claude: claude, codex: codex, agy: agy,
-                launchEnabled: raw["launch_enabled"] as? [String: Bool]
-                    ?? DriverTrafficSplit.engineDefault.launchEnabled
+                grok: grok, claude: claude, codex: codex, agy: agy
             )
             emit(.driverTrafficSplitResult(split: decoded.isValid ? decoded : .engineDefault))
         case "codex_sol_percentage":

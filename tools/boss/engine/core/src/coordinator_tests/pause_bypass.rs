@@ -666,10 +666,18 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
     let chore = create_test_chore(&db, product.id.clone(), "Queued before share change");
     db.reconcile_product_executions(&product.id).unwrap();
     let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-    // The whole share moves to a driver whose allocated launches are disabled.
-    let mut split = boss_protocol::DriverTrafficSplit::new(0, 0, 0, 100);
-    split.launch_enabled.agy = false;
-    db.set_driver_traffic_split(split).unwrap();
+    // Restrict the queued chore to Claude, then put Claude at 0% so no
+    // eligible driver holds a share.
+    db.update_work_item(
+        &chore.id,
+        boss_protocol::WorkItemPatch {
+            model_override: Some("opus".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.set_driver_traffic_split(boss_protocol::DriverTrafficSplit::new(0, 0, 100, 0))
+        .unwrap();
 
     let runner = Arc::new(FakeExecutionRunner::default());
     let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
@@ -692,7 +700,7 @@ async fn automatic_dispatch_fails_visibly_when_no_funded_driver_is_eligible() {
         failed
             .last_error
             .as_deref()
-            .is_some_and(|e| e.contains("agy excluded: launch flag off")),
+            .is_some_and(|e| e.contains("claude excluded: 0% share")),
         "{:?}",
         failed.last_error
     );

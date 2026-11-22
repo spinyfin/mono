@@ -363,6 +363,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: dispatch_focus::migrate_explicit_launch,
         },
         Migration {
+            id: driver_allocation::launch_flag_fold_migration::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: driver_allocation::launch_flag_fold_migration::migrate,
+        },
+        Migration {
             id: driver_allocation::traffic_split_migration::MIGRATION_ID.into(),
             legacy_version: None,
             apply: driver_allocation::traffic_split_migration::migrate,

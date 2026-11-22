@@ -30,8 +30,7 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         let peer = try XCTUnwrap(server.accept(timeout: 5))
         defer { peer.close() }
         wait(for: [connected], timeout: 5)
-        var split = DriverTrafficSplit(grok: 10, claude: 20, codex: 30, agy: 40)
-        split.launchEnabled["agy"] = false
+        let split = DriverTrafficSplit(grok: 10, claude: 20, codex: 30, agy: 40)
         client.sendSetDriverTrafficSplit(split)
         let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(peer.readLine(timeout: 5))) as? [String: Any])
         let payload = try XCTUnwrap(envelope["payload"] as? [String: Any])
@@ -40,7 +39,7 @@ final class EngineClientLifecycleOrderingTests: XCTestCase {
         for (driver, share) in ["grok": 10, "claude": 20, "codex": 30, "agy": 40] {
             XCTAssertEqual(sent[driver] as? Int, share)
         }
-        XCTAssertEqual(sent["launch_enabled"] as? [String: Bool], split.launchEnabled)
+        XCTAssertNil(sent["launch_enabled"])
         let replies: [[String: Any]] = [
             sent,
             ["grok": 10, "claude": 20, "codex": 30, "agy": 40],

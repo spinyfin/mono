@@ -303,16 +303,8 @@ struct DriverTrafficSplitRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Configured split")
             DriverTrafficSplitBar(split: chatModel.driverTrafficSplit)
-            if let effective = chatModel.driverTrafficSplit.effectiveLaunchSplit {
-                Text("Effective split after launch flags")
-                DriverTrafficSplitBar(split: effective)
-            } else {
-                Text("Allocation unavailable: no enabled driver has a non-zero share.")
-                    .foregroundStyle(.orange)
-            }
-            Text("Work-kind and model requirements may further restrict allocation. Explicit pins remain available when launch is off.")
+            Text("Work-kind and model requirements may further restrict allocation. Explicit pins still run on a driver at 0%.")
                 .font(.caption).foregroundStyle(.secondary)
             ForEach(DriverSlug.allCases, id: \.self) { driver in
                 Stepper(
@@ -335,16 +327,6 @@ struct DriverTrafficSplitRow: View {
                     }
                 }
                 .accessibilityLabel("\(driver.displayName) traffic share")
-                Toggle("\(driver.displayName) allocated launches", isOn: Binding(
-                    get: { chatModel.driverTrafficSplit.launchIsEnabled(driver) },
-                    set: { chatModel.setDriverLaunchEnabled(driver, enabled: $0) }
-                ))
-                Text("Effective: \(chatModel.driverTrafficSplit.effectiveLaunchSplit?.share(for: driver) ?? 0)%")
-                    .font(.caption).foregroundStyle(.secondary)
-                if !chatModel.driverTrafficSplit.launchIsEnabled(driver) {
-                    Text("\(driver.rawValue) excluded: launch flag off (configured \(chatModel.driverTrafficSplit.share(for: driver))%)")
-                        .font(.caption).foregroundStyle(.orange)
-                }
             }
         }
         .padding(.vertical, 2)

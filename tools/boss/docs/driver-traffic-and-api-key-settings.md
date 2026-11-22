@@ -7,25 +7,17 @@ document is where the detail that used to live in those captions moved to.
 
 The four shares (Codex / Claude / Grok / Antigravity) control what
 percentage of new work is sent to each driver. They always sum to 100%.
+**0% is off** for allocated work: that driver receives none. Any share
+above 0 is eligible in proportion to its share. Work-kind and model
+restrictions can narrow the eligible set further. The split survives
+restarts and applies to new and queued allocations; explicit pins remain
+available for a driver at 0%.
 
-Each driver also has a persisted **allocated launches** flag. Settings shows
-the configured split and the effective split after these flags. Turning a
-flag off preserves its configured share and explicitly reports its exclusion;
-the remaining enabled shares are renormalised. Work-kind and model restrictions
-can narrow that effective split further. Flags survive restarts and apply to
-new and queued allocations; explicit pins remain available for canaries.
-
-`bossctl dispatch traffic-split` shows the same state (also available with
-`--json`). Use `bossctl dispatch traffic-split --disable agy` to close allocated
-Antigravity launches, or `--enable agy` to reopen them. Flag changes are
-field-scoped: the engine flips one launch flag in a single write and does
-not take the rest of a client's cached split. Share edits keep the stored
-flags, so a Settings window opened before a `bossctl --disable` cannot
-silently reopen that driver on the next stepper click. Connected sessions
-receive the updated split. Allocation snapshots in
-`execution_driver_decisions.split_at_decision` include the flags and an
-`exclusions` array such as `agy excluded: launch flag off`, including when
-allocation is refused because every funded driver was closed.
+`bossctl dispatch traffic-split` shows the percentages (also available with
+`--json`). Connected sessions receive the updated split. Allocation snapshots in
+`execution_driver_decisions.split_at_decision` include an `exclusions` array
+such as `agy excluded: 0% share` when a driver holds no share, including when
+allocation is refused because every eligible driver is at 0%.
 
 - **PR reviews and automation keep their own pinned driver, outside the
   split.** This is the single most useful fact here: it explains why a
@@ -49,10 +41,8 @@ allocation is refused because every funded driver was closed.
   split is never in a state the engine would reject mid-edit.
 - **Up to three drivers may sit at 0%.** A driver at zero receives no work
   at all, and every such state is reachable by repeated single-share edits.
-  Fresh installations start Antigravity at 0%. Existing configured shares are
-  preserved, and launch flags default on, including Antigravity. If no enabled
-  eligible driver has a non-zero share, allocation fails visibly rather than
-  selecting a driver at zero.
+  Fresh installations start Antigravity at 0%. If every eligible driver is
+  at 0%, allocation fails visibly rather than selecting a driver at zero.
 
 ## Codex Sol model
 
