@@ -107,12 +107,23 @@ impl Drop for FrozenClock {
 }
 
 /// Park on wall time so gRPC can run while tokio's clock is paused.
-/// `tokio::time::sleep` would freeze; a yield-only loop lets virtual time
-/// (or a tight spin) outrun persist on a loaded remote executor.
+///
+/// `tokio::time::sleep` would freeze. A `spawn_blocking` sleep alone is also
+/// wrong: with a paused `test-util` clock, tokio auto-advances to the next
+/// timer when no async task is runnable, so command deadlines fire during
+/// persist. Keep a yield loop runnable for the duration of the park.
 async fn wall_park(dur: Duration) {
-    tokio::task::spawn_blocking(move || std::thread::sleep(dur))
-        .await
-        .expect("wall-clock park");
+    let sleep = tokio::task::spawn_blocking(move || std::thread::sleep(dur));
+    tokio::select! {
+        result = sleep => {
+            result.expect("wall-clock park");
+        }
+        () = async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        } => unreachable!("yield loop holds the paused clock still"),
+    }
 }
 
 /// Yield and park one wall-clock tick. Use in freeze-and-step loops so

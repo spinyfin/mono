@@ -213,6 +213,33 @@ async fn a_command_naming_a_run_the_hub_does_not_hold_is_never_stored_or_sent() 
     assert!(fx.db.host_command_wire(HOST, "genuine").unwrap().is_some());
 }
 
+/// `until` parks on wall time under a paused clock. If that park leaves the
+/// runtime with no runnable async task, tokio auto-advances to the next
+/// timer and command deadlines fire before persist. This is the load-sensitive
+/// failure mode of `integration_test` on a remote executor.
+#[tokio::test]
+async fn frozen_until_does_not_auto_advance_virtual_time() {
+    freeze_clock();
+    let virtual_start = tokio::time::Instant::now();
+    let ready = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ready);
+    let sleeper = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(40));
+        flag.store(true, Ordering::SeqCst);
+    });
+    until("wall-time flag", || ready.load(Ordering::SeqCst)).await;
+    assert!(
+        tokio::time::Instant::now() - virtual_start < Duration::from_millis(100),
+        "paused-clock waits must not auto-advance to the next timer"
+    );
+    assert!(!sleeper.is_finished(), "the 5s timer must still be pending");
+    sleeper.abort();
+    thaw_clock();
+}
+
 fn peer_command(id: &str) -> Command {
     Command {
         command_id: id.into(),
