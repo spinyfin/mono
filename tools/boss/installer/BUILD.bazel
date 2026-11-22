@@ -100,13 +100,12 @@ stamp_flag(
     visibility = ["//tools/boss:__subpackages__"],
 )
 
-# Stamped Rust constants file consumed by engine_lib, boss, and bossctl.
-# Unstamped (the default) writes a constant 0.0.0-dev placeholder and does
-# not read stable-status.txt, so a new boss-v* tag does not rebuild those
-# crates or their tests. `--config=release` (`--stamp`) embeds
-# STABLE_BOSS_BASE_VERSION. Each binary's BUILD rule adds this target to
-# compile_data and references it via $(execpath) in rustc_env →
-# include!(env!("BOSS_BUILD_INFO_RS")).
+# Stamped Rust constants file consumed ONLY by the `boss-build-info` leaf
+# crate (never engine_lib / runtime / app). Unstamped (the default) writes
+# a constant 0.0.0-dev placeholder and does not read stable-status.txt, so
+# a new boss-v* tag does not rebuild engine libraries or their tests.
+# `--config=release` (`--stamp`) embeds STABLE_BOSS_BASE_VERSION; a new
+# tag then recompiles the leaf crate and relinks boss / bossctl / engine.
 build_info_rs(
     name = "build_info_rs",
     out = "build_info_generated.rs",
@@ -123,14 +122,16 @@ genrule(
 )
 
 # Always-stamped sibling of :build_info_rs, used only by
-# build_info_stamp_test to assert a --stamp build embeds the tag-derived
-# version rather than the placeholder. Not on the library/test graph.
+# build_info_stamp_test / //tools/boss/build-info:build-info-stamped to
+# assert a --stamp build embeds the tag-derived version rather than the
+# placeholder. Not on the production library/test graph.
 build_info_rs(
     name = "build_info_rs_stamped",
     testonly = True,
     out = "build_info_stamped.rs",
     stamp = 1,
     status_file = ":stable_status_fixture",
+    visibility = ["//tools/boss/build-info:__pkg__"],
 )
 
 # Plist counterparts of the two build_info_rs targets above. The
@@ -163,6 +164,8 @@ sh_test(
         "$(location //tools/boss/cli:boss)",
         "$(location //tools/boss/bossctl)",
         "$(location :build_provenance_rs)",
+        "$(location //tools/boss/build-info:version_probe)",
+        "$(location //tools/boss/build-info:version_probe_stamped)",
     ],
     data = [
         ":build_info_rs",
@@ -171,6 +174,8 @@ sh_test(
         ":version_plist_stamped",
         ":version_plist_unstamped",
         "//tools/boss/bossctl",
+        "//tools/boss/build-info:version_probe",
+        "//tools/boss/build-info:version_probe_stamped",
         "//tools/boss/cli:boss",
     ],
 )

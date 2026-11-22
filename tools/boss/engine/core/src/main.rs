@@ -170,11 +170,12 @@ async fn run_engine() -> Result<()> {
     // `stamped_provenance_isolation_test`).
     install_stamped_provenance();
 
-    // Handle --version before the full startup so we print our custom
-    // "boss-engine 0+<sha> built <time>" format and exit cleanly
-    // without initialising logging or touching the audit log.
-    // Q-Risk-3 from the design doc: this flag did not exist before this change.
-    if boss_build_info::print_version_if_requested(&build_info::version_string("boss-engine")) {
+    // Handle --version before the full startup so we print
+    // "boss-engine <version>" (tag-derived `1.0.N` on a stamped
+    // release, `0.0.0-dev` unstamped) and exit without initialising
+    // logging or touching the audit log. The version comes from the
+    // `boss_build_info` leaf crate, same as `boss` / `bossctl`.
+    if boss_build_info::print_version_if_requested(&boss_build_info::version_string("boss-engine")) {
         return Ok(());
     }
 

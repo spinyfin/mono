@@ -61,6 +61,11 @@ rust_binary(
     ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    # Version and provenance come from leaf crates, not from this crate's
+    # own compile. stamp = 0 so --config=release does not feed
+    # stable-status.txt into this rustc action; a new tag recompiles the
+    # leaf crates and relinks this binary.
+    stamp = 0,
     visibility = [
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/installer:__pkg__",
@@ -87,6 +92,7 @@ rust_binary(
     srcs = ["src/main.rs"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    stamp = 0,
     visibility = ["//tools/boss/app-macos:__pkg__"],
     deps = [
         ":engine_lib",
@@ -765,25 +771,26 @@ sh_test(
     ],
 )
 
-# ── Stamped-provenance isolation guard ───────────────────────────────────────
+# ── Stamped leaf isolation guard ────────────────────────────────────────────
 #
-# `//tools/boss/build-provenance` is the one crate whose source changes on
-# every commit: it `include!`s the Bazel-stamped commit sha. It must stay a
-# leaf that only the two `engine` rust_binary targets above link. The moment
-# it is (transitively) a dependency of `engine_lib`, every commit — a
-# docs-only change included — recompiles `engine_lib`, every
-# `rust_test(crate = ":runtime")` binary, `boss` and `bossctl`, and
-# re-executes their tests. See
+# `//tools/boss/build-provenance` changes on every commit (stamped sha).
+# `//tools/boss/build-info` changes on every `boss-v*` tag (stamped
+# version). Both must stay leaves that only the `engine` rust_binary
+# targets (and, for build-info, `boss` / `bossctl`) link. The moment
+# either is a dependency of `engine_lib`, every commit or every release
+# tag recompiles `engine_lib`, every `rust_test(crate = ":runtime")`
+# binary, and re-executes their tests. See
 # docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md.
 #
 # `genquery` evaluates against the real dependency graph at build time
 # (hermetic, cached, no `bazel query` subprocess), so the test fails on the
 # PR that reintroduces the edge rather than showing up later as CI slowness.
-# Roots are `engine_lib` (what `boss`/`bossctl` link) plus the runtime and
-# app test binaries, whose closures add the fixture variants.
+# Roots are `engine_lib` / `engine_lib_test` (build-info and provenance)
+# plus `app_test` (provenance only: `app_test` data-deps `bossctl`, which
+# legitimately links build-info).
 genquery(
     name = "engine_lib_test_stamped_deps",
-    expression = 'filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(set(//tools/boss/engine/core:engine_lib_test //tools/boss/engine/core:engine_lib //tools/boss/engine/app:app_test)))',
+    expression = 'filter("//tools/boss/(build-provenance:|build-info:|installer:build_provenance_rs|installer:build_info_rs)", deps(set(//tools/boss/engine/core:engine_lib_test //tools/boss/engine/core:engine_lib))) + filter("//tools/boss/(build-provenance:|installer:build_provenance_rs)", deps(//tools/boss/engine/app:app_test))',
     scope = [
         ":engine_lib_test",
         ":engine_lib",
@@ -791,11 +798,11 @@ genquery(
     ],
 )
 
-# Positive control: the same filter over the production binary must find the
-# crate, so an empty result above means "not linked", not "filter rotted".
+# Positive control: the production binary must link both leaves, so an
+# empty result above means "not linked", not "filter rotted".
 genquery(
     name = "engine_binary_stamped_deps",
-    expression = 'filter("//tools/boss/build-provenance:build-provenance$", deps(//tools/boss/engine/core:engine))',
+    expression = 'filter("//tools/boss/(build-provenance:build-provenance|build-info:build-info)$", deps(//tools/boss/engine/core:engine))',
     scope = [":engine"],
 )
 

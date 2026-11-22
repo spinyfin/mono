@@ -93,18 +93,19 @@ fi
 #   - boss_pkg_unsigned:        STABLE_BOSS_GIT_SHA (embedded in the .pkg filename)
 #   - build_info_rs:            STABLE_BOSS_BASE_VERSION only, and only when
 #     --stamp; unstamped writes the constant 0.0.0-dev and does not read this
-#     file, so a new boss-v* tag does not rebuild engine_lib / cli / tests
+#     file, so a new boss-v* tag does not rebuild engine_lib / tests. The
+#     generated file is compiled only into the boss_build_info leaf crate.
 #   - build_provenance_rs:      STABLE_BOSS_VERSION / STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY
 #
 # IMPORTANT: do not add a per-build or per-commit value (wall-clock time, full
 # git SHA, dev-suffixed version) to anything build_info_rs reads, and do not
 # make build_info_rs read this file when --stamp is off. That file is compiled
-# into engine_lib/cli/bossctl, so a value that changes every build, every
-# commit, or every release tag busts the Rust action cache and forces a full
-# recompile of those crates and their tests. The SHA and full version remain
-# here for packaging and for the leaf provenance crate, which are cheap and
-# do not recompile engine_lib. Wall-clock build time goes to volatile-status
-# (BOSS_BUILD_TIME), never stable-status.
+# only into the boss_build_info leaf crate; engine_lib never sees it, so a
+# value that changes every release tag only recompiles that leaf and relinks
+# the binaries. The SHA and full version remain here for packaging and for
+# the leaf provenance crate, which are cheap and do not recompile engine_lib.
+# Wall-clock build time goes to volatile-status (BOSS_BUILD_TIME), never
+# stable-status.
 #
 # STABLE_BOSS_GIT_SHA_FULL / STABLE_BOSS_GIT_DIRTY are read ONLY by
 # `build_provenance_rs`, which stamps its own dedicated, single-purpose

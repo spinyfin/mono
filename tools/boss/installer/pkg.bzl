@@ -13,9 +13,10 @@ Defines four rules:
 
 `build_info_rs` and `boss_short_version_plist` follow `--stamp`: unstamped builds
 write a constant placeholder and do not read `ctx.info_file`, so a new `boss-v*`
-tag does not change their action keys (or those of engine_lib / cli / tests).
-Release builds pass `--config=release` (`--stamp`) and embed the tag-derived
-version.
+tag does not change their action keys (or those of engine_lib / tests). The
+generated Rust file is compiled only into the `boss_build_info` leaf crate;
+`engine_lib` never sees it. Release builds pass `--config=release` (`--stamp`)
+and embed the tag-derived version.
 """
 
 load(":stamp.bzl", "attrs_with_stamp", "is_stamping_enabled")
@@ -196,13 +197,14 @@ def _build_info_rs_impl(ctx):
     """Emits a Rust source file with stamped (or placeholder) build constants."""
     output = ctx.actions.declare_file(ctx.attr.out)
 
-    # This file is compiled into engine_lib, boss, and bossctl. Reading
+    # This file is compiled only into the boss_build_info leaf crate. Reading
     # stable-status.txt here — even only the tag-derived base version — makes
-    # every new boss-v* tag a new action key for those crates and the 40–80
-    # tests downstream of them. Unstamped builds therefore write a constant
-    # placeholder with ctx.actions.write and do not take ctx.info_file as an
-    # input. Release builds (`--config=release` / `--stamp`) read
-    # STABLE_BOSS_BASE_VERSION from stable-status.txt.
+    # every new boss-v* tag a new action key for that crate and the binaries
+    # that link it. Unstamped builds therefore write a constant placeholder
+    # with ctx.actions.write and do not take ctx.info_file as an input.
+    # Release builds (`--config=release` / `--stamp`) read
+    # STABLE_BOSS_BASE_VERSION from stable-status.txt. engine_lib never
+    # compiles this file, so a new tag does not rebuild runtime / app / tests.
     #
     # SHA and wall-clock time stay the literal "unknown" even when stamped:
     # those values live in build_provenance_rs (a leaf crate only the engine
@@ -254,7 +256,7 @@ Generates a Rust source file containing build constants.
 Unstamped (`--nostamp`, the default for check / developer builds):
   pub const BOSS_VERSION: &str = "0.0.0-dev";
   The action does not read stable-status.txt, so a new boss-v* tag does not
-  change this file or anything that compiles it in.
+  change this file or the boss_build_info leaf crate that compiles it in.
 
 Stamped (`--stamp` / `--config=release`):
   pub const BOSS_VERSION: &str = "<STABLE_BOSS_BASE_VERSION>";  // e.g. "1.0.4"
@@ -262,7 +264,8 @@ Stamped (`--stamp` / `--config=release`):
 BOSS_GIT_SHA and BOSS_BUILD_TIME are the literal "unknown" in both cases.
 Per-commit identity lives in `build_provenance_rs` (leaf crate, engine
 binaries only). The user-facing release version in the app bundle is
-`boss_short_version_plist`, which is also stamp-gated.
+`boss_short_version_plist`, which is also stamp-gated. engine_lib does
+not depend on this file.
 """,
 )
 

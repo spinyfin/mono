@@ -36,24 +36,12 @@ rust_library(
 rust_binary(
     name = "boss",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = [
-        # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
-        # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
-        # rules_rust expands $(execpath ...) to an absolute path at compile time.
-        "//tools/boss/installer:build_info_rs",
-    ],
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    # rules_rust does NOT propagate --action_env into the rustc compile
-    # action's cache key or environment. Use rustc_env + --define so that
-    # the cache key changes when the credential values change and rustc
-    # actually sees the vars via option_env!(). Default values are empty
-    # strings (see .bazelrc); the release pipeline overrides via --define.
-    rustc_env = {
-        # Absolute path to the generated build-info constants file.
-        # rules_rust prefixes $(execpath) values with ${pwd} and resolves
-        # them to absolute filesystem paths before invoking rustc.
-        "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
-    },
+    # Version comes from the boss_build_info leaf crate, not from this
+    # crate's own compile. stamp = 0 so --config=release does not feed
+    # stable-status.txt into this rustc action; a new tag recompiles the
+    # leaf and relinks this binary.
+    stamp = 0,
     visibility = [
         "//tools/boss/engine/spoke-worker-api:__pkg__",
         "//tools/boss/app-macos:__pkg__",

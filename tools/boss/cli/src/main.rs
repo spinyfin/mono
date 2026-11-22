@@ -310,17 +310,13 @@ pub(crate) struct RunContext {
     pub(crate) no_autostart: bool,
 }
 
-// Per-binary build-info stamp + `version_string` accessor. The
-// include!(env!("BOSS_BUILD_INFO_RS")) must be evaluated in this crate
-// (this rust_binary sets its own rustc_env), so the shared logic is a
-// macro rather than a plain function. See the boss_build_info crate.
-boss_build_info::stamp!();
-
 #[tokio::main]
 pub(crate) async fn main() -> ExitCode {
     // Intercept --version/-V before Cli::parse() so we print the
-    // canonical version string.
-    if boss_build_info::print_version_if_requested(&build_info::version_string("boss")) {
+    // canonical version string. The tag-derived value lives in the
+    // boss_build_info leaf crate so a new release tag does not recompile
+    // engine_lib / runtime / app.
+    if boss_build_info::print_version_if_requested(&boss_build_info::version_string("boss")) {
         return ExitCode::SUCCESS;
     }
 
