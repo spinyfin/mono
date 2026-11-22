@@ -314,6 +314,13 @@ crate::register_counter!(
      because no worker_proposals row of kind automation_outcome existed for the execution \
      (automation_outcome_proposals_seam on).",
 );
+crate::register_counter!(
+    PR_CREATED_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.pr_created",
+    "Completion PR resolution fell back to the legacy PR-URL ladder (hook staging, artifact, \
+     driver prose, or detect_pr) because no usable pr_created worker_proposals row existed \
+     for the execution (pr_created_proposals_seam on).",
+);
 
 // The run-done gate and its backstop. Together these are the soak
 // instrumentation for the declaration: `GATE_HELD` counts runs the health-alone
@@ -375,6 +382,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
     registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
     registry.register_counter(&AUTOMATION_OUTCOME_FALLBACK_HIT);
+    registry.register_counter(&PR_CREATED_FALLBACK_HIT);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row

@@ -1066,7 +1066,7 @@ impl WorkerCompletionHandler {
     /// deferral horizon. Anchor preference: live-state `last_event_at`, then
     /// execution `started_at`. Missing/unparseable anchors fail open (do not
     /// defer) so terminalization cannot hang without a clock.
-    fn should_defer_mid_turn_within_activity_horizon(&self, execution_id: &str) -> bool {
+    pub(super) fn should_defer_mid_turn_within_activity_horizon(&self, execution_id: &str) -> bool {
         let horizon_secs = self.staged_pr_mid_turn_defer_secs.max(0);
         if horizon_secs == 0 {
             return false;

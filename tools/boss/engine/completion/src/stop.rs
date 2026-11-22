@@ -188,6 +188,94 @@ impl WorkerCompletionHandler {
             };
         }
 
+        let candidates = entry.candidates();
+        let (selected, rejected_candidates, slug_failed) = self
+            .verify_pr_url_candidates_against_work_item(execution, &candidates, log_ctx)
+            .await;
+        if slug_failed {
+            self.staged_pr_urls.forget(execution_id);
+            return None;
+        }
+        for rejected in rejected_candidates {
+            self.staged_pr_urls.evict_candidate(execution_id, &rejected);
+        }
+        if let Some(ref url) = selected {
+            self.staged_pr_urls.mark_branch_verified(execution_id, url);
+        }
+        selected
+    }
+
+    /// Primary-seam PR resolution: read `applied` `pr_created` proposals for
+    /// `execution` and verify the PR's head branch against GitHub before
+    /// trusting it. Returns `None` when the `pr_created_proposals_seam` gate
+    /// is off, no applied proposal exists, or verification fails/is transient.
+    pub(super) async fn verified_pr_created_proposal_url(
+        &self,
+        execution: &crate::work::WorkExecution,
+        log_ctx: &str,
+    ) -> Option<String> {
+        if !self.pr_created_proposals_first() {
+            return None;
+        }
+        let proposals = match self
+            .work_db
+            .list_worker_proposals_for_execution(&execution.id, ProposalKind::PrCreated)
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "{log_ctx}: failed to read pr_created proposals; falling back to legacy PR-URL ladder",
+                );
+                return None;
+            }
+        };
+        let applied_urls: Vec<String> = proposals
+            .into_iter()
+            .filter(|p| p.state == boss_protocol::ProposalState::Applied)
+            .filter_map(|p| {
+                serde_json::from_str::<boss_protocol::PrCreatedProposalPayload>(&p.payload_json)
+                    .ok()
+                    .map(|payload| payload.pr_url)
+            })
+            .collect();
+        if applied_urls.is_empty() {
+            return None;
+        }
+
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            return match self.resolve_bound_pr_url(execution) {
+                Some(bound_url) => {
+                    if applied_urls.contains(&bound_url) {
+                        Some(bound_url)
+                    } else {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            pr_created_urls = ?applied_urls,
+                            bound_pr_url = %bound_url,
+                            "{log_ctx}: pr_created proposal URL(s) do not match revision's bound (chain root) PR; ignoring",
+                        );
+                        None
+                    }
+                }
+                None => applied_urls.into_iter().next(),
+            };
+        }
+
+        let (selected, _, _) = self
+            .verify_pr_url_candidates_against_work_item(execution, &applied_urls, log_ctx)
+            .await;
+        selected
+    }
+
+    async fn verify_pr_url_candidates_against_work_item(
+        &self,
+        execution: &crate::work::WorkExecution,
+        candidates: &[String],
+        log_ctx: &str,
+    ) -> (Option<String>, Vec<String>, bool) {
+        let execution_id = execution.id.as_str();
         let expected_branch = expected_branch_name(
             execution_id,
             &execution.branch_naming,
@@ -202,69 +290,58 @@ impl WorkerCompletionHandler {
                 tracing::warn!(
                     execution_id,
                     ?err,
-                    "{log_ctx}: cannot parse repo slug; dropping staged URLs for safety",
+                    "{log_ctx}: cannot parse repo slug; dropping PR URL candidates for safety",
                 );
-                self.staged_pr_urls.forget(execution_id);
-                return None;
+                return (None, Vec::new(), true);
             }
         };
         let mut own_candidate = None;
         let mut predecessor_candidate = None;
         let mut rejected_candidates = Vec::new();
-        for staged_url in entry.candidates() {
-            let Some(pr_num) = pr_number_from_url(&staged_url) else {
+        for candidate_url in candidates {
+            let Some(pr_num) = pr_number_from_url(candidate_url) else {
                 tracing::warn!(
                     execution_id,
-                    staged_pr_url = %staged_url,
-                    "{log_ctx}: cannot parse PR number from staged URL; dropping that candidate for safety",
+                    staged_pr_url = %candidate_url,
+                    "{log_ctx}: cannot parse PR number from PR URL; dropping that candidate for safety",
                 );
-                rejected_candidates.push(staged_url);
+                rejected_candidates.push(candidate_url.clone());
                 continue;
             };
             match self.branch_verifier.fetch_pr_head_ref(&slug, pr_num).await {
                 Ok(ref head_ref) if head_identifies_any_branch(head_ref, &work_item_branches) => {
                     if super::branches_identify_same_work_item(head_ref, &expected_branch) {
-                        own_candidate.get_or_insert(staged_url);
+                        own_candidate.get_or_insert_with(|| candidate_url.clone());
                     } else {
-                        predecessor_candidate.get_or_insert(staged_url);
+                        predecessor_candidate.get_or_insert_with(|| candidate_url.clone());
                     }
                 }
                 Ok(head_ref) => {
                     tracing::warn!(
                         execution_id,
-                        staged_pr_url = %staged_url,
+                        staged_pr_url = %candidate_url,
                         staged_pr_branch = %head_ref,
                         %expected_branch,
-                        "pr_recheck_staged_branch_mismatch: staged PR's head branch is not a primary execution branch of this work item; dropping that candidate",
+                        "pr_recheck_staged_branch_mismatch: PR's head branch is not a primary execution branch of this work item; dropping that candidate",
                     );
                     PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                    rejected_candidates.push(staged_url);
+                    rejected_candidates.push(candidate_url.clone());
                 }
                 Err(err) => {
                     // Transient API failure: cannot verify this candidate on
                     // this pass, but do NOT discard it. On the next pass the
-                    // candidate is still staged and verification is retried —
-                    // dropping here would strand the worker if the cold path
-                    // also fails. A definitive branch-name mismatch (the
-                    // Ok(head_ref) arm above) evicts after selection.
+                    // candidate is still available and verification is retried.
                     tracing::warn!(
                         execution_id,
-                        staged_pr_url = %staged_url,
+                        staged_pr_url = %candidate_url,
                         ?err,
                         "{log_ctx}: branch verification failed transiently; \
-                         keeping staged URL for retry on next pass",
+                         keeping PR URL for retry on next pass",
                     );
                 }
             }
         }
-        let selected = own_candidate.or(predecessor_candidate);
-        for rejected in rejected_candidates {
-            self.staged_pr_urls.evict_candidate(execution_id, &rejected);
-        }
-        if let Some(ref url) = selected {
-            self.staged_pr_urls.mark_branch_verified(execution_id, url);
-        }
-        selected
+        (own_candidate.or(predecessor_candidate), rejected_candidates, false)
     }
 
     /// Capture-time branch verification, spawned by the `PostToolUse` hook
@@ -789,6 +866,62 @@ impl WorkerCompletionHandler {
             return StopOutcome::DeferredForProbeTurn;
         }
 
+        // Proposals-first seam (`pr_created_proposals_seam`): read any
+        // `applied` `pr_created` proposal for this execution before consulting
+        // the legacy PR-URL ladder (remote/local structured-output artifact,
+        // hook staging cache, driver final-message prose, and cold `detect_pr`).
+        if let Some(proposal_url) = on_heap(|| self.verified_pr_created_proposal_url(&execution, "stop event")).await {
+            self.retire_produce_pr_nudge(execution_id);
+            tracing::info!(
+                execution_id,
+                pr_url = %proposal_url,
+                "stop event: using PR URL from pr_created proposal (primary seam); skipping legacy PR-URL ladder",
+            );
+            if execution.kind == ExecutionKind::RevisionImplementation {
+                on_heap(|| {
+                    self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &proposal_url)
+                })
+                .await;
+                let outcome = on_heap(|| {
+                    self.finalize_pr_transition(
+                        execution_id,
+                        proposal_url.clone(),
+                        WorkerPrCompletionTarget::InReview,
+                        "stop_pr_created_proposal",
+                    )
+                })
+                .await;
+                if !matches!(outcome, StopOutcome::AwaitingInput) {
+                    return outcome;
+                }
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposal_url,
+                    "stop event: pr_created proposal finalize refused by revision contribution gate; \
+                     falling through to SHA-delta / no-op / nudge path",
+                );
+            } else {
+                if !self.primary_staged_url_may_finalize(execution_id) {
+                    tracing::info!(
+                        execution_id,
+                        pr_url = %proposal_url,
+                        "stop event: pr_created proposal present but no `delivered` run_done \
+                         declaration yet; declaration remains required — deferring finalization",
+                    );
+                    return on_heap(|| self.await_run_done_declaration(&execution, &proposal_url)).await;
+                }
+                return on_heap(|| {
+                    self.finalize_pr_transition(
+                        execution_id,
+                        proposal_url,
+                        WorkerPrCompletionTarget::InReview,
+                        "stop_pr_created_proposal",
+                    )
+                })
+                .await;
+            }
+        }
+
         // A remote worker writes this artifact on its own host; collect it
         // before reading so the primary channel remains usable off-host.
         let _ = on_heap(|| {
@@ -831,6 +964,7 @@ impl WorkerCompletionHandler {
             // run_done hold or finalization so a later quiet sweep cannot
             // replay a stale `no_pr` intent.
             self.retire_produce_pr_nudge(execution_id);
+            self.record_pr_created_fallback_hit(&execution, "stop_staged", &staged_url);
             tracing::info!(
                 execution_id,
                 pr_url = %staged_url,
@@ -1031,6 +1165,7 @@ impl WorkerCompletionHandler {
             && let Some(recovered_url) =
                 on_heap(|| self.verified_staged_pr_url(execution_id, &execution, "stop event (driver fallback)")).await
         {
+            self.record_pr_created_fallback_hit(&execution, "stop_driver_fallback", &recovered_url);
             tracing::info!(
                 execution_id,
                 pr_url = %recovered_url,
@@ -1735,8 +1870,14 @@ must not be asked to open one",
                 })
                 .await;
             }
-            PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
-            PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
+            PrStatus::Fresh { url } => {
+                self.record_pr_created_fallback_hit(&execution, "stop_detector", &url);
+                (url, WorkerPrCompletionTarget::InReview)
+            }
+            PrStatus::Merged { url } => {
+                self.record_pr_created_fallback_hit(&execution, "stop_detector", &url);
+                (url, WorkerPrCompletionTarget::Done)
+            }
         };
         on_heap(|| self.finalize_pr_transition(execution_id, pr_url, target, "stop")).await
     }

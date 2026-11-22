@@ -248,6 +248,9 @@ impl WorkerCompletionHandler {
     /// finalize it. That keeps the module's rule that a GitHub hang can never
     /// hold a slot indefinitely, without binding anything unverified.
     async fn resolve_declared_pr_url(&self, execution: &crate::work::WorkExecution) -> DeclaredPrResolution {
+        if let Some(url) = self.verified_pr_created_proposal_url(execution, "run_done").await {
+            return self.resolve_verified_pr_state(execution, url).await;
+        }
         let mut transient_detail: Option<String> = None;
         let stored_url = self.resolve_bound_pr_url(execution);
         if let Some(url) = stored_url.clone() {
@@ -287,6 +290,7 @@ impl WorkerCompletionHandler {
             .await
             {
                 Ok(Some(url)) => {
+                    self.record_pr_created_fallback_hit(execution, "run_done_staged", &url);
                     return self.resolve_verified_pr_state(execution, url).await;
                 }
                 Ok(None) => {
@@ -325,8 +329,14 @@ impl WorkerCompletionHandler {
             )
         };
         match detected {
-            Ok(Ok(PrStatus::Fresh { url })) => self.resolve_declared_pr_base(execution, url, false).await,
-            Ok(Ok(PrStatus::Merged { url })) => self.resolve_declared_pr_base(execution, url, true).await,
+            Ok(Ok(PrStatus::Fresh { url })) => {
+                self.record_pr_created_fallback_hit(execution, "run_done_detector", &url);
+                self.resolve_declared_pr_base(execution, url, false).await
+            }
+            Ok(Ok(PrStatus::Merged { url })) => {
+                self.record_pr_created_fallback_hit(execution, "run_done_detector", &url);
+                self.resolve_declared_pr_base(execution, url, true).await
+            }
             Ok(Ok(
                 status @ (PrStatus::None
                 | PrStatus::Closed { .. }

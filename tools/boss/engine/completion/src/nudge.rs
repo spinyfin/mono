@@ -951,6 +951,12 @@ impl WorkerCompletionHandler {
     /// captured URL from an unrelated `gh pr view`.
     async fn current_verified_or_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
         if let Some(url) = self
+            .verified_pr_created_proposal_url(execution, "background-nudge-recheck")
+            .await
+        {
+            return Some(url);
+        }
+        if let Some(url) = self
             .verified_staged_pr_url(&execution.id, execution, "background-nudge-recheck")
             .await
         {
