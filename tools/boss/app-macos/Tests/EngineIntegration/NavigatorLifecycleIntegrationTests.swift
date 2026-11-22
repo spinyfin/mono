@@ -194,8 +194,11 @@ private final class NavigatorEngineFixture {
         stdout = output.fileHandleForReading
         try output.fileHandleForWriting.close()
         do {
-            try waitForListening(socket: socket, output: stdout)
+            try EngineFixtureReadiness.waitForListening(socket: socket, output: stdout)
         } catch {
+            // init throws, so the caller never gets a fixture whose defer can
+            // stop the process. Tear down here before wrapping the error.
+            stop()
             let logText = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "engine log unavailable"
             throw NSError(domain: "NavigatorFixture", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "\(error.localizedDescription): \(logText)",
@@ -208,26 +211,6 @@ private final class NavigatorEngineFixture {
         process.waitUntilExit()
         try? stdout.close()
         try? log.close()
-    }
-
-    /// The fixture announces the bind on stdout. The file existing is not
-    /// enough: connect() can succeed before the accept loop starts.
-    private func waitForListening(socket: String, output: FileHandle) throws {
-        let ready = Data("boss-engine listening on \(socket)".utf8)
-        var pending = Data()
-        while true {
-            let chunk = output.availableData
-            guard !chunk.isEmpty else {
-                throw NSError(domain: "NavigatorFixture", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "engine stdout closed before announcing \(socket)",
-                ])
-            }
-            pending.append(chunk)
-            while let newline = pending.firstIndex(of: 0x0A) {
-                if pending[..<newline] == ready { return }
-                pending.removeSubrange(...newline)
-            }
-        }
     }
 
     func sql(_ statement: String) throws {

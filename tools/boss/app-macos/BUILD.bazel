@@ -336,6 +336,7 @@ swift_library(
     name = "engine_reconnect_integration_tests_lib",
     testonly = True,
     srcs = [
+        "Tests/EngineIntegration/EngineFixtureReadiness.swift",
         "Tests/EngineIntegration/EngineReconnectIntegrationTests.swift",
         "Tests/EngineIntegration/NavigatorLifecycleIntegrationTests.swift",
     ],
