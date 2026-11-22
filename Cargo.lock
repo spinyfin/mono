@@ -1489,12 +1489,14 @@ dependencies = [
  "boss-protocol",
  "boss-protocol-spoke",
  "boss-tmux",
+ "boss-transcript-tail",
  "git-utils",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

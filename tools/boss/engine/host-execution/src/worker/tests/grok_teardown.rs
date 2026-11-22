@@ -1,10 +1,11 @@
 use super::{
-    FakeTmux, GrokEnv, ListingCube, MemoryStore, grok_env, grok_spawn_command, grok_supervisor, live, stop_command,
-    stored,
+    FakeTmux, GrokEnv, ListingCube, MemoryStore, grok_env, grok_spawn_command, grok_supervisor, live, session_name,
+    stop_command, stored,
 };
 use crate::homes;
 use crate::worker::Supervisor;
-use crate::worker::grok_teardown::{GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON, override_settle_window};
+use crate::worker::grok_teardown::override_settle_window;
+use boss_engine_driver::grok::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON;
 use boss_protocol_spoke::v1::ResultCode;
 use std::io::Write;
 use std::sync::Arc;
@@ -167,4 +168,64 @@ async fn grok_stop_times_out_within_bound_when_turn_completed_never_arrives() {
         !fake.killed.lock().unwrap().is_empty(),
         "session must still be killed after the bound"
     );
+}
+
+#[tokio::test]
+async fn grok_stop_with_foreign_live_token_sends_no_keys_and_refuses_kill() {
+    let root = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeTmux::default());
+    live(&fake);
+    let (supervisor, _env) = spawned_grok(&root, fake.clone()).await;
+    let (events, updates) = session_files(&supervisor);
+    write_open_turn(&events, &updates);
+    fake.sessions
+        .lock()
+        .unwrap()
+        .insert(session_name("token"), "other-token".into());
+
+    let started = Instant::now();
+    let stopped = supervisor.execute(&stop_command(), false, 1).await;
+    let elapsed = started.elapsed();
+    assert_eq!(stopped.code, ResultCode::Rejected as i32, "{}", stopped.reason);
+    assert!(stopped.reason.contains("live token"), "{}", stopped.reason);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "foreign token must not enter settle wait (elapsed={elapsed:?})"
+    );
+    let sent = fake.sent.lock().unwrap().clone();
+    assert!(
+        !sent.iter().any(|args| args.iter().any(|arg| arg == "send-keys")),
+        "foreign live token must never receive send-keys: {sent:?}"
+    );
+    assert!(fake.killed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn grok_stop_on_exited_pane_skips_send_keys_and_settle_delay() {
+    let root = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeTmux::default());
+    live(&fake);
+    let (supervisor, _env) = spawned_grok(&root, fake.clone()).await;
+    let (events, updates) = session_files(&supervisor);
+    write_open_turn(&events, &updates);
+    fake.pane_dead
+        .lock()
+        .unwrap()
+        .insert(session_name("token"), ("1".into(), Some(0)));
+
+    let started = Instant::now();
+    let stopped = supervisor.execute(&stop_command(), false, 1).await;
+    let elapsed = started.elapsed();
+    assert_eq!(stopped.code, ResultCode::Ok as i32, "{}", stopped.reason);
+    assert!(stopped.reason.is_empty(), "{}", stopped.reason);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "exited pane must skip the 5s settle wait (elapsed={elapsed:?})"
+    );
+    let sent = fake.sent.lock().unwrap().clone();
+    assert!(
+        !sent.iter().any(|args| args.iter().any(|arg| arg == "send-keys")),
+        "exited pane must not receive send-keys: {sent:?}"
+    );
+    assert!(!fake.killed.lock().unwrap().is_empty());
 }

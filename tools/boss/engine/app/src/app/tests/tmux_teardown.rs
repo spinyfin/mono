@@ -1246,3 +1246,72 @@ async fn claude_and_codex_teardown_are_unchanged() {
         );
     }
 }
+
+/// A stalled DB write lock during Grok teardown must not hold back
+/// `kill_session_verified` beyond the advertised settle bound.
+#[tokio::test]
+async fn grok_teardown_stalled_db_does_not_hold_back_kill() {
+    use std::time::{Duration, Instant};
+
+    let (state, dir) = test_server_state();
+    state.set_grok_teardown_settle_window_for_test(Duration::from_millis(200));
+    let db = state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "grok stalled db");
+    let execution_id = seed_tmux_run(db, &work_item_id, "boss-1-grok-stalled", "tok-stalled", 4_194_303);
+    db.record_execution_launch_config(&execution_id, "grok", "grok-4.6", None)
+        .unwrap();
+    let identity = read_back_identity(db, &execution_id);
+
+    let session_dir = dir.path().join("grok-stalled");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let events_path = session_dir.join("events.jsonl");
+    let updates_path = session_dir.join("updates.jsonl");
+    std::fs::write(
+        &events_path,
+        concat!(
+            r#"{"type":"turn_started","session_id":"sess-grok-stalled","turn_number":0}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &updates_path,
+        concat!(
+            r#"{"method":"session/update","params":{"sessionId":"sess-grok-stalled","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command"}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    db.set_run_transcript_path_if_unset(&execution_id, updates_path.to_str().unwrap())
+        .unwrap();
+
+    let runner = ScriptedGrokTmuxRunner::new("tok-stalled", None);
+    let tmux =
+        boss_tmux::Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+
+    // Hold an exclusive write lock on a separate connection so any synchronous
+    // `set_run_cost_snapshot` on the runtime thread would block on SQLite's
+    // busy timeout.
+    let lock_conn = db.connect().unwrap();
+    lock_conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let started = Instant::now();
+    let _outcome = state.reap_tmux_worker_with(&tmux, &execution_id, &identity).await;
+    let elapsed = started.elapsed();
+
+    let _ = lock_conn.execute_batch("ROLLBACK;");
+    assert!(
+        runner
+            .calls()
+            .iter()
+            .any(|args| args.iter().any(|a| a.contains("kill-session"))),
+        "kill-session must still run: {:?}",
+        runner.calls()
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "stalled DB must not delay kill-session past the settle bound (elapsed={elapsed:?})"
+    );
+}

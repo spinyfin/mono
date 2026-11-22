@@ -882,15 +882,24 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
         record.phase = Phase::Stopping;
         self.persist(&record)?;
-        let grok_settle = grok_teardown::settle_open_grok_turn(
-            &self.tmux,
-            &record.session,
-            record.home.as_deref(),
-            &record.execution_id,
-            &record.driver_id,
-        )
-        .await;
         let mut observed = self.observe(&record).await;
+        // Only cancel and wait when the pane is positively verified as alive
+        // and owned by this execution's spawn token. Foreign, unreadable,
+        // exited, or missing panes must never be sent interrupt keys or delayed.
+        let grok_settle = if pane_life(&observed) == PaneLife::Alive {
+            let outcome = grok_teardown::settle_open_grok_turn(
+                &self.tmux,
+                &record.session,
+                record.home.as_deref(),
+                &record.execution_id,
+                &record.driver_id,
+            )
+            .await;
+            observed = self.observe(&record).await;
+            outcome
+        } else {
+            grok_teardown::GrokSettleOutcome::Skipped
+        };
         if stop.grace_ms > 0 {
             let budget = Duration::from_millis(u64::from(stop.grace_ms.min(30_000)));
             let deadline = Instant::now() + budget;

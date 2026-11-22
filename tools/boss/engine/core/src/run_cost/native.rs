@@ -90,14 +90,8 @@ fn count(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(nonnegative_i64)
 }
 
-/// Whether `value` is a Grok ACP `turn_completed` update that [`NativeUsage`]
-/// can ingest for token accounting.
-pub fn is_grok_turn_completed_record(value: &Value) -> bool {
-    boss_engine_driver::grok::is_turn_completed(value)
-}
-
 fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {
-    if !is_grok_turn_completed_record(value) {
+    if !boss_engine_driver::grok::is_turn_completed(value) {
         return None;
     }
     let update = value.pointer("/params/update")?;

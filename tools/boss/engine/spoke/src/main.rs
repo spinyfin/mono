@@ -174,12 +174,39 @@ mod commands {
                 result.code = ResultCode::OutcomeUncertain.into();
             }
             let observed = stamp()?;
+            let mut usage_unavailable_recorded = !matches!(command.body, Some(command::Body::Stop(_)))
+                || result.code != ResultCode::Ok as i32
+                || result.reason.is_empty();
             loop {
-                let completed = journal
-                    .lock()
-                    .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
-                    .complete_command(&command, result.clone(), &observed);
-                match completed {
+                let step = {
+                    let mut guard = journal
+                        .lock()
+                        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+                    let mut append_err = None;
+                    if !usage_unavailable_recorded {
+                        let gap_record = boss_protocol_spoke::v1::Record {
+                            run: command.run.clone(),
+                            observed: Some(observed.clone()),
+                            body: Some(boss_protocol_spoke::v1::record::Body::Gap(
+                                boss_protocol_spoke::v1::Gap {
+                                    resource: boss_protocol_spoke::USAGE_UNAVAILABLE_GAP_RESOURCE.into(),
+                                    reason: result.reason.clone(),
+                                    ..Default::default()
+                                },
+                            )),
+                            ..Default::default()
+                        };
+                        match guard.append(gap_record, boss_spoke_journal::Admission::Lifecycle) {
+                            Ok(_) => usage_unavailable_recorded = true,
+                            Err(error) => append_err = Some(error),
+                        }
+                    }
+                    match append_err {
+                        Some(error) => Err(error),
+                        None => guard.complete_command(&command, result.clone(), &observed),
+                    }
+                };
+                match step {
                     Ok(()) => break,
                     Err(error) if Fault::is_full(&error) => interval.tick().await,
                     Err(error) => return Err(error),

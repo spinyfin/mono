@@ -23,7 +23,7 @@ boss-ssh-transport = { path = "../ssh-transport" }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

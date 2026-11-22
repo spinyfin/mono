@@ -23,7 +23,7 @@ use boss_work_db::TmuxIdentity;
 
 mod grok;
 #[cfg(test)]
-pub(crate) use grok::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON;
+pub(crate) use boss_engine_driver::grok::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON;
 
 /// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
 /// Late-bound via `set_server_state` to break the ownership cycle:
@@ -284,19 +284,22 @@ impl ServerState {
             &observation,
         );
 
-        if self.is_grok_execution(execution_id) {
+        let pending_usage_persist = if self.is_grok_execution(execution_id) {
             if observation.pane_dead == Some(true) {
                 self.capture_grok_cost_if_present(execution_id).await;
+                None
             } else {
                 self.settle_grok_turn_before_reap(tmux, execution_id, &identity.session_name)
-                    .await;
+                    .await
             }
-        }
+        } else {
+            None
+        };
 
         // The shared tmux teardown waits for token-owned processes, including
         // detached children, before clearing identity or releasing the lease.
 
-        match tmux
+        let outcome = match tmux
             .kill_session_verified(&identity.session_name, &identity.spawn_token)
             .await
         {
@@ -340,7 +343,11 @@ impl ServerState {
                 );
                 TmuxTeardownOutcome::Refused
             }
+        };
+        if let Some(handle) = pending_usage_persist {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
         }
+        outcome
     }
 
     fn finish_tmux_reap(&self, execution_id: &str, identity: &TmuxIdentity) -> TmuxTeardownOutcome {
