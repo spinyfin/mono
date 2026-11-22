@@ -7,11 +7,11 @@ struct NavigatorRowPresentation {
 
     var isWorkerActive = false
 
-    /// True when any of the row's activities maps (by run id, falling back
-    /// to execution id) to a live worker that is currently working.
+    /// Live workers use the execution id as their run key. The projection's
+    /// runId identifies a work_runs spawn attempt, not a live worker.
     static func isWorkerActive(row: NavigatorRow, liveStates: [String: WorkerLiveState]) -> Bool {
         row.projection.activities.contains { activity in
-            liveStates[activity.runId ?? activity.executionId]?.activity == .working
+            liveStates[activity.executionId]?.activity == .working
         }
     }
 
