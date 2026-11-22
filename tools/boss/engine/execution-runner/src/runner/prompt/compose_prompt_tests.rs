@@ -15,6 +15,8 @@ mod invocation;
 mod non_bazel_gate;
 #[path = "compose_prompt_tests/prepush_rebase.rs"]
 mod prepush_rebase;
+#[path = "compose_prompt_tests/reconcile_history.rs"]
+mod reconcile_history;
 #[path = "compose_prompt_tests/revision_rebase.rs"]
 mod revision_rebase;
 #[path = "compose_prompt_tests/vocabulary_leakage.rs"]

@@ -1002,6 +1002,9 @@ mod stuck_activity;
 mod stuck_report;
 mod stuck_snapshot;
 pub use progression_brief_reads::{ExecutionDiagnosis, ProductPrCiSnapshot, ProgressionCreateBudget, StatusAuditRow};
+mod reconcile_history;
+#[cfg(test)]
+mod reconcile_history_tests;
 mod sweep_reads;
 mod task_insert;
 mod task_status_audit;

@@ -498,6 +498,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: reconcile_history::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: reconcile_history::migrate,
+        },
+        Migration {
             id: "20261102_2105_recovery_fresh_start".into(),
             legacy_version: None,
             apply: execution_recovery_rearm::migrate_fresh_start,

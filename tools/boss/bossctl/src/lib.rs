@@ -1031,6 +1031,8 @@ enum WorkAction {
     /// ran on. Reads `state.db` directly (same resolution as
     /// `metrics`/`hosts`), so it works even when the engine is wedged.
     /// Exec ids are ready to paste into `bossctl dispatch diagnose`.
+    /// Includes the item's durable reconciliation history, even for attempts
+    /// whose execution rows have been removed by retention.
     Executions {
         #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         work_item_id: String,
@@ -2260,6 +2262,12 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
         .resolve_work_item_ref_strict(work_item_id)
         .map_err(|err| anyhow::anyhow!("{err}"))?;
     let executions = db.list_executions(Some(&work_item_id)).context("listing executions")?;
+    let reconciliation: Vec<_> = db
+        .list_task_field_audit(&work_item_id)
+        .context("listing reconciliation history")?
+        .into_iter()
+        .filter(|row| row.property == "reconciliation")
+        .collect();
     let host_ids = db
         .execution_host_ids_for_item(&work_item_id)
         .context("resolving execution hosts")?;
@@ -2285,6 +2293,7 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
             serde_json::json!({
                 "work_item_id": work_item_id,
                 "executions": entries,
+                "reconciliation": reconciliation,
             })
         );
     } else if executions.is_empty() {
@@ -2292,6 +2301,12 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
     } else {
         for (exec, host) in executions.iter().zip(hosts.iter()) {
             print_execution_history_row(exec, host);
+        }
+    }
+    if !json && !reconciliation.is_empty() {
+        println!("Reconciliation history:");
+        for row in reconciliation {
+            println!("  {}", row.detail.as_deref().unwrap_or(""));
         }
     }
     Ok(())

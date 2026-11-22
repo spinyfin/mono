@@ -824,7 +824,12 @@ mod tests {
         let t = task(&db, &task_id);
         assert_eq!(t.pr_url.as_deref(), Some(OWN));
         assert_eq!(t.status, TaskStatus::InReview);
-        assert!(t.description.contains("re-bound pr_url"));
+        assert!(!t.description.contains("re-bound pr_url"));
+        assert!(db.list_task_field_audit(&t.id).unwrap().iter().any(|row| {
+            row.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("re-bound pr_url"))
+        }));
         assert_eq!(db.get_execution(&exec_id).unwrap().pr_url.as_deref(), Some(OWN));
         assert_eq!(
             docs.0.lock().unwrap().as_slice(),

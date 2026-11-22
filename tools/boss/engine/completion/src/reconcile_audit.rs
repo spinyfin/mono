@@ -1,38 +1,30 @@
-//! Shared `[engine-reconcile]` audit-line helper.
-//!
-//! Several reconciliation sweeps (dead-pid, stale-worker, spawn-ack) and the
-//! transient-recovery path all need to append an `[engine-reconcile]` audit
-//! line to a work item's description so an operator can see why a chore was
-//! reset or resumed. They previously reimplemented the identical
-//! get -> extract-description -> format -> update sequence. This module owns
-//! the line formatting and the audit-marker vocabulary; the append itself is
-//! storage's [`WorkDb::append_work_item_description_line`]. Each call site
-//! supplies only its caller-specific reason.
+//! Shared reconciliation audit writers. Full narratives remain queryable in
+//! the work-item audit ledger without changing the authored brief or recovery interface.
 
 use crate::work::WorkDb;
 
-/// Append an `[engine-reconcile]` audit line to `work_item_id`'s description.
+/// Record an `[engine-reconcile]` narrative in the work-item audit ledger.
 ///
 /// The emitted line is:
-/// `\n[engine-reconcile] epoch {now_epoch_secs}: {reason}.`
+/// `[engine-reconcile] epoch {now_epoch_secs}: {reason}.`
 /// The caller formats only `reason` (without the trailing period); this helper
-/// owns the fetch, description extraction, and update.
+/// owns formatting; storage owns the durable ledger write.
 pub fn append_reconcile_audit(
     work_db: &WorkDb,
     work_item_id: &str,
     now_epoch_secs: i64,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let audit_line = format!("\n{ENGINE_RECONCILE_MARKER} epoch {now_epoch_secs}: {reason}.");
-    append_description_line(work_db, work_item_id, &audit_line)
+    let audit_line = format!("{ENGINE_RECONCILE_MARKER} epoch {now_epoch_secs}: {reason}.");
+    work_db.record_reconcile_audit(work_item_id, now_epoch_secs, &audit_line)
 }
 
 pub use boss_engine_storage_values::audit_text::*;
 
-/// Append a `[parking]` audit line to `work_item_id`'s description: one line of
+/// Record a `[parking]` audit line in the work-item audit ledger: one line of
 /// the un-park reconciliation trail.
 ///
-/// The emitted line is `\n[parking] epoch {now_epoch_secs}: {step}: {detail}.`
+/// The emitted line is `[parking] epoch {now_epoch_secs}: {step}: {detail}.`
 /// where `step` is the reconciliation step's stable name. The caller formats
 /// `detail` (without the trailing period); this helper owns the marker and the
 /// shape, so the vocabulary stays registered in [`ENGINE_AUDIT_LINE_PREFIXES`].
@@ -43,17 +35,16 @@ pub fn append_parking_audit(
     step: &str,
     detail: &str,
 ) -> anyhow::Result<()> {
-    append_description_line(
-        work_db,
+    work_db.record_reconcile_audit(
         work_item_id,
-        &format!("\n{PARKING_MARKER} epoch {now_epoch_secs}: {step}: {detail}."),
+        now_epoch_secs,
+        &format!("{PARKING_MARKER} epoch {now_epoch_secs}: {step}: {detail}."),
     )
 }
 
-/// Append `line` verbatim to `work_item_id`'s description. Shared by
-/// [`append_reconcile_audit`] and [`crate::WorkerCompletionHandler::record_deferred_scope_item`]
-/// (the `[deferred-scope]` audit trail) — both use the same atomic append,
-/// differing only in the line they format.
+/// Append `line` verbatim to `work_item_id`'s description for the remaining
+/// non-reconciliation writers, including
+/// [`crate::WorkerCompletionHandler::record_deferred_scope_item`].
 /// [`WorkDb::append_work_item_description_line`] owns the update so
 /// the proposal path can append its post-commit line without calling back
 /// into engine core.
@@ -99,9 +90,18 @@ mod tests {
         }
     }
 
+    fn audit_of(db: &WorkDb, id: &str) -> String {
+        db.list_task_field_audit(id)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.property == "reconciliation")
+            .map(|row| row.detail.unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Overwrite `id`'s description with `desc` so a test can start from a
-    /// known non-empty value and prove the helper appends rather than
-    /// replaces.
+    /// known non-empty value and prove reconciliation leaves it unchanged.
     fn set_description(db: &WorkDb, id: &str, desc: &str) {
         db.update_work_item(
             id,
@@ -114,56 +114,57 @@ mod tests {
     }
 
     #[test]
-    fn appends_audit_line_in_exact_format_without_recovery_note() {
+    fn records_audit_without_changing_the_brief() {
         let (_dir, db) = open_db();
         let product = create_test_product(&db);
         let chore = create_active_chore(&db, &product.id, "reap me");
         set_description(&db, &chore, "original body");
 
         append_reconcile_audit(&db, &chore, EPOCH, "worker pid 123 exited").unwrap();
+        assert_eq!(description_of(&db, &chore), "original body");
 
         assert_eq!(
-            description_of(&db, &chore),
-            "original body\n[engine-reconcile] epoch 1700000000: worker pid 123 exited.",
+            audit_of(&db, &chore),
+            "[engine-reconcile] epoch 1700000000: worker pid 123 exited.",
         );
     }
 
     #[test]
-    fn appends_rather_than_replaces_existing_description() {
+    fn repeated_reconciliation_keeps_history_out_of_the_brief() {
         let (_dir, db) = open_db();
         let product = create_test_product(&db);
         let chore = create_active_chore(&db, &product.id, "keep history");
         set_description(&db, &chore, "line one\nline two");
 
-        // Two successive appends must both survive, in order, on top of the
-        // original body — nothing is overwritten.
+        // Both events survive in order; the authored brief stays byte-for-byte intact.
         append_reconcile_audit(&db, &chore, EPOCH, "first reason").unwrap();
         append_reconcile_audit(&db, &chore, EPOCH + 1, "second reason").unwrap();
+        assert_eq!(description_of(&db, &chore), "line one\nline two");
 
         assert_eq!(
-            description_of(&db, &chore),
-            "line one\nline two\
-             \n[engine-reconcile] epoch 1700000000: first reason.\
+            audit_of(&db, &chore),
+            "[engine-reconcile] epoch 1700000000: first reason.\
              \n[engine-reconcile] epoch 1700000001: second reason.",
         );
     }
 
     #[test]
-    fn appends_to_product_description() {
+    fn records_product_history_without_changing_description() {
         let (_dir, db) = open_db();
         let product = create_test_product(&db);
         set_description(&db, &product.id, "product notes");
 
         append_reconcile_audit(&db, &product.id, EPOCH, "product reason").unwrap();
+        assert_eq!(description_of(&db, &product.id), "product notes");
 
         assert_eq!(
-            description_of(&db, &product.id),
-            "product notes\n[engine-reconcile] epoch 1700000000: product reason.",
+            audit_of(&db, &product.id),
+            "[engine-reconcile] epoch 1700000000: product reason.",
         );
     }
 
     #[test]
-    fn appends_to_project_description() {
+    fn records_project_history_without_changing_description() {
         let (_dir, db) = open_db();
         let product = create_test_product(&db);
         let project = db
@@ -178,10 +179,11 @@ mod tests {
             .unwrap();
 
         append_reconcile_audit(&db, &project.id, EPOCH, "project reason").unwrap();
+        assert_eq!(description_of(&db, &project.id), "project notes");
 
         assert_eq!(
-            description_of(&db, &project.id),
-            "project notes\n[engine-reconcile] epoch 1700000000: project reason.",
+            audit_of(&db, &project.id),
+            "[engine-reconcile] epoch 1700000000: project reason.",
         );
     }
 
@@ -194,15 +196,10 @@ mod tests {
 
         append_parking_audit(&db, &chore, EPOCH, "refresh_pr", "PR is still open").unwrap();
 
-        let description = description_of(&db, &chore);
+        assert_eq!(description_of(&db, &chore), "brief");
         assert_eq!(
-            description,
-            "brief\n[parking] epoch 1700000000: refresh_pr: PR is still open."
-        );
-        assert_eq!(
-            strip_engine_audit_lines(&description),
-            "brief",
-            "the parking trail must not leak into the brief a worker reads",
+            audit_of(&db, &chore),
+            "[parking] epoch 1700000000: refresh_pr: PR is still open."
         );
     }
 

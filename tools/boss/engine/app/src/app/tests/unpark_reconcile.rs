@@ -65,11 +65,14 @@ fn task_of(state: &ServerState, id: &str) -> boss_protocol::Task {
     }
 }
 
-fn parking_lines(task: &boss_protocol::Task) -> Vec<String> {
-    task.description
-        .lines()
+fn parking_lines(state: &ServerState, task: &boss_protocol::Task) -> Vec<String> {
+    state
+        .work_db
+        .list_task_field_audit(&task.id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| row.detail)
         .filter(|line| line.starts_with("[parking]"))
-        .map(str::to_owned)
         .collect()
 }
 
@@ -92,7 +95,7 @@ async fn unparking_over_the_rpc_traces_the_database_steps_and_runs_the_job() {
     patch(&state, &chore.id, WorkItemPatch::builder().parked(true).build(), "park").await;
     assert!(task_of(&state, &chore.id).parked_at.is_some());
     assert!(
-        parking_lines(&task_of(&state, &chore.id)).is_empty(),
+        parking_lines(&state, &task_of(&state, &chore.id)).is_empty(),
         "parking leaves no reconciliation trail"
     );
 
@@ -109,7 +112,7 @@ async fn unparking_over_the_rpc_traces_the_database_steps_and_runs_the_job() {
 
     assert!(reply.parked_at.is_none(), "the reply is the un-parked item");
     // Steps 1 and 2 are traced before the reply goes out.
-    let at_reply = parking_lines(&task_of(&state, &chore.id));
+    let at_reply = parking_lines(&state, &task_of(&state, &chore.id));
     assert!(at_reply.len() >= 2, "{at_reply:#?}");
     assert!(
         at_reply[0].contains("clear_park: un-parked by human"),
@@ -122,7 +125,7 @@ async fn unparking_over_the_rpc_traces_the_database_steps_and_runs_the_job() {
     let mut finished = None;
     for _ in 0..500 {
         let task = task_of(&state, &chore.id);
-        if parking_lines(&task)
+        if parking_lines(&state, &task)
             .iter()
             .any(|line| line.contains("progression_grace"))
         {
@@ -134,7 +137,7 @@ async fn unparking_over_the_rpc_traces_the_database_steps_and_runs_the_job() {
     let task = finished.unwrap_or_else(|| {
         panic!(
             "the background job must run to its last step; the trail so far: {:#?}",
-            parking_lines(&task_of(&state, &chore.id))
+            parking_lines(&state, &task_of(&state, &chore.id))
         )
     });
     assert_eq!(
@@ -142,7 +145,7 @@ async fn unparking_over_the_rpc_traces_the_database_steps_and_runs_the_job() {
         boss_protocol::TaskStatus::Done,
         "the PR merged while the item was parked"
     );
-    let lines = parking_lines(&task);
+    let lines = parking_lines(&state, &task);
     assert!(
         lines
             .iter()
@@ -229,11 +232,11 @@ async fn parking_and_unparking_a_project_over_the_rpc_reconciles_each_child() {
         assert!(
             done,
             "{child}: the merged PR was routed to done by the project's job; trail: {:#?}",
-            parking_lines(&task_of(&state, child))
+            parking_lines(&state, &task_of(&state, child))
         );
         let task = task_of(&state, child);
         assert!(task.parked_at.is_none());
-        let lines = parking_lines(&task);
+        let lines = parking_lines(&state, &task);
         assert!(
             lines
                 .first()

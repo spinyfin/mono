@@ -18,6 +18,16 @@ use crate::work::ExecutionStatus;
 #[path = "worker_death_regression_tests.rs"]
 mod worker_death_regression_tests;
 
+fn reconciliation_audit(db: &WorkDb, id: &str) -> String {
+    db.list_task_field_audit(id)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.property == "reconciliation")
+        .map(|row| row.detail.unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // A staleness threshold whose cutoff lands in the *future*, so any
 // `last_event_at` stamped "now" by `apply_event` compares as stale.
 // This lets us exercise the staleness branch deterministically
@@ -465,7 +475,9 @@ async fn stale_idle_worker_is_reaped() {
         boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description.clone(),
         _ => panic!("expected chore"),
     };
-    assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
+    assert!(!desc.contains("[engine-reconcile]"), "got: {desc:?}");
+    let audit = reconciliation_audit(&db, &work_item_id);
+    assert!(audit.contains("[engine-reconcile]"), "got: {audit:?}");
 }
 
 /// The cadence fallback's guarded release must leave a replacement that the
@@ -658,8 +670,10 @@ async fn stale_review_guide_worker_reap_appends_audit_to_series_root_task() {
         boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description,
         _ => panic!("expected chore"),
     };
-    assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
-    assert!(desc.contains(&execution_id), "got: {desc:?}");
+    assert!(!desc.contains("[engine-reconcile]"), "got: {desc:?}");
+    let audit = reconciliation_audit(&db, &root);
+    assert!(audit.contains("[engine-reconcile]"), "got: {audit:?}");
+    assert!(audit.contains(&execution_id), "got: {audit:?}");
 }
 
 /// A live tmux pane whose driver is below `Rich` fidelity raises the
@@ -1709,8 +1723,10 @@ async fn two_hour_idle_tmux_worker_is_auto_reaped() {
         boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description.clone(),
         _ => panic!("expected chore"),
     };
-    assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
-    assert!(desc.contains("auto-reaped"), "got: {desc:?}");
+    assert!(!desc.contains("[engine-reconcile]"), "got: {desc:?}");
+    let audit = reconciliation_audit(&db, &work_item_id);
+    assert!(audit.contains("[engine-reconcile]"), "got: {audit:?}");
+    assert!(audit.contains("auto-reaped"), "got: {audit:?}");
 
     let open_items: Vec<_> = db
         .list_attention_items_for_work_item(&work_item_id)

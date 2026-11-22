@@ -27,7 +27,7 @@
 //!       tracked pid was the wrong identity — skip, do not reap.
 //! 3. For dead PIDs with no corroborating activity:
 //!    1. Mark the execution `orphaned` in the DB.
-//!    2. Append an `[engine-reconcile]` audit line to the task description.
+//!    2. Append an `[engine-reconcile]` audit line to the work-item audit ledger.
 //!    3. Release the worker pool slot so the orphan sweep can redispatch.
 //!    4. Emit a `dead_pid_reconcile` dispatch event.
 //!    5. Kick the coordinator.
@@ -675,7 +675,7 @@ async fn reap_dead_execution(
     )
     .await;
 
-    // Append [engine-reconcile] audit line to the task description
+    // Append [engine-reconcile] audit line to the work-item audit ledger
     // so a human inspecting the chore can see why it was reset.
     let detection_source = evidence.audit_source();
     if execution.kind.holds_cube_lease()
@@ -692,7 +692,7 @@ async fn reap_dead_execution(
         tracing::warn!(
             work_item_id,
             ?err,
-            "dead-pid reconcile: failed to append audit line to description (non-fatal)",
+            "dead-pid reconcile: failed to append audit line to ledger (non-fatal)",
         );
     }
 
@@ -1153,16 +1153,24 @@ mod tests {
         assert_eq!(events[0].outcome, "ok");
         assert_eq!(events[0].work_item_id.as_deref(), Some(work_item_id.as_str()),);
 
-        // The task description must contain the [engine-reconcile] audit line.
+        // The ledger retains the reason while the description stays clean.
         let item = db.get_work_item(&work_item_id).unwrap();
         let desc = match &item {
             boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description.clone(),
             _ => panic!("expected chore"),
         };
         assert!(
-            desc.contains("[engine-reconcile]"),
-            "task description must contain the engine-reconcile audit line; got: {desc:?}",
+            !desc.contains("[engine-reconcile]"),
+            "reconciliation must not enter the description; got: {desc:?}",
         );
+
+        assert!(db.list_task_field_audit(&work_item_id).unwrap().iter().any(|row| {
+            row.property == "reconciliation"
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("detected via a PID probe"))
+        }));
 
         // The periodic sweep must not file any attention item for a routine
         // crash reap — it is already surfaced via the dispatch event above.

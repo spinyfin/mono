@@ -482,7 +482,7 @@ const ITEM_EVER_RAN_ON_TASK_SQL: &str = "EXISTS (
 
 impl WorkDb {
     /// The recorded history of one task, oldest first: its `deferred` /
-    /// `autostart` changes, every execution abandonment, and the status moves
+    /// `autostart` changes, reconciliation notes, every execution abandonment, and the status moves
     /// that happened in the same operation as one of those.
     pub fn list_task_field_audit(&self, work_item_id: &str) -> Result<Vec<boss_protocol::TaskFieldAuditRow>> {
         let conn = self.connect()?;
@@ -492,7 +492,7 @@ impl WorkDb {
                     execution_ever_ran, item_ever_ran
              FROM task_status_audit a
              WHERE work_item_id = ?1
-               AND (property IN (?2, ?3, ?4)
+               AND (property = 'reconciliation' OR property IN (?2, ?3, ?4)
                     OR (property = 'status' AND operation_id IS NOT NULL AND operation_id IN (
                         SELECT operation_id FROM task_status_audit
                         WHERE work_item_id = ?1 AND property IN (?2, ?3, ?4))))

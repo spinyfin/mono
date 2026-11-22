@@ -1631,7 +1631,7 @@ pub(crate) fn print_field_audit_section(rows: &[boss_protocol::TaskFieldAuditRow
         return;
     }
     println!();
-    println!("Flag and abandonment history ({}):", rows.len());
+    println!("Flag, abandonment and reconciliation history ({}):", rows.len());
     for row in rows {
         let old = row.old_value.as_deref().unwrap_or("-");
         let new = row.new_value.as_deref().unwrap_or("-");

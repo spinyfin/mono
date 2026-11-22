@@ -1546,7 +1546,7 @@ async fn execute_auto_reap(
         tracing::warn!(
             work_item_id,
             ?err,
-            "stale-worker sweep: auto-reap failed to append audit line to description (non-fatal)",
+            "stale-worker sweep: auto-reap failed to append audit line to ledger (non-fatal)",
         );
     }
 
@@ -1750,7 +1750,7 @@ async fn run_cadence_fallback(
     )
     .await;
 
-    // Append [engine-reconcile] audit line to the task description so
+    // Append [engine-reconcile] audit line to the work-item audit ledger so
     // a human inspecting the chore can see why it was reset.
     if let Some(work_item_id) = state.work_item_id.as_deref().map(|id| work_db.owning_work_item_id(id))
         && let Err(err) = crate::reconcile_audit::append_reconcile_audit(
@@ -1765,7 +1765,7 @@ async fn run_cadence_fallback(
         tracing::warn!(
             work_item_id,
             ?err,
-            "stale-worker sweep: failed to append audit line to description (non-fatal)",
+            "stale-worker sweep: failed to append audit line to ledger (non-fatal)",
         );
     }
 

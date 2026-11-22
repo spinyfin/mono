@@ -271,6 +271,30 @@ on the worker's next hook, and submitting its guide minutes later — is
 covered by `restart_during_spawn_reopens_the_attempt_with_the_readopted_execution_and_publishes_the_guide`
 in `tools/boss/engine/work-db/src/review_guide_jobs_tests.rs`.
 
+## Reconciliation history and worker briefs
+
+Reconciliation records live in `task_status_audit` with property
+`reconciliation`. The existing work-item history query (`ListTaskFieldAudit`)
+and `boss task show <id>` expose the original epoch and complete narrative in
+`detail`; JSON output includes these rows in `field_audit`. The ledger is
+operator/coordinator history, not an input to worker prompt composition.
+`bossctl work executions <id>` also prints the history (JSON key
+`reconciliation`), including notes whose execution rows have been retired.
+
+The description appends were intentional: the shared helper introduced in
+[#1828](https://github.com/spinyfin/mono/pull/1828) preserved the sweep-specific
+explanation of why an item was reset or resumed. The ledger preserves that
+purpose without changing the authored brief or its effort-classification size.
+Startup migrates existing `[engine-reconcile] epoch ...` and `[parking] epoch
+...` records out of descriptions in the same transaction that records them in
+the ledger, retaining duplicate attempts and historical patch paths. Fenced
+examples, indented text, and other authored bytes are retained. New events
+never append to the description or update the item's modification timestamp.
+
+Worker prompts use the authored description and the existing recovery
+interface. Reconciliation history is not injected into that interface, and
+the migration does not interpret or replay historical patch paths.
+
 ## Workspace patch backup (retired)
 
 The engine no longer exports a patch when it records a death. A worker's
