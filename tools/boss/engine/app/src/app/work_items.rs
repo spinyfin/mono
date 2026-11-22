@@ -180,26 +180,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
     match result {
         Ok(outcome) => {
             tracing::info!(%request_id, verb, elapsed_ms = write_ms, "operator answer durable write completed");
-            let mut item = outcome.item;
-            // "Archive it", the owner's answer to the engine's question about an
-            // item progression could not unstick, archives through the ordinary
-            // update path now that the answer has committed. If that fails the
-            // item is back in the state it was stuck in, so the ladder will
-            // ask again rather than lose it.
-            if let Some(archive_id) = outcome.archive_work_item_id.as_deref() {
-                let patch = boss_protocol::WorkItemPatch::builder()
-                    .status("archived")
-                    .archived_reason("progression could not unstick it; the owner chose to archive it")
-                    .build();
-                match work_db.update_work_item(archive_id, patch) {
-                    Ok(archived) => item = archived,
-                    Err(err) => tracing::warn!(
-                        work_item_id = %archive_id,
-                        error = %format!("{err:#}"),
-                        "operator answer: could not archive the item the owner chose to archive",
-                    ),
-                }
-            }
+            let item = outcome.item;
             let product_id = item.product_id().to_string();
             // A Yes on a prerequisite proposal also created (or linked) a
             // task; the board must refresh that card too.

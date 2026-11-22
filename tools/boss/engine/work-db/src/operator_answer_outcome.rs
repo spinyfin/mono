@@ -24,11 +24,6 @@ pub struct OperatorAnswerOutcome {
     /// force launch. An ordinary resume of a normally dispatched run leaves
     /// this unset so the scheduler applies the pause.
     pub dispatch_work_item_id: Option<String>,
-    /// The task the owner chose to archive when the engine asked what to do
-    /// with an item progression could not unstick. The archive is the ordinary
-    /// update path (it cascades to dependents and the project), so the caller
-    /// runs it once the answer has committed.
-    pub archive_work_item_id: Option<String>,
 }
 
 impl OperatorAnswerOutcome {

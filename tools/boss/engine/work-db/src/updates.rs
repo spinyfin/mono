@@ -399,7 +399,35 @@ impl WorkDb {
     /// A caller that can name the code path or the socket peer it is acting
     /// for passes that here; `update_task` is the unattributed default.
     pub fn update_task_with_basis(&self, id: &str, patch: WorkItemPatch, actor: &str, basis: &str) -> Result<WorkItem> {
-        // Fail fast, before opening a transaction: validate the incoming
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvents::new();
+        let item = self.update_task_in_tx(
+            &tx,
+            &mut pending,
+            id,
+            patch,
+            crate::task_status_audit::WriteAttribution {
+                actor,
+                provenance: Some(basis),
+            },
+        )?;
+        commit_and_publish(tx, pending, self.event_bus())?;
+        Ok(item)
+    }
+
+    /// Apply the ordinary task lifecycle changes atomically with an owner answer.
+    pub(crate) fn update_task_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        pending: &mut PendingEvents,
+        id: &str,
+        patch: WorkItemPatch,
+        attribution: crate::task_status_audit::WriteAttribution<'_>,
+    ) -> Result<WorkItem> {
+        let actor = attribution.actor;
+        let basis = attribution.provenance.unwrap_or(DEFAULT_UPDATE_BASIS);
+        // Validate the incoming
         // value only (never a value already sitting in a row from before
         // this limit existed — see `validate_blocked_reason_length`).
         if let Some(reason) = patch.blocked_reason.as_deref() {
@@ -407,10 +435,7 @@ impl WorkDb {
         }
         let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
         let archived_reason_patch_requests_set = patch.archived_reason.as_deref().is_some_and(|s| !s.is_empty());
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut pending = PendingEvents::new();
-        let mut task = query_task(&tx, id).require("task", id)?;
+        let mut task = query_task(tx, id).require("task", id)?;
         let previous_status = task.status.clone();
         // Check this before the generic tombstone bail below: an
         // archived-and-tombstoned moot revision (see
@@ -420,7 +445,7 @@ impl WorkDb {
         // instead of the specific, actionable explanation.
         if let Some(status_str) = patch.status.as_deref() {
             let requested_status = status_str.parse::<TaskStatus>().map_err(|e| anyhow::anyhow!(e))?;
-            refuse_manual_move_off_archived_moot_revision(&tx, id, &task.kind, &previous_status, &requested_status)?;
+            refuse_manual_move_off_archived_moot_revision(tx, id, &task.kind, &previous_status, &requested_status)?;
         }
         if task.deleted_at.is_some() {
             bail!("cannot update a deleted task: {id}");
@@ -453,7 +478,7 @@ impl WorkDb {
         if let Some(ref repo_patch) = patch.repo_remote_url
             && !repo_patch.trim().is_empty()
         {
-            let product = query_product(&tx, &task.product_id)?
+            let product = query_product(tx, &task.product_id)?
                 .with_context(|| format!("orphan task {id}: parent product {} missing", task.product_id))?;
             if let Some(product_repo) = product.repo_remote_url.as_deref() {
                 bail!(
@@ -603,12 +628,12 @@ impl WorkDb {
                 Some(trimmed.to_owned())
             };
             if let Some(target) = target_project_id.as_deref() {
-                ensure_project_belongs_to_product(&tx, target, &task.product_id)
+                ensure_project_belongs_to_product(tx, target, &task.product_id)
                     .with_context(|| format!("cannot move {id} into project {target}"))?;
             }
             if target_project_id != task.project_id {
                 task.ordinal = match target_project_id.as_deref() {
-                    Some(target) => Some(next_task_ordinal(&tx, target)?),
+                    Some(target) => Some(next_task_ordinal(tx, target)?),
                     None => None,
                 };
                 if task.kind != TaskKind::Followup {
@@ -671,7 +696,7 @@ impl WorkDb {
         }
 
         if status_changed {
-            refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), task.status.as_str())?;
+            refuse_manual_move_off_blocked_while_gated(tx, id, previous_status.as_str(), task.status.as_str())?;
         }
         // Human-driven close ritual: moving to `done` requires a non-empty
         // completion_summary (supplied by `boss task complete --summary`).
@@ -706,9 +731,9 @@ impl WorkDb {
 
         // One operation spans the task write and the deferral's abandonment,
         // so the ledger ties the flag change to the executions it withdrew.
-        let operation = crate::task_status_audit::begin_operation(&tx)?;
+        let operation = crate::task_status_audit::begin_operation(tx)?;
         crate::task_status_audit::execute(
-            &tx,
+            tx,
             basis,
             actor,
             "UPDATE tasks
@@ -764,10 +789,10 @@ impl WorkDb {
         )?;
 
         if cascade_project_to_revisions {
-            cascade_project_id_to_revisions(&tx, id, task.project_id.as_deref(), &task.updated_at)?;
+            cascade_project_id_to_revisions(tx, id, task.project_id.as_deref(), &task.updated_at)?;
             // Joining a parked project parks the item via the membership
             // trigger; retire its not-yet-started executions too.
-            crate::parking::cancel_pending_for_parked_chain(&tx, &mut pending, id)?;
+            crate::parking::cancel_pending_for_parked_chain(tx, pending, id)?;
         }
 
         // Re-classifying an item as deferred pulls it out of the dispatch
@@ -778,26 +803,20 @@ impl WorkDb {
         // reconcile guard (`work_item_is_deferred`) then keeps it parked.
         if patch.deferred == Some(true) {
             abandon_pending_executions(
-                &mut pending,
-                &tx,
+                pending,
+                tx,
                 id,
                 &task.updated_at,
                 crate::task_status_audit::abandon_cause::DEFERRED.by(actor),
             )?;
         }
         if let Some(through) = patch.acknowledge_auto_stop_through {
-            super::auto_stop_notice::acknowledge(&tx, id, through, actor, &task.updated_at)?;
+            super::auto_stop_notice::acknowledge(tx, id, through, actor, &task.updated_at)?;
         }
         operation.end()?;
 
         if status_changed && previous_status != task.status {
-            cascade_dependents_after_prereq_status_change(
-                &mut pending,
-                &tx,
-                id,
-                task.status.as_str(),
-                &task.updated_at,
-            )?;
+            cascade_dependents_after_prereq_status_change(pending, tx, id, task.status.as_str(), &task.updated_at)?;
         }
 
         // Manual-override suppression for `blocked: ci_failure` /
@@ -820,7 +839,7 @@ impl WorkDb {
                 Some("ci_failure") | Some("ci_failure_exhausted")
             )
         {
-            record_ci_failure_suppression_in_tx(&tx, id, &task.updated_at)?;
+            record_ci_failure_suppression_in_tx(tx, id, &task.updated_at)?;
         }
 
         if before.pr_url != task.pr_url
@@ -828,21 +847,20 @@ impl WorkDb {
                 && task.status != TaskStatus::InReview
                 && !(task.status == TaskStatus::Blocked && task.blocked_reason.as_deref() == Some("merge_conflict")))
         {
-            crate::merge_conflict_merging::cancel(&tx, id)?;
+            crate::merge_conflict_merging::cancel(tx, id)?;
         }
         if previous_status != task.status || previous_blocked_reason != task.blocked_reason {
             // A stopped-merge explanation ends with the state it described
             // (a sign-off, a landed revision, a human move).
-            crate::merge_conflict_merging::clear_stopped(&tx, id)?;
+            crate::merge_conflict_merging::clear_stopped(tx, id)?;
         }
-        let mut updated = query_task(&tx, id).require("task", id)?;
+        let mut updated = query_task(tx, id).require("task", id)?;
         // Audit the stored status before applying the board presentation.
-        boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
+        boothby::capture_task_update(tx, self, actor, &before, &updated, &task.updated_at)?;
         // Same single-item projection `get_work_item` runs, so SetStatus's
         // WorkItemUpdated does not flicker derived flags to mapper zeros
         // for the 150 ms until the invalidation refetch lands.
-        project_for_work_item_updated(&tx, &mut updated, "update_task");
-        commit_and_publish(tx, pending, self.event_bus())?;
+        project_for_work_item_updated(tx, &mut updated, "update_task");
         Ok(task_to_item(updated))
     }
 }

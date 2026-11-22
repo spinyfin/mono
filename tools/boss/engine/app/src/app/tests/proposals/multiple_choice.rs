@@ -203,8 +203,7 @@ async fn unparkable_multiple_choice_retains_answerable_options() {
 }
 
 /// The engine's own question, filed when progression ran out of attempts on a
-/// stuck chore. "Archive it" is answered here, where the handler runs the
-/// archive after the answer commits.
+/// stuck chore. The archive commits atomically with the answer.
 #[tokio::test]
 async fn archive_it_archives_the_item_progression_could_not_unstick() {
     let (state, _dir, _, task_id) = parked_task_with_question(multiple_choice_payload()).await;
@@ -262,4 +261,187 @@ async fn archive_it_archives_the_item_progression_could_not_unstick() {
         Some("manual_status_change"),
         "archived as the owner"
     );
+}
+
+fn disposition_payload(choice: &str) -> Value {
+    let mut payload = multiple_choice_payload();
+    payload["question"]["answer_type"]["choices"] = json!([choice, "Pick a PR", "Keep trying"]);
+    payload
+}
+
+#[tokio::test]
+async fn owner_archive_choices_archive_once_without_a_new_worker_or_question() {
+    for choice in ["Archive", "Archive this chore", "Archive it", "Archive this item"] {
+        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice)).await;
+        let question = question_task(&state, &task_id).operator_question.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                choose(&state, &question.id, choice).await,
+                FrontendEvent::WorkItemUpdated { .. }
+            ));
+            let task = question_task(&state, &task_id);
+            assert_eq!(task.status, boss_protocol::TaskStatus::Archived);
+            assert_eq!(task.last_status_actor, "human");
+            assert_eq!(task.archived_by.as_deref(), Some("manual_status_change"));
+            assert!(task.operator_question.is_none());
+            assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+        }
+        let history = state.work_db.list_operator_questions(&task_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, boss_protocol::OperatorQuestionStatus::Answered);
+        assert_eq!(history[0].answered_by.as_deref(), Some("human"));
+        let archives: i64 = state
+            .work_db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM task_status_audit WHERE work_item_id = ?1 AND property = 'status' AND new_value = 'archived'",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archives, 1, "a repeated answer must not archive twice");
+    }
+}
+
+#[tokio::test]
+async fn owner_park_choice_parks_without_resuming_and_unparks_without_an_answer_hold() {
+    for revision in [false, true] {
+        let (state, _dir, _, task_id) =
+            parked_task_with_question_kind(disposition_payload("Park this item"), revision).await;
+        let task = question_task(&state, &task_id);
+        let root_id = task.parent_task_id.clone().unwrap_or_else(|| task_id.clone());
+        let question = task.operator_question.unwrap();
+        assert!(matches!(
+            choose(&state, &question.id, "Park this item").await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
+        let task = question_task(&state, &task_id);
+        assert_eq!(task.parked_by.as_deref(), Some("human"));
+        assert!(state.work_db.is_parked(&task_id).unwrap());
+        assert!(state.work_db.is_parked(&root_id).unwrap());
+        assert!(task.operator_question.is_none());
+        assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+        assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+        state
+            .work_db
+            .park_work_item_as_actor(&root_id, false, None, "human")
+            .unwrap();
+        let task = question_task(&state, &task_id);
+        assert!(task.parked_at.is_none());
+        assert!(task.blocked_reason.is_none());
+        assert!(task.operator_question.is_none());
+    }
+}
+
+#[tokio::test]
+async fn ordinary_choices_still_resume_including_pr_selection_and_keep_trying() {
+    for choice in ["Pick a PR", "Keep trying", "Archive the old logs"] {
+        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Archive the old logs")).await;
+        let question = question_task(&state, &task_id).operator_question.unwrap();
+        assert!(matches!(
+            choose(&state, &question.id, choice).await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
+        let task = question_task(&state, &task_id);
+        assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
+        assert!(task.parked_at.is_none());
+        assert!(task.description.contains(&format!("Operator chose:** {choice}")));
+        assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
+    let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Archive")).await;
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_test_archive BEFORE UPDATE OF status ON tasks
+         WHEN NEW.status = 'archived' BEGIN SELECT RAISE(ABORT, 'archive failed'); END;",
+        )
+        .unwrap();
+    assert!(!matches!(
+        choose(&state, &question.id, "Archive").await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    assert_eq!(
+        question_task(&state, &task_id).operator_question.unwrap().id,
+        question.id
+    );
+    assert_eq!(
+        state.work_db.list_operator_questions(&task_id).unwrap()[0].status,
+        boss_protocol::OperatorQuestionStatus::Open
+    );
+    state
+        .work_db
+        .connect()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_test_archive")
+        .unwrap();
+    assert!(matches!(
+        choose(&state, &question.id, "Archive").await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    assert_eq!(
+        question_task(&state, &task_id).status,
+        boss_protocol::TaskStatus::Archived
+    );
+}
+
+#[tokio::test]
+async fn disposition_answers_do_not_grant_workers_owner_authority() {
+    for choice in ["Archive", "Park"] {
+        let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice)).await;
+        let question = question_task(&state, &task_id).operator_question.unwrap();
+        let result = state.work_db.answer_operator_question_from(
+            &question.id,
+            boss_protocol::OperatorAnswer::MultipleChoice { value: choice.into() },
+            state.pr_state_checker.as_ref(),
+            "worker",
+            None,
+            false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            question_task(&state, &task_id).operator_question.unwrap().id,
+            question.id
+        );
+        assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn archive_this_chore_closes_an_unbound_merge_conflict_chore() {
+    let (state, _dir, execution, id) = live_chore_execution();
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution,
+                ProposalKind::RunDone,
+                disposition_payload("Archive this chore"),
+            ),
+        )
+        .await,
+    );
+    let question = state.work_db.list_operator_questions(&id).unwrap().remove(0).question;
+    let response = choose(&state, &question.id, "Archive this chore").await;
+    let FrontendEvent::WorkItemUpdated {
+        item: boss_work_db::WorkItem::Chore(task),
+    } = response
+    else {
+        panic!("expected archived chore: {response:?}");
+    };
+    assert!(task.pr_url.is_none());
+    assert_eq!(task.status, boss_protocol::TaskStatus::Archived);
+    assert_eq!(task.last_status_actor, "human");
+    assert!(task.operator_question.is_none());
+    state.work_db.reconcile_product_executions(&task.product_id).unwrap();
+    assert_eq!(state.work_db.list_executions(Some(&id)).unwrap().len(), 1);
+    assert_eq!(state.work_db.list_operator_questions(&id).unwrap().len(), 1);
 }

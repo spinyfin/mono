@@ -905,6 +905,7 @@ mod github_merge_intents;
 mod merge_conflict_merging;
 mod merge_intent;
 mod operator_answer_outcome;
+mod operator_disposition;
 pub mod parking;
 pub mod parking_reconcile;
 pub mod personas;
