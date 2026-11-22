@@ -22,7 +22,11 @@
 #        (positive control, so an empty $1 cannot be a rotted filter).
 #   $3 — bundled production binaries with stamp = -1;    must be empty.
 #
-#   $4, $5 — the root .bazelrc and the .ci.bazelrc it imports. `--stamp` must
+#   $4 — default-stamp rust_binary found by the same expression as $3 over a
+#        known unstamped binary; must be non-empty (positive control, so an
+#        empty $3 cannot be a rotted filter).
+#
+#   $5, $6 — the root .bazelrc and the .ci.bazelrc it imports. `--stamp` must
 #        not be set for ordinary builds: with it, every rust_binary's Rustc
 #        action takes stable-status.txt (which carries the commit sha) as an
 #        input and recompiles on every commit. Under any verb (`build`,
@@ -39,11 +43,13 @@ set -euo pipefail
 engine_lib_hits_file="$1"
 positive_control_file="$2"
 default_stamp_binaries_file="$3"
-bazelrc_files=("$4" "$5")
+default_stamp_control_file="$4"
+bazelrc_files=("$5" "$6")
 
 engine_lib_hits="$(<"$engine_lib_hits_file")"
 positive_control="$(<"$positive_control_file")"
 default_stamp_binaries="$(<"$default_stamp_binaries_file")"
+default_stamp_control="$(<"$default_stamp_control_file")"
 
 if [[ -n "${engine_lib_hits//[[:space:]]/}" ]]; then
   echo "ERROR: engine_lib_test (and therefore engine_lib) transitively depends on a per-commit or per-tag stamped target:" >&2
@@ -61,6 +67,13 @@ if [[ -z "${positive_control//[[:space:]]/}" ]]; then
   echo "Either the engine binary stopped linking a stamped leaf (then main.rs can no longer install the" >&2
   echo "real build identity or print --version) or genquery's label spelling changed; fix the regex in BUILD.bazel rather than" >&2
   echo "trusting an empty engine_lib result." >&2
+  exit 1
+fi
+
+if [[ -z "${default_stamp_control//[[:space:]]/}" ]]; then
+  echo "ERROR: default-stamp positive control is empty — attr(\"stamp\", \"^-1\$\", ...) no longer matches a rust_binary that leaves stamp unset." >&2
+  echo "Fix the expression in BUILD.bazel (bundled_binaries_default_stamp and default_stamp_positive_control)" >&2
+  echo "rather than trusting an empty bundled-binaries result." >&2
   exit 1
 fi
 

@@ -825,6 +825,16 @@ genquery(
     ],
 )
 
+# Positive control for the guard above: the same attr("stamp", "^-1$", ...)
+# expression must find a known default-stamp rust_binary, so an empty result
+# above cannot be a rotted filter (attribute rendering or rules_rust default
+# change). Any rust_binary that leaves stamp unset works as the control.
+genquery(
+    name = "default_stamp_positive_control",
+    expression = 'attr("stamp", "^-1$", set(//tools/boss/engine/spoke:boss-spoke))',
+    scope = ["//tools/boss/engine/spoke:boss-spoke"],
+)
+
 sh_test(
     name = "stamped_provenance_isolation_test",
     size = "small",
@@ -833,11 +843,13 @@ sh_test(
         "$(location :engine_lib_test_stamped_deps)",
         "$(location :engine_binary_stamped_deps)",
         "$(location :bundled_binaries_default_stamp)",
+        "$(location :default_stamp_positive_control)",
         "$(location //:.bazelrc)",
         "$(location //:.ci.bazelrc)",
     ],
     data = [
         ":bundled_binaries_default_stamp",
+        ":default_stamp_positive_control",
         ":engine_binary_stamped_deps",
         ":engine_lib_test_stamped_deps",
         "//:.bazelrc",

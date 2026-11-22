@@ -376,11 +376,11 @@ enum Command {
     /// the case rather than parse a message.
     SelectedProduct,
     /// Scroll the kanban in the macOS app to a work item's card and
-    /// play a short transient highlight. Accepts a short id (`T607`)
+    /// play a short transient highlight. Accepts a short id (`T<n>`)
     /// or a canonical id. Returns an error when the app is not
     /// running, the item is deleted, or the id is unknown.
     Reveal {
-        /// Work item to reveal: short id (`T607`) or canonical id.
+        /// Work item to reveal: short id (`T<n>`) or canonical id.
         #[arg(value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
         id: String,
     },
@@ -842,7 +842,7 @@ enum AgentsAction {
         /// first against the live-worker registry, then against the
         /// engine's durable pane state. A bare decimal integer is always
         /// tried as a slot id and never reinterpreted as a work-item
-        /// short id (e.g. `T1`), even if resolution misses; an
+        /// short id (e.g. `T<n>`), even if resolution misses; an
         /// unresolvable reference errors in terms of workers (live/
         /// tracked slots), not work items.
         agent: String,
