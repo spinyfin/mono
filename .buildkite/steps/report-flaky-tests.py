@@ -42,7 +42,7 @@ def failed_cases_in_log(path):
         return set()
 
 
-def copy_outputs(items, output, folder, cases, seen, required=False, log_cases=None):
+def copy_outputs(items, output, folder, cases, seen, required=False, log_cases=None, any_log_name=False):
     paths, missing = [], []
     for index, item in enumerate(items):
         uri = item.get('uri', '')
@@ -63,7 +63,7 @@ def copy_outputs(items, output, folder, cases, seen, required=False, log_cases=N
         seen.add(uri)
         if name == 'test.xml':
             cases.update(failed_cases(source))
-        elif name == 'test.log' and log_cases is not None:
+        elif log_cases is not None and (any_log_name or name == 'test.log'):
             log_cases.update(failed_cases_in_log(source))
     return paths, missing
 
@@ -104,7 +104,8 @@ def collect(bep, output):
         for status, field in (('FAILED', 'failed'), ('PASSED', 'passed')):
             paths, missing = copy_outputs(summary.get(field, []), output,
                                           base / ('summary-' + field), cases, seen, required=True,
-                                          log_cases=log_cases if status == 'FAILED' else None)
+                                          log_cases=log_cases if status == 'FAILED' else None,
+                                          any_log_name=status == 'FAILED')
             if paths or missing:
                 summary_logs.append(dict(status=status, log_paths=paths, missing_outputs=missing))
         if not attempts:

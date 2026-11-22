@@ -64,10 +64,11 @@ const STEP_PACE: Duration = Duration::from_millis(1);
 /// Every step first lets [`STEP_PACE`] of real time pass. The work under test
 /// still runs on real time whatever the held clock says: SQLite calls on the
 /// blocking pool, frames crossing the socket. Stepping as fast as the CPU can
-/// spin put minutes of virtual time between one of those calls and its reply,
-/// so a deadline the test never meant to reach (the coordinator's 90 s lease
-/// backstop) fired while the reply was still in flight. Pacing bounds virtual
-/// time at fifty times real time, whatever the speed or load of the machine.
+/// spin would put minutes of virtual time between one of those calls and its
+/// reply, causing a deadline the test never means to reach (the coordinator's
+/// 90 s lease backstop) to fire while the reply is still in flight. Pacing
+/// bounds virtual time at fifty times real time, whatever the speed or load of
+/// the machine.
 pub async fn advancing(mut ready: impl FnMut() -> bool) {
     while !ready() {
         // Blocking this thread is the point: it is the only thread of the

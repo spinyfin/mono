@@ -293,12 +293,11 @@ def _build_provenance_rs_impl(ctx):
     #
     # BUILD_TIME follows the same gate, and an unstamped build does not take
     # volatile-status.txt as an input at all. The output of an unstamped build
-    # is then a function of the commit alone. With the time in it, the output
-    # differed every time the action ran, and the action runs again at an
-    # unchanged commit whenever stable-status.txt changes (a new boss-v* tag
-    # moves STABLE_BOSS_VERSION) or a machine has not built that commit yet.
-    # Each of those relinked both engine binaries and re-ran
-    # build-provenance_test, and no remote cache entry could ever match,
+    # is then a function of the commit alone. If the time were in an unstamped
+    # output, every run would produce a different output whenever
+    # stable-status.txt changes (a new boss-v* tag moves STABLE_BOSS_VERSION)
+    # or a machine has not built that commit yet, relinking both engine binaries,
+    # re-running build-provenance_test, and preventing any remote cache hit,
     # because the file's content is part of a remote action's key. The engine
     # reports its binary's modification time when the stamp says `unknown`
     # (`build_info::build_time`).

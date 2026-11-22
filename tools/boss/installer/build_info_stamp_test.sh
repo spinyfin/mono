@@ -104,8 +104,8 @@ if ! grep -q "<key>BossFullVersion</key><string>1.0.42-dev-abc1234</string>" "$s
 fi
 
 expect_line "$unstamped_provenance_rs" 'pub const VERSION: &str = "0.0.0-dev";'
-# The build time differs on every build. Compiled into an unstamped engine it
-# relinked the binary at an unchanged commit and defeated the remote cache.
+# The build time differs on every build; compiling it into an unstamped engine
+# would relink the binary at an unchanged commit and defeat the remote cache.
 expect_line "$unstamped_provenance_rs" 'pub const BUILD_TIME: &str = "unknown";'
 
 boss_version="$("$boss_bin" --version)"

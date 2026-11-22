@@ -170,7 +170,8 @@ class ReportTest(unittest.TestCase):
             root = Path(temp)
             passed, failed = root / 'test.log', root / 'failed.log'
             passed.write_text('passed on retry')
-            failed.write_text('original failure')
+            failed_text = 'original failure\ntest suite::cached_flake ... FAILED\n'
+            failed.write_text(failed_text)
             events = [dict(id=dict(testResult=dict(label='//pkg:cached')),
                            testResult=dict(status='FLAKY', cachedLocally=True, testActionOutput=[
                                dict(name='test.log', uri=passed.as_uri()),
@@ -186,15 +187,18 @@ class ReportTest(unittest.TestCase):
             self.assertTrue(test['replayed'])
             self.assertEqual(test['attempts'][0]['provenance'], 'local-cache')
             self.assertEqual(test['attempts'][0]['missing_outputs'], [(root / 'absent.zip').as_uri()])
+            self.assertEqual(test['test_cases'], ['suite::cached_flake'])
             self.assertEqual(len(test['summary_logs']), 1)
             path = test['summary_logs'][0]['log_paths'][0]
-            self.assertEqual((root / path).read_text(), 'original failure')
+            self.assertEqual((root / path).read_text(), failed_text)
             with patch.object(reporter.subprocess, 'run') as run:
                 reporter.publish(report, root)
             annotation = run.call_args.args[0][-1]
             self.assertIn('local cache replay: aggregate FLAKY', annotation)
             self.assertNotIn('attempt 1: FLAKY', annotation)
             self.assertIn('artifact://' + path, annotation)
+            self.assertIn('suite::cached_flake', annotation)
+            self.assertIn('suite::cached_flake', '\n'.join(reporter.step_log_summary(report)))
 
     def test_step_status_and_ci_retry_config(self):
         root = Path(os.environ['TEST_SRCDIR']) / os.environ['TEST_WORKSPACE']

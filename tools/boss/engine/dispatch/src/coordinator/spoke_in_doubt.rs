@@ -66,7 +66,7 @@ impl ExecutionCoordinator {
             "spoke lease unresolved; attempt parked without spending the retry budget",
         );
         self.raise_spoke_in_doubt_attention(execution, "workspace lease", &err, timing.attention_after);
-        err
+        anyhow::Error::new(SpokeAttemptParked(err))
     }
 
     /// Park an attempt that could not reach the host holding its in-doubt
@@ -535,6 +535,23 @@ impl ExecutionCoordinator {
         {
             tracing::warn!(execution_id, error = %format!("{error:#}"), "could not resolve the in-doubt spoke attention item");
         }
+    }
+}
+
+/// Marker attached by [`ExecutionCoordinator::park_in_doubt_spoke_lease`] when
+/// an attempt has been parked without spending the retry budget.
+#[derive(Debug)]
+pub(super) struct SpokeAttemptParked(anyhow::Error);
+
+impl std::fmt::Display for SpokeAttemptParked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for SpokeAttemptParked {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
     }
 }
 

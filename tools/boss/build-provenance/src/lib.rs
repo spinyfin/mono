@@ -52,8 +52,8 @@ pub fn git_dirty() -> bool {
 /// ISO-8601 UTC timestamp of a stamped (`--config=release`) build, or
 /// `"unknown"` on an unstamped Bazel build and on a Cargo build. An
 /// unstamped binary is a function of its commit, not of when it was built:
-/// with the time compiled in, rebuilding an unchanged commit relinked the
-/// engine and no remote cache entry could match. Even when stamped, Bazel
+/// if the build time were compiled in, rebuilding an unchanged commit would
+/// relink the engine and prevent any remote cache hit. Even when stamped, Bazel
 /// does not re-run the stamping action just because wall-clock time passed,
 /// so the value may lag a later rebuild of the same commit — use [`git_sha`]
 /// plus a binary content fingerprint (see
