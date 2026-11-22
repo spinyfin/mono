@@ -188,9 +188,12 @@ fn settle(db: &WorkDb, candidate: &PendingMergeCheck) -> anyhow::Result<Option<M
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::{CiRemediationInsertInput, GithubMergeIntentInsertInput, PrPollStateInput, WorkItemPatch};
+    use crate::work::{
+        CiRemediationInsertInput, CreateExecutionInput, ExecutionStatus, GithubMergeIntentInsertInput,
+        PrPollStateInput, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, ReviewVerdictInput, WorkItemPatch,
+    };
     use boss_execution_contracts::NoopExecutionPublisher;
-    use boss_protocol::{MERGE_INTENT_ACTIVE, MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE};
+    use boss_protocol::{ExecutionKind, MERGE_INTENT_ACTIVE, MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE};
 
     const PR: &str = "https://github.com/example/repo/pull/42";
     const APPROVED: &str = "aaaaaaa1111111111111111111111111111111aa";
@@ -356,6 +359,42 @@ mod tests {
                     },
                 )
                 .unwrap();
+            // Ready requires a verdict that matches the current head. A green
+            // probe without one lands in AI Review, and settle is a no-op.
+            if ci == "success" {
+                self.mark_head_reviewed_clean(head);
+            }
+        }
+
+        fn mark_head_reviewed_clean(&self, head_sha: &str) {
+            let execution = self
+                .db
+                .create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(&self.candidate.work_item_id)
+                        .kind(ExecutionKind::PrReview)
+                        .status(ExecutionStatus::Ready)
+                        .build(),
+                )
+                .unwrap();
+            let conn = self.db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+                [&execution.id],
+            )
+            .unwrap();
+            WorkDb::insert_review_verdict_in_tx(
+                &conn,
+                &execution.id,
+                &self.candidate.work_item_id,
+                &ReviewVerdictInput {
+                    head_sha: Some(head_sha.to_owned()),
+                    findings_count: 0,
+                    revision_warranted: false,
+                    gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+                },
+            )
+            .unwrap();
         }
 
         async fn settle(&self) {
