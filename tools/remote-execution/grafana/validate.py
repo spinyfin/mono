@@ -73,6 +73,22 @@ def validate_dashboard(dashboard, uid):
     panels(dashboard["panels"])
 
 
+def normalize_dashboard(dashboard, uid):
+    """Strip volatile fields, add built-in datasources on row/text panels, and validate."""
+    dashboard.pop("id", None)
+    dashboard.pop("version", None)
+
+    def fill_datasources(items):
+        for panel in items:
+            if panel.get("type") in ("row", "text") and not panel.get("datasource"):
+                panel["datasource"] = {"type": "grafana", "uid": "-- Grafana --"}
+            fill_datasources(panel.get("panels", []))
+
+    fill_datasources(dashboard.get("panels", []))
+    validate_dashboard(dashboard, uid)
+    return canonical(dashboard)
+
+
 def validate_bundle(bundle):
     if set(bundle) != {*DASHBOARDS, PROVIDER}:
         raise ValueError("publication must contain exactly the two NativeLink dashboards and provider")
@@ -103,10 +119,22 @@ def load_bundle(directory):
 
 
 if __name__ == "__main__":
-    bundle = load_bundle(Path(__file__).resolve().parent)
-    if sys.argv[1:] == ["--bundle"]:
-        print(canonical(bundle), end="")
-    elif sys.argv[1:]:
-        sys.exit("usage: validate.py [--bundle]")
+    if sys.argv[1:2] == ["--normalize"]:
+        if len(sys.argv) != 3:
+            sys.exit("usage: validate.py --normalize <target>")
+        target = Path(sys.argv[2])
+        if target.parent == Path(".") and not target.exists():
+            target = Path(__file__).resolve().parent / target
+        if target.name not in DASHBOARDS:
+            sys.exit(f"target filename must be one of {', '.join(DASHBOARDS)}")
+        dashboard = parse(sys.stdin.read())
+        target.write_text(normalize_dashboard(dashboard, target.stem))
+        print(f"Normalized and validated {target}")
     else:
-        print("Validated both NativeLink dashboards and provisioning")
+        bundle = load_bundle(Path(__file__).resolve().parent)
+        if sys.argv[1:] == ["--bundle"]:
+            print(canonical(bundle), end="")
+        elif sys.argv[1:]:
+            sys.exit("usage: validate.py [--bundle | --normalize <target>]")
+        else:
+            print("Validated both NativeLink dashboards and provisioning")

@@ -1,9 +1,11 @@
 """Validate the real exports and exercise publishing without host access."""
 
 import copy
+import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -78,6 +80,69 @@ class DashboardsTest(unittest.TestCase):
                 parse(text)
         with self.assertRaises(ValueError):
             canonical({"number": float("nan")})
+
+    def test_normalize_raw_export(self):
+        raw = {
+            "version": 42,
+            "id": 7,
+            "title": "NativeLink Overview",
+            "uid": "nativelink-overview",
+            "panels": [
+                {
+                    "type": "row",
+                    "title": "Section",
+                    "id": 1,
+                    "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+                    "panels": [
+                        {
+                            "type": "text",
+                            "title": "Notes",
+                            "id": 2,
+                            "gridPos": {"x": 0, "y": 1, "w": 12, "h": 2},
+                        }
+                    ],
+                },
+                {
+                    "type": "timeseries",
+                    "title": "Queue time",
+                    "id": 3,
+                    "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+                    "gridPos": {"x": 0, "y": 3, "w": 12, "h": 8},
+                },
+            ],
+        }
+        # Dump with sort_keys=False to simulate an unsorted Grafana export.
+        raw_text = json.dumps(raw, indent=2, sort_keys=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / DASHBOARDS[0]
+            result = subprocess.run(
+                [sys.executable, str(HERE / "validate.py"), "--normalize", str(target)],
+                input=raw_text,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            normalized = parse(target.read_text())
+            self.assertNotIn("id", normalized)
+            self.assertNotIn("version", normalized)
+            row = normalized["panels"][0]
+            builtin = {"type": "grafana", "uid": "-- Grafana --"}
+            self.assertEqual(builtin, row["datasource"])
+            self.assertEqual(builtin, row["panels"][0]["datasource"])
+            self.assertEqual(canonical(normalized), target.read_text())
+
+            # Metric panels without a datasource must still fail without writing.
+            bad = copy.deepcopy(raw)
+            bad["panels"][1].pop("datasource")
+            bad_target = Path(tmp) / DASHBOARDS[1]
+            bad_result = subprocess.run(
+                [sys.executable, str(HERE / "validate.py"), "--normalize", str(bad_target)],
+                input=json.dumps(bad),
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(0, bad_result.returncode)
+            self.assertFalse(bad_target.exists())
 
 
 class PublisherTest(unittest.TestCase):
