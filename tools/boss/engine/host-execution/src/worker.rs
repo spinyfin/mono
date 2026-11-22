@@ -1,5 +1,6 @@
 //! Token-identified tmux worker sessions: Spawn, Adopt, Deliver, Stop.
 
+mod grok_teardown;
 mod permissions;
 #[path = "worker_paths.rs"]
 mod worker_paths;
@@ -881,6 +882,14 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         }
         record.phase = Phase::Stopping;
         self.persist(&record)?;
+        let grok_settle = grok_teardown::settle_open_grok_turn(
+            &self.tmux,
+            &record.session,
+            record.home.as_deref(),
+            &record.execution_id,
+            &record.driver_id,
+        )
+        .await;
         let mut observed = self.observe(&record).await;
         if stop.grace_ms > 0 {
             let budget = Duration::from_millis(u64::from(stop.grace_ms.min(30_000)));
@@ -913,7 +922,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
                 Ok(outcome(
                     command,
                     ResultCode::Ok,
-                    String::new(),
+                    grok_settle.command_reason(),
                     Some(self.observe(&record).await),
                 ))
             }

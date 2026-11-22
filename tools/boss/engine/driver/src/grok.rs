@@ -49,7 +49,11 @@ mod permissions;
 mod preflight;
 mod progress;
 mod transcript;
-pub mod turn_end_recovery;
+mod turn_end_recovery;
+
+pub use turn_end_recovery::{
+    is_turn_completed, is_turn_end, is_turn_started, session_files_for_home, session_files_for_run,
+};
 
 pub(crate) use home::GROK_HOMES_DIR_NAME;
 pub use home::{

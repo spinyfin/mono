@@ -503,27 +503,62 @@ async fn pool_teardown_hook_recovers_from_refusal_and_failed_identity_clear() {
 /// `reap_tmux_worker_with` probes and fires an optional callback when
 /// `send-keys ... Escape` arrives so tests can simulate Grok emitting
 /// `turn_completed` in response to ACP `session/cancel`.
+struct ScriptedGrokTmuxLog {
+    calls: Vec<Vec<String>>,
+    escape_at: Option<std::time::Instant>,
+    kill_at: Option<std::time::Instant>,
+}
+
 struct ScriptedGrokTmuxRunner {
     token: String,
-    calls: std::sync::Mutex<Vec<Vec<String>>>,
-    escape_at: std::sync::Mutex<Option<std::time::Instant>>,
-    kill_at: std::sync::Mutex<Option<std::time::Instant>>,
+    log: std::sync::Mutex<ScriptedGrokTmuxLog>,
     on_escape: Option<Box<dyn Fn() + Send + Sync>>,
+    pane_dead: bool,
+    session_missing: bool,
 }
 
 impl ScriptedGrokTmuxRunner {
     fn new(token: impl Into<String>, on_escape: Option<Box<dyn Fn() + Send + Sync>>) -> Arc<Self> {
+        Self::with_state(token, on_escape, false, false)
+    }
+
+    fn dead_pane(token: impl Into<String>) -> Arc<Self> {
+        Self::with_state(token, None, true, false)
+    }
+
+    fn missing_session(token: impl Into<String>) -> Arc<Self> {
+        Self::with_state(token, None, false, true)
+    }
+
+    fn with_state(
+        token: impl Into<String>,
+        on_escape: Option<Box<dyn Fn() + Send + Sync>>,
+        pane_dead: bool,
+        session_missing: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             token: token.into(),
-            calls: std::sync::Mutex::new(Vec::new()),
-            escape_at: std::sync::Mutex::new(None),
-            kill_at: std::sync::Mutex::new(None),
+            log: std::sync::Mutex::new(ScriptedGrokTmuxLog {
+                calls: Vec::new(),
+                escape_at: None,
+                kill_at: None,
+            }),
             on_escape,
+            pane_dead,
+            session_missing,
         })
     }
 
     fn calls(&self) -> Vec<Vec<String>> {
-        self.calls.lock().unwrap().clone()
+        self.log.lock().unwrap().calls.clone()
+    }
+
+    fn recorded_escape_at(&self) -> Option<std::time::Instant> {
+        self.log.lock().unwrap().escape_at
+    }
+
+    fn recorded_kill_at(&self) -> Option<std::time::Instant> {
+        self.log.lock().unwrap().kill_at
     }
 }
 
@@ -536,22 +571,28 @@ impl boss_tmux::CommandRunner for ScriptedGrokTmuxRunner {
         _cwd: Option<&std::path::Path>,
     ) -> std::io::Result<boss_tmux::CommandOutput> {
         let argv: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        self.calls.lock().unwrap().push(argv.clone());
+        self.log.lock().unwrap().calls.push(argv.clone());
         if argv.iter().any(|a| a == "show-environment") {
+            if self.session_missing {
+                return Ok(failure("can't find session"));
+            }
             return Ok(ok(&format!("BOSS_SPAWN_TOKEN={}\n", self.token)));
         }
-        if argv.iter().any(|a| a == "#{pane_dead}") {
+        if argv.iter().any(|a| a == "#{pane_dead_status}") {
             return Ok(ok("0"));
         }
+        if argv.iter().any(|a| a == "#{pane_dead}") {
+            return Ok(ok(if self.pane_dead { "1" } else { "0" }));
+        }
         if argv.iter().any(|a| a == "send-keys") && argv.last().map(String::as_str) == Some("Escape") {
-            *self.escape_at.lock().unwrap() = Some(std::time::Instant::now());
+            self.log.lock().unwrap().escape_at = Some(std::time::Instant::now());
             if let Some(cb) = &self.on_escape {
                 cb();
             }
             return Ok(ok(""));
         }
         if argv.iter().any(|a| a == "if-shell" || a == "kill-session") {
-            *self.kill_at.lock().unwrap() = Some(std::time::Instant::now());
+            self.log.lock().unwrap().kill_at = Some(std::time::Instant::now());
         }
         Ok(ok(""))
     }
@@ -807,8 +848,8 @@ async fn grok_propose_done_mid_turn_cancels_open_turn_captures_usage_and_reaps_p
         other => panic!("expected ProposalSubmitted, got {other:?}"),
     }
 
-    let escape_at = runner.escape_at.lock().unwrap().expect("Escape timestamp recorded");
-    let kill_at = runner.kill_at.lock().unwrap().expect("kill-session timestamp recorded");
+    let escape_at = runner.recorded_escape_at().expect("Escape timestamp recorded");
+    let kill_at = runner.recorded_kill_at().expect("kill-session timestamp recorded");
     let settle_elapsed = kill_at.saturating_duration_since(escape_at);
     assert!(
         settle_elapsed < Duration::from_secs(5) && elapsed < Duration::from_secs(10),
@@ -922,6 +963,10 @@ async fn grok_missing_turn_completed_reaps_after_bound_with_specific_reason() {
     assert!(
         elapsed >= Duration::from_millis(100),
         "teardown should wait out the bounded settle window when turn_completed never arrives (elapsed={elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "teardown must stay inside the advertised settle bound even when Grok never responds (elapsed={elapsed:?})"
     );
     assert!(db.tmux_identity_for_execution(&execution_id).unwrap().is_none());
     assert_eq!(pool.idle_count().await, 1, "slot must be released after bound");
@@ -1039,6 +1084,135 @@ async fn grok_already_completed_turn_captures_usage_without_escape() {
             .cache_read_tokens(13440)
             .rounds(2)
             .build(),
+    );
+}
+
+fn seed_completed_grok_run(
+    state: &crate::app::ServerState,
+    dir: &tempfile::TempDir,
+    session_name: &str,
+    token: &str,
+) -> String {
+    let db = state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, session_name);
+    let execution_id = create_old_execution(db, &work_item_id);
+    db.record_execution_launch_config(&execution_id, "grok", "grok-4.6", None)
+        .unwrap();
+    db.start_execution_run(
+        &execution_id,
+        "worker-1",
+        "repo-1",
+        "lease-1",
+        "ws-1",
+        dir.path().to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        db.record_tmux_spawn_intent_for_execution(&execution_id, boss_tmux::TEST_SOCKET_PATH, session_name, token)
+            .unwrap()
+    );
+    assert!(
+        db.record_tmux_session_created_for_execution(&execution_id, token, 4_194_303)
+            .unwrap()
+    );
+
+    let session_dir = dir.path().join(format!("{session_name}-session"));
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("events.jsonl"),
+        concat!(
+            r#"{"type":"turn_started","session_id":"sess-grok-3","turn_number":0}"#,
+            "\n",
+            r#"{"type":"turn_ended","outcome":"completed"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let updates_path = session_dir.join("updates.jsonl");
+    std::fs::write(
+        &updates_path,
+        format!("{}\n", grok_turn_completed_line("prompt-done", "end_turn")),
+    )
+    .unwrap();
+    db.set_run_transcript_path_if_unset(&execution_id, updates_path.to_str().unwrap())
+        .unwrap();
+    execution_id
+}
+
+fn expected_completed_grok_usage() -> RunUsageFields {
+    RunUsageFields::builder()
+        .model("grok-4.6")
+        .input_tokens(159)
+        .output_tokens(33)
+        .cache_read_tokens(13440)
+        .rounds(2)
+        .build()
+}
+
+/// A Grok pane already dead (`#{pane_dead}=1`) still captures `turn_completed`
+/// usage, never sends an interrupt, and finishes the reap.
+#[tokio::test]
+async fn grok_dead_pane_captures_usage_without_escape() {
+    let (state, dir) = test_server_state();
+    let execution_id = seed_completed_grok_run(&state, &dir, "boss-1-grok-dead", "tok-grok-dead");
+    let runner = ScriptedGrokTmuxRunner::dead_pane("tok-grok-dead");
+    let tmux =
+        boss_tmux::Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+    state.set_tmux_override_for_test(tmux);
+
+    assert_eq!(
+        state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::Reaped
+    );
+    let calls = runner.calls();
+    assert!(
+        !calls.iter().any(|args| args.iter().any(|a| a == "send-keys")),
+        "a dead Grok pane must not send Escape: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|args| args.iter().any(|a| a == "if-shell" || a == "kill-session")),
+        "dead-pane Grok teardown must still kill the session: {calls:?}"
+    );
+    assert_eq!(
+        read_run_usage_fields(state.work_db.as_ref(), &execution_id),
+        expected_completed_grok_usage(),
+    );
+}
+
+/// A Grok session already gone still captures `turn_completed` usage that
+/// landed before exit, never sends an interrupt, and finishes the reap.
+#[tokio::test]
+async fn grok_missing_session_captures_usage_without_escape() {
+    let (state, dir) = test_server_state();
+    let execution_id = seed_completed_grok_run(&state, &dir, "boss-1-grok-gone", "tok-grok-gone");
+    let runner = ScriptedGrokTmuxRunner::missing_session("tok-grok-gone");
+    let tmux =
+        boss_tmux::Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+    state.set_tmux_override_for_test(tmux);
+
+    assert_eq!(
+        state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::Reaped
+    );
+    let calls = runner.calls();
+    assert!(
+        !calls.iter().any(|args| args.iter().any(|a| a == "send-keys")),
+        "a missing Grok session must not send Escape: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.iter().any(|a| a == "if-shell" || a == "kill-session")),
+        "a missing Grok session must not issue kill-session: {calls:?}"
+    );
+    assert_eq!(
+        read_run_usage_fields(state.work_db.as_ref(), &execution_id),
+        expected_completed_grok_usage(),
     );
 }
 

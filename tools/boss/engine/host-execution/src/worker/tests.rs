@@ -1,6 +1,7 @@
 use super::worker_paths::outputs_root;
 use super::*;
 
+mod grok_teardown;
 mod permissions_tests;
 use crate::cube::CubeJsonTransport;
 use async_trait::async_trait;
@@ -127,6 +128,8 @@ struct FakeTmux {
     #[builder(default)]
     sent: Mutex<Vec<Vec<String>>>,
     #[builder(default)]
+    on_send_keys: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[builder(default)]
     envs: Mutex<HashMap<String, Vec<String>>>,
     #[builder(default)]
     launches: Mutex<Vec<String>>,
@@ -213,6 +216,11 @@ impl CommandRunner for FakeTmux {
             }
             "send-keys" | "load-buffer" | "paste-buffer" => {
                 self.sent.lock().unwrap().push(rest.to_vec());
+                if verb == "send-keys"
+                    && let Some(callback) = self.on_send_keys.lock().unwrap().clone()
+                {
+                    callback();
+                }
                 Ok(ok(""))
             }
             "show-environment" => {

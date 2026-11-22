@@ -75,6 +75,22 @@ pub fn is_turn_end(raw: &Value) -> bool {
     raw.get("type").and_then(Value::as_str) == Some("turn_ended")
 }
 
+/// Whether `raw` is a Grok ACP `turn_completed` update that carries a
+/// `prompt_id` (the usage record the run-cost fold consumes).
+pub fn is_turn_completed(raw: &Value) -> bool {
+    if !matches!(
+        raw.get("method").and_then(Value::as_str),
+        Some("session/update" | "_x.ai/session/update")
+    ) {
+        return false;
+    }
+    let Some(update) = raw.pointer("/params/update") else {
+        return false;
+    };
+    update.get("sessionUpdate").and_then(Value::as_str) == Some("turn_completed")
+        && update.get("prompt_id").and_then(Value::as_str).is_some()
+}
+
 /// Whether `raw` is a Grok `events.jsonl` cancelled-turn-end record:
 /// `{"type": "turn_ended", "outcome": "cancelled", ...}`. Confirmed against
 /// both the redacted spike artifact and live `events.jsonl` files on a host
@@ -85,17 +101,23 @@ pub fn is_cancelled_turn_end(raw: &Value) -> bool {
     is_turn_end(raw) && raw.get("outcome").and_then(Value::as_str) == Some("cancelled")
 }
 
+/// Resolve the `(events.jsonl, updates.jsonl)` paths from a provisioned
+/// `GROK_HOME`. The returned `updates.jsonl` path is rewritten through Boss's
+/// durable transcript store when `$GROK_HOME/sessions` is symlinked there.
+pub fn session_files_for_home(grok_home: &Path) -> Option<(PathBuf, PathBuf)> {
+    let session_id = read_session_id(grok_home).ok()?;
+    let workspace = read_workspace_path_stamp(grok_home).ok()?;
+    let events_path = events_jsonl_path(grok_home, &workspace, &session_id);
+    let updates_path = persistable_transcript_path(&events_path.with_file_name("updates.jsonl"));
+    Some((events_path, updates_path))
+}
+
 /// Resolve the `(events.jsonl, updates.jsonl)` paths for `run_id` from its
 /// provisioned `GROK_HOME`, stamped session id, and stamped workspace path.
 /// The returned `updates.jsonl` path is rewritten through Boss's durable
 /// transcript store when `$GROK_HOME/sessions` is symlinked there.
 pub fn session_files_for_run(run_id: &str) -> Option<(PathBuf, PathBuf)> {
-    let grok_home = grok_home_for_run(run_id).ok()?;
-    let session_id = read_session_id(&grok_home).ok()?;
-    let workspace = read_workspace_path_stamp(&grok_home).ok()?;
-    let events_path = events_jsonl_path(&grok_home, &workspace, &session_id);
-    let updates_path = persistable_transcript_path(&events_path.with_file_name("updates.jsonl"));
-    Some((events_path, updates_path))
+    session_files_for_home(&grok_home_for_run(run_id).ok()?)
 }
 
 /// Build the [`InterruptRecoverySnapshot`] for `run_id`: resolve `GROK_HOME`,
