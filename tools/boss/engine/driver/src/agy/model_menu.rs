@@ -1,7 +1,10 @@
 //! Antigravity (`agy`) model / effort menu tables.
 //!
-//! Original catalogue sourced from authenticated `agy models` on 2026-11-12 (`agy` 1.5.7).
-//! Neon and work-type roles follow the November 2026 model guide.
+//! Catalogue verified against authenticated `agy models` on 2026-11-22 (`agy` 1.5.14),
+//! confirming `gemini-4-neon-{low,medium,high,xhigh}` (ceiling `xhigh`) alongside
+//! Hydrogen (`xhigh`), Carbon (`high`), Argon (`high`), and Flash (`high`).
+//! Work-type role mapping is documented in
+//! `tools/boss/docs/designs/effort-and-model-estimation.md` ("Antigravity work-type mapping").
 //! Catalogue snapshot of the Gemini families Boss dispatches; Claude,
 //! GPT-OSS, and orchestrator entries `agy` also lists are out of scope
 //! because Boss already has native drivers for those providers.

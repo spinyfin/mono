@@ -56,9 +56,11 @@ pub const MODEL_PRICING: &[(&str, ModelPriceUsdPerMillion)] = &[
             cache_read: Some(0.08),
         },
     ),
-    // API reference rates from the November 2026 model guide. Subscription
-    // agy runs remain unpriced in cost_report::price_for_record. Cache rates
-    // were not supplied, so nonzero cache usage cannot be estimated.
+    // Gemini 4 API reference rates (USD per million tokens, as of November 2026;
+    // documented in `tools/boss/docs/designs/effort-and-model-estimation.md`).
+    // Subscription agy runs remain unpriced in cost_report::price_for_record.
+    // Cache rates are omitted because published cache pricing is not configured
+    // here, so nonzero cache usage cannot be estimated.
     (
         "gemini-4-hydrogen",
         ModelPriceUsdPerMillion {

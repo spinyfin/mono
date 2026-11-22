@@ -203,6 +203,7 @@ pub enum ModelResolutionSource {
     /// The cheap standard tier requested by [`PoolModelTier::Standard`].
     PoolStandardTier,
     Reasoning,
+    WorkTypeKind,
     LegacyKindFloor,
     LegacyEffortTable,
     ProductDefault,
@@ -220,6 +221,7 @@ impl ModelResolutionSource {
             Self::PoolStrongTier => "pool_strong_tier",
             Self::PoolStandardTier => "pool_standard_tier",
             Self::Reasoning => "reasoning",
+            Self::WorkTypeKind => "work_type_kind",
             Self::LegacyKindFloor => "legacy_kind_floor",
             Self::LegacyEffortTable => "legacy_effort_table",
             Self::ProductDefault => "product_default",
@@ -471,8 +473,12 @@ pub fn is_design_or_investigation_tier(kind: Option<&TaskKind>, reasoning: Optio
 /// 2. `pool_model_override` — the owning pool's override, expressed as a
 ///    driver-relative [`PoolModelTier`] rather than a literal model slug.
 ///    Both the automation pool and the review pool set this to
-///    [`PoolModelTier::Strong`] unconditionally, which resolves through the
-///    *selected driver's* menu the same way step 3 does (via
+///    [`PoolModelTier::Strong`] unconditionally. For drivers with a
+///    `work_type_policy`, [`PoolModelTier::Strong`] resolves to
+///    `policy.pool_fallback_model` (e.g. Hydrogen on Antigravity) while named
+///    review and design execution roles are already selected by
+///    `work_type_policy.execution_model` before step 2. Otherwise it resolves
+///    through the *selected driver's* menu the same way step 3 does (via
 ///    [`boss_engine_driver::ModelMenu::model_for_reasoning`]) — so a Claude
 ///    reviewer still lands on Opus and a Codex reviewer lands on Codex's own
 ///    strong-tier model, never on a literal `"opus"` a non-Claude CLI
@@ -532,8 +538,10 @@ pub fn resolve_spawn_config(input: &SpawnResolutionInput) -> Result<SpawnConfig,
 /// emits a token).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolModelTier {
-    /// The strong/high-capability tier for the resolved driver, reached via
-    /// the same lever `tasks.reasoning = investigation` uses:
+    /// The strong/high-capability tier for the resolved driver. Drivers with a
+    /// `work_type_policy` resolve this to `policy.pool_fallback_model` (after
+    /// `work_type_policy.execution_model` has already selected named review and
+    /// design roles). Other drivers reach it via
     /// [`boss_engine_driver::ModelMenu::model_for_reasoning`]`(`[`ReasoningMode::Investigation`]`)`.
     /// Both the automation pool and the review pool request this tier
     /// unconditionally.
@@ -640,7 +648,7 @@ pub fn resolve_spawn_config_in(
         .work_type_policy
         .and_then(|policy| policy.kind_models.iter().find(|(kind, _)| Some(kind) == input.kind))
     {
-        ((*model).to_owned(), ModelResolutionSource::LegacyKindFloor)
+        ((*model).to_owned(), ModelResolutionSource::WorkTypeKind)
     } else if let Some(reasoning) = input.reasoning {
         // Drivers may refine standard work by effort; investigation keeps its tier.
         let model = match (reasoning, menu.work_type_policy) {
