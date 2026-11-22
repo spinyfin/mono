@@ -128,6 +128,19 @@ fn work_resumed_evidence() -> String {
     )
 }
 
+/// `EXISTS` clause for [`ClearedBy::OwningExecutionTerminal`]: the execution
+/// the attention is scoped to has reached a terminal status. Work-item-scoped
+/// rows have no owning execution and never match.
+fn owning_execution_terminal_evidence() -> &'static str {
+    "work_attention_items.execution_id IS NOT NULL
+     AND EXISTS (
+         SELECT 1
+         FROM work_executions we
+         WHERE we.id = work_attention_items.execution_id
+           AND we.status IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+     )"
+}
+
 /// `EXISTS` clause for [`ClearedBy::ExecutionKindCompleted`]: an execution of
 /// that kind for the same work item reached `completed` at or after the
 /// attention was most recently raised, **and is not the execution the
@@ -182,9 +195,28 @@ fn resolve_one_kind(conn: &Connection, now: &str, lifecycle: &AttentionLifecycle
             );
             conn.execute(&sql, params![now, lifecycle.kind, execution_kind.as_str()])?
         }
+        ClearedBy::WorkItemPrBound => {
+            let sql = format!(
+                "UPDATE work_attention_items SET status = 'resolved', resolved_at = ?1
+                 WHERE status = 'open' AND kind = ?2
+                 AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = {ATTENTION_WORK_ITEM}
+                             AND NULLIF(t.pr_url, '') IS NOT NULL)"
+            );
+            conn.execute(&sql, params![now, lifecycle.kind])?
+        }
+        ClearedBy::OwningExecutionTerminal => {
+            let sql = format!(
+                "UPDATE work_attention_items
+                 SET status = 'resolved', resolved_at = ?1
+                 WHERE status = 'open'
+                   AND kind = ?2
+                   AND {}",
+                owning_execution_terminal_evidence()
+            );
+            conn.execute(&sql, params![now, lifecycle.kind])?
+        }
         // `automatically_cleared()` never yields these; matched explicitly so
-        // adding a fifth variant is a compile error here rather than a silent
-        // no-op.
+        // adding a variant is a compile error here rather than a silent no-op.
         ClearedBy::ProducerReconciles | ClearedBy::HumanDecision => 0,
     };
     Ok(rows)

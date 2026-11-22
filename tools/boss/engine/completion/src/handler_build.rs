@@ -24,6 +24,7 @@ impl WorkerCompletionHandler {
         Self {
             stop_locks: Default::default(),
             pending_no_op_completions: Default::default(),
+            pr_base_refusal_next_check: Default::default(),
             work_db,
             pr_detector,
             workspace_diff_verifier: Arc::new(CommandWorkspaceDiffVerifier),

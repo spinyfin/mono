@@ -694,6 +694,13 @@ pub enum StopOutcome {
     /// as its blocked reason, and an attention item was filed. A PR that
     /// belongs to another row is never this execution's deliverable.
     ForeignPrRefused { pr_url: String, detail: String },
+    /// A primary execution's PR does not target the repository default
+    /// branch (`pr_binding_guard`). Nothing was bound and an attention item
+    /// names the retarget remedy. Unlike [`Self::DetectorFailed`] this is a
+    /// confirmed policy answer, not an inconclusive lookup: the execution
+    /// stays live and is re-evaluated at a slow cadence rather than retried
+    /// hot.
+    PrBaseRefused { pr_url: String, detail: String },
 }
 
 /// Completion-side requests the merge poller makes after a probe.

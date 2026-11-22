@@ -44,6 +44,12 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// SQLite contention or a short GitHub blip has cleared.
 pub(crate) const STUCK_FINALIZE_ATTENTION_AFTER: Duration = Duration::from_secs(10 * 60);
 
+/// How long a confirmed PR-base refusal stays parked before the pending-finalize
+/// sweep re-probes GitHub. Matches the abandoned-branch sweep interval: the
+/// answer cannot change until a human retargets, so the 30s sweep tick must
+/// not be the retry cadence.
+pub(crate) const PR_BASE_REFUSED_RECHECK_AFTER: Duration = Duration::from_secs(5 * 60);
+
 /// Attention kind filed when a declared finalize is stuck.
 pub const RUN_DONE_FINALIZE_STUCK_ATTENTION_KIND: &str = "run_done_finalize_stuck";
 
@@ -60,9 +66,13 @@ pub struct PendingFinalizeSweepOutcome {
     pub no_ops_still_pending: usize,
 }
 
-/// Whether a finalize attempt ended the declaration's life: anything except a
-/// DB failure or an inconclusive GitHub answer (both leave the execution live
-/// with its stamp) or a deferred no-op.
+/// Whether a finalize attempt ended the in-process retry loop: anything except
+/// a DB failure or an inconclusive GitHub answer (both leave the execution live
+/// with its stamp) or a deferred no-op. A confirmed base-policy refusal
+/// ([`StopOutcome::PrBaseRefused`]) also ends the hot retry loop — the answer
+/// will not change until a human retargets the PR — but the execution stays
+/// live. The pending-finalize sweep is the only retry path, and it re-probes
+/// only after [`PR_BASE_REFUSED_RECHECK_AFTER`], not on every 30s tick.
 pub fn finalize_resolved(outcome: &StopOutcome) -> bool {
     !matches!(
         outcome,
@@ -71,6 +81,28 @@ pub fn finalize_resolved(outcome: &StopOutcome) -> bool {
 }
 
 impl WorkerCompletionHandler {
+    pub(super) fn park_pr_base_refusal(&self, execution_id: &str) {
+        self.pr_base_refusal_next_check
+            .lock()
+            .expect("pr-base-refusal park map poisoned")
+            .insert(execution_id.to_owned(), Instant::now() + PR_BASE_REFUSED_RECHECK_AFTER);
+    }
+
+    pub(super) fn unpark_pr_base_refusal(&self, execution_id: &str) {
+        self.pr_base_refusal_next_check
+            .lock()
+            .expect("pr-base-refusal park map poisoned")
+            .remove(execution_id);
+    }
+
+    pub(super) fn pr_base_refusal_is_parked(&self, execution_id: &str) -> bool {
+        self.pr_base_refusal_next_check
+            .lock()
+            .expect("pr-base-refusal park map poisoned")
+            .get(execution_id)
+            .is_some_and(|deadline| Instant::now() < *deadline)
+    }
+
     /// [`Self::finalize_declared_run_done`], repeated until it reaches a
     /// terminal commit: a DB failure ([`StopOutcome::DbError`]) or an
     /// inconclusive GitHub answer ([`StopOutcome::DetectorFailed`]) both
@@ -156,6 +188,10 @@ impl WorkerCompletionHandler {
                 .live_executions_with_pending_run_done(declared_at_or_before)
             {
                 Ok(pending) => {
+                    self.pr_base_refusal_next_check
+                        .lock()
+                        .expect("pr-base-refusal park map poisoned")
+                        .retain(|id, _| pending.iter().any(|(pending_id, _)| pending_id == id));
                     for (execution_id, declared) in pending {
                         // The retained-input path below owns this attempt in
                         // this process. Durable recovery covers lost handlers.
@@ -167,8 +203,15 @@ impl WorkerCompletionHandler {
                         {
                             continue;
                         }
+                        if self.pr_base_refusal_is_parked(&execution_id) {
+                            outcome.still_pending += 1;
+                            continue;
+                        }
                         let result = self.finalize_declared_run_done(&execution_id, declared).await;
-                        if finalize_resolved(&result) {
+                        if matches!(result, StopOutcome::PrBaseRefused { .. }) {
+                            self.park_pr_base_refusal(&execution_id);
+                            outcome.still_pending += 1;
+                        } else if finalize_resolved(&result) {
                             outcome.finalized += 1;
                             tracing::info!(%execution_id, ?result, "run_done finalize sweep: recovered a stamped declaration");
                         } else {

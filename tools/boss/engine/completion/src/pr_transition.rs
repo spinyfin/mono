@@ -123,7 +123,11 @@ impl WorkerCompletionHandler {
                 .refuse_foreign_pr_binding(&execution, &pr_url, &conflict, source)
                 .await;
         }
-        if let Some(outcome) = self.guard_pr_base(&execution, &pr_url).await {
+        // A merged PR can no longer be retargeted, so the base policy only
+        // applies to a PR that is still open.
+        if matches!(target, WorkerPrCompletionTarget::Done) {
+            self.resolve_pr_base_refusal_attention(&execution.id);
+        } else if let Some(outcome) = self.guard_pr_base(&execution, &pr_url).await {
             return outcome;
         }
         let workspace_path = execution.workspace_path.clone();

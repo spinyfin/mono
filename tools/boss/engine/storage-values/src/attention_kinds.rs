@@ -342,6 +342,12 @@ pub const UNOWNED_OCCUPANTS_RELEASED_ATTENTION_KIND: &str = "workspace_unowned_o
 /// have failed `ESCALATE_AFTER_CONSECUTIVE_FAILURES` times in a row.
 pub const ATTENTION_KIND_ABANDONED_BRANCH_NO_PR: &str = "abandoned_branch_no_pr";
 
+/// Work-item-scoped: the abandoned-branch sweep found a PR but could not
+/// read its base branch after repeated attempts. Distinct from
+/// [`ATTENTION_KIND_ABANDONED_BRANCH_NO_PR`] so a lookup failure does not
+/// overwrite a more accurate "PR exists but wrong base" diagnosis.
+pub const ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE: &str = "abandoned_branch_pr_base_unreadable";
+
 /// Attention kind used when CI remediation exhausts its attempt budget.
 pub const CI_REMEDIATION_EXHAUSTED_ATTENTION_KIND: &str = "ci_remediation_exhausted";
 

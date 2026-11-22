@@ -89,7 +89,7 @@ pub enum PrOpenState {
 }
 
 /// Coarse GitHub PR lifecycle classification derivable purely from the
-/// `(state, mergedAt)` pair returned by `gh pr view`.
+/// `(state, mergedAt)` pair returned by the GraphQL PR query.
 ///
 /// This is the single source of truth for the merged / closed-unmerged /
 /// open tri-state. Both the merge poller
@@ -155,8 +155,10 @@ impl PrStateChecker for GhPrStateChecker {
     }
 }
 
-/// Upper bound on one base-policy lookup made from an async sweep.
-pub const PR_BASE_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// Hard timeout for one GraphQL PR query (`gh api graphql`), shared by the
+/// lifecycle `check`/`inspect` readers and the base-policy lookup made from
+/// async sweeps.
+pub const PR_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Run [`PrStateChecker::base_verdict`] off the async runtime with a deadline.
 ///
@@ -205,13 +207,18 @@ fn repository_from_response(value: &serde_json::Value, pr_url: &str) -> Result<s
 }
 
 /// Both readers use one parameterised query; policy never changes lifecycle.
+///
+/// Uses `scope_blocking_if_unattributed` rather than an unconditional scope:
+/// a call issued from inside a more specific sweep (the merge poller's
+/// sweep label, for one) must keep that attribution, and only an
+/// unattributed call falls back to `PR_STATE_CHECK`.
 fn query_pr(pr_url: &str) -> Result<serde_json::Value> {
     let (owner, repo, number) =
         boss_github::pr_url::parse_pr_url_parts(pr_url).with_context(|| format!("invalid PR URL: {pr_url}"))?;
     let args = pr_query_args(owner, repo, number);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
-        boss_github::gh_runner::gh_output_blocking_timeout(&arg_refs, PR_BASE_CHECK_BUDGET)
+        boss_github::gh_runner::gh_output_blocking_timeout(&arg_refs, PR_QUERY_TIMEOUT)
     })
     .with_context(|| format!("failed to query PR {pr_url}"))?;
     if !output.status.success() {
@@ -235,7 +242,7 @@ fn map_base_verdict(repository: &serde_json::Value) -> Result<PrBaseVerdict> {
     })
 }
 
-/// Pure mapping from the parsed `gh pr view --json state,mergedAt` JSON to a
+/// Pure mapping from the parsed GraphQL PR JSON (`state`, `mergedAt`) to a
 /// [`PrOpenState`]. Extracted from [`GhPrStateChecker::check`] so the mapping
 /// can be unit-tested without shelling out to `gh`.
 ///
@@ -255,7 +262,7 @@ fn map_gh_state(v: &serde_json::Value) -> PrOpenState {
     }
 }
 
-/// Pure mapping from `gh pr view --json state,mergedAt,headRefOid,headRefName` JSON.
+/// Pure mapping from the GraphQL PR JSON (`state`, `mergedAt`, `headRefOid`, `headRefName`).
 /// Empty / missing / non-string `headRefOid` or `headRefName` is `None` so a
 /// caller that cannot confirm the live SHA or branch name does not treat
 /// "unknown" as positionable.
@@ -283,7 +290,7 @@ fn optional_trimmed_json_str(v: &serde_json::Value, key: &str) -> Option<String>
 /// `OpenPrMergeability::Conflict` result, which by construction means the PR
 /// is open. Feeding that observation straight into the `create_revision`
 /// gate reuses the gate's parent-revisable invariant (R4) while avoiding a
-/// redundant — and, in tests, non-hermetic — `gh pr view` round-trip.
+/// redundant — and, in tests, non-hermetic — GraphQL round-trip.
 pub struct StaticPrStateChecker(pub PrOpenState);
 
 impl PrStateChecker for StaticPrStateChecker {
@@ -471,9 +478,9 @@ mod tests {
     async fn bounded_base_verdict_times_out_on_a_stalled_checker() {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let checker: std::sync::Arc<dyn PrStateChecker> = std::sync::Arc::new(Hanging(std::sync::Mutex::new(wait)));
-        let (result, ()) = tokio::join!(bounded_base_verdict(checker, "u", PR_BASE_CHECK_BUDGET), async {
+        let (result, ()) = tokio::join!(bounded_base_verdict(checker, "u", PR_QUERY_TIMEOUT), async {
             tokio::task::yield_now().await;
-            tokio::time::advance(PR_BASE_CHECK_BUDGET + std::time::Duration::from_secs(1)).await;
+            tokio::time::advance(PR_QUERY_TIMEOUT + std::time::Duration::from_secs(1)).await;
         });
         drop(release);
         assert!(result.unwrap_err().to_string().contains("exceeded"));

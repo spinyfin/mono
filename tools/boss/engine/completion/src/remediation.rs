@@ -330,6 +330,9 @@ impl WorkerCompletionHandler {
             // The foreign-PR guard already failed the execution visibly;
             // the attempt it belonged to is retired as unsuccessful.
             StopOutcome::ForeignPrRefused { .. } => true,
+            // The PR base policy refusal parks the live execution for a
+            // retarget; the attempt is not over.
+            StopOutcome::PrBaseRefused { .. } => false,
         };
         if !should_mark_failed {
             return;

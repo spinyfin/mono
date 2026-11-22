@@ -252,7 +252,7 @@ impl WorkerCompletionHandler {
         let stored_url = self.resolve_bound_pr_url(execution);
         if let Some(url) = stored_url.clone() {
             if execution.kind == ExecutionKind::RevisionImplementation {
-                return self.resolve_verified_pr_state(url).await;
+                return self.resolve_verified_pr_state(execution, url).await;
             }
             let branches = self.work_item_branches(execution);
             if let (Ok(slug), Some(number)) = (parse_repo_slug(&execution.repo_remote_url), pr_number_from_url(&url)) {
@@ -263,7 +263,7 @@ impl WorkerCompletionHandler {
                 .await
                 {
                     Ok(Ok(head)) if head_identifies_any_branch(&head, &branches) => {
-                        return self.resolve_verified_pr_state(url).await;
+                        return self.resolve_verified_pr_state(execution, url).await;
                     }
                     Ok(Ok(_)) => {}
                     _ => transient_detail = Some(format!("could not verify stored PR {url}")),
@@ -287,7 +287,7 @@ impl WorkerCompletionHandler {
             .await
             {
                 Ok(Some(url)) => {
-                    return self.resolve_verified_pr_state(url).await;
+                    return self.resolve_verified_pr_state(execution, url).await;
                 }
                 Ok(None) => {
                     // Candidates that survived are transient failures the next
@@ -325,8 +325,8 @@ impl WorkerCompletionHandler {
             )
         };
         match detected {
-            Ok(Ok(PrStatus::Fresh { url })) => self.resolve_declared_pr_base(url, false).await,
-            Ok(Ok(PrStatus::Merged { url })) => self.resolve_declared_pr_base(url, true).await,
+            Ok(Ok(PrStatus::Fresh { url })) => self.resolve_declared_pr_base(execution, url, false).await,
+            Ok(Ok(PrStatus::Merged { url })) => self.resolve_declared_pr_base(execution, url, true).await,
             Ok(Ok(
                 status @ (PrStatus::None
                 | PrStatus::Closed { .. }
@@ -366,16 +366,16 @@ impl WorkerCompletionHandler {
 
     /// Branch identity is already verified; read lifecycle fresh because a
     /// capture-time branch cache cannot certify that a PR is still open.
-    pub(super) async fn resolve_verified_pr_state(&self, pr_url: String) -> DeclaredPrResolution {
-        let base = self.resolve_declared_pr_base(pr_url.clone(), false).await;
-        if !matches!(base, DeclaredPrResolution::Bound { .. }) {
-            return base;
-        }
+    pub(super) async fn resolve_verified_pr_state(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: String,
+    ) -> DeclaredPrResolution {
         let checker = Arc::clone(&self.pr_state_checker);
         let url = pr_url.clone();
         let check = tokio::task::spawn_blocking(move || checker.check(&url));
         match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
-            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => DeclaredPrResolution::Bound { pr_url, merged: false },
+            Ok(Ok(Ok(crate::work::PrOpenState::Open))) => self.resolve_declared_pr_base(execution, pr_url, false).await,
             Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
             Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::ClosedUnmerged { pr_url },
             result => DeclaredPrResolution::Transient {
@@ -384,7 +384,17 @@ impl WorkerCompletionHandler {
         }
     }
 
-    async fn resolve_declared_pr_base(&self, pr_url: String, merged: bool) -> DeclaredPrResolution {
+    async fn resolve_declared_pr_base(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: String,
+        merged: bool,
+    ) -> DeclaredPrResolution {
+        // A merged PR can no longer be retargeted. Revisions and already-bound
+        // PRs are not new binds, so the default-branch policy does not apply.
+        if merged || !self.binds_new_pr(execution, &pr_url) {
+            return DeclaredPrResolution::Bound { pr_url, merged };
+        }
         match crate::work::bounded_base_verdict(
             Arc::clone(&self.pr_state_checker),
             &pr_url,
@@ -426,7 +436,8 @@ impl WorkerCompletionHandler {
             DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged, false),
             DeclaredPrResolution::BaseRefused { pr_url, reason } => {
                 self.record_pr_base_refusal(execution, &pr_url, &reason).await;
-                return StopOutcome::DetectorFailed;
+                let detail = format!("{pr_url}: {reason}. Retarget the PR before completing delivery.");
+                return StopOutcome::PrBaseRefused { pr_url, detail };
             }
             DeclaredPrResolution::ClosedUnmerged { pr_url } => {
                 if self.is_merge_conflict_revision(execution) {
@@ -462,13 +473,9 @@ impl WorkerCompletionHandler {
                 .await;
         }
 
-        // Successful resolution has already verified the base.
-        if let Err(err) = self.work_db.resolve_attention_kind_for_execution(
-            &execution.id,
-            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
-        ) {
-            tracing::warn!(?err, "failed to resolve PR base refusal attention");
-        }
+        // Successful resolution has already verified the base, or skipped it
+        // for a merged, closed, or already-bound PR.
+        self.resolve_pr_base_refusal_attention(&execution.id);
 
         if !merged && !closed_unmerged {
             match self.conflict_delivery_decision(execution, Some(&pr_url)).await {

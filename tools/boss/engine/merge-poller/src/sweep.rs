@@ -559,6 +559,16 @@ pub(crate) async fn sweep_pending_pr(handler: &dyn CompletionRequests, execution
         // The foreign-PR guard already failed the execution and filed its
         // attention item; nothing further for the sweep to do.
         | StopOutcome::ForeignPrRefused { .. } => {}
+        // The base guard filed its attention item and parked the execution
+        // awaiting a retarget; the next sweep re-evaluates it.
+        StopOutcome::PrBaseRefused { pr_url, .. } => {
+            outcome.pr_recheck_unresolved += 1;
+            tracing::info!(
+                execution_id,
+                pr_url = %pr_url,
+                "merge poller: PR-detection recheck refused by the base policy — PR must be retargeted to the default branch",
+            );
+        }
     }
 }
 
@@ -672,6 +682,16 @@ pub(crate) async fn sweep_late_pr(
         // never through `finalize_pr_transition`, so the foreign-PR guard's
         // refusal cannot surface here — covered for exhaustiveness.
         | StopOutcome::ForeignPrRefused { .. } => {}
+        // Late-PR recheck applies the base policy before binding. A refused
+        // PR stays unbound for a later pass (or the abandoned-branch sweep).
+        StopOutcome::PrBaseRefused { pr_url, .. } => {
+            tracing::info!(
+                execution_id = %candidate.execution_id,
+                work_item_id = %candidate.work_item_id,
+                pr_url = %pr_url,
+                "merge poller: late-PR recheck refused by the base policy — PR must be retargeted to the default branch",
+            );
+        }
     }
 }
 

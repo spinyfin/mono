@@ -156,6 +156,35 @@ async fn recheck_for_pr_late_returns_awaiting_input_when_no_pr() {
     assert!(task.pr_url.is_none());
 }
 
+#[tokio::test]
+async fn recheck_for_pr_late_refuses_a_non_default_base() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let (_dir, db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/42"));
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_pr_state_checker(Arc::new(
+        FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature base".into())),
+    ));
+    let candidate = crate::work::LatePrCandidate {
+        execution_id: execution_id.clone(),
+        work_item_id: chore_id.clone(),
+        repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+        branch_naming: BranchNaming::BossExecPrefix,
+        worker_branch_prefix: None,
+    };
+    let outcome = handler.recheck_for_pr_late(&candidate).await;
+    assert!(
+        matches!(outcome, StopOutcome::PrBaseRefused { .. }),
+        "expected PrBaseRefused, got {outcome:?}"
+    );
+    let task = match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert!(task.pr_url.is_none());
+    assert_eq!(task.status, TaskStatus::Active);
+}
+
 // -----------------------------------------------------------
 // Revision task completion via SHA-delta gate in recheck_for_pr
 //
