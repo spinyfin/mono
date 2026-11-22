@@ -3,8 +3,7 @@
 //! in the parent [`super`] module (`completion/tests.rs`).
 //!
 //! Theme: PR-created-declaration worker-proposal seam
-//! (`pr_created_proposals_seam`, design implementation task 12 — the last
-//! of the per-seam migrations). Mirrors the `automation_outcome_proposals_seam`
+//! (`pr_created_proposals_seam`). Mirrors the `automation_outcome_proposals_seam`
 //! tests in `t11.rs`, adapted to the PR-detection ladder's shape: instead of
 //! one `finalize_*` entry point, `pr_created_from_proposal` is consulted from
 //! both `on_stop_inner` and `recheck_for_pr`, and every OTHER source that
@@ -20,6 +19,12 @@ fn enable_pr_created_seam() -> (Arc<crate::feature_flags::FeatureFlagsStore>, Te
     flags.load().unwrap();
     flags.set("worker_proposals", true).unwrap();
     flags.set("pr_created_proposals_seam", true).unwrap();
+    (flags, flags_dir)
+}
+
+fn enable_pr_created_and_run_done_seams() -> (Arc<crate::feature_flags::FeatureFlagsStore>, TempDir) {
+    let (flags, flags_dir) = enable_pr_created_seam();
+    flags.set("run_done_proposals_seam", true).unwrap();
     (flags, flags_dir)
 }
 
@@ -389,4 +394,132 @@ async fn pr_created_proposal_for_revision_rejects_a_url_other_than_the_bound_cha
         other => panic!("expected revision task, got {other:?}"),
     };
     assert!(revision.pr_url.is_none(), "revision tasks never own a PR URL");
+}
+
+/// With `run_done_proposals_seam` on, an Applied `pr_created` row is not
+/// enough to finalize a primary execution: a `delivered` declaration is
+/// still required, matching the staged-URL arm this proposal arm
+/// short-circuits.
+#[tokio::test]
+async fn pr_created_proposal_without_run_done_leaves_primary_execution_live_on_stop() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+
+    let (flags, _flags_dir) = enable_pr_created_and_run_done_seams();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::AwaitingRunDoneDeclaration { .. }),
+        "an undeclared primary pr_created proposal must be held pending declaration, not finalized; got {outcome:?}",
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(
+        execution.status.is_live(),
+        "an undeclared run must stay live when only a pr_created proposal is present"
+    );
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// Merge-poller mirror of the Stop-path declaration gate.
+#[tokio::test]
+async fn pr_created_proposal_without_run_done_leaves_primary_execution_live_on_recheck() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+
+    let (flags, _flags_dir) = enable_pr_created_and_run_done_seams();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.recheck_for_pr(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::AwaitingRunDoneDeclaration { .. }),
+        "an undeclared primary pr_created proposal must be held pending declaration on recheck; got {outcome:?}",
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(
+        execution.status.is_live(),
+        "an undeclared run must stay live on the poller sweep"
+    );
+}
+
+/// A `delivered` run_done declaration lets the proposal-first arm complete
+/// the same primary execution that the undeclared case holds.
+#[tokio::test]
+async fn pr_created_proposal_with_delivered_run_done_finalizes_on_stop() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::PrCreated,
+        payload_json: r#"{"pr_url":"https://github.com/spinyfin/mono/pull/500"}"#,
+        idempotency_key: "key-1",
+    })
+    .unwrap()
+    .unwrap();
+    db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {
+        execution_id: &execution_id,
+        work_item_id: &chore_id,
+        kind: ProposalKind::RunDone,
+        payload_json: r#"{"outcome":"delivered","summary":"opened the PR"}"#,
+        idempotency_key: "done-1",
+    })
+    .unwrap()
+    .unwrap();
+
+    let (flags, _flags_dir) = enable_pr_created_and_run_done_seams();
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let handler = handler
+        .with_feature_flags(flags)
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(&outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/500"),
+        "a delivered declaration must allow proposal-first completion, got {outcome:?}",
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(
+        !execution.status.is_live(),
+        "a delivered run must be finalized from the pr_created proposal"
+    );
 }

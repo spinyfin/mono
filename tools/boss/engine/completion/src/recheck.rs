@@ -51,13 +51,12 @@ impl WorkerCompletionHandler {
         if execution.kind == ExecutionKind::PrReview {
             return StopOutcome::AlreadyTerminal;
         }
-        // Worker-proposal seam (design implementation task 12): mirrors
-        // `on_stop_inner`'s proposal-first read — see that call site's
-        // comment. Matters even more for this poller sweep than for Stop:
-        // the staging cache is in-memory, so an engine restart between the
-        // worker's push and its own Stop loses a hook-captured URL
-        // entirely, while the `pr_created` proposal row is durable and
-        // still readable on the next sweep.
+        // Proposal-first read, mirroring `on_stop_inner`. Matters even more
+        // for this poller sweep than for Stop: the staging cache is
+        // in-memory, so an engine restart between the worker's push and its
+        // own Stop loses a hook-captured URL entirely, while the
+        // `pr_created` proposal row is durable and still readable on the
+        // next sweep.
         let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("pr_created_proposals_seam");
         let (proposed_pr_url, pr_created_proposal_row_existed) = if pr_created_proposals_first {
@@ -66,6 +65,10 @@ impl WorkerCompletionHandler {
             (None, false)
         };
         if let Some(proposed_pr_url) = proposed_pr_url {
+            // A verified declared PR is the progress the produce-a-PR
+            // fingerprint exists to detect. Retire that cycle before any
+            // deferral or finalization, matching the staged-URL arm.
+            self.retire_produce_pr_nudge(execution_id);
             // As with the staged-URL arm below, a merge-poller sweep must
             // not turn a revision's mid-turn push into implicit completion.
             if execution.kind == ExecutionKind::RevisionImplementation
@@ -78,6 +81,23 @@ impl WorkerCompletionHandler {
                      for the worker's own Stop boundary before finalization",
                 );
                 return StopOutcome::AwaitingInput;
+            }
+            // The declaration remains required for a primary (non-revision)
+            // execution: a declared PR URL is evidence the PR exists, never
+            // that the worker declared the run over. Mirrors
+            // `on_stop_inner`'s identical proposal-arm gate and the staged-URL
+            // arm below.
+            if execution.kind != ExecutionKind::RevisionImplementation
+                && !self.primary_staged_url_may_finalize(execution_id)
+            {
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposed_pr_url,
+                    "pr-recheck: pr_created proposal URL present but no `delivered` run_done \
+                     declaration yet; declaration remains required — deferring proposal \
+                     finalization",
+                );
+                return self.await_run_done_declaration(&execution, &proposed_pr_url).await;
             }
             tracing::info!(
                 execution_id,
@@ -642,22 +662,23 @@ impl WorkerCompletionHandler {
                 StopOutcome::DbError
             }
         };
-        // Worker-proposal seam (design implementation task 12): this sweep —
-        // the double-spawn-recovery counterpart to `recheck_for_pr` above —
-        // still finalizes purely through the cold `detect_pr` ladder; it
-        // never reads a `pr_created` proposal first the way `on_stop_inner`
-        // and `recheck_for_pr` do. Deliberately not wired to do so here: it
-        // runs for a TERMINAL execution recovering a task-row-only bind
-        // (see this method's doc), a narrower shape than the live-execution
-        // finalization the proposal read is designed to short-circuit, and
-        // folding it in would need its own verification pass against that
-        // shape rather than reusing `pr_created_from_proposal` as-is. But the
-        // counter is this seam's own stated exit criterion for eventually
-        // deleting the legacy ladder, so an uncounted finalization here would
-        // under-report and could wrongly green-light deleting a path this
-        // sweep still depends on — so count the hit regardless.
+        // This sweep still finalizes through the cold `detect_pr` ladder; it
+        // never uses a `pr_created` proposal as the URL source the way
+        // `on_stop_inner` and `recheck_for_pr` do. It runs for a TERMINAL
+        // execution recovering a task-row-only bind (see this method's doc),
+        // a narrower shape than the live-execution finalization the proposal
+        // read is designed to short-circuit. The fallback counter is still
+        // this seam's exit criterion for deleting the legacy ladder, so an
+        // uncounted finalization here would under-report. Look up whether a
+        // `pr_created` row exists so the recorded reason matches the row,
+        // even though this sweep does not read the proposal for a URL.
         if let Ok(execution) = self.work_db.get_execution(&candidate.execution_id) {
-            self.record_pr_created_fallback_after_success(&execution, "pr_recheck_late", false, &outcome);
+            let row_existed = self
+                .work_db
+                .list_worker_proposals_for_execution(&candidate.execution_id, ProposalKind::PrCreated)
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false);
+            self.record_pr_created_fallback_after_success(&execution, "pr_recheck_late", row_existed, &outcome);
         }
         outcome
     }

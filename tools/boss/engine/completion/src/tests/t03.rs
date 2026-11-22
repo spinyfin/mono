@@ -134,7 +134,7 @@ async fn recheck_for_pr_late_binds_pr_to_active_task() {
 /// It must still count the legacy-ladder hit: `worker_proposals.fallback_hit.pr_created`
 /// is this seam's own exit criterion for eventually deleting the ladder, and
 /// this path staying uncounted would make that criterion under-report a
-/// path still in live use (see design implementation task 12).
+/// path still in live use.
 #[tokio::test]
 async fn recheck_for_pr_late_counts_the_fallback_hit() {
     let (_dir, db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();

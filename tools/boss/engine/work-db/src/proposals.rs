@@ -288,16 +288,12 @@ impl WorkDb {
     /// pinned workspace, which spawns `git` and so happens above storage; use
     /// [`Self::submit_worker_proposal_with_guide`] for that kind. Submitting
     /// one here is an error and stores nothing.
+    ///
     /// Equivalent to [`Self::submit_worker_proposal_with_flags`] with
     /// `pr_created_proposals_seam_enabled: false` — the pre-migration apply
-    /// behaviour (see [`proposal_apply::apply_pr_created`]'s doc). `WorkDb`
-    /// has no `FeatureFlagsStore` of its own to query (it is a pure data
-    /// layer), so callers that know the flag's live value — currently only
-    /// the live submit path, which has `ServerState`'s store — call
-    /// [`Self::submit_worker_proposal_with_flags`] (or the guide+liveness
-    /// variant with the flag) instead. Every other caller (background
-    /// sweeps, and the many tests that submit kinds this flag never
-    /// affects) keeps calling this one.
+    /// behaviour (see [`proposal_apply::apply_pr_created`]'s doc). Test-only
+    /// convenience; production submits go through the guide+liveness variant
+    /// with the live flag value.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn submit_worker_proposal(

@@ -792,7 +792,7 @@ impl WorkerCompletionHandler {
         let pr_created_proposals_first = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("pr_created_proposals_seam");
         let (proposed_pr_url, pr_created_proposal_row_existed) = if pr_created_proposals_first {
-            self.pr_created_from_proposal(&execution).await
+            on_heap(|| self.pr_created_from_proposal(&execution)).await
         } else {
             (None, false)
         };
@@ -803,18 +803,41 @@ impl WorkerCompletionHandler {
                 "stop event: using PR URL from pr_created worker-proposal row; skipping the staging \
                  cache / cold-reconstruction ladder",
             );
+            // A verified declared PR is the progress the produce-a-PR
+            // fingerprint exists to detect. Retire that cycle before the
+            // run_done hold or finalization, matching the staged-URL arm.
+            self.retire_produce_pr_nudge(execution_id);
             if execution.kind == ExecutionKind::RevisionImplementation {
-                self.stamp_revision_stop_contributed_head_from_staged_url(execution_id, &execution, &proposed_pr_url)
-                    .await;
+                on_heap(|| {
+                    self.stamp_revision_stop_contributed_head_from_staged_url(
+                        execution_id,
+                        &execution,
+                        &proposed_pr_url,
+                    )
+                })
+                .await;
+            } else if !self.primary_staged_url_may_finalize(execution_id) {
+                // A declared PR URL is evidence the PR exists, never that
+                // the worker declared the run over. Same gate the staged-URL
+                // arm below enforces for a primary execution.
+                tracing::info!(
+                    execution_id,
+                    pr_url = %proposed_pr_url,
+                    "stop event: pr_created proposal URL present but no `delivered` run_done \
+                     declaration yet; declaration remains required — deferring proposal \
+                     finalization",
+                );
+                return on_heap(|| self.await_run_done_declaration(&execution, &proposed_pr_url)).await;
             }
-            let proposal_outcome = self
-                .finalize_pr_transition(
+            let proposal_outcome = on_heap(|| {
+                self.finalize_pr_transition(
                     execution_id,
                     proposed_pr_url.clone(),
                     WorkerPrCompletionTarget::InReview,
                     PR_CREATED_PROPOSAL_STOP_SOURCE,
                 )
-                .await;
+            })
+            .await;
             if execution.kind != ExecutionKind::RevisionImplementation
                 || !matches!(proposal_outcome, StopOutcome::AwaitingInput)
             {

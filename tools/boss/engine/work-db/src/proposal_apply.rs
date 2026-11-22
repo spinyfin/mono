@@ -961,21 +961,18 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 /// inside a DB transaction. The branch check here is therefore a pure,
 /// synchronous string comparison against the worker-supplied `branch` field;
 /// when the worker omits it, only the URL/repo check runs. The full
-/// network-verified check stays at Stop-time finalization (implementation
-/// task 12), which reads this proposal row instead of the in-memory
-/// `StagedPrUrlCache`.
+/// network-verified check stays at Stop-time finalization, which reads this
+/// proposal row instead of the in-memory `StagedPrUrlCache`.
 ///
-/// With `pr_created_proposals_seam_enabled` true (the hardened, task-12
-/// behaviour): a declaration that names a different PR than the task's
-/// existing binding is rejected; non-revision tasks are stamped with the
-/// declared URL; revision tasks are never stamped because their chain root
-/// owns the binding. With it false, this applier reproduces the
-/// pre-migration behaviour exactly, so the flag is a genuine kill switch:
-/// a conflicting declaration only warns and still applies (never rejects),
-/// and every task kind — including revisions — is stamped. This matters
-/// because `worker_proposals` (the master flag gating whether `pr_created`
-/// can be submitted at all) is independent of, and already on ahead of,
-/// this per-seam flag — see the flag's own registry description.
+/// With `pr_created_proposals_seam_enabled` true: a declaration that names a
+/// different PR than the task's existing binding is rejected; non-revision
+/// tasks are stamped with the declared URL; revision tasks are never stamped
+/// because their chain root owns the binding. With it false, this applier
+/// reproduces the pre-migration behaviour exactly, so the flag is a genuine
+/// kill switch: a conflicting declaration only warns and still applies
+/// (never rejects), and every task kind — including revisions — is stamped.
+/// `worker_proposals` (the master flag gating whether `pr_created` can be
+/// submitted at all) is independent of this per-seam flag.
 ///
 /// This remains narrower than [`WorkDb::record_worker_pr_completion`]'s
 /// full completion cascade (status transition, execution finalization, and
@@ -1498,8 +1495,8 @@ mod tests {
     /// pre-migration behaviour: warn and keep the existing binding,
     /// `Applied`, never `Rejected`. See `apply_pr_created`'s doc for why
     /// this specific inertness matters: `worker_proposals` (the flag
-    /// actually gating whether `pr_created` can be submitted) is already on
-    /// in production, independent of this flag.
+    /// gating whether `pr_created` can be submitted) is independent of
+    /// this per-seam flag.
     #[test]
     fn pr_created_conflicting_binding_warns_and_applies_when_seam_disabled() {
         let (_dir, db) = crate::test_support::open_db();
@@ -1544,11 +1541,10 @@ mod tests {
     }
 
     /// With the seam on, the same conflicting declaration must be a typed
-    /// `Rejected` disposition — the task-12 hardening this PR adds. Uses
-    /// `submit_worker_proposal_with_flags` directly (see its doc) rather
-    /// than injecting a `FeatureFlagsStore`: `WorkDb` has no store of its
-    /// own to query, so the flag's live value is always passed in by the
-    /// caller that resolved it.
+    /// `Rejected` disposition. Uses `submit_worker_proposal_with_flags`
+    /// directly (see its doc) rather than injecting a `FeatureFlagsStore`:
+    /// `WorkDb` has no store of its own to query, so the flag's live value
+    /// is always passed in by the caller that resolved it.
     #[test]
     fn pr_created_conflicting_binding_rejected_when_seam_enabled() {
         let (_dir, db) = crate::test_support::open_db();

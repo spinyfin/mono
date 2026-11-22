@@ -1204,23 +1204,19 @@ impl WorkerCompletionHandler {
         }
     }
 
-    /// Read `execution_id`'s `pr_created` worker-proposal row (design
-    /// implementation task 12 — the PR-created-declaration seam migration,
-    /// the last of the per-seam migrations, sequenced after
-    /// `automation_outcome_proposals_seam`). Returns the PR URL to
-    /// finalize on when an operative proposal exists, so
-    /// `on_stop_inner`/`recheck_for_pr` can short-circuit the whole
-    /// staging-cache / driver-prose / cold-reconstruction ladder and
-    /// finalize straight from a durable row that survives an engine
-    /// restart between the worker's `cube pr create`/`cube pr update` and
-    /// this Stop — unlike the in-memory `StagedPrUrlCache` the primary
-    /// path reads.
+    /// Read the newest applied `pr_created` proposal and return its URL only
+    /// after verifying the execution branch or revision chain-root binding.
+    /// `on_stop_inner`/`recheck_for_pr` then short-circuit the staging-cache
+    /// / driver-prose / cold-reconstruction ladder and finalize from that
+    /// durable row, which survives an engine restart between the worker's
+    /// `cube pr create`/`cube pr update` and this Stop — unlike the in-memory
+    /// `StagedPrUrlCache` the primary path reads.
     ///
-    /// Task 6's applier (`crate::work::proposal_apply::apply_pr_created`)
-    /// verified the URL/repo-slug synchronously at submission time. This
-    /// read independently verifies the URL still belongs to the execution's
-    /// expected branch (or the resolved chain-root PR for a revision) before
-    /// returning it, matching the legacy staged-URL path's safety boundary.
+    /// [`crate::work::proposal_apply::apply_pr_created`] validates URL shape
+    /// and repository at submission time. This read independently verifies
+    /// the URL still belongs to the execution's expected branch (or the
+    /// resolved chain-root PR for a revision) before returning it, matching
+    /// the legacy staged-URL path's safety boundary.
     ///
     /// Returns `(None, row_existed)` when no operative `pr_created`
     /// proposal is available — the caller then runs the legacy ladder and,
