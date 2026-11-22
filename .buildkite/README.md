@@ -24,6 +24,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     release-release.sh     # shared release tool prebuilt-binary release
     ci-env.sh              # shared env/toolchain setup sourced by other steps
     bazel-server-lock.sh   # stops a bazel server an earlier job left holding the command lock (sourced by ci-env.sh)
+    fetch-boss-tags.sh     # fetches and prunes boss-v* tags from origin (sourced by ci-env.sh)
     remote-execution.sh    # decides whether a step's bazel actions execute on remote workers (sourced by ci-env.sh)
     integrity-commit-delta.sh # mono-integrity: commit-delta check
     integrity-bazel.sh        # mono-integrity: full bazel build + test
