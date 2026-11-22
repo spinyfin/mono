@@ -524,6 +524,54 @@ impl WorkDb {
         self.terminate_pr_review_guide_attempt(attempt_id, PrReviewGuideAttemptStatus::Cancelled, Some(reason), None)
     }
 
+    /// Cancel every non-terminal review-guide attempt for this chain root
+    /// (the PR merged or closed). Bound executions are cancelled first so
+    /// the attempt is terminalised through [`Self::cancel_execution_with`];
+    /// unbound queued attempts are cancelled directly. Returns cancelled
+    /// execution ids so a caller can force-release their panes.
+    pub fn cancel_live_pr_review_guides_for_root(&self, work_item_id: &str, reason: &str) -> Result<Vec<String>> {
+        let attempts = {
+            let conn = self.connect()?;
+            let root = chain_root(&conn, work_item_id)?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS}
+                 FROM pr_review_guide_attempts
+                 WHERE series_id IN (SELECT id FROM pr_review_guide_source_series WHERE root_task_id = ?1)
+                   AND status NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')
+                 ORDER BY request_epoch DESC, created_at DESC, id DESC"
+            ))?;
+            let rows = stmt.query_map([&root], map_pr_review_guide_attempt)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut cancelled_executions = Vec::new();
+        for attempt in attempts {
+            if let Some(execution_id) = attempt.execution_id.clone() {
+                match self.cancel_execution_with(
+                    &execution_id,
+                    CancelExecutionOpts {
+                        reason: Some(reason.to_owned()),
+                        queued_only: false,
+                        record_failure_reason: false,
+                    },
+                ) {
+                    Ok(_) => cancelled_executions.push(execution_id),
+                    Err(err) => {
+                        tracing::warn!(
+                            attempt_id = %attempt.id,
+                            execution_id = %execution_id,
+                            ?err,
+                            "review-guide: failed to cancel the bound execution; cancelling the attempt directly",
+                        );
+                        self.cancel_pr_review_guide_attempt(&attempt.id, reason)?;
+                    }
+                }
+            } else {
+                self.cancel_pr_review_guide_attempt(&attempt.id, reason)?;
+            }
+        }
+        Ok(cancelled_executions)
+    }
+
     fn terminate_pr_review_guide_attempt(
         &self,
         attempt_id: &str,

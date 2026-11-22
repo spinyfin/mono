@@ -4,6 +4,35 @@ use super::post_merge_review::maybe_trigger_post_merge_review;
 use super::*;
 use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
 
+/// Cancel live review-guide attempts for a PR that merged or closed. Bound
+/// executions are cancelled (and force-released when a completion handler is
+/// wired) so an Astra-high generation does not keep burning tokens after the
+/// PR is gone. Unbound queued attempts are cancelled in the same pass.
+async fn stop_live_review_guides(
+    work_db: &WorkDb,
+    completion_handler: Option<&dyn CompletionRequests>,
+    chain_root_id: &str,
+    reason: &str,
+) {
+    let execution_ids = match work_db.cancel_live_pr_review_guides_for_root(chain_root_id, reason) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                chain_root_id,
+                ?err,
+                "merge poller: failed to cancel live review-guide attempts",
+            );
+            return;
+        }
+    };
+    let Some(handler) = completion_handler else {
+        return;
+    };
+    for execution_id in execution_ids {
+        handler.force_release(&execution_id).await;
+    }
+}
+
 /// The engine services one sweep step may call. Each is absent when the sweep
 /// runs bare — a pass that only observes and promotes.
 #[derive(Clone, Copy)]
@@ -828,6 +857,7 @@ pub(crate) async fn sweep_one(
             // terminal so the scheduler doesn't try to redispatch.
             stop_active_revision_executions(work_db, publisher, completion_handler, &candidate.work_item_id, outcome)
                 .await;
+            stop_live_review_guides(work_db, completion_handler, &candidate.work_item_id, "parent PR merged").await;
             // Deep-production eligibility + merge-SHA batch creation for the
             // landed-code post-merge review. Independent of `mark_merged`'s
             // own bookkeeping outcome (a human-driven row that stays in
@@ -1057,6 +1087,13 @@ pub(crate) async fn sweep_one(
             if mark_closed_unmerged(work_db, publisher, candidate).await {
                 outcome.closed_unmerged += 1;
             }
+            stop_live_review_guides(
+                work_db,
+                completion_handler,
+                &candidate.work_item_id,
+                "PR closed unmerged",
+            )
+            .await;
         }
     }
     // For every open (or just-probed) PR, persist the CI + review poll

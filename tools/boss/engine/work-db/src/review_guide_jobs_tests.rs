@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::test_support::{
     create_active_chore, create_product, open_db, review_guide_source_packet, seed_review_guide_series,
+    seed_review_guide_series_for_pr,
 };
 
 fn seeded_series(db: &WorkDb) -> (String, String, String) {
@@ -803,6 +804,57 @@ fn replacement_failure_rolls_back_cancellation_and_lifecycle() {
             .lifecycle,
         "generating"
     );
+}
+
+#[test]
+fn cancel_live_guides_for_root_cancels_bound_and_unbound_attempts() {
+    let (_dir, db) = open_db();
+    let (root, series, comparison) = seeded_series(&db);
+    let bound = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let bound = db.dispatch_pr_review_guide_attempt(&bound.id, &root).unwrap();
+    let execution_id = bound.execution_id.clone().expect("dispatch binds an execution");
+
+    let cancelled = db.cancel_live_pr_review_guides_for_root(&root, "PR merged").unwrap();
+    assert_eq!(cancelled, vec![execution_id.clone()]);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty());
+
+    let product2 = create_product(&db);
+    let root2 = create_active_chore(&db, &product2, "review guide unbound cancel");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            params!["https://github.com/acme/widget.git", root2],
+        )
+        .unwrap();
+    let (series2, comparison2) =
+        seed_review_guide_series_for_pr(&db, &root2, "https://github.com/acme/widget/pull/10", "base", "head");
+    let unbound = db
+        .create_pr_review_guide_attempt(&series2, &comparison2, "test")
+        .unwrap();
+    let cancelled = db
+        .cancel_live_pr_review_guides_for_root(&root2, "PR closed unmerged")
+        .unwrap();
+    assert!(cancelled.is_empty());
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&series2)
+            .unwrap()
+            .is_empty()
+    );
+    let unbound_status: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+            [&unbound.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unbound_status, "cancelled");
 }
 
 #[test]

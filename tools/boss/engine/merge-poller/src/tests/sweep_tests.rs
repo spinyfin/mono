@@ -39,6 +39,73 @@ async fn merged_pr_is_promoted_and_publishes_invalidation() {
 }
 
 #[tokio::test]
+async fn merged_pr_cancels_live_review_guide_attempts() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/acme/widget/pull/9";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-merge", pr);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+    let (series, comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
+    let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let attempt = db.dispatch_pr_review_guide_attempt(&attempt.id, &chore_id).unwrap();
+    let execution_id = attempt.execution_id.clone().expect("dispatch binds an execution");
+
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::Merged);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(outcome.merged, 1);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty(),
+        "a merged PR must cancel the in-flight review-guide attempt"
+    );
+}
+
+#[tokio::test]
+async fn closed_unmerged_pr_cancels_live_review_guide_attempts() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/acme/widget/pull/10";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-close", pr);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+    let (series, comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
+    let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let attempt = db.dispatch_pr_review_guide_attempt(&attempt.id, &chore_id).unwrap();
+    let execution_id = attempt.execution_id.clone().expect("dispatch binds an execution");
+
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::ClosedUnmerged);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let _ = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty(),
+        "a closed-unmerged PR must cancel the in-flight review-guide attempt"
+    );
+}
+
+#[tokio::test]
 async fn late_merge_probe_records_evidence_for_a_manually_completed_task() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();

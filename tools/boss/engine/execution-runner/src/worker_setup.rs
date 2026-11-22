@@ -165,6 +165,59 @@ pub fn render_claude_md_with_invocation(
     rules
 }
 
+/// Minimal read-only agent rules for a review-guide worker. The Standard
+/// implementer file teaches PR creation; this kind inspects one captured
+/// comparison and submits a guide, and must never open or update a PR.
+fn render_review_guide_claude_md(lease_id: &str, workspace_path: &str, boss: &str) -> String {
+    format!(
+        "# Boss review-guide rules\n\
+         \n\
+         You are running inside a Boss-managed **review-guide** session. The\n\
+         engine spawned you to write one review guide for a single captured PR\n\
+         comparison. Your initial prompt carries the pinned sources. You change\n\
+         nothing except by submitting that guide.\n\
+         \n\
+         ## Read-only mandate (HARD CONSTRAINT)\n\
+         \n\
+         **Your only state-changing action is submitting the guide with\n\
+         `{boss} propose review-guide`.** Tool calls for anything else are denied\n\
+         at the dispatch layer (deny-by-default `dontAsk` permission mode plus an\n\
+         explicit deny list) — this is enforced, not advisory.\n\
+         \n\
+         Forbidden (tool calls for these are denied):\n\
+         \n\
+         - Editing or writing ANY file (`Edit`, `Write`, `NotebookEdit`).\n\
+         - Committing or pushing (`jj git push`, `git push`).\n\
+         - Opening, updating, merging, closing, editing, or commenting on a PR\n\
+           (`gh pr …`, `cube pr create`, `cube pr update`).\n\
+         - Creating or mutating tasks, chores, revisions, or projects.\n\
+         - Leasing, releasing, or otherwise mutating cube state (`cube …`). The\n\
+           engine already handed you a read-only checkout — use it as-is.\n\
+         \n\
+         ## Submitting the guide\n\
+         \n\
+         When the guide is ready, submit it once with `{boss} propose review-guide`.\n\
+         Do not open a pull request. Do not edit the repository.\n\
+         \n\
+         ## What you can read\n\
+         \n\
+         - The captured comparison and the pinned sources in your prompt.\n\
+         - Code in your leased workspace — use `Read`, `Grep`, `Glob`, and\n\
+           read-only shell (`cat`, `grep`, `git show`, `git --git-dir`).\n\
+         \n\
+         ## Your workspace\n\
+         \n\
+         - Workspace path: `{workspace_path}`\n\
+         - Cube lease id: `{lease}`\n\
+         \n\
+         The workspace is a read-only checkout. Lease held for the lifetime of\n\
+         this run. Do not lease, release, or mutate cube state.\n",
+        lease = lease_id,
+        workspace_path = workspace_path,
+        boss = boss,
+    )
+}
+
 fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir: &str, boss: &str) -> String {
     if input.worker_kind == WorkerKind::Reviewer && input.is_review_supervisor {
         return crate::pr_review::render_supervisor_claude_md(
@@ -208,6 +261,9 @@ fn render_worker_rules_body(input: &WorkerSetupInput, preamble: &str, config_dir
             &input.workspace_path.display().to_string(),
             boss,
         );
+    }
+    if input.worker_kind == WorkerKind::ReviewGuide {
+        return render_review_guide_claude_md(&input.lease_id, &input.workspace_path.display().to_string(), boss);
     }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;

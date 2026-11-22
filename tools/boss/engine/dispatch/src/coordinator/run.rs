@@ -1003,16 +1003,22 @@ impl ExecutionCoordinator {
                 // execution directly. Excluded: `PrReview` (needs the
                 // dedicated re-fire path, not a plain `request_execution`,
                 // to land the right kind) and `AutomationTriage` /
-                // `AnswerAgent` (synthetic work items with no `tasks` row
-                // — `AutomationTriage` already got its own fresh execution
-                // above; `AnswerAgent` is unhandled here, matching its
-                // pre-existing scope). Also excluded: unconfirmed abort
-                // of a SlotBusy-rejected spawn (`ViewerAbortFailed`).
+                // `AnswerAgent` / `PrReviewGuide` (synthetic work items with
+                // no `tasks` row — `AutomationTriage` already got its own
+                // fresh execution above; `AnswerAgent` and `PrReviewGuide`
+                // are unhandled here, matching their pre-existing scope.
+                // A comparison id is not a work item, so `request_execution`
+                // cannot re-fire a review-guide job). Also excluded:
+                // unconfirmed abort of a SlotBusy-rejected spawn
+                // (`ViewerAbortFailed`).
                 // Do not request a replacement while the rejected spawn may still run.
                 if !abort_unconfirmed
                     && !matches!(
                         execution.kind,
-                        ExecutionKind::PrReview | ExecutionKind::AutomationTriage | ExecutionKind::AnswerAgent
+                        ExecutionKind::PrReview
+                            | ExecutionKind::AutomationTriage
+                            | ExecutionKind::AnswerAgent
+                            | ExecutionKind::PrReviewGuide
                     )
                     && let Err(err) = self.work_db.request_execution(
                         boss_protocol::RequestExecutionInput::builder()

@@ -861,6 +861,17 @@ impl WorkerCompletionHandler {
                                         false
                                     }
                                     Err(err) => {
+                                        let reason = format!("could not publish the review guide: {err:#}");
+                                        if let Err(error) =
+                                            self.work_db.fail_pr_review_guide_attempt(&attempt.id, &reason)
+                                        {
+                                            tracing::warn!(
+                                                execution_id = %execution.id,
+                                                attempt_id = %attempt.id,
+                                                ?error,
+                                                "review-guide finalizer: failed to record the publish failure"
+                                            );
+                                        }
                                         tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to publish");
                                         false
                                     }
@@ -885,6 +896,15 @@ impl WorkerCompletionHandler {
                         false
                     }
                     Err(err) => {
+                        let reason = format!("could not load the comparison for validation: {err:#}");
+                        if let Err(error) = self.work_db.fail_pr_review_guide_attempt(&attempt.id, &reason) {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                attempt_id = %attempt.id,
+                                ?error,
+                                "review-guide finalizer: failed to record the comparison-lookup failure"
+                            );
+                        }
                         tracing::warn!(execution_id = %execution.id, attempt_id = %attempt.id, ?err, "review-guide finalizer: failed to load the comparison for validation");
                         false
                     }
