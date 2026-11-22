@@ -174,6 +174,7 @@ pub async fn run_one_pass(
                     match work_db.request_execution_with_live_check(
                         RequestExecutionInput::builder()
                             .work_item_id(hold.work_item_id.clone())
+                            .created_via("positioning_refusal_recheck_sweep")
                             .build(),
                         |id| claimed.contains(id),
                     ) {

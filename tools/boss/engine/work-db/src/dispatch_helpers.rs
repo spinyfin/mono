@@ -2346,7 +2346,12 @@ fn request_execution_in_tx_body<F: FnOnce(&str) -> bool>(
     insert_execution(
         conn,
         CreateExecutionInput::builder()
-            .created_via(created_via.as_deref().unwrap_or("request_execution"))
+            .created_via(
+                created_via
+                    .as_deref()
+                    .or(audit_basis.as_deref())
+                    .unwrap_or("request_execution"),
+            )
             .work_item_id(work_item_id)
             .kind(kind)
             .status(ExecutionStatus::Ready)

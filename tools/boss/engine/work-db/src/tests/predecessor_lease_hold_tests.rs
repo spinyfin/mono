@@ -128,6 +128,7 @@ fn a_resume_row_names_no_workspace() {
     assert_eq!(resumed.transient_failure_count, 2);
     assert_eq!(resumed.preferred_workspace_id, None);
     assert!(!resumed.allow_dirty);
+    assert_eq!(resumed.created_via.as_deref(), Some("resume_execution"));
     assert_eq!(db.get_execution(&id).unwrap().status, ExecutionStatus::Orphaned);
     // The stalled run keeps its lease until the caller preserves and releases
     // it, and that is what the successor waits for.

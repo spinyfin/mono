@@ -129,9 +129,9 @@ pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_gr
 pub(super) const EXECUTION_PROVENANCE_MIGRATION_ID: &str = "20261106_1205_execution_created_via";
 pub(super) const VIEWS_MIGRATION_ID: &str = "20261106_1210_progression_candidate_views";
 
-/// Add `work_executions.created_via`: which producer minted the execution. Only
-/// the `progression_sweep` sets it today; a NULL value means an execution minted
-/// by the ordinary reconcile and request paths.
+/// Add `work_executions.created_via`: which producer minted the execution. Every
+/// execution-creation path populates it; a NULL value marks only a row created
+/// before this column existed.
 pub(super) fn migrate_execution_provenance(conn: &Connection) -> Result<()> {
     if !crate::schema_init::table_has_column(conn, "work_executions", "created_via")? {
         conn.execute_batch("ALTER TABLE work_executions ADD COLUMN created_via TEXT")?;

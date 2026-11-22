@@ -56,7 +56,7 @@ use boss_execution_contracts::{CubeClient, ExecutionPublisher};
 
 /// Provenance stamped on the bespoke `ci_remediation` execution a
 /// `retrigger` attempt parks so a worker can re-run CI without a commit.
-const CREATED_VIA_CI_WATCH_RETRIGGER: &str = "ci_watch:retrigger";
+pub(super) const CREATED_VIA_CI_WATCH_RETRIGGER: &str = "ci_watch:retrigger";
 /// Provenance stamped when the merge-poller re-emits an execution for a
 /// pending `ci_remediations` row that has no live executor.
 const CREATED_VIA_CI_WATCH_STRANDED_ATTEMPT_RESCUE: &str = "ci_watch:stranded_attempt_rescue";

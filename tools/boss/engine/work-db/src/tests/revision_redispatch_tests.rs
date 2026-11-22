@@ -264,3 +264,25 @@ fn list_task_field_audit_with_status_surfaces_engine_status_reasons() {
     assert_eq!(demote.actor, "engine");
     assert_eq!(demote.basis, "demote_active_work_item_to_todo");
 }
+
+#[test]
+fn reconcile_product_executions_stamps_created_via() {
+    let db = WorkDb::open(temp_db_path("reconcile-stamps-created-via")).unwrap();
+    let (product, _root, rev) = setup_revision_chain(&db, "reconcile-stamp");
+    let chore = create_test_chore(&db, product.id.clone(), "Runnable chore");
+
+    let result = db.reconcile_product_executions(&product.id).unwrap();
+    let rev_exec = result
+        .created
+        .iter()
+        .find(|e| e.work_item_id == rev.id)
+        .expect("reconcile should mint an execution for the open revision");
+    assert_eq!(rev_exec.created_via.as_deref(), Some("reconcile_revision_execution"));
+
+    let chore_exec = result
+        .created
+        .iter()
+        .find(|e| e.work_item_id == chore.id)
+        .expect("reconcile should mint an execution for the runnable chore");
+    assert_eq!(chore_exec.created_via.as_deref(), Some("reconcile_work_item_execution"));
+}

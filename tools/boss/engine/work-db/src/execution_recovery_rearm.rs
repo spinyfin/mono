@@ -81,10 +81,25 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
     }
     let rearmed = ids.len();
     for id in ids {
-        let Some(previous) = query_latest_execution_for_work_item(conn, &id)? else {
+        // Historical migrations (v039, v043, v059) and the fresh-start
+        // migration run before `20261106_1205_execution_created_via`, so this
+        // query must not select `created_via` or other later-added columns.
+        let previous_status: Option<String> = conn
+            .prepare_cached(
+                "SELECT status FROM work_executions
+                 WHERE work_item_id = ?1 AND kind <> 'progression'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+            )?
+            .query_row([&id], |row| row.get(0))
+            .optional()?;
+        let Some(previous_status) = previous_status else {
             continue;
         };
-        if !previous.status.is_terminal() {
+        let Ok(previous_status) = previous_status.parse::<ExecutionStatus>() else {
+            continue;
+        };
+        if !previous_status.is_terminal() {
             continue;
         }
         // The reconciler only looks at the latest execution, so a never-started
@@ -116,16 +131,40 @@ pub(super) fn migrate(conn: &Connection, recognizes: fn(&str) -> bool) -> Result
         // Preserve the terminal attempt and its bookmarks as recovery
         // provenance. The normal reconciler applies dependency admission
         // and project ordering before promoting this replacement to ready.
-        insert_execution(
-            conn,
-            CreateExecutionInput::builder()
-                .created_via("execution_recovery_rearm")
-                .work_item_id(id)
-                .kind(kind)
-                .status(ExecutionStatus::WaitingDependency)
-                .maybe_pr_url(pr_url)
-                .build(),
-        )?;
+        if crate::schema_init::table_has_column(conn, "work_executions", "created_via")? {
+            insert_execution(
+                conn,
+                CreateExecutionInput::builder()
+                    .created_via("execution_recovery_rearm")
+                    .work_item_id(id)
+                    .kind(kind)
+                    .status(ExecutionStatus::WaitingDependency)
+                    .maybe_pr_url(pr_url)
+                    .build(),
+            )?;
+        } else {
+            let repo_remote_url = resolve_execution_repo_remote_url(conn, &id, None)?;
+            let worker_branch_prefix = resolve_execution_worker_branch_prefix(conn, &id)?;
+            let branch_naming = resolve_execution_branch_naming(conn, &id)?;
+            let branch_naming_json = serde_json::to_string(&branch_naming).unwrap_or_default();
+            conn.execute(
+                "INSERT INTO work_executions (
+                    id, work_item_id, kind, status, repo_remote_url,
+                    created_at, pr_url, worker_branch_prefix, branch_naming
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    next_id("exec"),
+                    id,
+                    kind.as_str(),
+                    ExecutionStatus::WaitingDependency.as_str(),
+                    repo_remote_url,
+                    now_string(),
+                    pr_url,
+                    worker_branch_prefix,
+                    branch_naming_json,
+                ],
+            )?;
+        }
     }
     if rearmed > 0 {
         tracing::info!(
@@ -715,5 +754,38 @@ mod tests {
         let db = WorkDb::open(path).unwrap();
         assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
         super::super::schema_init::assert_all_migrations_applied(&db.connect().unwrap());
+    }
+
+    #[test]
+    fn opening_a_pre_provenance_database_rearms_with_prior_execution_and_opens_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.db");
+        let stale = format!("{NOT_DESCENDED_MESSAGE} boss-base/exec_18dd050856e97880_290");
+        let wedged = {
+            let db = WorkDb::open(path.clone()).unwrap();
+            let product_id = product(&db);
+            let wedged = insert_blocked(&db, &product_id, "wedged", "execution_recovery_failed", &stale);
+            db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(wedged.clone())
+                    .kind(ExecutionKind::TaskImplementation)
+                    .status(ExecutionStatus::Failed)
+                    .created_via("test")
+                    .build(),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            drop_audit_ledger(&conn);
+            conn.execute_batch("ALTER TABLE work_executions DROP COLUMN created_via;")
+                .unwrap();
+            conn.execute_batch(RESET_TO_38).unwrap();
+            wedged
+        };
+        let db = WorkDb::open(path.clone()).unwrap();
+        assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
+        super::super::schema_init::assert_all_migrations_applied(&db.connect().unwrap());
+        drop(db);
+        let db = WorkDb::open(path).unwrap();
+        assert_eq!(state(&db, &wedged), ("todo".to_owned(), None, None, 1));
     }
 }
