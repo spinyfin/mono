@@ -8,17 +8,19 @@ use boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED;
 /// executions are cancelled (and force-released when a completion handler is
 /// wired) so an Astra-high generation does not keep burning tokens after the
 /// PR is gone. Unbound queued attempts are cancelled in the same pass.
-async fn stop_live_review_guides(
+pub(crate) async fn stop_live_review_guides(
     work_db: &WorkDb,
     completion_handler: Option<&dyn CompletionRequests>,
     chain_root_id: &str,
+    pr_url: &str,
     reason: &str,
 ) {
-    let execution_ids = match work_db.cancel_live_pr_review_guides_for_root(chain_root_id, reason) {
+    let execution_ids = match work_db.cancel_live_pr_review_guides_for_root(chain_root_id, pr_url, reason) {
         Ok(ids) => ids,
         Err(err) => {
             tracing::warn!(
                 chain_root_id,
+                pr_url,
                 ?err,
                 "merge poller: failed to cancel live review-guide attempts",
             );
@@ -857,7 +859,14 @@ pub(crate) async fn sweep_one(
             // terminal so the scheduler doesn't try to redispatch.
             stop_active_revision_executions(work_db, publisher, completion_handler, &candidate.work_item_id, outcome)
                 .await;
-            stop_live_review_guides(work_db, completion_handler, &candidate.work_item_id, "parent PR merged").await;
+            stop_live_review_guides(
+                work_db,
+                completion_handler,
+                &candidate.work_item_id,
+                &candidate.pr_url,
+                "parent PR merged",
+            )
+            .await;
             // Deep-production eligibility + merge-SHA batch creation for the
             // landed-code post-merge review. Independent of `mark_merged`'s
             // own bookkeeping outcome (a human-driven row that stays in
@@ -1091,6 +1100,7 @@ pub(crate) async fn sweep_one(
                 work_db,
                 completion_handler,
                 &candidate.work_item_id,
+                &candidate.pr_url,
                 "PR closed unmerged",
             )
             .await;

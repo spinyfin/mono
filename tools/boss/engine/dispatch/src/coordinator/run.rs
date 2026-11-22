@@ -1006,9 +1006,11 @@ impl ExecutionCoordinator {
                 // `AnswerAgent` / `PrReviewGuide` (synthetic work items with
                 // no `tasks` row — `AutomationTriage` already got its own
                 // fresh execution above; `AnswerAgent` and `PrReviewGuide`
-                // are unhandled here, matching their pre-existing scope.
-                // A comparison id is not a work item, so `request_execution`
-                // cannot re-fire a review-guide job). Also excluded:
+                // have no tasks row to re-request. A review-guide
+                // `work_item_id` is a comparison id `request_execution`
+                // cannot resolve; the bound attempt is failed by the
+                // spawn-failure path and the guide can be retried from
+                // its card). Also excluded:
                 // unconfirmed abort of a SlotBusy-rejected spawn
                 // (`ViewerAbortFailed`).
                 // Do not request a replacement while the rejected spawn may still run.

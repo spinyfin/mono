@@ -814,7 +814,9 @@ fn cancel_live_guides_for_root_cancels_bound_and_unbound_attempts() {
     let bound = db.dispatch_pr_review_guide_attempt(&bound.id, &root).unwrap();
     let execution_id = bound.execution_id.clone().expect("dispatch binds an execution");
 
-    let cancelled = db.cancel_live_pr_review_guides_for_root(&root, "PR merged").unwrap();
+    let cancelled = db
+        .cancel_live_pr_review_guides_for_root(&root, "https://github.com/acme/widget/pull/9", "PR merged")
+        .unwrap();
     assert_eq!(cancelled, vec![execution_id.clone()]);
     assert_eq!(
         db.get_execution(&execution_id).unwrap().status,
@@ -837,7 +839,7 @@ fn cancel_live_guides_for_root_cancels_bound_and_unbound_attempts() {
         .create_pr_review_guide_attempt(&series2, &comparison2, "test")
         .unwrap();
     let cancelled = db
-        .cancel_live_pr_review_guides_for_root(&root2, "PR closed unmerged")
+        .cancel_live_pr_review_guides_for_root(&root2, "https://github.com/acme/widget/pull/10", "PR closed unmerged")
         .unwrap();
     assert!(cancelled.is_empty());
     assert!(
@@ -855,6 +857,107 @@ fn cancel_live_guides_for_root_cancels_bound_and_unbound_attempts() {
         )
         .unwrap();
     assert_eq!(unbound_status, "cancelled");
+}
+
+#[test]
+fn delayed_terminal_observation_cancels_only_the_observed_pr() {
+    let (_dir, db) = open_db();
+    let (root, old_series, old_comparison) = seeded_series(&db);
+    let old = db
+        .create_pr_review_guide_attempt(&old_series, &old_comparison, "test")
+        .unwrap();
+    let old = db.dispatch_pr_review_guide_attempt(&old.id, &root).unwrap();
+    let old_execution = old.execution_id.clone().expect("dispatch binds an execution");
+
+    let new_pr = "https://github.com/acme/widget/pull/11";
+    let (new_series, new_comparison) = seed_review_guide_series_for_pr(&db, &root, new_pr, "base-b", "head-b");
+    let new = db
+        .create_pr_review_guide_attempt(&new_series, &new_comparison, "test")
+        .unwrap();
+    let new = db.dispatch_pr_review_guide_attempt(&new.id, &root).unwrap();
+    let new_execution = new.execution_id.clone().expect("dispatch binds an execution");
+
+    let cancelled = db
+        .cancel_live_pr_review_guides_for_root(&root, "https://github.com/acme/widget/pull/9", "PR merged")
+        .unwrap();
+    assert_eq!(cancelled, vec![old_execution.clone()]);
+    assert_eq!(
+        db.get_execution(&old_execution).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert_eq!(db.get_execution(&new_execution).unwrap().status, ExecutionStatus::Ready);
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&old_series)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.live_pr_review_guide_attempts_for_series(&new_series).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn cancel_live_guides_continues_after_a_mid_loop_attempt_error() {
+    let (_dir, db) = open_db();
+    let (root, series, comparison) = seeded_series(&db);
+    let bound = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let bound = db.dispatch_pr_review_guide_attempt(&bound.id, &root).unwrap();
+    let execution_id = bound.execution_id.clone().expect("dispatch binds an execution");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_guide_attempts SET created_at = '2026-01-01' WHERE id = ?1",
+            [&bound.id],
+        )
+        .unwrap();
+
+    // A second series for the same PR identity (different stored URL) so the
+    // cancel pass visits two live attempts. One live attempt per series is
+    // the durable unique constraint.
+    let alt_pr = "https://github.com/Acme/Widget/pull/9";
+    let (fail_series, fail_comparison) = seed_review_guide_series_for_pr(&db, &root, alt_pr, "base-alt", "head-alt");
+    let fail = db
+        .create_pr_review_guide_attempt(&fail_series, &fail_comparison, "test")
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE pr_review_guide_attempts SET created_at = '2026-01-02' WHERE id = ?1",
+            [&fail.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_fail_attempt BEFORE UPDATE OF status ON pr_review_guide_attempts
+             WHEN OLD.id = '{id}' BEGIN
+               SELECT RAISE(ABORT, 'injected attempt cancel failure');
+             END;",
+            id = fail.id
+        ))
+        .unwrap();
+
+    let cancelled = db
+        .cancel_live_pr_review_guides_for_root(&root, "https://github.com/acme/widget/pull/9", "PR merged")
+        .unwrap();
+    assert_eq!(cancelled, vec![execution_id.clone()]);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    let status = |id: &str| -> String {
+        db.connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM pr_review_guide_attempts WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(status(&fail.id), "queued");
+    assert_eq!(status(&bound.id), "cancelled");
 }
 
 #[test]

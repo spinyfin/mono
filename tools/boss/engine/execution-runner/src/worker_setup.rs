@@ -203,7 +203,8 @@ fn render_review_guide_claude_md(lease_id: &str, workspace_path: &str, boss: &st
          \n\
          - The captured comparison and the pinned sources in your prompt.\n\
          - Code in your leased workspace — use `Read`, `Grep`, `Glob`, and\n\
-           read-only shell (`cat`, `grep`, `git show`, `git --git-dir`).\n\
+           read-only shell (`cat`, `nl`, `head`, `tail`, `wc -l`, `sed -n`,\n\
+           `rg`, and pinned `git show` / `git diff` / `git --git-dir` forms).\n\
          \n\
          ## Your workspace\n\
          \n\

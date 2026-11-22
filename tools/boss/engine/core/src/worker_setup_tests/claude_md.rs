@@ -59,6 +59,20 @@ fn review_guide_kind_renders_read_only_claude_md_without_pr_mandate() {
     );
     assert!(rendered.contains(&input.lease_id));
     assert!(rendered.contains(input.workspace_path.to_str().unwrap()));
+    assert!(
+        rendered.contains("`rg`"),
+        "review-guide CLAUDE.md must name the allowed search command; got:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("`grep`"),
+        "review-guide CLAUDE.md must not advertise grep, which the command guard denies; got:\n{rendered}",
+    );
+    for command in ["`cat`", "`nl`", "`head`", "`tail`", "`wc -l`", "`sed -n`"] {
+        assert!(
+            rendered.contains(command),
+            "review-guide CLAUDE.md must list allowed shell command {command}; got:\n{rendered}",
+        );
+    }
 }
 
 #[test]

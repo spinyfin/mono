@@ -525,23 +525,49 @@ impl WorkDb {
     }
 
     /// Cancel every non-terminal review-guide attempt for this chain root
-    /// (the PR merged or closed). Bound executions are cancelled first so
+    /// and the observed PR (the PR merged or closed). A delayed terminal
+    /// observation of an earlier PR must not cancel a replacement PR's
+    /// guide under the same root. Bound executions are cancelled first so
     /// the attempt is terminalised through [`Self::cancel_execution_with`];
-    /// unbound queued attempts are cancelled directly. Returns cancelled
-    /// execution ids so a caller can force-release their panes.
-    pub fn cancel_live_pr_review_guides_for_root(&self, work_item_id: &str, reason: &str) -> Result<Vec<String>> {
+    /// unbound queued attempts are cancelled directly. Per-attempt errors
+    /// are logged and skipped so later attempts still cancel and the
+    /// caller still receives every execution id that did cancel (to
+    /// force-release those panes).
+    pub fn cancel_live_pr_review_guides_for_root(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        reason: &str,
+    ) -> Result<Vec<String>> {
         let attempts = {
             let conn = self.connect()?;
             let root = chain_root(&conn, work_item_id)?;
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS}
-                 FROM pr_review_guide_attempts
-                 WHERE series_id IN (SELECT id FROM pr_review_guide_source_series WHERE root_task_id = ?1)
-                   AND status NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')
-                 ORDER BY request_epoch DESC, created_at DESC, id DESC"
-            ))?;
-            let rows = stmt.query_map([&root], map_pr_review_guide_attempt)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            let series_ids = {
+                let mut stmt = conn.prepare(
+                    "SELECT id, canonical_pr_url FROM pr_review_guide_source_series WHERE root_task_id = ?1",
+                )?;
+                let rows = stmt.query_map([&root], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|(_, url)| crate::merge_evidence::same_binding(url, pr_url))
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>()
+            };
+            if series_ids.is_empty() {
+                Vec::new()
+            } else {
+                let placeholders = vec!["?"; series_ids.len()].join(", ");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {PR_REVIEW_GUIDE_ATTEMPT_COLUMNS}
+                     FROM pr_review_guide_attempts
+                     WHERE series_id IN ({placeholders})
+                       AND status NOT IN ('succeeded', 'failed', 'cancelled', 'superseded')
+                     ORDER BY request_epoch DESC, created_at DESC, id DESC"
+                ))?;
+                let params = rusqlite::params_from_iter(series_ids.iter());
+                let rows = stmt.query_map(params, map_pr_review_guide_attempt)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
         };
         let mut cancelled_executions = Vec::new();
         for attempt in attempts {
@@ -562,11 +588,22 @@ impl WorkDb {
                             ?err,
                             "review-guide: failed to cancel the bound execution; cancelling the attempt directly",
                         );
-                        self.cancel_pr_review_guide_attempt(&attempt.id, reason)?;
+                        if let Err(err) = self.cancel_pr_review_guide_attempt(&attempt.id, reason) {
+                            tracing::warn!(
+                                attempt_id = %attempt.id,
+                                execution_id = %execution_id,
+                                ?err,
+                                "review-guide: failed to cancel the attempt after the bound execution refused",
+                            );
+                        }
                     }
                 }
-            } else {
-                self.cancel_pr_review_guide_attempt(&attempt.id, reason)?;
+            } else if let Err(err) = self.cancel_pr_review_guide_attempt(&attempt.id, reason) {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "review-guide: failed to cancel an unbound attempt; continuing with remaining attempts",
+                );
             }
         }
         Ok(cancelled_executions)
