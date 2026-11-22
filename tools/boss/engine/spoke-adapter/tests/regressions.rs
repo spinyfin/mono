@@ -646,14 +646,13 @@ async fn an_adopt_that_finds_no_session_does_not_end_the_doubt_of_an_unanswered_
 
 #[tokio::test]
 async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt_again() {
-    // Spawn is answered via `standard`; only Stop is left unanswered. Split
-    // the deadlines so a loaded CI worker's Spawn reply cannot miss a 300ms
-    // spawn_deadline (unsettled SpawnOutcomeUncertain) before the Stop-retry
-    // path runs, while the unanswered Stop still parks quickly enough for
-    // the <450ms retry assertion. workspace_slack(10_000) would raise Stop
-    // to 5s and fail that assertion. Freeze until spawn settles, thaw for the
-    // prompt wait, freeze again once Stop is stored, then fire its deadline
-    // on the paused clock so the retry assertion is independent of load.
+    // Spawn is answered via `standard`; only Stop is left unanswered. The
+    // spawn deadline is load-tolerant so a loaded worker's Spawn reply cannot
+    // time out before the Stop-retry path runs, while the Stop deadline is
+    // short and is fired with virtual time on a clock that stays frozen
+    // throughout, so the result is independent of sibling-test contention.
+    // The second attempt must retry only the Stop: it neither waits for the
+    // prompt again nor replays the spawn.
     let fx = Fixture::with(answered_spawn_short_stop(300)).await;
     fx.ready(HOST);
     fx.signals.0.store(false, Ordering::SeqCst);
@@ -694,10 +693,10 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
     let uncertain = first.downcast_ref::<SpawnOutcomeUncertain>().expect("stop unconfirmed");
     assert!(uncertain.settled, "{first:#}");
     // A later attempt asks only about the stop. The first spawn already
-    // stored one Stop (`stop_sends_before`); the retry arms a new Stop
-    // send_command (not a spawn replay), so waits_for("stop") and a send
-    // count above that snapshot name the retry directly.
+    // stored one Stop; the retry arms a new Stop send_command (not a spawn
+    // replay), so a send count above this snapshot names the retry directly.
     let stop_sends_before = fx.provider.command_sends_for("stop");
+    let retry_started = tokio::time::Instant::now();
     let second_waiting = {
         let adapter = Arc::clone(&adapter);
         tokio::spawn(async move { spawn(&adapter).await })
@@ -716,6 +715,13 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
     }
     let second = second_waiting.await.unwrap().unwrap_err();
     assert!(second.downcast_ref::<SpawnOutcomeUncertain>().is_some(), "{second:#}");
+    // The clock is frozen, so virtual time only moved by the 320 ms stepped
+    // above. A retry that waited out the prompt timeout again would need
+    // another 300 ms on top of the Stop deadline.
+    assert!(
+        tokio::time::Instant::now() - retry_started <= Duration::from_millis(320),
+        "the Stop retry must not wait for the prompt again"
+    );
     drop(clock);
     let stop = peer
         .commands()

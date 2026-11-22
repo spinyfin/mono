@@ -12,7 +12,7 @@ impl Peer {
         // Tokio intervals tick immediately, even with a one-hour period. A
         // reply queued on the peer is insufficient: the hub must ingest it
         // before a test can safely advance past the pulse's one-second timeout.
-        crate::timing::guarded(async {
+        guarded(async {
             // Welcome is queued before the driver starts. A receipt proves
             // its interval exists before crossing the rounded initial tick;
             // otherwise a late driver can create a tick after our only advance.
@@ -20,7 +20,10 @@ impl Peer {
             // Cross the timer wheel's rounded initial tick while remaining
             // safely inside an already-started pulse's one-second deadline.
             tokio::time::advance(Duration::from_millis(50)).await;
-            crate::timing::condition(|| self.liveness.pulse_replied.load(Ordering::SeqCst)).await;
+            until("the initial pulse to be replied to", || {
+                self.liveness.pulse_replied.load(Ordering::SeqCst)
+            })
+            .await;
             // Frames are ordered: this receipt proves the preceding reply
             // has cleared the outstanding challenge.
             self.capacity_receipt().await;
@@ -45,14 +48,17 @@ impl Peer {
             })))
             .await
             .unwrap();
-        crate::timing::condition(|| self.liveness.received.load(Ordering::SeqCst) >= sequence).await;
+        until("the hub to ingest the capacity record", || {
+            self.liveness.received.load(Ordering::SeqCst) >= sequence
+        })
+        .await;
     }
 }
 
 #[tokio::test]
 async fn frozen_liveness_survives_advancing_past_the_initial_pulse_deadline() {
-    crate::timing::hold();
-    crate::timing::guarded(async {
+    freeze_clock();
+    guarded(async {
         let fx = Fixture::with_frozen_liveness(crate::short(300)).await;
         fx.ready(HOST);
         let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
