@@ -327,7 +327,7 @@ When `notification_dedup_taxonomy` is enabled, `DedupInput.existing_work_items` 
 - **Work-item kinds:** tasks, chores, revisions, projects — all four.
 - **Non-terminal states:** any state that is not a terminal/closed state. Concretely: tasks and chores in `open | in_progress | review | paused`; revisions in `in_progress | in_review`; projects in `planned | active`. The query is `WHERE state NOT IN ('done','cancelled','archived','merged','closed')` scoped to the same product.
 - **Scope: same product, no recency window.** Unlike attentions (where a recency window prevents the comparison set growing unboundedly), work items in non-terminal states are by definition still active — a task open for three months is still work the human is tracking. Include all non-terminal items in the product. If the combined set (attentions + work items) exceeds K, attentions rank above work items as the primary dup target; work items beyond the cap are `log()`-ed, not silently dropped.
-- **K (combined cap):** raise the per-call cap to accommodate both sets (e.g. K ≤ 24 attentions + 24 work items = 48 total). Open question R15 covers the concrete value.
+- **K (combined cap):** K = 48 (24 attentions + 24 work items). Attentions ranked first. The work-item side applies a most-recently-updated prefilter before the cap (R15 settled): each of the four kinds keeps up to 6 newest rows, then unused combined-cap slots fill from remaining most-recently-updated items. Overflow is logged, never silently dropped.
 - **The LLM prompt** receives the two lists under distinct headings ("Existing open notifications:" and "Existing scheduled work items:") so it can make the distinction clear in its rationale.
 
 #### Work-item dup verdict handling
@@ -490,7 +490,7 @@ Three flags are registered. All default `false` (off-safe). The sub-flags are on
 
 **R14 — Startup sweep + sensibility filter scope.** The sweep is designed for attention-vs-attention folding. _Open:_ should the sweep also apply the sensibility filter to existing open attentions (evaluate whether already-persisted attentions are now stale)? The primary use case for sensibility is at creation time (catching bad attentions before they appear), and sweep-based sensibility would retire items the human may have already seen. Proposed: sensibility filter is creation-path-only in v1; the sweep applies attention-vs-attention folding + work-item dup detection only.
 
-**R15 — Combined comparison-set cap K for taxonomy-aware dedup.** Proposed: K ≤ 48 total (24 attentions + 24 work items), attentions ranked first. _Open:_ the right split depends on typical product sizes (how many open tasks vs. open attentions). If products regularly have 50+ open tasks, the work-item side needs its own prefilter (e.g. most-recently-updated N work items) before the combined cap. Settle by measuring real product sizes before implementing task 4a (taxonomy prefilter).
+**R15 — Combined comparison-set cap K for taxonomy-aware dedup.** Settled: K = 48 (24 attentions + 24 work items), attentions ranked first. Work-item side: per-kind cap of 6 (task / chore / revision / project) with unused combined-cap slots filled from the remaining most-recently-updated items, so a product with many tasks and few chores still contributes the chores. Overflow is logged. A most-recently-updated prefilter is always applied (a no-op under the cap). Busy products routinely exceed 50 open `tasks` rows once revisions are counted, which is the design's threshold for requiring that prefilter.
 
 ---
 
