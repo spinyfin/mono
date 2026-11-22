@@ -20,23 +20,16 @@
 # a frozen hub is worse.
 
 steps:
-  # Diagnostic only: explicitly request two compatible agents, in sequence so
-  # the second can reuse the first job's populated cache for the same commit.
-  - label: "Boss tag cache: populate"
-    key: "boss-tag-cache-populate"
+  # Both jobs rendezvous while running, guaranteeing distinct agents; the
+  # second waits for the first to populate the cache before invoking Bazel.
+  - label: "Boss tag cache: %n"
     if: build.env("BOSS_VERIFY_TAG_CACHE") == "1"
+    parallelism: 2
     command: "bash .buildkite/steps/verify-boss-tag-cache.sh"
     agents:
       queue: "bazel-any"
-      name: "arbitrary-1-any"
-
-  - label: "Boss tag cache: reuse"
-    if: build.env("BOSS_VERIFY_TAG_CACHE") == "1"
-    depends_on: "boss-tag-cache-populate"
-    command: "bash .buildkite/steps/verify-boss-tag-cache.sh"
-    agents:
-      queue: "bazel-any"
-      name: "determinist-1-any"
+      os: "darwin"
+      arch: "arm64"
 
   - label: ":bazel: bazel-build-test"
     key: "bazel-build-test"
