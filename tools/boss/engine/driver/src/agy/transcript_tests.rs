@@ -372,3 +372,30 @@ fn unknown_bookkeeping_rows_preserve_pending_calls() {
         }
     }
 }
+
+#[test]
+fn live_background_task_tracks_running_rows_until_system_message() {
+    let before_completion: String = BACKGROUND_TASK
+        .lines()
+        .take(4)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(reader_has_live_background_task(before_completion.as_bytes()));
+    assert!(!reader_has_live_background_task(BACKGROUND_TASK.as_bytes()));
+
+    let two_tasks = concat!(
+        r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","content":"Tool is running as a background task with task id: conv/task-1\n"}"#,
+        "\n",
+        r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","content":"Tool is running as a background task with task id: conv/task-2\n"}"#,
+        "\n",
+        r#"{"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"[Message] sender=conv/task-1 content=Task id \"conv/task-1\" finished with result:\nok"}"#,
+        "\n",
+    );
+    assert!(reader_has_live_background_task(two_tasks.as_bytes()));
+
+    let both_done = format!(
+        "{two_tasks}{}\n",
+        r#"{"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"[Message] sender=conv/task-2 content=Task id \"conv/task-2\" finished with result:\nok"}"#
+    );
+    assert!(!reader_has_live_background_task(both_done.as_bytes()));
+}

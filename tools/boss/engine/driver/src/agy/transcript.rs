@@ -58,7 +58,9 @@
 //!
 //! [`AgyDriver::extract_error_from_transcript`]: crate::AgentDriver::extract_error_from_transcript
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
@@ -273,6 +275,100 @@ fn api_error(row: &Map<String, Value>) -> Value {
         }),
         row,
     )
+}
+
+const MAX_TRANSCRIPT_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+fn extract_running_task_id(content: &str) -> Option<&str> {
+    let rest = content.split("task id:").nth(1)?;
+    let id = rest.split_whitespace().next()?;
+    (!id.is_empty()).then_some(id)
+}
+
+fn extract_completed_task_id(content: &str) -> Option<&str> {
+    if let Some(rest) = content.split("sender=").nth(1)
+        && let Some(id) = rest.split_whitespace().next()
+        && !id.is_empty()
+    {
+        return Some(id);
+    }
+    if let Some(rest) = content.split("Task id \"").nth(1)
+        && let Some(id) = rest.split('"').next()
+        && !id.is_empty()
+    {
+        return Some(id);
+    }
+    None
+}
+
+/// Whether `reader` shows at least one `agy` background task (`GENERIC`
+/// `RUNNING` / `tool_running`) that has not yet been closed by a matching
+/// completion `SYSTEM_MESSAGE` / `system_message`.
+pub(super) fn reader_has_live_background_task(reader: impl BufRead) -> bool {
+    let mut active_task_ids: HashSet<String> = HashSet::new();
+    let mut anonymous_running: usize = 0;
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(row) = raw.as_object() else {
+            continue;
+        };
+        let Some(step_type) = row.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match step_type {
+            "GENERIC" if is_model_sourced(row) && status_of(row) == "RUNNING" => {
+                let content = text_of(row, "content");
+                if let Some(id) = extract_running_task_id(content) {
+                    active_task_ids.insert(id.to_owned());
+                } else {
+                    anonymous_running += 1;
+                }
+            }
+            "SYSTEM_MESSAGE" => {
+                let content = text_of(row, "content");
+                let removed = extract_completed_task_id(content).is_some_and(|id| active_task_ids.remove(id));
+                if !removed && content.contains("finished with result:") {
+                    anonymous_running = anonymous_running.saturating_sub(1);
+                }
+            }
+            "system" => match row.get("subtype").and_then(Value::as_str) {
+                Some("tool_running") => anonymous_running += 1,
+                Some("system_message") => anonymous_running = anonymous_running.saturating_sub(1),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    !active_task_ids.is_empty() || anonymous_running > 0
+}
+
+/// Check whether an `agy` transcript on disk currently has a background task
+/// still running (a `GENERIC` `RUNNING` / `tool_running` row without a later
+/// completion `SYSTEM_MESSAGE`).
+pub fn transcript_has_live_background_task(path: &Path, containment_root: Option<&Path>) -> bool {
+    if let Some(root) = containment_root {
+        let (Ok(canon_root), Ok(canon_path)) = (std::fs::canonicalize(root), std::fs::canonicalize(path)) else {
+            return false;
+        };
+        if !canon_path.starts_with(&canon_root) {
+            return false;
+        }
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    reader_has_live_background_task(BufReader::new(file.take(MAX_TRANSCRIPT_SCAN_BYTES)))
 }
 
 #[cfg(test)]

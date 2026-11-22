@@ -144,18 +144,63 @@ impl ServerState {
             }
         }
         for state in &mut states {
-            state.hung_since = boss_engine_runtime::hung_worker::hung_since(
+            let checkpoint = self.live_worker_states.semantic_progress_for_slot(state.slot_id);
+            let fidelity = self.live_worker_states.progress_fidelity_for_slot(state.slot_id);
+            let held = self.hold_registry.is_held(&state.run_id);
+            let has_active_wait = self.wait_registry.active(&state.run_id, now).is_some();
+            let tool_completed = self.live_worker_states.tool_completed_since_prompt(state.slot_id);
+            let preliminary = boss_engine_runtime::hung_worker::hung_since(
                 state,
-                self.live_worker_states
-                    .semantic_progress_for_slot(state.slot_id)
-                    .as_ref(),
-                self.live_worker_states.progress_fidelity_for_slot(state.slot_id),
-                self.hold_registry.is_held(&state.run_id),
-                self.live_worker_states.tool_completed_since_prompt(state.slot_id),
+                checkpoint.as_ref(),
+                fidelity,
+                boss_engine_runtime::hung_worker::HungSignals {
+                    held,
+                    has_active_wait,
+                    has_blocking_tool_poll: false,
+                    tool_completed_since_prompt: tool_completed,
+                },
                 now,
             );
+            state.hung_since = if preliminary.is_some() && self.agy_has_live_background_task(&state.run_id) {
+                None
+            } else {
+                preliminary
+            };
         }
         states
+    }
+
+    /// Whether `execution_id` is an `agy` run whose transcript currently shows
+    /// a background task (`GENERIC` `RUNNING` / `tool_running`) without a
+    /// matching completion `SYSTEM_MESSAGE`.
+    fn agy_has_live_background_task(&self, execution_id: &str) -> bool {
+        if boss_engine_completion::driver_transcript::resolve_execution_driver_slug(&self.work_db, execution_id)
+            .as_deref()
+            != Some("agy")
+        {
+            return false;
+        }
+        let transcript_path = self
+            .transcript_path_cache
+            .get(execution_id)
+            .or_else(|| self.work_db.transcript_path_for_execution(execution_id).ok().flatten());
+        let Some(transcript_path) = transcript_path else {
+            return false;
+        };
+        let containment_root = match boss_engine_driver::AgentDriver::transcript_containment_root(
+            &boss_engine_driver::agy::AgyDriver::default(),
+            execution_id,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(execution_id, %error, "agy transcript containment check failed");
+                return false;
+            }
+        };
+        boss_engine_driver::agy::transcript_has_live_background_task(
+            std::path::Path::new(&transcript_path),
+            containment_root.as_deref(),
+        )
     }
 
     /// Push the current live-worker-state snapshot on the

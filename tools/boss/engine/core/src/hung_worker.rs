@@ -10,17 +10,26 @@ use boss_protocol::{LiveWorkerState, WorkerActivity};
 pub(crate) const FIRST_RESPONSE_SECS: i64 = 600;
 pub(crate) const NEXT_RESPONSE_SECS: i64 = 900;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HungSignals {
+    pub held: bool,
+    pub has_active_wait: bool,
+    pub has_blocking_tool_poll: bool,
+    pub tool_completed_since_prompt: bool,
+}
+
 pub fn hung_since(
     state: &LiveWorkerState,
     checkpoint: Option<&SemanticProgressCheckpoint>,
     fidelity: ProgressFidelity,
-    held: bool,
-    tool_completed_since_prompt: bool,
+    signals: HungSignals,
     now: i64,
 ) -> Option<String> {
     let checkpoint = checkpoint?;
     let yielded = checkpoint.tool_condition == SemanticToolCondition::Yielded;
-    if held
+    if signals.held
+        || signals.has_active_wait
+        || signals.has_blocking_tool_poll
         || state.wait_reason.is_some()
         || (state.current_tool.is_some() && !yielded)
         || state.activity != WorkerActivity::Working
@@ -30,7 +39,7 @@ pub fn hung_since(
     if checkpoint.turn_condition != SemanticTurnCondition::InTurn {
         return None;
     }
-    let threshold = if yielded || tool_completed_since_prompt {
+    let threshold = if yielded || signals.tool_completed_since_prompt {
         NEXT_RESPONSE_SECS
     } else {
         FIRST_RESPONSE_SECS
@@ -133,8 +142,10 @@ mod tests {
                 &registry.get(1).unwrap(),
                 Some(&checkpoint),
                 ProgressFidelity::Rich,
-                false,
-                registry.tool_completed_since_prompt(1),
+                HungSignals {
+                    tool_completed_since_prompt: registry.tool_completed_since_prompt(1),
+                    ..Default::default()
+                },
                 now + 899
             )
             .is_none()
@@ -144,8 +155,10 @@ mod tests {
                 &registry.get(1).unwrap(),
                 Some(&checkpoint),
                 ProgressFidelity::Rich,
-                false,
-                registry.tool_completed_since_prompt(1),
+                HungSignals {
+                    tool_completed_since_prompt: registry.tool_completed_since_prompt(1),
+                    ..Default::default()
+                },
                 now + 900
             )
             .is_some()
@@ -162,8 +175,10 @@ mod tests {
                 &registry.get(1).unwrap(),
                 registry.semantic_progress_for_slot(1).as_ref(),
                 ProgressFidelity::Rich,
-                false,
-                registry.tool_completed_since_prompt(1),
+                HungSignals {
+                    tool_completed_since_prompt: registry.tool_completed_since_prompt(1),
+                    ..Default::default()
+                },
                 now + 900
             )
             .is_none()
@@ -190,8 +205,10 @@ mod tests {
                 &registry.get(1).unwrap(),
                 registry.semantic_progress_for_slot(1).as_ref(),
                 ProgressFidelity::Rich,
-                false,
-                registry.tool_completed_since_prompt(1),
+                HungSignals {
+                    tool_completed_since_prompt: registry.tool_completed_since_prompt(1),
+                    ..Default::default()
+                },
                 now,
             )
         };
@@ -224,7 +241,16 @@ mod tests {
             turn_condition: SemanticTurnCondition::InTurn,
         };
         let classify = |state: &LiveWorkerState, checkpoint: &SemanticProgressCheckpoint, completed, now| {
-            hung_since(state, Some(checkpoint), ProgressFidelity::Rich, false, completed, now)
+            hung_since(
+                state,
+                Some(checkpoint),
+                ProgressFidelity::Rich,
+                HungSignals {
+                    tool_completed_since_prompt: completed,
+                    ..Default::default()
+                },
+                now,
+            )
         };
         assert!(classify(&state, &checkpoint, false, 1599).is_none());
         assert!(classify(&state, &checkpoint, false, 1600).is_some());
@@ -236,7 +262,48 @@ mod tests {
         state.wait_reason = Some("long build".into());
         assert!(classify(&state, &checkpoint, true, 10000).is_none());
         state.wait_reason = None;
-        assert!(hung_since(&state, Some(&checkpoint), ProgressFidelity::Rich, true, true, 10000).is_none());
+        assert!(
+            hung_since(
+                &state,
+                Some(&checkpoint),
+                ProgressFidelity::Rich,
+                HungSignals {
+                    held: true,
+                    tool_completed_since_prompt: true,
+                    ..Default::default()
+                },
+                10000,
+            )
+            .is_none()
+        );
+        assert!(
+            hung_since(
+                &state,
+                Some(&checkpoint),
+                ProgressFidelity::Rich,
+                HungSignals {
+                    has_active_wait: true,
+                    tool_completed_since_prompt: true,
+                    ..Default::default()
+                },
+                10000,
+            )
+            .is_none()
+        );
+        assert!(
+            hung_since(
+                &state,
+                Some(&checkpoint),
+                ProgressFidelity::Rich,
+                HungSignals {
+                    has_blocking_tool_poll: true,
+                    tool_completed_since_prompt: true,
+                    ..Default::default()
+                },
+                10000,
+            )
+            .is_none()
+        );
         checkpoint.progress_at = crate::live_worker_state::iso8601_utc(9999);
         assert!(classify(&state, &checkpoint, true, 10000).is_none());
         checkpoint.turn_condition = SemanticTurnCondition::Ended;
