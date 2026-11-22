@@ -127,18 +127,29 @@ def load_bundle(directory):
     return bundle
 
 
+def resolve_normalize_target(raw_arg, dashboards_dir=None):
+    target = Path(raw_arg)
+    if target.parent == Path("."):
+        base = Path(__file__).resolve().parent if dashboards_dir is None else Path(dashboards_dir)
+        target = base / target.name
+    target = target.resolve()
+    if target.name not in DASHBOARDS:
+        raise ValueError(f"target filename must be one of {', '.join(DASHBOARDS)}")
+    return target
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--normalize"]:
         if len(sys.argv) != 3:
             sys.exit("usage: validate.py --normalize <target>")
-        target = Path(sys.argv[2])
-        if target.parent == Path(".") and not target.exists():
-            target = Path(__file__).resolve().parent / target
-        if target.name not in DASHBOARDS:
-            sys.exit(f"target filename must be one of {', '.join(DASHBOARDS)}")
+        try:
+            target = resolve_normalize_target(sys.argv[2])
+        except ValueError as err:
+            sys.exit(str(err))
         dashboard = parse(sys.stdin.read())
         target.write_text(normalize_dashboard(dashboard, target.stem))
         print(f"Normalized and validated {target}")
+        print("Run bin/checkleft fix to format JSON before committing.")
     else:
         bundle = load_bundle(Path(__file__).resolve().parent)
         if sys.argv[1:] == ["--bundle"]:

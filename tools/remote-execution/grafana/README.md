@@ -38,13 +38,14 @@ Files are replaced atomically, individually, after validating the whole bundle. 
 
 ## Editing and rollback
 
-Edit the dashboard in Grafana, then export its JSON without saving over the provisioned dashboard. Export for the same Grafana instance, not for external sharing (which substitutes datasource placeholders). Normalize and validate the export in one step:
+Edit the dashboard in Grafana, then export its JSON without saving over the provisioned dashboard. Export for the same Grafana instance, not for external sharing (which substitutes datasource placeholders). Normalize, validate, and format the export:
 
 ```sh
 python3 tools/remote-execution/grafana/validate.py --normalize nativelink-overview.json < export.json
+bin/checkleft fix
 ```
 
-(Pass `nativelink-workers.json` for the workers dashboard.) This strips dashboard-level `id`/`version`, adds the built-in `-- Grafana --` datasource to any `row` or `text` panels that omit one, sorts keys recursively, validates the dashboard, and writes the target file. Do not edit files on headcrash.
+(Pass `nativelink-workers.json` for the workers dashboard.) `validate.py --normalize` strips dashboard-level `id`/`version`, adds the built-in `-- Grafana --` datasource to any `row` or `text` panels that omit one, sorts keys recursively, validates the dashboard, and writes the target file in this directory; `bin/checkleft fix` applies the repo's JSON formatting (`oxfmt`) so `bin/checkleft run` passes. Do not edit files on headcrash.
 
 Run `bazel build --remote_download_outputs=minimal //tools/remote-execution/grafana:grafana_test`, `bazel test --remote_download_outputs=minimal //tools/remote-execution/grafana:grafana_test`, and `bin/checkleft run`. Validation parses both real exports, checks unique panel IDs (including collapsed rows), grid bounds/non-overlap and datasources, and enforces publication scope. Tests also exercise repeated publishing, failure/retry behavior, preservation of unrelated files and CI guards without touching a live host.
 

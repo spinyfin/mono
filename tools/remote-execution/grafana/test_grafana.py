@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import install
-from validate import DASHBOARDS, PROVIDER, canonical, load_bundle, parse, validate_bundle
+from validate import DASHBOARDS, PROVIDER, canonical, load_bundle, parse, resolve_normalize_target, validate_bundle
 
 HERE = Path(__file__).resolve().parent
 
@@ -122,14 +122,16 @@ class DashboardsTest(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn(str(target.resolve()), result.stdout)
+            self.assertIn("bin/checkleft fix", result.stdout)
             normalized = parse(target.read_text())
-            self.assertNotIn("id", normalized)
-            self.assertNotIn("version", normalized)
-            row = normalized["panels"][0]
             builtin = {"type": "grafana", "uid": "-- Grafana --"}
-            self.assertEqual(builtin, row["datasource"])
-            self.assertEqual(builtin, row["panels"][0]["datasource"])
-            self.assertEqual(canonical(normalized), target.read_text())
+            expected = copy.deepcopy(raw)
+            expected.pop("id")
+            expected.pop("version")
+            expected["panels"][0]["datasource"] = builtin
+            expected["panels"][0]["panels"][0]["datasource"] = builtin
+            self.assertEqual(expected, normalized)
 
             # Metric panels without a datasource must still fail without writing.
             bad = copy.deepcopy(raw)
@@ -143,6 +145,48 @@ class DashboardsTest(unittest.TestCase):
             )
             self.assertNotEqual(0, bad_result.returncode)
             self.assertFalse(bad_target.exists())
+
+    def test_normalize_target_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dashboards_dir = root / "dashboards"
+            dashboards_dir.mkdir()
+            cwd_dir = root / "cwd"
+            cwd_dir.mkdir()
+            (cwd_dir / DASHBOARDS[0]).write_text("{}")
+
+            old_cwd = Path.cwd()
+            os.chdir(cwd_dir)
+            try:
+                resolved = resolve_normalize_target(DASHBOARDS[0], dashboards_dir=dashboards_dir)
+                self.assertEqual((dashboards_dir / DASHBOARDS[0]).resolve(), resolved)
+                explicit = cwd_dir / DASHBOARDS[0]
+                self.assertEqual(explicit.resolve(), resolve_normalize_target(str(explicit), dashboards_dir=dashboards_dir))
+            finally:
+                os.chdir(old_cwd)
+
+            with self.assertRaises(ValueError):
+                resolve_normalize_target("other.json", dashboards_dir=dashboards_dir)
+
+    def test_pipeline_force_matches_pipeline_without_if_changed(self):
+        pipeline_lines = (HERE / "pipeline.yml").read_text().splitlines()
+        force_text = (HERE / "pipeline-force.yml").read_text()
+        filtered = []
+        skip_block = False
+        for line in pipeline_lines:
+            if line.startswith("    if_changed:"):
+                skip_block = True
+                continue
+            if skip_block:
+                if line.startswith("      ") or not line.strip():
+                    continue
+                skip_block = False
+            filtered.append(line)
+        self.assertEqual("\n".join(filtered) + "\n", force_text)
+        self.assertNotIn("if_changed", force_text)
+        self.assertIn('queue: "nativelink-grafana"', force_text)
+        self.assertIn("concurrency: 1", force_text)
+        self.assertIn('if: build.branch == "main" && build.pull_request.id == null', force_text)
 
 
 class PublisherTest(unittest.TestCase):
