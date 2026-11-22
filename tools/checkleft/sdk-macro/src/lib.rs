@@ -7,7 +7,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Expr, ExprArray, ExprLit, Ident, ItemFn, Lit, LitStr, Path, Token,
+    Expr, ExprArray, ExprLit, Ident, ItemFn, Lit, LitBool, LitStr, Path, Token,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
@@ -34,6 +34,8 @@ struct CheckArgs {
     required_files: Option<Ident>,
     /// Optional function to call for `fix-check` dispatch.
     fix: Option<Ident>,
+    /// Whether this check consumes `ChangeSet::base_files` (`false` by default).
+    needs_base_files: bool,
 }
 
 #[derive(Default)]
@@ -63,6 +65,7 @@ impl Parse for CheckArgs {
         let mut evaluate_exclusion: Option<Ident> = None;
         let mut required_files: Option<Ident> = None;
         let mut fix: Option<Ident> = None;
+        let mut needs_base_files = false;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -110,6 +113,10 @@ impl Parse for CheckArgs {
                     let ident: Ident = input.parse()?;
                     fix = Some(ident);
                 }
+                "needs_base_files" => {
+                    let lit: LitBool = input.parse()?;
+                    needs_base_files = lit.value();
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -139,6 +146,7 @@ impl Parse for CheckArgs {
             evaluate_exclusion,
             required_files,
             fix,
+            needs_base_files,
         })
     }
 }
@@ -199,6 +207,9 @@ fn parse_access_scope(input: ParseStream<'_>) -> syn::Result<AccessScopeArg> {
 ///   (may fail with a message). The host validates that every returned edit targets
 ///   a file in the fixable set and applies the edits itself — the guest never writes
 ///   the filesystem. Absent ⇒ the check has no fix (a no-op for `checkleft fix`).
+/// - `needs_base_files = true|false` (optional): Set `true` when the check reads
+///   `ChangeSet::base_files` (`base_content_for` / `base_file_content`). Defaults to
+///   `false`, allowing the host to skip reading base revisions when not consumed.
 ///
 /// After annotating all check functions, call `export_checks!(path::to::fn, ...)` once at
 /// the crate root to wire up the component exports.
@@ -219,6 +230,8 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
 
     let check_name = &args.name;
     let description = args.description.as_deref().unwrap_or(check_name);
+
+    let needs_base_files = args.needs_base_files;
 
     let severity_tokens = match args.severity {
         SeverityArg::Error => quote! { ::checkleft_check_sdk::Severity::Error },
@@ -328,6 +341,7 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
                     description: #description.to_owned(),
                     default_severity: #severity_tokens,
                     access_scope: #access_scope_tokens,
+                    needs_base_files: #needs_base_files,
                 }
             }
 
@@ -747,6 +761,7 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                         ::checkleft_check_sdk::AccessScope::DeclaredFiles => W::AccessScope::DeclaredFiles,
                         ::checkleft_check_sdk::AccessScope::Globs(patterns) => W::AccessScope::Globs(patterns),
                     }),
+                    needs_base_files: d.needs_base_files,
                 }
             }
 

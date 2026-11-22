@@ -28,10 +28,12 @@ mod tests {
             description: "An example check for smoke testing.".to_owned(),
             default_severity: types::Severity::Warning,
             access_scope: None,
+            needs_base_files: false,
         };
         assert_eq!(desc.name, "example-check");
         assert_eq!(desc.default_severity, types::Severity::Warning);
         assert!(desc.access_scope.is_none());
+        assert!(!desc.needs_base_files);
     }
 
     #[test]

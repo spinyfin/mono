@@ -395,6 +395,8 @@ pub struct CheckDescriptor {
     pub default_severity: Severity,
     /// `None` means `modified-only`.
     pub access_scope: Option<AccessScope>,
+    /// Whether this check consumes base-revision file contents (`ChangeSet::base_files`).
+    pub needs_base_files: bool,
 }
 
 // ── Internal module used by proc-macro expansions ────────────────────────────

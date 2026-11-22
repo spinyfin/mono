@@ -239,6 +239,9 @@ interface types {
         default-severity: severity,
         /// Declared file-access scope. Absent (`none`) means `modified-only`.
         access-scope: option<access-scope>,
+        /// Whether this check reads base-revision file contents (`change-set.base-files`).
+        /// When `false`, the host skips reading base revisions for this check.
+        needs-base-files: bool,
     }
 
     /// Error variants returned by `run-check`.
