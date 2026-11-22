@@ -3,10 +3,12 @@
 import concurrent.futures
 import fcntl
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 
 COMPLETE = "complete"
@@ -28,23 +30,28 @@ def group_members(group, runtime):
 
 def summarize(pid, command, report):
     """Compact per-thread lines for test.log if undeclared outputs are dropped."""
-    print(f"timeout stacks pid={pid} command={command}", file=sys.stderr, flush=True)
+    prefix = f"timeout stacks pid={pid}"
+    lines = [f"{prefix} command={command}"]
     try:
         text = report.read_text(errors="replace")
     except OSError:
         return
-    printed = 0
+    threads = []
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped:
-            continue
-        if printed == 0 and "Call graph:" not in stripped and "Thread_" not in stripped:
-            continue
-        if "Call graph:" in stripped or "Thread_" in stripped or printed:
-            print(f"timeout stacks   {stripped}", file=sys.stderr, flush=True)
-            printed += 1
-            if printed >= 24:
-                break
+        if re.search(r"\bThread_\w+", stripped):
+            threads.append([stripped])
+        elif stripped.startswith(("Total number", "Sort by", "Binary Images")):
+            break
+        elif threads and stripped:
+            threads[-1].append(stripped)
+    # sample prints callers before leaf frames. Bound each thread separately
+    # so a deep harness wait does not hide the blocked test's name.
+    for thread in threads[:32]:
+        lines.append(f"{prefix} {thread[0]}")
+        lines.extend(f"{prefix}   {frame}" for frame in thread[1:][-4:])
+    sys.stderr.write("\n".join(lines) + "\n")
+    sys.stderr.flush()
 
 
 def capture(pid, command, output, sample_runtime):
@@ -134,6 +141,14 @@ def main():
             capture_to_stderr_only(group, ps_runtime, sample_runtime)
         return
     try:
+        # The wrapper binds this one-shot hook to the supervisor's private
+        # directory; a successor captures normally after this holder dies.
+        hold = os.environ.get("MONO_CAPTURE_TEST_HOLD")
+        if hold and Path(hold).exists():
+            Path(hold).unlink()
+            Path(hold + ".paused").write_text(f"{os.getpid()}\n")
+            while True:
+                time.sleep(0.05)
         members = group_members(group, ps_runtime)
         capture_members(members, output, sample_runtime, group)
         finish_capture(output, lock)

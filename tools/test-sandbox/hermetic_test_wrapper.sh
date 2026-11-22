@@ -35,6 +35,8 @@ bound_hook() {
 }
 hold_before_ready="$(bound_hook "${MONO_WRAPPER_TEST_HOLD_BEFORE_READY:-}")"
 hold_before_setpgid="$(bound_hook "${MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID:-}")"
+capture_hold="$(bound_hook "${MONO_CAPTURE_TEST_HOLD:-}")"
+unset MONO_CAPTURE_TEST_HOLD
 unset MONO_WRAPPER_TEST_HOLD_BEFORE_READY MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID
 
 runtime_root="${TEST_SRCDIR:?}/+test_runtime_repository+test_runtime_tools"
@@ -106,7 +108,7 @@ cancelled=""
 
 capture_child_stacks() {
   if [[ -n "${child_pid}" ]]; then
-    "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
+    MONO_CAPTURE_TEST_HOLD="${capture_hold}" "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
       "${child_pid}" "${runtime_bin}" "${capture_bin}" || \
       printf 'could not capture test thread backtraces for %s\n' "${child_pid}" >&2
   fi
@@ -418,22 +420,23 @@ fi
   canonical_runfile_execs="${TEST_TMPDIR}/runfile-executables"
   "${runtime_bin}/python3" -c \
     'import os, sys
-manifest, runfiles = sys.argv[1:3]
+manifest, runfiles, capture_root = sys.argv[1:4]
+capture_key = os.path.basename(capture_root) + "/"
 if os.path.isfile(manifest):
     for line in open(manifest):
         fields = line.rstrip("\n").split(" ", 1)
-        if len(fields) == 2 and os.access(fields[1], os.X_OK):
+        if len(fields) == 2 and not fields[0].startswith(capture_key) and not fields[1].startswith(capture_root + os.sep) and os.access(fields[1], os.X_OK):
             print(os.path.realpath(fields[1]))
 else:
     for root, dirs, files in os.walk(runfiles):
-        dirs.sort()
+        dirs[:] = sorted(d for d in dirs if os.path.join(root, d) != capture_root)
         for name in sorted(files):
             path = os.path.join(root, name)
             resolved = os.path.realpath(path)
             if os.access(path, os.X_OK) and not resolved.startswith(runfiles + os.sep):
                 print(resolved)' \
     "${RUNFILES_MANIFEST_FILE:-${TEST_SRCDIR}/MANIFEST}" \
-    "${TEST_SRCDIR}" \
+    "${TEST_SRCDIR}" "${capture_root}" \
     >"${canonical_runfile_execs}"
   while IFS= read -r runfile_path; do
     printf '  (allow process-exec (literal "%s"))\n' \
@@ -493,7 +496,7 @@ set -m
 (
   set +m
   trap - EXIT INT TERM HUP
-  exec 8<&- </dev/null >/dev/null 2>&1
+  exec 7>&2 8<&- </dev/null >/dev/null 2>&1
   printf '%s\n' "${wrapper_pid}" >"${TEST_TMPDIR}/watchdog-ready"
   if [[ -n "${hold_before_ready}" ]]; then
     : >"${hold_before_ready}.paused"
@@ -532,7 +535,8 @@ set -m
   if IFS= read -r _ <&9; then
     exit 0
   fi
-  terminate_child_group || true
+  terminate_child_group 2>&7 || true
+  exec 7>&-
   if [[ "${owns_test_tmpdir}" == "1" ]]; then
     "${runtime_bin}/rm" -rf "${test_tmpdir}"
   fi

@@ -35,12 +35,21 @@ assert_no_marker_process() {
 # group is not in the group that was killed.
 run_interruption_case() {
   local signal="$1"
+  local mode="${2:-normal}"
   local inner_pid=""
   local inner_root=""
-  local marker="cleanup-$$-${signal}"
+  local marker="cleanup-$$-${signal}-${mode}"
+  local outputs="${TEST_UNDECLARED_OUTPUTS_DIR:?}/outputs-${marker}"
+  local log="${TEST_TMPDIR}/stderr-${marker}"
+  local hold="${TEST_TMPDIR}/capture-${marker}"
+  mkdir "${outputs}"
+  if [[ "${mode}" == "takeover" ]]; then
+    : >"${hold}"
+  fi
 
   set -m
-  "${wrapper}" "${child}" "${marker}" &
+  TEST_UNDECLARED_OUTPUTS_DIR="${outputs}" MONO_CAPTURE_TEST_HOLD="${hold}" \
+    "${wrapper}" "${child}" "${marker}" 2>"${log}" &
   inner_pid=$!
   set +m
 
@@ -68,6 +77,22 @@ run_interruption_case() {
   fi
 
   read -r child_pid descendant_pid <"${inner_root}/cleanup-child-pids"
+  if [[ "${mode}" == "takeover" ]]; then
+    kill -TERM "${inner_pid}"
+    for _ in {1..400}; do
+      [[ -s "${hold}.paused" ]] && break
+      sleep 0.05
+    done
+    [[ -s "${hold}.paused" ]]
+    local capturer
+    read -r capturer <"${hold}.paused"
+    [[ ! -e "${outputs}/timeout-${child_pid}/complete" ]]
+    # Kill the real lock holder with its wrapper, leaving the test group
+    # alive for the independent watchdog to recapture before cleanup.
+    kill -0 "${capturer}"
+  elif [[ "${mode}" == "dropped" ]]; then
+    rm -rf "${outputs}"
+  fi
   if [[ "${signal}" == "KILL" ]]; then
     kill -KILL -- "-${inner_pid}"
     wait "${inner_pid}" 2>/dev/null || true
@@ -87,15 +112,21 @@ run_interruption_case() {
     wait "${inner_pid}" 2>/dev/null || true
   fi
 
-  if [[ "${signal}" == "TERM" || "${signal}" == "KILL" ]]; then
+  cat "${log}" >&2
+  if [[ "${mode}" == "dropped" ]]; then
+    [[ ! -e "${outputs}" ]]
+    grep -q "timeout stacks pid=${child_pid} .*Thread_" "${log}"
+    grep -q "timeout stacks pid=${descendant_pid} .*Thread_" "${log}"
+  elif [[ "${signal}" == "TERM" || "${signal}" == "KILL" ]]; then
     local pid report
     for pid in "${child_pid}" "${descendant_pid}"; do
-      report="${TEST_UNDECLARED_OUTPUTS_DIR:?}/timeout-${child_pid}/threads-${pid}.txt"
+      report="${outputs}/timeout-${child_pid}/threads-${pid}.txt"
       [[ -s "${report}" ]] || { printf 'missing thread backtraces: %s\n' "${report}" >&2; return 1; }
       grep -q 'Call graph:' "${report}"
       grep -q 'Thread_' "${report}"
       grep -q 'stack capture exit=0' "${report}"
     done
+    [[ -s "${outputs}/timeout-${child_pid}/complete" ]]
   fi
 
   [[ ! -e "${inner_root}" ]] || {
@@ -395,6 +426,8 @@ run_completion_case
 run_interruption_case TERM
 run_interruption_case HUP
 run_interruption_case KILL
+run_interruption_case KILL dropped
+run_interruption_case KILL takeover
 run_startup_kill_case
 run_pre_setpgid_case TERM
 run_pre_setpgid_case HUP

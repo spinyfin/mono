@@ -144,6 +144,21 @@ fn absolute_host_executables_are_denied() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn wrapper_only_sampler_cannot_be_executed() {
+    let runfiles = env::var_os("TEST_SRCDIR").unwrap();
+    let sampler = Path::new(&runfiles).join("+test_runtime_repository+timeout_capture_tools/bin/sample");
+    assert!(sampler.exists(), "wrapper sampler must be present for this guard");
+    for path in [sampler.as_path(), Path::new("/usr/bin/sample")] {
+        let error = Command::new(path)
+            .arg("--help")
+            .output()
+            .expect_err("wrapper-only sampler escaped the executable boundary");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{}: {error}", path.display());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn keychain_files_and_securityd_ipc_are_denied() {
     let error = File::open("/Library/Keychains/System.keychain")
         .expect_err("the test sandbox exposed a host Keychain database");

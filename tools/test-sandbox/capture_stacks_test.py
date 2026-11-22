@@ -1,5 +1,7 @@
 """Failure-path coverage for diagnostics that must never signal the test."""
 
+import contextlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -36,6 +38,25 @@ class CaptureTest(unittest.TestCase):
             report = (Path(directory) / "threads-11.txt").read_text()
             self.assertIn("partial thread backtrace", report)
             self.assertIn("stack capture unavailable:", report)
+
+    def test_summary_includes_later_threads_after_a_deep_harness_stack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "threads.txt"
+            report.write_text(
+                "Call graph:\n    10 Thread_1: libtest\n"
+                + "".join(f"  harness_frame_{i}\n" for i in range(40))
+                + "    10 Thread_2: blocked_test\n  caller\n  mutex_wait_leaf\n"
+                + "Total number in stack: 1\nBinary Images:\nmetadata\n"
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                capture_stacks.summarize(11, "test", report)
+            lines = stderr.getvalue().splitlines()
+            self.assertTrue(all(line.startswith("timeout stacks pid=11 ") for line in lines))
+            self.assertIn("Thread_2: blocked_test", stderr.getvalue())
+            self.assertIn("mutex_wait_leaf", stderr.getvalue())
+            self.assertNotIn("metadata", stderr.getvalue())
+            self.assertLess(len(lines), 12)
 
     def run_main(self, directory, capture, members=None):
         if members is None:
@@ -122,6 +143,10 @@ class CaptureTest(unittest.TestCase):
             finally:
                 holder.kill()
                 holder.wait()
+            with patch.object(capture_stacks, "capture") as capture:
+                self.run_main(directory, capture)
+            self.assertEqual(capture.call_count, 2)
+            self.assertTrue((output / capture_stacks.COMPLETE).exists())
 
     def test_missing_undeclared_dir_is_not_recreated(self):
         missing = Path(tempfile.mkdtemp()) / "gone"
