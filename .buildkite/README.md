@@ -24,7 +24,8 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     release-release.sh     # shared release tool prebuilt-binary release
     ci-env.sh              # shared env/toolchain setup sourced by other steps
     bazel-server-lock.sh   # stops a bazel server an earlier job left holding the command lock (sourced by ci-env.sh)
-    fetch-boss-tags.sh     # fetches and prunes boss-v* tags from origin (sourced by ci-env.sh)
+    fetch-boss-tags.sh     # fetches and prunes boss-v* tags from origin, with bounded retries (sourced by ci-env.sh)
+    verify-boss-tag-cache.sh # opt-in sequential cache comparison on two macOS bazel-any agents
     remote-execution.sh    # decides whether a step's bazel actions execute on remote workers (sourced by ci-env.sh)
     integrity-commit-delta.sh # mono-integrity: commit-delta check
     integrity-bazel.sh        # mono-integrity: full bazel build + test
@@ -47,6 +48,10 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 - `boss-release` (main branch only) explicitly `depends_on` all three so a release only happens once bazel, checks, and the mac app build have all gone green.
 
 ## Step details
+
+### `verify-boss-tag-cache.sh`
+
+CI operators can set `BOSS_VERIFY_TAG_CACHE=1` when creating a build of a specific commit to enable two sequential diagnostic steps on `arbitrary-1-any` and `determinist-1-any`. Both use the normal CI cache configuration, print the derived workspace status, and build and test the version-dependent CLI. Each uploads workspace status, Bazel execution logs, and profiles as artifacts; compare these alongside the action-cache counts and cached-test results in the job logs. These diagnostic steps are skipped in ordinary builds.
 
 ### `ci-env.sh`
 

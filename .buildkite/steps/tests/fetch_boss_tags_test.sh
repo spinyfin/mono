@@ -98,15 +98,55 @@ if ci_fetch_boss_tags "${tmpdir}/agent" "file://${tmpdir}/nonexistent.git" >/dev
   fail "expected ci_fetch_boss_tags to fail on unreachable remote"
 fi
 
-# 6. ci-env.sh sources fetch-boss-tags.sh and calls ci_fetch_boss_tags before
-#    its first `bazel build`.
+# 6. Exercise the jj bare-store layout with the same stale tags.
+mkdir -p "${tmpdir}/jj-agent/.jj/repo/store"
+git clone --bare "${tmpdir}/origin.git" "${tmpdir}/jj-agent/.jj/repo/store/git" >/dev/null 2>&1
+jj_store="${tmpdir}/jj-agent/.jj/repo/store/git"
+git --git-dir="$jj_store" tag -d boss-v1.0.2 >/dev/null
+git --git-dir="$jj_store" tag -f boss-v1.0.1 "${c2_sha}^" >/dev/null
+git --git-dir="$jj_store" tag boss-v1.0.stale "$c2_sha"
+git --git-dir="$jj_store" tag local-other-v1 "$c2_sha"
+git --git-dir="$jj_store" tag -d other-v2.0.0 >/dev/null
+ci_fetch_boss_tags "${tmpdir}/jj-agent" origin >/dev/null 2>&1
+assert_eq "$c2_sha" "$(git --git-dir="$jj_store" rev-parse refs/tags/boss-v1.0.2)" "jj missing tag fetched"
+assert_eq "$c2_sha" "$(git --git-dir="$jj_store" rev-parse refs/tags/boss-v1.0.1)" "jj moved tag updated"
+if git --git-dir="$jj_store" rev-parse --verify refs/tags/boss-v1.0.stale >/dev/null 2>&1; then
+  fail "jj stale tag should be pruned"
+fi
+if git --git-dir="$jj_store" rev-parse --verify refs/tags/other-v2.0.0 >/dev/null 2>&1; then
+  fail "jj unrelated remote tag should not be fetched"
+fi
+git --git-dir="$jj_store" rev-parse --verify refs/tags/local-other-v1 >/dev/null
+
+# 7. Deterministic transient failures recover; persistent failures stop after
+# three attempts, and success never sleeps or retries again.
+check_retries() (
+  local failures_before_success="$1" expected_attempts="$2" expected_sleeps="$3" expected_status="$4"
+  local attempts=0 sleeps=0 status=0
+  git() {
+    attempts=$((attempts + 1))
+    (( attempts > failures_before_success ))
+  }
+  sleep() { sleeps=$((sleeps + 1)); }
+  ci_fetch_boss_tags "${tmpdir}/agent" origin >/dev/null 2>&1 || status=$?
+  assert_eq "$expected_attempts" "$attempts" "fetch attempts"
+  assert_eq "$expected_sleeps" "$sleeps" "retry sleeps"
+  assert_eq "$expected_status" "$status" "fetch status"
+  (( failures == 0 ))
+)
+check_retries 0 1 0 0 || fail "immediate success"
+check_retries 2 3 2 0 || fail "transient failure recovery"
+check_retries 3 3 2 1 || fail "persistent failure bound"
+
+# 8. Check ordering against the first uncommented Bazel command, including
+# the early Xcode recovery path, rather than an incidental target name.
 env_sh="${workspace}/.buildkite/steps/ci-env.sh"
-fetch_line="$(grep -n 'ci_fetch_boss_tags' "$env_sh" | grep -v '^[0-9]*:[[:space:]]*#' | head -n1 | cut -d: -f1)"
-repobin_line="$(grep -n 'bazel build //tools/repobin:repobin' "$env_sh" | head -n1 | cut -d: -f1)"
-if [[ -z "$fetch_line" || -z "$repobin_line" ]]; then
-  fail "expected both ci_fetch_boss_tags and bazel build //tools/repobin:repobin in ci-env.sh"
-elif (( fetch_line >= repobin_line )); then
-  fail "ci_fetch_boss_tags (line ${fetch_line}) must run before bazel build //tools/repobin:repobin (line ${repobin_line})"
+fetch_line="$(awk '/^[[:space:]]*if ! ci_fetch_boss_tags; then/ { print NR; exit }' "$env_sh")"
+bazel_line="$(awk '/^[[:space:]]*(command[[:space:]]+)?bazel[[:space:]]/ { print NR; exit }' "$env_sh")"
+if [[ -z "$fetch_line" || -z "$bazel_line" ]]; then
+  fail "expected both tag sync and a Bazel invocation in ci-env.sh"
+elif (( fetch_line >= bazel_line )); then
+  fail "tag sync (line ${fetch_line}) must precede the first Bazel invocation (line ${bazel_line})"
 fi
 
 if ((failures > 0)); then

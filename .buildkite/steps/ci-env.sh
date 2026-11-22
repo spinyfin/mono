@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# Sync boss-v* tags before any Bazel command runs so every agent derives the
+# same STABLE_BOSS_BASE_VERSION from tools/boss/installer/workspace-status.sh.
+# shellcheck source=fetch-boss-tags.sh
+source "$(dirname "${BASH_SOURCE[0]}")/fetch-boss-tags.sh"
+echo "--- [ci-env] syncing boss-v* tags from origin"
+if ! ci_fetch_boss_tags; then
+  echo "^^^ +++"
+  echo "[ci-env] error: failed to fetch boss-v* tags from origin (see above). Refusing to run bazel with stale tags that would derive the wrong STABLE_BOSS_BASE_VERSION." >&2
+  exit 1
+fi
+
 OS_TYPE=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 # Size the disk-cache GC cap to this host's disk. .ci.bazelrc sets
@@ -340,17 +351,6 @@ binary_path() {
   [[ -n "${path}" && -f "${path}" ]] || die "could not locate Bazel output for ${target}"
   printf '%s\n' "${path}"
 }
-
-# Sync boss-v* tags before any Bazel command runs so every agent derives the
-# same STABLE_BOSS_BASE_VERSION from tools/boss/installer/workspace-status.sh.
-# shellcheck source=fetch-boss-tags.sh
-source "$(dirname "${BASH_SOURCE[0]}")/fetch-boss-tags.sh"
-echo "--- [ci-env] syncing boss-v* tags from origin"
-if ! ci_fetch_boss_tags; then
-  echo "^^^ +++"
-  echo "[ci-env] error: failed to fetch boss-v* tags from origin (see above). Refusing to run bazel with stale tags that would derive the wrong STABLE_BOSS_BASE_VERSION." >&2
-  exit 1
-fi
 
 # Local cube workspaces get the same bin/ layout from .cube/setup.yaml via
 # tools/repobin/shim/install-workspace-shims.sh (symlinks that build repobin

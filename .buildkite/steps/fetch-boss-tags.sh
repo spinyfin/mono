@@ -30,5 +30,15 @@ ci_fetch_boss_tags() {
     git_cmd=(env "GIT_DIR=${repo_dir}/.jj/repo/store/git" git)
   fi
 
-  "${git_cmd[@]}" fetch --prune --no-tags "$remote" '+refs/tags/boss-v*:refs/tags/boss-v*'
+  local attempt
+  for attempt in 1 2 3; do
+    if "${git_cmd[@]}" fetch --prune --no-tags "$remote" '+refs/tags/boss-v*:refs/tags/boss-v*'; then
+      return 0
+    fi
+    echo "[ci-env] boss-v* tag fetch attempt ${attempt}/3 failed" >&2
+    if (( attempt < 3 )); then
+      sleep "$attempt"
+    fi
+  done
+  return 1
 }
