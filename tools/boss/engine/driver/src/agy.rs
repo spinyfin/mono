@@ -70,8 +70,8 @@ pub use home::{
     contains_agy_transcripts,
 };
 use home::{
-    agent_rules_path_for_run, agy_homes_root, control_dir_for_run, log_file_for_run, process_home_for_run,
-    provision_agy_home, read_workspace_path_stamp, session_settings_path_for_run,
+    agy_homes_root, control_dir_for_run, log_file_for_run, process_home_for_run, provision_agy_home_with_kind,
+    read_workspace_path_stamp, session_settings_path_for_run,
 };
 
 pub use hooks::{
@@ -95,7 +95,8 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     // Per-run `agy` state lives under the Boss-owned process HOME; the
     // initial-prompt launcher lives in that run's `control/` directory.
     // Agent rules go to `<run container>/rules-root/AGENTS.md`, a rules-only
-    // directory passed to agy with --add-dir.
+    // directory passed to agy with --add-dir. A run with no checkout gets
+    // them at the root of its scratch working directory, with no --add-dir.
     config_dir: ".agy",
     agent_rules_filename: "AGENTS.md",
     initial_prompt_filename: "initial-prompt.txt",
@@ -391,13 +392,29 @@ impl AgentDriver for AgyDriver {
         prompt_text: &str,
         run_id: &str,
     ) -> anyhow::Result<Option<DriverRuntimeState>> {
+        self.provision_workspace_with_kind(workspace, prompt_text, run_id, crate::ExecutionWorkspaceKind::Cube)
+            .await
+    }
+
+    /// A scratch working directory (a run with no cube checkout) is recorded
+    /// at provisioning: it changes where the worker rules are delivered and
+    /// which directories the CLI is told are its workspace. See
+    /// [`home::rules_add_dir`].
+    async fn provision_workspace_with_kind(
+        &self,
+        workspace: &Path,
+        prompt_text: &str,
+        run_id: &str,
+        kind: crate::ExecutionWorkspaceKind,
+    ) -> anyhow::Result<Option<DriverRuntimeState>> {
         let (workspace_owned, prompt_owned, run_id_owned) =
             (workspace.to_path_buf(), prompt_text.to_owned(), run_id.to_owned());
-        let runtime =
-            tokio::task::spawn_blocking(move || provision_agy_home(&workspace_owned, &prompt_owned, &run_id_owned))
-                .await
-                .context("agy workspace provisioning task did not complete")?
-                .with_context(|| format!("provisioning Boss-owned agy HOME for run_id {run_id:?}"))?;
+        let runtime = tokio::task::spawn_blocking(move || {
+            provision_agy_home_with_kind(&workspace_owned, &prompt_owned, &run_id_owned, kind)
+        })
+        .await
+        .context("agy workspace provisioning task did not complete")?
+        .with_context(|| format!("provisioning Boss-owned agy HOME for run_id {run_id:?}"))?;
         Ok(Some(runtime.to_driver_runtime_state()))
     }
 
@@ -560,9 +577,12 @@ impl AgentDriver for AgyDriver {
     }
 
     /// Route Boss worker rules to `<rules-root>/AGENTS.md` under the per-run
-    /// container, added to the CLI workspace with `--add-dir`.
-    fn agent_rules_destination(&self, _workspace: &Path, run_id: &str) -> PathBuf {
-        agent_rules_path_for_run(run_id)
+    /// container, added to the CLI workspace with `--add-dir`. A run in a
+    /// scratch working directory gets them at that directory's root instead,
+    /// so the rules root never becomes a workspace directory the agent could
+    /// work from (see [`home::rules_add_dir`]).
+    fn agent_rules_destination(&self, workspace: &Path, run_id: &str) -> PathBuf {
+        home::agent_rules_path(workspace, run_id)
             .unwrap_or_else(|_| agy_homes_root().join("unknown-run").join("rules-root/AGENTS.md"))
     }
 
@@ -746,6 +766,7 @@ mod tests {
         }
     }
 
+    use super::home::{agent_rules_path_for_run, provision_agy_home};
     use super::test_environment::{env_for_provision, env_for_provision_with_home_override};
 
     #[test]
@@ -1682,6 +1703,39 @@ mod tests {
             .unwrap();
         let input = permission_input(tmp, run_id, workspace);
         driver.write_permission_config(&input, tmp.path()).await.unwrap()
+    }
+
+    /// A run with no cube checkout launches with its scratch directory as the
+    /// CLI's only workspace directory and reads its rules from there.
+    #[tokio::test]
+    async fn scratch_run_launches_without_the_rules_root_in_the_cli_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = env_for_provision(&tmp.path().join("homes"));
+        let run_id = "run-agy-scratch-1";
+        let scratch = tmp.path().join("boss-progression-scratch").join(run_id);
+        fs::create_dir_all(&scratch).unwrap();
+        let driver = AgyDriver::default();
+        driver
+            .provision_workspace_with_kind(&scratch, "the brief", run_id, crate::ExecutionWorkspaceKind::Scratch)
+            .await
+            .unwrap();
+        let mut input = permission_input(&tmp, run_id, scratch.clone());
+        input.worker_kind = crate::WorkerKind::Progression;
+        let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
+
+        let rules = driver.agent_rules_destination(&scratch, run_id);
+        assert_eq!(rules, scratch.join("AGENTS.md"));
+
+        let plan = driver.spawn_invocation(spawn_request("gemini-4-hydrogen-medium", Some("medium"), Some(run_id)));
+        let command = crate::apply_permission_extra_args(&plan.command, &artifacts.extra_args);
+        assert!(command.contains("'--log-file'"), "{command}");
+        assert!(command.contains("'--settings'"), "{command}");
+        assert!(!command.contains("--add-dir"), "{command}");
+        assert!(!command.contains("rules-root"), "{command}");
+        assert_eq!(
+            read_workspace_path_stamp(&control_dir_for_run(run_id).unwrap()).unwrap(),
+            fs::canonicalize(&scratch).unwrap()
+        );
     }
 
     #[tokio::test]

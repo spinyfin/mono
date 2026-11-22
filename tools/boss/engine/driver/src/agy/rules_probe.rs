@@ -10,8 +10,9 @@ use anyhow::{Context, ensure};
 use boss_ssh_transport::shell_quote;
 
 use super::environment::{AgyProcessEnvironment, run_agy_bounded};
-use super::home::{agent_rules_path_for_run, provision_agy_home};
+use super::home::{agent_rules_path, provision_agy_home_with_kind};
 use super::probe_isolation;
+use crate::ExecutionWorkspaceKind;
 
 fn verify_response(stdout: &[u8], canary: &str, attempts: &[u8], started: bool) -> anyhow::Result<()> {
     ensure!(
@@ -29,12 +30,15 @@ fn verify_response(stdout: &[u8], canary: &str, attempts: &[u8], started: bool) 
     Ok(())
 }
 
-/// Provision the production layout and measure automatic `--add-dir` rule loading.
+/// Provision the production layout and measure automatic rule loading: from
+/// the `--add-dir` rules root for a cube checkout, and from the working
+/// directory's own `AGENTS.md` for a scratch directory, which is launched with
+/// no `--add-dir`.
 /// The caller must select a fresh homes root before starting any threads.
-pub fn run(evidence: &Path) -> anyhow::Result<()> {
+pub fn run(evidence: &Path, kind: ExecutionWorkspaceKind) -> anyhow::Result<()> {
     let workspace = evidence.join("workspace");
     fs::create_dir(&workspace)?;
-    let runtime = provision_agy_home(&workspace, "unused", "rules-probe")?;
+    let runtime = provision_agy_home_with_kind(&workspace, "unused", "rules-probe", kind)?;
     let canary = format!(
         "AGY_RULES_{:032x}",
         std::time::SystemTime::now()
@@ -42,7 +46,7 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
             .as_nanos()
     );
     fs::write(
-        agent_rules_path_for_run("rules-probe")?,
+        agent_rules_path(&workspace, "rules-probe")?,
         format!("When asked for the rules canary, respond with exactly {canary} and nothing else. Never use tools.\n"),
     )?;
     let attempts = evidence.join("tool-attempts.log");

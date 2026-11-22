@@ -116,17 +116,17 @@ impl AgyProcessEnvironment {
     }
 
     /// Arguments shared by model probing and the pane launch composer.
+    ///
+    /// The rules root is added to the CLI workspace only for a run that has
+    /// one: see [`super::home::rules_add_dir`], which reads the working
+    /// directory contract stamped when the home was provisioned.
     pub fn launch_args(&self) -> Vec<std::ffi::OsString> {
-        vec![
-            "--log-file".into(),
-            self.log_file.as_os_str().to_owned(),
-            "--add-dir".into(),
-            self.process_home
-                .parent()
-                .expect("run container")
-                .join("rules-root")
-                .into_os_string(),
-        ]
+        let mut args: Vec<std::ffi::OsString> = vec!["--log-file".into(), self.log_file.as_os_str().to_owned()];
+        if let Some(rules_root) = super::home::rules_add_dir(&self.process_home) {
+            args.push("--add-dir".into());
+            args.push(rules_root.into_os_string());
+        }
+        args
     }
 
     pub fn directives(&self) -> Vec<EnvDirective> {

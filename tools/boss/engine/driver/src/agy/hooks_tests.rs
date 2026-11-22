@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
-use super::super::home::{process_home_for_run, provision_agy_home};
+use super::super::home::{process_home_for_run, provision_agy_home_with_kind};
 use super::super::test_environment::{EnvGuard, env_for_provision};
+use crate::ExecutionWorkspaceKind;
 
 struct Fixture {
     tmp: TempDir,
@@ -27,12 +28,16 @@ fn approve_guard() -> &'static str {
 
 impl Fixture {
     fn new(run_id: &str) -> Self {
+        Self::with_workspace_kind(run_id, ExecutionWorkspaceKind::Cube)
+    }
+
+    fn with_workspace_kind(run_id: &str, kind: ExecutionWorkspaceKind) -> Self {
         let tmp = TempDir::new().unwrap();
         let homes = tmp.path().join("homes");
         let workspace = tmp.path().join("ws");
         fs::create_dir_all(&workspace).unwrap();
         let guard = env_for_provision(&homes);
-        provision_agy_home(&workspace, "prompt", run_id).unwrap();
+        provision_agy_home_with_kind(&workspace, "prompt", run_id, kind).unwrap();
         let process_home = process_home_for_run(run_id).unwrap();
         let forwarder = tmp.path().join("boss-event");
         write_exec(&forwarder, "#!/bin/sh\ncat >/dev/null\n");
@@ -803,3 +808,6 @@ mod protected_operand_tests;
 
 #[path = "scratch_and_quoting_tests.rs"]
 mod scratch_and_quoting_tests;
+
+#[path = "scratch_workspace_tests.rs"]
+mod scratch_workspace_tests;

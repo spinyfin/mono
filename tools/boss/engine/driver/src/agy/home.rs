@@ -6,6 +6,7 @@
 //! keychain file is the deliberate credential exception, bridged through
 //! [`crate::scoped_home`].
 
+use crate::ExecutionWorkspaceKind;
 use crate::scoped_home::trust_path_variants;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -166,6 +167,11 @@ const RULES_ROOT_LEAF: &str = "rules-root";
 /// (live rules-discovery probe, `agy` 1.5.9).
 const RULES_FILENAME: &str = "AGENTS.md";
 const WORKSPACE_PATH_FILENAME: &str = "boss-workspace-path";
+/// Records which filesystem contract dispatch gave the run's working
+/// directory, so the stateless spawn and rules seams agree with provisioning.
+const WORKSPACE_KIND_FILENAME: &str = "boss-workspace-kind";
+const SCRATCH_KIND_STAMP: &str = "scratch";
+const CUBE_KIND_STAMP: &str = "cube";
 
 const ONBOARDING_JSON: &str = r#"{"consumerOnboardingComplete": true, "enterpriseOnboardingComplete": false, "onboardingComplete": true}
 "#;
@@ -340,6 +346,61 @@ pub fn agent_rules_path_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
         .join(RULES_FILENAME))
 }
 
+/// The contract of the run's working directory, as stamped at provisioning.
+///
+/// A run that was never stamped (or whose stamp is unreadable) is treated as
+/// a cube checkout: that is the layout every run had before the stamp existed,
+/// and both seams that read it ([`agent_rules_path`] and [`rules_add_dir`])
+/// fall the same way, so the rules file and the launch arguments never
+/// disagree.
+pub fn read_workspace_kind(control_dir: &Path) -> ExecutionWorkspaceKind {
+    match fs::read_to_string(control_dir.join(WORKSPACE_KIND_FILENAME)) {
+        Ok(raw) if raw.trim() == SCRATCH_KIND_STAMP => ExecutionWorkspaceKind::Scratch,
+        _ => ExecutionWorkspaceKind::Cube,
+    }
+}
+
+fn write_workspace_kind(control_dir: &Path, kind: ExecutionWorkspaceKind) -> anyhow::Result<()> {
+    let path = control_dir.join(WORKSPACE_KIND_FILENAME);
+    let stamp = match kind {
+        ExecutionWorkspaceKind::Cube => CUBE_KIND_STAMP,
+        ExecutionWorkspaceKind::Scratch => SCRATCH_KIND_STAMP,
+    };
+    fs::write(&path, format!("{stamp}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The directory to pass to the CLI with `--add-dir` so it loads the Boss
+/// worker rules, or `None` when the rules live in the working directory.
+///
+/// `--add-dir` makes its argument one of the agent's workspace directories.
+/// In a cube checkout that is harmless: the checkout is where the work is, and
+/// the agent runs its commands there. A scratch working directory is empty, so
+/// the rules root would be the only workspace directory with anything in it and
+/// the agent runs its commands from there instead — a directory the PreToolUse
+/// hook protects, so every command is denied. A scratch run therefore gets no
+/// extra workspace directory at all.
+pub fn rules_add_dir(process_home: &Path) -> Option<PathBuf> {
+    let container = process_home.parent()?;
+    match read_workspace_kind(&container.join(CONTROL_LEAF)) {
+        ExecutionWorkspaceKind::Cube => Some(container.join(RULES_ROOT_LEAF)),
+        ExecutionWorkspaceKind::Scratch => None,
+    }
+}
+
+/// Where the Boss worker rules for `run_id` are written.
+///
+/// A cube checkout must not receive a Boss file, so its rules go to the
+/// rules-only directory added with `--add-dir`. A scratch working directory is
+/// engine-owned, holds nothing else and is the agent's only workspace
+/// directory, so the rules go to `AGENTS.md` at its root, where the CLI loads
+/// them as it does for any workspace root.
+pub fn agent_rules_path(workspace: &Path, run_id: &str) -> anyhow::Result<PathBuf> {
+    match read_workspace_kind(&control_dir_for_run(run_id)?) {
+        ExecutionWorkspaceKind::Cube => agent_rules_path_for_run(run_id),
+        ExecutionWorkspaceKind::Scratch => Ok(workspace.join(RULES_FILENAME)),
+    }
+}
+
 pub fn workspace_path_stamp(control_dir: &Path) -> PathBuf {
     control_dir.join(WORKSPACE_PATH_FILENAME)
 }
@@ -424,8 +485,19 @@ fn render_provision_hooks_json() -> String {
 // Provision
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<AgyRuntimeState> {
-    provision_home(workspace, prompt_text, run_id, true)
+    provision_agy_home_with_kind(workspace, prompt_text, run_id, ExecutionWorkspaceKind::Cube)
+}
+
+/// Provision for the working-directory contract dispatch selected.
+pub fn provision_agy_home_with_kind(
+    workspace: &Path,
+    prompt_text: &str,
+    run_id: &str,
+    kind: ExecutionWorkspaceKind,
+) -> anyhow::Result<AgyRuntimeState> {
+    provision_home(workspace, prompt_text, run_id, kind, true)
 }
 
 /// Probes sharing a homes root hold an exclusive file lock while using this
@@ -434,13 +506,20 @@ pub(super) const QUOTA_PROBE_RUN_ID: &str = "quota-probe";
 
 /// The quota command itself exercises authentication; avoid a redundant models request.
 pub(super) fn provision_quota_home(workspace: &Path) -> anyhow::Result<AgyRuntimeState> {
-    provision_home(workspace, "unused", QUOTA_PROBE_RUN_ID, false)
+    provision_home(
+        workspace,
+        "unused",
+        QUOTA_PROBE_RUN_ID,
+        ExecutionWorkspaceKind::Cube,
+        false,
+    )
 }
 
 fn provision_home(
     workspace: &Path,
     prompt_text: &str,
     run_id: &str,
+    kind: ExecutionWorkspaceKind,
     probe_models: bool,
 ) -> anyhow::Result<AgyRuntimeState> {
     let container = agy_run_container_for_run(run_id)?;
@@ -496,6 +575,8 @@ fn provision_home(
         format!("{}\n", workspace_abs.display()),
     )
     .with_context(|| format!("writing {}", workspace_path_stamp(&control_dir).display()))?;
+    // Stamped before the model probe below: its launch arguments depend on it.
+    write_workspace_kind(&control_dir, kind)?;
 
     // A relaunch must observe this CLI's initialization, never an old log.
     match fs::remove_file(&log_file) {
