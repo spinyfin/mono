@@ -87,6 +87,27 @@ impl PrBindingSuspicion {
 const NON_PRIMARY_EXECUTION_KINDS_SQL: &str = "'pr_review', 'pr_review_guide', 'revision_implementation', \
      'ci_remediation', 'conflict_resolution', 'automation_triage', 'answer_agent'";
 
+/// Connection-level form of [`WorkDb::primary_execution_branches`], so a
+/// caller already inside a transaction (`Transaction` derefs to
+/// `Connection`) applies the same work-item branch set.
+pub(crate) fn query_primary_execution_branches(conn: &rusqlite::Connection, work_item_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, branch_naming, worker_branch_prefix FROM work_executions
+         WHERE work_item_id = ?1 AND kind NOT IN ({NON_PRIMARY_EXECUTION_KINDS_SQL})
+         ORDER BY created_at DESC, id DESC"
+    ))?;
+    let rows = stmt.query_map(params![work_item_id], |row| {
+        let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(1)?.as_deref());
+        let prefix = row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty());
+        Ok(boss_engine_storage_values::branch_identity::expected_branch_name(
+            &row.get::<_, String>(0)?,
+            &branch_naming,
+            prefix.as_deref(),
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
 /// Connection-level form of [`WorkDb::other_work_item_bound_to_pr`], so a
 /// caller already inside a transaction (`Transaction` derefs to
 /// `Connection`) applies the same holder policy.
@@ -159,22 +180,7 @@ impl WorkDb {
     /// or bounced-back execution is told to push to its predecessor's branch,
     /// so ownership is decided by work item, not by the latest execution.
     pub fn primary_execution_branches(&self, work_item_id: &str) -> Result<Vec<String>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, branch_naming, worker_branch_prefix FROM work_executions
-             WHERE work_item_id = ?1 AND kind NOT IN ({NON_PRIMARY_EXECUTION_KINDS_SQL})
-             ORDER BY created_at DESC, id DESC"
-        ))?;
-        let rows = stmt.query_map(params![work_item_id], |row| {
-            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(1)?.as_deref());
-            let prefix = row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty());
-            Ok(boss_engine_storage_values::branch_identity::expected_branch_name(
-                &row.get::<_, String>(0)?,
-                &branch_naming,
-                prefix.as_deref(),
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        query_primary_execution_branches(&*self.connect()?, work_item_id)
     }
 
     /// The id of a different non-revision work item (in any status, including

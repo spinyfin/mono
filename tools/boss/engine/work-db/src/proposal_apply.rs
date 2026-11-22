@@ -1016,15 +1016,32 @@ fn apply_pr_created(
     }
 
     if let Some(branch) = payload.branch.as_deref() {
-        let expected = boss_engine_storage_values::branch_identity::expected_branch_name(
+        let mut branches = vec![boss_engine_storage_values::branch_identity::expected_branch_name(
             execution_id,
             &execution.branch_naming,
             execution.worker_branch_prefix.as_deref(),
-        );
-        if !boss_engine_storage_values::branch_identity::branches_identify_same_work_item(branch, &expected) {
+        )];
+        match super::pr_binding::query_primary_execution_branches(tx, &execution.work_item_id) {
+            Ok(others) => {
+                for other in others {
+                    if !branches.contains(&other) {
+                        branches.push(other);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "pr_created: work-item branch lookup failed; verifying the declared branch \
+                     against this execution's branch only",
+                );
+            }
+        }
+        if !boss_engine_storage_values::branch_identity::head_identifies_any_branch(branch, &branches) {
             return Ok(ApplyDecision::Rejected(format!(
-                "branch `{branch}` does not identify this execution's work item (expected a branch \
-                 matching `{expected}`)"
+                "branch `{branch}` does not identify this work item (not a primary execution \
+                 branch of the task)"
             )));
         }
     }

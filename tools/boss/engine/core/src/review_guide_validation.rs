@@ -7,7 +7,7 @@
 //! orchestration — load the owned submission from storage, validate it here,
 //! hand the verdict back — for the three paths that accept a guide:
 //!
-//! - live submission ([`submit_worker_proposal`]), where storage judges the
+//! - live submission ([`submit_worker_proposal_with_flags`]), where storage judges the
 //!   verdict inside the proposal transaction after its attempt-state checks;
 //! - the finalizer, which re-validates the stored body through
 //!   [`validate_at_workspace`] before publishing it;
@@ -54,16 +54,11 @@ pub(crate) fn validate_at_workspace(
 /// large packet read and the `git` calls hold no lock; storage then refuses
 /// the submission, storing nothing, if the attempt is not running or the
 /// comparison changed while validation ran.
-pub fn submit_worker_proposal(
-    db: &WorkDb,
-    input: SubmitWorkerProposalInput<'_>,
-) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-    submit_worker_proposal_with_flags(db, input, false)
-}
-
-/// See [`submit_worker_proposal`]. `pr_created_proposals_seam_enabled` is
-/// the caller's composed `worker_proposals && pr_created_proposals_seam`
-/// value; only `apply_pr_created` reads it.
+///
+/// `pr_created_proposals_seam_enabled` is the caller's composed
+/// `worker_proposals && pr_created_proposals_seam` value; only
+/// `apply_pr_created` reads it. Production callers pass the live composed
+/// flag; tests that want the pre-migration apply behaviour pass `false`.
 pub fn submit_worker_proposal_with_flags(
     db: &WorkDb,
     input: SubmitWorkerProposalInput<'_>,
@@ -206,7 +201,7 @@ mod tests {
         comparison_id: &str,
         body: &str,
     ) -> Result<std::result::Result<SubmitWorkerProposalOutcome, ProposalSubmissionError>> {
-        submit_worker_proposal(
+        submit_worker_proposal_with_flags(
             db,
             SubmitWorkerProposalInput {
                 execution_id,
@@ -215,6 +210,7 @@ mod tests {
                 payload_json: &serde_json::json!({ "body_markdown": body }).to_string(),
                 idempotency_key: "guide",
             },
+            false,
         )
     }
 
@@ -267,7 +263,7 @@ mod tests {
         let (_dir, db) = open_db();
         let (execution, comparison, _attempt) = running_guide(&db, "/tmp/ws");
 
-        let outcome = submit_worker_proposal(
+        let outcome = submit_worker_proposal_with_flags(
             &db,
             SubmitWorkerProposalInput {
                 execution_id: &execution,
@@ -276,6 +272,7 @@ mod tests {
                 payload_json: r#"{"reason":"waiting on CI","duration_secs":60}"#,
                 idempotency_key: "wait",
             },
+            false,
         )
         .unwrap();
 

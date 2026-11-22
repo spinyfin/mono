@@ -2516,6 +2516,41 @@ mod tests {
         assert_eq!(outcome.proposal.state, ProposalState::Applied);
     }
 
+    /// A resumed execution is told to push to its predecessor's branch.
+    /// Declaring that branch must apply — the same work-item branch set the
+    /// staged-URL completion path accepts.
+    #[test]
+    fn pr_created_applies_when_the_supplied_branch_is_a_predecessor_execution_branch() {
+        let (_dir, db) = open_db();
+        let (execution_id, chore_id) = execution_for_new_chore(&db, "Cleanup");
+        let predecessor = db
+            .create_execution(
+                boss_protocol::CreateExecutionInput::builder()
+                    .work_item_id(&chore_id)
+                    .kind(boss_protocol::ExecutionKind::ChoreImplementation)
+                    .status(boss_protocol::ExecutionStatus::Completed)
+                    .build(),
+            )
+            .unwrap();
+        let predecessor_branch = boss_engine_storage_values::branch_identity::expected_branch_name(
+            &predecessor.id,
+            &predecessor.branch_naming,
+            predecessor.worker_branch_prefix.as_deref(),
+        );
+
+        let outcome = submit(
+            &db,
+            &execution_id,
+            &chore_id,
+            ProposalKind::PrCreated,
+            &format!(r#"{{"pr_url":"https://github.com/spinyfin/mono/pull/42","branch":"{predecessor_branch}"}}"#),
+            "key-1",
+        )
+        .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+    }
+
     /// A declaration must not replace an existing binding. Rejecting it keeps
     /// the durable proposal state aligned with the completion reader, which
     /// must never finalize against a URL the applier declined to bind. This

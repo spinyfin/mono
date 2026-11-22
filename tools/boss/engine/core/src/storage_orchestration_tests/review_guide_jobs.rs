@@ -63,7 +63,7 @@ fn submit_guide(
     comparison_id: &str,
 ) -> std::result::Result<crate::work::SubmitWorkerProposalOutcome, boss_protocol::ProposalSubmissionError> {
     let payload = serde_json::json!({ "body_markdown": RESTART_GUIDE }).to_string();
-    crate::review_guide_validation::submit_worker_proposal(
+    crate::review_guide_validation::submit_worker_proposal_with_flags(
         db,
         crate::work::SubmitWorkerProposalInput {
             execution_id,
@@ -72,6 +72,7 @@ fn submit_guide(
             payload_json: &payload,
             idempotency_key: "guide",
         },
+        false,
     )
     .unwrap()
 }

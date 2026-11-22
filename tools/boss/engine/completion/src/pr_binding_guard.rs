@@ -1,7 +1,8 @@
 //! Foreign-PR guard: the last check before a primary execution binds a PR.
 //!
 //! Branch verification (`stop::verified_staged_pr_url`, the branch-keyed
-//! detector) already guarantees the PR's head is this execution's branch.
+//! detector, and the `pr_created` proposal path) already guarantees the PR's
+//! head is a primary execution branch of this work item.
 //! This guard adds the one structural fact GitHub cannot tell us: whether
 //! the engine has that PR bound to a *different* work item already. A PR
 //! that belongs to another row can never be this execution's deliverable,
@@ -18,6 +19,25 @@ use super::*;
 /// is refused because the PR it resolved to is already bound to another
 /// work item.
 pub const FOREIGN_PR_REFUSED_ATTENTION_KIND: &str = "foreign_pr_binding_refused";
+
+/// Result of the per-candidate association check shared by the staged-URL
+/// path and the `pr_created` proposal path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PrUrlDeliverable {
+    /// The URL belongs to this execution: a revision bound-PR match, or a
+    /// primary whose head identifies any work-item branch.
+    Associated {
+        /// PR `headRefName` for a primary execution. `None` for revisions,
+        /// which match by bound-URL equality without a GitHub fetch.
+        head_ref: Option<String>,
+    },
+    /// Definitive mismatch: the URL is not this work item's PR.
+    Unassociated,
+    /// Could not decide (fetch error, or a revision with no resolved bound
+    /// PR). The staged path keeps the candidate for retry; the proposal
+    /// path falls through to the ladder.
+    Undecided,
+}
 
 /// A PR this execution verified as its own that the engine nonetheless has
 /// bound to a different work item.
@@ -165,6 +185,83 @@ impl WorkerCompletionHandler {
             ),
         }
         branches
+    }
+
+    /// Per-candidate association used by both [`Self::verified_staged_pr_url`]
+    /// and the `pr_created` proposal path. A URL belongs to this execution
+    /// when a revision's URL equals the resolved chain-root bound PR, or a
+    /// primary's PR head identifies any primary-execution branch of the work
+    /// item (this execution or a predecessor).
+    pub(super) async fn check_pr_url_deliverable(
+        &self,
+        execution: &crate::work::WorkExecution,
+        pr_url: &str,
+        log_ctx: &str,
+    ) -> PrUrlDeliverable {
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            return match self.resolve_bound_pr_url(execution) {
+                Some(bound_url) if bound_url == pr_url => PrUrlDeliverable::Associated { head_ref: None },
+                Some(bound_url) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        proposed_pr_url = %pr_url,
+                        bound_pr_url = %bound_url,
+                        "{log_ctx}: PR URL does not match the revision's bound chain-root PR",
+                    );
+                    PrUrlDeliverable::Unassociated
+                }
+                None => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        proposed_pr_url = %pr_url,
+                        "{log_ctx}: revision has no resolved bound PR; cannot verify the URL",
+                    );
+                    PrUrlDeliverable::Undecided
+                }
+            };
+        }
+
+        let work_item_branches = self.work_item_branches(execution);
+        let Ok(repo_slug) = parse_repo_slug(&execution.repo_remote_url) else {
+            tracing::warn!(
+                execution_id = %execution.id,
+                "{log_ctx}: cannot parse repo slug",
+            );
+            return PrUrlDeliverable::Unassociated;
+        };
+        let Some(pr_number) = pr_number_from_url(pr_url) else {
+            tracing::warn!(
+                execution_id = %execution.id,
+                proposed_pr_url = %pr_url,
+                "{log_ctx}: cannot parse PR number from URL",
+            );
+            return PrUrlDeliverable::Unassociated;
+        };
+        match self.branch_verifier.fetch_pr_head_ref(&repo_slug, pr_number).await {
+            Ok(head_ref) if head_identifies_any_branch(&head_ref, &work_item_branches) => {
+                PrUrlDeliverable::Associated {
+                    head_ref: Some(head_ref),
+                }
+            }
+            Ok(head_ref) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    proposed_pr_url = %pr_url,
+                    proposed_pr_branch = %head_ref,
+                    "{log_ctx}: PR head branch is not a primary execution branch of this work item",
+                );
+                PrUrlDeliverable::Unassociated
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    proposed_pr_url = %pr_url,
+                    ?err,
+                    "{log_ctx}: branch verification failed",
+                );
+                PrUrlDeliverable::Undecided
+            }
+        }
     }
 
     /// `Some(conflict)` when `pr_url` is already bound to a non-revision work
