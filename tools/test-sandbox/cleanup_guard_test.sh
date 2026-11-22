@@ -1,6 +1,7 @@
 #!/bin/bash
 
-set -euo pipefail
+set -eEuo pipefail
+trap 'printf "cleanup assertion failed at line %s: %s\n" "${LINENO}" "${BASH_COMMAND}" >&2' ERR
 
 if [[ "${OSTYPE:-}" != darwin* ]]; then
   exit 0
@@ -34,12 +35,21 @@ assert_no_marker_process() {
 # group is not in the group that was killed.
 run_interruption_case() {
   local signal="$1"
+  local mode="${2:-normal}"
   local inner_pid=""
   local inner_root=""
-  local marker="cleanup-$$-${signal}"
+  local marker="cleanup-$$-${signal}-${mode}"
+  local outputs="${TEST_UNDECLARED_OUTPUTS_DIR:?}/outputs-${marker}"
+  local log="${TEST_TMPDIR}/stderr-${marker}"
+  local hold="${TEST_TMPDIR}/capture-${marker}"
+  mkdir "${outputs}"
+  if [[ "${mode}" == "takeover" ]]; then
+    : >"${hold}"
+  fi
 
   set -m
-  "${wrapper}" "${child}" "${marker}" &
+  TEST_UNDECLARED_OUTPUTS_DIR="${outputs}" MONO_CAPTURE_TEST_HOLD="${hold}" \
+    "${wrapper}" "${child}" "${marker}" 2>"${log}" &
   inner_pid=$!
   set +m
 
@@ -49,7 +59,7 @@ run_interruption_case() {
   for _ in {1..400}; do
     for candidate in /private/tmp/mono-test.*; do
       if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/cleanup-child-marker" ]]; then
-        read -r candidate_marker <"${candidate}/cleanup-child-marker"
+        read -r candidate_marker <"${candidate}/cleanup-child-marker" || continue
         if [[ "${candidate_marker}" == "${marker}" ]]; then
           inner_root="${candidate}"
           break 2
@@ -67,6 +77,22 @@ run_interruption_case() {
   fi
 
   read -r child_pid descendant_pid <"${inner_root}/cleanup-child-pids"
+  if [[ "${mode}" == "takeover" ]]; then
+    kill -TERM "${inner_pid}"
+    for _ in {1..400}; do
+      [[ -s "${hold}.paused" ]] && break
+      sleep 0.05
+    done
+    [[ -s "${hold}.paused" ]]
+    local capturer
+    read -r capturer <"${hold}.paused"
+    [[ ! -e "${outputs}/timeout-${child_pid}/complete" ]]
+    # Kill the real lock holder with its wrapper, leaving the test group
+    # alive for the independent watchdog to recapture before cleanup.
+    kill -0 "${capturer}"
+  elif [[ "${mode}" == "dropped" ]]; then
+    rm -rf "${outputs}"
+  fi
   if [[ "${signal}" == "KILL" ]]; then
     kill -KILL -- "-${inner_pid}"
     wait "${inner_pid}" 2>/dev/null || true
@@ -84,6 +110,23 @@ run_interruption_case() {
   else
     kill "-${signal}" "${inner_pid}"
     wait "${inner_pid}" 2>/dev/null || true
+  fi
+
+  cat "${log}" >&2
+  if [[ "${mode}" == "dropped" ]]; then
+    [[ ! -e "${outputs}" ]]
+    grep -q "timeout stacks pid=${child_pid} .*Thread_" "${log}"
+    grep -q "timeout stacks pid=${descendant_pid} .*Thread_" "${log}"
+  elif [[ "${signal}" == "TERM" || "${signal}" == "KILL" ]]; then
+    local pid report
+    for pid in "${child_pid}" "${descendant_pid}"; do
+      report="${outputs}/timeout-${child_pid}/threads-${pid}.txt"
+      [[ -s "${report}" ]] || { printf 'missing thread backtraces: %s\n' "${report}" >&2; return 1; }
+      grep -q 'Call graph:' "${report}"
+      grep -q 'Thread_' "${report}"
+      grep -q 'stack capture exit=0' "${report}"
+    done
+    [[ -s "${outputs}/timeout-${child_pid}/complete" ]]
   fi
 
   [[ ! -e "${inner_root}" ]] || {
@@ -132,8 +175,12 @@ run_startup_kill_case() {
   for _ in {1..400}; do
     for candidate in /private/tmp/mono-test.*; do
       if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/watchdog-ready" ]]; then
-        read -r owner <"${candidate}/watchdog-ready"
-        owner_pgid="$(ps -o pgid= -p "${owner}" 2>/dev/null | tr -d ' ')"
+        # Another run can remove its root or exit while it is being inspected.
+        # Keep looking for this run; a vanished discovery candidate is not its owner.
+        read -r owner <"${candidate}/watchdog-ready" || continue
+        owner_pgid="$(ps -o pgid= -p "${owner}" 2>/dev/null || true)"
+        owner_pgid="${owner_pgid// /}"
+        [[ -n "${owner_pgid}" ]] || continue
         if [[ "${owner}" == "${inner_pid}" || "${owner_pgid}" == "${inner_pid}" ]]; then
           inner_root="${candidate}"
           break 2
@@ -330,14 +377,19 @@ run_sigint_forwarding_case() {
   local inner_pid=""
   : >"${out}"
   set -m
-  "${wrapper}" /bin/sh -c 'trap "echo got-int" INT; trap "" TERM; while :; do :; done' "${marker}" >"${out}" 2>&1 &
+  "${wrapper}" /bin/sh -c 'trap "echo got-int" INT; trap "" TERM; echo ready; while :; do :; done' "${marker}" >"${out}" 2>&1 &
   inner_pid=$!
   set +m
   for _ in {1..400}; do
-    [[ -n "$(marker_processes "${marker}" | grep -F -- 'while :')" ]] && break
+    grep -q '^ready$' "${out}" && break
     sleep 0.05
   done
-  sleep 0.5
+  grep -q '^ready$' "${out}" || {
+    printf '%s\n' "fixture did not install its SIGINT handler" >&2
+    kill -TERM "${inner_pid}" 2>/dev/null || true
+    wait_bounded "${inner_pid}" "SIGINT readiness" || return 1
+    return 1
+  }
   kill -INT "${inner_pid}"
   wait_bounded "${inner_pid}" "INT forwarding" || return 1
   grep -q got-int "${out}" || {
@@ -345,6 +397,95 @@ run_sigint_forwarding_case() {
     return 1
   }
   assert_no_marker_process "${marker}" "INT"
+}
+
+# Capture must finish while the test is still alive, before any TERM, so a
+# remote executor that SIGKILLs the wrapper at the deadline still has reports
+# in the undeclared-output tree it collects from the live action.
+run_pre_deadline_capture_case() {
+  local inner_pid=""
+  local inner_root=""
+  local marker="cleanup-$$-PREDEADLINE"
+  local outputs="${TEST_UNDECLARED_OUTPUTS_DIR:?}/outputs-${marker}"
+  local log="${TEST_TMPDIR}/stderr-${marker}"
+  mkdir "${outputs}"
+
+  set -m
+  TEST_TIMEOUT=5 TEST_UNDECLARED_OUTPUTS_DIR="${outputs}" \
+    "${wrapper}" "${child}" "${marker}" 2>"${log}" &
+  inner_pid=$!
+  set +m
+
+  for _ in {1..400}; do
+    for candidate in /private/tmp/mono-test.*; do
+      if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/cleanup-child-marker" ]]; then
+        read -r candidate_marker <"${candidate}/cleanup-child-marker" || continue
+        if [[ "${candidate_marker}" == "${marker}" ]]; then
+          inner_root="${candidate}"
+          break 2
+        fi
+      fi
+    done
+    sleep 0.05
+  done
+
+  if [[ -z "${inner_root}" ]]; then
+    kill -TERM "${inner_pid}" 2>/dev/null || true
+    wait "${inner_pid}" 2>/dev/null || true
+    printf '%s\n' "inner wrapper did not start for pre-deadline capture" >&2
+    return 1
+  fi
+
+  read -r child_pid descendant_pid <"${inner_root}/cleanup-child-pids"
+  local report=""
+  for _ in {1..400}; do
+    report="${outputs}/timeout-${child_pid}/complete"
+    if [[ -s "${report}" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  cat "${log}" >&2
+  [[ -s "${outputs}/timeout-${child_pid}/complete" ]] || {
+    printf '%s\n' "pre-deadline capture did not complete while the test was live" >&2
+    kill -TERM "${inner_pid}" 2>/dev/null || true
+    wait "${inner_pid}" 2>/dev/null || true
+    return 1
+  }
+  kill -0 "${child_pid}" 2>/dev/null || {
+    printf '%s\n' "pre-deadline capture ran only after the test had already exited" >&2
+    wait "${inner_pid}" 2>/dev/null || true
+    return 1
+  }
+  grep -q "capturing test thread backtraces before deadline" "${log}"
+  local pid
+  for pid in "${child_pid}" "${descendant_pid}"; do
+    report="${outputs}/timeout-${child_pid}/threads-${pid}.txt"
+    [[ -s "${report}" ]] || {
+      printf 'missing pre-deadline thread backtraces: %s\n' "${report}" >&2
+      kill -TERM "${inner_pid}" 2>/dev/null || true
+      wait "${inner_pid}" 2>/dev/null || true
+      return 1
+    }
+    grep -q 'Call graph:' "${report}"
+    grep -q 'Thread_' "${report}"
+  done
+
+  kill -TERM "${inner_pid}" 2>/dev/null || true
+  wait "${inner_pid}" 2>/dev/null || true
+  for _ in {1..200}; do
+    if [[ ! -e "${inner_root}" ]] && ! kill -0 "${child_pid}" 2>/dev/null &&
+      ! kill -0 "${descendant_pid}" 2>/dev/null &&
+      [[ -z "$(marker_processes "${marker}")" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  [[ ! -e "${inner_root}" ]] || {
+    printf 'sandbox root survived pre-deadline capture: %s\n' "${inner_root}" >&2
+    return 1
+  }
+  assert_no_marker_process "${marker}" "pre-deadline capture"
 }
 
 # A hook path outside the supervisor's private directory must be ignored: the
@@ -374,6 +515,8 @@ run_completion_case
 run_interruption_case TERM
 run_interruption_case HUP
 run_interruption_case KILL
+run_interruption_case KILL dropped
+run_interruption_case KILL takeover
 run_startup_kill_case
 run_pre_setpgid_case TERM
 run_pre_setpgid_case HUP
@@ -383,4 +526,5 @@ run_dead_watchdog_case
 run_cancel_before_ready_case TERM
 run_cancel_before_ready_case HUP
 run_sigint_forwarding_case
+run_pre_deadline_capture_case
 run_unbound_hook_case

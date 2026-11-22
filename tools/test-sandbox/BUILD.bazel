@@ -30,8 +30,10 @@ sh_binary(
     name = "hermetic_test_wrapper",
     srcs = ["hermetic_test_wrapper.sh"],
     data = [
+        "capture_stacks.py",
         ":xcodebuild",
         "@test_runtime_tools//:runtime",
+        "@timeout_capture_tools//:runtime",
     ],
     visibility = ["//visibility:public"],
 )
@@ -76,6 +78,23 @@ sh_test(
     data = [
         ":cleanup_child",
         ":hermetic_test_wrapper",
+    ],
+)
+
+sh_test(
+    name = "timeout_capture_fixture",
+    size = "small",
+    srcs = ["timeout_capture_fixture.sh"],
+    tags = ["manual"],
+)
+
+sh_test(
+    name = "capture_stacks_test",
+    size = "small",
+    srcs = ["capture_stacks_test.sh"],
+    data = [
+        "capture_stacks.py",
+        "capture_stacks_test.py",
     ],
 )
 

@@ -35,11 +35,15 @@ bound_hook() {
 }
 hold_before_ready="$(bound_hook "${MONO_WRAPPER_TEST_HOLD_BEFORE_READY:-}")"
 hold_before_setpgid="$(bound_hook "${MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID:-}")"
+capture_hold="$(bound_hook "${MONO_CAPTURE_TEST_HOLD:-}")"
+unset MONO_CAPTURE_TEST_HOLD
 unset MONO_WRAPPER_TEST_HOLD_BEFORE_READY MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID
 
 runtime_root="${TEST_SRCDIR:?}/+test_runtime_repository+test_runtime_tools"
 runtime_bin="${runtime_root}/bin"
 runtime_manifest="${runtime_root}/manifest"
+capture_root="${TEST_SRCDIR:?}/+test_runtime_repository+timeout_capture_tools"
+capture_bin="${capture_root}/bin"
 developer_dir_file="${runtime_root}/developer_dir"
 main_runfiles="${TEST_SRCDIR:?}/${TEST_WORKSPACE:?}"
 xcode_bin="${main_runfiles}/tools/test-sandbox"
@@ -100,7 +104,54 @@ unset \
 
 child_pid=""
 watchdog_pid=""
+pre_deadline_pid=""
 cancelled=""
+
+capture_child_stacks() {
+  if [[ -n "${child_pid}" ]]; then
+    MONO_CAPTURE_TEST_HOLD="${capture_hold}" "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
+      "${child_pid}" "${runtime_bin}" "${capture_bin}" || \
+      printf 'could not capture test thread backtraces for %s\n' "${child_pid}" >&2
+  fi
+}
+
+# Remote executors (NativeLink on the macOS workers) may SIGKILL the action
+# root at the Bazel deadline without a TERM the wrapper can trap, then collect
+# stdout/stderr and undeclared outputs as soon as that process exits. Capture
+# from a TERM trap or from the watchdog after the root is gone is then too
+# late: the worker has already taken the empty output tree. Sample while the
+# action is still alive, shortly before TEST_TIMEOUT, so the reports are on
+# disk when the executor collects them. Local process-wrapper TERM still
+# recaptures if this timer has not fired; the capture lock keeps that a no-op
+# when it has.
+start_pre_deadline_capture() {
+  local timeout lead delay
+  [[ "${OSTYPE:-}" == darwin* ]] || return 0
+  timeout="${TEST_TIMEOUT:-}"
+  [[ "${timeout}" =~ ^[1-9][0-9]*$ ]] || return 0
+  lead=8
+  if (( timeout <= lead + 2 )); then
+    lead=$((timeout / 2))
+  fi
+  (( lead >= 1 && timeout > lead )) || return 0
+  delay=$((timeout - lead))
+  # Close the watchdog lifeline in this child: an inherited write end would
+  # keep the watchdog waiting if this shell is SIGKILLed before the timer
+  # fires. Python argv does not carry the wrapper's test marker, so a
+  # pid-only SIGKILL of this shell cannot leave a marker-matching sleeper.
+  "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
+    --before-deadline "${delay}" "$$" "${child_pid}" "${runtime_bin}" "${capture_bin}" \
+    8<&- 9<&- 12<&- &
+  pre_deadline_pid=$!
+}
+
+stop_pre_deadline_capture() {
+  if [[ -n "${pre_deadline_pid}" ]]; then
+    kill "${pre_deadline_pid}" 2>/dev/null || true
+    wait "${pre_deadline_pid}" 2>/dev/null || true
+    pre_deadline_pid=""
+  fi
+}
 
 # The launcher announces its pid before it calls setpgid, so for a short
 # interval the pid is live while its group does not exist yet. Ownership of
@@ -122,6 +173,8 @@ terminate_child_group() {
     return 0
   fi
 
+  # Diagnose surviving children before cleanup's first signal.
+  capture_child_stacks
   signal_child TERM
   for _ in {1..20}; do
     if ! process_group_is_alive; then
@@ -164,6 +217,7 @@ release_watchdog() {
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
+  stop_pre_deadline_capture
   if [[ -n "${child_pid}" ]] && ! terminate_child_group && [[ "${status}" == "0" ]]; then
     status=1
   fi
@@ -180,6 +234,11 @@ cleanup() {
 forward_signal() {
   local signal="$1"
   if [[ -n "${child_pid}" ]]; then
+    # The child has its own process group. Capture its still-live threads
+    # before forwarding Bazel's timeout signal; the outputs survive cleanup.
+    if [[ "${signal}" == "TERM" ]]; then
+      capture_child_stacks
+    fi
     signal_child "${signal}"
   else
     cancelled="${signal}"
@@ -401,22 +460,23 @@ fi
   canonical_runfile_execs="${TEST_TMPDIR}/runfile-executables"
   "${runtime_bin}/python3" -c \
     'import os, sys
-manifest, runfiles = sys.argv[1:3]
+manifest, runfiles, capture_root = sys.argv[1:4]
+capture_key = os.path.basename(capture_root) + "/"
 if os.path.isfile(manifest):
     for line in open(manifest):
         fields = line.rstrip("\n").split(" ", 1)
-        if len(fields) == 2 and os.access(fields[1], os.X_OK):
+        if len(fields) == 2 and not fields[0].startswith(capture_key) and not fields[1].startswith(capture_root + os.sep) and os.access(fields[1], os.X_OK):
             print(os.path.realpath(fields[1]))
 else:
     for root, dirs, files in os.walk(runfiles):
-        dirs.sort()
+        dirs[:] = sorted(d for d in dirs if os.path.join(root, d) != capture_root)
         for name in sorted(files):
             path = os.path.join(root, name)
             resolved = os.path.realpath(path)
             if os.access(path, os.X_OK) and not resolved.startswith(runfiles + os.sep):
                 print(resolved)' \
     "${RUNFILES_MANIFEST_FILE:-${TEST_SRCDIR}/MANIFEST}" \
-    "${TEST_SRCDIR}" \
+    "${TEST_SRCDIR}" "${capture_root}" \
     >"${canonical_runfile_execs}"
   while IFS= read -r runfile_path; do
     printf '  (allow process-exec (literal "%s"))\n' \
@@ -476,7 +536,7 @@ set -m
 (
   set +m
   trap - EXIT INT TERM HUP
-  exec 8<&- </dev/null >/dev/null 2>&1
+  exec 7>&2 8<&- </dev/null >/dev/null 2>&1
   printf '%s\n' "${wrapper_pid}" >"${TEST_TMPDIR}/watchdog-ready"
   if [[ -n "${hold_before_ready}" ]]; then
     : >"${hold_before_ready}.paused"
@@ -515,7 +575,8 @@ set -m
   if IFS= read -r _ <&9; then
     exit 0
   fi
-  terminate_child_group || true
+  terminate_child_group 2>&7 || true
+  exec 7>&-
   if [[ "${owns_test_tmpdir}" == "1" ]]; then
     "${runtime_bin}/rm" -rf "${test_tmpdir}"
   fi
@@ -584,6 +645,7 @@ os._exit(127)' \
   /usr/bin/sandbox-exec -f "${profile}" "$@" 0<&0 8<&- 9<&- 12<&- &
 child_pid=$!
 exit_if_cancelled
+start_pre_deadline_capture
 
 set +e
 wait "${child_pid}"
