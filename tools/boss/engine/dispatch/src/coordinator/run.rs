@@ -174,6 +174,8 @@ impl ExecutionCoordinator {
                     ),
                 }
             }
+            #[cfg(any(test, feature = "test-support"))]
+            self.note_spoke_pass_start(&execution.id);
             let outcome = adapter
                 .spawn_worker(
                     &worker_id,
@@ -184,7 +186,11 @@ impl ExecutionCoordinator {
                 )
                 .await;
             let uncertain = match outcome.as_ref().err() {
-                None => break outcome,
+                None => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    self.note_spoke_pass_complete(&execution.id);
+                    break outcome;
+                }
                 Some(error) => {
                     match error
                         .chain()
@@ -204,7 +210,11 @@ impl ExecutionCoordinator {
                             );
                             last_uncertain.clone().expect("checked above")
                         }
-                        None => break outcome,
+                        None => {
+                            #[cfg(any(test, feature = "test-support"))]
+                            self.note_spoke_pass_complete(&execution.id);
+                            break outcome;
+                        }
                     }
                 }
             };
@@ -219,6 +229,8 @@ impl ExecutionCoordinator {
                     "spoke spawn unanswered; reconciling the stored command"
                 );
                 last_uncertain = Some(uncertain);
+                #[cfg(any(test, feature = "test-support"))]
+                self.note_spoke_pass_complete(&execution.id);
                 tokio::time::sleep(timing.spawn_retry_sleep).await;
                 continue;
             }
@@ -240,6 +252,8 @@ impl ExecutionCoordinator {
                 parked = true;
             }
             last_uncertain = Some(uncertain);
+            #[cfg(any(test, feature = "test-support"))]
+            self.note_spoke_pass_complete(&execution.id);
             tokio::time::sleep(timing.spawn_poll).await;
         };
         let cancelled_in_doubt = run_outcome

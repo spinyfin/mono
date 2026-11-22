@@ -1377,7 +1377,7 @@
           "FILE:@@//tools/boss/engine/timer-wheel/Cargo.toml 6f1e9fa4c08674baa9b45a9a97f93a5a1fc4a836984e1321d8c91802bc9013b1",
           "FILE:@@//tools/boss/engine/worker-policy/Cargo.toml c2ac4d205c7a30d66b6da7c618679e1305a4ff4bb31b1d4821db2c80dcddfd85",
           "FILE:@@//tools/boss/engine/single-flight/Cargo.toml e4304ba813bf545bd1c50f35fc0a900b62ac99a5dcaaffa8bedd7f20fa660fdd",
-          "FILE:@@//tools/boss/engine/spoke-adapter/Cargo.toml d2e8a04e4dcd536241ac7a26293712a4d2c4b3210f50b58e83eeed50b4feb9d5",
+          "FILE:@@//tools/boss/engine/spoke-adapter/Cargo.toml 4f4d0c219cdfc6ec4ddd33a0ba94a0227e05d33e1bfef21618c2389080a73b69",
           "FILE:@@//tools/boss/trunk_auth/Cargo.toml b587b790d373b83f7d915d79936c7d01de8e2eae3fc6464b75c1942bb9e3d30e",
           "FILE:@@//tools/boss/cli/Cargo.toml 0783eae5e327840fc73b58e9aae55aad39feba9ec1f4e54e01c99a3364e97e8c",
           "FILE:@@//tools/boss/engine/blocked-pr-diagnosis/Cargo.toml 1b3a257b1b345357c920d55da7557a72b4fd2bc5c4177103d2281d8c3b3541c1",

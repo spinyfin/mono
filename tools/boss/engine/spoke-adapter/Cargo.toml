@@ -26,12 +26,14 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-boss-engine-runtime = { path = "../core/runtime" }
+boss-engine-runtime = { path = "../core/runtime", features = ["test-support"] }
 boss-host-enrollment = { path = "../host-enrollment" }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+# test-util enables tokio::time::pause / advance so integration tests can fire
+# command deadlines independently of sibling-test CPU contention.
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }

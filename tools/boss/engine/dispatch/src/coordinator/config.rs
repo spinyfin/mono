@@ -98,6 +98,12 @@ impl ExecutionCoordinator {
             driving_runs: std::sync::Mutex::new(DrivingRuns::default()),
             in_doubt_sweep_active: AtomicBool::new(false),
             queued_display_reader: std::sync::OnceLock::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            spoke_pass_starts: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            spoke_pass_completions: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            heartbeat_beats: AtomicU64::new(0),
         }
     }
 
@@ -163,6 +169,65 @@ impl ExecutionCoordinator {
 
     pub fn repo_lease_limiter(&self) -> &lease_limiter::RepoLeaseLimiter {
         &self.repo_lease_limiter
+    }
+
+    /// True while a `run_scheduler` task holds `scheduling_active`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduler_is_running(&self) -> bool {
+        self.scheduling_active.load(Ordering::Acquire)
+    }
+
+    /// True when a kick arrived that the alive scheduler has not yet drained.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scheduler_wakeup_pending(&self) -> bool {
+        self.scheduling_pending.load(Ordering::Acquire)
+    }
+
+    /// True while an in-doubt spoke sweep pass is running.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_doubt_sweep_is_running(&self) -> bool {
+        self.in_doubt_sweep_active.load(Ordering::Acquire)
+    }
+
+    /// True while a `run_execution` task is driving `execution_id`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_driving_execution(&self, execution_id: &str) -> bool {
+        self.is_driving_run(execution_id)
+    }
+
+    /// In-doubt retry/dispatch passes started for `execution_id`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spoke_pass_starts(&self, execution_id: &str) -> u64 {
+        self.spoke_pass_starts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(execution_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// In-doubt retry/dispatch passes that finished parking, updating a
+    /// result, or returning a local failure for `execution_id`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spoke_pass_completions(&self, execution_id: &str) -> u64 {
+        self.spoke_pass_completions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(execution_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Heartbeat loop iterations started after the opening sleep.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn heartbeat_beats(&self) -> u64 {
+        self.heartbeat_beats.load(Ordering::Acquire)
+    }
+
+    /// Count a heartbeat loop iteration; a no-op outside test builds.
+    pub(super) fn note_heartbeat_beat(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.heartbeat_beats.fetch_add(1, Ordering::AcqRel);
     }
 
     // Test-only entry points onto crate-internal coordinator operations.

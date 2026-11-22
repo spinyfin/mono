@@ -29,7 +29,7 @@ mod workspace;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -122,6 +122,18 @@ pub(crate) struct Hub {
     /// decide nothing was stored.
     #[builder(skip)]
     stable_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// In-flight [`Hub::send_command`] calls, including the command timer.
+    #[builder(skip)]
+    command_waits: AtomicUsize,
+    /// [`Hub::send_command`] entries, including ones that have already returned.
+    #[builder(skip)]
+    command_sends: AtomicU64,
+    /// In-flight [`Hub::send_command`] calls keyed by `op` (`"stop"`, `"adopt"`, …).
+    #[builder(skip)]
+    command_waits_by_op: std::sync::Mutex<HashMap<&'static str, usize>>,
+    /// [`Hub::send_command`] entries keyed by `op`.
+    #[builder(skip)]
+    command_sends_by_op: std::sync::Mutex<HashMap<&'static str, u64>>,
 }
 
 impl Hub {
@@ -381,6 +393,39 @@ impl Hub {
         command: Command,
         deadline: Duration,
     ) -> Result<CommandResult, HostCallError> {
+        self.command_sends.fetch_add(1, Ordering::SeqCst);
+        self.command_waits.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut sends = self
+                .command_sends_by_op
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *sends.entry(op).or_insert(0) += 1;
+            let mut waits = self
+                .command_waits_by_op
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *waits.entry(op).or_insert(0) += 1;
+        }
+        struct CommandWait<'a> {
+            waits: &'a AtomicUsize,
+            by_op: &'a std::sync::Mutex<HashMap<&'static str, usize>>,
+            op: &'static str,
+        }
+        impl Drop for CommandWait<'_> {
+            fn drop(&mut self) {
+                self.waits.fetch_sub(1, Ordering::SeqCst);
+                let mut waits = self.by_op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(n) = waits.get_mut(self.op) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+        }
+        let _wait = CommandWait {
+            waits: &self.command_waits,
+            by_op: &self.command_waits_by_op,
+            op,
+        };
         let command_id = command.command_id.clone();
         match self
             .streams
@@ -400,6 +445,32 @@ impl Hub {
                 reason: other.to_string(),
             }),
         }
+    }
+
+    pub(crate) fn command_waits(&self) -> usize {
+        self.command_waits.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn command_sends(&self) -> u64 {
+        self.command_sends.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn command_waits_for(&self, op: &str) -> usize {
+        self.command_waits_by_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(op)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn command_sends_for(&self, op: &str) -> u64 {
+        self.command_sends_by_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(op)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -1121,6 +1192,30 @@ impl SpokeHostAdapterProvider {
     #[doc(hidden)]
     pub fn stable_callers(&self) -> usize {
         self.hub.stable_callers()
+    }
+
+    /// How many [`Hub::send_command`] calls are waiting on the command timer.
+    #[doc(hidden)]
+    pub fn command_waits(&self) -> usize {
+        self.hub.command_waits()
+    }
+
+    /// How many [`Hub::send_command`] calls have started, including finished ones.
+    #[doc(hidden)]
+    pub fn command_sends(&self) -> u64 {
+        self.hub.command_sends()
+    }
+
+    /// In-flight [`Hub::send_command`] calls for `op` (`"stop"`, `"adopt"`, `"spawn"`, …).
+    #[doc(hidden)]
+    pub fn command_waits_for(&self, op: &str) -> usize {
+        self.hub.command_waits_for(op)
+    }
+
+    /// [`Hub::send_command`] entries for `op`, including finished ones.
+    #[doc(hidden)]
+    pub fn command_sends_for(&self, op: &str) -> u64 {
+        self.hub.command_sends_for(op)
     }
 
     fn adapter(&self, host: &Host, bound: Option<SpokeAssignment>, legacy: bool) -> Arc<dyn HostAdapter> {

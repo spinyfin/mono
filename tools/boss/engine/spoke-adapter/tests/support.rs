@@ -2,6 +2,7 @@
 //! and a scripted spoke on the other end of a real stream.
 mod liveness;
 mod observed_outbox;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +42,437 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server,
 
 pub const STEP: Duration = Duration::from_secs(10);
 pub const HOST: &str = "host";
+
+/// Real TCP / gRPC connect. A paused clock auto-advances `timeout` when no
+/// task is runnable, so frozen tests keep a yield loop instead of a virtual
+/// STEP bound.
+async fn connect_within_step<T, E>(op: impl std::future::Future<Output = Result<T, E>>) -> T
+where
+    E: std::fmt::Debug,
+{
+    if clock_frozen() {
+        crate::timing::guarded(op).await.expect("spoke connect")
+    } else {
+        tokio::time::timeout(STEP, op)
+            .await
+            .expect("spoke connect timed out")
+            .expect("spoke connect")
+    }
+}
+
+/// Wall-clock bound for event waits. Virtual time (`tokio::time::timeout`) does
+/// not move while the clock is paused, so a hang must be detected on `Instant`.
+const WAIT: Duration = Duration::from_secs(20);
+pub(crate) const TICK: Duration = Duration::from_millis(20);
+
+thread_local! {
+    static CLOCK_FROZEN: Cell<bool> = const { Cell::new(false) };
+}
+
+fn clock_frozen() -> bool {
+    CLOCK_FROZEN.with(Cell::get)
+}
+
+/// Pause tokio timers on this test thread. gRPC I/O still progresses.
+pub(crate) fn freeze_clock() {
+    CLOCK_FROZEN.with(|frozen| {
+        assert!(!frozen.get(), "tokio clock is already frozen on this thread");
+        frozen.set(true);
+    });
+    tokio::time::pause();
+}
+
+/// Resume tokio timers on this test thread.
+pub(crate) fn thaw_clock() {
+    CLOCK_FROZEN.with(|frozen| {
+        assert!(frozen.get(), "tokio clock is not frozen on this thread");
+        frozen.set(false);
+    });
+    tokio::time::resume();
+}
+
+/// Pauses the tokio clock for a scope and thaws it on drop, including unwind.
+pub(crate) struct FrozenClock {
+    frozen: bool,
+}
+
+impl FrozenClock {
+    pub(crate) fn new() -> Self {
+        freeze_clock();
+        Self { frozen: true }
+    }
+
+    pub(crate) fn thaw(&mut self) {
+        if self.frozen {
+            thaw_clock();
+            self.frozen = false;
+        }
+    }
+}
+
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        self.thaw();
+    }
+}
+
+/// Park on wall time so gRPC can run while tokio's clock is paused.
+///
+/// `tokio::time::sleep` would freeze. A `spawn_blocking` sleep alone is also
+/// wrong: with a paused `test-util` clock, tokio auto-advances to the next
+/// timer when no async task is runnable, so command deadlines fire during
+/// persist. Keep a yield loop runnable for the duration of the park.
+async fn wall_park(dur: Duration) {
+    let sleep = tokio::task::spawn_blocking(move || std::thread::sleep(dur));
+    tokio::select! {
+        result = sleep => {
+            result.expect("wall-clock park");
+        }
+        () = async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        } => unreachable!("yield loop holds the paused clock still"),
+    }
+}
+
+/// Yield and park one wall-clock tick. Use in freeze-and-step loops so
+/// persist can finish before the next virtual deadline.
+pub(crate) async fn pace_io() {
+    tokio::task::yield_now().await;
+    wall_park(TICK).await;
+}
+
+/// Wait until `ready`. Works while tokio's clock is paused: gRPC I/O still
+/// progresses, and the loop parks on wall time instead of sleeping on a
+/// frozen timer.
+pub(crate) async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if ready() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if clock_frozen() {
+            wall_park(TICK).await;
+        } else {
+            tokio::time::sleep(TICK).await;
+        }
+    }
+}
+
+/// Like [`until`], for async predicates (pool occupancy, and similar).
+pub(crate) async fn until_async<F, Fut>(what: &str, mut ready: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if ready().await {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if clock_frozen() {
+            wall_park(TICK).await;
+        } else {
+            tokio::time::sleep(TICK).await;
+        }
+    }
+}
+
+async fn advance_in_steps(by: Duration) {
+    let mut left = by;
+    while !left.is_zero() {
+        let step = left.min(TICK);
+        tokio::time::advance(step).await;
+        tokio::task::yield_now().await;
+        left -= step;
+    }
+}
+
+/// Advance virtual time by `by` in small steps so pulse I/O can run between
+/// ticks. Pauses if needed and resumes only if this call paused.
+pub(crate) async fn elapse(by: Duration) {
+    if clock_frozen() {
+        advance_in_steps(by).await;
+        return;
+    }
+    freeze_clock();
+    advance_in_steps(by).await;
+    thaw_clock();
+}
+
+/// Advance virtual time until `ready`. The clock must already be paused, and
+/// the unanswered command must already be stored: advancing before persist
+/// would fire the deadline as `OutcomeUncertain` without a durable command.
+pub(crate) async fn until_elapsed(what: &str, mut ready: impl FnMut() -> bool) {
+    debug_assert!(clock_frozen());
+    let deadline = std::time::Instant::now() + WAIT;
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if ready() {
+            return;
+        }
+        // Pace virtual ticks on wall time so a command deadline cannot
+        // expire before the in-flight persist or Adopt round-trip.
+        wall_park(TICK).await;
+        if ready() {
+            return;
+        }
+        tokio::time::advance(TICK).await;
+    }
+}
+
+/// Wait for I/O-driven `ready` under a paused clock.
+///
+/// Advances virtual time by at most `max_virtual` so timers that must fire
+/// can run, then parks on wall time only. Callers that need a timer to fire
+/// first should `until_elapsed` for that signal, then `until` for `send_command`.
+pub(crate) async fn until_io(what: &str, mut ready: impl FnMut() -> bool, max_virtual: Duration) {
+    debug_assert!(clock_frozen());
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut advanced = Duration::ZERO;
+    loop {
+        if ready() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if ready() {
+            return;
+        }
+        wall_park(TICK).await;
+        if ready() {
+            return;
+        }
+        if advanced + TICK <= max_virtual {
+            tokio::time::advance(TICK).await;
+            advanced += TICK;
+        }
+    }
+}
+
+/// Freeze timers until `stored` (command on the wire), then advance virtual
+/// time until `ready` (retries exhausted, parked, attention). Use when `ready`
+/// is driven by tokio timers, not wall-clock assignment age.
+pub(crate) async fn until_ready_after_stored(
+    stored_what: &str,
+    stored: impl FnMut() -> bool,
+    ready_what: &str,
+    ready: impl FnMut() -> bool,
+) {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    until(stored_what, stored).await;
+    until_elapsed(ready_what, ready).await;
+}
+
+/// Freeze timers until `stored`, fire `deadline` once, then thaw if this
+/// call paused the clock. Use when the next wait is wall-clock (lease
+/// `attention_after` is assignment age).
+pub(crate) async fn fire_after_stored(stored_what: &str, stored: impl FnMut() -> bool, deadline: Duration) {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    until(stored_what, stored).await;
+    elapse(deadline).await;
+}
+
+/// Freeze until `count` commands are persisted, then fire `deadline`.
+///
+/// `host_slots` is the host's concurrent assignment capacity. When it is
+/// less than `count`, attempts share a slot: fire `deadline` after each
+/// stored command so the next persist can start. When it is at least
+/// `count`, wait for every persist before firing, so a shared deadline
+/// cannot expire an in-flight append.
+pub(crate) async fn fire_after_all_stored(
+    first_what: &str,
+    mut stored_count: impl FnMut() -> usize,
+    count: usize,
+    deadline: Duration,
+    host_slots: usize,
+) {
+    let _clock = FrozenClock::new();
+    until(first_what, || stored_count() >= 1).await;
+    if host_slots >= count {
+        until("every unanswered command to be stored", || stored_count() >= count).await;
+    } else {
+        while stored_count() < count {
+            let target = stored_count() + 1;
+            elapse(deadline).await;
+            until("a later unanswered command to be stored", || stored_count() >= target).await;
+        }
+    }
+    elapse(deadline).await;
+}
+
+/// Freeze until spawn is stored and the pane pid is recorded, then advance
+/// virtual time until the prompt wait arms a Stop send. Persist still runs
+/// on wall time while the clock stays frozen, so the Stop deadline is not
+/// racing persist. Fire `deadline` once the Stop is stored. The returned
+/// guard keeps the clock frozen and thaws on drop.
+pub(crate) async fn fire_unconfirmed_stop_after_answered_spawn(
+    mut spawn_stored: impl FnMut() -> bool,
+    mut pane_pid: impl FnMut() -> bool,
+    mut stop_send_armed: impl FnMut() -> bool,
+    mut stop_stored: impl FnMut() -> bool,
+    deadline: Duration,
+) -> FrozenClock {
+    let clock = FrozenClock::new();
+    until("spawn command stored", &mut spawn_stored).await;
+    until("pane pid recorded before prompt wait", &mut pane_pid).await;
+    // Pane pid is recorded before `confirm_prompt_accepted_or_reap` starts
+    // its timer. Keep stepping virtual time until `send_command` is entered
+    // (waits/sends increment before persist) so a late prompt-wait start
+    // cannot sit behind a frozen 300 ms timeout. Stop advancing the moment
+    // the Stop send is armed: persist still runs on wall time, and the
+    // command deadline must not expire during that persist.
+    let watchdog = std::time::Instant::now();
+    while !stop_send_armed() {
+        assert!(
+            watchdog.elapsed() < WAIT,
+            "timed out waiting for stop send entered with its timer armed"
+        );
+        pace_io().await;
+        elapse(TICK).await;
+    }
+    until("unconfirmed stop stored", &mut stop_stored).await;
+    elapse(deadline + TICK).await;
+    clock
+}
+
+/// Kick until `done` is true, firing `deadline` once per in-flight command
+/// wait. `started` / `completed` detect that a pass actually ran this kick;
+/// `done` is the outer stop condition (for example every execution's
+/// completion delta reaching the pre-start budget).
+pub(crate) async fn drive_kicked_deadline_passes(
+    kick: impl Fn(),
+    mut started: impl FnMut() -> u64,
+    mut completed: impl FnMut() -> u64,
+    mut waiting: impl FnMut() -> bool,
+    mut idle: impl FnMut() -> bool,
+    deadline: Duration,
+    mut done: impl FnMut() -> bool,
+) {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    while !done() {
+        let start_before = started();
+        let complete_before = completed();
+        kick();
+        until("a dispatch pass started", || {
+            started() > start_before || waiting() || completed() > complete_before
+        })
+        .await;
+        until("the pass armed a command wait or completed", || {
+            waiting() || completed() > complete_before
+        })
+        .await;
+        loop {
+            while waiting() {
+                elapse(deadline + TICK).await;
+            }
+            if completed() > complete_before {
+                break;
+            }
+            until("the dispatch pass finished its command wait or completed", || {
+                idle() || completed() > complete_before || waiting()
+            })
+            .await;
+            if completed() > complete_before {
+                break;
+            }
+            if waiting() {
+                continue;
+            }
+            break;
+        }
+        until("the dispatch pass completed parking or a local failure", || {
+            completed() > complete_before
+        })
+        .await;
+    }
+}
+
+/// Drive `passes` distinct retry/poll cycles. Each cycle waits for a new
+/// pass start, fires any armed command wait, then waits for that pass's
+/// parking/result update (or local failure).
+pub(crate) async fn drive_poll_deadline_passes(
+    mut started: impl FnMut() -> u64,
+    mut completed: impl FnMut() -> u64,
+    mut waiting: impl FnMut() -> bool,
+    mut idle: impl FnMut() -> bool,
+    deadline: Duration,
+    passes: usize,
+) {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    let mut seen = 0;
+    while seen < passes {
+        let start_before = started();
+        let complete_before = completed();
+        until_elapsed("a poll pass started", || {
+            started() > start_before || waiting() || completed() > complete_before
+        })
+        .await;
+        until("the poll armed a command wait or completed", || {
+            waiting() || completed() > complete_before
+        })
+        .await;
+        loop {
+            while waiting() {
+                elapse(deadline + TICK).await;
+            }
+            if completed() > complete_before {
+                break;
+            }
+            until("the poll finished its command wait or completed", || {
+                idle() || completed() > complete_before || waiting()
+            })
+            .await;
+            if completed() > complete_before {
+                break;
+            }
+            if waiting() {
+                continue;
+            }
+            break;
+        }
+        until("the poll completed parking or a local failure", || {
+            completed() > complete_before
+        })
+        .await;
+        seen += 1;
+    }
+}
+
+/// After a restart sweep resumes a live execution, wait until that driver
+/// has started and completed one pass. Fires any armed command deadline
+/// under a frozen clock, and ticks virtual time so prompt-confirmation
+/// timers can fire too. An idle command layer is not evidence of a pass.
+pub(crate) async fn drive_resumed_deadline_pass(
+    mut started: impl FnMut() -> u64,
+    mut completed: impl FnMut() -> u64,
+    mut waiting: impl FnMut() -> bool,
+    deadline: Duration,
+    starts_before: u64,
+    completions_before: u64,
+) {
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
+    until("a resumed pass started", || started() > starts_before).await;
+    let watchdog = std::time::Instant::now();
+    while completed() <= completions_before {
+        assert!(
+            watchdog.elapsed() < WAIT,
+            "timed out waiting for the resumed pass completed parking or a local failure"
+        );
+        if waiting() {
+            elapse(deadline + TICK).await;
+        } else {
+            pace_io().await;
+            elapse(TICK).await;
+        }
+    }
+}
 
 struct Authority {
     events: broadcast::Sender<CredentialEvent>,
@@ -604,18 +1036,11 @@ impl Fixture {
         })
         .await
         .unwrap();
-        let channel = tokio::time::timeout(STEP, self.dialer.connect())
-            .await
-            .unwrap()
-            .unwrap();
-        let mut incoming = tokio::time::timeout(
-            STEP,
-            spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .into_inner();
+        let channel = connect_within_step(self.dialer.connect()).await;
+        let mut incoming =
+            connect_within_step(spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)))
+                .await
+                .into_inner();
         incoming.message().await.unwrap().unwrap().body.expect("hub frame")
     }
 
@@ -682,15 +1107,11 @@ impl Fixture {
         })
         .await
         .unwrap();
-        let channel = tokio::time::timeout(STEP, dialer.connect()).await.unwrap().unwrap();
-        let mut incoming = tokio::time::timeout(
-            STEP,
-            spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .into_inner();
+        let channel = connect_within_step(dialer.connect()).await;
+        let mut incoming =
+            connect_within_step(spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)))
+                .await
+                .into_inner();
         let Some(hub_frame::Body::Welcome(welcome)) = incoming.message().await.unwrap().unwrap().body else {
             panic!("expected a welcome")
         };
@@ -803,19 +1224,11 @@ impl Peer {
     }
 
     pub async fn wait_for_command(&self, count: usize) -> Vec<Command> {
-        let deadline = tokio::time::Instant::now() + STEP;
-        loop {
-            let seen = self.commands();
-            if seen.len() >= count {
-                return seen;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "spoke saw {} of {count} commands",
-                seen.len()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        until(&format!("spoke saw {count} commands"), || {
+            self.commands().len() >= count
+        })
+        .await;
+        self.commands()
     }
 
     /// Answer a command the spoke chose not to answer in time.
