@@ -19,7 +19,8 @@ use reqwest::{Method, StatusCode};
 use tracing::warn;
 
 use crate::http_retry::{
-    RetrySettings, SendOutcome, failure_from_body, failure_from_http, failure_from_send, parse_retry_after, retry_loop,
+    AttemptFailure, FailureKind, RetrySettings, SendOutcome, failure_from_body, failure_from_http, failure_from_send,
+    parse_retry_after, retry_loop,
 };
 
 /// Three attempts: the original plus two retries. Each request still uses the
@@ -79,7 +80,7 @@ impl GithubRetryPolicy {
 
 /// Classified result of a GitHub REST call after retries have been applied.
 #[derive(Debug)]
-pub(crate) enum GithubGetOutcome {
+pub(crate) enum GithubOutcome {
     Success(Vec<u8>),
     Timeout { attempts: u32 },
     Transport { error: reqwest::Error },
@@ -106,7 +107,7 @@ pub(crate) async fn github_get(
     operation: &'static str,
     request_timeout: Duration,
     retry: GithubRetryPolicy,
-) -> GithubGetOutcome {
+) -> GithubOutcome {
     github_request(
         client,
         GithubCall {
@@ -124,7 +125,7 @@ pub(crate) async fn github_get(
 }
 
 /// POST/PATCH/GET with GitHub REST headers, retrying transient failures.
-pub(crate) async fn github_request(client: &reqwest::Client, call: GithubCall<'_>) -> GithubGetOutcome {
+pub(crate) async fn github_request(client: &reqwest::Client, call: GithubCall<'_>) -> GithubOutcome {
     let started = Instant::now();
     let remaining = || call.retry.budget.saturating_sub(started.elapsed());
     let settings = RetrySettings {
@@ -162,11 +163,11 @@ pub(crate) async fn github_request(client: &reqwest::Client, call: GithubCall<'_
     )
     .await;
     match outcome {
-        SendOutcome::Success(bytes) => GithubGetOutcome::Success(bytes),
-        SendOutcome::Timeout { attempts } => GithubGetOutcome::Timeout { attempts },
-        SendOutcome::Transport { error, .. } => GithubGetOutcome::Transport { error },
-        SendOutcome::Body { error, .. } => GithubGetOutcome::Body { error },
-        SendOutcome::Http { status, body, .. } => GithubGetOutcome::Http { status, body },
+        SendOutcome::Success(bytes) => GithubOutcome::Success(bytes),
+        SendOutcome::Timeout { attempts } => GithubOutcome::Timeout { attempts },
+        SendOutcome::Transport { error, .. } => GithubOutcome::Transport { error },
+        SendOutcome::Body { error, .. } => GithubOutcome::Body { error },
+        SendOutcome::Http { status, body, .. } => GithubOutcome::Http { status, body },
     }
 }
 
@@ -178,7 +179,8 @@ async fn send_once(
     timeout: Duration,
     extra_headers: &[(&str, &str)],
     body: Option<Vec<u8>>,
-) -> Result<Vec<u8>, crate::http_retry::AttemptFailure> {
+) -> Result<Vec<u8>, AttemptFailure> {
+    let is_write = method != Method::GET;
     let mut request = client
         .request(method, url)
         .timeout(timeout)
@@ -208,6 +210,14 @@ async fn send_once(
 
     match response.bytes().await {
         Ok(bytes) => Ok(bytes.to_vec()),
+        // GitHub already accepted a write (2xx); replaying it would duplicate
+        // the check-run or SARIF upload, so a failed body read is final.
+        Err(error) if is_write => Err(AttemptFailure {
+            cause: format!("response body error after accepted write: {error}"),
+            kind: FailureKind::Body(error),
+            retryable: false,
+            retry_after: None,
+        }),
         Err(error) => Err(failure_from_body(error)),
     }
 }
@@ -223,8 +233,7 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{GITHUB_RETRY_MAX_ATTEMPTS, GithubGetOutcome, GithubRetryPolicy, github_get};
-    use crate::http_retry::parse_retry_after;
+    use super::{GITHUB_RETRY_MAX_ATTEMPTS, GithubCall, GithubOutcome, GithubRetryPolicy, github_get, github_request};
 
     struct LogBuf(Arc<Mutex<Vec<u8>>>);
 
@@ -269,7 +278,7 @@ mod tests {
         format!("{}/repos/o/r/pulls", server.uri())
     }
 
-    async fn get_with(server: &MockServer, timeout: Duration, retry: GithubRetryPolicy) -> GithubGetOutcome {
+    async fn get_with(server: &MockServer, timeout: Duration, retry: GithubRetryPolicy) -> GithubOutcome {
         let client = reqwest::Client::builder().timeout(timeout).build().expect("client");
         github_get(
             &client,
@@ -282,21 +291,8 @@ mod tests {
         .await
     }
 
-    async fn get(server: &MockServer, timeout: Duration) -> GithubGetOutcome {
+    async fn get(server: &MockServer, timeout: Duration) -> GithubOutcome {
         get_with(server, timeout, retry()).await
-    }
-
-    #[test]
-    fn parse_retry_after_reads_integer_seconds_and_http_dates() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().expect("header"));
-        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
-
-        headers.insert(
-            reqwest::header::RETRY_AFTER,
-            "Wed, 21 Oct 2015 07:28:00 GMT".parse().expect("header"),
-        );
-        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
     }
 
     #[tokio::test]
@@ -319,7 +315,7 @@ mod tests {
         let (_guard, buf) = install_warn_capture();
         let outcome = get(&server, Duration::from_millis(10)).await;
         match outcome {
-            GithubGetOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
+            GithubOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
             other => panic!("expected success after retry, got {other:?}"),
         }
         let logs = captured(&buf);
@@ -348,7 +344,7 @@ mod tests {
             .await;
 
         match get(&server, Duration::from_secs(1)).await {
-            GithubGetOutcome::Success(bytes) => {
+            GithubOutcome::Success(bytes) => {
                 assert_eq!(bytes, br#"[{"number":7}]"#);
             }
             other => panic!("expected success after 502, got {other:?}"),
@@ -369,7 +365,7 @@ mod tests {
         let outcome = get(&server, Duration::from_millis(10)).await;
         let elapsed = started.elapsed();
         match outcome {
-            GithubGetOutcome::Timeout { attempts } => {
+            GithubOutcome::Timeout { attempts } => {
                 assert_eq!(attempts, GITHUB_RETRY_MAX_ATTEMPTS);
             }
             other => panic!("expected timeout after retries, got {other:?}"),
@@ -391,7 +387,7 @@ mod tests {
             .await;
 
         match get(&server, Duration::from_secs(1)).await {
-            GithubGetOutcome::Http { status, .. } => {
+            GithubOutcome::Http { status, .. } => {
                 assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
             }
             other => panic!("expected HTTP 404 without retry, got {other:?}"),
@@ -417,7 +413,7 @@ mod tests {
             .await;
 
         match get(&server, Duration::from_secs(1)).await {
-            GithubGetOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
+            GithubOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
             other => panic!("expected success after 429, got {other:?}"),
         }
     }
@@ -448,7 +444,7 @@ mod tests {
         };
         let started = Instant::now();
         match get_with(&server, Duration::from_secs(1), policy).await {
-            GithubGetOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
+            GithubOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
             other => panic!("expected success after capped 503 Retry-After, got {other:?}"),
         }
         let elapsed = started.elapsed();
@@ -488,7 +484,7 @@ mod tests {
         };
         let started = Instant::now();
         match get_with(&server, Duration::from_secs(1), policy).await {
-            GithubGetOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
+            GithubOutcome::Success(bytes) => assert_eq!(bytes, b"[]"),
             other => panic!("expected success after HTTP-date Retry-After, got {other:?}"),
         }
         let elapsed = started.elapsed();
@@ -520,7 +516,7 @@ mod tests {
             jitter: false,
         };
         match get_with(&server, Duration::from_secs(1), policy).await {
-            GithubGetOutcome::Http { status, .. } => {
+            GithubOutcome::Http { status, .. } => {
                 assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
             }
             other => panic!("expected HTTP 503 after budget exhaustion, got {other:?}"),
@@ -552,7 +548,7 @@ mod tests {
             jitter: false,
         };
         match get_with(&server, Duration::from_millis(10), policy).await {
-            GithubGetOutcome::Timeout { attempts } => {
+            GithubOutcome::Timeout { attempts } => {
                 assert_eq!(attempts, 2);
             }
             other => panic!("timeout then 502 must stay a timeout, got {other:?}"),
@@ -587,7 +583,7 @@ mod tests {
         )
         .await
         {
-            GithubGetOutcome::Transport { .. } => {}
+            GithubOutcome::Transport { .. } => {}
             other => panic!("connection refused must be transport after retries, got {other:?}"),
         }
         let elapsed = started.elapsed();
@@ -595,5 +591,54 @@ mod tests {
             elapsed >= Duration::from_millis(25),
             "connection-refused must sleep between the three attempts, elapsed={elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_post_with_stalled_body_is_not_replayed() {
+        use std::io::{Read, Write};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut requests = 0;
+            listener.set_nonblocking(false).expect("blocking");
+            let (mut socket, _) = listener.accept().expect("accept");
+            requests += 1;
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf);
+            socket
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 100\r\n\r\n{")
+                .expect("write");
+            socket.flush().expect("flush");
+            let _ = done_rx.recv();
+            drop(socket);
+            listener.set_nonblocking(true).expect("nonblocking");
+            if listener.accept().is_ok() {
+                requests += 1;
+            }
+            requests
+        });
+        let client = reqwest::Client::new();
+        let outcome = github_request(
+            &client,
+            GithubCall {
+                method: reqwest::Method::POST,
+                url: &format!("http://{addr}/upload"),
+                token: Some("token"),
+                operation: "uploading SARIF to GitHub code scanning",
+                timeout: Duration::from_millis(100),
+                retry: retry(),
+                extra_headers: &[],
+                body: Some(b"{}".to_vec()),
+            },
+        )
+        .await;
+        done_tx.send(()).expect("signal");
+        match outcome {
+            GithubOutcome::Body { .. } => {}
+            other => panic!("accepted write with failed body must be Body, got {other:?}"),
+        }
+        assert_eq!(server.join().expect("server"), 1, "accepted POST must not be replayed");
     }
 }

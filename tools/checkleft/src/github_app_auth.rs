@@ -23,7 +23,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
-use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubGetOutcome, GithubRetryPolicy, github_request};
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubOutcome, GithubRetryPolicy, github_request};
 
 /// `CHECKS_GITHUB_APP_ID`: GitHub App numeric ID.
 pub const CHECKS_GITHUB_APP_ID_ENV: &str = "CHECKS_GITHUB_APP_ID";
@@ -181,13 +181,13 @@ async fn exchange_for_installation_token(
 
 async fn github_bytes(client: &reqwest::Client, call: GithubCall<'_>, what: &str) -> Result<Vec<u8>> {
     match github_request(client, call).await {
-        GithubGetOutcome::Success(bytes) => Ok(bytes),
-        GithubGetOutcome::Timeout { attempts } => {
+        GithubOutcome::Success(bytes) => Ok(bytes),
+        GithubOutcome::Timeout { attempts } => {
             anyhow::bail!("{what} timed out after {attempts} attempts")
         }
-        GithubGetOutcome::Transport { error } => Err(error).context(what.to_owned()),
-        GithubGetOutcome::Body { error } => Err(error).with_context(|| format!("reading {what} response body")),
-        GithubGetOutcome::Http { status, body } => {
+        GithubOutcome::Transport { error } => Err(error).context(what.to_owned()),
+        GithubOutcome::Body { error } => Err(error).with_context(|| format!("reading {what} response body")),
+        GithubOutcome::Http { status, body } => {
             let snippet = truncate_response_body(String::from_utf8_lossy(&body).trim(), 300);
             anyhow::bail!("{what} returned HTTP {status}: {snippet}");
         }

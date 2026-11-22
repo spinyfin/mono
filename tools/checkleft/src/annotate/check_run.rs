@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::annotate::{Annotation, AnnotationLevel, annotation_from_finding, cap_with_log};
-use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubGetOutcome, GithubRetryPolicy, github_request};
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubOutcome, GithubRetryPolicy, github_request};
 use crate::output::{CheckResult, Severity};
 
 /// Maximum annotations GitHub accepts in a single check-run create/update request.
@@ -375,13 +375,13 @@ async fn send_json<B: Serialize>(
     )
     .await
     {
-        GithubGetOutcome::Success(bytes) => Ok(bytes),
-        GithubGetOutcome::Timeout { attempts } => {
+        GithubOutcome::Success(bytes) => Ok(bytes),
+        GithubOutcome::Timeout { attempts } => {
             bail!("sending check-run request to GitHub timed out after {attempts} attempts")
         }
-        GithubGetOutcome::Transport { error } => Err(error).context("sending check-run request to GitHub"),
-        GithubGetOutcome::Body { error } => Err(error).context("reading GitHub check-run response body"),
-        GithubGetOutcome::Http { status, body } => {
+        GithubOutcome::Transport { error } => Err(error).context("sending check-run request to GitHub"),
+        GithubOutcome::Body { error } => Err(error).context("reading GitHub check-run response body"),
+        GithubOutcome::Http { status, body } => {
             let snippet = truncate_chars(String::from_utf8_lossy(&body).trim(), 500);
             bail!("GitHub check-run API returned HTTP {status}: {snippet}");
         }

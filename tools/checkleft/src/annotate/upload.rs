@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubGetOutcome, GithubRetryPolicy, github_request};
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubCall, GithubOutcome, GithubRetryPolicy, github_request};
 
 /// How many seconds to wait for each SARIF upload request.
 const UPLOAD_TIMEOUT_SECS: u64 = 30;
@@ -140,21 +140,21 @@ pub async fn upload_sarif(sarif: &Value, ctx: &SarifUploadContext<'_>) -> bool {
     )
     .await
     {
-        GithubGetOutcome::Success(bytes) => bytes,
-        GithubGetOutcome::Timeout { attempts } => {
+        GithubOutcome::Success(bytes) => bytes,
+        GithubOutcome::Timeout { attempts } => {
             warn!("checkleft: SARIF upload failed — timed out after {attempts} attempts");
             return false;
         }
-        GithubGetOutcome::Transport { error } => {
+        GithubOutcome::Transport { error } => {
             warn!("checkleft: SARIF upload failed — network error: {error}");
             return false;
         }
-        GithubGetOutcome::Body { error } => {
+        GithubOutcome::Body { error } => {
             warn!("checkleft: SARIF upload succeeded but could not read response body: {error}");
             eprintln!("checkleft: SARIF upload succeeded (id unknown)");
             return true;
         }
-        GithubGetOutcome::Http { status, body } => {
+        GithubOutcome::Http { status, body } => {
             warn!(
                 "checkleft: SARIF upload failed — HTTP {}: {}",
                 status,
@@ -210,17 +210,17 @@ async fn poll_sarif_status(client: &reqwest::Client, base_url: &str, repository:
         )
         .await
         {
-            GithubGetOutcome::Success(bytes) => bytes,
-            GithubGetOutcome::Timeout { attempts } => {
+            GithubOutcome::Success(bytes) => bytes,
+            GithubOutcome::Timeout { attempts } => {
                 warn!("checkleft: SARIF status poll failed: timed out after {attempts} attempts");
                 return;
             }
-            GithubGetOutcome::Transport { error } => {
+            GithubOutcome::Transport { error } => {
                 warn!("checkleft: SARIF status poll failed: {error}");
                 return;
             }
-            GithubGetOutcome::Body { .. } => return,
-            GithubGetOutcome::Http { status, .. } => {
+            GithubOutcome::Body { .. } => return,
+            GithubOutcome::Http { status, .. } => {
                 warn!("checkleft: SARIF status poll returned HTTP {status}");
                 return;
             }

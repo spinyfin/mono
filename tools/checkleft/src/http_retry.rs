@@ -27,6 +27,11 @@ pub struct GetRetryPolicy<'a> {
     pub remaining: Option<&'a dyn Fn() -> Duration>,
 }
 
+/// Cap on one backoff sleep for the generic GET, including a server-supplied
+/// `Retry-After`, so a hostile or misconfigured server cannot stall a fetch
+/// for hours when no overall budget is set.
+pub(crate) const GET_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
 /// Settings for [`retry_loop`]. GitHub REST and generic GET both map into this.
 pub(crate) struct RetrySettings<'a> {
     pub max_attempts: u32,
@@ -45,7 +50,7 @@ impl<'a> RetrySettings<'a> {
         Self {
             max_attempts: policy.max_attempts,
             base_delay: policy.base_delay,
-            max_delay: Duration::MAX,
+            max_delay: GET_MAX_RETRY_DELAY,
             jitter: false,
             not_found_base_delay: policy.not_found_base_delay,
             remaining: policy.remaining,
@@ -124,7 +129,9 @@ pub(crate) fn failure_from_send(error: reqwest::Error) -> AttemptFailure {
             cause: "timed out".to_owned(),
         };
     }
-    let retryable = error.is_connect();
+    // Resets and early closes on pooled connections are not `is_connect()`
+    // but are transient; only clearly permanent request errors are terminal.
+    let retryable = !(error.is_builder() || error.is_redirect());
     AttemptFailure {
         cause: format!("transport error: {error}"),
         kind: FailureKind::Transport(error),
@@ -207,9 +214,24 @@ pub(crate) fn retry_delay(settings: &RetrySettings<'_>, attempt: u32, failure: &
 /// attempt failed for a different retryable reason.
 pub(crate) async fn retry_loop<F, Fut>(
     settings: &RetrySettings<'_>,
+    send_once: F,
+    on_retry: impl FnMut(RetryNotice<'_>),
+) -> SendOutcome
+where
+    F: FnMut(u32, Duration) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, AttemptFailure>>,
+{
+    retry_loop_detailed(settings, send_once, on_retry).await.0
+}
+
+/// Like [`retry_loop`], also reporting whether the loop stopped early because
+/// the overall budget ran out (rather than a non-retryable failure or the
+/// attempt limit).
+pub(crate) async fn retry_loop_detailed<F, Fut>(
+    settings: &RetrySettings<'_>,
     mut send_once: F,
     mut on_retry: impl FnMut(RetryNotice<'_>),
-) -> SendOutcome
+) -> (SendOutcome, bool)
 where
     F: FnMut(u32, Duration) -> Fut,
     Fut: Future<Output = Result<Vec<u8>, AttemptFailure>>,
@@ -218,15 +240,17 @@ where
     let mut last: Option<AttemptFailure> = None;
     let mut saw_timeout = false;
     let mut attempts = 0;
+    let mut budget_stopped = false;
 
     for attempt in 1..=max_attempts {
         attempts = attempt;
         if remaining_budget(settings).is_some_and(|remaining| remaining.is_zero() && attempt > 1) {
+            budget_stopped = true;
             break;
         }
         let timeout = attempt_timeout(settings);
         let failure = match send_once(attempt, timeout).await {
-            Ok(bytes) => return SendOutcome::Success(bytes),
+            Ok(bytes) => return (SendOutcome::Success(bytes), false),
             Err(failure) => failure,
         };
         if failure.timed_out() {
@@ -239,6 +263,7 @@ where
         let delay = retry_delay(settings, attempt, &failure);
         if remaining_budget(settings).is_some_and(|remaining| remaining <= delay) {
             last = Some(failure);
+            budget_stopped = true;
             break;
         }
         let cause = failure.cause.clone();
@@ -254,7 +279,7 @@ where
         }
     }
 
-    finish(last, attempts, saw_timeout)
+    (finish(last, attempts, saw_timeout), budget_stopped)
 }
 
 fn remaining_budget(settings: &RetrySettings<'_>) -> Option<Duration> {
@@ -308,7 +333,7 @@ pub async fn get_bytes_with_retry(
 ) -> Result<Vec<u8>> {
     let settings = RetrySettings::from_get(policy);
     let retry_not_found = policy.not_found_base_delay.is_some();
-    let outcome = retry_loop(
+    let (outcome, budget_stopped) = retry_loop_detailed(
         &settings,
         |attempt, timeout| {
             let mut request = client.get(url.clone());
@@ -329,19 +354,19 @@ pub async fn get_bytes_with_retry(
             format!("failed to retrieve {what}: timed out"),
             attempts,
             policy.max_attempts,
-            budget_exhausted(policy, attempts),
+            budget_stopped,
         )),
         SendOutcome::Transport { error, attempts } => Err(get_retry_error(
             format!("failed to retrieve {what}: {error}"),
             attempts,
             policy.max_attempts,
-            budget_exhausted(policy, attempts),
+            budget_stopped,
         )),
         SendOutcome::Body { error, attempts } => Err(get_retry_error(
             format!("failed to read {what} response body: {error}"),
             attempts,
             policy.max_attempts,
-            budget_exhausted(policy, attempts),
+            budget_stopped,
         )),
         SendOutcome::Http { status, attempts, .. } => {
             let message = format!("{what} returned {status}");
@@ -350,18 +375,9 @@ pub async fn get_bytes_with_retry(
             {
                 bail!("{message}");
             }
-            Err(get_retry_error(
-                message,
-                attempts,
-                policy.max_attempts,
-                budget_exhausted(policy, attempts),
-            ))
+            Err(get_retry_error(message, attempts, policy.max_attempts, budget_stopped))
         }
     }
-}
-
-fn budget_exhausted(policy: &GetRetryPolicy<'_>, attempts: u32) -> bool {
-    policy.remaining.is_some() && attempts < policy.max_attempts
 }
 
 fn get_retry_error(message: String, attempts: u32, max_attempts: u32, deadline_exhausted: bool) -> anyhow::Error {
@@ -650,6 +666,75 @@ mod tests {
             .await
             .expect("should succeed");
         assert_eq!(bytes, b"payload");
+    }
+
+    #[test]
+    fn generic_get_caps_retry_after_without_budget() {
+        let policy = policy(None);
+        let settings = RetrySettings::from_get(&policy);
+        let failure = super::failure_from_http(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Vec::new(),
+            Some(Duration::from_secs(3600)),
+            false,
+        );
+        assert_eq!(
+            retry_delay(&settings, 1, &failure),
+            super::GET_MAX_RETRY_DELAY,
+            "an uncapped Retry-After must not stall a budgetless GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_connection_without_response_is_retried() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            loop {
+                let (mut socket, _) = listener.accept().expect("accept");
+                accepted += 1;
+                if accepted == 1 {
+                    drop(socket);
+                    continue;
+                }
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf);
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .expect("write");
+                return accepted;
+            }
+        });
+        let url: reqwest::Url = format!("http://{addr}/file").parse().expect("url");
+        let bytes = get_bytes_with_retry(&client(), &url, "thing", &policy(None))
+            .await
+            .expect("reset connection should be retried");
+        assert_eq!(bytes, b"ok");
+        assert_eq!(server.join().expect("server"), 2);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_under_budget_is_not_labelled_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let remaining = || Duration::from_secs(10);
+        let policy = GetRetryPolicy {
+            base_delay: Duration::from_secs(120),
+            remaining: Some(&remaining),
+            ..policy(None)
+        };
+        let error = get_bytes_with_retry(&client(), &url(&server), "thing", &policy)
+            .await
+            .expect_err("fails");
+        assert!(error.to_string().contains("deadline exhausted"), "{error}");
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::github_http::{GithubGetOutcome, github_get};
+use crate::github_http::{GithubOutcome, github_get};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use tracing::{info, warn};
 
@@ -481,21 +481,21 @@ async fn fetch_github_bytes(
         .build()
         .with_context(|| format!("failed to build GitHub API client for {skip_name}"))?;
     match github_get(&client, url, github_token, operation, github.timeout, github.retry).await {
-        GithubGetOutcome::Success(bytes) => Ok(FetchedGithubBytes::Body(bytes)),
-        GithubGetOutcome::Timeout { attempts } => Err(github_timeout(operation, attempts)),
-        GithubGetOutcome::Transport { error } => {
+        GithubOutcome::Success(bytes) => Ok(FetchedGithubBytes::Body(bytes)),
+        GithubOutcome::Timeout { attempts } => Err(github_timeout(operation, attempts)),
+        GithubOutcome::Transport { error } => {
             warn!(repository, error = %error, "checkleft: GitHub {skip_name} skipped — transport error");
             Ok(FetchedGithubBytes::LookupFailed(format!(
                 "GitHub API {reason_name} transport error: {error}"
             )))
         }
-        GithubGetOutcome::Body { error } => {
+        GithubOutcome::Body { error } => {
             warn!(repository, error = %error, "checkleft: GitHub {skip_name} skipped — response body error");
             Ok(FetchedGithubBytes::LookupFailed(format!(
                 "GitHub API {reason_name} response body error: {error}"
             )))
         }
-        GithubGetOutcome::Http { status, .. } => {
+        GithubOutcome::Http { status, .. } => {
             warn!(repository, %status, "checkleft: GitHub {skip_name} skipped — non-success status");
             Ok(FetchedGithubBytes::LookupFailed(format!(
                 "GitHub API {reason_name} returned HTTP {status}"
