@@ -33,6 +33,7 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
         try await refresh(model, section: .working)
         model.setWorkViewMode(.navigator)
         model.selectWorkCard("task_nav_root")
+        try assertWorkerActivity(model, executionID: "nav-original", taskID: "task_nav_root")
         let original = try XCTUnwrap(model.navigatorSelectedTask)
         model.beginNavigatorBriefEdit(original)
         model.setNavigatorBriefText(original.id, text: "Unsaved original brief")
@@ -60,6 +61,7 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
             VALUES ('nav-repair-run','nav-repair','fixture','active','102');
             """)
         try await refresh(model, section: .working)
+        try assertWorkerActivity(model, executionID: "nav-repair", taskID: "task_nav_revision")
         XCTAssertEqual(model.navigator.askID, "task_nav_revision")
         model.setNavigatorDocument(.currentAsk, rootID: "task_nav_root")
         XCTAssertEqual(model.navigatorDocumentTask(for: try XCTUnwrap(model.navigatorSelectedTask)).description, "Current CI ask")
@@ -125,6 +127,35 @@ final class NavigatorLifecycleIntegrationTests: XCTestCase {
         try await wait("identified missing-guide reply") {
             model.navigatorReviewGuides.readers["task_nav_root"]?.state == .failed("This review guide is no longer available.")
         }
+    }
+
+    private func assertWorkerActivity(_ model: ChatViewModel, executionID: String, taskID: String) throws {
+        let root = try XCTUnwrap(model.navigatorSelectedTask)
+        let projection = try XCTUnwrap(root.navigator?.root)
+        let activity = try XCTUnwrap(projection.activities.first { $0.executionId == executionID })
+        XCTAssertEqual(activity.taskId, taskID)
+        XCTAssertEqual(activity.runId, executionID + "-run")
+        XCTAssertNotEqual(activity.runId, activity.executionId)
+        let row = NavigatorRow(task: root, projection: projection, matchingAskID: nil)
+        let observed = NavigatorRowLiveState(model: model, row: row)
+        // Worker registration uses execution.id, while work_runs has its own spawn id.
+        // Feed the wire parser and observable store, not a hand-keyed lookup dictionary.
+        for (workerID, status, expected) in [
+            (executionID, "working", true), (executionID, "idle", false),
+            (executionID, "waiting_for_input", false), ("unrelated-execution", "working", false),
+            (executionID, "working", true),
+        ] {
+            let state = try XCTUnwrap(model.engine.parseWorkerLiveState([
+                "slot_id": 1, "run_id": workerID, "model": "fixture",
+                "activity": status, "work_item_id": taskID,
+            ]))
+            model.liveWorkerStates.update(states: [state])
+            model.presentationUpdates.flush()
+            XCTAssertEqual(observed.isWorkerActive, expected, "\(taskID): \(workerID) \(status)")
+        }
+        model.liveWorkerStates.update(states: [])
+        model.presentationUpdates.flush()
+        XCTAssertFalse(observed.isWorkerActive)
     }
 
     private func refresh(_ model: ChatViewModel, section: NavigatorSection) async throws {

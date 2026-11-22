@@ -188,7 +188,7 @@ final class NavigatorRowTests: XCTestCase {
         XCTAssertEqual(chromeChanges, 0)
         XCTAssertEqual(chromeReads, 1, "Live-only ticks must not rederive navigator chrome")
         XCTAssertEqual(rowChanges, 0, "A row must ignore other workers' ticks")
-        model.liveWorkerStates.update(states: [worker("run", .working, "go")])
+        model.liveWorkerStates.update(states: [worker("execution", .working, "go")])
         model.presentationUpdates.flush()
         XCTAssertEqual(rowChanges, 1)
         XCTAssertTrue(rowState.isWorkerActive)
@@ -204,9 +204,10 @@ final class NavigatorRowTests: XCTestCase {
                             recoveryStatus: nil, tmuxHosted: nil)
         }
         typealias P = NavigatorRowPresentation
-        XCTAssertTrue(P.isWorkerActive(row: row, liveStates: ["run": live("run", .working)]))
-        XCTAssertFalse(P.isWorkerActive(row: row, liveStates: ["run": live("run", .idle)]))
+        XCTAssertTrue(P.isWorkerActive(row: row, liveStates: ["execution": live("execution", .working)]))
+        XCTAssertFalse(P.isWorkerActive(row: row, liveStates: ["execution": live("execution", .idle)]))
         XCTAssertFalse(P.isWorkerActive(row: row, liveStates: ["other": live("other", .working)]))
+        XCTAssertFalse(P.isWorkerActive(row: row, liveStates: ["run": live("run", .working)]))
         XCTAssertFalse(P.isWorkerActive(row: row, liveStates: [:]))
     }
 
