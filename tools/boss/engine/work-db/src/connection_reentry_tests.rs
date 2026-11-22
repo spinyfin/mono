@@ -35,10 +35,16 @@ fn independent_connections_can_be_held_and_released_out_of_order() {
 fn another_thread_can_acquire_after_the_holder_releases() {
     let db = crate::WorkDb::open(":memory:".into()).unwrap();
     let held = db.connect().unwrap();
+    let id = super::mutex_id(db.conn.as_ref());
+    assert!(super::held_by_this_thread(id).is_some(), "the holder records itself");
     std::thread::scope(|scope| {
         let (entered, ready) = std::sync::mpsc::channel();
         let db = &db;
         let other = scope.spawn(move || {
+            assert!(
+                super::held_by_this_thread(id).is_none(),
+                "ownership is per-thread, not process-global"
+            );
             assert!(matches!(db.conn.try_lock(), Err(TryLockError::WouldBlock)));
             entered.send(()).unwrap();
             drop(db.connect().expect("another thread is contention, not re-entry"));

@@ -32,11 +32,19 @@ thread_local! {
     static HELD: RefCell<Vec<(usize, &'static Location<'static>)>> = const { RefCell::new(Vec::new()) };
 }
 
+pub(super) fn mutex_id(connection: &Mutex<Connection>) -> usize {
+    std::ptr::from_ref(connection) as usize
+}
+
+pub(super) fn held_by_this_thread(id: usize) -> Option<&'static Location<'static>> {
+    HELD.with_borrow(|held| held.iter().find(|(key, _)| *key == id).map(|(_, site)| *site))
+}
+
 struct ConnectionOwner(usize);
 
 impl ConnectionOwner {
     fn register(connection: &Mutex<Connection>, caller: &'static Location<'static>) -> Self {
-        let id = std::ptr::from_ref(connection) as usize;
+        let id = mutex_id(connection);
         HELD.with_borrow_mut(|held| held.push((id, caller)));
         Self(id)
     }
@@ -132,8 +140,8 @@ pub(super) fn acquire<'a>(
     metrics: &std::sync::Arc<boss_metrics::Registry>,
 ) -> Result<PooledConnection<'a>> {
     let caller = std::panic::Location::caller();
-    let id = std::ptr::from_ref(connection) as usize;
-    if let Some(holder) = HELD.with_borrow(|held| held.iter().find(|(key, _)| *key == id).map(|(_, site)| *site)) {
+    let id = mutex_id(connection);
+    if let Some(holder) = held_by_this_thread(id) {
         anyhow::bail!(
             "work db connection re-entry at {caller}: this thread already holds it from {holder}; release the connection guard before calling a WorkDb method"
         );

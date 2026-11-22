@@ -54,7 +54,7 @@ fn credentials_and_host_tools_are_not_in_the_test_environment() {
         "test code can search outside Bazel-declared runtime inputs"
     );
 
-    for forbidden_binary in ["gh", "bk", "codex", "claude", "cube"] {
+    for forbidden_binary in ["gh", "bk", "codex", "claude", "cube", "sample"] {
         assert!(
             !path_entries.iter().any(|entry| entry.join(forbidden_binary).exists()),
             "{forbidden_binary} is reachable through the declared test PATH"

@@ -40,6 +40,8 @@ unset MONO_WRAPPER_TEST_HOLD_BEFORE_READY MONO_WRAPPER_TEST_HOLD_BEFORE_SETPGID
 runtime_root="${TEST_SRCDIR:?}/+test_runtime_repository+test_runtime_tools"
 runtime_bin="${runtime_root}/bin"
 runtime_manifest="${runtime_root}/manifest"
+capture_root="${TEST_SRCDIR:?}/+test_runtime_repository+timeout_capture_tools"
+capture_bin="${capture_root}/bin"
 developer_dir_file="${runtime_root}/developer_dir"
 main_runfiles="${TEST_SRCDIR:?}/${TEST_WORKSPACE:?}"
 xcode_bin="${main_runfiles}/tools/test-sandbox"
@@ -103,9 +105,9 @@ watchdog_pid=""
 cancelled=""
 
 capture_child_stacks() {
-  if [[ -n "${child_pid}" && -n "${TEST_UNDECLARED_OUTPUTS_DIR:-}" ]]; then
+  if [[ -n "${child_pid}" ]]; then
     "${runtime_bin}/python3" "${main_runfiles}/tools/test-sandbox/capture_stacks.py" \
-      "${child_pid}" "${runtime_bin}" || \
+      "${child_pid}" "${runtime_bin}" "${capture_bin}" || \
       printf 'could not capture test thread backtraces for %s\n' "${child_pid}" >&2
   fi
 }

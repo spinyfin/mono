@@ -51,6 +51,10 @@ while IFS='=' read -r name recorded; do
   fi
 done <"${manifest}"
 
+if grep -q '^sample=' "${manifest}"; then
+  fail "sample must not be in the shared test runtime; timeout capture owns it"
+fi
+
 if [[ "${checked}" -eq 0 ]]; then
   fail "the runtime manifest lists no tools, so nothing was checked"
 fi

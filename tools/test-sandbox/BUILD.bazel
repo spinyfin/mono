@@ -33,6 +33,7 @@ sh_binary(
         "capture_stacks.py",
         ":xcodebuild",
         "@test_runtime_tools//:runtime",
+        "@timeout_capture_tools//:runtime",
     ],
     visibility = ["//visibility:public"],
 )

@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -36,21 +37,104 @@ class CaptureTest(unittest.TestCase):
             self.assertIn("partial thread backtrace", report)
             self.assertIn("stack capture unavailable:", report)
 
+    def run_main(self, directory, capture, members=None):
+        if members is None:
+            members = [(11, "test"), (12, "child")]
+        with (
+            patch.dict(os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": directory, "TEST_TARGET": "//test"}),
+            patch("sys.argv", ["capture_stacks.py", "11", "/runtime"]),
+            patch.object(capture_stacks, "group_members", return_value=members),
+            patch.object(capture_stacks, "capture", capture),
+        ):
+            capture_stacks.main()
+
     def test_signal_then_cleanup_capture_each_member_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(capture_stacks, "capture") as capture:
+                self.run_main(directory, capture)
+                self.run_main(directory, capture)
+            self.assertEqual(capture.call_count, 2)
+            self.assertEqual({call.args[0] for call in capture.call_args_list}, {11, 12})
+            output = Path(directory) / "timeout-11"
+            manifest = (output / "processes.txt").read_text()
+            self.assertIn("test=//test group=11", manifest)
+            self.assertIn("12 child", manifest)
+            self.assertTrue((output / capture_stacks.COMPLETE).exists())
+
+    def test_abandoned_claim_without_complete_is_recaptured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "timeout-11"
+            output.mkdir()
+            (output / capture_stacks.LOCK).write_text("dead capturer")
+            with patch.object(capture_stacks, "capture") as capture:
+                self.run_main(directory, capture)
+            self.assertEqual(capture.call_count, 2)
+            self.assertTrue((output / capture_stacks.COMPLETE).exists())
+
+    def test_enumeration_failure_lets_a_successor_capture(self):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch.dict(os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": directory, "TEST_TARGET": "//test"}),
                 patch("sys.argv", ["capture_stacks.py", "11", "/runtime"]),
-                patch.object(capture_stacks, "group_members", return_value=[(11, "test"), (12, "child")]),
+                patch.object(
+                    capture_stacks,
+                    "group_members",
+                    side_effect=subprocess.CalledProcessError(1, ["ps"]),
+                ),
                 patch.object(capture_stacks, "capture") as capture,
             ):
                 capture_stacks.main()
-                capture_stacks.main()
+            output = Path(directory) / "timeout-11"
+            self.assertTrue(output.is_dir())
+            self.assertFalse((output / capture_stacks.COMPLETE).exists())
+            self.assertEqual(capture.call_count, 0)
+            with patch.object(capture_stacks, "capture") as capture:
+                self.run_main(directory, capture)
             self.assertEqual(capture.call_count, 2)
-            self.assertEqual({call.args[0] for call in capture.call_args_list}, {11, 12})
-            manifest = (Path(directory) / "timeout-11" / "processes.txt").read_text()
-            self.assertIn("test=//test group=11", manifest)
-            self.assertIn("12 child", manifest)
+            self.assertTrue((output / capture_stacks.COMPLETE).exists())
+
+    def test_live_holder_blocks_successor_until_it_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "timeout-11"
+            output.mkdir()
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import fcntl, sys, time\n"
+                    "from pathlib import Path\n"
+                    "lock = (Path(sys.argv[1]) / sys.argv[2]).open('a+')\n"
+                    "fcntl.flock(lock.fileno(), fcntl.LOCK_EX)\n"
+                    "sys.stdout.write('held\\n')\n"
+                    "sys.stdout.flush()\n"
+                    "time.sleep(30)\n",
+                    str(output),
+                    capture_stacks.LOCK,
+                ],
+                stdout=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline(), b"held\n")
+                with patch.object(capture_stacks, "capture") as capture:
+                    self.run_main(directory, capture)
+                self.assertEqual(capture.call_count, 0)
+                self.assertFalse((output / capture_stacks.COMPLETE).exists())
+            finally:
+                holder.kill()
+                holder.wait()
+
+    def test_missing_undeclared_dir_is_not_recreated(self):
+        missing = Path(tempfile.mkdtemp()) / "gone"
+        with (
+            patch.dict(os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": str(missing)}),
+            patch("sys.argv", ["capture_stacks.py", "11", "/runtime"]),
+            patch.object(capture_stacks, "group_members", return_value=[(11, "test")]),
+            patch.object(capture_stacks, "capture") as capture,
+        ):
+            capture_stacks.main()
+        self.assertFalse(missing.exists())
+        self.assertEqual(capture.call_count, 1)
+        self.assertEqual(capture.call_args.args[0], 11)
 
 
 if __name__ == "__main__":

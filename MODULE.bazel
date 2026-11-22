@@ -72,6 +72,16 @@ test_runtime_repository = use_repo_rule(
 
 test_runtime_repository(
     name = "test_runtime_tools",
+)
+
+# Host `sample` is used only by the wrapper's timeout-stack capture, which
+# runs outside Seatbelt. Keep it out of the shared runtime so tests do not
+# get it on PATH or as a process-exec grant.
+test_runtime_repository(
+    name = "timeout_capture_tools",
+    required = ["true"],
+    runtime_visibility = ["@@//tools/test-sandbox:__pkg__"],
+    tools = ["true"],
     tools_by_os = {"mac os x": ["sample"]},
 )
 
