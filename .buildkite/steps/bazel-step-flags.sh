@@ -18,11 +18,13 @@
 #   CI_BAZEL_VERIFY_ONLY=1  → --config=ci-strip --compilation_mode=fastbuild
 #                             (matches bazel_verify_only)
 #   unset                   → --compilation_mode=fastbuild
-#                             (matches Bazel default and checkleft's bazel)
-# Release steps set CI_BAZEL_STEP_FLAGS=--compilation_mode=opt to match
-# `bazel build -c opt`. --config=release and credential --defines stay on the
-# Boss.app compile only: they stamp the binary and embed secrets, and must not
-# re-key tool-install. That command is the documented exception.
+#                             (fallback for a step that sets neither variable)
+# Checkleft steps (`checks.sh`, `integrity-checkleft.sh`) and release steps set
+# CI_BAZEL_STEP_FLAGS=--compilation_mode=opt: checkleft's embedded
+# wasmtime/Cranelift JIT is much slower when unoptimized, and release steps
+# match `bazel build -c opt`. --config=release and credential --defines stay on
+# the Boss.app compile only: they stamp the binary and embed secrets, and must
+# not re-key tool-install. That command is the documented exception.
 
 ci_resolve_bazel_step_flags() {
   if [[ -n "${CI_BAZEL_STEP_FLAGS:-}" ]]; then

@@ -15,12 +15,12 @@ set -euo pipefail
 # nothing it passes to bazel is a credential. checkleft and
 # repobin build the tools they then run, which downloads those outputs as usual.
 #
-# Build bin/checkleft in opt rather than fastbuild: checkleft JIT-compiles wasm
-# check components via embedded wasmtime/Cranelift (~17x slower in unoptimized
-# builds per docs/investigations/checkleft-lib-test-wasm-compile-timeout.md),
-# and fastbuild regressed this step from 9 s (main build 28592) to 19 s
-# (build 28596), wiping out the 2-5 s analysis-cache saving. checkleft's own
-# bazel invocations read CI_BAZEL_FLAGS, so the analysis cache stays shared.
+# Build bin/checkleft in opt rather than fastbuild: a fastbuild checkleft is
+# much slower because its embedded wasmtime/Cranelift JIT runs unoptimized
+# (~17x slower per docs/investigations/checkleft-lib-test-wasm-compile-timeout.md),
+# which costs more than the re-analysis a shared fastbuild config would save.
+# checkleft's own bazel invocations read CI_BAZEL_FLAGS, so the analysis cache
+# stays shared.
 # Do not set CI_BAZEL_VERIFY_ONLY: ci-strip is not used here.
 CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 CI_REMOTE_EXECUTION_ALLOWED=1
