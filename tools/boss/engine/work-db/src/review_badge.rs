@@ -167,13 +167,7 @@ pub(super) fn fetch_review_due(
         return Ok(std::collections::HashSet::new());
     }
     let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-    let family = review_family_cte(&placeholders, key);
-    let due = review_due_sql();
-    let sql = format!(
-        "{family}
-         SELECT o.card FROM owners o JOIN tasks root ON root.id = o.id
-         WHERE NULLIF(root.pr_url, '') IS NOT NULL AND ({due})"
-    );
+    let sql = review_due_heads_sql(&placeholders, key);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(ids), |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -615,19 +609,33 @@ fn review_due_sql() -> String {
     let eligible = super::review_verdicts::dead_review_recovery_eligible_sql("root");
     let churn_cutoff = boss_engine_utils::epoch_time::now_epoch_secs() - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
     let churn_threshold = ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
+    // Family probes start from the CTE and seek each member's executions /
+    // attention by work_item_id. A JOIN that starts from those tables walks
+    // every historical row on the 15s unexplained-wait timer.
+    let live_pr_review = "EXISTS(SELECT 1 FROM family f
+                CROSS JOIN work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
+                  ON we.work_item_id = f.id AND we.kind = 'pr_review'
+                WHERE f.root = root.id
+                  AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned'))";
+    let deferred_admission = "EXISTS(SELECT 1 FROM family f
+                CROSS JOIN work_attention_items ai INDEXED BY work_attention_items_work_item_idx
+                  ON ai.work_item_id = f.id
+                WHERE f.root = root.id
+                  AND ai.kind = 'pr_review_admission_deferred'
+                  AND ai.status = 'open')";
     let latest_dead_pr_review = format!(
-        "EXISTS(SELECT 1 FROM work_executions we
+        "EXISTS(SELECT 1 FROM work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
                 WHERE we.work_item_id = root.id AND we.kind = 'pr_review'
                   AND {dead_we} AND {latest_we})"
     );
     let recoverable_dead_pr_review = format!(
-        "(EXISTS(SELECT 1 FROM work_executions we
+        "(EXISTS(SELECT 1 FROM work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
                  WHERE we.work_item_id = root.id AND we.kind = 'pr_review'
                    AND {dead_we} AND {latest_we}
                    AND NOT EXISTS(SELECT 1 FROM pr_review_batch_members m WHERE m.execution_id = we.id))
           AND {eligible}
           AND NOT {batch_owns}
-          AND (SELECT COUNT(*) FROM work_executions we3
+          AND (SELECT COUNT(*) FROM work_executions we3 INDEXED BY work_executions_item_kind_status_finished_idx
                WHERE we3.work_item_id = root.id
                  AND we3.kind = 'pr_review'
                  AND CAST(we3.created_at AS INTEGER) >= {churn_cutoff}
@@ -636,16 +644,11 @@ fn review_due_sql() -> String {
     format!(
         "(NULLIF(root.pr_head_sha, '') IS NULL AND NOT {latest_dead_pr_review})
          OR (root.status = 'active' AND root.parked_at IS NULL AND root.deleted_at IS NULL)
-         OR EXISTS(SELECT 1 FROM family f JOIN work_executions we ON we.work_item_id = f.id
-                   WHERE f.root = root.id AND we.kind = 'pr_review'
-                     AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned'))
+         OR {live_pr_review}
          OR EXISTS(SELECT 1 FROM pr_review_batches b
                    WHERE b.cycle_root_id = root.id AND b.phase = 'pre_merge'
                      AND b.status NOT IN ('completed', 'failed'))
-         OR EXISTS(SELECT 1 FROM family f JOIN work_attention_items ai ON ai.work_item_id = f.id
-                   WHERE f.root = root.id
-                     AND ai.kind = 'pr_review_admission_deferred'
-                     AND ai.status = 'open')
+         OR {deferred_admission}
          OR {needs_readmission}
          OR EXISTS(SELECT 1 FROM pr_review_batches b
                    WHERE b.id = (SELECT latest.id FROM pr_review_batches latest
@@ -658,6 +661,18 @@ fn review_due_sql() -> String {
                                     WHERE v2.batch_id = b.id AND v2.gate_outcome != '{stale_head}')
                      AND {none_started})
          OR {recoverable_dead_pr_review}"
+    )
+}
+
+/// Production SQL for [`fetch_review_due`]. Exposed so the query-plan test
+/// can `EXPLAIN` the same statement the wait classifier and board run.
+pub(crate) fn review_due_heads_sql(placeholders: &str, key: ReviewKey) -> String {
+    let family = review_family_cte(placeholders, key);
+    let due = review_due_sql();
+    format!(
+        "{family}
+         SELECT o.card FROM owners o JOIN tasks root ON root.id = o.id
+         WHERE NULLIF(root.pr_url, '') IS NOT NULL AND ({due})"
     )
 }
 
@@ -689,9 +704,11 @@ pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
                                                      AND e.kind = 'revision_implementation'
                                                    ORDER BY e.finished_at DESC, e.id DESC LIMIT 1)
                                       AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha))),
-                EXISTS(SELECT 1 FROM pr_review_verdicts sk
-                       JOIN family f ON f.id = sk.work_item_id AND f.root = root.id
-                       WHERE sk.head_sha = NULLIF(root.pr_head_sha, '')
+                EXISTS(SELECT 1 FROM family f
+                       CROSS JOIN pr_review_verdicts sk INDEXED BY pr_review_verdicts_work_item_idx
+                         ON sk.work_item_id = f.id
+                       WHERE f.root = root.id
+                         AND sk.head_sha = NULLIF(root.pr_head_sha, '')
                          AND sk.gate_outcome IN ({skipped_outcomes})
                          AND sk.created_at >= v.created_at)
          FROM owners o JOIN tasks root ON root.id = o.id
