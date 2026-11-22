@@ -30,8 +30,11 @@ fn python_scratch_traversal_and_clustered_programs_are_inspected() {
             "python3 -sc",
             "python3 -Sc",
             "uv run python3 -c",
+            "uv run --python python3.12 python3 -c",
             "poetry run python3 -c",
             "pipx run python3 -c",
+            "pipx run --python python3.11 python -c",
+            "python3.13t -c",
             "python3 -W ignore -X dev -Ic",
         ] {
             let command = format!("{prefix} 'print(open(\"{path}\").read())'");

@@ -476,6 +476,7 @@ def main():
     raw_command = ""
     tokens = []
     creates_link = False
+    plant_link = False
     if tool == "Bash":
         command = tool_input.get("command")
         if not isinstance(command, str):
@@ -493,20 +494,38 @@ def main():
             tokens = command.split()
         candidates.extend(tokens)
         # Creating a link inside the conversation allowance is how a later
-        # (or same-command) read walks out of scratch. Do not skip scratch
-        # operands of `ln` / `cp -s` / `cp -l`.
+        # (or same-command) read walks out of scratch. `ln` / `cp -s` / `cp -l`
+        # never get the scratch skip. Interpreters, `mv`, `cp -a`/`-R`, tar,
+        # rsync and git can plant a link that lexical realpath of a missing
+        # scratch component will not follow, so those only skip existing paths.
         for index, token in enumerate(tokens):
             prog = os.path.basename(token.lstrip("({"))
             if prog == "ln":
                 creates_link = True
                 break
-            if prog == "cp" and any(
-                w in ("-s", "--symbolic-link", "-l", "--link")
-                or (w.startswith("-") and not w.startswith("--") and ("s" in w[1:] or "l" in w[1:]))
-                for w in tokens[index + 1:]
-            ):
-                creates_link = True
-                break
+            rest = tokens[index + 1:]
+            if prog == "cp":
+                for w in rest:
+                    if w == "--":
+                        break
+                    clustered = w.startswith("-") and not w.startswith("--")
+                    if w in ("-s", "--symbolic-link", "-l", "--link") or (
+                        clustered and ("s" in w[1:] or "l" in w[1:])
+                    ):
+                        creates_link = True
+                        break
+                    if w in ("-a", "--archive", "-R", "-r", "--recursive", "-d", "--no-dereference") or w.startswith("--preserve") or (
+                        clustered and any(flag in w[1:] for flag in "aRrd")
+                    ):
+                        plant_link = True
+                if creates_link:
+                    break
+            if prog in ("mv", "tar", "bsdtar", "gtar", "rsync", "git"):
+                plant_link = True
+            if re.fullmatch(r"(?:python|pypy|ipython)[0-9.]*[a-z]*", prog):
+                plant_link = True
+            if "symlink" in token or "os.link" in token or re.search(r"(?<![A-Za-z0-9_])link\s*\(", token):
+                plant_link = True
         # Worker shells do not inherit BOSS_DATA_DIR. Any expansion of
         # $BOSS_DATA_DIR or ${BOSS_DATA_DIR} is therefore empty or
         # attacker-controlled, while expandvars still resolves this process's
@@ -533,10 +552,14 @@ def main():
     scratch_candidates = []
     for candidate in candidates:
         try:
-            if not creates_link and conversation_scratch_path(candidate, cwd, payload):
+            resolved = canonical(candidate, cwd)
+            skip_scratch = (not creates_link) and conversation_scratch_path(candidate, cwd, payload)
+            if skip_scratch and plant_link and not os.path.lexists(resolved):
+                skip_scratch = False
+            if skip_scratch:
                 scratch_candidates.append(candidate)
                 continue
-            if is_inside(canonical(candidate, cwd), data_dir):
+            if is_inside(resolved, data_dir):
                 emit("block", RECOVERY)
         except Exception:
             continue

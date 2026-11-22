@@ -515,11 +515,6 @@ def nested_shell_bodies(group):
             if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
                 return [rest[index + 1]]
         fail_closed("shell stdin or script execution cannot be inspected")
-    # A Python `-c` string or stdin body is Python source, not shell. It is not
-    # shell-parsed (its quotes, backticks and `$` mean nothing to bash). Python
-    # is as opaque here as a script file the worker runs by name; the shell
-    # text that carries it is still fully inspected. Protected-root spellings
-    # inside those bodies are scanned separately (see python_inline_bodies).
     if base == "find":
         bodies = []
         for index, arg in enumerate(rest):
@@ -530,20 +525,19 @@ def nested_shell_bodies(group):
     return []
 
 
-PYTHON_PROGRAMS = {"python", "python2", "python3", "ipython"}
+PYTHON_PROGRAM_RE = re.compile(r"(?:python|pypy|ipython)[0-9.]*[a-z]*")
+PYTHON_PATH_ESCAPE_RE = re.compile(r"\\(?:x|u|U|N|[0-7])")
+PYTHON_DOTDOT_TOKEN_RE = re.compile(r"(?:^|[/\\'\"\s])\.\.(?:[/\\'\"\s]|$)")
+PYTHON_LINK_RE = re.compile(r"symlink(?:_to)?|os\s*\.\s*link|(?<![A-Za-z0-9_])link\s*\(")
+PYTHON_JOIN_RE = re.compile(r"(?:os\s*\.\s*path\s*\.\s*join|pathlib\s*\.\s*Path|(?<![A-Za-z0-9_])Path)\s*\(")
+PYTHON_PATH_DIV_RE = re.compile(r"/\s*['\"]\.\.|\.\.['\"]\s*/")
 
 
 def is_python_program(name):
-    return name in PYTHON_PROGRAMS or re.fullmatch(r"python[0-9.]+", name)
+    return bool(PYTHON_PROGRAM_RE.fullmatch(name))
 
 
-def python_inline_bodies(group):
-    rest = strip_prefixes(group)
-    # Launchers such as uv/poetry/pipx can precede the interpreter.
-    start = next((i for i, arg in enumerate(rest)
-                  if is_python_program(os.path.basename(arg))), None)
-    if start is None:
-        return []
+def python_c_bodies_after(rest, start):
     bodies = []
     arguments = iter(rest[start + 1:])
     for arg in arguments:
@@ -565,6 +559,18 @@ def python_inline_bodies(group):
             continue
         if flag in "cm":
             break
+    return bodies
+
+
+def python_inline_bodies(group):
+    rest = strip_prefixes(group)
+    # Launchers such as uv/poetry/pipx can precede the interpreter, and
+    # `--python python3.12` is itself a python-looking word. Parse options
+    # after every such word and union the `-c` bodies.
+    bodies = []
+    for start, arg in enumerate(rest):
+        if is_python_program(os.path.basename(arg)):
+            bodies.extend(python_c_bodies_after(rest, start))
     body = getattr(group, "body", "") or ""
     if body:
         bodies.append(body)
@@ -572,6 +578,57 @@ def python_inline_bodies(group):
     if here:
         bodies.append(here)
     return bodies
+
+
+def python_group_source_bodies(group):
+    bodies = list(python_inline_bodies(group))
+    rest = strip_prefixes(group)
+    if not any(is_python_program(os.path.basename(arg)) for arg in rest):
+        return bodies
+    for source in getattr(group, "pipe_sources", None) or []:
+        if source:
+            bodies.append(shlex.join(list(source)))
+        source_body = getattr(source, "body", "") or ""
+        if source_body:
+            bodies.append(source_body)
+        here = here_string_body(source)
+        if here:
+            bodies.append(here)
+    return bodies
+
+
+def python_string_contents(body):
+    contents = []
+    index, length = 0, len(body)
+    while index < length:
+        char = body[index]
+        if char == "#":
+            newline = body.find("\n", index)
+            index = length if newline < 0 else newline + 1
+            continue
+        if char in "\"'":
+            triple = body.startswith(char * 3, index)
+            delim = char * 3 if triple else char
+            index += len(delim)
+            chunk = []
+            while index < length:
+                if body.startswith(delim, index):
+                    index += len(delim)
+                    break
+                if body[index] == chr(92) and index + 1 < length:
+                    chunk.append(body[index:index + 2])
+                    index += 2
+                    continue
+                chunk.append(body[index])
+                index += 1
+            contents.append("".join(chunk))
+            continue
+        index += 1
+    return contents
+
+
+def python_body_creates_link(body):
+    return bool(PYTHON_LINK_RE.search(body))
 
 
 def allowed_scratch_spellings(policy):
@@ -607,18 +664,46 @@ def allowed_scratch_spellings(policy):
     return unique
 
 
+def python_literal_escapes_scratch(content, spellings):
+    for spelling in spellings:
+        if not spelling or spelling not in content:
+            continue
+        start = 0
+        while True:
+            pos = content.find(spelling, start)
+            if pos < 0:
+                break
+            suffix = content[pos + len(spelling):]
+            parts = suffix.replace(chr(92), "/").split("/")
+            if ".." in parts:
+                return True
+            if suffix and not suffix.startswith("/") and not suffix.startswith(" "):
+                return True
+            start = pos + 1
+    return False
+
+
 def python_body_touches_protected(body, policy):
     # Literal scan only: the body is Python, so `$()` is not shell. Mask this
     # run's allowed scratch/steps/tasks spellings first so a body that opens
-    # `{scratch}/lib.rs` stays allowed.
+    # `{scratch}/lib.rs` stays allowed. Scratch-adjacent `..`, escapes that
+    # can spell `.` or `/`, and link creation are denied because a glued
+    # `[^\s"']*` suffix misses whitespace, `\x2e`, adjacent literals and
+    # `os.path.join`.
+    if python_body_creates_link(body):
+        return True
+    spellings = allowed_scratch_spellings(policy)
+    if any(spelling and spelling in body for spelling in spellings):
+        if PYTHON_PATH_ESCAPE_RE.search(body) or PYTHON_DOTDOT_TOKEN_RE.search(body):
+            return True
+        if PYTHON_JOIN_RE.search(body) and ".." in body:
+            return True
+        if PYTHON_PATH_DIV_RE.search(body):
+            return True
+        if any(python_literal_escapes_scratch(content, spellings) for content in python_string_contents(body)):
+            return True
     text = body
-    for spelling in allowed_scratch_spellings(policy):
-        for match in re.finditer(re.escape(spelling) + r"[^\s\"']*", text):
-            suffix = match.group()[len(spelling):]
-            if ".." in suffix.replace(chr(92), "/").split("/"):
-                return True
-            if suffix and not suffix.startswith("/"):
-                return True
+    for spelling in spellings:
         text = text.replace(spelling, "ALLOWED_SCRATCH")
     needles = []
     for root in policy.get("protected_paths", []):
@@ -950,10 +1035,11 @@ def within_conversation_scratch(resolved, policy):
     return conversation_scratch_contains(resolved, conversation_scratch_dir(policy))
 
 
-def path_is_protected(path, policy, cwd=None, pre_expanded=False):
+def path_is_protected(path, policy, cwd=None, pre_expanded=False, trust_missing_scratch=True):
     expanded = resolve_path(path, policy, cwd, pre_expanded=pre_expanded)
     if within_conversation_scratch(expanded, policy):
-        return False
+        if trust_missing_scratch or os.path.lexists(expanded):
+            return False
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
             root_abs = spelling.rstrip(os.sep)
@@ -985,7 +1071,7 @@ def glob_wildcard_uses_unmodeled_brackets(wildcard):
     return any(marker in wildcard for marker in ("[[", "[!", "[^"))
 
 
-def glob_touches_protected(expanded, policy):
+def glob_touches_protected(expanded, policy, trust_missing_scratch=True):
     # Keep the un-normalized static prefix so a symlink-then-`..` glob is
     # compared after physical resolution, matching bash, not after lexically
     # collapsing `link/../` away from the protected root.
@@ -999,7 +1085,8 @@ def glob_touches_protected(expanded, policy):
     base = conversation_scratch_dir(policy)
     wildcard = expanded[len(static):]
     if (
-        base is not None
+        trust_missing_scratch
+        and base is not None
         and ".." not in wildcard.split(os.sep)
         and not glob_wildcard_uses_unmodeled_brackets(wildcard)
     ):
@@ -1316,6 +1403,44 @@ def cp_creates_links(rest):
     return False
 
 
+def cp_preserves_links(rest):
+    for arg in rest[1:]:
+        if arg == "--":
+            break
+        if arg in ("-a", "--archive", "-R", "-r", "--recursive", "-d", "--no-dereference") or arg.startswith("--preserve"):
+            return True
+        if arg.startswith("-") and not arg.startswith("--") and any(flag in arg[1:] for flag in "aRrd"):
+            return True
+    return False
+
+
+LINK_MOVE_PROGRAMS = {"ln", "mv", "tar", "bsdtar", "gtar", "rsync", "git"}
+
+
+def group_may_create_or_move_link(rest):
+    if not rest:
+        return False
+    program = os.path.basename(rest[0])
+    if program in LINK_MOVE_PROGRAMS:
+        return True
+    if program == "cp" and (cp_creates_links(rest) or cp_preserves_links(rest)):
+        return True
+    if is_python_program(program):
+        return True
+    return False
+
+
+def command_may_create_or_move_link(groups):
+    for group in groups:
+        rest = strip_prefixes(group)
+        if group_may_create_or_move_link(rest):
+            return True
+        joined = " ".join(group)
+        if "symlink" in joined or PYTHON_LINK_RE.search(joined):
+            return True
+    return False
+
+
 def link_creation_touches_protected(rest, policy, current):
     program = os.path.basename(rest[0]) if rest else ""
     if program == "ln":
@@ -1348,7 +1473,7 @@ def link_creation_touches_protected(rest, policy, current):
     return False
 
 
-def operand_touches_protected(candidate, policy, current, program, is_redirect, literal=None, segments=None):
+def operand_touches_protected(candidate, policy, current, program, is_redirect, literal=None, segments=None, trust_missing_scratch=True):
     expanded = expand_exported(candidate, literal, segments, shell_token=True)
     if '$' in expanded or re.match(r"^~[^/]", expanded):
         # echo/printf argv text is data; a redirect target is always opened.
@@ -1360,15 +1485,16 @@ def operand_touches_protected(candidate, policy, current, program, is_redirect, 
     expanded = expanded.replace(chr(1), '$').replace(chr(3), '~')
     if not os.path.isabs(expanded):
         expanded = os.path.join(current or policy['workspace_path'], expanded)
-    if any(c in expanded for c in '*?[') and glob_touches_protected(expanded, policy):
+    if any(c in expanded for c in '*?[') and glob_touches_protected(expanded, policy, trust_missing_scratch):
         return True
-    return path_is_protected(expanded, policy, current, pre_expanded=True)
+    return path_is_protected(expanded, policy, current, pre_expanded=True, trust_missing_scratch=trust_missing_scratch)
 
 
 def command_touches_protected(command, policy, cwd):
     current = cwd
     groups = command_groups(command)
     reject_trusted_rebinding(command, groups)
+    trust_missing_scratch = not command_may_create_or_move_link(groups)
     for group in groups:
         rest = strip_prefixes(group)
         inner = stdin_argv_program(group)
@@ -1377,9 +1503,14 @@ def command_touches_protected(command, policy, cwd):
         program = os.path.basename(rest[0]) if rest else ''
         if rest and link_creation_touches_protected(rest, policy, current):
             return True
-        for body in python_inline_bodies(group):
+        # Python `-c` / heredoc / piped-stdin bodies are Python source, not
+        # shell. Protected-root spellings in those bodies are scanned by
+        # python_body_touches_protected.
+        for body in python_group_source_bodies(group):
             if python_body_touches_protected(body, policy):
                 return True
+        rest_ids = strip_prefix_indices(group)
+        program_index = rest_ids[0] if rest_ids else None
         for index, role in sorted(path_operand_positions(group).items()):
             token = group[index]
             literal = token_literal(group, index)
@@ -1398,8 +1529,13 @@ def command_touches_protected(command, policy, cwd):
             for candidate, offset in operand_path_texts(protected_text, role, program):
                 cand_literal = literal[offset:offset + len(candidate)] if literal else []
                 cand_segments = segments[offset:offset + len(candidate)] if segments is not None else None
+                # The program word is a PATH lookup, not a scratch file, even
+                # after `cd` into scratch. Missing-scratch distrust applies to
+                # real operands (`cat up/state.db`), not to `python3` itself.
+                token_trust = trust_missing_scratch or index == program_index
                 if candidate and not candidate.startswith('&') and operand_touches_protected(
-                        candidate, policy, current, program, is_redirect, cand_literal, cand_segments):
+                        candidate, policy, current, program, is_redirect, cand_literal, cand_segments,
+                        token_trust):
                     return True
         if rest and rest[0] in ("cd", "pushd", "popd"):
             if len(rest) != 2 or rest[1] == "-" or re.match(r"^~[^/]", rest[1]) or any(c in rest[1] for c in "`*?["):
@@ -1414,7 +1550,7 @@ def command_touches_protected(command, policy, cwd):
             if "$" in expanded:
                 return True
             current = resolve_path(expanded, policy, current, pre_expanded=True)
-            if path_is_protected(current, policy, pre_expanded=True):
+            if path_is_protected(current, policy, pre_expanded=True, trust_missing_scratch=trust_missing_scratch):
                 return True
         for body in nested_shell_bodies(group):
             if command_touches_protected(body, policy, current):
@@ -1504,7 +1640,7 @@ def structural_command_reason(command, policy, worker_kind, cwd):
             if not rest:
                 continue
             prog = os.path.basename(rest[0])
-            if prog in REVIEWER_BLOCKED or prog == "osascript" or prog.startswith("pypy") or re.fullmatch(r"python[0-9.]*", prog):
+            if prog in REVIEWER_BLOCKED or prog == "osascript" or is_python_program(prog):
                 return "%s workers must not execute uninspectable interpreter bodies" % worker_kind
             if vcs_mutation(rest):
                 return "%s workers must not mutate repository or GitHub state" % worker_kind

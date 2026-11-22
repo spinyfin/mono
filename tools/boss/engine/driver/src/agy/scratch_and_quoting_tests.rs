@@ -567,6 +567,8 @@ fn same_command_symlink_in_scratch_cannot_reach_protected_state() {
     let hooks = fx.process_home.join(".gemini/config/hooks.json");
     let to_data = relative_from(&scratch, &data);
     let to_hooks = relative_from(&scratch, &hooks);
+    std::os::unix::fs::symlink(&to_data, fx.workspace().join("prepared-up")).unwrap();
+    std::os::unix::fs::symlink(&to_data, fx.workspace().join("prepared-link")).unwrap();
     let home_scratch = format!("$HOME/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch");
     for command in [
         format!(
@@ -587,6 +589,24 @@ fn same_command_symlink_in_scratch_cannot_reach_protected_state() {
         ),
         format!("ln -s {} {}/up", to_data.display(), scratch.display()),
         format!("cp -s {} {}/up", to_data.display(), scratch.display()),
+        format!(
+            "python3 -c 'import os; os.symlink({:?}, {:?})' && cat {}/up/state.db",
+            to_data.to_string_lossy(),
+            scratch.join("up").to_string_lossy(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/up && cat {}/up/state.db",
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "cp -a {} {}/up && cat {}/up/state.db",
+            fx.workspace().join("prepared-link").display(),
+            scratch.display(),
+            scratch.display()
+        ),
     ] {
         assert_command_denied(&fx, &command);
     }
@@ -629,6 +649,8 @@ fn python_bodies_cannot_open_settings_hooks_or_other_conversations() {
     fs::write(&other, "print(1)\n").unwrap();
     let scratch = conversation_dir(&fx).join("scratch");
     fs::write(scratch.join("lib.rs"), "fn main() {}\n").unwrap();
+    fs::create_dir_all(scratch.join("work dir")).unwrap();
+    fs::write(scratch.join("work dir/file.rs"), "fn main() {}\n").unwrap();
     for command in [
         format!("python3 -c 'print(open(\"{}\").read())'", settings.display()),
         format!("python3 -c 'print(open(\"{}\").read())'", hooks.display()),
@@ -638,6 +660,44 @@ fn python_bodies_cannot_open_settings_hooks_or_other_conversations() {
         "python3 -c 'print(open(\"~/.gemini/antigravity-cli/settings.json\").read())'".to_owned(),
         "python3 -c 'print(open(\"$HOME/.gemini/config/hooks.json\").read())'".to_owned(),
         "python3 -c 'print(open(\"$HOME/.gemini/antigravity-cli/brain/c2/scratch/x.py\").read())'".to_owned(),
+        format!(
+            "python3 -c 'print(open(\"{}/work dir/../../.system_generated/logs/transcript_full.jsonl\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 - <<'PY'\nprint(open(\"{}/work dir/../../.system_generated/logs/transcript_full.jsonl\").read())\nPY",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'print(open(\"{}/\\x2e\\x2e/.system_generated/logs/transcript_full.jsonl\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'print(open(\"{}/\" \"../../../antigravity-cli/settings.json\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'import os; print(open(os.path.join(\"{}\", \"..\", \"..\", \"c2\", \"scratch\", \"x.py\")).read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'from pathlib import Path; print(open(Path(\"{}\") / \"..\" / \"..\" / \"c2\" / \"scratch\" / \"x.py\").read())'",
+            scratch.display()
+        ),
+        format!("echo 'print(open(\"{}\").read())' | python3", settings.display()),
+        format!(
+            "printf '%s' 'print(open(\"{}\").read())' | python3 -",
+            settings.display()
+        ),
+        format!(
+            "cat <<'PY' | python3 -\nprint(open(\"{}\").read())\nPY",
+            other.display()
+        ),
+        format!(
+            "uv run --python python3.12 python3 -c 'print(open(\"{}\").read())'",
+            settings.display()
+        ),
+        format!("python3.13t -c 'print(open(\"{}\").read())'", settings.display()),
     ] {
         let reason = assert_command_denied(&fx, &command);
         assert!(
@@ -653,6 +713,20 @@ fn python_bodies_cannot_open_settings_hooks_or_other_conversations() {
         &fx,
         &format!(
             "python3 - <<'PY'\nprint(open(\"{}/lib.rs\").read())\nPY",
+            scratch.display()
+        ),
+    );
+    assert_command_allowed(
+        &fx,
+        &format!(
+            "python3 -c 'print(open(\"{}/work dir/file.rs\").read())'",
+            scratch.display()
+        ),
+    );
+    assert_command_allowed(
+        &fx,
+        &format!(
+            "python3 - <<'PY'\nprint(open(\"{}/work dir/file.rs\").read())\nPY",
             scratch.display()
         ),
     );

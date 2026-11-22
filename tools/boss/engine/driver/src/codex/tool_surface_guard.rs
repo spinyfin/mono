@@ -242,14 +242,27 @@ def stdin_comes_from_redirect(group, cwd, files_proven):
         if operator not in ('<', '<<', '<<-', '<<<'):
             return False
         target = token[match.end():] or (group[index + 1] if index + 1 < len(group) else '')
-        redirects.append((operator, target))
+        target_index = index if token[match.end():] else (index + 1 if index + 1 < len(group) else index)
+        redirects.append((operator, target, target_index))
     if len(redirects) != 1:
         return False
-    operator, target = redirects[0]
+    operator, target, target_index = redirects[0]
     if operator != '<':
         return bool(target)
     if not files_proven:
         return False
+    # Command and process substitution in this group run before the redirect
+    # opens, so `python3 - < f "$(ln -sf /dev/tty f)"` can replace a proven
+    # regular file. Treat the redirect as unproven when this group contains
+    # that syntax, or a `$` / backtick in any token other than the target.
+    joined = ''.join(group)
+    if '$(' in joined or '`' in joined or '<(' in joined or '>(' in joined:
+        return False
+    for index, token in enumerate(group):
+        if index == target_index:
+            continue
+        if '$' in token or '`' in token:
+            return False
     # Expansions and preceding directory changes prevent proving which file
     # will be opened. Resolve symlinks before checking device roots and type.
     if not target or any(char in target for char in '$~*?[]`'):
@@ -705,6 +718,17 @@ mod tests {
                 "tool_input": {"command": command}
             }));
             assert_eq!(decision, "approve", "{command}: {reason}");
+        }
+        for command in [
+            r#"python3 - < f "$(ln -sf /dev/tty f)""#.to_owned(),
+            "python3 - < f `ln -sf /dev/tty f`".to_owned(),
+            "python3 - < f <(ln -sf /dev/tty f)".to_owned(),
+        ] {
+            let (decision, reason) = decide(serde_json::json!({
+                "tool_name": "Bash", "cwd": dir.path(),
+                "tool_input": {"command": command}
+            }));
+            assert_eq!(decision, "block", "{command} still opens a stdin channel: {reason}");
         }
     }
 

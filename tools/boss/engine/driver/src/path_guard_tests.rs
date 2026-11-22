@@ -150,6 +150,8 @@ fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
     let brain = tmp.path().join("brain");
     std::os::unix::fs::symlink(&sessions, &brain).unwrap();
     std::os::unix::fs::symlink(&data, sessions.join("c1/scratch/up")).unwrap();
+    std::os::unix::fs::symlink(&data, tmp.path().join("prepared-up")).unwrap();
+    std::os::unix::fs::symlink(&data, tmp.path().join("prepared-link")).unwrap();
     let scratch = brain.join("c1/scratch");
     for command in [
         format!("ln -s ../../../../../../.. {}/climb", scratch.display()),
@@ -165,6 +167,23 @@ fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
         format!("cat {}/[!x]p/state.db", scratch.display()),
         format!(
             "ln -s ../../../../../../.. {}/climb && cat {}/climb/state.db",
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'import os; os.symlink(\"../../../../../../..\", \"{}/climb\")' && cat {}/climb/state.db",
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/up && cat {}/up/state.db",
+            tmp.path().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "cp -a {} {}/up && cat {}/up/state.db",
+            tmp.path().join("prepared-link").display(),
             scratch.display(),
             scratch.display()
         ),
