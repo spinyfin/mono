@@ -199,7 +199,7 @@ Dependents:
 
 Churn-window terminal count (1h, excluding progression): 1
 
-- exec_ID item=task_ID kind=chore_implementation status=failed via=(unset) run_done=blocked error=Should the API return 404 or 410 for retired ids? I need the owner to pick.
+- exec_ID item=task_ID kind=chore_implementation status=failed via=test run_done=blocked error=Should the API return 404 or 410 for retired ids? I need the owner to pick.
 
 Should the API return 404 or 410 for retired ids? I need the owner to pick.
 
@@ -755,7 +755,7 @@ Dependents:
 
 Churn-window terminal count (1h, excluding progression): 1
 
-- exec_ID item=task_ID kind=chore_implementation status=failed via=(unset) run_done=blocked error=need a decision on the retry budget
+- exec_ID item=task_ID kind=chore_implementation status=failed via=test run_done=blocked error=need a decision on the retry budget
 
 need a decision on the retry budget
 
@@ -840,7 +840,7 @@ Dependents:
 
 Churn-window terminal count (1h, excluding progression): 1
 
-- exec_ID item=task_ID kind=chore_implementation status=failed via=(unset) run_done=(none) error=nudge loop bounded after silence
+- exec_ID item=task_ID kind=chore_implementation status=failed via=test run_done=(none) error=nudge loop bounded after silence
 
 ## Declared blocker (2.9)
 
