@@ -79,6 +79,8 @@ sh_test(
         "//.buildkite/steps:boss-head-release-tag.sh",
         "//.buildkite/steps:boss-release.sh",
         "//.buildkite/steps:fetch-boss-tags.sh",
+        "//tools:boss/release.toml",
+        "//tools/release:src/testdata/boss-version-family-cases.txt",
     ],
 )
 

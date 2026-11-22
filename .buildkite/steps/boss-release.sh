@@ -20,12 +20,15 @@ set -euo pipefail
 
 # Cheap already-tagged skip. ci-env.sh installs bin/release via repobin, which
 # builds //tools/release before `prepare` can see that HEAD is already a
-# published boss-v* tag. On a no-op scheduled check that build is most of the
-# step. Fetch tags first (Buildkite checkouts do not). A scheduled run whose
-# HEAD already carries a version-family tag exits 0 here. UI/API triggers
-# still run `prepare` so a stranded draft on a tagged HEAD can resume.
-# `bin/release prepare` remains the authority for untagged HEADs (change
-# detection, GitHub last-published SHA).
+# published boss-v* tag. On a no-op check that build is most of the step.
+# Fetch tags first (Buildkite checkouts do not). Skip here only when:
+#   1. resume-draft (RELEASE_RESUME_DRAFT / CHECKLEFT_RESUME_DRAFT) is not 1,
+#   2. tools/boss/release.toml parses cleanly,
+#   3. HEAD carries a version-family tag, and
+#   4. `gh release view` confirms that tag's GitHub Release is published
+#      (isDraft == false).
+# Draft releases, missing releases, gh errors, config parse errors, and
+# untagged HEADs all fall through to `bin/release prepare`.
 # shellcheck source=fetch-boss-tags.sh
 source "$(dirname "${BASH_SOURCE[0]}")/fetch-boss-tags.sh"
 # shellcheck source=boss-head-release-tag.sh
@@ -34,7 +37,10 @@ if ! ci_fetch_boss_tags; then
   echo "ERROR: failed to fetch boss-v* tags from origin. Refusing to decide a release from stale tags." >&2
   exit 1
 fi
-if [[ "${BUILDKITE_SOURCE:-}" == "schedule" ]] && tag="$(ci_boss_head_release_tag)"; then
+if ! ci_boss_resume_draft_enabled \
+  && ci_boss_load_release_config "tools/boss/release.toml" \
+  && tag="$(ci_boss_head_release_tag)" \
+  && ci_boss_release_is_published "$tag" "${CI_BOSS_RELEASE_REPO}"; then
   echo "$(ci_boss_already_released_skip_message "$tag")"
   exit 0
 fi

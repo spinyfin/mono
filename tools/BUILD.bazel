@@ -1,1 +1,9 @@
 # Tools
+
+exports_files(
+    ["boss/release.toml"],
+    visibility = [
+        "//.buildkite/steps/tests:__pkg__",
+        "//tools/release:__pkg__",
+    ],
+)

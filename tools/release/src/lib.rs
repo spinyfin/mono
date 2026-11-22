@@ -16,7 +16,7 @@ pub use config::{NotesConfig, NotesSource, ReleaseConfig, VersionConfig, Version
 pub use decision::{SkipDecision, SkipInput, SkipReason, Trigger, assert_allowed_trigger, should_skip, skip_log_line};
 pub use release_state::{GitHubRelease, LastReleases, ReleaseState, query_release_state, resolve_last_release};
 pub use runner::{Command, CommandOutput, CommandRunner, ProcessCommandRunner, RunnerError};
-pub use version::{NextVersion, compute_next_version, highest_version_family_tag, tag_in_version_family};
+pub use version::{NextVersion, compute_next_version};
 
 use thiserror::Error;
 
