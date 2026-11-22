@@ -85,6 +85,24 @@ fn raw_abandon(db: &WorkDb, execution_id: &str) {
         .unwrap();
 }
 
+/// An engine `autostart` 1→0 row in the pre-enrichment shape: `basis` names
+/// the writer, every added column is NULL. Matches rows recorded between the
+/// original ledger and migration `20261118_1530_execution_abandon_audit`.
+fn insert_pre_enrichment_autostart_off(db: &WorkDb, work_item_id: &str, basis: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO task_status_audit
+                (work_item_id, property, old_value, new_value, actor, changed_at, basis,
+                 reason_code, operation_id, detail, execution_id, failure_stamp, failure_error,
+                 execution_ever_ran, item_ever_ran)
+             VALUES (?1, 'autostart', '1', '0', 'engine', strftime('%s','now'), ?2,
+                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            rusqlite::params![work_item_id, basis],
+        )
+        .unwrap();
+}
+
 fn acknowledge(db: &WorkDb, id: &str, through: i64) -> Task {
     match db
         .update_work_item_as_actor(
@@ -498,4 +516,37 @@ fn a_bypass_of_the_ledger_helpers_still_raises_the_notice() {
     raw_abandon(&db, &execution.id);
     let notice = stop_notice(&db, &chore.id).unwrap();
     assert_eq!(notice.reason_code, task_status_audit::UNATTRIBUTED_WRITE);
+}
+
+#[test]
+fn a_pre_enrichment_autostart_off_derives_its_reason_from_basis() {
+    let db = WorkDb::open(temp_db_path("auto-stop-legacy-autostart")).unwrap();
+    let product = create_test_product_named(&db, "Auto stop legacy autostart");
+    let bounced = create_test_chore_manual(&db, &product.id, "Bounced");
+    let consumed = create_test_chore_manual(&db, &product.id, "Consumed");
+    // First word is the writer; the rest is the socket caller, as on live rows.
+    let bounce_basis = "cube_workspace_lease_failed pid=1";
+    insert_pre_enrichment_autostart_off(&db, &bounced.id, bounce_basis);
+    insert_pre_enrichment_autostart_off(&db, &consumed.id, task_status_audit::START_EXECUTION_RUN_BASIS);
+
+    let bounced_row = db
+        .list_task_field_audit(&bounced.id)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.property == "autostart" && row.old_value.as_deref() == Some("1"))
+        .expect("the pre-enrichment 1→0 row is listed");
+    assert!(bounced_row.reason_code.is_none());
+    assert!(bounced_row.operation_id.is_none());
+    assert_eq!(bounced_row.basis, bounce_basis);
+
+    let notice = stop_notice(&db, &bounced.id).expect("a pre-enrichment bounce still raises");
+    assert_eq!(notice.reason_code, "cube_workspace_lease_failed");
+    assert!(notice.autostart_disabled && !notice.execution_abandoned);
+    assert!(notice.audit_id > 0);
+
+    assert_eq!(
+        stop_notice(&db, &consumed.id),
+        None,
+        "a pre-enrichment run-start consumption is excluded by the derived code, with no later run"
+    );
 }

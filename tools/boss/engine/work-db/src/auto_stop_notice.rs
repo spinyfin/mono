@@ -18,15 +18,22 @@
 //!   without hiding a stop that followed an earlier finished run;
 //! - no execution is queued or running, so queueing a replacement clears it;
 //! - the item is live and not held on purpose (closed, deferred or parked);
-//! - for an autostart `1 → 0` write, autostart is still off;
+//! - for an autostart `1 → 0` write, autostart is still off. Rows written
+//!   before the ledger stored `reason_code` still qualify: the code is the
+//!   first word of `basis`, the same derivation the recorder uses, so a
+//!   pre-enrichment bounce is labelled with its writer and a pre-enrichment
+//!   run-start consumption is excluded by that code;
 //! - for an abandonment, the execution itself never started a run, and the
 //!   cause is not one of [`BENIGN_ABANDON_CAUSES`], where withdrawing the
 //!   execution is the intended outcome rather than a stop. Autostart may
 //!   still be on: an unreplaced never-started abandonment is a stall even
 //!   when the reconciler is supposed to re-mint. Any other cause, including
 //!   a write that bypassed the ledger helpers, raises the notice.
+//!   Pre-enrichment abandonment rows keep NULL `execution_ever_ran` and
+//!   therefore never raise.
 //!
-//! Which items get stopped is unchanged; this only makes the stop visible.
+//! This module only reads the ledger and the acknowledgment table; it never
+//! decides which items are stopped or changes dispatch.
 use super::*;
 use crate::task_status_audit::{AbandonCause, EXECUTION_ABANDONED_PROPERTY, START_EXECUTION_RUN_BASIS, abandon_cause};
 use boss_protocol::AutoStopNotice;
@@ -37,6 +44,11 @@ pub(super) const MIGRATION_ID: &str = "20261118_1700_task_auto_stop_ack";
 /// Execution statuses that mean an attempt is queued or running.
 const IN_FLIGHT_EXECUTION_STATUSES: &str =
     "'queued', 'ready', 'waiting_dependency', 'claimed', 'running', 'waiting_human'";
+
+/// Reason code the property trigger would have stored. Pre-enrichment rows
+/// keep NULL `reason_code`; `basis` still names the writer, so the first word
+/// of `basis` is the same derivation the recorder uses.
+const DERIVED_REASON_SQL: &str = "COALESCE(a.reason_code, substr(a.basis, 1, instr(a.basis || ' ', ' ') - 1))";
 
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -76,7 +88,7 @@ fn candidate_sql() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT a.work_item_id, a.id, a.property, a.reason_code, a.detail, a.changed_at
+        "SELECT a.work_item_id, a.id, a.property, {derived_reason}, a.detail, a.changed_at
          FROM task_status_audit a
          JOIN tasks t ON t.id = a.work_item_id
          WHERE a.work_item_id IN (SELECT value FROM json_each(?1))
@@ -89,7 +101,7 @@ fn candidate_sql() -> String {
            AND (
                 (a.property = 'autostart' AND a.old_value = '1' AND a.new_value = '0'
                  AND t.autostart = 0
-                 AND a.reason_code IS NOT '{run_start}')
+                 AND {derived_reason} IS NOT '{run_start}')
                 OR
                 (a.property = '{abandoned}' AND a.execution_ever_ran = 0
                  AND COALESCE(a.reason_code, '') NOT IN ({benign}))
@@ -109,6 +121,7 @@ fn candidate_sql() -> String {
                           AND wr.started_at IS NOT NULL
                           AND CAST(wr.started_at AS INTEGER) >= CAST(a.changed_at AS INTEGER))))
          ORDER BY a.work_item_id, a.id",
+        derived_reason = DERIVED_REASON_SQL,
         run_start = START_EXECUTION_RUN_BASIS,
         abandoned = EXECUTION_ABANDONED_PROPERTY,
         in_flight = IN_FLIGHT_EXECUTION_STATUSES,
@@ -128,7 +141,7 @@ pub(crate) fn notices_among(conn: &Connection, ids: &[&str]) -> Result<HashMap<S
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, String>(5)?,
         ))
@@ -150,7 +163,7 @@ pub(crate) fn notices_among(conn: &Connection, ids: &[&str]) -> Result<HashMap<S
         }
         // Rows come oldest first, so the last one names the latest stop.
         notice.audit_id = audit_id;
-        notice.reason_code = reason_code.unwrap_or_else(|| crate::task_status_audit::UNATTRIBUTED_WRITE.to_owned());
+        notice.reason_code = reason_code;
         notice.detail = detail;
         notice.changed_at = changed_at;
     }
