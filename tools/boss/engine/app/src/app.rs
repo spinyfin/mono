@@ -2992,13 +2992,8 @@ async fn handle_frontend_connection(
 
 /// Whether a socket read error means the peer went away, as opposed to the
 /// engine failing. Linux reports `ECONNRESET` on a Unix stream whose peer
-/// closed while frames were still unread in its receive buffer: the normal
-/// end of a `boss` CLI invocation that exits on its reply without draining
-/// later pushes, or of the app quitting mid-burst. macOS reports the same
-/// close as plain EOF. Either way the session simply ends.
+/// closed with unread frames; macOS reports plain EOF. Either way the session ends.
 fn read_error_is_peer_disconnect(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-    )
+    use std::io::ErrorKind;
+    matches!(error.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted)
 }
