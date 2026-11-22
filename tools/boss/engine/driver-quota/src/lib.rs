@@ -1,10 +1,9 @@
 //! Per-driver provider quota probes and their cache.
 //!
 //! Boss drives four coding-agent CLIs, and each one's provider meters the
-//! maintainer's subscription independently. Getting the original three figures used to
-//! mean starting each driver interactively and typing its slash command. This
-//! crate obtains the same figures out of band and caches them, so the engine
-//! can serve one comparable snapshot over RPC.
+//! maintainer's subscription independently. This crate obtains each provider's
+//! usage figures out of band and caches them so the engine can serve one
+//! comparable snapshot over RPC.
 //!
 //! # Mechanism per driver
 //!
@@ -772,10 +771,11 @@ mod tests {
     use super::*;
     use boss_protocol::DRIVER_QUOTA_ORDER;
 
+    struct StubAgyProbe;
     struct NoRefresh;
 
     #[async_trait]
-    impl DriverQuotaProbe for NoRefresh {
+    impl DriverQuotaProbe for StubAgyProbe {
         fn driver(&self) -> &'static str {
             "agy"
         }
@@ -799,7 +799,7 @@ mod tests {
     #[test]
     fn production_probe_set_covers_every_driver_the_snapshot_promises() {
         let probes = default_probes(
-            std::sync::Arc::new(NoRefresh),
+            std::sync::Arc::new(StubAgyProbe),
             std::path::PathBuf::from("/tmp/auth.json"),
             std::sync::Arc::new(NoRefresh),
         );

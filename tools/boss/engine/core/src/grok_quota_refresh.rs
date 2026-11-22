@@ -63,29 +63,10 @@ impl GrokCredentialRefresher for GrokCliCredentialRefresher {
 pub fn production_probes() -> QuotaProbeSet {
     let auth_path = resolve_grok_auth_source();
     boss_engine_driver_quota::default_probes(
-        Arc::new(AgyQuotaProbe),
+        Arc::new(crate::agy_quota_probe::AgyQuotaProbe),
         auth_path.clone(),
         Arc::new(GrokCliCredentialRefresher::new(auth_path)),
     )
-}
-
-struct AgyQuotaProbe;
-
-#[async_trait]
-impl boss_engine_driver_quota::DriverQuotaProbe for AgyQuotaProbe {
-    fn driver(&self) -> &'static str {
-        boss_protocol::DRIVER_SLUG_AGY
-    }
-
-    async fn probe(&self) -> boss_protocol::DriverQuotaOutcome {
-        match tokio::task::spawn_blocking(boss_engine_driver::agy::quota::usage_json).await {
-            Ok(Ok(output)) => boss_engine_driver_quota::agy::parse_usage_json(&output),
-            _ => boss_protocol::DriverQuotaOutcome::Unavailable {
-                kind: boss_protocol::DriverQuotaFailureKind::ProbeFailed,
-                reason: "Could not read agy quota; check installation and sign-in".to_owned(),
-            },
-        }
-    }
 }
 
 #[cfg(test)]

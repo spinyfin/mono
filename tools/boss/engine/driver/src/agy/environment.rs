@@ -188,6 +188,12 @@ fn resolve_agy_binary_with(
         let host = crate::scoped_home::nonempty_env(AGY_BIN_ENV)
             .map(Ok)
             .unwrap_or_else(find_host_agy)?;
+        if !host.is_file() {
+            bail!(
+                "agy CLI is not installed ({}); install Antigravity CLI or set {AGY_BIN_ENV}",
+                host.display()
+            );
+        }
         install_boss_owned_agy(&host, &owned, &qualify)?;
         assert_protected_binary(&owned)?;
         QUALIFIED

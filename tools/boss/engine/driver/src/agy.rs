@@ -58,6 +58,7 @@ mod turn_end_recovery;
 use progress::AgyProgressSession;
 use transcript::AgyTranscriptSession;
 
+pub mod probe_isolation;
 pub mod quota;
 /// Manual authenticated rules-discovery conformance probe.
 pub mod rules_probe;

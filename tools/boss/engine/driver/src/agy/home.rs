@@ -428,14 +428,13 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     provision_home(workspace, prompt_text, run_id, true)
 }
 
+pub(super) fn quota_probe_run_id() -> String {
+    format!("quota-probe-{}", std::process::id())
+}
+
 /// The quota command itself exercises authentication; avoid a redundant models request.
 pub(super) fn provision_quota_home(workspace: &Path) -> anyhow::Result<AgyRuntimeState> {
-    provision_home(
-        workspace,
-        "unused",
-        &format!("quota-probe-{}", std::process::id()),
-        false,
-    )
+    provision_home(workspace, "unused", &quota_probe_run_id(), false)
 }
 
 fn provision_home(
@@ -462,11 +461,16 @@ fn provision_home(
     let antigravity = gemini.join("antigravity-cli");
     fs::create_dir_all(antigravity.join("cache"))
         .with_context(|| format!("creating antigravity-cli cache under {}", antigravity.display()))?;
-    // `brain/<cid>/.system_generated/logs/transcript_full.jsonl` is the file
-    // every hook payload stamps as `transcriptPath`. Link it into the durable
-    // per-execution store now, before the CLI can write a conversation, so the
-    // transcript outlives this home.
-    provision_durable_brain(&process_home)?;
+    // Worker homes: `brain/<cid>/.system_generated/logs/transcript_full.jsonl`
+    // is the file every hook payload stamps as `transcriptPath`. Link it into
+    // the durable per-execution store now, before the CLI can write a
+    // conversation, so the transcript outlives this home.
+    // Quota probes are not recorded on work_executions, so the retention
+    // sweep never owns their store entries; they skip the durable link and
+    // delete the whole container after the command (see reclaim_quota_probe_container).
+    if probe_models {
+        provision_durable_brain(&process_home)?;
+    }
     let hooks_dir = process_home.join(HOOKS_DIR_RELATIVE);
     fs::create_dir_all(&hooks_dir).with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
@@ -741,6 +745,21 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Delete a quota-probe container entirely.
+///
+/// Quota probes are not recorded on `work_executions`, so the agy
+/// home-retention sweep never owns them. Worker teardown
+/// ([`reclaim_agy_run`]) keeps `control/` and the durable transcript target;
+/// that would leak a `quota-probe-<pid>` directory on every engine restart.
+pub(super) fn reclaim_quota_probe_container(container: &Path) -> anyhow::Result<()> {
+    assert_agy_home_safe_to_delete(container)?;
+    match fs::remove_dir_all(container) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("deleting quota probe container {}", container.display())),
+    }
 }
 
 /// Remove run state at teardown.
