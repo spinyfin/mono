@@ -1031,3 +1031,33 @@ fn navigator_ready_shares_the_kanban_ready_predicate() {
     assert_eq!(card(&model, &ready).review_section, Some(ReviewSection::Ready));
     assert_eq!(row(&model, &ready).section, NavigatorSection::Ready);
 }
+
+/// A new head with CI still green and MERGEABLE unchanged is not Ready on
+/// either surface until a verdict matches that head.
+#[test]
+fn a_new_unreviewed_head_drops_ready_on_both_surfaces() {
+    let db = WorkDb::open(temp_db_path("navigator-ready-new-head")).unwrap();
+    let product = make_revision_product(&db, "navigator-ready-new-head");
+    let root = in_review_named(&db, &product, "ready", PR);
+    reviewed_clean_pr(&db, &root);
+    let mut model = None;
+    step(&db, &product, &mut model);
+    assert_eq!(card(&model, &root).review_section, Some(ReviewSection::Ready));
+    assert_eq!(row(&model, &root).section, NavigatorSection::Ready);
+    assert_eq!(
+        card(&model, &root).ai_review_state.as_deref(),
+        Some("reviewed_all_clear")
+    );
+
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_head_sha = 'head-2' WHERE id = ?1", [&root])
+        .unwrap();
+    step(&db, &product, &mut model);
+    assert_eq!(card(&model, &root).ci_required_state.as_deref(), Some("success"));
+    assert_eq!(card(&model, &root).pr_mergeable_state.as_deref(), Some("mergeable"));
+    assert_eq!(card(&model, &root).ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(card(&model, &root).review_section, Some(ReviewSection::AiReview));
+    assert_eq!(row(&model, &root).section, NavigatorSection::Backlog);
+    assert_eq!(waiting(&model, &root), NavigatorWait::ReviewQueued);
+}

@@ -120,7 +120,8 @@ fn decide(intent: &MergeIntent, current_head: Option<&str>, remediation: MergeIn
 /// in flight. Called on a definitive clean probe of an item that is not
 /// parked. Ready is the engine's own definition of "could be merged right
 /// now" (`classify_review_section`): in review, not blocked, no revision
-/// queued or running, no AI review pending, required CI green, mergeable.
+/// queued or running, no AI review pending or missing a current-head
+/// verdict, required CI green, mergeable.
 pub async fn settle_after_clean_probe(db: &WorkDb, publisher: &dyn ExecutionPublisher, candidate: &PendingMergeCheck) {
     match settle(db, candidate) {
         Ok(Some(end)) => {

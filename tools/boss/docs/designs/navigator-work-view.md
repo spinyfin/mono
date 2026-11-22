@@ -127,7 +127,7 @@ The following table supplies inputs to the ordered rules above, not a second com
 | Revision queued / blocked / running / awaiting question / completed                     | Applies above to the original row; terminal child cannot complete the root; revision count and current ask remain in detail                                                                                    |
 | AI review `reviewing`                                                                   | Working only while reviewer/consolidator agent runs; admitted hold without running agent is Backlog with stage                                                                                                 |
 | AI `review_queued`, `reviewed_with_findings`                                            | Backlog while automatic admission/repair is due; Working if repair runs; Needs attention for explicit manual intervention                                                                                      |
-| AI `not_reviewed`                                                                       | Ready when the Review column is Ready and no question is open; otherwise Backlog while admission is due                                                                                                        |
+| AI `not_reviewed`                                                                       | Review column is AI Review, never Ready: the current head has no verdict yet. Navigator is Backlog while admission is due; Needs attention only for an open question, input wait or intervention               |
 | AI `reviewed_all_clear`, `reviewed_clean_pending`, `review_not_required`                | No activity implied; Ready when the Review column is Ready and no question is open; pending checks => Backlog                                                                                                  |
 | CI pending / unknown / failed / success                                                 | Indicators only; failed with queued repair => Backlog, running repair => Working, manual action => Needs attention; success alone is not merge readiness                                                       |
 | Review required / approved / changes requested / unknown                                | Required actionable human review => Ready when the Review column is Ready; questions stay in Needs attention; changes requested with automatic revision follows revision state; unknown never authorizes merge |
@@ -149,12 +149,14 @@ Default navigator width is 360 points, resizable from 260 to 520. Rows are 30 po
 Work                           [ Kanban | Navigator ]
 [ Project: All v ]  [Search tasks and revision asks]
 +--------------------------------------+----------------------------------+
-| v Working                         3 | Improve startup                  |
-| > <> Improve startup   [rev 2] ~ !1 | Working: revision 2, fixing CI    |
-|   ? Audit migrations          ~     | [Activity] [Review] [History]     |
-| v Needs attention                 2 |                                  |
-|   <> Release workflow         ?2    | Original brief / Current ask     |
-|   <> Update installer         PR    | + existing Ghostty agent pane    |
+| v Ready                           1 | Keep keyboard focus              |
+|   <> Keep keyboard focus      PR    | Ready: Review                     |
+| v Working                         3 | [Activity] [Review] [History]     |
+| > <> Improve startup   [rev 2] ~ !1 |                                  |
+|   ? Audit migrations          ~     | Original brief / Current ask     |
+| v Needs attention                 2 | + existing Ghostty agent pane    |
+|   <> Release workflow         ?2    |                                  |
+|   <> Update installer         PR    |                                  |
 | v Backlog                        18 |                                  |
 |   <> Navigation       [Focus held]  |                                  |
 |   <> Cleanup             [Merging]  |                                  |
@@ -168,12 +170,13 @@ Indicators from leading to trailing: animated activity dot when Working; task-ki
 
 At widths below 340, drop project label and revision count into tooltip/detail; below that retain kind/activity, truncated title, highest-priority health glyph and question count. Effort, driver name, review-cycle count, all CI checks and timestamps live in detail, not the row. A two-line accessibility layout carries title then reason; no third line.
 
-Fixed section order: Working, Needs attention, Backlog, Landed. Counts represent roots, not revisions or matching attention members. Working/Needs attention/Backlog start expanded; Landed starts collapsed. Preserve expansion per product/project scope. Empty sections retain a zero-count header and “No tasks” when expanded. Filtered counts read “shown / total.”
+Fixed section order: Ready, Working, Needs attention, Backlog, Landed. Counts represent roots, not revisions or matching attention members. Ready/Working/Needs attention/Backlog start expanded; Landed starts collapsed. Preserve expansion per product/project scope. Empty sections retain a zero-count header and “No tasks” when expanded. Filtered counts read “shown / total.”
 
 Engine ordering, with root ID as final tie-breaker:
 
+- Ready: human review before merge, then priority descending, then actionable-since ascending.
 - Working: priority descending, then current activity start ascending. Heartbeats do not reorder rows.
-- Needs attention: input/question first, then explicit intervention, then human review, then ready-to-merge; within each, priority descending, actionable-since ascending.
+- Needs attention: input/question first, then explicit intervention; within each, priority descending, actionable-since ascending. Human review and ready-to-merge belong in Ready unless a question, input wait or intervention is open.
 - Backlog: failed/interrupted first, then queued/starting, automatic PR waits including merging, dependency/focus holds, parked/deferred, and completed-without-merge-evidence last; within group use priority, project ordinal where present, creation time and root ID. No implied dispatch-order guarantee.
 - Landed: confirmed merge time descending, using observation time labelled as such when actual merge time is unavailable.
 

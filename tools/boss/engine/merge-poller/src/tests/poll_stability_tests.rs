@@ -1,5 +1,38 @@
 use super::*;
-use boss_protocol::ReviewSection;
+use crate::work::{CreateExecutionInput, ExecutionStatus, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, ReviewVerdictInput};
+use boss_protocol::{ExecutionKind, ReviewSection};
+
+const OBSERVED_HEAD: &str = "unchanged-head";
+
+fn mark_head_reviewed_clean(db: &WorkDb, work_item_id: &str, head_sha: &str) {
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(work_item_id)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+        [&execution.id],
+    )
+    .unwrap();
+    WorkDb::insert_review_verdict_in_tx(
+        &conn,
+        &execution.id,
+        work_item_id,
+        &ReviewVerdictInput {
+            head_sha: Some(head_sha.to_owned()),
+            findings_count: 0,
+            revision_warranted: false,
+            gate_outcome: REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        },
+    )
+    .unwrap();
+}
 
 fn observation(candidate: &PendingMergeCheck, mergeability: OpenPrMergeability, raw: &str) -> PrLifecycleProbe {
     let mut open = OpenPrStatus::clean();
@@ -7,7 +40,7 @@ fn observation(candidate: &PendingMergeCheck, mergeability: OpenPrMergeability, 
     PrLifecycleProbe::builder()
         .url(candidate.pr_url.clone())
         .state(PrLifecycleState::Open(open))
-        .head_ref_oid("unchanged-head")
+        .head_ref_oid(OBSERVED_HEAD)
         .raw_merge_state_status(raw)
         .labels(Vec::new())
         .review(PrReviewState::Unknown)
@@ -50,6 +83,7 @@ async fn mass_base_move_keeps_ready_cards_and_publishes_nothing() {
         })
         .collect();
     for candidate in &candidates {
+        mark_head_reviewed_clean(&db, &candidate.work_item_id, OBSERVED_HEAD);
         update_pr_poll_state(
             &db,
             &publisher,
@@ -93,6 +127,7 @@ async fn definite_conflict_moves_card_and_logs_transition_after_unknown() {
     let logs = log_capture::install();
     let (_dir, db) = open_db();
     let candidate = candidate(&db, "definite-conflict");
+    mark_head_reviewed_clean(&db, &candidate.work_item_id, OBSERVED_HEAD);
     let publisher = RecordingPublisher::default();
     for (mergeability, raw, expected, events, caller) in [
         (
@@ -161,6 +196,7 @@ async fn definite_conflict_moves_card_and_logs_transition_after_unknown() {
 async fn first_unknown_is_pending_and_real_ci_progress_still_moves_ready_card() {
     let (_dir, db) = open_db();
     let candidate = candidate(&db, "first-unknown");
+    mark_head_reviewed_clean(&db, &candidate.work_item_id, OBSERVED_HEAD);
     let publisher = RecordingPublisher::default();
     update_pr_poll_state(
         &db,
@@ -198,6 +234,7 @@ async fn first_unknown_is_pending_and_real_ci_progress_still_moves_ready_card() 
 async fn refresh_preserves_known_values_but_accepts_conflicts_and_invalidates_ci_on_new_head() {
     let (_dir, db) = open_db();
     let candidate = candidate(&db, "refresh");
+    mark_head_reviewed_clean(&db, &candidate.work_item_id, OBSERVED_HEAD);
     let publisher = RecordingPublisher::default();
     update_pr_poll_state(
         &db,
@@ -213,7 +250,7 @@ async fn refresh_preserves_known_values_but_accepts_conflicts_and_invalidates_ci
             &candidate.work_item_id,
             "unknown",
             Some("UNKNOWN"),
-            Some("unchanged-head"),
+            Some(OBSERVED_HEAD),
             "2026-10-27T00:00:00Z"
         )
         .unwrap()
@@ -229,7 +266,7 @@ async fn refresh_preserves_known_values_but_accepts_conflicts_and_invalidates_ci
         )
         .unwrap()
     );
-    assert_eq!(section(&db, &candidate), Some(ReviewSection::Pending));
+    assert_eq!(section(&db, &candidate), Some(ReviewSection::AiReview));
     assert!(
         db.set_pr_status_observation(
             &candidate.work_item_id,
