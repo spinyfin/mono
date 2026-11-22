@@ -244,7 +244,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 })
                 .await;
                 if !finished {
-                    boss_task_scope::spawn(launch);
+                    boss_work_db::db_diagnostics::spawn(launch);
                 }
             }
             let publication_started = Instant::now();

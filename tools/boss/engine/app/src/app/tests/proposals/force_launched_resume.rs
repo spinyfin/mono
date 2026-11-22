@@ -25,7 +25,7 @@ fn resume_execution(state: &Arc<ServerState>, task_id: &str, asking_execution: &
 }
 
 #[derive(Default)]
-struct QuestionRunner(std::sync::atomic::AtomicUsize, tokio::sync::Notify);
+pub(super) struct QuestionRunner(std::sync::atomic::AtomicUsize, tokio::sync::Notify);
 
 #[async_trait]
 impl ExecutionRunner for QuestionRunner {
@@ -78,9 +78,18 @@ async fn wait_for_starts(state: &ServerState, runner: &QuestionRunner, count: us
 
 async fn force_launched_question_holding_predecessor_lease()
 -> (Arc<ServerState>, tempfile::TempDir, String, String, Arc<QuestionRunner>) {
+    force_launched_question_holding_predecessor_lease_with(Arc::new(
+        boss_engine_runtime::test_support::AlwaysSucceedsCube,
+    ))
+    .await
+}
+
+async fn force_launched_question_holding_predecessor_lease_with(
+    cube_client: Arc<dyn CubeClient>,
+) -> (Arc<ServerState>, tempfile::TempDir, String, String, Arc<QuestionRunner>) {
     let runner = Arc::new(QuestionRunner::default());
     let (state, dir) = test_server_state_with_overrides(ServerStateOverrides {
-        cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+        cube_client: Some(cube_client),
         execution_runner: Some(runner.clone()),
         ..Default::default()
     });
@@ -145,7 +154,14 @@ async fn force_launched_question_holding_predecessor_lease()
 }
 
 async fn force_launched_question() -> (Arc<ServerState>, tempfile::TempDir, String, String, Arc<QuestionRunner>) {
-    let (state, dir, asking, task_id, runner) = force_launched_question_holding_predecessor_lease().await;
+    force_launched_question_with(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)).await
+}
+
+pub(super) async fn force_launched_question_with(
+    cube_client: Arc<dyn CubeClient>,
+) -> (Arc<ServerState>, tempfile::TempDir, String, String, Arc<QuestionRunner>) {
+    let (state, dir, asking, task_id, runner) =
+        force_launched_question_holding_predecessor_lease_with(cube_client).await;
     // The pending runner fake never returns, so teardown never releases the
     // cube lease. Dispatch holds a successor while that lease is recorded.
     release_finished_execution_lease(&state.work_db, &asking);

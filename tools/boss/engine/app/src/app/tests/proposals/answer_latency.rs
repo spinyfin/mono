@@ -15,12 +15,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use boss_engine_dispatch::coordinator::DispatchPauseOrigin;
 use boss_execution_contracts::{
-    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, ExecutionRunner,
-    RunOutcome,
+    CubeChangeHandle, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
-use boss_protocol::{ExecutionStatus, PauseReason, ProposalKind};
 
 /// How long a person's own action may take to be recorded and replied to.
 const ANSWER_BOUND: Duration = Duration::from_millis(300);
@@ -252,103 +249,11 @@ boss_execution_contracts::stub_cube_client! { HeldLeaseCube {
     }
 }}
 
-#[derive(Default)]
-struct HeldLaunchRunner(std::sync::atomic::AtomicUsize, tokio::sync::Notify);
-
-#[async_trait::async_trait]
-impl ExecutionRunner for HeldLaunchRunner {
-    async fn run_execution(
-        &self,
-        _worker_id: &str,
-        _execution: &boss_protocol::WorkExecution,
-        _work_item: &boss_protocol::WorkItem,
-        _workspace_path: &std::path::Path,
-        _cube_change_id: Option<&str>,
-    ) -> anyhow::Result<RunOutcome> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        self.1.notify_one();
-        std::future::pending().await
-    }
-}
-
-async fn force_launched_question_with_held_lease() -> (
-    Arc<ServerState>,
-    tempfile::TempDir,
-    String,
-    String,
-    Arc<HeldLeaseCube>,
-    Arc<HeldLaunchRunner>,
-) {
-    let cube = Arc::new(HeldLeaseCube::new());
-    let runner = Arc::new(HeldLaunchRunner::default());
-    let (state, dir) = test_server_state_with_overrides(ServerStateOverrides {
-        cube_client: Some(cube.clone()),
-        execution_runner: Some(runner.clone()),
-        ..Default::default()
-    });
-    state.feature_flags.set("worker_proposals", true).unwrap();
-    state.feature_flags.set("run_done_proposals_seam", true).unwrap();
-    state.execution_coordinator.pause_dispatch(
-        1_700_000_000,
-        DispatchPauseOrigin::Operator,
-        PauseReason::new("test: investigating worker failures").unwrap(),
-    );
-    let product = boss_engine_runtime::test_support::create_test_product(&state.work_db);
-    let task =
-        boss_engine_runtime::test_support::create_test_chore(&state.work_db, product.id, "Force launched question");
-    let task_id = task.id;
-    let asking = state
-        .work_db
-        .request_execution(
-            boss_protocol::RequestExecutionInput::builder()
-                .work_item_id(&task_id)
-                .build(),
-        )
-        .unwrap()
-        .id;
-    state
-        .work_db
-        .update_work_item(
-            &task_id,
-            boss_protocol::WorkItemPatch::builder()
-                .description("Original brief")
-                .build(),
-        )
-        .unwrap();
-    state
-        .execution_coordinator
-        .force_dispatch(&asking, boss_execution_contracts::DispatchAdmission::OperatorForced)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while runner.0.load(Ordering::SeqCst) < 1 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the asking run must start so force-launch lineage is recorded");
-    assert_eq!(
-        state.work_db.get_execution(&asking).unwrap().status,
-        ExecutionStatus::Running
-    );
-    state
-        .worker_registry
-        .register(std::process::id() as libc::pid_t, asking.clone());
-    submitted(
-        call_with_peer(
-            &state,
-            Some(std::process::id() as libc::pid_t),
-            submit_request(&asking, ProposalKind::RunDone, operator_question_payload()),
-        )
-        .await,
-    );
-    boss_engine_runtime::test_support::release_finished_execution_lease(&state.work_db, &asking);
-    (state, dir, asking, task_id, cube, runner)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answer_that_launches_work_is_not_queued_behind_a_slow_cube_lease() {
-    let (state, _dir, asking, task_id, cube, _runner) = force_launched_question_with_held_lease().await;
+    let cube = Arc::new(HeldLeaseCube::new());
+    let (state, _dir, asking, task_id, _runner) =
+        super::force_launched_resume::force_launched_question_with(cube.clone()).await;
 
     let clicked = Instant::now();
     let reply = answer_question(&state, &task_id, true).await;
@@ -381,6 +286,13 @@ async fn an_answer_that_launches_work_is_not_queued_behind_a_slow_cube_lease() {
     assert!(
         launch_still_pending,
         "the answer completed while launch_answered_work was still waiting for the cube lease"
+    );
+    assert!(
+        state
+            .execution_coordinator
+            .inflight_dispatches()
+            .is_work_item_dispatching(&task_id),
+        "the first poll of launch_answered_work must take the dispatch reservation before the reply"
     );
     assert_eq!(
         resume_after_answer(&state, &task_id, &asking),

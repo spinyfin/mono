@@ -382,6 +382,8 @@ impl ExecutionCoordinator {
     /// the auto-dispatcher in a race, terminal, or unknown), when the
     /// active pause does not admit `admission`, or when the target pool is
     /// already at its hard cap with no idle slot.
+    /// `try_reserve` stays before the first `.await` (`claim_worker_force`);
+    /// the operator-answer first poll of [`Self::launch_answered_work`] depends on it.
     pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str, admission: DispatchAdmission) -> Result<String> {
         if let Some(reason) = self.dispatch_preflight_block_reason() {
             return Err(anyhow!("local dispatch is unavailable: {reason}"));
@@ -484,6 +486,8 @@ impl ExecutionCoordinator {
     /// the dependency cascade, which then drains it as operator-forced. The
     /// dispatch claim and per-repo lease bound are respected. Returns the
     /// worker id, or `None` when there is no ready execution to launch.
+    /// Lookup through [`Self::force_dispatch`]'s reservation stays synchronous
+    /// so the operator-answer first poll holds it before the drain kick.
     pub async fn launch_answered_work(self: &Arc<Self>, work_item_id: &str) -> Result<Option<String>> {
         let ready = self
             .work_db
