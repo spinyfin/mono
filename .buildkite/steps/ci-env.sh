@@ -199,10 +199,51 @@ if [[ "$CI_REMOTE_EXECUTION" == "on" ]]; then
   CI_REMOTE_STEP_WATCHDOG_PID=$!
 fi
 
+_CI_STEP_EXIT_TRAP="${_CI_STEP_EXIT_TRAP:-}"
+
+_ci_capture_preexisting_exit_trap() {
+  local existing
+  existing="$(trap -p EXIT)"
+  [[ -n "$existing" ]] || return 0
+  eval "set -- $existing"
+  if [[ "${3:-}" != "_ci_on_exit" ]]; then
+    _CI_STEP_EXIT_TRAP="${3:-}"
+  fi
+}
+
+# Register or clear a step-level EXIT handler without clobbering CI's own
+# _ci_on_exit finalizer (which cleans up the watchdog and prints the execlog
+# byte summary).
+ci_set_exit_trap() {
+  _CI_STEP_EXIT_TRAP="$1"
+  trap '_ci_on_exit' EXIT
+}
+
+ci_clear_exit_trap() {
+  _CI_STEP_EXIT_TRAP=""
+  trap '_ci_on_exit' EXIT
+}
+
 _ci_on_exit() {
+  local rc=$?
+  set +e
+  if [[ -n "${_CI_ON_EXIT_RAN:-}" ]]; then
+    return "$rc"
+  fi
+  _CI_ON_EXIT_RAN=1
+  if [[ -n "${_CI_STEP_EXIT_TRAP:-}" ]]; then
+    (exit "$rc")
+    eval "$_CI_STEP_EXIT_TRAP"
+  fi
   _ci_remote_cleanup_step_watchdog
   _ci_execlog_print_summary
+  return "$rc"
 }
+
+if [[ -z "${_CI_EXIT_TRAP_INSTALLED:-}" ]]; then
+  _ci_capture_preexisting_exit_trap
+  _CI_EXIT_TRAP_INSTALLED=1
+fi
 trap '_ci_on_exit' EXIT
 
 _ci_remote_on_term() {
@@ -220,8 +261,8 @@ _ci_remote_on_term() {
     buildkite-agent annotate --style error --context "ci-remote-execution-timeout-${BUILDKITE_JOB_ID:-step}" \
       "${BUILDKITE_LABEL:-A step} was killed (SIGTERM) while remote execution was on: ${probed}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\"." || true
   fi
-  _ci_remote_cleanup_step_watchdog
-  _ci_execlog_print_summary
+  # exit 143 triggers _ci_on_exit, which runs any step EXIT trap, cleans up
+  # the watchdog, and prints the execlog byte summary.
   exit 143
 }
 

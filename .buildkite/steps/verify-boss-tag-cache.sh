@@ -64,5 +64,5 @@ done
 buildkite-agent artifact upload "${evidence_dir}/*"
 if (( role == 0 )); then
   buildkite-agent meta-data set "${probe_key}-result" passed
-  trap - EXIT
+  ci_clear_exit_trap
 fi

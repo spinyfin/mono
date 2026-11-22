@@ -228,6 +228,96 @@ done
 scan_file "${workspace}/.buildkite/steps/integrity-commit-delta.sh" \
   || fail "artifact_paths missing in integrity-commit-delta.sh"
 
+# Also extract the EXIT-trap composition block from ci-env.sh.
+trap_block_file="${tmpdir}/ci-exit-trap.sh"
+awk '
+  /^_CI_STEP_EXIT_TRAP=/ { in_blk=1 }
+  in_blk { print }
+  in_blk && /^trap \x27_ci_on_exit\x27 EXIT$/ { exit }
+' "$env_sh" > "$trap_block_file"
+
+test_exit_trap_composition() {
+  local marker="${tmpdir}/trap-marker"
+  local out_file="${tmpdir}/trap-out"
+  local rc
+
+  # 1. Pre-existing EXIT trap (verify-boss-tag-cache.sh pattern) runs on
+  # failure, preserves original exit status, and still prints execlog summary.
+  rm -f "$marker" "$out_file"
+  mkdir -p "${tmpdir}/trap-logs-1"
+  printf 'abc' > "${tmpdir}/trap-logs-1/01-build.bin.zst"
+  set +e
+  (
+    set -euo pipefail
+    export CI_EXECLOG_DIR="${tmpdir}/trap-logs-1"
+    export BUILDKITE_JOB_ID="job-trap-1"
+    _ci_remote_cleanup_step_watchdog() { :; }
+    trap "printf 'pre:%s\n' \"\$?\" > '${marker}'" EXIT
+    set -- "arg1" "arg2"
+    source "$trap_block_file"
+    [[ "$1" == "arg1" && "$2" == "arg2" ]] || exit 99
+    exit 42
+  ) > "$out_file"
+  rc=$?
+  set -e
+  [[ "$rc" == "42" ]] || fail "pre-existing EXIT trap changed exit code: got ${rc}, expected 42"
+  grep -qxF 'pre:42' "$marker" || fail "pre-existing EXIT trap did not run with rc=42: $(cat "$marker" 2>/dev/null || true)"
+  grep -qF 'job=job-trap-1 files=1 total_bytes=3' "$out_file" || fail "execlog summary missing with pre-existing EXIT trap: $(cat "$out_file")"
+
+  # 2. Clearing pre-existing trap via ci_clear_exit_trap suppresses failure
+  # handler while keeping _ci_on_exit active.
+  rm -f "$marker" "$out_file"
+  (
+    set -euo pipefail
+    export CI_EXECLOG_DIR="${tmpdir}/trap-logs-1"
+    export BUILDKITE_JOB_ID="job-trap-2"
+    _ci_remote_cleanup_step_watchdog() { :; }
+    trap "printf 'pre-should-not-run\n' > '${marker}'" EXIT
+    source "$trap_block_file"
+    ci_clear_exit_trap
+  ) > "$out_file"
+  [[ ! -e "$marker" ]] || fail "ci_clear_exit_trap did not clear pre-existing trap"
+  grep -qF 'job=job-trap-2 files=1 total_bytes=3' "$out_file" || fail "execlog summary missing after ci_clear_exit_trap: $(cat "$out_file")"
+
+  # 3. Release step installs cleanup via ci_set_exit_trap; on failure, both
+  # cleanup and execlog summary run and original exit status is preserved.
+  rm -f "$marker" "$out_file"
+  set +e
+  (
+    set -euo pipefail
+    export CI_EXECLOG_DIR="${tmpdir}/trap-logs-1"
+    export BUILDKITE_JOB_ID="job-trap-3"
+    _ci_remote_cleanup_step_watchdog() { :; }
+    source "$trap_block_file"
+    cleanup() { printf 'cleanup:%s\n' "$?" > "${marker}"; }
+    ci_set_exit_trap cleanup
+    exit 17
+  ) > "$out_file"
+  rc=$?
+  set -e
+  [[ "$rc" == "17" ]] || fail "ci_set_exit_trap changed exit code: got ${rc}, expected 17"
+  grep -qxF 'cleanup:17' "$marker" || fail "ci_set_exit_trap handler did not run with rc=17: $(cat "$marker" 2>/dev/null || true)"
+  grep -qF 'job=job-trap-3 files=1 total_bytes=3' "$out_file" || fail "execlog summary missing with ci_set_exit_trap: $(cat "$out_file")"
+
+  # 4. Release step removes its cleanup trap via ci_clear_exit_trap after
+  # manual cleanup; execlog summary still prints on exit.
+  rm -f "$marker" "$out_file"
+  (
+    set -euo pipefail
+    export CI_EXECLOG_DIR="${tmpdir}/trap-logs-1"
+    export BUILDKITE_JOB_ID="job-trap-4"
+    _ci_remote_cleanup_step_watchdog() { :; }
+    source "$trap_block_file"
+    cleanup() { printf 'cleanup-should-not-run\n' > "${marker}"; }
+    ci_set_exit_trap cleanup
+    ci_clear_exit_trap
+  ) > "$out_file"
+  [[ ! -e "$marker" ]] || fail "ci_clear_exit_trap did not clear release cleanup trap"
+  grep -qF 'job=job-trap-4 files=1 total_bytes=3' "$out_file" || fail "execlog summary missing after release ci_clear_exit_trap: $(cat "$out_file")"
+}
+
+test_exit_trap_composition
+
 if ((failures > 0)); then
   echo "${failures} failure(s)" >&2
   exit 1
