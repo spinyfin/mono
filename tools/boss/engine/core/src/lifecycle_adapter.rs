@@ -453,7 +453,7 @@ impl LifecycleServices for CoreLifecycleServices {
         if let Err(err) = crate::local_worker_quarantine::reevaluate_local_worker_holds(&self.work_db) {
             tracing::warn!(
                 error = %format!("{err:#}"),
-                "could not re-evaluate the hold on unverified local workers; it stands until the next dispatch decision",
+                "could not re-evaluate the hold on unverified local workers; it stands until the next admission or orphan-sweep pass",
             );
         }
     }

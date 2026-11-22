@@ -202,8 +202,9 @@ impl WorkDb {
 fn inventory_unreadable_reason(error: &str) -> String {
     format!(
         "local dispatch paused: the engine could not read its local run inventory, so it cannot tell which \
-         work items have an unverified worker ({error}). The inventory is re-read on every dispatch decision and \
-         the pause lifts as soon as a read succeeds; {INSPECT_HINT}"
+         work items have an unverified worker ({error}). The inventory is re-read before coordinator admission, \
+         host selection, the active-dispatch rescan, and each orphan-sweep pass, and the pause lifts as soon as \
+         a read succeeds; {INSPECT_HINT}"
     )
 }
 
@@ -417,7 +418,7 @@ mod tests {
         assert!(db.is_execution_quarantined("any-execution").unwrap());
         let reason = db.local_dispatch_quarantine_reason().unwrap().unwrap();
         assert!(reason.contains("inventory unreadable"), "{reason}");
-        assert!(reason.contains("re-read on every dispatch decision"), "{reason}");
+        assert!(reason.contains("orphan-sweep pass"), "{reason}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use boss_protocol::{
     BoardColumn, BoardDropTarget, CreateRevisionInput, ExecutionKind, FrontendRequest, Task, TaskStatus, WorkItem,
     WorkItemPatch,
 };
-use boss_work_db::{PrOpenState, StaticPrStateChecker};
+use boss_work_db::{LocalWorkerQuarantine, PrOpenState, StaticPrStateChecker};
 
 fn dispatch(state: &Arc<ServerState>, sink: &Arc<SessionSink>, request_id: &str) -> Dispatch {
     Dispatch::builder()
@@ -441,6 +441,58 @@ async fn quarantined_drop_restores_block_and_surfaces_explicit_start_error() {
             .unwrap()
             .status
             .is_terminal()
+    );
+}
+
+/// A stored unreadable-inventory pause used to refuse every board drop to
+/// Doing until restart. Board admission re-judges first, so a now-readable
+/// inventory lifts the pause and the drop dispatches.
+#[tokio::test]
+async fn board_drop_retries_an_unreadable_inventory_without_a_restart() {
+    let (state, _dir) = test_server_state_with_fakes();
+    let product = create_test_product_with_repo(
+        &state.work_db,
+        "BoardDropReadableInventory",
+        Some("git@example.com:board/readable-inventory.git"),
+    );
+    let chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Drop after a readable inventory");
+    state
+        .work_db
+        .write_local_worker_quarantine(&LocalWorkerQuarantine {
+            executions: Default::default(),
+            scan_error: Some("inventory unreadable".to_owned()),
+        })
+        .unwrap();
+    assert!(state.work_db.local_dispatch_quarantine_reason().unwrap().is_some());
+
+    let sink = make_session_sink();
+    handle_move_work_item_on_board(
+        dispatch(&state, &sink, "readable-inventory-drop"),
+        drop_on_doing(&chore.id),
+    )
+    .await;
+    match sole_response(&sink).await {
+        FrontendEvent::WorkItemUpdated { item } => {
+            let (WorkItem::Task(t) | WorkItem::Chore(t)) = item else {
+                panic!("expected a task row in the drop response");
+            };
+            assert_eq!(t.id, chore.id);
+            assert_eq!(t.status, TaskStatus::Active, "the drop must land the card in Doing");
+        }
+        other => panic!("expected WorkItemUpdated after the pause lifted, got: {other:?}"),
+    }
+    assert!(state.work_db.local_dispatch_quarantine_reason().unwrap().is_none());
+    let fresh: Vec<_> = state
+        .work_db
+        .list_executions(Some(&chore.id))
+        .unwrap()
+        .into_iter()
+        .filter(|execution| !execution.status.is_terminal())
+        .collect();
+    assert_eq!(
+        fresh.len(),
+        1,
+        "the drop must dispatch after re-reading the inventory; got {fresh:?}"
     );
 }
 

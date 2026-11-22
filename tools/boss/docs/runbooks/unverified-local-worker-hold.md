@@ -32,9 +32,9 @@ This is read-only and works with the engine down. For each held execution it pri
 
 ## Release
 
-Work down this list and stop at the first step that applies. None of them needs an engine restart; dispatch re-reads the hold on every decision.
+Work down this list and stop at the first step that applies. None of them needs an engine restart.
 
-1. **Do nothing if the cause is already gone.** The engine re-judges every hold before each dispatch decision (admission, host selection, and the active-dispatch rescan). If the process has exited or the execution has gone terminal, that decision releases it. To see the result immediately, or with the engine down:
+1. **Do nothing if the cause is already gone.** The engine re-judges every hold before coordinator admission, host selection, and the active-dispatch rescan, and on every orphan-sweep pass. If the process has exited or the execution has gone terminal, the next of those releases it. To see the result immediately, or with the engine down:
 
    ```sh
    bossctl dispatch quarantine recheck
@@ -62,7 +62,9 @@ Work down this list and stop at the first step that applies. None of them needs 
    bossctl dispatch quarantine clear --execution <execution-id>
    ```
 
-   Without `--confirm` this prints what it would release and changes nothing. Re-run with `--confirm` to release. `--all --confirm` releases every hold. Either form refuses, and releases nothing, if a hold it names has a live recorded process.
+   Without `--confirm` this prints what it would release and changes nothing. Re-run with `--confirm` to release. `--all --confirm` releases every hold when the inventory is readable. Either named or `--all` form refuses, and releases nothing, if a hold it would release has a live recorded process.
+
+   When the run inventory is unreadable, `--all --confirm` does not release holds. It retries the read, lifts the pause only after a successful classification, keeps the remaining classified holds, and refuses while the inventory is still unreadable. A live pid on a classified hold does not block that pause lift, because `--all` will not release that hold.
 
    A manual release removes the hold only. The engine's liveness sweeps then reap the execution if its worker is gone. An execution that is still non-terminal and unverifiable when the engine next starts is held again, so cancel it (step 3) if it should not come back.
 
@@ -72,9 +74,9 @@ Releasing a hold while a worker really is still running lets the engine dispatch
 
 This is the only condition that pauses local dispatch for every work item. Startup could not read the `work_runs` / `work_executions` inventory, so it cannot tell which work items have an unverified worker. `status` prints the underlying error.
 
-The engine retries the read on every dispatch decision and lifts the pause when one succeeds, so a transient failure clears itself. `bossctl dispatch quarantine recheck` retries immediately.
+The engine retries the read before coordinator admission, host selection, the active-dispatch rescan, and each orphan-sweep pass, and lifts the pause when one succeeds, so a transient failure clears itself. `bossctl dispatch quarantine recheck` retries immediately.
 
-If the read keeps failing, the error names a real database problem (a missing column after a bad migration, a damaged file). Fix that first. `bossctl dispatch quarantine clear --all --confirm` lifts the pause without fixing the cause and should be a last resort: with the inventory unreadable, the engine cannot protect any unverified worker from a duplicate dispatch.
+If the read keeps failing, the error names a real database problem (a missing column after a bad migration, a damaged file). Fix that first. `bossctl dispatch quarantine clear --all --confirm` retries the same read: it lifts the pause only after a successful classification, keeps the remaining classified holds, and refuses while the inventory is still unreadable. It is not an escape that erases the pause without a successful read.
 
 ## What not to do
 

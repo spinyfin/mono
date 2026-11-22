@@ -171,7 +171,8 @@ pub async fn run_one_pass(
                 if hold.restarts && !deferred {
                     // Ordinary request, not an explicit start: automatic recovery
                     // must not reopen a retired spawning attempt.
-                    match work_db.request_execution_with_live_check(
+                    match crate::local_worker_quarantine::request_execution_after_rejudging_holds(
+                        work_db,
                         RequestExecutionInput::builder()
                             .work_item_id(hold.work_item_id.clone())
                             .build(),

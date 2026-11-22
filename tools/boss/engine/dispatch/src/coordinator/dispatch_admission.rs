@@ -523,7 +523,10 @@ impl ExecutionCoordinator {
         live_states: Arc<dyn LiveWorkerLiveness>,
     ) -> Result<WorkExecution> {
         // Re-judge before admission, including ordinary requests that never
-        // reach host selection. A stored unreadable-inventory pause and a
+        // reach host selection (board drop, RequestExecution RPC, automations).
+        // Sweeps that mint through the store use
+        // `request_execution_after_rejudging_holds`; the orphan-sweep pass
+        // also re-judges on a timer. A stored unreadable-inventory pause and a
         // hold whose pid has since died both lift here; the storage
         // transaction below then sees the current record.
         self.lifecycle.reevaluate_local_worker_holds();

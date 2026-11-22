@@ -9,8 +9,9 @@
 //! cannot lift, without editing the database by hand.
 //!
 //! All three read and write `state.db` directly, so they work while the
-//! engine is down or wedged. Dispatch reads the hold on every decision, so a
-//! release takes effect on the next one with no engine restart.
+//! engine is down or wedged. Admission, host selection, the active-dispatch
+//! rescan, and each orphan-sweep pass re-judge the hold, so a release takes
+//! effect on the next of those with no engine restart.
 
 use std::path::PathBuf;
 
@@ -33,8 +34,9 @@ pub(crate) enum QuarantineAction {
     },
     /// Re-judge every hold now and release the ones whose cause is gone (the
     /// execution is terminal, its process has exited, or the run inventory is
-    /// readable again). This is the check the engine already runs on every
-    /// dispatch decision; run it by hand when the engine is down, or to see
+    /// readable again). This is the check the engine already runs before
+    /// admission, host selection, the active-dispatch rescan, and each
+    /// orphan-sweep pass; run it by hand when the engine is down, or to see
     /// the result immediately.
     Recheck {
         /// Override the Boss state root.
@@ -53,9 +55,10 @@ pub(crate) enum QuarantineAction {
         /// Release the hold on this execution. Repeatable.
         #[arg(long = "execution", value_name = "EXECUTION_ID", required_unless_present = "all")]
         executions: Vec<String>,
-        /// Release every hold. When the run inventory is unreadable, re-read
-        /// it and lift the pause only if that read succeeds; remaining
-        /// classified holds stay.
+        /// Release every hold while the inventory is readable. When the run
+        /// inventory is unreadable, re-read it and lift the pause only if that
+        /// read succeeds; remaining classified holds stay, and none are listed
+        /// as released.
         #[arg(long, conflicts_with = "executions")]
         all: bool,
         /// Actually release. Check first that no worker from before tmux
@@ -119,50 +122,23 @@ fn clear(json: bool, state_root: Option<PathBuf>, executions: Vec<String>, all: 
             not_held.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
-    // A hold whose recorded process exists is doing its job. Releasing it by
-    // hand is how a second worker ends up on the same work item, so that is
-    // refused outright; the two safe ways out are named instead.
-    let alive: Vec<String> = targets
-        .iter()
-        .filter(|held| held.process.is_alive())
-        .map(|held| format!("{} (pid {})", held.execution_id, held.shell_pid().unwrap_or_default()))
-        .collect();
-    if !alive.is_empty() {
-        bail!(
-            "refusing to release a hold whose worker process is alive: {}. Nothing was released. If the pid is \
-             the old worker, stop it and run `bossctl dispatch quarantine recheck`. If the pid now belongs to \
-             something else, cancel the execution with `bossctl work cancel <EXECUTION_ID>`; a terminal \
-             execution holds nothing",
-            alive.join(", ")
-        );
-    }
     let inventory_unreadable = all && before.scan_error.is_some();
-    if targets.is_empty() && !inventory_unreadable {
-        if json {
-            println!("{}", serde_json::json!({ "released": [], "confirmed": confirm }));
-        } else {
-            println!("nothing is held; nothing to release");
-        }
-        return Ok(());
-    }
-    if !confirm {
-        println!("would release (nothing has been changed):");
-        for held in &targets {
-            println!("  {}", held_line(held));
-        }
-        if inventory_unreadable {
+    if inventory_unreadable {
+        // --all against an unreadable inventory is a pause re-read, not a
+        // release of the classified holds. Skip the liveness gate and list
+        // nothing as "would release": those holds stay after a successful
+        // classification.
+        if !confirm {
+            println!("would re-read the run inventory (nothing has been changed):");
             println!(
-                "  the pause on all local dispatch left by an unreadable run inventory \
-                 (re-read on --confirm; the pause lifts only if that read succeeds)"
+                "  the pause on all local dispatch lifts only if that read succeeds; \
+                 classified holds are not released"
+            );
+            bail!(
+                "not released: re-run with --confirm. --confirm re-reads the inventory and lifts the pause only \
+                 if that read succeeds; classified holds are not released"
             );
         }
-        bail!(
-            "not released: re-run with --confirm. When holds are listed above, check that no worker from before \
-             tmux hosting is still running for those work items. When the run inventory is unreadable, \
-             --confirm re-reads it and lifts the pause only if that read succeeds; remaining classified holds stay"
-        );
-    }
-    if inventory_unreadable {
         let reevaluation = reevaluate_local_worker_holds(&db)?;
         let after = local_worker_hold_status(&db)?;
         if let Some(error) = after.scan_error.as_deref() {
@@ -191,6 +167,41 @@ fn clear(json: bool, state_root: Option<PathBuf>, executions: Vec<String>, all: 
             );
         }
         return Ok(());
+    }
+    // A hold whose recorded process exists is doing its job. Releasing it by
+    // hand is how a second worker ends up on the same work item, so that is
+    // refused outright; the two safe ways out are named instead.
+    let alive: Vec<String> = targets
+        .iter()
+        .filter(|held| held.process.is_alive())
+        .map(|held| format!("{} (pid {})", held.execution_id, held.shell_pid().unwrap_or_default()))
+        .collect();
+    if !alive.is_empty() {
+        bail!(
+            "refusing to release a hold whose worker process is alive: {}. Nothing was released. If the pid is \
+             the old worker, stop it and run `bossctl dispatch quarantine recheck`. If the pid now belongs to \
+             something else, cancel the execution with `bossctl work cancel <EXECUTION_ID>`; a terminal \
+             execution holds nothing",
+            alive.join(", ")
+        );
+    }
+    if targets.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({ "released": [], "confirmed": confirm }));
+        } else {
+            println!("nothing is held; nothing to release");
+        }
+        return Ok(());
+    }
+    if !confirm {
+        println!("would release (nothing has been changed):");
+        for held in &targets {
+            println!("  {}", held_line(held));
+        }
+        bail!(
+            "not released: re-run with --confirm. Check that no worker from before tmux hosting is still \
+             running for those work items"
+        );
     }
     let released = if all {
         release_local_worker_holds(&db, None)?
@@ -273,7 +284,8 @@ fn status_lines(status: &LocalWorkerHoldStatus) -> Vec<String> {
                 "local dispatch: PAUSED. The engine could not read its local run inventory: {error}"
             ));
             lines.push(
-                "  releases when: a read succeeds. The engine retries on every dispatch decision; \
+                "  releases when: a read succeeds. The engine retries before admission, host selection, \
+                 the active-dispatch rescan, and each orphan-sweep pass; \
                  `bossctl dispatch quarantine recheck` retries now."
                     .to_owned(),
             );
@@ -317,8 +329,9 @@ fn releases_when(held: &HeldLocalWorker) -> String {
     let terminal = "the execution is cancelled or reaches any other terminal state";
     match held.process.alive_pid() {
         Some(pid) => format!(
-            "pid {pid} exits (checked on every dispatch decision), or {terminal}. If pid {pid} is not a Boss \
-             worker, the number was recycled and only cancelling the execution lifts the hold"
+            "pid {pid} exits (checked before admission, host selection, the active-dispatch rescan, and each \
+             orphan-sweep pass), or {terminal}. If pid {pid} is not a Boss worker, the number was recycled and \
+             only cancelling the execution lifts the hold"
         ),
         None => format!(
             "{terminal}. No live pid is recorded for it, so its process cannot be proven gone short of a reboot"
@@ -627,7 +640,8 @@ mod tests {
         let dry_run = run(false, clear_action(&[], true, false, &scratch))
             .unwrap_err()
             .to_string();
-        assert!(dry_run.contains("re-reads it"), "{dry_run}");
+        assert!(dry_run.contains("classified holds are not released"), "{dry_run}");
+        assert!(dry_run.contains("re-reads the inventory"), "{dry_run}");
         assert!(db.local_dispatch_quarantine_reason().unwrap().is_some());
 
         let refusal = run(false, clear_action(&[], true, true, &scratch))
@@ -655,6 +669,28 @@ mod tests {
         for (_, work_item_id) in &held {
             assert!(db.ensure_work_item_not_quarantined(work_item_id).is_err());
         }
+    }
+
+    #[test]
+    fn clear_all_with_an_unreadable_inventory_does_not_liveness_gate_holds_it_will_not_release() {
+        let scratch = ScratchDir::new("clear-all-unreadable-live");
+        let (db, held) = held_db(&scratch);
+        let (live, _) = &held[0];
+        let live_pid = i64::from(std::process::id());
+        db.set_run_shell_pid_for_execution(live, live_pid).unwrap();
+        let mut recorded = db.read_local_worker_quarantine().unwrap();
+        recorded.scan_error = Some("database is locked".to_owned());
+        db.write_local_worker_quarantine(&recorded).unwrap();
+
+        let dry_run = run(false, clear_action(&[], true, false, &scratch))
+            .unwrap_err()
+            .to_string();
+        assert!(dry_run.contains("classified holds are not released"), "{dry_run}");
+        assert!(!dry_run.contains("worker process is alive"), "{dry_run}");
+
+        run(true, clear_action(&[], true, true, &scratch)).unwrap();
+        assert!(db.local_dispatch_quarantine_reason().unwrap().is_none());
+        assert!(db.is_execution_quarantined(live).unwrap());
     }
 
     #[test]

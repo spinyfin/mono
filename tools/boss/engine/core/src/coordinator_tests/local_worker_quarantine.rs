@@ -3,10 +3,13 @@
 //! holds nothing at all, and a hold lifts without an engine restart.
 
 use super::helpers::*;
+use crate::dispatch_events::RecordingDispatchEventSink;
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::local_worker_quarantine::{SPAWN_NEVER_REACHED_TMUX_REASON, quarantine_historical_local_workers};
+use crate::orphan_sweep::run_one_pass;
 use crate::run_reconcile::RunReconcileVerdict;
 use crate::work::LocalWorkerQuarantine;
+use crate::worker_readoption::NoopLiveWorkerConvergence;
 
 fn coordinator_for(db: &Arc<WorkDb>, runner: Arc<FakeExecutionRunner>) -> Arc<ExecutionCoordinator> {
     Arc::new(ExecutionCoordinator::new(
@@ -295,10 +298,10 @@ async fn an_ordinary_request_retries_an_unreadable_inventory_without_a_restart()
 }
 
 /// A held pid that dies while only that work item is pending used to stay
-/// held until unrelated work hit host selection. Re-judgement before the
-/// active-dispatch reconcile must drop the hold and redispatch.
+/// held until unrelated work hit host selection. The orphan-sweep tick
+/// re-judges, orphans the now-unheld dead execution, and redispatches.
 #[tokio::test]
-async fn a_dead_held_pid_is_redispatched_by_the_active_dispatch_rescan() {
+async fn a_dead_held_pid_is_redispatched_by_the_orphan_sweep() {
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -312,6 +315,10 @@ async fn a_dead_held_pid_is_redispatched_by_the_active_dispatch_rescan() {
     let _ = child.wait();
     db.set_run_shell_pid_for_execution(&execution, pid).unwrap();
     assert!(db.list_ready_executions().unwrap().is_empty());
+    assert!(
+        db.reconcile_active_dispatch(|_| false).unwrap().is_empty(),
+        "without re-judgement the still-held work item is skipped"
+    );
 
     let coordinator = coordinator_for(
         &db,
@@ -320,16 +327,27 @@ async fn a_dead_held_pid_is_redispatched_by_the_active_dispatch_rescan() {
             ..FakeExecutionRunner::default()
         }),
     );
-    assert!(
-        db.reconcile_active_dispatch(|_| false).unwrap().is_empty(),
-        "without re-judgement the still-held work item is skipped"
-    );
-    let redispatched = coordinator
-        .reevaluate_local_worker_holds_and_reconcile_active_dispatch_for_test(|_| false)
-        .unwrap();
-    assert!(
-        redispatched.contains(&held_item),
-        "re-judgement before reconcile must redispatch the work item whose pid is gone: {redispatched:?}"
+    let outcome = run_one_pass(
+        db.as_ref(),
+        coordinator,
+        &RecordingDispatchEventSink::new(),
+        &NoopLiveWorkerConvergence,
+    )
+    .await;
+    assert_eq!(
+        outcome.redispatched, 1,
+        "the orphan-sweep tick must redispatch the work item whose pid is gone"
     );
     assert!(!db.is_execution_quarantined(&execution).unwrap());
+    let replacement: Vec<_> = db
+        .list_executions(Some(&held_item))
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.id != execution && matches!(row.status, ExecutionStatus::Ready | ExecutionStatus::Running))
+        .collect();
+    assert_eq!(
+        replacement.len(),
+        1,
+        "a replacement Ready or running execution must appear: {replacement:?}"
+    );
 }

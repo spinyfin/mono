@@ -248,21 +248,6 @@ impl ExecutionCoordinator {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn reevaluate_local_worker_holds_and_rescan_active_dispatch_for_test(&self) -> Result<Vec<String>> {
-        self.lifecycle.reevaluate_local_worker_holds();
-        self.work_db.rescan_active_dispatch()
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn reevaluate_local_worker_holds_and_reconcile_active_dispatch_for_test<F: Fn(&str) -> bool>(
-        &self,
-        is_live: F,
-    ) -> Result<Vec<String>> {
-        self.lifecycle.reevaluate_local_worker_holds();
-        self.work_db.reconcile_active_dispatch(is_live)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
     pub fn mark_requested_host_for_test(&self, execution_id: &str, host_id: String) {
         self.mark_requested_host(execution_id, host_id)
     }

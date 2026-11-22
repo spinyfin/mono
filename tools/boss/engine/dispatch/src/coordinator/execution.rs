@@ -244,9 +244,10 @@ impl ExecutionCoordinator {
         }
 
         // A hold on an unverified local worker is re-judged on every
-        // selection, so it lifts as soon as its cause does. It only ever
-        // refuses the held worker's own work item; the local host is dropped
-        // for everyone only while the run inventory itself is unreadable.
+        // selection (and on each orphan-sweep tick), so it lifts as soon as
+        // its cause does. It only ever refuses the held worker's own work
+        // item; the local host is dropped for everyone only while the run
+        // inventory itself is unreadable.
         self.lifecycle.reevaluate_local_worker_holds();
         self.work_db.ensure_work_item_not_quarantined(work_item.primary_id())?;
         let quarantine_reason = self.work_db.local_dispatch_quarantine_reason()?;

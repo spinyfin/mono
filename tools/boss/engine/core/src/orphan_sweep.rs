@@ -18,8 +18,12 @@
 //! as the backstop for whatever the best-effort bus drops. Each
 //! pass:
 //!
-//! 1. Snapshots execution claims across all worker pools.
-//! 2. Queries `active` work items whose `updated_at` is older than
+//! 1. Re-judges unverified local-worker holds and orphans any still-
+//!    unidentified execution whose process is now proven gone, so a dead
+//!    held pid recovers on this tick instead of waiting for an unrelated
+//!    RPC or a restart.
+//! 2. Snapshots execution claims across all worker pools.
+//! 3. Queries `active` work items whose `updated_at` is older than
 //!    [`ORPHAN_MIN_AGE_SECS`] and that have no `ready`, `running` or
 //!    `waiting_human` execution. Both live statuses describe a worker the
 //!    engine dispatched and has not concluded — one working, one parked on
@@ -29,28 +33,28 @@
 //!    `husk_pane_sweep`, `lost_workspace_sweep`, `dead_pid_sweep`,
 //!    `spawn_ack_sweep`); this sweep picks the item up on the pass after
 //!    one of them reconciles it to `orphaned`/`abandoned`.
-//! 3. Determines, per candidate, whether the row's last run ended in a
+//! 4. Determines, per candidate, whether the row's last run ended in a
 //!    deliberate engine park (a `boss propose done --outcome blocked`
 //!    declaration, or the auto-nudge breaker giving up — both terminalize
 //!    the run as `abandoned` and leave an open attention item), and
-//!    evaluates the churn guard (step 6) alongside it. Both conditions must
+//!    evaluates the churn guard (step 7) alongside it. Both conditions must
 //!    reach the halted-state bounce after the liveness guards, independently
 //!    of dispatch pause or worker capacity. An unreadable park state fails
 //!    closed rather than defaulting to redispatch.
-//! 4. For each candidate, checks whether its latest non-terminal
+//! 5. For each candidate, checks whether its latest non-terminal
 //!    execution (if any) is claimed by a live worker slot. If it is,
 //!    the execution is genuinely live and the candidate is skipped.
 //!    As a defense-in-depth guard, any candidate whose live execution is
 //!    still in a live status at this point is also skipped unconditionally.
-//! 5. Applies the **durable-process guard**: probes the pid recorded on the
+//! 6. Applies the **durable-process guard**: probes the pid recorded on the
 //!    item's most recent local run ([`crate::durable_liveness`]) and refuses
 //!    to redispatch while that process is alive, then hands the contradiction
 //!    to [`crate::worker_readoption`] to be resolved. Every guard above this
 //!    one reads engine bookkeeping, which is exactly what is wrong in the
 //!    failure this guards — see the comment at the call site.
-//! 6. Only once both liveness guards above have passed does the sweep act on
+//! 7. Only once both liveness guards above have passed does the sweep act on
 //!    the deliberate-park and churn-guard state it evaluated earlier in the
-//!    pass (step 3). The churn guard has two halves and either one trips it:
+//!    pass (step 4). The churn guard has two halves and either one trips it:
 //!    [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal executions inside
 //!    the trailing [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`] (fast
 //!    churn), or [`ORPHAN_REDISPATCH_CHURN_GUARD_CONSECUTIVE_THRESHOLD`]
@@ -70,7 +74,7 @@
 //!    uses, so the kanban board shows the halt instead of the card sitting
 //!    in Doing looking like ordinary work in progress — see
 //!    `docs/designs/dispatch-halt-state-vs-attention-items.md`. The bounce is
-//!    deliberately sequenced *after* steps 4 and 5: those are the only
+//!    deliberately sequenced *after* steps 5 and 6: those are the only
 //!    checks that can tell a churn-tripped row apart from a row whose
 //!    previous worker process is still alive (a live-but-untracked worker
 //!    tends to also produce the terminal-execution churn that trips this
@@ -93,11 +97,12 @@
 //!    un-park ([`crate::work::WorkDb::last_unparked_at`]): un-parking is the
 //!    owner deciding to try again, so what died before it is not evidence
 //!    against the first attempt after it (`crate::unpark_reconcile`).
-//! 7. Checks dispatch pause and worker capacity, then calls [`WorkDb::request_execution_with_live_check`] (the same
-//!    path `bossctl work start` uses) to mark the stale execution
-//!    `abandoned` and insert a fresh `ready` execution, then kicks
-//!    the coordinator's scheduler.
-//! 8. Emits an [`Stage::OrphanActiveRedispatch`] dispatch event so
+//! 8. Checks dispatch pause and worker capacity, then calls
+//!    [`crate::local_worker_quarantine::request_execution_after_rejudging_holds`]
+//!    (the same mint `bossctl work start` uses, after a hold re-judgement)
+//!    to mark the stale execution `abandoned` and insert a fresh `ready`
+//!    execution, then kicks the coordinator's scheduler.
+//! 9. Emits an [`Stage::OrphanActiveRedispatch`] dispatch event so
 //!    the redispatch is visible in `bossctl dispatch tail`.
 
 use std::collections::HashSet;
@@ -154,11 +159,11 @@ pub struct OrphanSweepOutcome {
     /// `husk_pane_reconcile` events before assuming the guard alone is enough.
     pub live_process_skipped: usize,
     /// Items skipped because global dispatch is paused. The sweep mints
-    /// executions through `WorkDb::request_execution_with_live_check`
-    /// directly, so nothing downstream of it re-asks the pause question on
-    /// its behalf: without this gate a pause made the sweep *more* active,
-    /// not less, because a pause stops anything consuming worker slots and
-    /// `has_idle_worker()` is then always true.
+    /// executions through `request_execution_after_rejudging_holds` after
+    /// the pass's own pause gate, so nothing downstream of it re-asks the
+    /// pause question on its behalf: without this gate a pause made the
+    /// sweep *more* active, not less, because a pause stops anything
+    /// consuming worker slots and `has_idle_worker()` is then always true.
     pub dispatch_paused_skipped: usize,
     /// Items whose most recent run ended in a deliberate engine park — a
     /// `boss propose done --outcome blocked` declaration, or the auto-nudge
@@ -384,6 +389,67 @@ pub async fn run_one_pass_for_item_with_min_age(
 /// [`run_one_pass_for_item`]. `only_work_item_id` restricts the pass to
 /// a single candidate when set; `None` scans every candidate (the
 /// periodic-sweep behavior).
+/// Re-judge unverified local-worker holds, then orphan still-unidentified
+/// executions whose hold just lifted because the process is proven gone.
+/// Those work items join this pass's candidate list so redispatch does not
+/// wait for an unrelated release or a later tick.
+fn reevaluate_holds_and_release_dead(work_db: &WorkDb) -> Vec<String> {
+    let reevaluation = match crate::local_worker_quarantine::reevaluate_local_worker_holds(work_db) {
+        Ok(reevaluation) => reevaluation,
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "orphan sweep: could not re-evaluate unverified local worker holds; continuing with the stored record"
+            );
+            return Vec::new();
+        }
+    };
+    let mut recovered = Vec::new();
+    for (execution_id, work_item_id) in reevaluation.released {
+        let Ok(execution) = work_db.get_execution(&execution_id) else {
+            continue;
+        };
+        if execution.status.is_terminal() {
+            continue;
+        }
+        match work_db.tmux_identity_for_execution(&execution_id) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    error = %format!("{err:#}"),
+                    "orphan sweep: could not read tmux identity after hold release; leaving the execution as it is"
+                );
+                continue;
+            }
+        }
+        match work_db.mark_execution_orphaned(
+            &execution_id,
+            "unverified local worker process proven gone after re-judging the hold",
+        ) {
+            Ok(_) => {
+                if let Err(err) = work_db.release_persona(&execution_id) {
+                    tracing::warn!(
+                        execution_id,
+                        error = %format!("{err:#}"),
+                        "orphan sweep: could not release persona after hold lift"
+                    );
+                }
+                recovered.push(work_item_id);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    error = %format!("{err:#}"),
+                    "orphan sweep: hold lifted but the execution could not be marked orphaned"
+                );
+            }
+        }
+    }
+    recovered
+}
+
 async fn run_one_pass_filtered(
     work_db: &WorkDb,
     coordinator: Arc<ExecutionCoordinator>,
@@ -393,6 +459,7 @@ async fn run_one_pass_filtered(
     min_age_secs: i64,
 ) -> OrphanSweepOutcome {
     let mut outcome = OrphanSweepOutcome::default();
+    let recovered_from_holds = reevaluate_holds_and_release_dead(work_db);
 
     // Snapshot of which execution ids are currently claimed by a live
     // worker slot across ALL pools (main, automation, review).  Built
@@ -405,17 +472,24 @@ async fn run_one_pass_filtered(
     // incorrectly treat it as dead and abandon it.
     let claimed: HashSet<String> = coordinator.all_claimed_execution_ids().await;
 
-    let candidates = match work_db.list_orphan_active_candidates(min_age_secs) {
+    let mut candidates = match work_db.list_orphan_active_candidates(min_age_secs) {
         Ok(ids) => ids,
         Err(err) => {
             tracing::warn!(?err, "orphan sweep: failed to list candidates; skipping pass");
             return outcome;
         }
     };
-    let candidates = match only_work_item_id {
-        Some(id) => candidates.into_iter().filter(|c| c == id).collect(),
-        None => candidates,
-    };
+    if let Some(id) = only_work_item_id {
+        candidates.retain(|candidate| candidate == id);
+    }
+    for work_item_id in recovered_from_holds {
+        if only_work_item_id.is_some_and(|id| id != work_item_id) {
+            continue;
+        }
+        if !candidates.contains(&work_item_id) {
+            candidates.push(work_item_id);
+        }
+    }
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let churn_cutoff = now_epoch_secs - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
@@ -942,7 +1016,8 @@ async fn run_one_pass_filtered(
         // died without updating the DB — `request_execution_with_live_check`
         // will mark it `abandoned` and create a new `ready` row.
         let is_live = |exec_id: &str| claimed.contains(exec_id);
-        let new_execution = match work_db.request_execution_with_live_check(
+        let new_execution = match crate::local_worker_quarantine::request_execution_after_rejudging_holds(
+            work_db,
             RequestExecutionInput::builder()
                 .work_item_id(work_item_id.clone())
                 .build(),

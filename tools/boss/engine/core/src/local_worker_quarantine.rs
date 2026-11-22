@@ -29,17 +29,24 @@
 //! A hold is released by any of: the execution reaching a terminal status
 //! (the storage readers check this on every dispatch decision, so a cancel
 //! takes effect at once), the process being proven gone
-//! ([`reevaluate_local_worker_holds`], also run on every dispatch decision),
-//! or a manual `bossctl dispatch quarantine clear`. None needs an engine
-//! restart.
+//! ([`reevaluate_local_worker_holds`]), or a manual
+//! `bossctl dispatch quarantine clear`. None needs an engine restart.
+//!
+//! [`reevaluate_local_worker_holds`] runs before coordinator admission
+//! ([`crate::coordinator::ExecutionCoordinator::request_execution_via_db`]),
+//! host selection, the active-dispatch rescan after a worker release, every
+//! orphan-sweep pass, and any other mint that goes through
+//! [`request_execution_after_rejudging_holds`]. An idle engine therefore
+//! lifts a stored unreadable-inventory pause and a dead held pid on the next
+//! sweep tick, without a restart or an unrelated RPC.
 //!
 //! Only a run inventory that cannot be read at all pauses local dispatch as a
 //! whole, because the engine then cannot name which work items are affected.
-//! That read is retried on every dispatch decision too.
 
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Result, bail};
+use boss_protocol::{RequestExecutionInput, WorkExecution};
 
 use crate::durable_liveness::{WorkerProcess, probe_execution_worker};
 use crate::work::{LocalWorkerQuarantine, UnidentifiedLocalRun, WorkDb};
@@ -135,6 +142,14 @@ enum Verdict {
     Held(&'static str),
 }
 
+/// Result of writing the hold record computed by [`evaluate`].
+enum HoldPersist {
+    /// The record now matches the verdict, including when nothing changed.
+    Applied(StartupQuarantineReport),
+    /// A concurrent writer won the compare-and-swap.
+    ConcurrentChange,
+}
+
 /// Establish the hold at engine startup, before any recovery runs.
 pub fn quarantine_historical_local_workers(db: &WorkDb) -> Result<StartupQuarantineReport> {
     let boot = kernel_boot_epoch_secs();
@@ -146,13 +161,34 @@ pub fn quarantine_historical_local_workers(db: &WorkDb) -> Result<StartupQuarant
 
 /// Re-judge the existing hold and release whatever no longer needs it.
 ///
-/// Dispatch calls this before every dispatch decision (admission, host
-/// selection, and the active-dispatch rescan), so a hold never outlives its
-/// cause by more than one decision. It never adds a new execution to a hold
-/// that a successful scan established, and it does nothing at all, beyond
-/// one metadata read, while nothing is held.
+/// Called before coordinator admission, host selection, the active-dispatch
+/// rescan, each orphan-sweep pass, and any mint that goes through
+/// [`request_execution_after_rejudging_holds`], so a hold never outlives its
+/// cause by more than one of those decisions or one sweep tick. It never
+/// adds a new execution to a hold that a successful scan established, and it
+/// does nothing at all, beyond one metadata read, while nothing is held.
 pub fn reevaluate_local_worker_holds(db: &WorkDb) -> Result<HoldReevaluation> {
     reevaluate_with_probe(db, |id| probe_execution_worker(db, id), kernel_boot_epoch_secs())
+}
+
+/// Re-judge holds, then mint or reuse an execution.
+///
+/// Production callers that talk to the store instead of
+/// [`crate::coordinator::ExecutionCoordinator::request_execution_via_db`]
+/// go through this so an unreadable-inventory pause and a dead held pid
+/// lift on the same admission that would otherwise refuse them.
+pub fn request_execution_after_rejudging_holds<F: FnOnce(&str) -> bool>(
+    db: &WorkDb,
+    input: RequestExecutionInput,
+    is_live: F,
+) -> Result<WorkExecution> {
+    if let Err(err) = reevaluate_local_worker_holds(db) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            "could not re-evaluate the hold on unverified local workers; admission continues with the stored record"
+        );
+    }
+    db.request_execution_with_live_check(input, is_live)
 }
 
 fn reevaluate_with_probe(
@@ -164,7 +200,14 @@ fn reevaluate_with_probe(
     if previous.is_empty() {
         return Ok(HoldReevaluation::default());
     }
-    evaluate(db, &previous, probe, boot_epoch_secs, Scope::Running)?;
+    match evaluate(db, &previous, &probe, boot_epoch_secs, Scope::Running)? {
+        HoldPersist::Applied(_) => {}
+        HoldPersist::ConcurrentChange => {
+            tracing::info!(
+                "local worker hold record changed concurrently; leaving it for the next admission or orphan-sweep pass"
+            );
+        }
+    }
     let held = db.read_local_worker_quarantine()?;
     let released = previous
         .executions
@@ -295,8 +338,22 @@ fn quarantine_with_probe(
     probe: impl Fn(&str) -> WorkerProcess,
     boot_epoch_secs: Option<i64>,
 ) -> Result<StartupQuarantineReport> {
-    let previous = db.read_local_worker_quarantine()?;
-    evaluate(db, &previous, probe, boot_epoch_secs, Scope::Startup)
+    for attempt in 0..HOLD_RECORD_CAS_ATTEMPTS {
+        let previous = db.read_local_worker_quarantine()?;
+        match evaluate(db, &previous, &probe, boot_epoch_secs, Scope::Startup)? {
+            HoldPersist::Applied(report) => return Ok(report),
+            HoldPersist::ConcurrentChange => {
+                tracing::info!(
+                    attempt = attempt + 1,
+                    "local worker hold record changed concurrently during startup; retrying the scan"
+                );
+            }
+        }
+    }
+    bail!(
+        "could not persist the startup hold on unverified local workers; the record changed concurrently. \
+         Restart the engine to retry the scan"
+    )
 }
 
 fn classify(
@@ -337,10 +394,10 @@ fn classify(
 fn evaluate(
     db: &WorkDb,
     previous: &LocalWorkerQuarantine,
-    probe: impl Fn(&str) -> WorkerProcess,
+    probe: &impl Fn(&str) -> WorkerProcess,
     boot_epoch_secs: Option<i64>,
     scope: Scope,
-) -> Result<StartupQuarantineReport> {
+) -> Result<HoldPersist> {
     let mut quarantine = LocalWorkerQuarantine::default();
     let mut report = StartupQuarantineReport::default();
     // After an unreadable inventory nothing was judged, so a later pass has
@@ -406,7 +463,7 @@ fn evaluate(
                 "could not re-read the local run inventory; leaving the existing hold as it is"
             );
             report.scan_failed = true;
-            return Ok(report);
+            return Ok(HoldPersist::Applied(report));
         }
         Err(err) => {
             tracing::error!(
@@ -421,12 +478,7 @@ fn evaluate(
     if quarantine != *previous {
         match db.replace_local_worker_quarantine(previous, &quarantine) {
             Ok(true) => {}
-            Ok(false) => {
-                tracing::info!(
-                    "local worker hold record changed concurrently; leaving it for the next dispatch decision"
-                );
-                return Ok(report);
-            }
+            Ok(false) => return Ok(HoldPersist::ConcurrentChange),
             Err(err) => return Err(err),
         }
     }
@@ -447,8 +499,8 @@ fn evaluate(
     // (the hold is already durable), so it is logged and the pass continues.
     resolve_released_attention(db, previous, &quarantine);
     for (execution_id, work_item_id) in &quarantine.executions {
-        // A re-evaluation runs on every dispatch decision; refile only what
-        // this pass newly held.
+        // A re-evaluation runs on every admission and sweep tick; refile only
+        // what this pass newly held.
         if scope == Scope::Running && previous.executions.contains_key(execution_id) {
             continue;
         }
@@ -474,7 +526,7 @@ fn evaluate(
             );
         }
     }
-    Ok(report)
+    Ok(HoldPersist::Applied(report))
 }
 
 /// Resolve the attention item of every work item `previous` held and `now`
@@ -1042,5 +1094,39 @@ mod tests {
         } else {
             assert!(boot.is_none());
         }
+    }
+
+    #[test]
+    fn a_startup_cas_miss_retries_and_persists_the_newly_classified_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("work.db")).unwrap();
+        let (execution, item) = seed(&db, "cas miss");
+        let mutated = std::sync::atomic::AtomicBool::new(false);
+        let report = quarantine_with_probe(
+            &db,
+            |_| {
+                if !mutated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    db.write_local_worker_quarantine(&LocalWorkerQuarantine {
+                        executions: BTreeMap::new(),
+                        scan_error: Some("concurrent bossctl recheck".to_owned()),
+                    })
+                    .unwrap();
+                }
+                WorkerProcess::Unknown
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            report.protected_execution_ids.contains(&execution),
+            "startup must return the holds it persisted, got {:?}",
+            report.protected_execution_ids
+        );
+        assert!(!report.scan_failed);
+        let recorded = db.read_local_worker_quarantine().unwrap();
+        assert_eq!(recorded.scan_error, None);
+        assert_eq!(recorded.executions, BTreeMap::from([(execution.clone(), item.clone())]));
+        assert!(db.is_execution_quarantined(&execution).unwrap());
+        assert!(db.ensure_work_item_not_quarantined(&item).is_err());
     }
 }
