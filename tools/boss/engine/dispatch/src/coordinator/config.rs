@@ -224,6 +224,12 @@ impl ExecutionCoordinator {
         self.heartbeat_beats.load(Ordering::Acquire)
     }
 
+    /// Count a heartbeat loop iteration; a no-op outside test builds.
+    pub(super) fn note_heartbeat_beat(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        self.heartbeat_beats.fetch_add(1, Ordering::AcqRel);
+    }
+
     // Test-only entry points onto crate-internal coordinator operations.
     #[cfg(any(test, feature = "test-support"))]
     pub fn inflight_dispatches_for_test(&self) -> crate::dispatch_inflight::InflightDispatches {

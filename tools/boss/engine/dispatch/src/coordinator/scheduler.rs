@@ -161,8 +161,7 @@ impl ExecutionCoordinator {
             let mut unexplained_waits = UnexplainedWaitWatch::default();
             let mut queued_displays = None;
             loop {
-                #[cfg(any(test, feature = "test-support"))]
-                coordinator.heartbeat_beats.fetch_add(1, Ordering::AcqRel);
+                coordinator.note_heartbeat_beat();
                 coordinator.spawn_in_doubt_reconcile();
                 // A deadline can pass without a DB write (including while dispatch
                 // is paused). Publish changed engine projections, never ask clients
