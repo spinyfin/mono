@@ -677,20 +677,20 @@ async fn reap_confirmed_candidates(
             }
         }
 
+        let mut event = DispatchEvent::new(Stage::TerminalWorkReconcile, Outcome::Ok, &candidate.run_id)
+            .with_work_item(&candidate.work_item_id);
+        if let Some(worker_id) = boss_execution_contracts::try_worker_id_for_slot(candidate.slot_id) {
+            event = event.with_worker(worker_id);
+        }
         dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::TerminalWorkReconcile, Outcome::Ok, &candidate.run_id)
-                    .with_work_item(&candidate.work_item_id)
-                    .with_worker(boss_execution_contracts::worker_id_for_slot(candidate.slot_id))
-                    .with_details(serde_json::json!({
-                        "reason": candidate.reason,
-                        "slot_id": candidate.slot_id,
-                        "execution_status": candidate.execution_status,
-                        "work_item_terminal": candidate.work_item_terminal,
-                        "execution_terminal": candidate.execution_terminal,
-                        "work_item_missing": candidate.work_item_missing,
-                    })),
-            )
+            .emit(event.with_details(serde_json::json!({
+                "reason": candidate.reason,
+                "slot_id": candidate.slot_id,
+                "execution_status": candidate.execution_status,
+                "work_item_terminal": candidate.work_item_terminal,
+                "execution_terminal": candidate.execution_terminal,
+                "work_item_missing": candidate.work_item_missing,
+            })))
             .await;
     }
 

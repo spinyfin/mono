@@ -124,7 +124,7 @@ use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::work::WorkDb;
-use boss_execution_contracts::{CubeClient, worker_id_for_slot};
+use boss_execution_contracts::{CubeClient, try_worker_id_for_slot};
 
 /// Grace period after `started_at` (epoch seconds) during which we
 /// skip PID probing. Guards against racing a fresh dispatch whose pane
@@ -769,10 +769,11 @@ pub(crate) async fn release_reaped_execution(
     state: &LiveWorkerState,
 ) {
     live_states.release_slot_for_run(&state.run_id);
-    let worker_id = worker_id_for_slot(state.slot_id);
-    coordinator
-        .release_pool_claim_if_execution(&worker_id, &state.run_id)
-        .await;
+    if let Some(worker_id) = try_worker_id_for_slot(state.slot_id) {
+        coordinator
+            .release_pool_claim_if_execution(&worker_id, &state.run_id)
+            .await;
+    }
 }
 
 pub enum PidStatus {

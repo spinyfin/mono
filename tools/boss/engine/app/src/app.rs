@@ -2353,22 +2353,23 @@ impl ServerState {
         // retains unconfirmed claims until then. Other nonterminal callers
         // release here because the sweep only considers terminal rows.
         // The tmux process has already been reaped.
-        let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
-        let sweep_owns_handback =
-            !pane_confirmed_released && (hold_unconfirmed_claim || self.execution_is_terminal(run_id));
-        if sweep_owns_handback {
-            tracing::warn!(
-                run_id,
-                slot_id,
-                grace_secs = boss_engine_runtime::pool_claim_sweep::LEAK_GRACE_SECS,
-                "release_worker_pane: app never confirmed the pane teardown; holding the worker \
-                 pool claim so a fresh dispatch cannot land on a slot the app may still host \
-                 (pool_claim_sweep reconciles it)",
-            );
-        } else {
-            self.execution_coordinator
-                .release_worker_and_kick(&worker_id, run_id, None)
-                .await;
+        if let Some(worker_id) = boss_execution_contracts::try_worker_id_for_slot(slot_id) {
+            let sweep_owns_handback =
+                !pane_confirmed_released && (hold_unconfirmed_claim || self.execution_is_terminal(run_id));
+            if sweep_owns_handback {
+                tracing::warn!(
+                    run_id,
+                    slot_id,
+                    grace_secs = boss_engine_runtime::pool_claim_sweep::LEAK_GRACE_SECS,
+                    "release_worker_pane: app never confirmed the pane teardown; holding the worker \
+                     pool claim so a fresh dispatch cannot land on a slot the app may still host \
+                     (pool_claim_sweep reconciles it)",
+                );
+            } else {
+                self.execution_coordinator
+                    .release_worker_and_kick(&worker_id, run_id, None)
+                    .await;
+            }
         }
         // Dispatch can reuse the slot during the viewer-detach await or
         // the pool release above. Only retire this run's live state.

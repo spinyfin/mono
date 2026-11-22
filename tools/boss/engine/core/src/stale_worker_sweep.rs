@@ -144,7 +144,9 @@ use crate::hold_registry::HoldRegistry;
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::semantic_progress::SemanticToolCondition;
 use crate::work::WorkDb;
-use boss_execution_contracts::{CubeClient, worker_id_for_slot};
+#[cfg(test)]
+use boss_execution_contracts::worker_id_for_slot;
+use boss_execution_contracts::{CubeClient, try_worker_id_for_slot};
 
 pub use boss_engine_storage_values::attention_kinds::STALE_WORKER_ATTENTION_KIND;
 
@@ -1786,17 +1788,17 @@ async fn run_cadence_fallback(
 
     // Release the worker pool slot so the orphan sweep detects the
     // chore and creates a fresh ready execution for redispatch.
-    // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
-    // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
-    // "auto-worker-N" prefix and release_worker_and_kick routes to the
-    // correct pool via pool_for_worker_id. Release only if this execution
-    // still owns the claim, because the reaper's release may already have
-    // given the slot to a new occupant; with a recording-stub reaper this is
-    // what frees the slot.
-    let worker_id = worker_id_for_slot(state.slot_id);
-    coordinator
-        .release_worker_and_kick(&worker_id, execution_id, None)
-        .await;
+    // Use try_worker_id_for_slot so automation-pool slots (> MAX_WORKER_POOL_SIZE)
+    // produce the "auto-worker-N" prefix and release_worker_and_kick routes to
+    // the correct pool via pool_for_worker_id, while unallocated slots skip
+    // pool release without panicking. Release only if this execution still owns
+    // the claim, because the reaper's release may already have given the slot to
+    // a new occupant; with a recording-stub reaper this is what frees the slot.
+    if let Some(worker_id) = try_worker_id_for_slot(state.slot_id) {
+        coordinator
+            .release_worker_and_kick(&worker_id, execution_id, None)
+            .await;
+    }
 
     // Structured event for bossctl dispatch tail.
     dispatch_events

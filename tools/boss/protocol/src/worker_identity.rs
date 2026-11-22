@@ -30,7 +30,13 @@ impl WorkerSlotIdentity {
         })
     }
 
-    /// Decode only the frozen legacy allocation ranges. Gaps are invalid.
+    /// Decode only the frozen legacy allocation ranges (main 1..=16,
+    /// automation 17..=24, review 25..=40, progression 41..=44, remote
+    /// `REMOTE_SLOT_BASE..=u8::MAX`). Gaps are invalid.
+    ///
+    /// Keep these constants in sync with `execution-contracts` pool-size
+    /// constants (verified by `legacy_codec_boundaries_match_pool_size_constants`
+    /// in `tools/boss/engine/execution-contracts/src/lib.rs`).
     pub fn from_legacy_slot(slot: u8) -> Option<Self> {
         let (pool, offset) = match slot {
             1..=16 => (WorkerSlotPool::Local(DispatchPool::Main), 0),

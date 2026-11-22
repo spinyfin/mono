@@ -171,7 +171,9 @@ use crate::spawn_health::{
 };
 use crate::transcript_liveness::{TranscriptLiveness, probe_transcript_liveness};
 use crate::work::WorkDb;
-use boss_execution_contracts::{CubeClient, worker_id_for_slot};
+#[cfg(test)]
+use boss_execution_contracts::worker_id_for_slot;
+use boss_execution_contracts::{CubeClient, try_worker_id_for_slot};
 
 pub use boss_engine_storage_values::attention_kinds::DRIVER_START_ATTENTION_KIND;
 
@@ -1008,10 +1010,11 @@ pub(crate) async fn finish_reap(
     // creates a fresh ready execution for redispatch. The reaper may already
     // have released and dispatched a replacement into this slot, so only
     // release the execution whose reap just completed.
-    let worker_id = worker_id_for_slot(slot_id);
-    ctx.coordinator
-        .release_worker_and_kick(&worker_id, execution_id, None)
-        .await;
+    if let Some(worker_id) = try_worker_id_for_slot(slot_id) {
+        ctx.coordinator
+            .release_worker_and_kick(&worker_id, execution_id, None)
+            .await;
+    }
 
     // Release the cube workspace lease. `mark_execution_orphaned`
     // deliberately leaves the lease columns intact (a live workspace may
