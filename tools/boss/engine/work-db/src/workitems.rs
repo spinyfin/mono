@@ -1788,11 +1788,19 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
         let (status_clause, order_clause) = if open_only {
             (
-                " AND status NOT IN ('done', 'archived')",
+                format!(
+                    " AND status NOT IN ({})",
+                    TaskStatus::ALL
+                        .iter()
+                        .filter(|status| status.is_terminal())
+                        .map(|status| format!("'{}'", status.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
                 "CAST(updated_at AS INTEGER) DESC, id ASC",
             )
         } else {
-            ("", "COALESCE(ordinal, 0) ASC, created_at ASC")
+            (String::new(), "COALESCE(ordinal, 0) ASC, created_at ASC")
         };
 
         // The soft-delete predicate is dropped entirely (rather than

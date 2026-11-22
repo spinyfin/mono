@@ -66,13 +66,14 @@ pub const CANDIDATE_ID: &str = "candidate";
 /// scheduled row".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItemBrief {
-    /// Short display id, e.g. `"T42"` / `"C7"` / `"R3"` / `"P12"`. A
+    /// Short display id: `T{n}` for tasks, chores and revisions; `P{n}` for projects. A
     /// `WorkItemDup` verdict must name one of these.
     pub work_item_id: String,
     /// `"task"` | `"chore"` | `"revision"` | `"project"`.
     pub kind: String,
     pub title: String,
-    /// Non-terminal state string, for context (e.g. `"in_progress"`).
+    /// Non-terminal state: `todo`, `active`, `blocked`, or `in_review` for task-table
+    /// rows; `planned`, `active`, or `blocked` for projects.
     pub status: String,
     /// First ~200 chars of the description, for context.
     pub description_snippet: String,

@@ -54,14 +54,32 @@ pub enum ProjectStatus {
     Archived,
 }
 
+macro_rules! project_status_variants {
+    ($($variant:ident => $str:literal),+ $(,)?) => {
+        impl ProjectStatus {
+            /// Every persisted status, sharing the exhaustive string mapping.
+            pub const ALL: &'static [ProjectStatus] = &[$(ProjectStatus::$variant),+];
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $str),+ }
+            }
+        }
+    };
+}
+
+project_status_variants! {
+    Planned => "planned",
+    Active => "active",
+    Blocked => "blocked",
+    Done => "done",
+    Archived => "archived",
+}
+
 impl ProjectStatus {
-    pub fn as_str(self) -> &'static str {
+    /// Whether the project is closed to further work.
+    pub fn is_terminal(self) -> bool {
         match self {
-            ProjectStatus::Planned => "planned",
-            ProjectStatus::Active => "active",
-            ProjectStatus::Blocked => "blocked",
-            ProjectStatus::Done => "done",
-            ProjectStatus::Archived => "archived",
+            Self::Done | Self::Archived => true,
+            Self::Planned | Self::Active | Self::Blocked => false,
         }
     }
 }

@@ -267,13 +267,19 @@ impl WorkDb {
     pub fn list_open_projects_mru(&self, product_id: &str) -> Result<Vec<Project>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
-        let mut stmt = conn.prepare(
+        let terminal_statuses = ProjectStatus::ALL
+            .iter()
+            .filter(|status| status.is_terminal())
+            .map(|status| format!("'{}'", status.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, product_id, name, slug, description, goal, status, priority, created_at, updated_at, last_status_actor,
                     design_doc_repo_remote_url, design_doc_branch, design_doc_path, short_id, status_basis, parked_at, parked_by, parked_reason, parked_via
              FROM projects
-             WHERE product_id = ?1 AND status NOT IN ('done', 'archived')
+             WHERE product_id = ?1 AND status NOT IN ({terminal_statuses})
              ORDER BY CAST(updated_at AS INTEGER) DESC, id ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([product_id], map_project)?;
         collect_rows(rows)
     }

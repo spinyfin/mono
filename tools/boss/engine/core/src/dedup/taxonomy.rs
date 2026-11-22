@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use boss_protocol::{Project, ProjectStatus, Task, TaskKind, WorkItemBrief, short_id_label};
+use boss_protocol::{Project, Task, TaskKind, WorkItemBrief, short_id_label};
 
 use crate::work::WorkDb;
 
@@ -163,12 +163,8 @@ pub fn select_taxonomy_briefs(
 
 fn candidates_from_db(db: &WorkDb, product_id: &str) -> Result<Vec<TaxonomyCandidate>> {
     let mut out = Vec::new();
-    // Terminal rows are excluded in SQL; the Rust-side checks below are a
-    // guard only.
+    // The database queries derive terminal exclusions from the status enums.
     for task in db.list_open_tasks_mru(product_id)? {
-        if task.status.is_terminal() {
-            continue;
-        }
         let Some(brief) = brief_from_task(&task) else {
             continue;
         };
@@ -179,9 +175,6 @@ fn candidates_from_db(db: &WorkDb, product_id: &str) -> Result<Vec<TaxonomyCandi
         });
     }
     for project in db.list_open_projects_mru(product_id)? {
-        if project_is_terminal(project.status) {
-            continue;
-        }
         let Some(brief) = brief_from_project(&project) else {
             continue;
         };
@@ -234,10 +227,6 @@ fn taxonomy_kind(task: &Task) -> &'static str {
         | TaskKind::DesignPostmortem
         | TaskKind::Followup => "task",
     }
-}
-
-fn project_is_terminal(status: ProjectStatus) -> bool {
-    matches!(status, ProjectStatus::Done | ProjectStatus::Archived)
 }
 
 fn snippet(text: &str) -> String {
