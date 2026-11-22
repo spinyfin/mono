@@ -140,7 +140,7 @@ run_interruption_case() {
     grep -q "timeout stacks pid=${child_pid} .*Thread_" "${log}"
     grep -q "timeout stacks pid=${descendant_pid} .*Thread_" "${log}"
     grep -q "test thread backtraces: not retained (output directory unavailable)" "${log}"
-    ! grep -q "test thread backtraces: /" "${log}"
+    ! grep -q "test thread backtraces: /" "${log}" || { printf '%s\n' 'log names a deleted backtrace path' >&2; return 1; }
   elif [[ "${signal}" == "TERM" || "${signal}" == "KILL" ]]; then
     local pid report
     for pid in "${child_pid}" "${descendant_pid}"; do
