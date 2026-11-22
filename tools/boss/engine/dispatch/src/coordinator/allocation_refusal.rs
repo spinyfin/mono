@@ -45,14 +45,9 @@ impl ExecutionCoordinator {
             reason = %refusal,
             "failed execution at dispatch: driver allocation refused",
         );
-        let launch_remedy = if error_text.contains("launch flag off") {
-            "Enable an eligible funded driver in Settings or with `bossctl dispatch traffic-split --enable <driver>`. "
-        } else {
-            ""
-        };
         let attention_body = format!(
-            "Execution `{id}` was not dispatched because no enabled eligible driver holds a share of the traffic \
-             split.\n\n**Reason:** {refusal}\n\n{launch_remedy}Raise the share of an eligible driver \
+            "Execution `{id}` was not dispatched because no eligible driver holds a share of the traffic \
+             split.\n\n**Reason:** {refusal}\n\nRaise the share of an eligible driver \
              (`bossctl dispatch traffic-split`), or change the item's model or driver pin, then start \
              the item again.",
             id = failed.id,
@@ -70,7 +65,7 @@ impl ExecutionCoordinator {
             attention: StartFailureAttention {
                 suppress: false,
                 kind: crate::work::DRIVER_ALLOCATION_REFUSED_ATTENTION_KIND,
-                title: "No enabled funded driver can run this work",
+                title: "No funded driver can run this work",
                 body: Some(attention_body),
             },
         })

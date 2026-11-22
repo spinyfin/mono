@@ -1209,7 +1209,7 @@ fn legacy_percentage_decision_rows_still_read_back() {
 }
 
 #[test]
-fn share_write_repairs_invalid_persisted_split() {
+fn set_driver_traffic_split_overwrites_an_unreadable_persisted_row() {
     for raw in [r#"{"grok":50,"claude":50,"codex":50,"agy":0}"#, "not json"] {
         let (_dir, db) = open_db();
         db.set_metadata(METADATA_KEY_DRIVER_TRAFFIC_SPLIT, raw).unwrap();

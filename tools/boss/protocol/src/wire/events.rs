@@ -1360,11 +1360,11 @@ pub enum FrontendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clamped_from: Option<usize>,
     },
-    /// Response to [`FrontendRequest::SetDriverTrafficSplit`],
-    /// [`FrontendRequest::SetDriverLaunchFlag`] and [`FrontendRequest::GetDriverTrafficSplit`],
-    /// and pushed to subscribed sessions after either setter. `split` is the stored
-    /// configured split (shares sum to exactly 100) with its persisted `launch_enabled`
-    /// flags; use [`DriverTrafficSplit::effective_launch_split`] for the shares after launch flags.
+    /// Response to [`FrontendRequest::SetDriverTrafficSplit`] and
+    /// [`FrontendRequest::GetDriverTrafficSplit`], and published on
+    /// `TOPIC_DRIVER_TRAFFIC_SPLIT` to subscribed sessions after a successful
+    /// set. `split` is the stored configured split; its four shares sum to
+    /// exactly 100 and a 0% share is off.
     #[worker(passthrough)]
     DriverTrafficSplitResult { split: DriverTrafficSplit },
     /// Response to [`FrontendRequest::GetDriverQuotaUsage`]. Carries one
