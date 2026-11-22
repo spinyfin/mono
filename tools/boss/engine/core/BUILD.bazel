@@ -582,11 +582,7 @@ rust_test(
         "@host_tmux//:tmux",
     ],
     edition = "2024",
-    # Runs where the host claude and tmux are installed: copies of the client's binaries do not load on a worker (tmux needs libutf8proc, libevent and ncurses from its install prefix).
-    tags = [
-        "manual",
-        "no-remote-exec",
-    ],
+    tags = ["manual"],
     deps = [
         ":engine_lib",
         ":tmux_fixture",
@@ -614,11 +610,7 @@ rust_test(
     ],
     edition = "2024",
     rustc_flags = ["--cfg=boss_real_model_test"],
-    # Runs where the host claude and tmux are installed: copies of the client's binaries do not load on a worker (tmux needs libutf8proc, libevent and ncurses from its install prefix).
-    tags = [
-        "manual",
-        "no-remote-exec",
-    ],
+    tags = ["manual"],
     deps = [
         ":engine_lib",
         ":tmux_fixture",
@@ -658,11 +650,7 @@ rust_test(
     # host assignment. Remove once every `bazel-any` Linux host is confirmed
     # to have tmux installed — an operator/fleet-provisioning decision, not
     # one this target can make for itself.
-    # Runs on the machine that has the host tmux and its libraries: a copy of the client's tmux shipped to a worker cannot load libutf8proc/libevent/ncurses.
-    tags = [
-        "manual",
-        "no-remote-exec",
-    ],
+    tags = ["manual"],
     deps = [
         ":engine_lib",
         ":tmux_fixture",
@@ -702,11 +690,7 @@ rust_test(
     ),
     # Same `bazel-any` host-tmux-availability rationale as
     # `tmux_recovery_integration_test` above.
-    # Runs on the machine that has the host tmux and its libraries: a copy of the client's tmux shipped to a worker cannot load libutf8proc/libevent/ncurses.
-    tags = [
-        "manual",
-        "no-remote-exec",
-    ],
+    tags = ["manual"],
     deps = [
         ":engine_lib",
         ":tmux_fixture",

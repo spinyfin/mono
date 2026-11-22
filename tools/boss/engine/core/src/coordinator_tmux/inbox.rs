@@ -554,7 +554,8 @@ impl Injected {
         }?;
         Ok(TurnObserver {
             file: turn_file,
-            message_ids: std::iter::once(message_id).chain(input_uuid).collect(),
+            message_id,
+            seed_uuids: input_uuid.into_iter().collect(),
         })
     }
 }
