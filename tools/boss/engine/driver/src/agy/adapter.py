@@ -539,19 +539,32 @@ def is_python_program(name):
 
 def python_inline_bodies(group):
     rest = strip_prefixes(group)
-    if not rest or not is_python_program(os.path.basename(rest[0])):
+    # Launchers such as uv/poetry/pipx can precede the interpreter.
+    start = next((i for i, arg in enumerate(rest)
+                  if is_python_program(os.path.basename(arg))), None)
+    if start is None:
         return []
     bodies = []
-    skip_next = False
-    for index, arg in enumerate(rest[1:], 1):
-        if skip_next:
-            skip_next = False
+    arguments = iter(rest[start + 1:])
+    for arg in arguments:
+        if arg == "--" or arg == "-" or not arg.startswith("-"):
+            break
+        if arg == "--check-hash-based-pycs":
+            next(arguments, "")
             continue
-        if arg == "-c" and index + 1 < len(rest):
-            bodies.append(rest[index + 1])
-            skip_next = True
-        elif arg.startswith("-c") and len(arg) > 2 and not arg.startswith("--"):
-            bodies.append(arg[2:])
+        if arg.startswith("--"):
+            continue
+        # c/m end option processing; W/X consume an attached or next value.
+        for offset, flag in enumerate(arg[1:], 2):
+            if flag in "cmWX":
+                value = arg[offset:] or next(arguments, "")
+                if flag == "c":
+                    bodies.append(value)
+                break
+        else:
+            continue
+        if flag in "cm":
+            break
     body = getattr(group, "body", "") or ""
     if body:
         bodies.append(body)
@@ -600,6 +613,12 @@ def python_body_touches_protected(body, policy):
     # `{scratch}/lib.rs` stays allowed.
     text = body
     for spelling in allowed_scratch_spellings(policy):
+        for match in re.finditer(re.escape(spelling) + r"[^\s\"']*", text):
+            suffix = match.group()[len(spelling):]
+            if ".." in suffix.replace(chr(92), "/").split("/"):
+                return True
+            if suffix and not suffix.startswith("/"):
+                return True
         text = text.replace(spelling, "ALLOWED_SCRATCH")
     needles = []
     for root in policy.get("protected_paths", []):
@@ -960,10 +979,10 @@ def glob_prefix_spellings(static):
 
 
 def glob_wildcard_uses_unmodeled_brackets(wildcard):
-    # Python's glob/fnmatch does not implement POSIX classes (`[[:lower:]]`)
-    # or `[^` negation. bash still expands them, so a "no matches" result is
+    # Python's glob/fnmatch does not implement POSIX classes, equivalence
+    # classes, collating symbols or bash's `[^` negation. A "no matches" result is
     # not proof the pattern stays inside scratch.
-    return "[[:" in wildcard or "[^" in wildcard
+    return any(marker in wildcard for marker in ("[[", "[!", "[^"))
 
 
 def glob_touches_protected(expanded, policy):

@@ -433,10 +433,10 @@ def emit(decision, reason=None):
         r#"
 def conversation_scratch_path(candidate, cwd, payload):
     # The root comes from engine-owned hook wiring, never the payload.
-    # POSIX bracket classes Python's glob does not model (`[[:`, `[^`) can
+    # Bracket constructs Python's glob does not model (`[[`, `[^`) can
     # expand to a name the worker created as a link out of scratch, so those
     # spellings keep the data-dir check.
-    if "[[:" in candidate or "[^" in candidate:
+    if any(marker in candidate for marker in ("[[", "[!", "[^")):
         return False
     base = conversation_scratch_base(os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
     return conversation_scratch_contains(canonical(candidate, cwd), base)
@@ -495,18 +495,15 @@ def main():
         # Creating a link inside the conversation allowance is how a later
         # (or same-command) read walks out of scratch. Do not skip scratch
         # operands of `ln` / `cp -s` / `cp -l`.
-        for part in re.split(r"[;&|]+", command):
-            words = part.split()
-            if not words:
-                continue
-            prog = os.path.basename(words[0])
+        for index, token in enumerate(tokens):
+            prog = os.path.basename(token.lstrip("({"))
             if prog == "ln":
                 creates_link = True
                 break
             if prog == "cp" and any(
                 w in ("-s", "--symbolic-link", "-l", "--link")
                 or (w.startswith("-") and not w.startswith("--") and ("s" in w[1:] or "l" in w[1:]))
-                for w in words[1:]
+                for w in tokens[index + 1:]
             ):
                 creates_link = True
                 break

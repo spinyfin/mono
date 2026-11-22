@@ -153,7 +153,16 @@ fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
     let scratch = brain.join("c1/scratch");
     for command in [
         format!("ln -s ../../../../../../.. {}/climb", scratch.display()),
+        format!("echo ok\nln -s ../../../../../../.. {}/climb", scratch.display()),
+        format!("FOO=1 ln -s ../../../../../../.. {}/climb", scratch.display()),
+        format!("env ln -s ../../../../../../.. {}/climb", scratch.display()),
+        format!("command ln -s ../../../../../../.. {}/climb", scratch.display()),
+        format!("(ln -s ../../../../../../.. {}/climb)", scratch.display()),
+        format!("env cp -s ../../../../../../.. {}/climb", scratch.display()),
         format!("cat {}/[[:lower:]]p/state.db", scratch.display()),
+        format!("cat {}/[[=u=]]p/state.db", scratch.display()),
+        format!("cat {}/[[.u.]]p/state.db", scratch.display()),
+        format!("cat {}/[!x]p/state.db", scratch.display()),
         format!(
             "ln -s ../../../../../../.. {}/climb && cat {}/climb/state.db",
             scratch.display(),

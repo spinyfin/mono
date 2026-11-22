@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn python_scratch_traversal_and_clustered_programs_are_inspected() {
+    let fx = Fixture::new("python-path-options");
+    fx.install(WorkerKind::Standard);
+    let home = fx.process_home.display();
+    let scratch = format!("{home}/.gemini/antigravity-cli/brain/c1/scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    let run_command_payload = |command: &str| {
+        let mut payload = super::run_command_payload(command);
+        payload["conversationId"] = json!("c1");
+        payload
+    };
+    for path in [
+        format!("{scratch}/../../../settings.json"),
+        format!("{scratch}/../../c2/scratch/x.py"),
+        format!("{scratch}/../.system_generated/logs/transcript_full.jsonl"),
+        format!("{home}/.gemini/antigravity-cli/brain/c1/.system_generated/steps/../../logs/transcript_full.jsonl"),
+        format!("{scratch}/../../../../config/hooks.json"),
+        format!("{home}/.gemini/antigravity-cli/settings.json"),
+        format!("{home}/.gemini/config/hooks.json"),
+        format!("{home}/.gemini/antigravity-cli/brain/c2/scratch/x.py"),
+    ] {
+        for prefix in [
+            "python3 -c",
+            "python3 -Ic",
+            "python3 -Bc",
+            "python3 -uc",
+            "python3 -sc",
+            "python3 -Sc",
+            "uv run python3 -c",
+            "poetry run python3 -c",
+            "pipx run python3 -c",
+            "python3 -W ignore -X dev -Ic",
+        ] {
+            let command = format!("{prefix} 'print(open(\"{path}\").read())'");
+            let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(&command));
+            assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+        }
+        for command in [
+            format!("python3 - <<'PY'\nprint(open(\"{path}\").read())\nPY"),
+            format!("python3 -Ic'print(open(\"{path}\").read())'"),
+        ] {
+            let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(&command));
+            assert_eq!(decision(&body), "deny", "{command}: {body} {stderr}");
+        }
+    }
+    for command in [
+        "python3 -Ic 'print(1)'",
+        "python3 -Bc 'print(1)'",
+        "python3 -uc 'print(1)'",
+        "uv run python3 -c 'print(1)'",
+    ] {
+        let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(command));
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+    }
+    let command = format!("python3 -Ic 'print(open(\"{scratch}/lib.rs\").read())'");
+    let (_, body, stderr) = authorize(&fx.process_home, &run_command_payload(&command));
+    assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
+}
+
+#[test]
 fn shared_forwarder_updates_do_not_change_live_hooks() {
     let fx = Fixture::new("forwarder-update");
     let log = fx.tmp.path().join("forwarded.json");

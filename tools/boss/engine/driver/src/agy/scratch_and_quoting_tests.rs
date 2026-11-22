@@ -606,6 +606,9 @@ fn two_command_bracket_glob_cannot_read_through_scratch_link() {
     std::os::unix::fs::symlink(&hooks, scratch.join("hooks.json")).unwrap();
     for command in [
         format!("cat {}/[[:lower:]]p/state.db", scratch.display()),
+        format!("cat {}/[[=u=]]p/state.db", scratch.display()),
+        format!("cat {}/[[.u.]]p/state.db", scratch.display()),
+        format!("cat {}/[!x]p/state.db", scratch.display()),
         format!("cat {}/[[:lower:]]ooks.json", scratch.display()),
         format!("cat $HOME/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch/[[:lower:]]p/state.db"),
         format!("cat ~/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch/[[:lower:]]ooks.json"),
