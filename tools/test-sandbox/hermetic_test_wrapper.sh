@@ -6,9 +6,13 @@ set -euo pipefail
 # process-lifecycle supervisor outside the profile so it can invoke and
 # interrupt fully enforced wrapper processes. The exception is bound to the
 # physical Bazel test executable passed by run_under; target-controlled
-# environment variables cannot enable it for another test action.
+# environment variables cannot enable it for another test action. Remote
+# execution may stage a copy of that executable, so inode identity (`-ef`)
+# is not enough: fall back to a content comparison against the runfiles path.
 cleanup_supervisor="${TEST_SRCDIR:?}/${TEST_WORKSPACE:?}/tools/test-sandbox/cleanup_guard_test"
-if [[ "$#" -gt 0 && -x "${cleanup_supervisor}" && "$1" -ef "${cleanup_supervisor}" ]]; then
+if [[ "$#" -gt 0 && -x "$1" && -x "${cleanup_supervisor}" ]] && {
+  [[ "$1" -ef "${cleanup_supervisor}" ]] || cmp -s "$1" "${cleanup_supervisor}"
+}; then
   unset \
     ANTHROPIC_API_KEY \
     OPENAI_API_KEY \
@@ -123,14 +127,22 @@ signal_child() {
 }
 
 terminate_child_group() {
+  # A launcher still in this shell's job table dies of SIGTERM/SIGHUP when
+  # we forward those signals. After the next foreground command, bash
+  # reports that as a failed background job ("Terminated: 15" / "Hangup: 1").
+  # errexit would then abort cleanup before the private root is removed.
+  set +e
   if ! process_group_is_alive; then
+    wait "${child_pid}" 2>/dev/null
+    set -e
     return 0
   fi
 
   signal_child TERM
   for _ in {1..20}; do
     if ! process_group_is_alive; then
-      wait "${child_pid}" 2>/dev/null || true
+      wait "${child_pid}" 2>/dev/null
+      set -e
       return 0
     fi
     "${cleanup_sleep}" 0.05
@@ -140,15 +152,32 @@ terminate_child_group() {
   # between two signals.
   for _ in {1..20}; do
     signal_child KILL
-    wait "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null
     if ! process_group_is_alive; then
+      set -e
       return 0
     fi
     "${cleanup_sleep}" 0.05
   done
 
+  set -e
   printf 'test process group survived SIGKILL: %s\n' "${child_pid}" >&2
   return 1
+}
+
+# `rm -rf` can fail with "Directory not empty" when the watchdog is unparked
+# and writes into the root in the same instant. Retry rather than leaving the
+# private directory behind.
+remove_private_root() {
+  local _try
+  [[ "${owns_test_tmpdir}" == "1" ]] || return 0
+  for _try in {1..10}; do
+    if "${cleanup_rm}" -rf "${test_tmpdir}"; then
+      return 0
+    fi
+    "${cleanup_sleep}" 0.05
+  done
+  "${cleanup_rm}" -rf "${test_tmpdir}" || true
 }
 
 # Tells the watchdog this shell did its own cleanup, and reaps it. Called
@@ -169,9 +198,7 @@ cleanup() {
   if [[ -n "${child_pid}" ]] && ! terminate_child_group && [[ "${status}" == "0" ]]; then
     status=1
   fi
-  if [[ "${owns_test_tmpdir}" == "1" ]]; then
-    "${cleanup_rm}" -rf "${test_tmpdir}"
-  fi
+  remove_private_root
   release_watchdog
   exit "${status}"
 }
@@ -504,18 +531,14 @@ set -m
   if [[ -z "${child_pid}" ]]; then
     # The wrapper is gone and no launcher pid was published, so no test was
     # started or it exited without announcing. Only the private root is left.
-    if [[ "${owns_test_tmpdir}" == "1" ]]; then
-      "${cleanup_rm}" -rf "${test_tmpdir}"
-    fi
+    remove_private_root
     exit 0
   fi
   if IFS= read -r _ <&9; then
     exit 0
   fi
   terminate_child_group || true
-  if [[ "${owns_test_tmpdir}" == "1" ]]; then
-    "${cleanup_rm}" -rf "${test_tmpdir}"
-  fi
+  remove_private_root
 ) &
 watchdog_pid=$!
 set +m
@@ -527,6 +550,9 @@ exec 9<&-
 # Block until the watchdog says it is listening. There is no give-up bound,
 # because a watchdog that is merely slow to be scheduled on a loaded host is
 # healthy; the wait ends in failure only if the watchdog process has died.
+# errexit is off so a job-status report cannot abort the wait if the
+# fixture SIGKILL's the watchdog while this loop is in a foreground command.
+set +e
 until [[ -s "${ready_file}" ]]; do
   exit_if_cancelled
   if ! kill -0 "${watchdog_pid}" 2>/dev/null; then
@@ -535,6 +561,7 @@ until [[ -s "${ready_file}" ]]; do
   fi
   "${cleanup_sleep}" 0.05
 done
+set -e
 exit_if_cancelled
 
 # The launcher stays in this shell's group, writes its pid, then setpgid's

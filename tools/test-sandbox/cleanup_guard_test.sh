@@ -8,6 +8,7 @@ fi
 
 wrapper="${TEST_SRCDIR:?}/${TEST_WORKSPACE:?}/tools/test-sandbox/hermetic_test_wrapper"
 child="${TEST_SRCDIR:?}/${TEST_WORKSPACE:?}/tools/test-sandbox/cleanup_child"
+runtime_python="${TEST_SRCDIR:?}/+test_runtime_repository+test_runtime_tools/bin/python3"
 
 # Every process of one inner run carries its marker on its command line: the
 # wrapper, the watchdog it forks, and the fixture. The fixture's own descendant
@@ -79,7 +80,10 @@ run_interruption_case() {
     rm -rf "${inner_runfiles}"
   fi
   if [[ "${signal}" == "KILL" ]]; then
-    kill -KILL -- "-${inner_pid}"
+    kill -KILL -- "-${inner_pid}" || {
+      printf 'kill of inner wrapper group failed: %s\n' "${inner_pid}" >&2
+      return 1
+    }
     wait "${inner_pid}" 2>/dev/null || true
     # Nothing is left to wait on: the watchdog that takes over is not a child
     # of this shell. It gives the fixture, which ignores SIGTERM, one second
@@ -143,8 +147,11 @@ run_startup_kill_case() {
   for _ in {1..400}; do
     for candidate in /private/tmp/mono-test.*; do
       if [[ "${candidate}" != "${TEST_TMPDIR}" && -f "${candidate}/watchdog-ready" ]]; then
-        read -r owner <"${candidate}/watchdog-ready"
-        owner_pgid="$(ps -o pgid= -p "${owner}" 2>/dev/null | tr -d ' ')"
+        # Other actions share host /tmp. A stale watchdog-ready whose owner
+        # has already exited makes `ps` fail; with pipefail that would abort
+        # this test before it can ignore the foreign directory.
+        read -r owner <"${candidate}/watchdog-ready" || continue
+        owner_pgid="$(ps -o pgid= -p "${owner}" 2>/dev/null | tr -d ' ' || true)"
         if [[ "${owner}" == "${inner_pid}" || "${owner_pgid}" == "${inner_pid}" ]]; then
           inner_root="${candidate}"
           break 2
@@ -161,7 +168,10 @@ run_startup_kill_case() {
     return 1
   fi
 
-  kill -KILL -- "-${inner_pid}"
+  kill -KILL -- "-${inner_pid}" || {
+    printf 'kill of inner wrapper group failed: %s\n' "${inner_pid}" >&2
+    return 1
+  }
   wait "${inner_pid}" 2>/dev/null || true
   for _ in {1..200}; do
     if [[ ! -e "${inner_root}" ]] && [[ -z "$(marker_processes "${marker}")" ]]; then
@@ -334,14 +344,22 @@ run_cancel_before_ready_case() {
 
 # The test must start with SIGINT live, so an INT sent to the wrapper reaches
 # a fixture that handles it. A fixture handles INT only if it did not start
-# with INT ignored (a shell cannot trap a signal ignored on entry).
+# with INT ignored (a shell cannot trap a signal ignored on entry). This case
+# backgrounds the wrapper, which would otherwise inherit SIG_IGN for INT;
+# python restores the defaults so the wrapper can trap INT, matching a
+# foreground Bazel test action.
 run_sigint_forwarding_case() {
   local marker="cleanup-$$-SIGINT"
   local out="${TEST_TMPDIR}/sigint-out"
   local inner_pid=""
   : >"${out}"
   set -m
-  "${wrapper}" /bin/sh -c 'trap "echo got-int" INT; trap "" TERM; while :; do :; done' "${marker}" >"${out}" 2>&1 &
+  "${runtime_python}" -c \
+    'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' \
+    "${wrapper}" /bin/sh -c 'trap "echo got-int; exit 0" INT; trap "" TERM; while :; do :; done' "${marker}" >"${out}" 2>&1 &
   inner_pid=$!
   set +m
   for _ in {1..400}; do
