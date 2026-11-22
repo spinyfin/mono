@@ -1743,16 +1743,21 @@ async fn serve_scoped(
         server_state.work_db.clone(),
         merge_probe,
         server_state.publisher.clone(),
-        boss_engine_merge_poller::LoopServices {
-            cube_client: server_state.cube_client.clone(),
-            completion_handler: server_state.completion_handler.clone(),
-            trunk_queue_api,
+        boss_engine_merge_poller::LoopServices::builder()
+            .cube_client(server_state.cube_client.clone())
+            .completion_handler(server_state.completion_handler.clone())
+            .trunk_queue_api(trunk_queue_api)
             // Conflict remediation, design-doc pointer maintenance and project
             // population are carried out by the services that own them; the
             // poller reaches them through this host.
-            host: server_state.sweep_host.clone(),
-            detection_stall: server_state.merge_detection_stall.clone(),
-        },
+            .host(server_state.sweep_host.clone())
+            // Full probes go to the product the operator is working in; every
+            // other product's PRs are still watched for merge and close.
+            .active_products(Arc::new(selected_product::PollerActiveProducts(Arc::downgrade(
+                &server_state,
+            ))))
+            .detection_stall(server_state.merge_detection_stall.clone())
+            .build(),
         Duration::from_secs(60),
         server_state.metrics.clone(),
         (server_state.pr_reconciler_kick.clone(), pr_reconcile_requests),

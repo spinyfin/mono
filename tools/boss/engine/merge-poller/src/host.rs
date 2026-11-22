@@ -13,6 +13,7 @@
 //! sweep awaits the same futures at the same points and reads the same
 //! boolean / count back.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -164,6 +165,34 @@ pub trait SweepPasses: Send {
 pub trait LoopPasses: Send + Sync {
     /// Fresh pass state for one loop. Called once, as the loop starts.
     fn start_passes(&self) -> Box<dyn SweepPasses>;
+}
+
+/// Which products the operator is working in right now, so the poller can
+/// spend its full probes where they will be acted on.
+///
+/// The poller probes a PR in an active product in full every pass, and a PR in
+/// any other product only for merge or close, on a slower cadence (see
+/// `probe_tier`). Nothing is dropped: every tracked PR in every product is
+/// still watched for merge and close.
+#[async_trait]
+pub trait ActiveProducts: Send + Sync {
+    /// The product ids to treat as active, or `None` when none is singled
+    /// out (no app connected, nothing selected, no dispatch focus), which
+    /// makes every product active. Called once before each pass, so it must be
+    /// cheap and must not block on the poller.
+    async fn active_product_ids(&self) -> Option<HashSet<String>>;
+}
+
+/// No product is singled out: every product is active, so every in-review PR
+/// that is not parked or dormant is probed in full every pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EveryProductActive;
+
+#[async_trait]
+impl ActiveProducts for EveryProductActive {
+    async fn active_product_ids(&self) -> Option<HashSet<String>> {
+        None
+    }
 }
 
 /// Everything the sweep needs from the engine host: conflict handling, design-doc

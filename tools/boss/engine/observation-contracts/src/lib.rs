@@ -312,6 +312,41 @@ pub struct TrunkQueueCheckFailure {
     pub completed_at: Option<String>,
 }
 
+/// What a shallow probe learned about one PR: whether it is still open, and
+/// when GitHub last saw it change.
+///
+/// A shallow probe asks only for the PR's lifecycle, never its CI rollup,
+/// reviews, labels or mergeability, so it is a fraction of the cost of a full
+/// [`PrLifecycleProbe`]. It exists for PRs the poller watches only to learn
+/// that they merged or closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShallowProbe {
+    /// Still open. Nothing else about the PR was observed, and nothing about
+    /// an open PR may be inferred from this (in particular not CI, review or
+    /// mergeability state).
+    Open {
+        /// GitHub's `updatedAt` for the PR (RFC 3339), when it reported one.
+        updated_at: Option<String>,
+    },
+    /// Merged or closed without merging. The probe carries what the
+    /// merge/close transition reads (state, merge commit, head and base refs,
+    /// base-branch check) and nothing else.
+    Terminal(Box<PrLifecycleProbe>),
+}
+
+impl ShallowProbe {
+    /// The shallow view of a full probe: an open PR keeps only its
+    /// `updatedAt`, a terminal one is kept whole.
+    pub fn from_full(probe: PrLifecycleProbe) -> Self {
+        match probe.state {
+            PrLifecycleState::Open(_) => Self::Open {
+                updated_at: probe.updated_at,
+            },
+            PrLifecycleState::Merged | PrLifecycleState::ClosedUnmerged => Self::Terminal(Box::new(probe)),
+        }
+    }
+}
+
 /// Probe the lifecycle state of a single PR. Implemented for
 /// production by shelling out to `gh`; test doubles can stub it
 /// directly.
@@ -346,6 +381,25 @@ pub trait MergeProbe: Send + Sync {
             out.insert(url.clone(), result);
         }
         out
+    }
+
+    /// Like [`Self::probe_batch`], but only as deep as needed to learn
+    /// whether each PR is still open (see [`ShallowProbe`]).
+    ///
+    /// The default derives the answer from [`Self::probe_batch`], which is
+    /// right for every test double and costs nothing extra. `CommandMergeProbe`
+    /// overrides it to request a handful of scalar fields per PR instead of
+    /// the full CI/review selection, so a large set of PRs can be watched for
+    /// merge or close in one cheap, large batch.
+    async fn probe_shallow_batch(
+        &self,
+        pr_urls: &[String],
+    ) -> HashMap<String, std::result::Result<ShallowProbe, String>> {
+        self.probe_batch(pr_urls)
+            .await
+            .into_iter()
+            .map(|(url, result)| (url, result.map(ShallowProbe::from_full)))
+            .collect()
     }
 }
 

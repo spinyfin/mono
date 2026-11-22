@@ -397,6 +397,11 @@ impl PassTrace {
         work.deferred += deferred;
     }
 
+    /// What [`Self::record_probe_work`] has recorded under `kind` this pass.
+    pub(crate) fn probe_work(&self, kind: &str) -> ProbeWork {
+        self.state().probe_work.get(kind).cloned().unwrap_or_default()
+    }
+
     pub(crate) fn interrupt(&self) {
         self.state().interrupted = true;
     }

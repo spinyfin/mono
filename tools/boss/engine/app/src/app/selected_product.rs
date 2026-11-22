@@ -225,6 +225,46 @@ impl ServerState {
     }
 }
 
+/// The products the merge poller keeps fully observed: the product the
+/// app has selected, plus every product named by dispatch focus (directly, or
+/// through a focused project). It answers "where is the operator working?"
+/// from the two places the engine already records that, and singles out
+/// nothing — so the poller treats every product as active — when neither
+/// names one: no app connected, nothing selected, focus mode off.
+pub(super) struct PollerActiveProducts(pub(super) Weak<ServerState>);
+
+#[async_trait]
+impl boss_engine_merge_poller::ActiveProducts for PollerActiveProducts {
+    async fn active_product_ids(&self) -> Option<HashSet<String>> {
+        let state = self.0.upgrade()?;
+        let mut products = HashSet::new();
+        if let SelectedProductState::Selected { product_id, .. } = state.selected_product_state().await {
+            products.insert(product_id);
+        }
+        match state.work_db.load_dispatch_focus() {
+            Ok(focus) => {
+                products.extend(focus.product_ids);
+                for project_id in &focus.project_ids {
+                    match state.work_db.get_project(project_id) {
+                        Ok(project) => {
+                            products.insert(project.product_id);
+                        }
+                        Err(err) => tracing::warn!(
+                            ?err,
+                            project_id = %project_id,
+                            "merge poller: focused project not found; its product is not treated as active",
+                        ),
+                    }
+                }
+            }
+            // An unreadable focus set singles nothing out; the selection, if
+            // any, still counts.
+            Err(err) => tracing::warn!(?err, "merge poller: could not read dispatch focus for active products"),
+        }
+        (!products.is_empty()).then_some(products)
+    }
+}
+
 pub(super) async fn handle_get_selected_product(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

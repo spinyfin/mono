@@ -571,6 +571,31 @@ impl WorkDb {
         query_active(&conn, work_item_id, pr_url)
     }
 
+    /// Work items with a merge attempt in flight: an active merge request,
+    /// an active GitHub-native auto-merge request or an active Trunk queue
+    /// episode. The merge poller probes these PRs in full on every pass,
+    /// whatever else it knows about them, because their next transition is
+    /// the merge itself.
+    ///
+    /// Each arm filters on `status = 'active'`, the predicate of the partial
+    /// unique index on that table, so the cost follows the number of merges
+    /// in flight, not the history of merges.
+    pub fn list_work_item_ids_with_pending_merge(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT work_item_id FROM merge_intents
+              WHERE status = '{MERGE_INTENT_ACTIVE}'
+             UNION
+             SELECT work_item_id FROM github_merge_intents
+              WHERE status = 'active'
+             UNION
+             SELECT work_item_id FROM trunk_merge_intents
+              WHERE status = 'active'"
+        ))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(collect_rows(rows)?.into_iter().collect())
+    }
+
     /// End one intent, if it still stands. Addressed by id so a decision
     /// made about one request can never end the request that replaced it.
     pub fn end_merge_intent(&self, intent_id: &str, end: &MergeIntentEnd) -> Result<bool> {

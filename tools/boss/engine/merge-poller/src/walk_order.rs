@@ -94,6 +94,9 @@ pub struct PassState {
     pub(crate) probe_order: Arc<Mutex<crate::probe_budget::ProbeOrder>>,
     rotations: Mutex<PassRotations>,
     turns: PhaseTurns,
+    /// What the probe tiers remember between passes: when each tracked PR was
+    /// last observed, and which products are active. See [`crate::probe_tier`].
+    tiering: Mutex<crate::probe_tier::TierState>,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +119,20 @@ impl PassState {
     /// Phase timing of the pass in flight, or of the pass that just ended.
     pub fn trace(&self) -> &PassTrace {
         &self.trace
+    }
+
+    /// Name the products whose `in_review` PRs the next passes probe in full
+    /// every pass; the PRs of every other product are probed in full only when
+    /// something else calls for it (see [`crate::probe_tier`]) and are
+    /// otherwise watched for merge or close on a slower cadence. `None`, or an
+    /// empty set, singles out no product: every product is active.
+    pub fn set_active_products(&self, products: Option<HashSet<String>>) {
+        self.tiering().active_products = products.filter(|products| !products.is_empty());
+    }
+
+    /// The probe-tier memory. Never held across an await.
+    pub(crate) fn tiering(&self) -> MutexGuard<'_, crate::probe_tier::TierState> {
+        self.tiering.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The rotation memory. Never held across an await.

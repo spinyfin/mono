@@ -659,9 +659,13 @@ mod poll_stability_tests;
 #[cfg(test)]
 mod post_merge_review_trigger_tests;
 #[cfg(test)]
+mod probe_chunk_tests;
+#[cfg(test)]
 mod probe_snapshot_tests;
 #[cfg(test)]
 mod probe_tests;
+#[cfg(test)]
+mod probe_tier_tests;
 #[cfg(test)]
 mod schedule_tests;
 #[cfg(test)]

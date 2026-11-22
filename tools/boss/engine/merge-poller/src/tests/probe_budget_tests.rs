@@ -210,6 +210,11 @@ async fn bisect_rate_limit_rejection_stops_all_remaining_halves() {
         })
     }));
     let results = probe.probe_batch(&urls()).await;
+    // A rejection records an empty quota in a process-wide gauge that stretches
+    // every poll interval. Put it back, or a test sharing the process that
+    // reads the interval (`pr_poll_schedule_observe_drain_and_reschedule`)
+    // fails depending on which tests the shard happens to hold.
+    crate::record_rate_limit_remaining(i64::MAX, "test_reset");
     assert_eq!(results.len(), 4);
     assert!(results.values().all(|r| r.as_ref().unwrap_err().contains("rate limit")));
     let calls = calls.lock().unwrap();

@@ -595,10 +595,11 @@ pub async fn run_one_pass_tracked(
         "merge poller: sweep started",
     );
     let mut outcome = SweepOutcome::default();
-    // Batch every PR this pass will probe into one round trip
-    // (`MergeProbe::probe_batch`) instead of one `gh pr view` per PR —
-    // covers both the `sweep_one` candidates below and `stranded_blocked`,
-    // since both loops probe the same way.
+    // Every PR this pass tracks, probed by tier (see `probe_tier`): rows the
+    // poller acts on in full, in bounded chunks, first; everything else only
+    // for merge or close, and only when due. Covers both the `sweep_one`
+    // candidates below and `stranded_blocked`, since both loops probe the
+    // same way.
     let mut probe_url_seen = std::collections::HashSet::new();
     let probe_urls: Vec<String> = in_review
         .iter()
@@ -609,21 +610,63 @@ pub async fn run_one_pass_tracked(
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
-    // One batched GitHub request, so the phase is one item: entering with
-    // `probe_urls.len()` and never finishing those items would report every
-    // probed URL as unfinished even on a healthy pass.
     state.probe_order.lock().unwrap().retain(&probe_urls);
+    // The `Probe` phase is two batched steps, one per tier, reported as one item:
+    // entering with `probe_urls.len()` and never finishing those items would
+    // report every probed URL as unfinished even on a healthy pass.
     trace.enter(PassPhase::Probe, 1);
-    let source_observation_sequences = allocate_source_observation_sequences(work_db, completion_handler, &probe_urls);
-    let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
+    let in_review_parked = parked_ids_for_pass(work_db, in_review.iter());
+    let merge_in_flight = match work_db.list_work_item_ids_with_pending_merge() {
+        Ok(ids) => Some(ids),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: could not read merges in flight; probing every unparked in-review PR in full",
+            );
+            None
+        }
+    };
+    let active_products = state.tiering().active_products.clone();
+    let always_full: Vec<&str> = blocked_conflict
+        .iter()
+        .chain(blocked_ci.iter())
+        .chain(blocked_other.iter())
+        .chain(stranded_blocked.iter())
+        .map(|candidate| candidate.pr_url.as_str())
+        .collect();
+    let crate::probe_tier::TieredProbe {
+        results,
+        unwalked,
+        sequences: source_observation_sequences,
+    } = crate::probe_tier::probe_by_tier(
+        probe,
+        crate::probe_tier::TierRequest {
+            work_db,
+            completion_handler,
+            state,
+            inputs: crate::probe_tier::TierInputs {
+                always_full,
+                in_review: &in_review,
+                parked: &in_review_parked,
+                merge_in_flight: merge_in_flight.as_ref(),
+                active_products: active_products.as_ref(),
+            },
+            all_urls: &probe_urls,
+        },
+    )
+    .await;
+    let mut snapshot = ProbeSnapshot::new(results);
     trace.finish_item();
 
     // The pass's candidate walk, materialised so a mid-pass re-probe can be
     // scoped to the part of it that has not happened yet — see
     // [`ProbeSnapshot::ensure_fresh`]. Terminal facts first, then open-PR
     // upkeep; each half least recently attended first.
+    // A PR watched only for merge or close has nothing to walk unless that
+    // probe found it merged or closed.
     let (terminal, open): (Vec<&PendingMergeCheck>, Vec<&PendingMergeCheck>) = candidates
         .into_iter()
+        .filter(|candidate| !unwalked.contains(&candidate.pr_url))
         .partition(|candidate| probed_terminal(&snapshot.results, &candidate.pr_url));
     let terminal_walk: Vec<&PendingMergeCheck> = {
         let rotations = state.rotations();
@@ -862,10 +905,18 @@ pub async fn run_one_pass_tracked(
                             trace.enter(PassPhase::QueueRebounce, 0);
                             if !clock.should_yield(false) {
                                 parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
+                                // Rebounce acts on queued PRs, which are all in the full
+                                // tier; a PR watched only for merge or close has no
+                                // queue entry this poller is responsible for.
+                                let rebounce_in_review: Vec<PendingMergeCheck> = in_review
+                                    .iter()
+                                    .filter(|candidate| !unwalked.contains(&candidate.pr_url))
+                                    .cloned()
+                                    .collect();
                                 run_merge_queue_rebounce_pass(
                                     work_db,
                                     publisher,
-                                    &in_review,
+                                    &rebounce_in_review,
                                     &blocked_ci,
                                     Some(&parked_ids),
                                     &mut outcome,

@@ -128,6 +128,8 @@ impl Drop for FallbackReport {
     }
 }
 
+/// The allowance for one chunk of a probe, taken when the chunk starts: at
+/// most 30 s, and at most a quarter of what is left of the pass.
 pub(crate) fn deadline() -> Instant {
     let now = Instant::now();
     let allowance = CONTEXT
@@ -152,12 +154,22 @@ impl MergeProbe for PassProbe<'_> {
         self.inner.probe(url).await
     }
     async fn probe_batch(&self, urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
-        let context = ProbeContext {
+        CONTEXT.scope(self.context(), self.inner.probe_batch(urls)).await
+    }
+    async fn probe_shallow_batch(&self, urls: &[String]) -> HashMap<String, std::result::Result<ShallowProbe, String>> {
+        CONTEXT
+            .scope(self.context(), self.inner.probe_shallow_batch(urls))
+            .await
+    }
+}
+
+impl PassProbe<'_> {
+    fn context(&self) -> ProbeContext {
+        ProbeContext {
             pass_end: self.pass_end,
             trace: self.state.trace.clone(),
             order: self.state.probe_order.clone(),
-        };
-        CONTEXT.scope(context, self.inner.probe_batch(urls)).await
+        }
     }
 }
 

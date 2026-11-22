@@ -676,6 +676,10 @@ const NOT_UPKEEP: &[(&str, &str)] = &[
         "list_unranked_pending_executions",
         "a read-only board display listing; it mints nothing",
     ),
+    (
+        "list_work_item_ids_with_pending_merge",
+        "a set of ids the merge poller reads to choose how deeply to probe a PR; it nominates and mints nothing",
+    ),
 ];
 
 const LISTING_KEYWORDS: &[&str] = &[
