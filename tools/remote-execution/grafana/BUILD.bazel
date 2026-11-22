@@ -1,0 +1,17 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "grafana_test",
+    size = "small",
+    srcs = ["test.sh"],
+    data = [
+        "install.py",
+        "nativelink.yaml",
+        "nativelink-overview.json",
+        "nativelink-workers.json",
+        "pipeline.yml",
+        "publish.sh",
+        "test_grafana.py",
+        "validate.py",
+    ],
+)

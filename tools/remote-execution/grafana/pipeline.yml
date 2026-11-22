@@ -1,0 +1,12 @@
+steps:
+  - label: ":grafana: publish NativeLink dashboards"
+    key: "publish-nativelink-grafana"
+    if: build.branch == "main" && build.pull_request.id == null
+    if_changed: "tools/remote-execution/grafana/**"
+    command: "bash tools/remote-execution/grafana/publish.sh"
+    agents:
+      queue: "nativelink-grafana"
+    concurrency: 1
+    concurrency_group: "mono-nativelink-grafana"
+    retry:
+      automatic: false
