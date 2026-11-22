@@ -106,8 +106,25 @@ impl Drop for FrozenClock {
     }
 }
 
+/// Park on wall time so gRPC can run while tokio's clock is paused.
+/// `tokio::time::sleep` would freeze; a yield-only loop lets virtual time
+/// (or a tight spin) outrun persist on a loaded remote executor.
+async fn wall_park(dur: Duration) {
+    tokio::task::spawn_blocking(move || std::thread::sleep(dur))
+        .await
+        .expect("wall-clock park");
+}
+
+/// Yield and park one wall-clock tick. Use in freeze-and-step loops so
+/// persist can finish before the next virtual deadline.
+pub(crate) async fn pace_io() {
+    tokio::task::yield_now().await;
+    wall_park(TICK).await;
+}
+
 /// Wait until `ready`. Works while tokio's clock is paused: gRPC I/O still
-/// progresses, and the loop yields instead of sleeping on a frozen timer.
+/// progresses, and the loop parks on wall time instead of sleeping on a
+/// frozen timer.
 pub(crate) async fn until(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + WAIT;
     loop {
@@ -116,7 +133,9 @@ pub(crate) async fn until(what: &str, mut ready: impl FnMut() -> bool) {
         }
         assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
         tokio::task::yield_now().await;
-        if !clock_frozen() {
+        if clock_frozen() {
+            wall_park(TICK).await;
+        } else {
             tokio::time::sleep(TICK).await;
         }
     }
@@ -135,7 +154,9 @@ where
         }
         assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
         tokio::task::yield_now().await;
-        if !clock_frozen() {
+        if clock_frozen() {
+            wall_park(TICK).await;
+        } else {
             tokio::time::sleep(TICK).await;
         }
     }
@@ -172,6 +193,12 @@ pub(crate) async fn until_elapsed(what: &str, mut ready: impl FnMut() -> bool) {
     while !ready() {
         assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
         tokio::task::yield_now().await;
+        if ready() {
+            return;
+        }
+        // Pace virtual ticks on wall time so a command deadline cannot
+        // expire before the in-flight persist or Adopt round-trip.
+        wall_park(TICK).await;
         if ready() {
             return;
         }
@@ -256,6 +283,7 @@ pub(crate) async fn fire_unconfirmed_stop_after_answered_spawn(
             watchdog.elapsed() < WAIT,
             "timed out waiting for stop send entered with its timer armed"
         );
+        pace_io().await;
         elapse(TICK).await;
     }
     until("unconfirmed stop stored", &mut stop_stored).await;
@@ -389,6 +417,7 @@ pub(crate) async fn drive_resumed_deadline_pass(
         if waiting() {
             elapse(deadline + TICK).await;
         } else {
+            pace_io().await;
             elapse(TICK).await;
         }
     }

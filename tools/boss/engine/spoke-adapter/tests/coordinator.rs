@@ -3,8 +3,8 @@ use super::{short, support::*, timing, workspace_slack};
 
 pub(crate) use super::support::{
     FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, drive_resumed_deadline_pass, elapse,
-    fire_after_all_stored, fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_elapsed,
-    until_ready_after_stored,
+    fire_after_all_stored, fire_unconfirmed_stop_after_answered_spawn, freeze_clock, pace_io, thaw_clock, until,
+    until_async, until_elapsed, until_ready_after_stored,
 };
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
@@ -376,9 +376,9 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
             armed.elapsed() < Duration::from_secs(20),
             "timed out waiting for a post-alive Adopt send"
         );
+        pace_io().await;
         elapse(TICK).await;
         env.coordinator.kick();
-        tokio::task::yield_now().await;
     }
     until("the adopt to find the worker", pane_recorded).await;
     until("the in-doubt attention to resolve", || {
@@ -501,8 +501,11 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
     );
 
     alive.store(true, Ordering::SeqCst);
-    env.coordinator.reconcile_ended_in_doubt_spokes().await;
-    until("an unconfirmed stop to be sent", || stopped(&peer.commands())).await;
+    until_async("an unconfirmed stop to be sent", || async {
+        env.coordinator.reconcile_ended_in_doubt_spokes().await;
+        stopped(&peer.commands())
+    })
+    .await;
     assert!(
         persona_held(&fx, &execution.id),
         "persona stays leased while stop is unconfirmed"
@@ -1395,24 +1398,12 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     let adopt_sends_before = fx.provider.command_sends_for("adopt");
     let heartbeat_adopt_wait =
         || fx.provider.command_waits_for("adopt") >= 1 && fx.provider.command_sends_for("adopt") > adopt_sends_before;
-    let beats_before = env.coordinator.heartbeat_beats();
     let _handle = env.coordinator.spawn_scheduler_heartbeat(Duration::from_millis(80));
     let beat = Duration::from_millis(80);
-    // Virtual-time advances that happen before the heartbeat task has
-    // registered its opening sleep are lost. Step TICK until that first
-    // beat is observed, then wait on I/O for its Adopt send_command —
-    // do not keep burning virtual time or the 5s sweep timeout cancels
-    // the reconcile before waits_for("adopt") is visible.
-    let armed = std::time::Instant::now();
-    while env.coordinator.heartbeat_beats() == beats_before && !heartbeat_adopt_wait() {
-        assert!(
-            armed.elapsed() < Duration::from_secs(20),
-            "timed out waiting for the heartbeat's first beat"
-        );
-        elapse(TICK).await;
-        tokio::task::yield_now().await;
-    }
-    until("heartbeat Adopt wait to be armed", heartbeat_adopt_wait).await;
+    // Pace each virtual tick on wall time so the heartbeat task can
+    // register its opening sleep, and so the 5s sweep timeout cannot
+    // cancel the reconcile before waits_for("adopt") is visible.
+    until_elapsed("heartbeat Adopt wait to be armed", heartbeat_adopt_wait).await;
     // Adopt is in flight on the original host. Take that host out of
     // placement so the stranded row must go to `other`, without tearing
     // down the stream the hung Adopt still uses.
