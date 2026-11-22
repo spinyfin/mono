@@ -40,6 +40,8 @@ pub fn observe(cpu_count: u64, memory_bytes: u64, disk_bytes: u64, active: u64) 
 }
 
 /// Reclaimable memory the host can still promise a new worker.
+///
+/// Reads `/proc/meminfo` on Linux and `vm.page_*` sysctl counters on macOS.
 pub fn available_memory() -> Result<u64> {
     memory()
 }
