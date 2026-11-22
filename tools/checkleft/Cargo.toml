@@ -52,6 +52,7 @@ jaq-interpret = { workspace = true }
 jaq-parse = { workspace = true }
 hashbrown = { workspace = true }
 flate2 = { workspace = true }
+httpdate = "1.0.3"
 jsonwebtoken = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }

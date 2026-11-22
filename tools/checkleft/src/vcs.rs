@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::github_http::{GithubOutcome, github_get};
+use crate::github_http::{GITHUB_API_TIMEOUT, GithubOutcome, github_get};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use tracing::{info, warn};
 
@@ -16,10 +16,6 @@ pub use crate::github_http::GithubRetryPolicy;
 mod patch_line_deltas;
 
 use patch_line_deltas::parse_file_diffs_from_git_patch;
-
-/// Thirty seconds accommodates a slow TLS handshake and GitHub response while
-/// still failing promptly when a blackholed connection would block checkleft.
-const GITHUB_API_TIMEOUT_SECS: u64 = 30;
 
 /// Settings for best-effort GitHub API lookups.
 ///
@@ -45,7 +41,7 @@ impl<'a> GithubApiContext<'a> {
     }
 
     pub fn production(base_url: &'a str) -> Self {
-        Self::new(base_url, Duration::from_secs(GITHUB_API_TIMEOUT_SECS))
+        Self::new(base_url, GITHUB_API_TIMEOUT)
     }
 
     pub fn with_retry(mut self, retry: GithubRetryPolicy) -> Self {
@@ -87,7 +83,8 @@ impl std::fmt::Display for GithubApiTimeout {
         let attempt_word = if attempts == 1 { "attempt" } else { "attempts" };
         write!(
             f,
-            "GitHub API call timed out after {GITHUB_API_TIMEOUT_SECS} seconds while {} (after {attempts} {attempt_word})",
+            "GitHub API call timed out after {} seconds while {} (after {attempts} {attempt_word})",
+            GITHUB_API_TIMEOUT.as_secs(),
             self.operation
         )
     }
