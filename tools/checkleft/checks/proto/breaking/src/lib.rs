@@ -78,7 +78,8 @@ pub use schema::{ParseFailure, Schema, parse};
 #[check(
     name = "proto/breaking",
     description = "fails a change whose .proto files are not backward compatible with the same files at the change's base revision",
-    severity = error
+    severity = error,
+    needs_base_files = true
 )]
 pub fn proto_breaking_check(input: CheckInput) -> Vec<Finding> {
     // `--all` lists every tracked file as modified with no base revision; there

@@ -85,6 +85,12 @@ Required common fields:
 1. `artifact_path` (safe relative path to the `.wasm` artifact)
 2. `artifact_sha256` (64-character lowercase hex SHA-256 digest)
 
+> **WIT / SDK compatibility.** The `checkleft:check@0.1.0` WIT contract
+> includes `needs-base-files: bool` on `check-descriptor`. Out-of-tree
+> component `.wasm` checks built against an older SDK must be rebuilt against
+> the current `checkleft-check-sdk`; any component that reads base-revision
+> file contents must also set `needs_base_files = true` in `#[check(...)]`.
+
 Optional:
 
 1. `[limits]`

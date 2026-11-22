@@ -76,7 +76,8 @@ use serde::Deserialize;
     description = "requires a companion change (marked region/file or glob-matched surface) to change together",
     severity = error,
     access_scope = declared_files,
-    required_files = file_ifchange_declare_required_files
+    required_files = file_ifchange_declare_required_files,
+    needs_base_files = true
 )]
 pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
     run(&input)

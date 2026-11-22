@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +13,21 @@ use crate::input::{SourceTree, TreeVersion};
 use crate::path::validate_relative_path;
 use crate::vcs::BaseRevision;
 
+/// Runs VCS commands to read base-revision file contents.
+pub(crate) trait BaseCommandRunner: Send + Sync {
+    fn run(&self, root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>>;
+}
+
+struct ProcessBaseCommandRunner;
+
+impl BaseCommandRunner for ProcessBaseCommandRunner {
+    fn run(&self, root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>> {
+        run_bytes_command(root, binary, args)
+    }
+}
+
+type BaseFileCacheEntry = Arc<OnceLock<std::result::Result<Vec<u8>, String>>>;
+
 pub struct LocalSourceTree {
     root: PathBuf,
     base_revision: Option<BaseRevision>,
@@ -19,6 +35,10 @@ pub struct LocalSourceTree {
     /// these on top of the ignore-respecting walk so that files committed
     /// before a matching .gitignore rule was added are still returned.
     tracked_paths: Option<HashSet<PathBuf>>,
+    command_runner: Arc<dyn BaseCommandRunner>,
+    /// Memoized base-revision file reads, keyed by repo-relative path so
+    /// parallel checks share one VCS read per path for the life of this tree.
+    base_file_cache: Mutex<HashMap<PathBuf, BaseFileCacheEntry>>,
 }
 
 impl LocalSourceTree {
@@ -29,6 +49,16 @@ impl LocalSourceTree {
     pub fn with_base_revision(
         root: impl Into<PathBuf>,
         base_revision: impl Into<Option<BaseRevision>>,
+    ) -> Result<Self> {
+        Self::with_base_command_runner(root, base_revision, Arc::new(ProcessBaseCommandRunner))
+    }
+
+    /// Like [`with_base_revision`] but injects the VCS command runner used for
+    /// base-revision file reads.
+    pub(crate) fn with_base_command_runner(
+        root: impl Into<PathBuf>,
+        base_revision: impl Into<Option<BaseRevision>>,
+        command_runner: Arc<dyn BaseCommandRunner>,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
@@ -41,6 +71,8 @@ impl LocalSourceTree {
             root,
             base_revision: base_revision.into(),
             tracked_paths: None,
+            command_runner,
+            base_file_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -111,16 +143,49 @@ impl LocalSourceTree {
             bail!("base revision reads are not configured for this source tree");
         };
 
+        let cell = {
+            let mut cache = self
+                .base_file_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                cache
+                    .entry(path.to_path_buf())
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+
+        let cached = cell.get_or_init(|| {
+            self.fetch_base_file(base_revision, path)
+                .map_err(|err| format!("{err:#}"))
+        });
+
+        match cached {
+            Ok(bytes) => Ok(bytes.clone()),
+            Err(message) => bail!("{message}"),
+        }
+    }
+
+    fn fetch_base_file(&self, base_revision: &BaseRevision, path: &Path) -> Result<Vec<u8>> {
         match base_revision {
             BaseRevision::Git(revision) => {
                 let path = path.to_string_lossy();
                 let revision_arg = format!("{revision}:{path}");
-                run_bytes_command(&self.root, "git", &["show", &revision_arg])
+                self.command_runner
+                    .run(&self.root, "git", &["show", &revision_arg])
                     .with_context(|| format!("failed to read base file `{}` from git", path))
             }
             BaseRevision::Jujutsu(revision) => {
-                let path = path.to_string_lossy().to_string();
-                run_bytes_command(&self.root, "jj", &["file", "show", "-r", revision, &path])
+                let path = path.to_string_lossy();
+                // Checkleft has already snapshotted the working copy while resolving the
+                // changeset; reading the immutable base revision must not re-walk the
+                // tree or contend on working_copy.lock.
+                self.command_runner
+                    .run(
+                        &self.root,
+                        "jj",
+                        &["file", "show", "--ignore-working-copy", "-r", revision, &path],
+                    )
                     .with_context(|| format!("failed to read base file `{}` from jj", path))
             }
         }
@@ -283,12 +348,58 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::Arc;
 
     use tempfile::tempdir;
 
-    use super::LocalSourceTree;
+    use super::{BaseCommandRunner, LocalSourceTree};
+    use crate::external::test_support::RecordingBaseCommandRunner;
     use crate::input::{SourceTree, TreeVersion};
     use crate::vcs::BaseRevision;
+
+    #[test]
+    fn jj_base_reads_pass_ignore_working_copy_and_memoize_per_path() {
+        let temp = tempdir().expect("create temp dir");
+        let runner = Arc::new(RecordingBaseCommandRunner::new(vec![
+            ("a.rs", b"base a"),
+            ("b.rs", b"base b"),
+            ("old/c.rs", b"base c"),
+        ]));
+        let tree = LocalSourceTree::with_base_command_runner(
+            temp.path(),
+            Some(BaseRevision::Jujutsu("@-".to_owned())),
+            Arc::clone(&runner) as Arc<dyn BaseCommandRunner>,
+        )
+        .expect("create tree");
+
+        // Concurrent reads for the same set of paths (plus a missing path) must
+        // invoke jj at most once per unique path.
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    assert_eq!(
+                        tree.read_file_versioned(Path::new("a.rs"), TreeVersion::Base).unwrap(),
+                        b"base a"
+                    );
+                    assert_eq!(
+                        tree.read_file_versioned(Path::new("b.rs"), TreeVersion::Base).unwrap(),
+                        b"base b"
+                    );
+                    assert_eq!(
+                        tree.read_file_versioned(Path::new("old/c.rs"), TreeVersion::Base)
+                            .unwrap(),
+                        b"base c"
+                    );
+                    assert!(
+                        tree.read_file_versioned(Path::new("missing.rs"), TreeVersion::Base)
+                            .is_err()
+                    );
+                });
+            }
+        });
+
+        runner.assert_jj_base_reads("@-", &["a.rs", "b.rs", "old/c.rs", "missing.rs"]);
+    }
 
     #[test]
     fn read_file_within_root_succeeds() {

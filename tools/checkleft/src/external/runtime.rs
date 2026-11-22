@@ -829,7 +829,8 @@ fn lift_access_scope(scope: Option<&wit_types::AccessScope>) -> Option<AccessSco
 
 /// Resolve the access scope from the check descriptor and, if the check declares
 /// `declared-files` scope, call `declare-required-files` to get the concrete file
-/// list and return `AccessScope::ExplicitFiles`.
+/// list and return `AccessScope::ExplicitFiles` along with the lowered changeset
+/// so Phase 2 can reuse it without lowering base files a second time.
 ///
 /// For all static scopes (`modified-only`, `whole-repo`, `globs`) this is
 /// essentially free — it just maps the WIT variant. For `declared-files`, it
@@ -840,13 +841,13 @@ fn resolve_access_scope(
     linker: &Linker<HostState>,
     ceiling: &HostCeiling,
     run: &ComponentRun<'_>,
-    wit_scope: Option<&wit_types::AccessScope>,
+    descriptor: &wit_types::CheckDescriptor,
     max_memory_bytes: usize,
     timeout_ticks: u64,
-) -> Result<AccessScope> {
+) -> Result<(AccessScope, Option<wit_types::ChangeSet>)> {
     // Handle the static scopes first — no component call needed.
-    if let Some(static_scope) = lift_access_scope(wit_scope) {
-        return Ok(static_scope);
+    if let Some(static_scope) = lift_access_scope(descriptor.access_scope.as_ref()) {
+        return Ok((static_scope, None));
     }
 
     // Only `declared-files` reaches here. Build a temporary sandbox containing
@@ -865,7 +866,7 @@ fn resolve_access_scope(
     // starting the guest deadline, including for declared-files discovery.
     let config_json =
         serde_json::to_string(run.config).context("failed to serialize config for declare-required-files")?;
-    let wit_changeset = lower_changeset(run.changeset, run.source_tree);
+    let wit_changeset = lower_changeset(run.changeset, run.source_tree, descriptor.needs_base_files);
     let host_state = HostState::with_sandbox_root(temp_sandbox.root.path(), max_memory_bytes).with_context(|| {
         format!(
             "failed to configure WASI context for declare-required-files in check `{}`",
@@ -916,7 +917,37 @@ fn resolve_access_scope(
     drop(temp_sandbox);
 
     let explicit_paths: Vec<PathBuf> = declared.into_iter().map(PathBuf::from).collect();
-    Ok(AccessScope::ExplicitFiles(explicit_paths))
+    Ok((AccessScope::ExplicitFiles(explicit_paths), Some(wit_changeset)))
+}
+
+fn list_check_descriptor(
+    engine: &Engine,
+    linker: &Linker<HostState>,
+    package: &ExternalCheckPackage,
+    component: &Component,
+    check_name: &str,
+) -> Result<wit_types::CheckDescriptor> {
+    let mut store = Store::new(engine, HostState::with_empty_wasi());
+    // list-checks must never be interrupted by epoch; it returns static
+    // metadata so there is no meaningful wall-clock bound to enforce here.
+    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+    let instance = wasmtime(linker.instantiate(&mut store, component))
+        .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
+    let bindings = wasmtime(WitCheck::new(&mut store, &instance))
+        .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
+    let descriptors = wasmtime(bindings.call_list_checks(&mut store))
+        .with_context(|| format!("`list-checks` failed for component `{}`", package.id))?;
+
+    if let Some(descriptor) = descriptors.iter().find(|d| d.name == check_name) {
+        return Ok(descriptor.clone());
+    }
+    let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+    bail!(
+        "component `{}` does not export a check named `{}`; available: [{}]",
+        package.id,
+        check_name,
+        exported.join(", ")
+    )
 }
 
 fn compile_component(engine: &Engine, package_id: &str, component_bytes: &[u8]) -> Result<Component> {
@@ -944,40 +975,20 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let linker = build_component_v1_linker(engine)?;
 
     // Phase 1: instantiate with an empty WASI context (no preopens) to call
-    // list-checks() and discover the check's declared access-scope. The
-    // descriptor is purely static metadata; no filesystem access is needed.
-    let descriptors = {
-        let mut store = Store::new(engine, HostState::with_empty_wasi());
-        // list-checks must never be interrupted by epoch; it returns static
-        // metadata so there is no meaningful wall-clock bound to enforce here.
-        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
-        let instance = wasmtime(linker.instantiate(&mut store, run.component))
-            .with_context(|| format!("failed to instantiate component for `{}`", run.package.id))?;
-        let bindings = wasmtime(WitCheck::new(&mut store, &instance))
-            .with_context(|| format!("failed to bind component exports for `{}`", run.package.id))?;
-        wasmtime(bindings.call_list_checks(&mut store))
-            .with_context(|| format!("`list-checks` failed for component `{}`", run.package.id))?
-    };
-
-    let descriptor = descriptors.iter().find(|d| d.name == run.check_name).ok_or_else(|| {
-        let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
-        anyhow::anyhow!(
-            "component `{}` does not export a check named `{}`; available: [{}]",
-            run.package.id,
-            run.check_name,
-            exported.join(", ")
-        )
-    })?;
+    // list-checks() and discover the check's declared access-scope and whether
+    // it consumes base-revision file contents.
+    let descriptor = list_check_descriptor(engine, &linker, run.package, run.component, run.check_name)?;
+    let needs_base_files = descriptor.needs_base_files;
 
     // Build the capability sandbox from the declared scope. Files outside
     // the scope are not materialized; the guest cannot name them.
     let ceiling = HostCeiling::new(root);
-    let access_scope = resolve_access_scope(
+    let (access_scope, lowered_changeset) = resolve_access_scope(
         engine,
         &linker,
         &ceiling,
         &run,
-        descriptor.access_scope.as_ref(),
+        &descriptor,
         max_memory_bytes,
         timeout_ticks,
     )
@@ -1003,7 +1014,13 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     // Loading base versions may wait on VCS subprocesses under contention.
     // Charge only instantiation and execution to the guest's wall-clock budget.
     let input_start = Instant::now();
-    let input = lower_check_input(changeset, source_tree, config)?;
+    let input = match lowered_changeset {
+        Some(wit_changeset) => wit_types::CheckInput {
+            changeset: wit_changeset,
+            config_json: serialize_check_config(config)?,
+        },
+        None => lower_check_input(changeset, source_tree, config, needs_base_files)?,
+    };
     let input_ms = input_start.elapsed().as_millis();
     let file_list = format_file_list(changeset);
     let instantiate_start = Instant::now();
@@ -1113,9 +1130,10 @@ fn run_component_fix(engine: &Engine, root: &Path, run: FixRun) -> Result<Compon
         return Ok(ComponentFixOutcome::Applied(CopyBackReport::default()));
     }
 
-    let input = lower_check_input(run.changeset, run.source_tree, run.config)?;
-    let file_list = format_file_list(run.changeset);
     let linker = build_component_v1_linker(engine)?;
+    let descriptor = list_check_descriptor(engine, &linker, run.package, run.component, run.check_name)?;
+    let input = lower_check_input(run.changeset, run.source_tree, run.config, descriptor.needs_base_files)?;
+    let file_list = format_file_list(run.changeset);
     let host_state = HostState::with_sandbox_root(sandbox.root_path(), max_memory_bytes)
         .with_context(|| format!("failed to configure WASI context for fix of check `{}`", run.package.id))?;
     let mut store = Store::new(engine, host_state);
@@ -1407,29 +1425,38 @@ fn lower_file_diff(path: &Path, diff: &FileDiff) -> wit_types::FileDiff {
     }
 }
 
-fn lower_changeset(changeset: &ChangeSet, source_tree: &dyn SourceTree) -> wit_types::ChangeSet {
+fn lower_changeset(
+    changeset: &ChangeSet,
+    source_tree: &dyn SourceTree,
+    needs_base_files: bool,
+) -> wit_types::ChangeSet {
     // Base content is read at the path that existed at the base revision: the
     // file's own path, or its old path for a rename. The entry is keyed by
-    // that same path (see `base-file.path` in check.wit).
-    let base_files: Vec<wit_types::BaseFile> = changeset
-        .changed_files
-        .iter()
-        .filter_map(|f| match f.kind {
-            ChangeKind::Deleted | ChangeKind::Modified => Some(f.path.as_path()),
-            ChangeKind::Renamed => f.old_path.as_deref(),
-            ChangeKind::Added => None,
-        })
-        .filter_map(|base_path| {
-            source_tree
-                .read_file_versioned(base_path, crate::input::TreeVersion::Base)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .map(|content| wit_types::BaseFile {
-                    path: base_path.to_string_lossy().into_owned(),
-                    content,
-                })
-        })
-        .collect();
+    // that same path (see `base-file.path` in check.wit). Only checks that
+    // opt in via `needs_base_files` pay for base-revision reads.
+    let base_files: Vec<wit_types::BaseFile> = if needs_base_files {
+        changeset
+            .changed_files
+            .iter()
+            .filter_map(|f| match f.kind {
+                ChangeKind::Deleted | ChangeKind::Modified => Some(f.path.as_path()),
+                ChangeKind::Renamed => f.old_path.as_deref(),
+                ChangeKind::Added => None,
+            })
+            .filter_map(|base_path| {
+                source_tree
+                    .read_file_versioned(base_path, crate::input::TreeVersion::Base)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .map(|content| wit_types::BaseFile {
+                        path: base_path.to_string_lossy().into_owned(),
+                        content,
+                    })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     wit_types::ChangeSet {
         changed_files: changeset.changed_files.iter().map(lower_changed_file).collect(),
@@ -1448,19 +1475,23 @@ fn lower_changeset(changeset: &ChangeSet, source_tree: &dyn SourceTree) -> wit_t
     }
 }
 
+fn serialize_check_config(config: &toml::Value) -> Result<String> {
+    serde_json::to_string(config).context("failed to serialize config to JSON for component input")
+}
+
 fn lower_check_input(
     changeset: &ChangeSet,
     source_tree: &dyn SourceTree,
     config: &toml::Value,
+    needs_base_files: bool,
 ) -> Result<wit_types::CheckInput> {
     // Framework exclusion is now host-authoritative: the host filters the changeset
     // before lowering it (see `PathScope::filter_changeset`), so the guest
     // never sees an excluded path and no longer reads `exclude_files`/`exclude_globs`
     // from its config. The config is passed through verbatim.
-    let config_json =
-        serde_json::to_string(config).context("failed to serialize config to JSON for component input")?;
+    let config_json = serialize_check_config(config)?;
     Ok(wit_types::CheckInput {
-        changeset: lower_changeset(changeset, source_tree),
+        changeset: lower_changeset(changeset, source_tree, needs_base_files),
         config_json,
     })
 }

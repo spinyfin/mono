@@ -113,9 +113,12 @@ interface types {
         /// Base-revision content for deleted, modified and renamed files (a
         /// renamed file's entry is keyed by its old path).
         ///
-        /// Empty when no base revision is available (e.g. `--all` mode, unit
-        /// tests that do not configure a VCS base). Checks that need old content
-        /// should handle the absent case gracefully.
+        /// Populated only when the check's `check-descriptor` sets
+        /// `needs-base-files: true` and a base revision is available (e.g. not
+        /// `--all` mode or unit tests that do not configure a VCS base). A
+        /// check that reads base contents must declare `needs-base-files: true`
+        /// (`needs_base_files = true` in `#[check(...)]`), and should handle
+        /// the absent case gracefully.
         base-files: list<base-file>,
         /// True when this changeset is the full tracked-tree scan produced by
         /// `checkleft run --all`. In that mode every tracked file is listed as
@@ -239,6 +242,9 @@ interface types {
         default-severity: severity,
         /// Declared file-access scope. Absent (`none`) means `modified-only`.
         access-scope: option<access-scope>,
+        /// Whether this check reads base-revision file contents (`change-set.base-files`).
+        /// When `false`, the host skips reading base revisions for this check.
+        needs-base-files: bool,
     }
 
     /// Error variants returned by `run-check`.

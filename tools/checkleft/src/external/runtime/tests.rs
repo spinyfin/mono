@@ -298,7 +298,7 @@ fn lower_changeset_maps_fields_to_wit_types() {
         },
     );
 
-    let wit_cs = lower_changeset(&changeset, &NoopSourceTree);
+    let wit_cs = lower_changeset(&changeset, &NoopSourceTree, false);
     assert_eq!(wit_cs.changed_files.len(), 2);
     assert_eq!(wit_cs.changed_files[0].path, "src/foo.rs");
     assert!(matches!(
@@ -312,6 +312,7 @@ fn lower_changeset_maps_fields_to_wit_types() {
     assert_eq!(wit_cs.file_diffs[0].hunks[0].old_start, 1_u32);
     assert_eq!(wit_cs.file_diffs[0].hunks[0].added_lines, 2_u32);
     assert_eq!(wit_cs.commit_description.as_deref(), Some("feat: add bar"));
+    assert!(wit_cs.base_files.is_empty());
 }
 
 // --- Type lifting unit tests ---
@@ -1657,4 +1658,120 @@ fn fix_apply_no_edits_is_a_no_op() {
     let report = sandbox.copy_back(&changed, dir.path());
     assert!(report.is_ok() && report.applied.is_empty());
     assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "stable");
+}
+
+#[test]
+fn component_checks_read_base_files_once_only_when_consumed_and_pass_ignore_working_copy() {
+    use std::path::Path;
+
+    use crate::external::{
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
+    };
+    use crate::source_tree::BaseCommandRunner;
+    use crate::vcs::BaseRevision;
+
+    let temp = tempdir().expect("temp dir");
+    let (runner, changeset) = crate::external::test_support::base_reads_fixture(temp.path());
+
+    let tree = LocalSourceTree::with_base_command_runner(
+        temp.path(),
+        Some(BaseRevision::Jujutsu("base-sha".to_owned())),
+        Arc::clone(&runner) as Arc<dyn BaseCommandRunner>,
+    )
+    .expect("create tree");
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let empty_config = toml::Value::Table(Default::default());
+    let scope = crate::path_scope::PathScope::default();
+
+    // Checks that do not declare `needs_base_files = true` must trigger 0 jj base reads.
+    for check_name in [
+        "file/size",
+        "change/file-count",
+        "rust/giant-structs",
+        "md/link-integrity",
+        "text/forbidden-pattern",
+    ] {
+        let package = BundledExternalCheckPackageProvider
+            .resolve(&ExternalCheckImplementationRef::Bundled(check_name.to_owned()))
+            .unwrap()
+            .unwrap();
+        executor
+            .execute(&package, &changeset, &tree, &empty_config, Path::new(""), None, &scope)
+            .unwrap_or_else(|err| panic!("{check_name} failed: {err:#}"));
+    }
+    assert!(
+        runner.calls().is_empty(),
+        "non-base checks must not invoke jj for base files; got: {:?}",
+        runner.calls()
+    );
+
+    // Checks that declare `needs_base_files = true` read each base file once across both checks,
+    // including `file/ifchange` (which also uses `declared-files`).
+    let proto_pkg = BundledExternalCheckPackageProvider
+        .resolve(&ExternalCheckImplementationRef::Bundled("proto/breaking".to_owned()))
+        .unwrap()
+        .unwrap();
+    let proto_scope = crate::path_scope::PathScope::new(&["**/*.proto".to_owned()], &[]).unwrap();
+    let proto_res = executor
+        .execute(
+            &proto_pkg,
+            &changeset,
+            &tree,
+            &empty_config,
+            Path::new(""),
+            None,
+            &proto_scope,
+        )
+        .expect("proto/breaking");
+
+    let ifchange_pkg = BundledExternalCheckPackageProvider
+        .resolve(&ExternalCheckImplementationRef::Bundled("file/ifchange".to_owned()))
+        .unwrap()
+        .unwrap();
+    let ifchange_res = executor
+        .execute(
+            &ifchange_pkg,
+            &changeset,
+            &tree,
+            &empty_config,
+            Path::new(""),
+            None,
+            &scope,
+        )
+        .expect("file/ifchange");
+
+    // 4 non-added files (`api/modified.proto`, `api/deleted.proto`, `api/old_renamed.proto`, `changed.rs`)
+    // read exactly once each across all 7 checks (not 4 * 7 = 28).
+    runner.assert_jj_base_reads(
+        "base-sha",
+        &[
+            "api/modified.proto",
+            "api/deleted.proto",
+            "api/old_renamed.proto",
+            "changed.rs",
+        ],
+    );
+
+    // Verify base contents reached proto/breaking for modified, deleted, and renamed files.
+    let proto_msgs: Vec<&str> = proto_res.findings.iter().map(|f| f.message.as_str()).collect();
+    assert!(
+        proto_msgs.iter().any(|m| m.contains("field `x` (1)")),
+        "expected modified proto finding, got: {proto_msgs:?}"
+    );
+    assert!(
+        proto_msgs.iter().any(|m| m.contains("message `Gone` was removed")),
+        "expected deleted proto finding, got: {proto_msgs:?}"
+    );
+    assert!(
+        proto_msgs.iter().any(|m| m.contains("field `old_id` (1)")),
+        "expected renamed proto finding from old_path base, got: {proto_msgs:?}"
+    );
+
+    // Verify base contents reached file/ifchange (removed LINT.IfChange block detected).
+    let ifchange_msgs: Vec<&str> = ifchange_res.findings.iter().map(|f| f.message.as_str()).collect();
+    assert!(
+        ifchange_msgs.iter().any(|m| m.contains("companion.txt")),
+        "expected file/ifchange finding from removed base marker, got: {ifchange_msgs:?}"
+    );
 }

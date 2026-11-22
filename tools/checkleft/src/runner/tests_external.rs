@@ -1466,3 +1466,141 @@ id = "repo-visibility"
         "repo-visibility must register 2 (only BUILD files in changeset), got: {reg_map:?}"
     );
 }
+
+#[tokio::test]
+async fn runner_reads_each_base_file_once_across_parallel_external_checks() {
+    use crate::source_tree::BaseCommandRunner;
+    use crate::vcs::BaseRevision;
+
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"checks:
+  - id: file/size
+  - id: rust/giant-structs
+  - id: text/forbidden-pattern
+  - id: proto/breaking
+    scope: files-including-removed
+    include: ["api/**"]
+  - id: file/ifchange
+    scope: files-including-removed
+"#,
+    )
+    .expect("write config");
+
+    let (jj_runner, changeset) = crate::external::test_support::base_reads_fixture(temp.path());
+
+    let source_tree = Arc::new(
+        LocalSourceTree::with_base_command_runner(
+            temp.path(),
+            Some(BaseRevision::Jujutsu("@-".to_owned())),
+            Arc::clone(&jj_runner) as Arc<dyn BaseCommandRunner>,
+        )
+        .expect("create tree"),
+    );
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        source_tree,
+        Arc::new(crate::external::BundledExternalCheckPackageProvider),
+        shared_builder_audit_executor(),
+    );
+
+    let results = runner.run_changeset(&changeset).await.expect("run checks");
+
+    jj_runner.assert_jj_base_reads(
+        "@-",
+        &[
+            "api/modified.proto",
+            "api/deleted.proto",
+            "api/old_renamed.proto",
+            "changed.rs",
+        ],
+    );
+
+    let proto_msgs: Vec<&str> = results
+        .iter()
+        .find(|r| r.check_id == "proto/breaking")
+        .expect("proto/breaking result")
+        .findings
+        .iter()
+        .map(|f| f.message.as_str())
+        .collect();
+    assert!(proto_msgs.iter().any(|m| m.contains("field `x` (1)")), "{proto_msgs:?}");
+    assert!(
+        proto_msgs.iter().any(|m| m.contains("message `Gone` was removed")),
+        "{proto_msgs:?}"
+    );
+    assert!(
+        proto_msgs.iter().any(|m| m.contains("field `old_id` (1)")),
+        "{proto_msgs:?}"
+    );
+
+    let ifchange_msgs: Vec<&str> = results
+        .iter()
+        .find(|r| r.check_id == "file/ifchange")
+        .expect("file/ifchange result")
+        .findings
+        .iter()
+        .map(|f| f.message.as_str())
+        .collect();
+    assert!(
+        ifchange_msgs.iter().any(|m| m.contains("companion.txt")),
+        "{ifchange_msgs:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_skips_base_reads_when_only_non_base_external_checks_run() {
+    use crate::source_tree::BaseCommandRunner;
+    use crate::vcs::BaseRevision;
+
+    struct FailOnAnyJjRunner;
+
+    impl BaseCommandRunner for FailOnAnyJjRunner {
+        fn run(&self, _root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>> {
+            anyhow::bail!("unexpected VCS base read: {binary} {args:?}")
+        }
+    }
+
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"checks:
+  - id: file/size
+  - id: change/file-count
+  - id: rust/giant-structs
+  - id: text/forbidden-pattern
+  - id: md/link-integrity
+"#,
+    )
+    .expect("write config");
+    fs::write(temp.path().join("a.rs"), "pub fn ok() {}\n").unwrap();
+
+    let source_tree = Arc::new(
+        LocalSourceTree::with_base_command_runner(
+            temp.path(),
+            Some(BaseRevision::Jujutsu("@-".to_owned())),
+            Arc::new(FailOnAnyJjRunner),
+        )
+        .expect("create tree"),
+    );
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        source_tree,
+        Arc::new(crate::external::BundledExternalCheckPackageProvider),
+        shared_builder_audit_executor(),
+    );
+
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("a.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let results = runner.run_changeset(&changeset).await.expect("run checks");
+    assert_eq!(results.len(), 5);
+}
