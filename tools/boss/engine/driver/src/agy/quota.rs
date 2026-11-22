@@ -1,4 +1,5 @@
 //! Provider usage via the vendor CLI and the worker login-keychain bridge.
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -9,7 +10,6 @@ use anyhow::Context;
 use super::environment::{AgyProcessEnvironment, run_agy_bounded};
 use super::home::{
     QUOTA_PROBE_RUN_ID, agy_homes_root, agy_run_container_for_run, provision_quota_home, reclaim_quota_probe_container,
-    reclaim_stale_quota_probe_containers,
 };
 use super::probe_isolation;
 
@@ -29,8 +29,21 @@ pub fn usage_json() -> anyhow::Result<String> {
 }
 
 fn usage_in(workspace: &Path) -> anyhow::Result<String> {
-    reclaim_stale_quota_probe_containers()?;
+    let homes_root = agy_homes_root();
+    std::fs::create_dir_all(&homes_root)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(homes_root.join("quota-probe.lock"))?;
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => anyhow::anyhow!("agy quota check already running"),
+        std::fs::TryLockError::Error(error) => anyhow::Error::new(error).context("locking agy quota probe"),
+    })?;
     let container = agy_run_container_for_run(QUOTA_PROBE_RUN_ID)?;
+    reclaim_quota_probe_container(&container)?;
     let runtime = match provision_quota_home(workspace) {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -182,6 +195,42 @@ printf '%s' '{"status":"SUCCESS","num_turns":0}'
     }
 
     #[test]
+    fn another_process_holding_the_probe_lock_prevents_reclaim() {
+        use std::io::{BufRead, Write};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _env = super::super::test_environment::env_for_provision(&homes);
+        let container = homes.join(QUOTA_PROBE_RUN_ID);
+        std::fs::create_dir_all(&container).unwrap();
+        let marker = container.join("marker");
+        std::fs::write(&marker, "active probe").unwrap();
+        let mut holder = Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl, sys; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.readline()",
+            ])
+            .arg(homes.join("quota-probe.lock"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let result = usage_json();
+        // Release and reap the subprocess before asserting so failures leave no lock holder.
+        holder.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(holder.wait().unwrap().success());
+        assert_eq!(ready.trim(), "locked");
+        assert_eq!(result.unwrap_err().to_string(), "agy quota check already running");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "active probe");
+        let lock = std::fs::File::open(homes.join("quota-probe.lock")).unwrap();
+        lock.try_lock().unwrap();
+    }
+
+    #[test]
     fn stale_quota_probe_container_is_removed_before_provision() {
         let tmp = tempfile::TempDir::new().unwrap();
         let host = tmp.path().join("host");
@@ -200,14 +249,10 @@ printf '%s' '{"status":"SUCCESS","num_turns":0}'
         )
         .unwrap();
         let stale = homes.join(QUOTA_PROBE_RUN_ID);
-        let leftover_pid = homes.join("quota-probe-99999");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("marker"), "old").unwrap();
-        std::fs::create_dir_all(&leftover_pid).unwrap();
-        std::fs::write(leftover_pid.join("marker"), "old").unwrap();
         assert_eq!(usage_json().unwrap(), r#"{"status":"SUCCESS","num_turns":0}"#);
         assert!(!stale.exists(), "canonical stale quota container leaked");
-        assert!(!leftover_pid.exists(), "pid-keyed leftover quota container leaked");
         let (container, transcripts) = leftover_probe_paths(&homes);
         assert!(!container.exists(), "quota container must be deleted after the probe");
         assert!(
