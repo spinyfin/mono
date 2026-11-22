@@ -510,54 +510,7 @@ impl boss_engine_runtime::transient_recovery::TransientRecoveryReaper for Server
     }
 }
 
-/// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
-/// Late-bound via `set_server_state` to break the ownership cycle:
-/// ServerState owns the completion handler, which owns the releaser,
-/// which calls back into ServerState.
-#[derive(Default)]
-struct ServerStatePaneReleaser {
-    server: std::sync::OnceLock<Weak<ServerState>>,
-}
-
-impl ServerStatePaneReleaser {
-    fn set_server_state(&self, weak: Weak<ServerState>) {
-        let _ = self.server.set(weak);
-    }
-}
-
-#[async_trait]
-impl WorkerPaneReleaser for ServerStatePaneReleaser {
-    async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
-        let Some(weak) = self.server.get() else {
-            tracing::warn!(run_id, "pane releaser called before server state was bound");
-            // No server bound: nothing could be reaped. Treat as
-            // "no live worker" so the caller does not free a lease on
-            // the strength of a release that never happened.
-            return PaneReleaseOutcome::NoLiveWorker;
-        };
-        let Some(server) = weak.upgrade() else {
-            tracing::debug!(run_id, "pane releaser: server state already dropped");
-            return PaneReleaseOutcome::NoLiveWorker;
-        };
-        server.release_worker_pane(run_id).await
-    }
-
-    async fn forget_persona_name(&self, run_id: &str) {
-        if let Some(server) = self.server.get().and_then(Weak::upgrade) {
-            server.live_worker_states.forget_persona_name(run_id);
-            server.broadcast_live_worker_states().await;
-        }
-    }
-
-    async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
-        let Some(server) = self.server.get().and_then(Weak::upgrade) else {
-            return PaneReleaseOutcome::NoLiveWorker;
-        };
-        server
-            .release_worker_pane_with_teardown_policy(run_id, true, false)
-            .await
-    }
-}
+use tmux_teardown::ServerStatePaneReleaser;
 
 /// One outstanding waiter for a `UserPromptSubmit` hook that would
 /// confirm a specific pane-injection attempt. See the
@@ -892,6 +845,11 @@ struct ServerState {
     #[cfg(test)]
     #[builder(default)]
     tmux_override: std::sync::Mutex<Option<boss_tmux::Tmux>>,
+    /// Test-only override for Grok's pre-reap `turn_completed` settle window.
+    /// Production leaves this `None` and uses `GROK_TEARDOWN_SETTLE_WINDOW`.
+    #[cfg(test)]
+    #[builder(default)]
+    grok_teardown_settle_window_override: std::sync::Mutex<Option<Duration>>,
     /// One prepared/active run-correlated JSONL file source per execution.
     /// Prepared before Ghostty launch, activated after live-slot
     /// registration, and cancelled through `release_worker_pane`.

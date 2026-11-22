@@ -37,7 +37,7 @@ use crate::transcript_store::{durable_transcript_containment_root, persistable_t
 /// worker transcript store. Every caller that resolves, provisions, or grants
 /// access to that directory must agree on it, so it lives here rather than as
 /// a repeated literal.
-pub(crate) const TRANSCRIPT_DRIVER_SLUG: &str = "grok";
+pub const TRANSCRIPT_DRIVER_SLUG: &str = "grok";
 
 mod classify_error;
 mod environment;
@@ -49,7 +49,7 @@ mod permissions;
 mod preflight;
 mod progress;
 mod transcript;
-mod turn_end_recovery;
+pub mod turn_end_recovery;
 
 pub(crate) use home::GROK_HOMES_DIR_NAME;
 pub use home::{

@@ -90,17 +90,27 @@ fn count(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(nonnegative_i64)
 }
 
-fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {
+/// Whether `value` is a Grok ACP `turn_completed` update that [`NativeUsage`]
+/// can ingest for token accounting.
+pub fn is_grok_turn_completed_record(value: &Value) -> bool {
     if !matches!(
         value.get("method").and_then(Value::as_str),
         Some("session/update" | "_x.ai/session/update")
     ) {
+        return false;
+    }
+    let Some(update) = value.pointer("/params/update") else {
+        return false;
+    };
+    update.get("sessionUpdate").and_then(Value::as_str) == Some("turn_completed")
+        && update.get("prompt_id").and_then(Value::as_str).is_some()
+}
+
+fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {
+    if !is_grok_turn_completed_record(value) {
         return None;
     }
     let update = value.pointer("/params/update")?;
-    if update.get("sessionUpdate")?.as_str()? != "turn_completed" {
-        return None;
-    }
     let id = update.get("prompt_id")?.as_str()?;
     let usage = &update["usage"];
     let cache_read_tokens = count(usage, "cachedReadTokens");

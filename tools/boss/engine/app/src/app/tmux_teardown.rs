@@ -21,6 +21,59 @@ use boss_tmux::{KillSessionError, KillSessionOutcome, Tmux};
 use super::*;
 use boss_work_db::TmuxIdentity;
 
+mod grok;
+#[cfg(test)]
+pub(crate) use grok::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON;
+
+/// `WorkerPaneReleaser` implementation backed by a `Weak<ServerState>`.
+/// Late-bound via `set_server_state` to break the ownership cycle:
+/// ServerState owns the completion handler, which owns the releaser,
+/// which calls back into ServerState.
+#[derive(Default)]
+pub(super) struct ServerStatePaneReleaser {
+    server: std::sync::OnceLock<Weak<ServerState>>,
+}
+
+impl ServerStatePaneReleaser {
+    pub(super) fn set_server_state(&self, weak: Weak<ServerState>) {
+        let _ = self.server.set(weak);
+    }
+}
+
+#[async_trait]
+impl WorkerPaneReleaser for ServerStatePaneReleaser {
+    async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        let Some(weak) = self.server.get() else {
+            tracing::warn!(run_id, "pane releaser called before server state was bound");
+            // No server bound: nothing could be reaped. Treat as
+            // "no live worker" so the caller does not free a lease on
+            // the strength of a release that never happened.
+            return PaneReleaseOutcome::NoLiveWorker;
+        };
+        let Some(server) = weak.upgrade() else {
+            tracing::debug!(run_id, "pane releaser: server state already dropped");
+            return PaneReleaseOutcome::NoLiveWorker;
+        };
+        server.release_worker_pane(run_id).await
+    }
+
+    async fn forget_persona_name(&self, run_id: &str) {
+        if let Some(server) = self.server.get().and_then(Weak::upgrade) {
+            server.live_worker_states.forget_persona_name(run_id);
+            server.broadcast_live_worker_states().await;
+        }
+    }
+
+    async fn release_proven_dead_remote_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        let Some(server) = self.server.get().and_then(Weak::upgrade) else {
+            return PaneReleaseOutcome::NoLiveWorker;
+        };
+        server
+            .release_worker_pane_with_teardown_policy(run_id, true, false)
+            .await
+    }
+}
+
 /// Mirrors the private `BOSS_SPAWN_TOKEN_ENV` constant [`boss_engine_runtime::spawn_flow`]
 /// and [`boss_engine_runtime::tmux_adoption`] each redeclare for their own authoritative
 /// read — see `tmux_adoption`'s module doc for why this crate does not
@@ -171,6 +224,9 @@ impl ServerState {
                         current_command: None,
                     },
                 );
+                if self.is_grok_execution(execution_id) {
+                    self.capture_grok_cost_if_present(execution_id).await;
+                }
                 return match reap_worker_process_tree(tmux, &identity.spawn_token).await {
                     Ok(_) => self.finish_tmux_reap(execution_id, identity),
                     Err(err) => {
@@ -227,6 +283,15 @@ impl ServerState {
             &identity.session_name,
             &observation,
         );
+
+        if self.is_grok_execution(execution_id) {
+            if observation.pane_dead == Some(true) {
+                self.capture_grok_cost_if_present(execution_id).await;
+            } else {
+                self.settle_grok_turn_before_reap(tmux, execution_id, &identity.session_name)
+                    .await;
+            }
+        }
 
         // The shared tmux teardown waits for token-owned processes, including
         // detached children, before clearing identity or releasing the lease.

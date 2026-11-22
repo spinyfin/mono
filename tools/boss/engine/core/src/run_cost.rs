@@ -20,6 +20,7 @@ use crate::transcript_tail::TranscriptTail;
 pub(crate) use boss_engine_storage_values::RunCostSnapshot;
 
 mod native;
+pub use native::is_grok_turn_completed_record;
 
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[builder(on(String, into))]
