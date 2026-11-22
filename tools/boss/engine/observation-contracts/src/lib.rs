@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
 use boss_github::RequiredCheckFailure;
-use boss_protocol::{Attention, AttentionGroup, ExecutionStatus, WorkExecution};
+use boss_protocol::{Attention, AttentionGroup};
 use boss_work_db::{LatePrCandidate, PendingMergeCheck, ReviewBatchDispatch, WorkDb};
 
 /// One slice of GitHub-reported PR lifecycle state, captured by a
@@ -714,13 +714,9 @@ pub trait CompletionRequests: Send + Sync {
     fn review_batch_fanout_enabled(&self) -> bool;
     fn review_pool_size(&self) -> usize;
     async fn force_release(&self, execution_id: &str);
-    async fn record_parent_pr_merge_cancellation(
-        &self,
-        execution: &WorkExecution,
-        prior_status: ExecutionStatus,
-        chain_root_id: &str,
-    );
-    async fn force_stop_execution(&self, execution_id: &str);
+    /// Stop `execution_id`'s worker now, recording `actor` and `reason` as
+    /// who cancelled it and why.
+    async fn force_stop_execution_as(&self, execution_id: &str, actor: boss_protocol::StatusActor, reason: &str);
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome;
     async fn recheck_for_pr_late(&self, candidate: &LatePrCandidate) -> StopOutcome;
     fn reconcile_review_guide_source_from_probe(
@@ -824,17 +820,8 @@ impl<T: CompletionRequests + ?Sized> CompletionRequests for std::sync::Arc<T> {
         T::force_release(self.as_ref(), execution_id).await;
     }
 
-    async fn record_parent_pr_merge_cancellation(
-        &self,
-        execution: &WorkExecution,
-        prior_status: ExecutionStatus,
-        chain_root_id: &str,
-    ) {
-        T::record_parent_pr_merge_cancellation(self.as_ref(), execution, prior_status, chain_root_id).await;
-    }
-
-    async fn force_stop_execution(&self, execution_id: &str) {
-        T::force_stop_execution(self.as_ref(), execution_id).await;
+    async fn force_stop_execution_as(&self, execution_id: &str, actor: boss_protocol::StatusActor, reason: &str) {
+        T::force_stop_execution_as(self.as_ref(), execution_id, actor, reason).await;
     }
 
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {

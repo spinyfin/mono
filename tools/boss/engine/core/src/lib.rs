@@ -29,6 +29,7 @@ pub mod board_invalidation_metrics;
 mod board_invalidation_replay;
 pub use boss_execution_runner::boss_construct_scan;
 pub mod build_info;
+pub mod cancel_timeline;
 pub use boss_ci_log_reader as ci_log_reader;
 pub use boss_claude_client as claude_client;
 pub mod cli;

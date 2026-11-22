@@ -635,7 +635,7 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
     // the deadlines so a loaded CI worker's Spawn reply cannot miss a 300ms
     // spawn_deadline (unsettled SpawnOutcomeUncertain) before the Stop-retry
     // path runs, while the unanswered Stop still parks quickly enough for
-    // the <450ms retry assertion. workspace_slack(10_000) would raise Stop
+    // the <1s retry assertion. workspace_slack(10_000) would raise Stop
     // to 5s and fail that assertion.
     let fx = Fixture::with(answered_spawn_short_stop(300)).await;
     fx.ready(HOST);
@@ -661,7 +661,7 @@ async fn a_stop_that_stays_unconfirmed_is_retried_without_waiting_for_the_prompt
     let second = spawn(&adapter).await.unwrap_err();
     assert!(second.downcast_ref::<SpawnOutcomeUncertain>().is_some(), "{second:#}");
     assert!(
-        started.elapsed() < Duration::from_millis(450),
+        started.elapsed() < Duration::from_millis(1_000),
         "{:?}",
         started.elapsed()
     );

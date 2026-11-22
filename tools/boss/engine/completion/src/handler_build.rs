@@ -99,28 +99,6 @@ impl WorkerCompletionHandler {
         self
     }
 
-    /// Record the merge poller's intentional cancellation of a revision
-    /// execution after its parent PR merged. This is emitted only after the
-    /// durable cancellation succeeds.
-    pub(crate) async fn record_parent_pr_merge_cancellation(
-        &self,
-        execution: &crate::work::WorkExecution,
-        prior_status: ExecutionStatus,
-        chain_root_id: &str,
-    ) {
-        self.dispatch_events
-            .emit(
-                DispatchEvent::new(Stage::ExecutionCancelled, DispatchOutcome::Ok, &execution.id)
-                    .with_work_item(&execution.work_item_id)
-                    .with_details(serde_json::json!({
-                        "reason": "parent_pr_merged",
-                        "prior_status": prior_status.as_str(),
-                        "chain_root_id": chain_root_id,
-                    })),
-            )
-            .await;
-    }
-
     /// Point structured-output reads at `dir` instead of the process-wide
     /// [`crate::structured_output::default_dir`]. Tests use this to seed the
     /// per-execution artifact in a tempdir; production leaves the default.
@@ -600,18 +578,8 @@ impl CompletionRequests for WorkerCompletionHandler {
         let _ = WorkerCompletionHandler::force_release(self, execution_id).await;
     }
 
-    async fn record_parent_pr_merge_cancellation(
-        &self,
-        execution: &boss_protocol::WorkExecution,
-        prior_status: ExecutionStatus,
-        chain_root_id: &str,
-    ) {
-        WorkerCompletionHandler::record_parent_pr_merge_cancellation(self, execution, prior_status, chain_root_id)
-            .await;
-    }
-
-    async fn force_stop_execution(&self, execution_id: &str) {
-        WorkerCompletionHandler::force_stop_execution(self, execution_id).await;
+    async fn force_stop_execution_as(&self, execution_id: &str, actor: boss_protocol::StatusActor, reason: &str) {
+        WorkerCompletionHandler::force_stop_execution_as(self, execution_id, actor, reason).await;
     }
 
     async fn recheck_for_pr(&self, execution_id: &str) -> StopOutcome {

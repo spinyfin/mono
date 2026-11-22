@@ -276,10 +276,13 @@ fn stuck_kind_sql(a: &str, root: &str) -> String {
         "wa.kind IN ('worker_recovery_permanent_error', 'worker_recovery_exhausted')",
     );
     let review_churn = open_attention_sql(a, "wa.kind = 'churn_guard_parked'");
+    // A row stopped by a cancel is a recorded decision, not a failure: it
+    // falls through to the manual-start hold (`todo`, automatic start off).
+    let stopped = crate::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON;
     format!(
         "CASE
            WHEN {a}.id IN (SELECT work_item_id FROM progression_dependency_cycles) THEN 'S4_dependency_cycle'
-           WHEN {a}.dispatch_failed_reason IS NOT NULL THEN
+           WHEN {a}.dispatch_failed_reason IS NOT NULL AND {a}.dispatch_failed_reason <> '{stopped}' THEN
                CASE {a}.dispatch_failed_reason
                    WHEN 'churn_guard' THEN 'S2_churn_guard'
                    WHEN 'deliberate_park' THEN 'S3_deliberate_park'

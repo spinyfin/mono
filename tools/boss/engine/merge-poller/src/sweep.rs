@@ -292,21 +292,24 @@ pub async fn stop_active_revision_executions(
         // Now mark the obsolete revision execution terminal. The task has
         // already reached its parent-close state in the DB transaction, so
         // cancel's active-to-todo demotion does not overwrite that decision.
-        let prior_status = execution.status.clone();
         let cancel_result = work_db.cancel_execution_with(
             &execution.id,
             crate::work::CancelExecutionOpts {
+                peer_pid: None,
                 reason: Some("parent PR merged".to_owned()),
                 queued_only: false,
                 record_failure_reason: false,
+                actor: boss_protocol::StatusActor::Engine,
+                // The parent-close transaction above already settled the
+                // revision's status (or converted it to a chore the
+                // reconcile below re-mints); parking it here would undo
+                // that conversion.
+                keep_work_item_schedulable: true,
             },
         );
         match &cancel_result {
-            Ok(cancelled) => {
+            Ok(_) => {
                 outcome.revision_invalidated += 1;
-                handler
-                    .record_parent_pr_merge_cancellation(cancelled, prior_status, chain_root_id)
-                    .await;
             }
             Err(err) => {
                 // The execution may have already moved to a terminal state
@@ -368,7 +371,7 @@ pub async fn stop_active_revision_executions(
 /// worker slot indefinitely. We force-stop it regardless of what it is
 /// doing — cancel the execution row and release its cube lease + pane.
 ///
-/// `CompletionRequests::force_stop_execution` only demotes a task
+/// `CompletionRequests::force_stop_execution_as` only demotes a task
 /// that is still `active`; since the task is now `in_review`, that guard
 /// does not fire and the task stays in Review. Idempotent: a no-op when
 /// no live execution exists or `completion_handler` is `None` (tests /
@@ -403,7 +406,13 @@ pub(crate) async fn stop_worker_on_review_transition(
         work_item_id,
         "merge poller: stopping worker — task auto-transitioned to in_review (CI green)",
     );
-    handler.force_stop_execution(&execution.id).await;
+    handler
+        .force_stop_execution_as(
+            &execution.id,
+            boss_protocol::StatusActor::Engine,
+            "task auto-transitioned to in_review (CI green); worker stopped",
+        )
+        .await;
     outcome.worker_stopped_on_review += 1;
 }
 

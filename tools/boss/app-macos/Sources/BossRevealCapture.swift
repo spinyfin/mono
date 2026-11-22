@@ -217,6 +217,21 @@ enum BossRevealCapture {
                 states: [], doingSections: [rows[0].id: .coding, rows[1].id: .reviewing]
             ))
         }
+        // A row the engine stopped because its queued run was cancelled:
+        // Backlog, with the "Stopped — execution cancelled" banner and resume
+        // instruction.
+        if state == "cancel-parked" {
+            rows = Array(rows.suffix(1))
+            rows[0].status = "todo"
+            rows[0].autostart = false
+            rows[0].name = "Rebase stale PR branches onto main before building on them"
+            rows[0].shortID = 42
+            rows[0].dispatchFailedReason = "execution_cancelled"
+            rows[0].dispatchFailedError = "Execution `exec_capture_cancelled` was cancelled by a human "
+                + "(explicit cancel). This work item was moved to Backlog and will not restart on its own. "
+                + "Run `bossctl work start task_42` (or drag the card to Doing) to resume it."
+            rows[0].dispatchFailedAt = now
+        }
         model.applyEventForTest(.workTree(
             product: product, projects: [], tasks: [], chores: rows,
             taskRuntimes: runtimes, dependencies: [], ideas: []

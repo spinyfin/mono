@@ -214,6 +214,107 @@ pub fn demote_active_if_latest_execution(
     Ok(affected > 0)
 }
 
+/// `dispatch_failed_error` body written by [`park_work_item_after_cancel`].
+/// Names the execution, who cancelled it and the reason the caller supplied,
+/// states plainly that the row will not restart by itself, and says how to
+/// resume it — the card's banner, `boss task show` and `bossctl agents
+/// status` print this verbatim.
+pub(crate) fn execution_cancelled_park_text(
+    work_item_id: &str,
+    execution_id: &str,
+    actor: Option<StatusActor>,
+    reason: &str,
+) -> String {
+    format!(
+        "Execution `{execution_id}` was cancelled by {who} ({reason}). This work item was moved to \
+         Backlog and will not restart on its own. Run `bossctl work start {work_item_id}` (or drag the \
+         card to Doing) to resume it.",
+        who = describe_cancel_actor(actor),
+    )
+}
+
+/// Ledger basis for the write that stops a row in Backlog after a cancel.
+pub const BASIS_STOPPED_AFTER_CANCEL: &str = "park_work_item_after_cancel";
+
+/// Stop `work_item_id` in Backlog because `execution_id` — its governing
+/// execution — was cancelled: `status = todo`, `autostart = 0`, and the
+/// halt surface stamped with
+/// [`crate::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON`] so the board and CLI
+/// show the stop and its reason. Returns `true` iff the row moved. The
+/// `autostart` change lands in the task status ledger under
+/// [`BASIS_STOPPED_AFTER_CANCEL`] with the cancelling actor.
+///
+/// A cancelled execution is a run that ended, and the engine never starts a
+/// replacement for one by itself, so without this a queued card would stay
+/// `todo` with `autostart = 1` and nothing would ever start it.
+///
+/// This is not parking (`parking.rs`): the row keeps its place in Backlog
+/// and `parked_at` is untouched. A park's own cancels opt out of it
+/// (`CancelExecutionOpts::keep_work_item_schedulable`).
+///
+/// Only a `todo` row is stopped. An `active` row whose never-started
+/// execution is cancelled stays `active`: a human put that card in Doing,
+/// and `cancel_execution_ready_does_not_demote_active_task` pins the
+/// decision that a cancel of a pending row must not yank it back (the
+/// orphan-active sweep re-dispatches it). A *live* cancel reaches here
+/// after [`demote_active_if_latest_execution`] has already moved the row to
+/// `todo`, so it is stopped with its reason. `in_review` / `done` /
+/// `archived` / deleted rows are never touched — a cancel does not retract
+/// a PR or reopen closed work.
+///
+/// Two further guards keep this from touching a row a worker still owns,
+/// mirroring the demote: the cancelled execution must be the row's latest
+/// (a stale never-started duplicate shadowed by a newer row is not the
+/// governing execution), and no *other* non-terminal execution may exist
+/// for the row (a re-dispatch storm can leave the live run one row below a
+/// newer terminal one).
+pub(crate) fn park_work_item_after_cancel(
+    conn: &Connection,
+    work_item_id: &str,
+    execution_id: &str,
+    actor: Option<StatusActor>,
+    reason: &str,
+    now: &str,
+) -> Result<bool> {
+    let body = execution_cancelled_park_text(work_item_id, execution_id, actor, reason);
+    let affected = crate::task_status_audit::execute(
+        conn,
+        BASIS_STOPPED_AFTER_CANCEL,
+        actor.map_or("engine", |actor| actor.as_str()),
+        "UPDATE tasks
+         SET status                 = 'todo',
+             autostart              = 0,
+             last_status_actor      = 'engine',
+             dispatch_failed_reason = ?3,
+             dispatch_failed_error  = ?4,
+             dispatch_failed_at     = ?5,
+             updated_at             = ?5
+         WHERE id              = ?1
+           AND status          = 'todo'
+           AND deleted_at      IS NULL
+           AND ?2 = (
+               SELECT id FROM work_executions
+               WHERE work_item_id = ?1
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM work_executions
+               WHERE work_item_id = ?1
+                 AND id != ?2
+                 AND status NOT IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
+           )",
+        params![
+            work_item_id,
+            execution_id,
+            crate::EXECUTION_CANCELLED_DISPATCH_FAILED_REASON,
+            body,
+            now
+        ],
+    )?;
+    Ok(affected > 0)
+}
+
 pub(crate) fn update_execution_status(
     conn: &Connection,
     execution_id: &str,

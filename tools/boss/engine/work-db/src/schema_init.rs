@@ -922,6 +922,10 @@ mod floor_tests {
                 Box::new(|c| execution_bookmarks::migrate_retire_prune_state(c).unwrap()),
             ),
             (
+                super::super::cancel_records::MIGRATION_ID,
+                Box::new(|c| super::super::cancel_records::migrate(c).unwrap()),
+            ),
+            (
                 super::super::progression_candidates::EXECUTION_PROVENANCE_MIGRATION_ID,
                 Box::new(|c| super::super::progression_candidates::migrate_execution_provenance(c).unwrap()),
             ),

@@ -397,6 +397,7 @@ async fn cancelling_while_a_spawn_is_in_doubt_keeps_the_workspace_lease() {
                 reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -718,6 +719,7 @@ async fn a_cancelled_unanswered_spawn_is_reconciled_from_stored_state_after_a_re
                 reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1008,6 +1010,7 @@ async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released(
                 reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1104,6 +1107,7 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
                 reason: Some("operator cancel".into()),
                 queued_only: false,
                 record_failure_reason: false,
+                ..Default::default()
             },
         )
         .unwrap();

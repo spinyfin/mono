@@ -27,6 +27,19 @@ final class WorkDispatchFailureBannerTests: XCTestCase {
         )
     }
 
+    func testCancelledExecutionReadsAsStoppedNotFailed() {
+        let text = "Execution `exec_1` was cancelled by a human (explicit cancel). This work item was moved to "
+            + "Backlog and will not restart on its own. Run `bossctl work start task_1` (or drag the card to Doing) "
+            + "to resume it."
+        let banner = WorkDispatchFailureBanner(reason: "execution_cancelled", errorText: text)
+        XCTAssertEqual(banner.headline, "Stopped — execution cancelled")
+        XCTAssertEqual(
+            banner.summary, text,
+            "the engine's stored actor, reason and resume instruction render verbatim — the app never guesses"
+        )
+        XCTAssertNil(banner.summaryLineLimit, "the resume instruction must not be capped")
+    }
+
     func testParkOnlyAndDispatchFailureRemainDistinct() {
         let park = WorkDispatchFailureBanner(reason: "deliberate_park", errorText: "Worker declared blocked")
         XCTAssertEqual(park.headline, "Waiting on you — deliberate park")

@@ -2358,6 +2358,16 @@ async fn serve_scoped(
             }),
         );
 
+    // Every cancel commits a durable record of who cancelled and why. This
+    // writes each to engine-audit.log, and puts the ones whose caller has no
+    // dispatch sink of its own (dependency block, tombstoned remediation,
+    // review-guide replacement) on the execution's dispatch timeline.
+    let _cancel_timeline_handle = boss_engine_runtime::cancel_timeline::spawn_subscriber(
+        server_state.work_db.clone(),
+        server_state.dispatch_events.clone(),
+        server_state.event_bus.clone(),
+    );
+
     // Periodic dispatch-failure recovery reconciler: the pre-spawn
     // sibling of the orphan-active sweep above. Re-enqueues work items
     // the engine bounced to Backlog after a pre-spawn dispatch failure

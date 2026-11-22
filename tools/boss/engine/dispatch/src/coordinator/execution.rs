@@ -4,6 +4,7 @@
 use crate::work::CancelExecutionOpts;
 use anyhow::bail;
 use boss_protocol::ReviewBatchPhase;
+use boss_protocol::StatusActor;
 
 use super::permanent_start_failure::{PermanentStartFailure, StartFailureAttention, StartFailureDetail};
 use super::spoke_in_doubt::waitable_spoke_lease;
@@ -1089,19 +1090,23 @@ impl ExecutionCoordinator {
             }
             Err(err) => {
                 if had_requested_host {
-                    match self.work_db.cancel_execution_with(
+                    let reason = format!("requested host became ineligible: {err:#}");
+                    match self.work_db.cancel_execution_with_outcome(
                         &execution.id,
                         CancelExecutionOpts {
-                            reason: Some(format!("requested host became ineligible: {err:#}")),
+                            peer_pid: None,
+                            reason: Some(reason.clone()),
                             queued_only: true,
                             record_failure_reason: true,
+                            keep_work_item_schedulable: false,
+                            actor: StatusActor::Engine,
                         },
                     ) {
                         Ok(cancelled) => {
                             // Terminal for this execution: drop the constraint so it
                             // cannot leak (selection no longer takes it itself).
                             self.take_requested_host(&execution.id);
-                            self.notify_review_guide_pre_start_failure(&cancelled);
+                            self.notify_review_guide_pre_start_failure(&cancelled.execution);
                         }
                         Err(cancel_err) => {
                             // The cancel is what makes this row terminal. If it
@@ -2819,17 +2824,21 @@ impl ExecutionCoordinator {
             );
         }
 
-        match self.work_db.cancel_execution_with(
+        let reason = format!("requested host dispatch failed during {stage}: {err:#}");
+        match self.work_db.cancel_execution_with_outcome(
             &execution.id,
             CancelExecutionOpts {
-                reason: Some(format!("requested host dispatch failed during {stage}: {err:#}")),
+                peer_pid: None,
+                reason: Some(reason.clone()),
                 queued_only: true,
                 record_failure_reason: true,
+                keep_work_item_schedulable: false,
+                actor: StatusActor::Engine,
             },
         ) {
             Ok(cancelled) => {
                 self.take_requested_host(&execution.id);
-                self.notify_review_guide_pre_start_failure(&cancelled);
+                self.notify_review_guide_pre_start_failure(&cancelled.execution);
             }
             Err(cancel_err) => {
                 // The cancel is what makes this row terminal. If it failed,
