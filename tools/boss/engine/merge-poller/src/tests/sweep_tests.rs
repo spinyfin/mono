@@ -1783,6 +1783,68 @@ async fn mark_merged_refuses_a_merge_into_a_non_default_branch() {
 }
 
 #[tokio::test]
+async fn pending_disarm_drain_refuses_a_merge_into_a_non_default_branch() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/42";
+    let (product, parent) = make_chore_in_review(&db, "prerequisite", pr);
+    let dependent = db
+        .create_chore(
+            boss_protocol::CreateChoreInput::builder()
+                .product_id(product.clone())
+                .name("dependent")
+                .depends_on(vec![parent.clone()])
+                .build(),
+        )
+        .unwrap();
+    db.record_github_merge_intent(
+        crate::work::GithubMergeIntentInsertInput::builder()
+            .work_item_id(&parent)
+            .pr_url(pr)
+            .head_sha("before-disarm")
+            .build(),
+        "{}",
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE github_merge_intents SET status = 'disarm_pending' WHERE work_item_id = ?1",
+            [&parent],
+        )
+        .unwrap();
+    assert!(db.merge_disarm_pending(&parent, pr).unwrap());
+    let probe = StubProbe::new();
+    probe
+        .states
+        .lock()
+        .unwrap()
+        .insert(pr.into(), Ok(parent_base_probe(pr, "MERGED")));
+    let publisher = RecordingPublisher::default();
+    let host = NoopSweepHost::default();
+    crate::disarm_drain::drain_pending_merge_disarms(&db, probe.as_ref(), &publisher, &host).await;
+    assert_eq!(host.disarms.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!db.merge_disarm_pending(&parent, pr).unwrap());
+    assert!(db.list_pending_merge_disarms().unwrap().is_empty());
+    assert!(db.get_merge_evidence(&parent).unwrap().is_none());
+    let WorkItem::Chore(task) = db.get_work_item(&parent).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, TaskStatus::InReview);
+    let WorkItem::Chore(task) = db.get_work_item(&dependent.id).unwrap() else {
+        panic!("expected dependent")
+    };
+    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
+    assert!(
+        db.list_attention_items_for_work_item(&parent)
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED)
+    );
+}
+
+#[tokio::test]
 async fn closed_unmerged_pr_on_a_non_default_base_still_retires() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
@@ -1793,11 +1855,32 @@ async fn closed_unmerged_pr_on_a_non_default_base_still_retires() {
         .states
         .lock()
         .unwrap()
+        .insert(pr.into(), Ok(parent_base_probe(pr, "OPEN")));
+    let publisher = RecordingPublisher::default();
+    run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await;
+    assert!(
+        db.list_attention_items_for_work_item(&chore)
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED && a.status == "open"),
+        "an open stacked PR must raise a base refusal before it closes"
+    );
+    probe
+        .states
+        .lock()
+        .unwrap()
         .insert(pr.into(), Ok(parent_base_probe(pr, "CLOSED")));
-    let outcome = run_one_pass(&db, probe.as_ref(), &RecordingPublisher::default(), None, None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await;
     assert_eq!(outcome.closed_unmerged, 1);
     let WorkItem::Chore(task) = db.get_work_item(&chore).unwrap() else {
         panic!("expected chore")
     };
     assert_eq!(task.status, TaskStatus::Done);
+    assert!(
+        db.list_attention_items_for_work_item(&chore)
+            .unwrap()
+            .iter()
+            .all(|a| a.kind != boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED || a.status != "open"),
+        "retiring a closed-unmerged PR must resolve its open base refusal"
+    );
 }

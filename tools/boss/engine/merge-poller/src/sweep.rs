@@ -996,6 +996,15 @@ pub(crate) async fn sweep_one(
                 ),
             }
             end_conflict_deferral(work_db, candidate, crate::work::ConflictDeferralEnd::PrClosed);
+            // The sweep-wide clearer skips ClosedUnmerged so a stacked close
+            // can retire. Resolve a refusal that belongs to this PR: the
+            // row is done and the PR never landed.
+            if !base_attentions.is_empty()
+                && base_attentions.iter().all(|item| belongs_to_probe(&item.body_markdown))
+                && let Err(err) = work_db.resolve_external_tracker_attention(&candidate.work_item_id, PR_BASE_REFUSED)
+            {
+                tracing::warn!(?err, "merge poller: could not clear PR base refusal");
+            }
             // Comment reconciliation is a narrower, comment-only signal
             // (comment-intent-classification design §"Reconciliation" /
             // §Risks — the "reopen on abandon" half of task 2c): a comment
