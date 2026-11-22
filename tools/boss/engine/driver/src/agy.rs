@@ -45,8 +45,8 @@ mod pending_tools;
 pub mod permissions;
 mod progress;
 pub use environment::{
-    AGY_BIN_ENV, AGY_VERSION_TIMEOUT, DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE, MIN_QUALIFIED_AGY_VERSION,
-    parse_agy_version, run_agy_bounded, version_at_least,
+    AGY_BIN_ENV, AGY_VERSION_TIMEOUT, AgyNotInstalled, DISABLE_AUTO_UPDATE_ENV, DISABLE_AUTO_UPDATE_VALUE,
+    MIN_QUALIFIED_AGY_VERSION, parse_agy_version, run_agy_bounded, version_at_least,
 };
 pub use pending_tools::REFUSED_TOOL_PREFIX;
 #[cfg(test)]
@@ -58,6 +58,8 @@ mod turn_end_recovery;
 use progress::AgyProgressSession;
 use transcript::AgyTranscriptSession;
 
+pub mod probe_isolation;
+pub mod quota;
 /// Manual authenticated rules-discovery conformance probe.
 pub mod rules_probe;
 

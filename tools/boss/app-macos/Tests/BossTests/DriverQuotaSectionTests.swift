@@ -97,6 +97,26 @@ final class DriverQuotaSectionTests: XCTestCase {
 
     // MARK: - Roster
 
+    func testAgyReadingAndNotReportedMapping() {
+        let payload: [String: Any] = [
+            "driver": "agy", "observed_at_epoch_s": 1795212000,
+            "outcome": ["state": "reading", "used_percent": 0.8423,
+                        "window": ["kind": "weekly"], "resets_at_epoch_s": 1795567941,
+                        "source": "agy --print /usage (Gemini weekly)"],
+        ]
+        let entry = DriverQuotaEntry.decode(payload)
+        XCTAssertEqual(entry?.displayName, DriverSlug.agy.displayName)
+        guard case .reading(let reading) = entry?.outcome else { return XCTFail("expected agy reading") }
+        XCTAssertEqual(reading.usedPercent, 0.8423)
+        XCTAssertEqual(reading.window, .weekly)
+        XCTAssertEqual(reading.resetsAtEpochS, 1795567941)
+        let missing = DriverQuotaOutcome.decode([
+            "state": "unavailable", "kind": "not_reported", "reason": "Quota not reported by agy",
+        ])
+        XCTAssertEqual(missing, .unavailable(kind: .notReported, reason: "Quota not reported by agy"))
+        XCTAssertEqual(missing?.headline(checking: false), "Quota not reported")
+    }
+
     func testRosterAlwaysCoversEveryDriverEvenWhenTheEngineOmitsOne() {
         let decoded = snapshot([
             "entries": [[
@@ -107,8 +127,8 @@ final class DriverQuotaSectionTests: XCTestCase {
             "generated_at_epoch_s": 11,
         ])
         let roster = DriverQuotaSection.roster(from: decoded)
-        XCTAssertEqual(roster.map(\.driver), ["claude", "codex", "grok"])
-        for slug in ["codex", "grok"] {
+        XCTAssertEqual(roster.map(\.driver), ["agy", "claude", "codex", "grok"])
+        for slug in ["agy", "codex", "grok"] {
             let entry = roster.first { $0.driver == slug }
             guard case .unavailable = entry?.outcome else {
                 return XCTFail("\(slug) must be shown as unavailable, never quietly skipped")
@@ -118,7 +138,7 @@ final class DriverQuotaSectionTests: XCTestCase {
 
     func testRosterOnAnEmptySnapshotSaysNotCheckedRatherThanFailed() {
         let roster = DriverQuotaSection.roster(from: .empty)
-        XCTAssertEqual(roster.count, 3)
+        XCTAssertEqual(roster.count, 4)
         for entry in roster {
             guard case .pending = entry.outcome else {
                 return XCTFail("nothing should render as a reading or a failure before the first check")
@@ -214,7 +234,7 @@ final class DriverQuotaSectionTests: XCTestCase {
         model.isRefreshingDriverQuota = true
         var snap = DriverQuotaSnapshot.empty
         snap.generatedAtEpochS = 1_787_000_000
-        snap.pendingDrivers = ["claude", "codex", "grok"]
+        snap.pendingDrivers = ["agy", "claude", "codex", "grok"]
         model.applyEventForTest(.driverQuotaUsageResult(snapshot: snap))
         XCTAssertTrue(model.isRefreshingDriverQuota, "accepted refresh keeps the spinner")
 

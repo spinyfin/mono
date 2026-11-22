@@ -203,3 +203,11 @@ filegroup(
     srcs = ["src/agy/testdata/blocked_marker_1.5.9.jsonl"],
     visibility = ["//tools/boss/engine/core:__pkg__"],
 )
+
+rust_binary(
+    name = "agy_quota_probe",
+    srcs = ["bin/agy_quota_probe.rs"],
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [":driver"] + all_crate_deps(normal = True),
+)

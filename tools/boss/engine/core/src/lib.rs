@@ -85,6 +85,7 @@ pub use boss_dispatch_events as dispatch_events;
 // paths the engine has always used it by.
 pub use boss_engine_dispatch::{coordinator, dispatch_inflight, dispatch_metrics};
 pub mod agy_home_retention_sweep;
+pub mod agy_quota_probe;
 pub mod attachment_retention_sweep;
 pub mod attachment_server;
 pub mod codex_guard_trace;

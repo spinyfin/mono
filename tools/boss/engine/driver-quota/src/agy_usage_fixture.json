@@ -1,0 +1,44 @@
+{
+  "status": "SUCCESS",
+  "num_turns": 0,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0
+  },
+  "command": {
+    "name": "usage",
+    "data": {
+      "groups": [
+        {
+          "name": "Gemini Models",
+          "buckets": [
+            {
+              "id": "gemini-weekly",
+              "window": "weekly",
+              "remaining_fraction": 0.9915769696235657,
+              "reset_time": "2026-11-25T00:52:21Z"
+            },
+            {
+              "id": "gemini-5h",
+              "window": "5h",
+              "remaining_fraction": 0.9893192648887634,
+              "reset_time": "2026-11-21T03:34:29Z"
+            }
+          ]
+        },
+        {
+          "name": "Claude and GPT models",
+          "buckets": [
+            {
+              "id": "3p-weekly",
+              "window": "weekly",
+              "remaining_fraction": 1,
+              "reset_time": "2026-11-27T22:43:49Z"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

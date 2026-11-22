@@ -46,6 +46,7 @@ enum DriverQuotaFailureKind: String, Equatable, Sendable {
     case probeFailed = "probe_failed"
     case unparseable = "unparseable"
     case timeout
+    case notReported = "not_reported"
 
     /// Two or three words naming the failure, shown where a percentage would
     /// otherwise be. Never an empty string and never a dash — the reader has
@@ -57,6 +58,7 @@ enum DriverQuotaFailureKind: String, Equatable, Sendable {
         case .probeFailed: return "Check failed"
         case .unparseable: return "Unrecognized output"
         case .timeout: return "Timed out"
+        case .notReported: return "Quota not reported"
         }
     }
 }
@@ -390,12 +392,10 @@ struct DriverQuotaSection: View {
     /// having produced no result. Silently dropping it would be exactly the
     /// "quietly skip a driver that failed" behaviour this pane exists to
     /// prevent — the roster is the app's own guarantee that the reader sees
-    /// three drivers or is told why they do not.
+    /// four drivers or is told why they do not.
     static func roster(from snapshot: DriverQuotaSnapshot) -> [DriverQuotaEntry] {
         let known = Dictionary(uniqueKeysWithValues: snapshot.entries.map { ($0.driver, $0) })
-        // Traffic allocation also includes Antigravity, which has no quota
-        // probe. Its allocation share must not imply a failed quota reading.
-        return [DriverSlug.claude, .codex, .grok]
+        return [DriverSlug.agy, .claude, .codex, .grok]
             .map(\.rawValue)
             .sorted()
             .map { slug in

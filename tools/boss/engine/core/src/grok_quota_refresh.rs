@@ -62,7 +62,11 @@ impl GrokCredentialRefresher for GrokCliCredentialRefresher {
 /// CLI pass the Grok worker preflight uses.
 pub fn production_probes() -> QuotaProbeSet {
     let auth_path = resolve_grok_auth_source();
-    boss_engine_driver_quota::default_probes(auth_path.clone(), Arc::new(GrokCliCredentialRefresher::new(auth_path)))
+    boss_engine_driver_quota::default_probes(
+        Arc::new(crate::agy_quota_probe::AgyQuotaProbe),
+        auth_path.clone(),
+        Arc::new(GrokCliCredentialRefresher::new(auth_path)),
+    )
 }
 
 #[cfg(test)]

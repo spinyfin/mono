@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 /// The window a [`DriverQuotaReading`] describes. Each provider expresses
 /// its own limit period differently; this normalises the common case
-/// (a rolling week — what all three drivers currently report) while keeping
+/// (a rolling week — what the drivers currently report) while keeping
 /// anything else expressible rather than silently relabelled as weekly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -79,7 +79,7 @@ pub struct DriverQuotaReading {
     pub resets_at_text: Option<String>,
     /// Short provenance string naming the mechanism that produced this
     /// figure (e.g. `claude -p /usage`). Shown in the UI so the maintainer
-    /// can tell at a glance which of the three different mechanisms
+    /// can tell at a glance which mechanism
     /// answered, and never has to wonder whether a number is Boss's own
     /// accounting wearing a provider label.
     pub source: String,
@@ -93,6 +93,8 @@ pub struct DriverQuotaReading {
 pub enum DriverQuotaFailureKind {
     /// The driver's CLI is not installed or not on `PATH`.
     NotInstalled,
+    /// The provider returned no quota for the driver's model group.
+    NotReported,
     /// The CLI ran (or the endpoint answered) but the operator is not
     /// logged in, or the stored credential has expired.
     NotAuthenticated,
@@ -112,6 +114,7 @@ impl DriverQuotaFailureKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NotInstalled => "not_installed",
+            Self::NotReported => "not_reported",
             Self::NotAuthenticated => "not_authenticated",
             Self::ProbeFailed => "probe_failed",
             Self::Unparseable => "unparseable",
@@ -139,7 +142,7 @@ pub enum DriverQuotaOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DriverQuotaEntry {
     /// Driver slug — one of [`crate::DRIVER_SLUG_CLAUDE`],
-    /// [`crate::DRIVER_SLUG_CODEX`], [`crate::DRIVER_SLUG_GROK`].
+    /// [`crate::DRIVER_SLUG_CODEX`], [`crate::DRIVER_SLUG_GROK`], [`crate::DRIVER_SLUG_AGY`].
     pub driver: String,
     /// Epoch seconds when this outcome was produced. Present on failures
     /// too: "we tried at 14:03 and it failed" is information.
@@ -176,10 +179,11 @@ pub struct DriverQuotaSnapshot {
     pub pending_drivers: Vec<String>,
 }
 
-/// Display and probe order for the three implemented drivers. Alphabetical
+/// Display and probe order for the four implemented drivers. Alphabetical
 /// so the pane reads the same way every time regardless of which probe
 /// finished first.
-pub const DRIVER_QUOTA_ORDER: [&str; 3] = [
+pub const DRIVER_QUOTA_ORDER: [&str; 4] = [
+    super::DRIVER_SLUG_AGY,
     super::DRIVER_SLUG_CLAUDE,
     super::DRIVER_SLUG_CODEX,
     super::DRIVER_SLUG_GROK,
@@ -273,6 +277,6 @@ mod tests {
     fn order_covers_every_implemented_driver_exactly_once() {
         let mut sorted = DRIVER_QUOTA_ORDER;
         sorted.sort_unstable();
-        assert_eq!(sorted, ["claude", "codex", "grok"]);
+        assert_eq!(sorted, ["agy", "claude", "codex", "grok"]);
     }
 }

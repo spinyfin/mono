@@ -22,6 +22,20 @@ use crate::scoped_home::{HostToolPaths, worker_tool_path_directive};
 /// pins its bytes; later overrides must match the pinned copy.
 pub const AGY_BIN_ENV: &str = "BOSS_AGY_BIN";
 
+/// Host `agy` could not be resolved: `which agy` failed, returned empty, or
+/// the [`AGY_BIN_ENV`] path is not a file. The engine maps this to the quota
+/// panel's NotInstalled row by downcasting, not by matching the message.
+#[derive(Debug)]
+pub struct AgyNotInstalled(pub String);
+
+impl std::fmt::Display for AgyNotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AgyNotInstalled {}
+
 /// When set to `1`/`true`, skip live identity checks (`codesign`, `--version`).
 /// Production never sets this; layout tests do. It does not skip the `models`
 /// posture probe, which then runs whatever is at the Boss-owned binary path;
@@ -188,6 +202,13 @@ fn resolve_agy_binary_with(
         let host = crate::scoped_home::nonempty_env(AGY_BIN_ENV)
             .map(Ok)
             .unwrap_or_else(find_host_agy)?;
+        if !host.is_file() {
+            return Err(AgyNotInstalled(format!(
+                "agy CLI is not installed ({}); install Antigravity CLI or set {AGY_BIN_ENV}",
+                host.display()
+            ))
+            .into());
+        }
         install_boss_owned_agy(&host, &owned, &qualify)?;
         assert_protected_binary(&owned)?;
         QUALIFIED
@@ -212,11 +233,14 @@ fn find_host_agy() -> anyhow::Result<PathBuf> {
         .output()
         .context("resolving host agy via which")?;
     if !output.status.success() {
-        bail!("`which agy` failed; install Antigravity CLI or set {AGY_BIN_ENV}");
+        return Err(AgyNotInstalled(format!(
+            "`which agy` failed; install Antigravity CLI or set {AGY_BIN_ENV}"
+        ))
+        .into());
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if path.is_empty() {
-        bail!("`which agy` returned empty; set {AGY_BIN_ENV}");
+        return Err(AgyNotInstalled(format!("`which agy` returned empty; set {AGY_BIN_ENV}")).into());
     }
     Ok(PathBuf::from(path))
 }

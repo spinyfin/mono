@@ -425,6 +425,24 @@ fn render_provision_hooks_json() -> String {
 // ---------------------------------------------------------------------------
 
 pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<AgyRuntimeState> {
+    provision_home(workspace, prompt_text, run_id, true)
+}
+
+/// Probes sharing a homes root hold an exclusive file lock while using this
+/// container. An interrupted probe is reclaimed before provisioning.
+pub(super) const QUOTA_PROBE_RUN_ID: &str = "quota-probe";
+
+/// The quota command itself exercises authentication; avoid a redundant models request.
+pub(super) fn provision_quota_home(workspace: &Path) -> anyhow::Result<AgyRuntimeState> {
+    provision_home(workspace, "unused", QUOTA_PROBE_RUN_ID, false)
+}
+
+fn provision_home(
+    workspace: &Path,
+    prompt_text: &str,
+    run_id: &str,
+    probe_models: bool,
+) -> anyhow::Result<AgyRuntimeState> {
     let container = agy_run_container_for_run(run_id)?;
     let process_home = container.join(PROCESS_HOME_LEAF);
     let control_dir = container.join(CONTROL_LEAF);
@@ -443,11 +461,16 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     let antigravity = gemini.join("antigravity-cli");
     fs::create_dir_all(antigravity.join("cache"))
         .with_context(|| format!("creating antigravity-cli cache under {}", antigravity.display()))?;
-    // `brain/<cid>/.system_generated/logs/transcript_full.jsonl` is the file
-    // every hook payload stamps as `transcriptPath`. Link it into the durable
-    // per-execution store now, before the CLI can write a conversation, so the
-    // transcript outlives this home.
-    provision_durable_brain(&process_home)?;
+    // Worker homes: `brain/<cid>/.system_generated/logs/transcript_full.jsonl`
+    // is the file every hook payload stamps as `transcriptPath`. Link it into
+    // the durable per-execution store now, before the CLI can write a
+    // conversation, so the transcript outlives this home.
+    // Quota probes are not recorded on work_executions, so the retention
+    // sweep never owns their store entries; they skip the durable link and
+    // delete the whole container after the command (see reclaim_quota_probe_container).
+    if probe_models {
+        provision_durable_brain(&process_home)?;
+    }
     let hooks_dir = process_home.join(HOOKS_DIR_RELATIVE);
     fs::create_dir_all(&hooks_dir).with_context(|| format!("creating hooks directory {}", hooks_dir.display()))?;
 
@@ -493,7 +516,7 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
 
     assert_agy_posture(&process_home, workspace)?;
 
-    if !skip_posture_assert() {
+    if probe_models && !skip_posture_assert() {
         probe_agy_models(&environment).context("live agy models posture probe")?;
         // The probe is a CLI start in this home, and a start does not leave
         // the private settings as they were written above.
@@ -722,6 +745,20 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Delete a quota-probe container entirely.
+///
+/// Quota probes are not recorded on `work_executions`, so the agy
+/// home-retention sweep never owns them. Delete the canonical container before
+/// provisioning to reclaim an interrupted probe, and again after the command.
+pub(super) fn reclaim_quota_probe_container(container: &Path) -> anyhow::Result<()> {
+    assert_agy_home_safe_to_delete(container)?;
+    match fs::remove_dir_all(container) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("deleting quota probe container {}", container.display())),
+    }
 }
 
 /// Remove run state at teardown.
