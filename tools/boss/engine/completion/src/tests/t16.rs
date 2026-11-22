@@ -366,6 +366,27 @@ async fn stop_refuses_to_bind_a_pr_that_belongs_to_another_work_item() {
             .any(|item| item.kind == crate::pr_binding_guard::FOREIGN_PR_REFUSED_ATTENTION_KIND),
         "the refusal is surfaced as an attention item",
     );
+    assert!(
+        db.list_attention_items_for_work_item(&other.id)
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.kind == boss_engine_storage_values::attention_kinds::ATTENTION_KIND_PR_BINDING_REPAIR
+                    && item.status == "open"
+            }),
+        "the mis-bound holder is flagged for repair",
+    );
+    db.reconcile_stale_attention_signals().unwrap();
+    assert!(
+        db.list_attention_items_for_work_item(&other.id)
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item.kind == boss_engine_storage_values::attention_kinds::ATTENTION_KIND_PR_BINDING_REPAIR
+                    && item.status == "open"
+            }),
+        "reconciliation must not clear a still-wrong holder binding just because pr_url is set",
+    );
 }
 
 /// A `delivered` declaration parked by a GitHub outage must not stay parked
@@ -1130,7 +1151,7 @@ async fn late_recovery_checks_base_for_fresh_and_merged_prs() {
                 .count();
             if merged {
                 // Merging into a non-default base is not delivery. Late recovery
-                // refuses the bind, files a HumanDecision attention, and leaves
+                // refuses the bind, files `pr_merged_unsupported_base`, and leaves
                 // the work unfinished. A lookup failure stays retryable.
                 assert_eq!(task.status, TaskStatus::Active);
                 assert!(task.pr_url.is_none());
@@ -1138,7 +1159,10 @@ async fn late_recovery_checks_base_for_fresh_and_merged_prs() {
                 if transient {
                     assert!(matches!(outcome, StopOutcome::DetectorFailed), "{outcome:?}");
                 } else {
-                    assert!(matches!(outcome, StopOutcome::ForeignPrRefused { .. }), "{outcome:?}");
+                    assert!(
+                        matches!(outcome, StopOutcome::MergedUnsupportedBaseRefused { .. }),
+                        "{outcome:?}"
+                    );
                     assert!(
                         db.list_attention_items_for_work_item(&work_item_id)
                             .unwrap()
@@ -1175,6 +1199,65 @@ async fn late_recovery_checks_base_for_fresh_and_merged_prs() {
             }
         }
     }
+}
+
+struct CountingRefusedMergedChecker(std::sync::atomic::AtomicUsize);
+impl crate::work::PrStateChecker for CountingRefusedMergedChecker {
+    fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {
+        Ok(crate::work::PrOpenState::Merged)
+    }
+    fn base_verdict(&self, _: &str) -> anyhow::Result<crate::work::PrBaseVerdict> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::work::PrBaseVerdict::Refused("feature/parent".into()))
+    }
+}
+
+#[tokio::test]
+async fn late_recovery_merged_refusal_is_probed_once() {
+    let (_dir, db, _, work_item_id, execution_id) = abandoned_execution_fixture();
+    let checker = Arc::new(CountingRefusedMergedChecker(std::sync::atomic::AtomicUsize::new(0)));
+    let handler = TestHarness::new(
+        db.clone(),
+        StubPrDetector::ok_status(PrStatus::Merged { url: OWN_PR.into() }),
+    )
+    .handler
+    .with_pr_state_checker(checker.clone());
+    let candidate = crate::work::LatePrCandidate {
+        execution_id: execution_id.clone(),
+        work_item_id: work_item_id.clone(),
+        repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+        branch_naming: BranchNaming::BossExecPrefix,
+        worker_branch_prefix: None,
+    };
+    assert!(matches!(
+        handler.recheck_for_pr_late(&candidate).await,
+        StopOutcome::MergedUnsupportedBaseRefused { .. }
+    ));
+    assert_eq!(checker.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    db.resolve_external_tracker_attention(
+        &work_item_id,
+        boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE,
+    )
+    .unwrap();
+    assert!(matches!(
+        handler.recheck_for_pr_late(&candidate).await,
+        StopOutcome::MergedUnsupportedBaseRefused { .. }
+    ));
+    assert_eq!(
+        checker.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a recorded (including resolved) refusal must not re-probe GitHub"
+    );
+    assert!(
+        db.list_attention_items_for_work_item(&work_item_id)
+            .unwrap()
+            .iter()
+            .all(|item| {
+                item.kind != boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE
+                    || item.status != "open"
+            }),
+        "a human-resolved row must not be re-created"
+    );
 }
 
 struct CountingBaseChecker(std::sync::atomic::AtomicUsize);
@@ -1251,7 +1334,10 @@ async fn merged_pr_on_non_default_base_fails_without_completing() {
     let outcome = handler
         .finalize_pr_transition(&execution_id, OWN_PR.into(), WorkerPrCompletionTarget::Done, "test")
         .await;
-    assert!(matches!(outcome, StopOutcome::ForeignPrRefused { .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, StopOutcome::MergedUnsupportedBaseRefused { .. }),
+        "{outcome:?}"
+    );
     assert_ne!(task_row(&db, &chore_id).status, TaskStatus::Done);
     assert!(task_row(&db, &chore_id).pr_url.is_none());
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
@@ -1329,7 +1415,10 @@ async fn finalize_declared_delivery_fails_merged_pr_on_non_default_base() {
     let outcome = handler
         .finalize_declared_delivery(&db.get_execution(&execution_id).unwrap())
         .await;
-    assert!(matches!(outcome, StopOutcome::ForeignPrRefused { .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, StopOutcome::MergedUnsupportedBaseRefused { .. }),
+        "{outcome:?}"
+    );
     assert_ne!(task_row(&db, &chore_id).status, TaskStatus::Done);
     assert!(task_row(&db, &chore_id).pr_url.is_none());
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);

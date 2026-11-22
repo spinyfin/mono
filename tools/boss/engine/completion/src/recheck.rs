@@ -473,9 +473,22 @@ impl WorkerCompletionHandler {
         let merged = matches!(pr_status, PrStatus::Merged { .. });
         // A new bind of an open PR on a non-default base parks for a retarget.
         // A new bind of a PR already merged into a non-default base cannot be
-        // retargeted: file a HumanDecision attention, leave the work unbound,
-        // and fail a still-live execution. Closed-unmerged PRs never reach
-        // this arm.
+        // retargeted: file a `pr_merged_unsupported_base` attention, leave the
+        // work unbound, and fail a still-live execution. Closed-unmerged PRs
+        // never reach this arm. An already-recorded row for this PR skips the
+        // base probe so a late-recovery pass does not re-log or re-upsert.
+        if merged && self.already_recorded_merged_unsupported_base(&candidate.work_item_id, &pr_url) {
+            tracing::info!(
+                execution_id = %candidate.execution_id,
+                work_item_id = %candidate.work_item_id,
+                pr_url = %pr_url,
+                "pr-recheck-late: merged unsupported-base refusal already recorded; skipping re-probe",
+            );
+            return StopOutcome::MergedUnsupportedBaseRefused {
+                pr_url,
+                detail: "already recorded merged unsupported-base refusal".into(),
+            };
+        }
         match crate::work::bounded_base_verdict(
             Arc::clone(&self.pr_state_checker),
             &pr_url,

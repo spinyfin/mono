@@ -675,6 +675,8 @@ async fn manual_pr_binding_resolves_abandoned_branch_attentions() {
     let kinds = [
         boss_engine_storage_values::attention_kinds::ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
         boss_engine_storage_values::attention_kinds::ATTENTION_KIND_ABANDONED_BRANCH_PR_BASE_UNREADABLE,
+        boss_engine_storage_values::attention_kinds::ATTENTION_KIND_PR_BINDING_UNRESOLVED,
+        boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE,
     ];
     let ids = kinds.map(|kind| open_attention_for_work_item(&db, &chore.id, kind, 1000));
     assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
@@ -686,7 +688,7 @@ async fn manual_pr_binding_resolves_abandoned_branch_attentions() {
         },
     )
     .unwrap();
-    assert_eq!(run_one_pass(&db).await.attentions_resolved, 2);
+    assert_eq!(run_one_pass(&db).await.attentions_resolved, 4);
     for id in ids {
         assert_eq!(attention_status(&db, &id).0, "resolved");
     }

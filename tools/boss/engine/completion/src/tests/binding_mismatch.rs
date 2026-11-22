@@ -67,6 +67,14 @@ async fn finalize_pr_transition_does_not_treat_a_binding_mismatch_as_merged() {
         reasons.iter().all(|reason| reason != "worker_pr_merged"),
         "mismatch must not publish a merged reason, got {reasons:?}"
     );
+    db.reconcile_stale_attention_signals().unwrap();
+    assert!(
+        db.list_attention_items_for_work_item(&chore_id)
+            .unwrap()
+            .iter()
+            .any(|item| item.kind == ATTENTION_KIND_PR_BINDING_REPAIR && item.status == "open"),
+        "reconciliation must not clear a still-wrong binding just because pr_url is set"
+    );
 }
 
 #[tokio::test]

@@ -174,10 +174,10 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         PR_MERGED_UNSUPPORTED_BASE,
-        ClearedBy::HumanDecision,
+        ClearedBy::WorkItemPrBound,
         "The PR already merged into a branch other than the repository default, so it cannot be retargeted. Failing \
-         the execution does not undo that merge; a human decides whether to reopen onto the default branch or close \
-         the work.",
+         the execution does not undo that merge. Binding a PR on the work item is the evidence a human has taken \
+         over (reopened onto the default branch, or bound a replacement), so reconciliation clears it then.",
     ),
     entry(
         WORKSPACE_POSITIONING_REFUSED,
@@ -452,8 +452,15 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     ),
     entry(
         ATTENTION_KIND_PR_BINDING_REPAIR,
+        ClearedBy::ProducerReconciles,
+        "Filed while a non-empty binding is still present and still wrong (exhausted GitHub retries, a \
+         foreign-PR holder, or a merge observed on a different PR). The producer resolves it after \
+         confirming or replacing the binding; a bound `pr_url` is not evidence the warning is over.",
+    ),
+    entry(
+        ATTENTION_KIND_PR_BINDING_UNRESOLVED,
         ClearedBy::WorkItemPrBound,
-        "The repair sweep files this when it cannot adopt a replacement PR and parks the row. \
+        "The repair sweep files this when it clears a wrong binding and cannot adopt a replacement. \
          Reconciliation clears it once the work item has a bound PR, including a manual \
          `boss task update --pr-url` after the sweep has dropped the row.",
     ),

@@ -442,8 +442,8 @@ pub const PR_BASE_REFUSED: &str = "pr_base_refused";
 /// A newly bound PR has already merged into a branch other than the
 /// repository default. It cannot be retargeted, so the execution fails
 /// visibly instead of parking for a retarget, and the work item stays
-/// unfinished. [`attention_lifecycle::ClearedBy::HumanDecision`]: merging
-/// into the wrong base is a fact a later success does not undo.
+/// unfinished. [`attention_lifecycle::ClearedBy::WorkItemPrBound`]: a later
+/// bind of a replacement PR is the evidence a human has taken over.
 pub const PR_MERGED_UNSUPPORTED_BASE: &str = "pr_merged_unsupported_base";
 
 /// Cube refused to position a workspace because the repository state needs
@@ -542,7 +542,17 @@ pub const REVIEW_DESIGN_DOC_UNRESOLVED_ATTENTION_KIND: &str = "review_design_doc
 /// open rows of this kind, so its lifecycle stays registered to clear them.
 pub const LEGACY_QUESTION_RESUME_DISPATCH_FAILED_ATTENTION_KIND: &str = "question_resume_dispatch_failed";
 
-/// `work_attention_items.kind` filed when a row's binding could not be
-/// repaired automatically (no PR on its branch, a foreign PR, or repeated
-/// GitHub failures).
+/// `work_attention_items.kind` filed when a row's binding is still present
+/// and still wrong: GitHub retries for the repair sweep are exhausted, a
+/// foreign-PR holder was flagged, or a worker observed a merge of a PR that
+/// is not the bound one. The producer resolves it after confirming or
+/// replacing the binding; a non-empty `pr_url` is not enough, because that
+/// URL may be the suspect one.
 pub const ATTENTION_KIND_PR_BINDING_REPAIR: &str = "pr_binding_repair";
+
+/// `work_attention_items.kind` filed when the repair sweep clears a wrong
+/// binding and cannot adopt a replacement (no PR on the execution's branch,
+/// an open PR on a non-default base, or a PR already bound to another row).
+/// Distinct from [`ATTENTION_KIND_PR_BINDING_REPAIR`] so a still-wrong
+/// non-empty binding is not auto-cleared by the generic reconciler.
+pub const ATTENTION_KIND_PR_BINDING_UNRESOLVED: &str = "pr_binding_unresolved";

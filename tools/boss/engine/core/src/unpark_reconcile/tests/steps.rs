@@ -585,6 +585,7 @@ async fn every_worker_failure_reaches_step_7_without_a_step_5_redispatch() {
         WorkerFailureBasis::NudgeBreaker,
         WorkerFailureBasis::DeliveredWithoutPr,
         WorkerFailureBasis::ForeignPrBinding,
+        WorkerFailureBasis::MergedUnsupportedBase,
     ] {
         let f = Fixture::new();
         let chore = f.worker_failed(basis.as_str(), basis);

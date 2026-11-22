@@ -412,6 +412,11 @@ pub enum WorkerFailureBasis {
     DeclaredBlocked,
     DeliveredWithoutPr,
     ForeignPrBinding,
+    /// A new bind of a PR that has already merged into a branch other than
+    /// the repository default. Distinct from [`Self::ForeignPrBinding`]: the
+    /// PR is not held by another work item; it is not a deliverable because
+    /// it cannot be retargeted.
+    MergedUnsupportedBase,
     OperatorNo,
 }
 
@@ -433,6 +438,7 @@ worker_failure_basis_variants! {
     DeclaredBlocked => "declared_blocked",
     DeliveredWithoutPr => "delivered_without_pr",
     ForeignPrBinding => "foreign_pr_binding",
+    MergedUnsupportedBase => "merged_unsupported_base",
     OperatorNo => "operator_no",
 }
 

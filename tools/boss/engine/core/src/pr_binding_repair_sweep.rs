@@ -83,7 +83,9 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// sweep files an attention item and stops retrying until restart.
 pub const MAX_ATTEMPTS_PER_TASK: u32 = 3;
 
-pub use boss_engine_storage_values::attention_kinds::ATTENTION_KIND_PR_BINDING_REPAIR;
+pub use boss_engine_storage_values::attention_kinds::{
+    ATTENTION_KIND_PR_BINDING_REPAIR, ATTENTION_KIND_PR_BINDING_UNRESOLVED,
+};
 
 /// Scans without mutating so a failed GitHub read preserves the repair signal.
 /// A successful scan may contain no unambiguous doc path.
@@ -391,7 +393,13 @@ async fn repair_candidate(
                 bound = candidate.bound_pr_url,
                 searched = branches.join(", "),
             );
-            return park_unresolved(work_db, candidate, &detail, outcome);
+            return park_unresolved(
+                work_db,
+                candidate,
+                &detail,
+                Some(ATTENTION_KIND_PR_BINDING_UNRESOLVED),
+                outcome,
+            );
         }
     };
     match crate::work::bounded_base_verdict(Arc::clone(&pr_checker), &own_pr_url, crate::work::PR_QUERY_TIMEOUT).await {
@@ -415,9 +423,14 @@ async fn repair_candidate(
             tracing::warn!(
                 task_id = %candidate.task_id,
                 own_pr_url,
+                merged,
                 %reason,
                 "pr-binding-repair sweep: PR on the execution's branch targets a non-default base; clearing the foreign binding",
             );
+            if merged {
+                file_merged_unsupported_base_attention(work_db, &candidate.task_id, &own_pr_url, &reason);
+                return park_unresolved(work_db, candidate, "", None, outcome);
+            }
             let detail = format!(
                 "This row was bound to {bound}, a PR its own execution (`{exec}`) did not open. The PR on its \
                  branch `{expected_branch}`, {own_pr_url}, cannot replace that binding because {reason}. The engine \
@@ -426,7 +439,13 @@ async fn repair_candidate(
                 bound = candidate.bound_pr_url,
                 exec = candidate.execution_id,
             );
-            return park_unresolved(work_db, candidate, &detail, outcome);
+            return park_unresolved(
+                work_db,
+                candidate,
+                &detail,
+                Some(ATTENTION_KIND_PR_BINDING_UNRESOLVED),
+                outcome,
+            );
         }
         Err(err) => return Err(Inconclusive::GitHub(format!("checking PR base: {err:#}"))),
     }
@@ -438,7 +457,13 @@ async fn repair_candidate(
             bound = candidate.bound_pr_url,
             exec = candidate.execution_id,
         );
-        return park_unresolved(work_db, candidate, &detail, outcome);
+        return park_unresolved(
+            work_db,
+            candidate,
+            &detail,
+            Some(ATTENTION_KIND_PR_BINDING_UNRESOLVED),
+            outcome,
+        );
     }
     let scan = doc_refresher
         .scan(&candidate.task_id, &own_pr_url)
@@ -530,13 +555,22 @@ fn park_unresolved(
     work_db: &WorkDb,
     candidate: &PrBindingRepairCandidate,
     detail: &str,
+    attention_kind: Option<&'static str>,
     outcome: &mut PrBindingRepairOutcome,
 ) -> Result<(), Inconclusive> {
+    let park_detail = if detail.is_empty() {
+        format!(
+            "This row was bound to {}, a PR its own execution did not open. The engine cleared the wrong binding.",
+            candidate.bound_pr_url
+        )
+    } else {
+        detail.to_owned()
+    };
     match work_db.mark_task_pr_binding_unresolved(
         &candidate.task_id,
         &candidate.execution_id,
         &candidate.bound_pr_url,
-        detail,
+        &park_detail,
     ) {
         Ok(true) => {
             outcome.unresolved += 1;
@@ -546,7 +580,15 @@ fn park_unresolved(
                 bound_pr_url = %candidate.bound_pr_url,
                 "pr-binding-repair sweep: cleared a binding to a PR this row did not open; no PR on its own branch — parked visibly",
             );
-            file_attention(work_db, candidate, detail);
+            if let Some(kind) = attention_kind {
+                upsert_attention(
+                    work_db,
+                    candidate,
+                    kind,
+                    "Bound to a PR this work item did not open",
+                    &park_detail,
+                );
+            }
         }
         Ok(false) => {}
         Err(err) => {
@@ -557,13 +599,47 @@ fn park_unresolved(
 }
 
 fn file_attention(work_db: &WorkDb, candidate: &PrBindingRepairCandidate, body: &str) {
-    upsert_attention(work_db, candidate, "Bound to a PR this work item did not open", body);
+    upsert_attention(
+        work_db,
+        candidate,
+        ATTENTION_KIND_PR_BINDING_REPAIR,
+        "Bound to a PR this work item did not open",
+        body,
+    );
 }
 
-fn upsert_attention(work_db: &WorkDb, candidate: &PrBindingRepairCandidate, title: &str, body: &str) {
-    if let Err(err) =
-        work_db.upsert_external_tracker_attention(&candidate.task_id, ATTENTION_KIND_PR_BINDING_REPAIR, title, body)
-    {
+fn file_merged_unsupported_base_attention(work_db: &WorkDb, work_item_id: &str, pr_url: &str, reason: &str) {
+    use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
+    let already = work_db
+        .list_attention_items_for_work_item(work_item_id)
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|item| item.kind == PR_MERGED_UNSUPPORTED_BASE && item.body_markdown.contains(pr_url));
+    if already {
+        return;
+    }
+    let detail = format!(
+        "{pr_url}: {reason}. The PR has merged into a branch other than the repository default, \
+         so it cannot be retargeted and is not a deliverable. The work item is unfinished and \
+         dependents stay blocked."
+    );
+    if let Err(err) = work_db.upsert_external_tracker_attention(
+        work_item_id,
+        PR_MERGED_UNSUPPORTED_BASE,
+        "PR merged into an unsupported base",
+        &detail,
+    ) {
+        tracing::warn!(
+            work_item_id,
+            ?err,
+            "pr-binding-repair sweep: failed to file merged-unsupported-base attention",
+        );
+    }
+}
+
+fn upsert_attention(work_db: &WorkDb, candidate: &PrBindingRepairCandidate, kind: &str, title: &str, body: &str) {
+    if let Err(err) = work_db.upsert_external_tracker_attention(&candidate.task_id, kind, title, body) {
         tracing::warn!(task_id = %candidate.task_id, ?err, "pr-binding-repair sweep: failed to file attention item");
     }
 }
@@ -723,7 +799,7 @@ mod tests {
         let items = db.list_attention_items_for_work_item(&task_id).unwrap();
         let item = items
             .iter()
-            .find(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR)
+            .find(|a| a.kind == ATTENTION_KIND_PR_BINDING_UNRESOLVED)
             .expect("refusal is surfaced");
         assert!(item.body_markdown.contains(OWN) && item.body_markdown.contains(ORIGIN));
         assert!(item.body_markdown.contains("feature base") && item.body_markdown.contains("Retarget"));
@@ -885,7 +961,7 @@ mod tests {
         assert!(docs.0.lock().unwrap().is_empty());
         let items = db.list_attention_items_for_work_item(&task_id).unwrap();
         assert!(items.iter().any(|a| {
-            a.kind == ATTENTION_KIND_PR_BINDING_REPAIR
+            a.kind == ATTENTION_KIND_PR_BINDING_UNRESOLVED
                 && a.status == "open"
                 && a.body_markdown.contains("feature/parent")
         }));
@@ -975,7 +1051,7 @@ mod tests {
             db.list_attention_items_for_work_item(&task_id)
                 .unwrap()
                 .iter()
-                .any(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR)
+                .any(|a| a.kind == ATTENTION_KIND_PR_BINDING_UNRESOLVED)
         );
     }
 
@@ -1097,7 +1173,63 @@ mod tests {
                 .iter()
                 .any(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR)
         );
+        db.reconcile_stale_attention_signals().unwrap();
+        assert!(
+            db.list_attention_items_for_work_item(&task_id)
+                .unwrap()
+                .iter()
+                .any(|a| a.kind == ATTENTION_KIND_PR_BINDING_REPAIR && a.status == "open"),
+            "reconciliation must not clear a still-wrong binding just because pr_url is set"
+        );
     }
+
+    #[tokio::test]
+    async fn merged_non_default_own_pr_does_not_file_a_retarget_park_card() {
+        use boss_engine_storage_values::attention_kinds::PR_MERGED_UNSUPPORTED_BASE;
+        let (_dir, db) = open_db();
+        let (_, task_id, _) = mis_bound_followup(&db, ORIGIN);
+        db.upsert_work_item_attention(
+            &task_id,
+            PR_MERGED_UNSUPPORTED_BASE,
+            "PR merged into an unsupported base",
+            &format!(
+                "{OWN}: feature base. The PR has merged into a branch other than the repository default, \
+                 so it cannot be retargeted and is not a deliverable. The work item is unfinished and \
+                 dependents stay blocked."
+            ),
+        )
+        .unwrap();
+        let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_foreign".into())]));
+        let checker = FakePrStateChecker::always(PrOpenState::Merged)
+            .with_base(crate::work::PrBaseVerdict::Refused("feature base".into()));
+        let outcome = run_one_pass(
+            &db,
+            &FixedDetector(PrStatus::Merged { url: OWN.into() }, StdMutex::default()),
+            &verifier,
+            Arc::new(checker),
+            &RecordingDocRefresher::default(),
+            &mut HashMap::new(),
+        )
+        .await;
+        assert_eq!(outcome.rebound, 0);
+        assert_eq!(outcome.base_refused, 1);
+        assert_eq!(task(&db, &task_id).pr_url, None);
+        let open: Vec<_> = db
+            .list_attention_items_for_work_item(&task_id)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].kind, PR_MERGED_UNSUPPORTED_BASE);
+        assert!(
+            open.iter().all(|a| !a.body_markdown.contains("Retarget the PR")),
+            "{open:?}"
+        );
+        assert!(open.iter().all(|a| a.kind != ATTENTION_KIND_PR_BINDING_UNRESOLVED));
+        assert!(open.iter().all(|a| a.kind != ATTENTION_KIND_PR_BINDING_REPAIR));
+    }
+
     /// Second primary execution on `task_id` (a resume / bounce-back), newer
     /// than the first and never pushed.
     fn add_resumed_execution(db: &WorkDb, task_id: &str) -> String {
