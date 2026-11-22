@@ -112,7 +112,13 @@ pub(super) enum DeclaredPrResolution {
     /// [`PrStatus::Merged`]: the deliverable is done, not reviewable.
     Bound { pr_url: String, merged: bool },
     /// GitHub answered, but the PR targets a non-default branch.
-    BaseRefused { pr_url: String, reason: String },
+    /// `merged` is true when that PR has already landed: it cannot be
+    /// retargeted, so the caller fails the execution instead of parking.
+    BaseRefused {
+        pr_url: String,
+        reason: String,
+        merged: bool,
+    },
     /// GitHub answered and there is definitively no PR on this execution's
     /// branch. `detail` names the branch, what the detector saw and which
     /// staged URLs were rejected; it becomes the row's visible failure.
@@ -376,7 +382,9 @@ impl WorkerCompletionHandler {
         let check = tokio::task::spawn_blocking(move || checker.check(&url));
         match tokio::time::timeout(DECLARED_DELIVERY_NETWORK_BUDGET, check).await {
             Ok(Ok(Ok(crate::work::PrOpenState::Open))) => self.resolve_declared_pr_base(execution, pr_url, false).await,
-            Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => DeclaredPrResolution::Bound { pr_url, merged: true },
+            Ok(Ok(Ok(crate::work::PrOpenState::Merged))) => {
+                self.resolve_declared_pr_base(execution, pr_url, true).await
+            }
             Ok(Ok(Ok(crate::work::PrOpenState::ClosedUnmerged))) => DeclaredPrResolution::ClosedUnmerged { pr_url },
             result => DeclaredPrResolution::Transient {
                 detail: format!("could not determine state of PR {pr_url}: {result:?}"),
@@ -390,9 +398,11 @@ impl WorkerCompletionHandler {
         pr_url: String,
         merged: bool,
     ) -> DeclaredPrResolution {
-        // A merged PR can no longer be retargeted. Revisions and already-bound
-        // PRs are not new binds, so the default-branch policy does not apply.
-        if merged || !self.binds_new_pr(execution, &pr_url) {
+        // Revisions and already-bound PRs are not new binds, so the
+        // default-branch policy does not apply. A new bind of a merged PR
+        // still has to target the default branch: merging into another
+        // branch is not delivery.
+        if !self.binds_new_pr(execution, &pr_url) {
             return DeclaredPrResolution::Bound { pr_url, merged };
         }
         match crate::work::bounded_base_verdict(
@@ -403,7 +413,7 @@ impl WorkerCompletionHandler {
         .await
         {
             Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
-                return DeclaredPrResolution::BaseRefused { pr_url, reason };
+                return DeclaredPrResolution::BaseRefused { pr_url, reason, merged };
             }
             Ok(_) => {}
             Err(err) => {
@@ -434,7 +444,12 @@ impl WorkerCompletionHandler {
         let resolution = self.resolve_declared_pr_url(execution).await;
         let (pr_url, mut merged, mut closed_unmerged) = match resolution {
             DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged, false),
-            DeclaredPrResolution::BaseRefused { pr_url, reason } => {
+            DeclaredPrResolution::BaseRefused { pr_url, reason, merged } => {
+                if merged {
+                    return self
+                        .refuse_merged_unsupported_base(execution, &pr_url, &reason, "declared_delivery")
+                        .await;
+                }
                 self.record_pr_base_refusal(execution, &pr_url, &reason).await;
                 let detail = format!("{pr_url}: {reason}. Retarget the PR before completing delivery.");
                 return StopOutcome::PrBaseRefused { pr_url, detail };

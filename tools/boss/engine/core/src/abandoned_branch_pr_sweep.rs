@@ -726,13 +726,11 @@ async fn bind_and_record(
         }
         Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
             tracing::warn!(%reason, pr_url, "abandoned PR base refused; leaving binding untouched");
-            if let Err(err) = work_db.upsert_work_item_attention(
+            if let Err(err) = work_db.resolve_external_tracker_attention(
                 &candidate.work_item_id,
                 boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
-                "PR base could not be accepted",
-                &format!("Cannot bind {pr_url}: {reason}"),
             ) {
-                tracing::warn!(?err, "could not surface recovered PR base refusal");
+                tracing::warn!(?err, "could not clear recovered PR base refusal");
             }
             outcome.base_refused += 1;
             failure_counts.remove(&candidate.execution_id);
@@ -1225,6 +1223,13 @@ mod tests {
     async fn pr_on_a_non_default_base_is_not_adopted() {
         let (_dir, db) = open_db();
         let (chore_id, _exec_id) = make_candidate_chore(&db, "stacked-pr");
+        db.upsert_work_item_attention(
+            &chore_id,
+            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+            "PR base could not be accepted",
+            "Cannot bind https://github.com/foo/bar/pull/8: leftover",
+        )
+        .unwrap();
         let detector = FixedPrDetector(PrStatus::Merged {
             url: "https://github.com/foo/bar/pull/8".to_owned(),
         });
@@ -1247,9 +1252,33 @@ mod tests {
         assert!(pr_url.is_none());
         let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
         assert!(items.iter().any(|a| {
-            a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+            a.kind == ATTENTION_KIND_ABANDONED_BRANCH_NO_PR
+                && a.status == "open"
                 && a.body_markdown.contains("feature/parent")
         }));
+        assert!(
+            items.iter().all(|a| {
+                a.kind != boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED || a.status != "open"
+            })
+        );
+
+        db.update_work_item(
+            &chore_id,
+            WorkItemPatch {
+                pr_url: Some("https://github.com/foo/bar/pull/8".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.reconcile_stale_attention_signals().unwrap();
+        assert!(
+            db.list_attention_items_for_work_item(&chore_id)
+                .unwrap()
+                .iter()
+                .all(|a| a.status != "open"),
+            "manual bind must leave no open attention: {:?}",
+            db.list_attention_items_for_work_item(&chore_id).unwrap()
+        );
     }
 
     #[tokio::test]

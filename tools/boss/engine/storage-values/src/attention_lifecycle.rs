@@ -36,7 +36,7 @@
 //!
 //! A signal comes down when, and only when, there is positive evidence that
 //! the condition it describes is over. Not on a timer, not on a lane change,
-//! not on operator hand-dismissal. [`ClearedBy`] enumerates the five shapes
+//! not on operator hand-dismissal. [`ClearedBy`] enumerates the six shapes
 //! that evidence can take, and every kind below declares one — including
 //! the kinds whose honest answer is "a human has to decide this", which are
 //! marked [`ClearedBy::HumanDecision`] rather than left silently blank.
@@ -167,9 +167,17 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         PR_BASE_REFUSED,
         ClearedBy::OwningExecutionTerminal,
         "The completion guard parks a live execution until the PR is retargeted. Once that execution is cancelled, \
-         failed, reaped, or completed (including via the merged/closed or already-bound bypass), the parked condition \
-         is over and the retarget remedy no longer applies. Producers also resolve it on a successful default-branch \
-         observation or a later bind.",
+         failed, reaped, or completed (including via a closed-unmerged or already-bound bypass), the parked condition \
+         is over and the retarget remedy no longer applies. A PR merged into a non-default base fails the execution \
+         instead of parking and uses `pr_merged_unsupported_base`. Producers also resolve this kind on a successful \
+         default-branch observation or a later bind.",
+    ),
+    entry(
+        PR_MERGED_UNSUPPORTED_BASE,
+        ClearedBy::HumanDecision,
+        "The PR already merged into a branch other than the repository default, so it cannot be retargeted. Failing \
+         the execution does not undo that merge; a human decides whether to reopen onto the default branch or close \
+         the work.",
     ),
     entry(
         WORKSPACE_POSITIONING_REFUSED,
@@ -441,6 +449,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::ProducerReconciles,
         "Same coordinator-ack contract as `worker_escalation`: the marker pauses this run's auto-nudge \
          loop until the coordinator answers, so only the probe may lower it.",
+    ),
+    entry(
+        ATTENTION_KIND_PR_BINDING_REPAIR,
+        ClearedBy::WorkItemPrBound,
+        "The repair sweep files this when it cannot adopt a replacement PR and parks the row. \
+         Reconciliation clears it once the work item has a bound PR, including a manual \
+         `boss task update --pr-url` after the sweep has dropped the row.",
     ),
     entry(
         ATTENTION_KIND_ABANDONED_BRANCH_NO_PR,
@@ -764,6 +779,7 @@ mod tests {
         assert!(ClearedBy::WorkResumed.is_automatic());
         assert!(ClearedBy::ExecutionKindCompleted(ExecutionKind::PrReview).is_automatic());
         assert!(ClearedBy::OwningExecutionTerminal.is_automatic());
+        assert!(ClearedBy::WorkItemPrBound.is_automatic());
         assert!(!ClearedBy::ProducerReconciles.is_automatic());
         assert!(!ClearedBy::HumanDecision.is_automatic());
     }

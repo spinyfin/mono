@@ -1484,7 +1484,8 @@ pub struct WorkerCompletionHandler {
     /// The 30s pending-finalize sweep consults this so a parked run does not
     /// re-query GitHub or re-publish attention on every tick.
     #[builder(skip)]
-    pr_base_refusal_next_check: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    pr_base_refusal_next_check:
+        std::sync::Mutex<std::collections::HashMap<String, pending_finalize::PrBaseRefusalPark>>,
     work_db: Arc<WorkDb>,
     pr_detector: Arc<dyn PrDetector>,
     /// Verifies the worker's recorded workspace is genuinely empty before a

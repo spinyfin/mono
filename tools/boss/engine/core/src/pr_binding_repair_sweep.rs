@@ -405,13 +405,11 @@ async fn repair_candidate(
         }
         Ok(crate::work::PrBaseVerdict::NotChecked) => {}
         Ok(crate::work::PrBaseVerdict::Refused(reason)) => {
-            if let Err(err) = work_db.upsert_work_item_attention(
+            if let Err(err) = work_db.resolve_external_tracker_attention(
                 &candidate.task_id,
                 boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
-                "PR base could not be accepted",
-                &format!("Cannot bind {own_pr_url}: {reason}"),
             ) {
-                tracing::warn!(?err, "could not surface recovered PR base refusal");
+                tracing::warn!(?err, "could not clear recovered PR base refusal");
             }
             outcome.base_refused += 1;
             tracing::warn!(
@@ -859,6 +857,13 @@ mod tests {
     async fn pr_on_a_non_default_base_is_not_adopted_by_the_repair() {
         let (_dir, db) = open_db();
         let (_product, task_id, _exec_id) = mis_bound_followup(&db, ORIGIN);
+        db.upsert_work_item_attention(
+            &task_id,
+            boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED,
+            "PR base could not be accepted",
+            "Cannot bind leftover",
+        )
+        .unwrap();
         let verifier = MapVerifier(HashMap::from([(1757, "boss/exec_18dad2723a80ed10_23".to_owned())]));
         let detector = FixedDetector(PrStatus::Fresh { url: OWN.to_owned() }, StdMutex::default());
         let docs = RecordingDocRefresher::default();
@@ -878,14 +883,34 @@ mod tests {
         assert_eq!(outcome.base_refused, 1, "{outcome:?}");
         assert_eq!(task(&db, &task_id).pr_url.as_deref(), None);
         assert!(docs.0.lock().unwrap().is_empty());
+        let items = db.list_attention_items_for_work_item(&task_id).unwrap();
+        assert!(items.iter().any(|a| {
+            a.kind == ATTENTION_KIND_PR_BINDING_REPAIR
+                && a.status == "open"
+                && a.body_markdown.contains("feature/parent")
+        }));
+        assert!(
+            items
+                .iter()
+                .all(|a| a.kind != boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED || a.status != "open")
+        );
+
+        db.update_work_item(
+            &task_id,
+            crate::work::WorkItemPatch {
+                pr_url: Some(OWN.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        db.reconcile_stale_attention_signals().unwrap();
         assert!(
             db.list_attention_items_for_work_item(&task_id)
                 .unwrap()
                 .iter()
-                .any(|a| {
-                    a.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
-                        && a.body_markdown.contains("feature/parent")
-                })
+                .all(|a| a.status != "open"),
+            "manual bind must leave no open attention: {:?}",
+            db.list_attention_items_for_work_item(&task_id).unwrap()
         );
     }
 

@@ -439,6 +439,13 @@ pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 /// branch other than the repository default branch.
 pub const PR_BASE_REFUSED: &str = "pr_base_refused";
 
+/// A newly bound PR has already merged into a branch other than the
+/// repository default. It cannot be retargeted, so the execution fails
+/// visibly instead of parking for a retarget, and the work item stays
+/// unfinished. [`attention_lifecycle::ClearedBy::HumanDecision`]: merging
+/// into the wrong base is a fact a later success does not undo.
+pub const PR_MERGED_UNSUPPORTED_BASE: &str = "pr_merged_unsupported_base";
+
 /// Cube refused to position a workspace because the repository state needs
 /// repair (closed or merged PR, missing head, missing branch). This one string
 /// is the `tasks.blocked_reason`, the attention kind and the dispatch-wait

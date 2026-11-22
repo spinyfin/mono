@@ -123,10 +123,15 @@ impl WorkerCompletionHandler {
                 .refuse_foreign_pr_binding(&execution, &pr_url, &conflict, source)
                 .await;
         }
-        // A merged PR can no longer be retargeted, so the base policy only
-        // applies to a PR that is still open.
+        // Revisions and already-bound PRs skip the default-branch policy.
+        // A new bind of an open PR parks for a retarget; a new bind of a
+        // PR merged into a non-default base fails the execution instead,
+        // because that PR can no longer be retargeted. Closed-unmerged
+        // still skips the guard at this layer.
         if matches!(target, WorkerPrCompletionTarget::Done) {
-            self.resolve_pr_base_refusal_attention(&execution.id);
+            if let Some(outcome) = self.guard_merged_pr_base(&execution, &pr_url).await {
+                return outcome;
+            }
         } else if let Some(outcome) = self.guard_pr_base(&execution, &pr_url).await {
             return outcome;
         }
