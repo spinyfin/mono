@@ -1,5 +1,7 @@
 """Exercise BEP parsing and artifact/annotation publication without an agent."""
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -65,12 +67,49 @@ class ReportTest(unittest.TestCase):
             for path in paths:
                 self.assertIn('artifact://' + path, annotation)
 
+    def test_rust_failure_is_named_from_the_failed_attempt_log(self):
+        # A Rust test binary writes no XML: Bazel's stand-in names the wrapper
+        # script, and only the failed attempt's log names the test that failed.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            xml = root / 'test.xml'
+            xml.write_text('<testsuite><testcase name="pkg/flaky_test_wrapper.sh">'
+                           '<error message="exited with error code 101"/></testcase></testsuite>')
+            failed, passed = root / 'failed.log', root / 'passed.log'
+            failed.write_text('test other::case ... ok\n'
+                              'test suite::hangs has been running for over 60 seconds\n'
+                              'test suite::hangs ... FAILED\n\nfailures:\n    suite::hangs\n')
+            passed.write_text('test suite::hangs ... ok\ntest other::case ... ok\n')
+            events = [dict(id=dict(testResult=dict(label='//pkg:flaky', attempt=attempt)),
+                           testResult=dict(status=status, testActionOutput=[
+                               dict(name='test.log', uri=log.as_uri()),
+                               dict(name='test.xml', uri=xml.as_uri())]))
+                      for attempt, status, log in ((1, 'FAILED', failed), (2, 'PASSED', passed))]
+            events.append(dict(id=dict(testSummary=dict(label='//pkg:flaky')),
+                               testSummary=dict(overallStatus='FLAKY', totalRunCount=2)))
+            bep = root / 'events.json'
+            bep.write_text('\n'.join(map(json.dumps, events)))
+            report = reporter.collect(bep, root)
+            self.assertEqual(report['tests'][0]['test_cases'], ['suite::hangs'])
+            printed = io.StringIO()
+            with patch.object(reporter.subprocess, 'run') as run, redirect_stdout(printed):
+                reporter.publish(report, root)
+            # The annotation and the step's own log both name the test.
+            self.assertIn('suite::hangs', run.call_args.args[0][-1])
+            self.assertNotIn('flaky_test_wrapper.sh', run.call_args.args[0][-1])
+            lines = printed.getvalue().splitlines()
+            self.assertEqual(lines[0], '+++ [bazel-test] 1 flaky test target: failed, then passed on the retry')
+            self.assertIn('  //pkg:flaky (2 attempts)', lines)
+            self.assertIn('    suite::hangs', lines)
+
     def test_empty_report_uploads_artifact_without_warning(self):
         with tempfile.TemporaryDirectory() as temp:
-            with patch.object(reporter.subprocess, 'run') as run:
+            printed = io.StringIO()
+            with patch.object(reporter.subprocess, 'run') as run, redirect_stdout(printed):
                 reporter.publish(dict(tests=[]), Path(temp))
             self.assertEqual(run.call_count, 1)
             self.assertIn('flaky-tests.json', run.call_args.args[0])
+            self.assertEqual(printed.getvalue(), '')
 
     def test_invalid_bep_fails_loudly(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -76,18 +76,20 @@ def attrs_with_stamp(attrs):
 
 def _stamp_inputs_analysis_test_impl(ctx):
     target = ctx.attr.target_under_test
-    expect_stable_status = ctx.attr.expect_stable_status
-    has_stable_status = False
+    status_file = ctx.attr.status_file
+    expected = ctx.attr.expect_stable_status
+    found = False
     for action in target.actions:
         for f in action.inputs.to_list():
-            if f.basename == "stable-status.txt":
-                has_stable_status = True
+            if f.basename == status_file:
+                found = True
                 break
-    if has_stable_status != expect_stable_status:
-        msg = "expected stable-status.txt input=%s for %s, got %s" % (
-            expect_stable_status,
+    if found != expected:
+        msg = "expected %s input=%s for %s, got %s" % (
+            status_file,
+            expected,
             target.label,
-            has_stable_status,
+            found,
         )
         return [AnalysisTestResultInfo(success = False, message = msg)]
     return [AnalysisTestResultInfo(success = True, message = "OK")]
@@ -97,7 +99,15 @@ stamp_inputs_analysis_test = rule(
     analysis_test = True,
     attrs = {
         "target_under_test": attr.label(mandatory = True),
-        "expect_stable_status": attr.bool(mandatory = True),
+        "expect_stable_status": attr.bool(
+            mandatory = True,
+            doc = "Whether an action of the target must take `status_file` as an input.",
+        ),
+        "status_file": attr.string(
+            default = "stable-status.txt",
+            values = ["stable-status.txt", "volatile-status.txt"],
+            doc = "The workspace-status file to look for among the action inputs.",
+        ),
     },
-    doc = "Asserts whether target_under_test's actions take stable-status.txt as an input.",
+    doc = "Asserts whether target_under_test's actions take a workspace-status file as an input.",
 )

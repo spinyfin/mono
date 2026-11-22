@@ -6,7 +6,7 @@ use anyhow::bail;
 use boss_protocol::ReviewBatchPhase;
 
 use super::permanent_start_failure::{PermanentStartFailure, StartFailureAttention, StartFailureDetail};
-use super::spoke_in_doubt::waitable_spoke_lease;
+use super::spoke_in_doubt::{LeaseBackstopElapsed, lease_backstop_elapsed, waitable_spoke_lease};
 use super::*;
 
 /// The original dispatch failure is already visible in the event stream.
@@ -1350,8 +1350,16 @@ impl ExecutionCoordinator {
         // failed start. Hand back every claim this attempt holds (the per-repo
         // permit, the dispatch slot and the pool slot are all released when
         // this returns) and come back to the same stored lease command later.
+        //
+        // The coordinator's own backstop elapsing is no answer either. Once a
+        // spoke host holds the assignment (this attempt may be the one that
+        // stored its lease command) the host may have granted the lease, so
+        // that too is parked, as the repo-ensure backstop above already is.
         let lease_result = match lease_result {
-            Err(err) if waitable_spoke_lease(&err).is_some() => {
+            Err(err)
+                if waitable_spoke_lease(&err).is_some()
+                    || (lease_backstop_elapsed(&err) && self.held_by_spoke_host(&execution.id)) =>
+            {
                 if self.repo_lease_limiter.release(&execution.id) {
                     self.kick();
                 }
@@ -2502,10 +2510,7 @@ impl ExecutionCoordinator {
             // chain; that is a timeout just as much as the outer backstop.
             Ok(Err(err)) if err.chain().any(|cause| cause.is::<tokio::time::error::Elapsed>()) => Err(("timeout", err)),
             Ok(Err(err)) => Err(("cube_error", err)),
-            Err(_elapsed) => Err((
-                "timeout",
-                anyhow!("cube workspace lease timed out after {}s", timeout.as_secs()),
-            )),
+            Err(_elapsed) => Err(("timeout", anyhow::Error::new(LeaseBackstopElapsed(timeout)))),
         }
     }
 

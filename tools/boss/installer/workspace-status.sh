@@ -43,7 +43,8 @@ fi
 # the build_info_rs note below) — it goes to volatile-status.txt instead,
 # which Bazel already regenerates on every build without that forcing a
 # rebuild of unrelated actions; only `build_provenance_rs` (a dedicated,
-# intentionally-small genrule/crate — see its own doc comment) reads it.
+# intentionally-small rule/crate — see its own doc comment) reads it, and
+# only in a stamped (release) build.
 BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Compute a semantic version string from git tags (boss-v* prefix).
@@ -125,6 +126,7 @@ echo "STABLE_BOSS_GIT_DIRTY $DIRTY"
 echo "BUILD_EMBED_LABEL $BOSS_BASE_VERSION"
 
 # Goes to volatile-status.txt. Read ONLY by `build_provenance_rs`'s tiny,
-# dedicated crate (see above) — regenerating on every build is expected and
-# does not force a recompile of anything else.
+# dedicated crate (see above), and only under --stamp: an unstamped build
+# writes "unknown" and does not take the file as an input, so its engine
+# binaries are a function of the commit and not of when they were built.
 echo "BOSS_BUILD_TIME $BUILD_TIME"

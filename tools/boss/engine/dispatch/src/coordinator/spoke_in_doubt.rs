@@ -90,6 +90,14 @@ impl ExecutionCoordinator {
         err
     }
 
+    /// Whether a spoke host holds this execution's assignment right now (see
+    /// [`WorkDb::spoke_host_holding_execution`]): its lease command may have
+    /// been stored by the very attempt that is asking. A failed read answers
+    /// "no", which leaves the caller on the ordinary failed-start path.
+    pub(super) fn held_by_spoke_host(&self, execution_id: &str) -> bool {
+        matches!(self.work_db.spoke_host_holding_execution(execution_id), Ok(Some(_)))
+    }
+
     /// File the in-doubt attention item once the assignment has waited past
     /// `after`. Repeated calls refresh one item rather than adding more.
     pub(super) fn raise_spoke_in_doubt_attention(
@@ -533,6 +541,18 @@ impl ExecutionCoordinator {
 pub(super) fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeUncertain> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<LeaseOutcomeUncertain>())
+}
+
+/// The coordinator's own lease backstop elapsed before the transport returned.
+/// That is the absence of an answer, not an answer: it says nothing about
+/// whether the host granted the lease. Typed so the caller can tell it from a
+/// lease the host actually refused.
+#[derive(Debug, thiserror::Error)]
+#[error("cube workspace lease timed out after {}s", .0.as_secs())]
+pub(super) struct LeaseBackstopElapsed(pub(super) Duration);
+
+pub(super) fn lease_backstop_elapsed(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<LeaseBackstopElapsed>())
 }
 
 /// Whether the execution has been cancelled or finished. A failed read is not

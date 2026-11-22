@@ -269,39 +269,55 @@ binaries only). The user-facing release version in the app bundle is
 # ── build_provenance_rs ───────────────────────────────────────────────────────
 
 def _build_provenance_rs_impl(ctx):
-    """Emits a Rust source file with the real version/sha/dirty/build-time."""
+    """Emits a Rust source file with the version, sha, dirty flag and build time."""
     output = ctx.actions.declare_file(ctx.attr.out)
 
     # ctx.info_file (stable-status.txt) carries the commit-derived facts;
     # ctx.version_file (volatile-status.txt) carries the wall-clock build
-    # time, which Bazel already regenerates on every build regardless of
-    # what else changed. Both are read here — and ONLY here, never by
-    # build_info_rs above — so this per-commit/per-build stamping stays out
-    # of engine_lib's own source and lives in its own small, dedicated leaf
-    # crate (`boss-build-provenance`) that only the `engine` rust_binary
-    # targets link. That is what keeps the churn out of engine_lib's Bazel
-    # action cache: the output here changes every commit, so everything
-    # downstream of it rebuilds every commit, and the downstream set is
-    # deliberately just the two engine binaries (guarded by
-    # //tools/boss/engine/core:stamped_provenance_isolation_test). See the
-    # `LiveStatusDebugReport.engine_build_sha` doc comment for how the
-    # values appear in the live-status debug report.
+    # time. They are read here — and ONLY here, never by build_info_rs above
+    # — so the per-commit stamping stays out of engine_lib's own source and
+    # lives in its own small, dedicated leaf crate (`boss-build-provenance`)
+    # that only the `engine` rust_binary targets link. That is what keeps the
+    # churn out of engine_lib's Bazel action cache: the output here changes
+    # every commit, so everything downstream of it rebuilds every commit, and
+    # the downstream set is deliberately just the two engine binaries
+    # (guarded by //tools/boss/engine/core:stamped_provenance_isolation_test).
+    # See the `LiveStatusDebugReport.engine_build_sha` doc comment for how
+    # the values appear in the live-status debug report.
     #
     # VERSION is STABLE_BOSS_VERSION (`1.0.N` on a release tag, `1.0.N-dev-<sha>`
     # otherwise) when `--stamp` is set, and UNSTAMPED_BOSS_VERSION (`0.0.0-dev`)
     # when unstamped so the tag-derived version only reaches release binaries.
-    # SHA, dirty, and build-time are always populated here because this leaf
-    # crate already changes every commit/build and is isolated to the engine
-    # binaries. Empty / `0.0.0` when stamped fall back to `unknown` — never
-    # the Cargo-crate placeholder.
+    # Empty / `0.0.0` when stamped fall back to `unknown` — never the
+    # Cargo-crate placeholder. SHA and dirty are always populated.
+    #
+    # BUILD_TIME follows the same gate, and an unstamped build does not take
+    # volatile-status.txt as an input at all. The output of an unstamped build
+    # is then a function of the commit alone. With the time in it, the output
+    # differed every time the action ran, and the action runs again at an
+    # unchanged commit whenever stable-status.txt changes (a new boss-v* tag
+    # moves STABLE_BOSS_VERSION) or a machine has not built that commit yet.
+    # Each of those relinked both engine binaries and re-ran
+    # build-provenance_test, and no remote cache entry could ever match,
+    # because the file's content is part of a remote action's key. The engine
+    # reports its binary's modification time when the stamp says `unknown`
+    # (`build_info::build_time`).
+    inputs = [ctx.info_file]
     if is_stamping_enabled(ctx):
+        inputs.append(ctx.version_file)
         version_cmd = (
             "VERSION=$(grep '^STABLE_BOSS_VERSION ' " + ctx.info_file.path +
             " | cut -d' ' -f2 2>/dev/null || true)\n" +
             "if [ -z \"$VERSION\" ] || [ \"$VERSION\" = \"0.0.0\" ]; then VERSION=unknown; fi\n"
         )
+        build_time_cmd = (
+            "BUILD_TIME=$(grep '^BOSS_BUILD_TIME ' " + ctx.version_file.path +
+            " | cut -d' ' -f2 2>/dev/null || true)\n" +
+            "[ -z \"$BUILD_TIME\" ] && BUILD_TIME=unknown\n"
+        )
     else:
         version_cmd = "VERSION=\"" + UNSTAMPED_BOSS_VERSION + "\"\n"
+        build_time_cmd = "BUILD_TIME=unknown\n"
 
     command = (
         "set -euo pipefail\n" +
@@ -312,9 +328,7 @@ def _build_provenance_rs_impl(ctx):
         "DIRTY=$(grep '^STABLE_BOSS_GIT_DIRTY ' " + ctx.info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ \"$DIRTY\" = \"true\" ] && DIRTY=true || DIRTY=false\n" +
-        "BUILD_TIME=$(grep '^BOSS_BUILD_TIME ' " + ctx.version_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "[ -z \"$BUILD_TIME\" ] && BUILD_TIME=unknown\n" +
+        build_time_cmd +
         "printf 'pub const VERSION: &str = \"%s\";\\n" +
         "pub const GIT_SHA: &str = \"%s\";\\n" +
         "pub const GIT_DIRTY: bool = %s;\\n" +
@@ -323,7 +337,7 @@ def _build_provenance_rs_impl(ctx):
     )
 
     ctx.actions.run_shell(
-        inputs = [ctx.info_file, ctx.version_file],
+        inputs = inputs,
         outputs = [output],
         command = command,
         mnemonic = "BuildProvenanceRs",
@@ -347,10 +361,10 @@ Emits:
   pub const VERSION: &str = "0.0.0-dev" (unstamped) or "<1.0.N or 1.0.N-dev-<sha>, else unknown>" (stamped);
   pub const GIT_SHA: &str = "<full commit sha>";
   pub const GIT_DIRTY: bool = <true|false>;
-  pub const BUILD_TIME: &str = "<ISO-8601 UTC>";
+  pub const BUILD_TIME: &str = "unknown" (unstamped) or "<ISO-8601 UTC>" (stamped);
 
-Unlike `build_info_rs` (which deliberately stamps "unknown" for these same
-concepts to protect engine_lib's compile cache), this rule feeds a dedicated,
+Unlike `build_info_rs` (which deliberately stamps "unknown" for the sha to
+protect engine_lib's compile cache), this rule feeds a dedicated,
 otherwise-empty `boss-build-provenance` leaf crate — see that crate's
 BUILD.bazel and doc comment. The output changes on every commit, so every
 action downstream of it re-runs on every commit; the crate is therefore

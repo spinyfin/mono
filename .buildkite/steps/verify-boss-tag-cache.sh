@@ -43,6 +43,17 @@ bazel_verify_only test --test_output=errors \
   //tools/boss/cli:boss_test //tools/boss/build-info:build-info_test
 cp bazel-out/stable-status.txt "${evidence_dir}/bazel-stable-status.txt"
 cp bazel-out/volatile-status.txt "${evidence_dir}/bazel-volatile-status.txt"
+# The two files every test action takes from the machine that submits it: the
+# audited runtime's tool paths and its host fingerprint (OS build and a digest
+# of each tool; tools/test-sandbox/README.md, "The fingerprint"). Two agents
+# can share a test result only when these match, so a test that the second
+# agent runs again is explained by comparing them.
+external="$(cd -P bazel-out/../../.. && pwd)/external"
+for runtime in test_runtime_tools timeout_capture_tools; do
+  for file in fingerprint manifest; do
+    cp "${external}/+test_runtime_repository+${runtime}/${file}" "${evidence_dir}/${runtime}-${file}.txt"
+  done
+done
 buildkite-agent artifact upload "${evidence_dir}/*"
 if (( role == 0 )); then
   buildkite-agent meta-data set "${probe_key}-result" passed
