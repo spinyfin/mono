@@ -1321,6 +1321,28 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_with_division_after_a_block_comment_then_exec_drains_as_a_command() {
+        let script = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const ratio = 4 /* units */ / 2; "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        let mut tracker = RolloutCallTracker::default();
+        let call = cell_exec("div", script);
+        assert!(call.issues_command);
+        assert_eq!(rollout_call_command_display(&call), "sleep 999");
+        tracker.observe_call("div", call).unwrap();
+        assert_eq!(
+            tracker
+                .drain_open_calls()
+                .iter()
+                .map(rollout_call_command_display)
+                .collect::<Vec<_>>(),
+            ["sleep 999"]
+        );
+    }
+
+    #[test]
     fn a_poll_with_a_regex_literal_then_exec_drains_as_a_command() {
         let script = concat!(
             r#"await tools.write_stdin({session_id:8467,chars:""}); const n = "a/b".replace(/\//g, "_"); "#,

@@ -74,7 +74,12 @@ fn decode_js_escape(chars: &mut Peekable<impl Iterator<Item = char>>, out: &mut 
         'b' => out.push('\u{0008}'),
         'f' => out.push('\u{000c}'),
         'v' => out.push('\u{000b}'),
-        '0' => out.push('\0'),
+        '0' => {
+            if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            out.push('\0');
+        }
         '"' | '\'' | '\\' | '/' => out.push(ch),
         '\n' => {}
         '\r' => {
@@ -147,6 +152,13 @@ mod tests {
         assert_eq!(parsed["cmd"], "$BOSS_BIN propose done");
         let parsed = parse_literal_object(r#"{cmd:"echo \$HOME \q"}"#).unwrap();
         assert_eq!(parsed["cmd"], "echo $HOME q");
+    }
+
+    #[test]
+    fn refuses_legacy_octal_escapes_including_nul_followed_by_a_digit() {
+        assert!(parse_literal_object(r#"{cmd:"echo \7"}"#).is_none());
+        assert!(parse_literal_object(r#"{cmd:"echo \01"}"#).is_none());
+        assert_eq!(parse_literal_object(r#"{cmd:"a\0b"}"#).unwrap()["cmd"], "a\0b");
     }
 
     #[test]

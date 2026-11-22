@@ -432,6 +432,34 @@ mod tests {
     }
 
     #[test]
+    fn division_after_a_block_comment_does_not_drop_a_following_exec_command() {
+        let call = canonical_exec_script(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const ratio = 4 /* units */ / 2; "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
+    }
+
+    #[test]
+    fn division_after_a_non_ascii_identifier_does_not_drop_a_following_exec_command() {
+        let call = canonical_exec_script(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = café2 / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
+    }
+
+    #[test]
     fn regex_literal_with_slashes_does_not_drop_a_following_exec_command() {
         let call = canonical_exec_script(concat!(
             r#"await tools.write_stdin({session_id:8467,chars:""}); const n = "a/b".replace(/\//g, "_"); "#,

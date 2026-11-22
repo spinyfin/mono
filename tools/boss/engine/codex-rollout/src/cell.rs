@@ -416,39 +416,102 @@ fn js_ident_boundary_at(source: &str, at: usize) -> bool {
 }
 
 /// Whether a `/` at byte offset `at` begins a regular-expression literal
-/// rather than a division, judged from the previous significant token: a
-/// regex can follow the start of input, an operator or opening punctuation,
-/// or a keyword such as `return`; it cannot follow an identifier, number,
-/// string or closing bracket.
+/// rather than a division, judged from the previous significant token
+/// after comments, strings, and whitespace are skipped. A regex can follow
+/// the start of input, an operator or opening punctuation, or a keyword
+/// such as `return`; it cannot follow an identifier, number, string or
+/// closing bracket. When the previous token is unclear, treat the slash as
+/// division so a later command stays visible.
 fn js_regex_allowed_before(source: &str, at: usize) -> bool {
-    let Some(prefix) = source.get(..at).map(str::trim_end) else {
+    let Some(prefix) = source.get(..at) else {
         return false;
     };
-    let Some(last) = prefix.chars().next_back() else {
-        return true;
-    };
-    if last.is_ascii_alphanumeric() || last == '_' || last == '$' {
-        let word_start = prefix
-            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
-            .map_or(0, |i| i + 1);
-        return matches!(
-            &prefix[word_start..],
-            "return"
-                | "typeof"
-                | "case"
-                | "do"
-                | "else"
-                | "in"
-                | "of"
-                | "void"
-                | "delete"
-                | "throw"
-                | "new"
-                | "yield"
-                | "await"
-        );
+    match last_js_token(prefix) {
+        LastJsToken::Start | LastJsToken::RegexPunct => true,
+        LastJsToken::Word { start, end } => matches!(
+            prefix.get(start..end),
+            Some(
+                "return"
+                    | "typeof"
+                    | "case"
+                    | "do"
+                    | "else"
+                    | "in"
+                    | "of"
+                    | "void"
+                    | "delete"
+                    | "throw"
+                    | "new"
+                    | "yield"
+                    | "await"
+            )
+        ),
+        LastJsToken::Operand => false,
     }
-    !matches!(last, ')' | ']' | '"' | '\'' | '`')
+}
+
+/// Last significant token in `prefix` after skipping comments, strings, and
+/// whitespace. Used only to tell a regex literal from division.
+enum LastJsToken {
+    Start,
+    Word { start: usize, end: usize },
+    Operand,
+    RegexPunct,
+}
+
+fn last_js_token(prefix: &str) -> LastJsToken {
+    let mut chars = prefix.char_indices().peekable();
+    let mut last = LastJsToken::Start;
+    while let Some((at, ch)) = chars.next() {
+        match ch {
+            '/' => match chars.peek().map(|&(_, next)| next) {
+                Some('/') => {
+                    chars.next();
+                    skip_js_line_comment(&mut chars);
+                }
+                Some('*') => {
+                    chars.next();
+                    skip_js_block_comment(&mut chars);
+                }
+                _ => last = LastJsToken::RegexPunct,
+            },
+            '"' | '\'' => {
+                skip_js_quoted_string(&mut chars, ch, false);
+                last = LastJsToken::Operand;
+            }
+            '`' => {
+                skip_js_quoted_string(&mut chars, ch, true);
+                last = LastJsToken::Operand;
+            }
+            ch if ch.is_whitespace() => {}
+            ')' | ']' => last = LastJsToken::Operand,
+            ch if js_ident_part(ch) => {
+                let mut end = at + ch.len_utf8();
+                while let Some(&(next_at, next)) = chars.peek() {
+                    if js_ident_part(next) {
+                        end = next_at + next.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                last = if ch.is_ascii_digit() {
+                    LastJsToken::Operand
+                } else {
+                    LastJsToken::Word { start: at, end }
+                };
+            }
+            ch if ch.is_ascii() => last = LastJsToken::RegexPunct,
+            // Non-ASCII punctuation is not a reliable regex opener; fail
+            // toward division so a later command stays visible.
+            _ => last = LastJsToken::Operand,
+        }
+    }
+    last
+}
+
+fn js_ident_part(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
 }
 
 /// Skip a regex literal body (the opening `/` is already consumed): ends at
@@ -947,7 +1010,13 @@ mod tests {
             cell_script_command(r#"await tools.exec_command({env:"a\.b", cmd:"echo \$HOME \q"});"#).as_deref(),
             Some("echo $HOME q")
         );
-        for malformed in [r#"echo \x4"#, r#"echo \u00G1"#, r#"echo \u{110000}"#, r#"echo \7"#] {
+        for malformed in [
+            r#"echo \x4"#,
+            r#"echo \u00G1"#,
+            r#"echo \u{110000}"#,
+            r#"echo \7"#,
+            r#"echo \01"#,
+        ] {
             let script = format!(r#"await tools.exec_command({{cmd:"{malformed}"}});"#);
             assert_eq!(cell_script_command(&script), None, "{malformed}");
             assert!(script_issues_command(&script));
@@ -968,6 +1037,37 @@ mod tests {
         let script = "await tools.write_stdin({session_id:8467,chars:\"\"});\nconst r = s.replace(/\\/*/g, \"\");\nawait tools.exec_command({cmd:\"sleep 999\"});\n";
         assert!(!script_is_continuation_only(script));
         assert_eq!(cell_script_command(script).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn division_after_a_block_comment_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const ratio = 4 /* units */ / 2; "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn division_after_a_non_ascii_identifier_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = café2 / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+        let pi = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = πx / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(pi));
+        assert_eq!(cell_script_command(pi).as_deref(), Some("sleep 999"));
     }
 
     #[test]
