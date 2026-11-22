@@ -176,7 +176,7 @@ pub fn convert_revision_to_review_findings_followup(
     )?;
     // Removing the revision-parent link also changes projected root edges.
     // Recompute in the caller's transaction so readers see the repaired graph.
-    if rows_changed > 0 {
+    if rows_changed > 0 && crate::work_dependencies::cycle::any_member(conn, &[rev.id.as_str()])? {
         crate::work_dependencies::cycle::rebuild_members(conn)?;
     }
     Ok((rows_changed, plan.kind))

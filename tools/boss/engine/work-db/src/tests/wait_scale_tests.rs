@@ -797,31 +797,35 @@ fn board_runtime_and_queued_display_do_not_rescan_the_dependency_graph() {
 
     let plan_of = |sql: &str| {
         let conn = db.connect().unwrap();
-        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .unwrap()
-            .query_map(["task_ws03560"], |row| row.get::<_, String>(3))
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let params = vec![rusqlite::types::Null; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
     };
-    let gating = plan_of(crate::work_dependencies::cycle::PREREQUISITES_SQL);
-    for (alias, key) in [("m", "work_item_id=?"), ("d", "dependent_id=?")] {
-        assert!(
-            gating
-                .iter()
-                .any(|step| step.starts_with(&format!("SEARCH {alias} ")) && step.contains(key)),
-            "gating must seek {alias} by {key}: {gating:#?}"
-        );
-    }
-    assert!(gating.iter().all(|step| !step.contains("SCAN tasks")), "{gating:#?}");
+    let membership = plan_of(crate::work_dependencies::cycle::GATING_STATE_SQL);
+    assert!(
+        membership
+            .iter()
+            .any(|step| step.starts_with("SEARCH m ") && step.contains("work_item_id=?")),
+        "{membership:#?}"
+    );
+
+    assert!(
+        membership
+            .iter()
+            .any(|step| step.starts_with("SEARCH tasks ") && step.contains("id=?")),
+        "{membership:#?}"
+    );
 
     let mut connection = db.connect().unwrap();
     let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = steps.clone();
     connection.progress_handler(
-        1000,
+        1,
         Some(move || {
-            counter.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             false
         }),
     );
@@ -834,6 +838,9 @@ fn board_runtime_and_queued_display_do_not_rescan_the_dependency_graph() {
         }),
     );
     SQL.with(|rows| rows.borrow_mut().clear());
+    crate::db_diagnostics::SQL_OBSERVER.with(|observer| {
+        observer.set(Some(|sql| SQL.with(|rows| rows.borrow_mut().push(sql.to_owned()))));
+    });
     {
         let transaction = connection.transaction().unwrap();
         let mut trace = PopulationTrace::new(PRODUCT, "wait-scale-cycle-sql", None, Instant::now());
@@ -846,20 +853,129 @@ fn board_runtime_and_queued_display_do_not_rescan_the_dependency_graph() {
         );
     }
     let board_steps = steps.swap(0, std::sync::atomic::Ordering::Relaxed);
+    crate::db_diagnostics::SQL_OBSERVER.with(|observer| observer.set(None));
+    let board_sql = SQL.with(|rows| rows.borrow().join("\n"));
+    assert!(
+        board_sql.contains("SELECT id, kind, status, pr_url, review_required_state, deleted_at IS NOT NULL"),
+        "annotation SQL must be captured: {board_sql}"
+    );
+    let board_statements = SQL.with(|rows| rows.borrow().clone());
+    SQL.with(|rows| rows.borrow_mut().clear());
+    connection.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(|event| {
+            if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+                SQL.with(|rows| rows.borrow_mut().push(sql.to_owned()));
+            }
+        }),
+    );
     drop(connection);
     db.queued_displays(1_800_000_000, &Default::default()).unwrap();
     let queued_steps = steps.load(std::sync::atomic::Ordering::Relaxed);
-    // Per-card whole-graph reads exceed these deterministic
-    // budgets; unlike elapsed time, they are independent of machine load.
-    assert!(board_steps <= 4_000_000, "board used {board_steps} VM steps");
-    assert!(queued_steps <= 16_000, "queued displays used {queued_steps} VM steps");
+    // Post-revert c90f1dd309292d19aec69d8479a4cc6189fee75a gating,
+    // substituted into this exact harness, used 3,829,914 / 41,061 steps.
+    // Both measurements use the one-step progress interval above.
+    // Allow 5% for membership reads; pin cost to the baseline, not this head.
+    const BASELINE_BOARD_STEPS: usize = 3_829_914;
+    const BASELINE_QUEUED_STEPS: usize = 41_061;
+    println!("cycle-hot-path board_steps={board_steps} queued_steps={queued_steps}");
+    assert!(
+        board_steps <= BASELINE_BOARD_STEPS * 105 / 100,
+        "board used {board_steps} VM steps"
+    );
+    assert!(
+        queued_steps <= BASELINE_QUEUED_STEPS * 105 / 100,
+        "queued displays used {queued_steps} VM steps"
+    );
     let connection = db.connect().unwrap();
     connection.progress_handler(0, None::<fn() -> bool>);
     connection.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     drop(connection);
     let sql = SQL.with(|rows| rows.borrow().join("\n"));
     assert!(
-        !sql.to_uppercase().contains("WITH RECURSIVE"),
-        "board and queued-display reads must not recursively rebuild the task graph"
+        sql.contains("SELECT DISTINCT t.product_id, t.id, COALESCE(ep.epoch, 0)"),
+        "queued-display candidate SQL must be captured: {sql}"
+    );
+    let dependency_sql = board_statements
+        .iter()
+        .find(|sql| sql.contains("FROM work_item_dependencies") && sql.contains("WHERE dependent_id ="))
+        .expect("the board must capture the production prerequisite read");
+    let dependencies = plan_of(dependency_sql);
+    assert!(
+        dependencies
+            .iter()
+            .any(|step| step.starts_with("SEARCH work_item_dependencies ") && step.contains("dependent_id=?")),
+        "{dependencies:#?}"
+    );
+    assert!(
+        dependencies.iter().all(|step| !step.contains("SCAN tasks")),
+        "{dependencies:#?}"
+    );
+    let connection = db.connect().unwrap();
+    assert_recursive_graph_seeks(&connection, &board_statements);
+    SQL.with(|rows| assert_recursive_graph_seeks(&connection, &rows.borrow()));
+}
+
+/// Review annotation legitimately traverses indexed revision families. Check
+/// every recursive statement for full scans of task/dependency tables or their
+/// indexes instead of forbidding recursion itself. SQLite opens each btree by
+/// root page; Rewind/Last on that cursor starts an unbounded scan, whereas
+/// primary-key and parent-key seeks do not.
+fn assert_recursive_graph_seeks(conn: &rusqlite::Connection, statements: &[String]) {
+    let roots = conn
+        .prepare(
+            "SELECT rootpage FROM sqlite_schema
+         WHERE tbl_name IN ('tasks', 'work_item_dependencies') AND rootpage > 0",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()
+        .unwrap();
+    for sql in statements
+        .iter()
+        .filter(|sql| sql.to_uppercase().contains("WITH RECURSIVE"))
+    {
+        let mut stmt = conn.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        let params = vec![rusqlite::types::Null; stmt.parameter_count()];
+        let ops = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let cursors: std::collections::HashSet<_> = ops
+            .iter()
+            .filter(|(op, _, root, db)| op == "OpenRead" && *db == 0 && roots.contains(root))
+            .map(|(_, cursor, _, _)| *cursor)
+            .collect();
+        assert!(
+            ops.iter()
+                .all(|(op, cursor, _, _)| !matches!(op.as_str(), "Rewind" | "Last" | "Count")
+                    || !cursors.contains(cursor)),
+            "recursive SQL must seek graph rows instead of scanning them: {sql}\n{ops:#?}"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "recursive SQL must seek graph rows instead of scanning them")]
+fn recursive_graph_scan_guard_rejects_an_unfiltered_tasks_scan() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE tasks(id TEXT PRIMARY KEY, parent_task_id TEXT);")
+        .unwrap();
+    assert_recursive_graph_seeks(
+        &conn,
+        &["WITH RECURSIVE graph(id) AS (
+            SELECT id FROM tasks
+            UNION SELECT t.id FROM tasks t JOIN graph g ON t.parent_task_id = g.id
+         ) SELECT * FROM graph"
+            .into()],
     );
 }

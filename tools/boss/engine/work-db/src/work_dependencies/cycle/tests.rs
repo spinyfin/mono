@@ -4,7 +4,7 @@ use crate::work_dependencies::{EdgeInsertOutcome, RELATION_MERGE_ORDER, insert_e
 fn fixture() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
-        "CREATE TABLE tasks (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT DEFAULT 'chore', parent_task_id TEXT);
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT DEFAULT 'chore', parent_task_id TEXT, deleted_at TEXT);
          CREATE INDEX idx_tasks_parent_kind_id ON tasks(parent_task_id, kind, id);
          CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
          CREATE TABLE work_item_dependencies (
@@ -250,7 +250,7 @@ fn gating_read_does_not_build_a_whole_graph_cte() {
         }),
     );
     SQL.with(|rows| rows.borrow_mut().clear());
-    let (cyclic, gates) = prerequisites(&conn, "revision").unwrap();
+    let (cyclic, gates, _) = prerequisites(&conn, "revision").unwrap();
     conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     assert!(!cyclic);
     assert_eq!(gates, vec!["b".to_owned()]);
@@ -307,7 +307,7 @@ fn gating_one_item_does_not_scan_thousands_of_unrelated_edges() {
     );
     SQL.with(|rows| rows.borrow_mut().clear());
     let started = std::time::Instant::now();
-    let (cyclic, gates) = prerequisites(&conn, "t0").unwrap();
+    let (cyclic, gates, _) = prerequisites(&conn, "t0").unwrap();
     let millis = started.elapsed().as_secs_f64() * 1000.0;
     conn.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     assert!(!cyclic);

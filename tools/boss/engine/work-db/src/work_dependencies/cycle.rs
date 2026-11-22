@@ -32,7 +32,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 /// Whether a graph repair touches stored cycle membership. Each endpoint is
 /// sought by primary key; acyclic edge deletion needs no graph traversal.
 pub(crate) fn any_member(conn: &Connection, ids: &[&str]) -> Result<bool> {
-    let mut stmt = conn.prepare("SELECT 1 FROM dependency_cycle_members WHERE work_item_id = ?1")?;
+    let mut stmt = conn.prepare_cached(MEMBERSHIP_SQL)?;
     for id in ids {
         if stmt.exists([id])? {
             return Ok(true);
@@ -207,31 +207,25 @@ fn reaches(adj: &HashMap<String, Vec<String>>, start: &str, goal: &str) -> bool 
     false
 }
 
-pub(crate) const PREREQUISITES_SQL: &str = "SELECT m.work_item_id IS NOT NULL, d.prerequisite_id
-         FROM (SELECT ?1 AS id) item
-         LEFT JOIN dependency_cycle_members m ON m.work_item_id = item.id
-         LEFT JOIN work_item_dependencies d
-           ON d.dependent_id = item.id AND d.relation = 'blocks'
-         ORDER BY d.created_at, d.prerequisite_id";
+pub(crate) const MEMBERSHIP_SQL: &str = "SELECT 1 FROM dependency_cycle_members m WHERE m.work_item_id = ?1";
 
-/// Structural health and the gates dispatch should honour, without scanning
-/// the whole graph. One statement seeks membership by primary key and this
-/// item's `blocks` rows by dependent.
-pub(super) fn prerequisites(conn: &Connection, id: &str) -> Result<(bool, Vec<String>)> {
-    let mut stmt = conn.prepare(PREREQUISITES_SQL)?;
-    let mut cyclic = false;
-    let mut gates = Vec::new();
-    for row in stmt.query_map([id], |row| {
-        Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?))
-    })? {
-        let (found, gate) = row?;
-        cyclic = found;
-        if let Some(gate) = gate
-            && !gates.contains(&gate)
-        {
-            gates.push(gate);
-        }
-    }
+/// Kind and membership share the point read dispatch already needs. Keeping
+/// this separate from the edge read avoids a join/sort per card without adding
+/// a statement to the heartbeat.
+pub(crate) const GATING_STATE_SQL: &str = "SELECT
+    (SELECT kind FROM tasks WHERE id = ?1 AND deleted_at IS NULL AND ?2),
+    EXISTS(SELECT 1 FROM dependency_cycle_members m WHERE m.work_item_id = ?1)";
+
+pub(super) fn prerequisites(conn: &Connection, id: &str) -> Result<(bool, Vec<String>, Option<String>)> {
+    let (kind, cyclic): (Option<String>, bool) = conn
+        .prepare_cached(GATING_STATE_SQL)?
+        .query_row(rusqlite::params![id, id.starts_with("task_")], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    let mut gates: Vec<String> = prerequisites_of(conn, id, Some(RELATION_BLOCKS))?
+        .into_iter()
+        .map(|edge| edge.prerequisite_id)
+        .collect();
     if cyclic {
         for (next, _) in successors(conn, id)? {
             if !gates.contains(&next) {
@@ -239,7 +233,7 @@ pub(super) fn prerequisites(conn: &Connection, id: &str) -> Result<(bool, Vec<St
             }
         }
     }
-    Ok((cyclic, gates))
+    Ok((cyclic, gates, kind))
 }
 
 struct Node {

@@ -688,3 +688,50 @@ fn graph_repairs_clear_cycle_membership_without_reopening() {
         );
     }
 }
+
+#[test]
+fn converting_nonmember_revision_does_not_scan_tasks() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let f = fixture();
+    let root = f.chore("PR root");
+    let revision = f.revision_of(&root, "Review findings");
+    let mut conn = f.db.connect().unwrap();
+    conn.execute_batch(
+        "WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n < 9999)
+         INSERT INTO tasks(id, name, product_id, kind, status, created_at, updated_at)
+         SELECT printf('unrelated%d', n), 'Unrelated', (SELECT product_id FROM tasks LIMIT 1),
+                'chore', 'done', '1760000000', '1760000000' FROM s",
+    )
+    .unwrap();
+    assert!(!crate::work_dependencies::cycle::any_member(&conn, &[&revision]).unwrap());
+    let rev = query_task(&conn, &revision).unwrap().unwrap();
+    let steps = Arc::new(AtomicUsize::new(0));
+    let count = steps.clone();
+    conn.progress_handler(
+        100,
+        Some(move || {
+            count.fetch_add(100, Ordering::Relaxed);
+            false
+        }),
+    );
+    let tx = conn.transaction().unwrap();
+    let (changed, _) = crate::review_findings_followup::convert_revision_to_review_findings_followup(
+        &tx,
+        &rev,
+        &root,
+        &now_string(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(changed, 1);
+    tx.commit().unwrap();
+    let steps = steps.load(Ordering::Relaxed);
+    assert!(
+        steps < 3000,
+        "nonmember conversion used {steps} VM steps; must not scan 10000 tasks"
+    );
+    assert!(query_task(&conn, &revision).unwrap().unwrap().parent_task_id.is_none());
+}

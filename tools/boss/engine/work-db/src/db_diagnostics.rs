@@ -12,6 +12,13 @@ use std::{
 pub mod read_volume;
 pub mod size_report;
 
+// Tests can observe annotation SQL even while its statement counter owns
+// SQLite's single trace hook. The observer is scoped to the test thread.
+#[cfg(test)]
+thread_local! {
+    pub(super) static SQL_OBSERVER: std::cell::Cell<Option<fn(&str)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Counts the statements a connection runs while this is alive, including
 /// nested helper queries, through a temporary SQLite statement trace callback
 /// that is removed on drop.
@@ -49,6 +56,16 @@ impl<'conn> StatementCounter<'conn> {
             // thread, never while `total` is reading the cell.
             let statements = unsafe { &*context.cast::<std::cell::Cell<u64>>() };
             statements.set(statements.get() + 1);
+            #[cfg(test)]
+            SQL_OBSERVER.with(|observer| {
+                if let Some(observe) = observer.get() {
+                    // SAFETY: SQLITE_TRACE_STMT supplies a live sqlite3_stmt.
+                    let sql = unsafe { rusqlite::ffi::sqlite3_sql(subject.cast()) };
+                    if !sql.is_null() {
+                        observe(&unsafe { std::ffi::CStr::from_ptr(sql) }.to_string_lossy());
+                    }
+                }
+            });
             0
         }
         let statements = Box::new(std::cell::Cell::new(0u64));

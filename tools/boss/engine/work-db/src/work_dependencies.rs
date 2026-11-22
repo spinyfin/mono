@@ -171,14 +171,14 @@ fn edges_for(
     let mut out = Vec::new();
     if let Some(rel) = relation {
         let sql = format!("{base_sql} AND relation = ?2 ORDER BY created_at ASC, {order_by_id_column} ASC");
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![work_item_id, rel], map_edge)?;
         for row in rows {
             out.push(row?);
         }
     } else {
         let sql = format!("{base_sql} ORDER BY created_at ASC, {order_by_id_column} ASC");
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map([work_item_id], map_edge)?;
         for row in rows {
             out.push(row?);
@@ -376,8 +376,7 @@ fn dead_same_chain_revision_writer(
 /// `maybe_engine_unblock_dependent` and the dep-unblock sweep re-evaluate
 /// this predicate.
 pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
-    let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;
-    let (cyclic, prerequisites) = cycle::prerequisites(conn, work_item_id)?;
+    let (cyclic, prerequisites, dependent_kind) = cycle::prerequisites(conn, work_item_id)?;
     // Membership is stored on edge writes. This read is an indexed lookup plus
     // the item's own `blocks` rows, not a whole-graph CTE.
     // A structural cycle is never satisfied by archived/dead writers. Keep the
