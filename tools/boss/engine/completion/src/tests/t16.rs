@@ -1579,3 +1579,199 @@ async fn pending_finalize_prunes_cancelled_refusal() {
     handler.sweep_pending_finalizes(i64::MAX).await;
     assert!(handler.pr_base_refusal_next_check.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn approved_superseded_closed_pr_records_succeeded_with_superseding_pr_and_no_failure_metrics() {
+    use crate::work::{FakePrStateChecker, PrOpenState, SubmitWorkerProposalInput};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, first_exec_id) = followup_fixture(workspace.path());
+    let closed_pr = "https://github.com/spinyfin/mono/pull/2927";
+    let superseding_pr = "https://github.com/spinyfin/mono/pull/2977";
+
+    // Execution 1 asks a structured Yes/No question to close PR #2927 as superseded by #2977,
+    // and the repo owner approves.
+    let q_payload = serde_json::json!({
+        "outcome": "blocked",
+        "summary": "PR #2927 is superseded by #2977; asking to close.",
+        "question": {
+            "text": "Close PR #2927 as superseded by #2977?",
+            "answer_type": { "kind": "yes_no" },
+            "explanation": "Context:\nPR #2977 supersedes #2927.\nYes:\nClose #2927.\nNo:\nKeep #2927.\nRecommendation:\nYes."
+        }
+    })
+    .to_string();
+    let _ = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &first_exec_id,
+            work_item_id: &chore_id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: &q_payload,
+            idempotency_key: "ask-supersede",
+        })
+        .unwrap();
+    let ask_handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()));
+    let _ = ask_handler
+        .finalize_declared_run_done(&first_exec_id, boss_protocol::RunDoneOutcome::Blocked)
+        .await;
+    db.answer_operator_question(&chore_id, boss_protocol::OperatorAnswer::YesNo { value: true })
+        .unwrap();
+
+    // Execution 2 runs after approval, closes #2927, and proposes done with superseded_by = #2977.
+    let exec2 = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("https://github.com/spinyfin/mono.git")
+                .pr_url(closed_pr)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_head_before = 'deadbeef' WHERE id = ?1",
+            [&exec2.id],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", [&chore_id, closed_pr])
+        .unwrap();
+    let done_payload = serde_json::json!({
+        "outcome": "delivered",
+        "summary": "Closed PR #2927 as superseded by #2977 per owner approval.",
+        "superseded_by": superseding_pr,
+    })
+    .to_string();
+    let _ = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &exec2.id,
+            work_item_id: &chore_id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: &done_payload,
+            idempotency_key: "deliver-superseded",
+        })
+        .unwrap();
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()))
+        .with_branch_verifier(StubBranchVerifier::ok(&own_branch(&exec2.id)))
+        .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::ClosedUnmerged)));
+
+    let outcome = handler
+        .finalize_declared_run_done(&exec2.id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == closed_pr),
+        "expected PrDetected for closed superseded PR, got {outcome:?}"
+    );
+
+    let finished = db.get_execution(&exec2.id).unwrap();
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    assert_eq!(finished.superseded_by_pr.as_deref(), Some(superseding_pr));
+
+    let crate::work::WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore work item");
+    };
+    assert_eq!(task.status, TaskStatus::Done);
+    assert_eq!(task.blocked_reason, None);
+    assert!(db.get_merge_evidence(&chore_id).unwrap().is_none());
+    assert!(
+        db.list_attention_items(&exec2.id)
+            .unwrap()
+            .iter()
+            .all(|item| item.kind != crate::RUN_DONE_AUDIT_FLAGGED_ATTENTION_KIND),
+        "superseded completion must not file a delivery audit attention item"
+    );
+
+    // Stuck report / failure counts must not count the approved supersede completion as failed.
+    let report = db.stuck_daily_snapshot(1_700_000_000, &|_| false).unwrap();
+    assert!(
+        !report
+            .rows
+            .iter()
+            .any(|e| e.work_item_id == chore_id && e.classification.contains("worker_failed")),
+        "approved supersede-and-close must not appear in worker_failed report: {:?}",
+        report.rows
+    );
+}
+
+#[tokio::test]
+async fn unexplained_closed_unmerged_pr_without_supersede_declaration_still_fails() {
+    use crate::work::{FakePrStateChecker, PrOpenState};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+    let closed_pr = "https://github.com/spinyfin/mono/pull/2927";
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", [&chore_id, closed_pr])
+        .unwrap();
+    stamp_delivered(&db, &execution_id);
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()))
+        .with_branch_verifier(StubBranchVerifier::ok(&own_branch(&execution_id)))
+        .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::ClosedUnmerged)));
+
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { .. }),
+        "unexplained closed-unmerged PR must fail, got {outcome:?}"
+    );
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+    let crate::work::WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore work item");
+    };
+    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("worker_failed"));
+}
+
+#[tokio::test]
+async fn open_pr_with_superseded_declaration_is_refused() {
+    use crate::work::{FakePrStateChecker, PrOpenState, SubmitWorkerProposalInput};
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, execution_id) = followup_fixture(workspace.path());
+    let open_pr = "https://github.com/spinyfin/mono/pull/2927";
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET pr_url = ?2 WHERE id = ?1", [&chore_id, open_pr])
+        .unwrap();
+    let done_payload = serde_json::json!({
+        "outcome": "delivered",
+        "summary": "Claimed superseded while PR is still open",
+        "superseded_by": "https://github.com/spinyfin/mono/pull/2977",
+    })
+    .to_string();
+    let _ = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution_id,
+            work_item_id: &chore_id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: &done_payload,
+            idempotency_key: "deliver-still-open",
+        })
+        .unwrap();
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()))
+        .with_branch_verifier(StubBranchVerifier::ok(&own_branch(&execution_id)))
+        .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Open)));
+
+    let outcome = handler
+        .finalize_declared_run_done(&execution_id, boss_protocol::RunDoneOutcome::Delivered)
+        .await;
+    assert!(
+        matches!(outcome, StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail } if detail.contains("still open")),
+        "open PR with superseded_by must fail, got {outcome:?}"
+    );
+    assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+}

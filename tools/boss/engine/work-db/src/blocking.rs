@@ -2565,6 +2565,7 @@ mod tests {
             summary: String::new(),
             question: None,
             queue_ci_evidence: Some(evidence),
+            superseded_by: None,
         };
         conn.execute(
             "INSERT INTO worker_proposals (id, execution_id, work_item_id, kind, payload_json, idempotency_key, state, created_at)

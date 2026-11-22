@@ -881,6 +881,32 @@ impl WorkDb {
         }
     }
 
+    /// Read the `superseded_by` PR reference from this execution's latest
+    /// applied `run_done` proposal, if any.
+    pub fn execution_run_done_superseded_by(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let payload_json: Option<String> = conn
+            .query_row(
+                "SELECT payload_json FROM worker_proposals
+                 WHERE execution_id = ?1 AND kind = 'run_done' AND state = 'applied'
+                 ORDER BY rowid DESC LIMIT 1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(payload_json) = payload_json else {
+            return Ok(None);
+        };
+        let payload: boss_protocol::RunDoneProposalPayload = match serde_json::from_str(&payload_json) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(execution_id, %err, "run_done: applied payload_json did not parse for superseded_by");
+                return Ok(None);
+            }
+        };
+        Ok(payload.superseded_by.filter(|s| !s.trim().is_empty()))
+    }
+
     /// Live executions carrying a stamped `run_done`
     /// declaration made at or before `declared_at_or_before` (epoch seconds).
     /// The stamp is the durable pending-finalize record: a live execution

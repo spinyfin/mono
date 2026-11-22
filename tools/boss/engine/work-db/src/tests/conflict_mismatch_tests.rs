@@ -110,6 +110,7 @@ fn declare_blocked_keyed(f: &Fixture, idempotency_key: &str) {
         summary: "Architectural mismatch".into(),
         question: None,
         queue_ci_evidence: None,
+        superseded_by: None,
     })
     .unwrap();
     f.db.submit_worker_proposal(crate::SubmitWorkerProposalInput {
@@ -552,6 +553,7 @@ fn declare_outcome_keyed(f: &Fixture, outcome: RunDoneOutcome, key: &str) {
         summary: "later declaration".into(),
         question: None,
         queue_ci_evidence: None,
+        superseded_by: None,
     })
     .unwrap();
     f.db.submit_worker_proposal(crate::SubmitWorkerProposalInput {

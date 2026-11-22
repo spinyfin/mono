@@ -564,6 +564,10 @@ pub struct RunDoneProposalPayload {
     pub question: Option<super::OperatorQuestion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_ci_evidence: Option<super::QueueCiEvidence>,
+    /// Superseding PR reference (URL, `owner/repo#N`, `#N`, or number) when
+    /// the run closed its bound PR as superseded with approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 /// Payload for [`ProposalKind::Wait`]. Auto-applies to a time-bounded
@@ -1414,6 +1418,7 @@ mod tests {
             outcome: super::RunDoneOutcome::Blocked,
             summary: "A decision is required.".into(),
             question: Some(question),
+            superseded_by: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["question"]["answer_type"]["kind"], "yes_no");

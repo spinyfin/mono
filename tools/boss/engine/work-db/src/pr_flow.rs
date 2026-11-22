@@ -202,6 +202,48 @@ impl WorkDb {
         target: WorkerPrCompletionTarget,
         review_verdict: Option<ReviewVerdictInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_inner(
+            execution_id,
+            pr_url,
+            pr_head_after,
+            result_summary,
+            target,
+            review_verdict,
+            None,
+        )
+    }
+
+    /// Record a successful non-merged completion for an execution that closed
+    /// its bound PR as superseded by `superseded_by_pr`.
+    pub fn record_worker_superseded_pr_completion(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        superseded_by_pr: &str,
+        result_summary: Option<&str>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_inner(
+            execution_id,
+            pr_url,
+            None,
+            result_summary,
+            WorkerPrCompletionTarget::DoneUnmerged,
+            None,
+            Some(superseded_by_pr),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_worker_pr_completion_inner(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        pr_head_after: Option<&str>,
+        result_summary: Option<&str>,
+        target: WorkerPrCompletionTarget,
+        review_verdict: Option<ReviewVerdictInput>,
+        superseded_by_pr: Option<&str>,
+    ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -329,9 +371,10 @@ impl WorkDb {
              SET status = 'completed',
                  finished_at = ?2,
                  pr_url = ?3,
-                 pr_head_after = ?4
+                 pr_head_after = ?4,
+                 superseded_by_pr = COALESCE(?5, superseded_by_pr)
              WHERE id = ?1",
-            params![execution_id, now, pr_url, pr_head_after],
+            params![execution_id, now, pr_url, pr_head_after, superseded_by_pr],
         )?;
 
         // Update the most-recent run for this execution: if a summary is

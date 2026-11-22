@@ -327,21 +327,23 @@ impl WorkerCompletionHandler {
         match detected {
             Ok(Ok(PrStatus::Fresh { url })) => self.resolve_declared_pr_base(execution, url, false).await,
             Ok(Ok(PrStatus::Merged { url })) => self.resolve_declared_pr_base(execution, url, true).await,
-            Ok(Ok(
-                status @ (PrStatus::None
-                | PrStatus::Closed { .. }
-                | PrStatus::Stale { .. }
-                | PrStatus::EmptyDiff { .. }),
-            )) => {
+            Ok(Ok(PrStatus::Closed { url })) => {
+                if let Some(detail) = transient_detail {
+                    return DeclaredPrResolution::Transient { detail };
+                }
+                DeclaredPrResolution::ClosedUnmerged { pr_url: url }
+            }
+            Ok(Ok(status @ (PrStatus::None | PrStatus::Stale { .. } | PrStatus::EmptyDiff { .. }))) => {
                 if let Some(detail) = transient_detail {
                     return DeclaredPrResolution::Transient { detail };
                 }
                 let detector_says = match status {
                     PrStatus::None => "no PR has that branch as its head".to_owned(),
-                    PrStatus::Closed { url } => format!("the PR on that branch, {url}, is closed without merging"),
                     PrStatus::Stale { url, reason } => format!("the PR on that branch, {url}, is stale ({reason})"),
                     PrStatus::EmptyDiff { url } => format!("the PR on that branch, {url}, has an empty diff"),
-                    PrStatus::Fresh { .. } | PrStatus::Merged { .. } => unreachable!("matched above"),
+                    PrStatus::Fresh { .. } | PrStatus::Merged { .. } | PrStatus::Closed { .. } => {
+                        unreachable!("matched above")
+                    }
                 };
                 DeclaredPrResolution::NoneFound {
                     detail: format!(
@@ -431,16 +433,37 @@ impl WorkerCompletionHandler {
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
     pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        let superseded_by = match self.work_db.execution_run_done_superseded_by(&execution.id) {
+            Ok(superseded_by) => superseded_by,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "run_done finalize (delivered): failed to read superseded_by from declaration",
+                );
+                None
+            }
+        };
         let resolution = self.resolve_declared_pr_url(execution).await;
         let (pr_url, mut merged, mut closed_unmerged) = match resolution {
-            DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged, false),
+            DeclaredPrResolution::Bound { pr_url, merged } => {
+                if !merged && superseded_by.is_some() {
+                    return self
+                        .finalize_declared_delivery_without_pr(
+                            execution,
+                            &format!("PR {pr_url} is still open; close it before declaring it superseded"),
+                        )
+                        .await;
+                }
+                (pr_url, merged, false)
+            }
             DeclaredPrResolution::BaseRefused { pr_url, reason } => {
                 self.record_pr_base_refusal(execution, &pr_url, &reason).await;
                 let detail = format!("{pr_url}: {reason}. Retarget the PR before completing delivery.");
                 return StopOutcome::PrBaseRefused { pr_url, detail };
             }
             DeclaredPrResolution::ClosedUnmerged { pr_url } => {
-                if self.is_merge_conflict_revision(execution) {
+                if self.is_merge_conflict_revision(execution) || superseded_by.is_some() {
                     (pr_url, false, true)
                 } else {
                     return self
@@ -510,22 +533,25 @@ impl WorkerCompletionHandler {
         } else {
             WorkerPrCompletionTarget::InReview
         };
-        let completion =
-            match self
-                .work_db
+        let completion_result = if closed_unmerged && let Some(superseding_pr) = superseded_by.as_deref() {
+            self.work_db
+                .record_worker_superseded_pr_completion(&execution.id, &pr_url, superseding_pr, None)
+        } else {
+            self.work_db
                 .record_worker_pr_completion(&execution.id, &pr_url, None, None, target, None)
-            {
-                Ok(Some(completion)) => completion,
-                Ok(None) => return StopOutcome::AlreadyTerminal,
-                Err(err) => {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "run_done finalize (delivered): failed to record PR completion",
-                    );
-                    return StopOutcome::DbError;
-                }
-            };
+        };
+        let completion = match completion_result {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "run_done finalize (delivered): failed to record PR completion",
+                );
+                return StopOutcome::DbError;
+            }
+        };
         self.reconcile_review_guide_source_for_execution(
             &execution.id,
             &pr_url,
@@ -576,7 +602,9 @@ impl WorkerCompletionHandler {
             merged = false;
         }
 
-        self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
+        if !closed_unmerged {
+            self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
+        }
         if merged {
             return StopOutcome::PrMerged { pr_url };
         }

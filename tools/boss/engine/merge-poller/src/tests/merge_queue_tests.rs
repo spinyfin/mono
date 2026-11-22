@@ -1768,6 +1768,7 @@ async fn verified_same_head_requeue_allows_a_later_queue_failure() {
         outcome: RunDoneOutcome::Delivered,
         summary: "Verified main rebase and re-enqueued unchanged head".into(),
         question: None,
+        superseded_by: None,
         queue_ci_evidence: Some(
             QueueCiEvidence::builder()
                 .main_sha(base.clone())

@@ -1186,6 +1186,13 @@ mod floor_tests {
                     .unwrap();
             }),
         ));
+        steps.push((
+            "20261122_0615_execution_superseded_by_pr",
+            Box::new(|c| {
+                c.execute_batch("ALTER TABLE work_executions ADD COLUMN superseded_by_pr TEXT")
+                    .unwrap();
+            }),
+        ));
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
             apply(&expected);

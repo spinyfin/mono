@@ -297,12 +297,29 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                     }
                 }
             });
+            let superseded_by = reader.optional_text("superseded_by", MAX_SHORT_FIELD_CHARS);
+            if let Some(ref pr) = superseded_by {
+                if outcome != Some(RunDoneOutcome::Delivered) {
+                    reader.error(
+                        "superseded_by",
+                        "superseded_by is only meaningful on a delivered declaration",
+                    );
+                } else if pr.contains(['\n', '\r']) || !is_pr_reference(pr) {
+                    reader.error(
+                        "superseded_by",
+                        format!(
+                            "`{pr}` is not a PR reference; expected a GitHub PR URL, owner/repo#N, #N, or PR number"
+                        ),
+                    );
+                }
+            }
             reader.finish()?;
             let canonical = to_json(&RunDoneProposalPayload {
                 outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
                 summary: summary.unwrap_or_default(),
                 question,
                 queue_ci_evidence,
+                superseded_by,
             });
             with_criterion(canonical, criterion)
         }
@@ -572,6 +589,28 @@ fn json_type_name(value: &Value) -> &'static str {
 /// Infallible in practice: every payload struct is a plain `Serialize` of
 /// owned `String`s and enums with no map keys that could fail. The fallback
 /// keeps the signature total rather than panicking inside an RPC handler.
+fn is_pr_reference(text: &str) -> bool {
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if boss_github::pr_url::parse_pr_url_parts(text).is_some() {
+        return true;
+    }
+    if let Some((repo, num)) = text.split_once('#') {
+        let valid_num = !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && num != "0";
+        if !valid_num {
+            return false;
+        }
+        if repo.is_empty() {
+            return true;
+        }
+        return repo
+            .split_once('/')
+            .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'));
+    }
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) && text != "0"
+}
+
 fn to_json<T: serde::Serialize>(payload: &T) -> String {
     serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned())
 }
