@@ -306,7 +306,7 @@ final class NavigatorRowTests: XCTestCase {
             row: NavigatorRow(task: task, projection: try XCTUnwrap(task.navigator?.root), matchingAskID: nil),
             project: nil, width: 360)
         XCTAssertNil(ready.health)
-        XCTAssertTrue(ready.accessibilityLabel.contains("CI success"))
+        XCTAssertTrue(ready.accessibilityLabel.contains("CI passed"))
         XCTAssertTrue(ready.accessibilityLabel.contains("Review approved"))
         task = NavigatorTestFixture.task(section: "working")
         task.ciRequiredState = "success"
