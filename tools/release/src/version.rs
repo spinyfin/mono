@@ -98,6 +98,30 @@ pub(crate) fn matching_tag_counter(
     Ok(counter_for_tag(&base, tag_prefix, tag))
 }
 
+/// Whether `tag` belongs to this config's version family: `tag_prefix` plus
+/// the scheme's counter suffix. `bin/release prepare` uses this to pick
+/// remote tags; the boss-release CI skip uses the same rule so a `boss-v*`
+/// glob cannot skip (or miss) a tag prepare would treat differently.
+pub fn tag_in_version_family(
+    config: &VersionConfig,
+    tag_prefix: &str,
+    manifest_contents: Option<&str>,
+    tag: &str,
+) -> Result<bool> {
+    matching_tag_counter(config, tag_prefix, manifest_contents, tag).map(|counter| counter.is_some())
+}
+
+/// Highest version-family tag in `tags`, if any. The CI skip prints this
+/// tag in the same "HEAD is already {tag}" line prepare uses.
+pub fn highest_version_family_tag(
+    config: &VersionConfig,
+    tag_prefix: &str,
+    manifest_contents: Option<&str>,
+    tags: &[String],
+) -> Result<Option<String>> {
+    Ok(highest_matching_tag(config, tag_prefix, manifest_contents, tags)?.map(|(_, tag)| tag))
+}
+
 fn version_base(config: &VersionConfig, manifest_contents: Option<&str>) -> Result<VersionBase> {
     let manifest_version = || -> Result<String> {
         let contents = manifest_contents.ok_or_else(|| {
@@ -297,6 +321,48 @@ source = "github-generated"
         let next = compute_next_version(&config, "boss-v", None, &[]).expect("compute first version");
 
         assert_eq!(next.version, "1.0.0");
+    }
+
+    #[test]
+    fn boss_version_family_agrees_with_ci_already_tagged_skip() {
+        // Keep in lockstep with .buildkite/steps/boss-head-release-tag.sh
+        // (`ci_boss_release_tag_matches`) and tools/boss/release.toml.
+        let config = VersionConfig {
+            scheme: VersionScheme::PatchCounter,
+            manifest: None,
+            major_minor: Some("1.0".to_owned()),
+        };
+        let prefix = "boss-v";
+        let cases = [
+            ("boss-v1.0.0", true),
+            ("boss-v1.0.1102", true),
+            ("boss-v1.0.09", true),
+            ("boss-v1.0.stale", false),
+            ("boss-v1.0.1102-rc1", false),
+            ("boss-v1.0.", false),
+            ("boss-v2.0.0", false),
+            ("boss-v1.1.0", false),
+            ("other-v1.0.0", false),
+            ("boss-v", false),
+        ];
+        for (tag, expected) in cases {
+            let actual = tag_in_version_family(&config, prefix, None, tag).expect("family check");
+            assert_eq!(actual, expected, "tag {tag}");
+        }
+
+        let highest = highest_version_family_tag(
+            &config,
+            prefix,
+            None,
+            &[
+                "boss-v1.0.stale".to_owned(),
+                "boss-v1.0.9".to_owned(),
+                "boss-v1.0.1102".to_owned(),
+                "boss-v2.0.0".to_owned(),
+            ],
+        )
+        .expect("highest");
+        assert_eq!(highest.as_deref(), Some("boss-v1.0.1102"));
     }
 
     #[test]

@@ -4,6 +4,8 @@ exports_files(
     [
         "bazel-build-test.sh",
         "bazel-server-lock.sh",
+        "boss-head-release-tag.sh",
+        "boss-release.sh",
         "ci-env.sh",
         "disk-cache-gc-cap.sh",
         "fetch-boss-tags.sh",

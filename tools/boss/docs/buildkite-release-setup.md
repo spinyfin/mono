@@ -64,7 +64,7 @@ This is a one-time setup in the Buildkite web UI.
    - **Commit:** `HEAD`
 4. Click **Create Schedule**.
 
-The schedule fires every hour. If no Boss-affecting files have changed since the last published `boss-v*` tag, `release prepare` logs `release skipped: ...` and the step exits 0 without creating a release.
+The schedule fires every hour. If HEAD already carries a `boss-v1.0.N` tag, the step logs `release skipped: HEAD is already …` and exits 0 before building the release tool. If HEAD is untagged and no Boss-affecting files have changed since the last published `boss-v*` tag, `release prepare` logs `release skipped: ...` and the step exits 0 without creating a release.
 
 ### 2. Provision `BK_API_TOKEN` for `boss release`
 
@@ -163,7 +163,7 @@ release skipped: no release-affecting changes since boss-v1.0.N
 
 `prepare` creates the tag and the GitHub Release as a **draft** before the zip is built, then `upload` attaches the zip and sidecar, and `publish` verifies + publishes at the end. If the build, upload, or publish fails, the release is left as a draft — never published — with whatever assets did upload still attached. To recover:
 
-- **Re-run the failed `boss-release` job** (`bk job retry <job-id>`). A manual re-trigger of the whole `mono` pipeline on the same commit also works: because the trigger is manual (`BUILDKITE_SOURCE` is `ui`/`api`), `prepare` re-adopts the existing draft/tag instead of computing a new version, and `upload` uses `--clobber`. A **scheduled (cron)** trigger will refuse to auto-resume a stranded draft — see "Abandoning a draft release" below — to avoid silently retrying a stuck release forever.
+- **Re-run the failed `boss-release` job** (`bk job retry <job-id>`). A manual re-trigger of the whole `mono` pipeline on the same commit also works: because the trigger is manual (`BUILDKITE_SOURCE` is `ui`/`api`), the cheap already-tagged skip does not fire, `prepare` re-adopts the existing draft/tag instead of computing a new version, and `upload` uses `--clobber`. A **scheduled (cron)** trigger treats a `boss-v1.0.N` tag on HEAD as already released and exits 0 before `prepare`, and otherwise refuses to auto-resume a stranded draft — see "Abandoning a draft release" below — to avoid silently retrying a stuck release forever.
 - **Or upload manually** from a macOS agent checked out at the tag, after building the zip with the same `-c opt --define=BOSS_SHAKE_*` flags, then:
 
   ```sh

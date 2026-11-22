@@ -18,6 +18,27 @@
 # tools/boss/docs/buildkite-shake-secrets-setup.md.
 set -euo pipefail
 
+# Cheap already-tagged skip. ci-env.sh installs bin/release via repobin, which
+# builds //tools/release before `prepare` can see that HEAD is already a
+# published boss-v* tag. On a no-op scheduled check that build is most of the
+# step. Fetch tags first (Buildkite checkouts do not). A scheduled run whose
+# HEAD already carries a version-family tag exits 0 here. UI/API triggers
+# still run `prepare` so a stranded draft on a tagged HEAD can resume.
+# `bin/release prepare` remains the authority for untagged HEADs (change
+# detection, GitHub last-published SHA).
+# shellcheck source=fetch-boss-tags.sh
+source "$(dirname "${BASH_SOURCE[0]}")/fetch-boss-tags.sh"
+# shellcheck source=boss-head-release-tag.sh
+source "$(dirname "${BASH_SOURCE[0]}")/boss-head-release-tag.sh"
+if ! ci_fetch_boss_tags; then
+  echo "ERROR: failed to fetch boss-v* tags from origin. Refusing to decide a release from stale tags." >&2
+  exit 1
+fi
+if [[ "${BUILDKITE_SOURCE:-}" == "schedule" ]] && tag="$(ci_boss_head_release_tag)"; then
+  echo "$(ci_boss_already_released_skip_message "$tag")"
+  exit 0
+fi
+
 # This step may execute its bazel actions on the remote macOS workers; ci-env.sh
 # decides whether it does (see remote-execution.sh). For this step, opting in is
 # a decision about the shake credentials, which the build below passes through
