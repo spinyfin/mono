@@ -116,7 +116,11 @@ async fn supervisor_pass(state: Arc<ServerState>) {
 /// The durable socket hosts the coordinator, so a hung or absent retired
 /// `-L boss` server must neither be probed nor delay the reset, even while
 /// a real supervisor pass and an app-registration attach hold or queue on
-/// the lifecycle lock.
+/// the lifecycle lock. After the supervisor releases, the reset waits at
+/// least 100 ms and less than 1 s for the lock. A 30 s `legacy_delay` is
+/// the slow-legacy fixture; zero with `legacy_absent` returns "no server
+/// running". Neither server is probed when the durable socket hosts the
+/// coordinator.
 async fn contended_legacy_reset(token: &str, legacy_delay: Duration) {
     let (f, mut read, mut write, connection) = rpc_fixture(token).await;
     let entered = Arc::new(tokio::sync::Notify::new());

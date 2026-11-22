@@ -170,10 +170,12 @@ pub(super) async fn handle_verify_coordinator_reset_request(ctx: Dispatch, req: 
     );
 }
 
-/// How long a delivery whose confirmation is still outstanding suppresses a
-/// repeat request for the same session. Past this, a lost, held or denied
-/// frame is retried instead of being reported as pending.
-const PENDING_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a delivery suppresses a repeat request for the same session,
+/// covering both outstanding confirmation and the confirmed input turn.
+/// Past this, a lost, held, or denied frame, or a confirmed turn that never
+/// ends (transcript error, compaction, `/clear`), is retried with a new id
+/// instead of being reported as pending.
+pub(super) const PENDING_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// A credential delivery awaiting confirmation or turn end, keyed to the coordinator
 /// generation it targets so a replacement session is never suppressed by its
@@ -184,7 +186,6 @@ pub(super) struct PendingAuthorizationDelivery {
     spawn_token: String,
     attempt_id: u64,
     delivery_id: Option<String>,
-    confirmed: bool,
     started: std::time::Instant,
 }
 
@@ -210,8 +211,10 @@ fn clear_pending(pending: &std::sync::Mutex<Option<PendingAuthorizationDelivery>
 /// that asked mid-turn gets an answer now and the message at its next input
 /// boundary. Confirmation continues in the background, bounded by
 /// [`boss_engine_runtime::coordinator_tmux::inbox::AUTHORIZATION_CONFIRMATION_TIMEOUT`],
-/// and records the delivery against the spawn token once confirmed. Every
-/// outcome is audited as `coordinator_handoff_authorization_delivery`.
+/// and records the delivery against the spawn token once confirmed. The
+/// confirmed-turn wait is then bounded by [`PENDING_COALESCE_WINDOW`] so a
+/// turn that never ends cannot suppress later redelivery. Every outcome is
+/// audited as `coordinator_handoff_authorization_delivery`.
 pub(super) async fn deliver_authorization(
     state: Arc<ServerState>,
     trigger: &'static str,
@@ -249,8 +252,7 @@ pub(super) async fn deliver_authorization(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("credential delivery state lock poisoned"))?;
             if pending.as_ref().is_some_and(|entry| {
-                entry.spawn_token == record.spawn_token
-                    && (entry.confirmed || entry.started.elapsed() < PENDING_COALESCE_WINDOW)
+                entry.spawn_token == record.spawn_token && entry.started.elapsed() < PENDING_COALESCE_WINDOW
             }) {
                 return Ok(None);
             }
@@ -258,7 +260,6 @@ pub(super) async fn deliver_authorization(
                 spawn_token: record.spawn_token.clone(),
                 attempt_id,
                 delivery_id: None,
-                confirmed: false,
                 started: std::time::Instant::now(),
             });
         }
@@ -321,12 +322,6 @@ pub(super) async fn deliver_authorization(
                 let mut turn_end = None;
                 let (outcome, error) = match outcome {
                     Ok(Ok(observer)) => {
-                        if let Ok(mut entry) = pending.lock()
-                            && let Some(entry) = entry.as_mut()
-                            && entry.attempt_id == attempt_id
-                        {
-                            entry.confirmed = true;
-                        }
                         turn_end = Some(observer);
                         match work_db.record_coordinator_handoff_authorization_delivered(&spawn_token) {
                             Ok(true) => {}
@@ -356,7 +351,7 @@ pub(super) async fn deliver_authorization(
                     tracing::error!(%error, trigger, "coordinator handoff credential delivery was not confirmed");
                 }
                 if let Some(turn_end) = turn_end {
-                    turn_end.await;
+                    let _ = tokio::time::timeout(PENDING_COALESCE_WINDOW, turn_end).await;
                 }
                 clear_pending(&pending, attempt_id);
             });
