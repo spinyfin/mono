@@ -673,6 +673,7 @@ mod tests {
                     initial_prompt_filename: "initial-prompt.txt",
                     model_menu: crate::driver::ModelMenu {
                         resolve_model_effort: None,
+                        work_type_policy: None,
                         engine_default: "stub-model",
                         effort_value_for_level: no_effort_value,
                         default_model_for_level: only_model,

@@ -201,3 +201,89 @@ async fn tier_row_with_grok_product_default_spawns_on_the_allocated_driver() {
         );
     }
 }
+
+#[tokio::test]
+async fn agy_uses_row_effort_and_execution_role_at_composition() {
+    let workspace = tempfile::tempdir().unwrap();
+    let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+    let product = crate::test_support::create_test_product(&db);
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 0, 100))
+        .unwrap();
+    for (kind, effort, reasoning, created_via, expected) in [
+        (
+            ExecutionKind::ChoreImplementation,
+            EffortLevel::Small,
+            ReasoningMode::Standard,
+            "human",
+            "gemini-4-hydrogen-medium",
+        ),
+        (
+            ExecutionKind::ChoreImplementation,
+            EffortLevel::Large,
+            ReasoningMode::Standard,
+            "human",
+            "gemini-4-neon-xhigh",
+        ),
+        (
+            ExecutionKind::ChoreImplementation,
+            EffortLevel::Large,
+            ReasoningMode::Investigation,
+            "human",
+            "gemini-4-carbon-high",
+        ),
+        (
+            ExecutionKind::RevisionImplementation,
+            EffortLevel::Large,
+            ReasoningMode::Standard,
+            boss_protocol::CREATED_VIA_CI_FIX_PREFIX,
+            "gemini-4-hydrogen-xhigh",
+        ),
+        (
+            ExecutionKind::RevisionImplementation,
+            EffortLevel::Large,
+            ReasoningMode::Standard,
+            boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX,
+            "gemini-4-neon-xhigh",
+        ),
+    ] {
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(&product.id)
+                    .name(format!(
+                        "Gemini launch policy {kind} {effort:?} {reasoning:?} {created_via}"
+                    ))
+                    .effort_level(effort)
+                    .reasoning(reasoning)
+                    // Investigation auto-allocation remains Claude/Codex-only;
+                    // an explicit agy driver choice uses its Carbon tier.
+                    .maybe_driver((reasoning == ReasoningMode::Investigation).then_some("agy"))
+                    .created_via(created_via)
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(&chore.id)
+                    .kind(kind)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &db.get_work_item(&chore.id).unwrap(),
+            workspace.path(),
+            None,
+            WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(composed.spawn_config.driver, "agy");
+        assert_eq!(composed.spawn_config.model, expected);
+    }
+}

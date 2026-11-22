@@ -21,8 +21,8 @@
 pub struct ModelPriceUsdPerMillion {
     pub input: f64,
     pub output: f64,
-    pub cache_write: f64,
-    pub cache_read: f64,
+    pub cache_write: Option<f64>,
+    pub cache_read: Option<f64>,
 }
 
 /// `(family substring, price)` pairs, checked in order against the
@@ -34,8 +34,8 @@ pub const MODEL_PRICING: &[(&str, ModelPriceUsdPerMillion)] = &[
         ModelPriceUsdPerMillion {
             input: 15.0,
             output: 75.0,
-            cache_write: 18.75,
-            cache_read: 1.50,
+            cache_write: Some(18.75),
+            cache_read: Some(1.50),
         },
     ),
     (
@@ -43,8 +43,8 @@ pub const MODEL_PRICING: &[(&str, ModelPriceUsdPerMillion)] = &[
         ModelPriceUsdPerMillion {
             input: 3.0,
             output: 15.0,
-            cache_write: 3.75,
-            cache_read: 0.30,
+            cache_write: Some(3.75),
+            cache_read: Some(0.30),
         },
     ),
     (
@@ -52,8 +52,39 @@ pub const MODEL_PRICING: &[(&str, ModelPriceUsdPerMillion)] = &[
         ModelPriceUsdPerMillion {
             input: 0.80,
             output: 4.0,
-            cache_write: 1.0,
-            cache_read: 0.08,
+            cache_write: Some(1.0),
+            cache_read: Some(0.08),
+        },
+    ),
+    // API reference rates from the November 2026 model guide. Subscription
+    // agy runs remain unpriced in cost_report::price_for_record. Cache rates
+    // were not supplied, so nonzero cache usage cannot be estimated.
+    (
+        "gemini-4-hydrogen",
+        ModelPriceUsdPerMillion {
+            input: 1.50,
+            output: 7.50,
+            cache_write: None,
+            cache_read: None,
+        },
+    ),
+    (
+        "gemini-4-neon",
+        ModelPriceUsdPerMillion {
+            input: 3.0,
+            output: 15.0,
+            cache_write: None,
+            cache_read: None,
+        },
+    ),
+    // Regular list price; the introductory $2/$10 offer is temporary.
+    (
+        "gemini-4-carbon",
+        ModelPriceUsdPerMillion {
+            input: 4.0,
+            output: 20.0,
+            cache_write: None,
+            cache_read: None,
         },
     ),
 ];
@@ -79,11 +110,38 @@ pub fn estimate_usd(
     output_tokens: i64,
     cache_creation_tokens: i64,
     cache_read_tokens: i64,
-) -> f64 {
+) -> Option<f64> {
     const PER_MILLION: f64 = 1_000_000.0;
-    (input_tokens as f64 * price.input
-        + output_tokens as f64 * price.output
-        + cache_creation_tokens as f64 * price.cache_write
-        + cache_read_tokens as f64 * price.cache_read)
-        / PER_MILLION
+    let cache_cost = |tokens: i64, rate: Option<f64>| {
+        if tokens == 0 {
+            Some(0.0)
+        } else {
+            rate.map(|rate| tokens as f64 * rate)
+        }
+    };
+    Some(
+        (input_tokens as f64 * price.input
+            + output_tokens as f64 * price.output
+            + cache_cost(cache_creation_tokens, price.cache_write)?
+            + cache_cost(cache_read_tokens, price.cache_read)?)
+            / PER_MILLION,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn gemini_families_match_all_thinking_suffixes_without_inventing_cache_prices() {
+        for (family, input, output) in [("hydrogen", 1.5, 7.5), ("neon", 3.0, 15.0), ("carbon", 4.0, 20.0)] {
+            for rung in ["low", "medium", "high", "xhigh"] {
+                let price = price_for_model(&format!("GEMINI-4-{family}-{rung}")).unwrap();
+                assert_eq!(price.input, input);
+                assert_eq!(price.output, output);
+                assert_eq!(estimate_usd(price, 1_000_000, 1_000_000, 0, 0), Some(input + output));
+                assert_eq!(estimate_usd(price, 0, 0, 1, 0), None);
+                assert_eq!(estimate_usd(price, 0, 0, 0, 1), None);
+            }
+        }
+    }
 }

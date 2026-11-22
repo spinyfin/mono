@@ -402,6 +402,7 @@ pub fn stub_descriptor() -> DriverDescriptor {
         initial_prompt_filename: "initial-prompt.txt",
         model_menu: ModelMenu {
             resolve_model_effort: None,
+            work_type_policy: None,
             engine_default: "stub-model",
             effort_value_for_level: |_| None,
             default_model_for_level: |_| "stub-model",

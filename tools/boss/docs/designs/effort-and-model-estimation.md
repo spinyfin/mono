@@ -401,3 +401,46 @@ Operator-filed revisions (`boss task create-revision` with no `--reasoning`) inh
 ### What this deliberately does not do
 
 There is no per-row `--model` for the coordinator. The operator's guidance is a _policy_ about kinds of work, so it lives in the model tables as policy rather than as per-row micromanagement; the coordinator classifies the work and the driver's menu decides the slug. `model_override` remains the human escape hatch it always was.
+
+### Antigravity work-type mapping (November 2026)
+
+Antigravity refines the standard tier using the driver-owned
+`agy/model_menu.rs` tables. The existing menu is compiled data; there is no
+runtime per-driver mapping configuration. Other drivers retain their selection
+policy.
+
+Automatic design/investigation driver allocation remains limited to Claude and
+Codex. An explicit Antigravity driver choice uses the Carbon mapping below;
+the model policy does not change driver-allocation eligibility.
+
+| Work                                                                                              | Antigravity family                                                    |
+| ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Standard reasoning, trivial/small effort                                                          | Gemini 4 Hydrogen                                                     |
+| Standard reasoning, medium/large/max effort; unclassified or unspecified default                  | Gemini 4 Neon (unclassified rows with effort use the same size table) |
+| Progression, automation triage, quick answers                                                     | Gemini 4 Hydrogen                                                     |
+| Merge-conflict and CI-remediation runs, including engine-minted revision retries                  | Gemini 4 Hydrogen                                                     |
+| PR reviews, review-finding revisions                                                              | Gemini 4 Neon                                                         |
+| Investigation reasoning; design/investigation rows; product/project design and investigation runs | Gemini 4 Carbon                                                       |
+
+Generic pool automation defaults to Hydrogen; named review and design runs use
+their respective roles. Execution roles take precedence over the owning row and pool tier: progression
+and triage stay on Hydrogen even for a design or investigation item. Revision
+provenance distinguishes mechanical CI/conflict retries from review findings.
+Ordinary revisions still follow the row's reasoning and effort. Existing explicit
+model pins retain their precedence; progression already strips inherited pins.
+
+The Antigravity review menu maps every review tier to Neon. Its work-type table
+also names Neon for review guides, but the review-guide product route remains
+explicitly fixed to Codex/Astra; this table does not change driver routing.
+
+Thinking levels follow effort: trivial → low, small → medium, medium → high,
+large/max → xhigh. Hydrogen and Neon support xhigh; Carbon clamps to high.
+The driver resolves one suffixed model ID and matching thinking level, passes
+both to launch, and the existing launch-recording path saves that exact model
+on the execution, run, and allocation decision.
+
+The API reference pricing table includes Hydrogen ($1.50/$7.50), Neon
+($3/$15), and Carbon ($4/$20) per million input/output tokens. Carbon uses its
+regular price rather than the temporary introductory offer. Unspecified cache
+rates remain unknown. Antigravity subscription runs remain unpriced by
+`boss cost --usd`; measured token views retain their Gemini model labels.

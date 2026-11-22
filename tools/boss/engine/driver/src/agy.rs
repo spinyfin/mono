@@ -102,6 +102,7 @@ static AGY_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
         resolve_model_effort: Some(model_menu::resolve_model_effort),
+        work_type_policy: Some(model_menu::WORK_TYPE_POLICY),
         engine_default: model_menu::STANDARD_FAMILY,
         effort_value_for_level: model_menu::effort_value_for_level,
         default_model_for_level: model_menu::default_model_for_level,
@@ -833,7 +834,7 @@ mod tests {
         for reasoning in [ReasoningMode::Standard, ReasoningMode::Investigation] {
             let family = (menu.model_for_reasoning)(reasoning);
             let expected_family = match reasoning {
-                ReasoningMode::Standard => model_menu::STANDARD_FAMILY,
+                ReasoningMode::Standard => model_menu::LIGHT_FAMILY,
                 ReasoningMode::Investigation => model_menu::STRONG_FAMILY,
             };
             assert_eq!(family, expected_family, "{reasoning:?}");
@@ -867,7 +868,7 @@ mod tests {
         );
         assert_eq!(
             (menu.review_model_for_tier)(ReviewModelTier::Strong),
-            model_menu::STRONG_FAMILY
+            model_menu::STANDARD_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Trivial),
@@ -875,7 +876,7 @@ mod tests {
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Small),
-            model_menu::STANDARD_FAMILY
+            model_menu::LIGHT_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Medium),
@@ -883,11 +884,11 @@ mod tests {
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Large),
-            model_menu::STRONG_FAMILY
+            model_menu::STANDARD_FAMILY
         );
         assert_eq!(
             (menu.default_model_for_level)(EffortLevel::Max),
-            model_menu::STRONG_FAMILY
+            model_menu::STANDARD_FAMILY
         );
         assert!((menu.model_belongs_to_driver)("gemini-4-hydrogen-xhigh"));
         assert!((menu.model_belongs_to_driver)("GEMINI-4-CARBON-HIGH"));

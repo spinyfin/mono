@@ -146,6 +146,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
         resolve_model_effort: None,
+        work_type_policy: None,
         // Intentionally stays "opus", not "fable": this is only the step-5
         // fallback in resolve_spawn_config for a row with no model_override,
         // no pool override, no effort_level, and no product default — a

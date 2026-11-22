@@ -1301,6 +1301,8 @@ pub async fn compose_worker_spawn(
             Some(member) => resolve_batch_reviewer_spawn(&registry, member, work_item_kind)?,
             None => {
                 let spawn_input = SpawnResolutionInput::builder()
+                    .execution_kind(&execution.kind)
+                    .maybe_created_via(work_item_created_via(work_item))
                     // Effort always comes from the owning row, for pool and main-pool workers alike.
                     // For review/automation pools this is deliberate: capability comes from the pool's
                     // strong model tier below, while effort stays proportional to the likely material to

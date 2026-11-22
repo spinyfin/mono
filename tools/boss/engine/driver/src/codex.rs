@@ -344,6 +344,7 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     initial_prompt_filename: "initial-prompt.txt",
     model_menu: ModelMenu {
         resolve_model_effort: None,
+        work_type_policy: None,
         // Highest-priority model in `codex debug models` on 0.153.4: frontier
         // agentic coding. 0.159.1 added `gpt-6.1-sol` above it (priority 1
         // on 0.160.1); astra is retained deliberately — swapping the
