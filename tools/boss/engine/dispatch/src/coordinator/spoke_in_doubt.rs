@@ -60,18 +60,20 @@ impl ExecutionCoordinator {
                 tracing::error!(
                     execution_id = %execution.id,
                     error = %format!("{park_err:#}"),
-                    "could not park an execution whose spoke lease is in doubt",
+                    "could not park an execution whose spoke lease is in doubt; falling back to the failed-start path",
                 );
             }
         }
-        tracing::warn!(
-            execution_id = %execution.id,
-            error = %format!("{err:#}"),
-            "spoke lease unresolved; attempt parked without spending the retry budget",
-        );
+        if parked {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "spoke lease unresolved; attempt parked without spending the retry budget",
+            );
+        }
         self.raise_spoke_in_doubt_attention(execution, "workspace lease", &err, timing.attention_after);
         if parked {
-            err.context(SpokeAttemptParked)
+            anyhow::Error::new(SpokeAttemptParked(err))
         } else {
             // The row may still be claimed; let the scheduler's unclaim fallback run.
             err
@@ -548,20 +550,33 @@ impl ExecutionCoordinator {
 }
 
 /// Marker attached by [`ExecutionCoordinator::park_in_doubt_spoke_lease`] as
-/// error context once the attempt has actually been parked without spending the
-/// retry budget. The original error stays in the source chain.
+/// a transparent error wrapper once the attempt has actually been parked
+/// without spending the retry budget. Its `Display` and `source()` delegate
+/// to the inner error so single-line callers such as `force_dispatch` keep the
+/// underlying cause without duplicating it in `{:#}`.
 #[derive(Debug)]
-pub(super) struct SpokeAttemptParked;
+pub(super) struct SpokeAttemptParked(anyhow::Error);
 
 impl std::fmt::Display for SpokeAttemptParked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("attempt parked while the spoke lease is in doubt")
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for SpokeAttemptParked {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
     }
 }
 
 pub(super) fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeUncertain> {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<LeaseOutcomeUncertain>())
+    err.chain().find_map(|cause| {
+        cause.downcast_ref::<LeaseOutcomeUncertain>().or_else(|| {
+            cause
+                .downcast_ref::<SpokeAttemptParked>()
+                .and_then(|p| waitable_spoke_lease(&p.0))
+        })
+    })
 }
 
 /// The coordinator's own lease backstop elapsed before the transport returned.
@@ -573,7 +588,12 @@ pub(super) fn waitable_spoke_lease(err: &anyhow::Error) -> Option<&LeaseOutcomeU
 pub(super) struct LeaseBackstopElapsed(pub(super) Duration);
 
 pub(super) fn lease_backstop_elapsed(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| cause.is::<LeaseBackstopElapsed>())
+    err.chain().any(|cause| {
+        cause.is::<LeaseBackstopElapsed>()
+            || cause
+                .downcast_ref::<SpokeAttemptParked>()
+                .is_some_and(|p| lease_backstop_elapsed(&p.0))
+    })
 }
 
 /// Whether the execution has been cancelled or finished. A failed read is not
@@ -581,4 +601,34 @@ pub(super) fn lease_backstop_elapsed(err: &anyhow::Error) -> bool {
 /// release state a worker may still be using.
 pub(super) fn execution_no_longer_runnable(work_db: &WorkDb, execution_id: &str) -> Result<bool> {
     Ok(work_db.get_execution(execution_id)?.status.is_terminal())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spoke_attempt_parked_preserves_display_and_chain() {
+        let inner = anyhow::Error::new(LeaseOutcomeUncertain {
+            host_id: "host-1".to_owned(),
+            command_id: "cmd-1".to_owned(),
+            reason: "host did not answer".to_owned(),
+            settled: false,
+        });
+        let inner_display = inner.to_string();
+        let inner_alt = format!("{inner:#}");
+        let parked = anyhow::Error::new(SpokeAttemptParked(inner));
+
+        assert!(parked.is::<SpokeAttemptParked>());
+        assert_eq!(parked.to_string(), inner_display);
+        assert_eq!(format!("{parked:#}"), inner_alt);
+        assert!(waitable_spoke_lease(&parked).is_some());
+
+        let backstop = anyhow::Error::new(LeaseBackstopElapsed(Duration::from_secs(90)));
+        let backstop_display = backstop.to_string();
+        let parked_backstop = anyhow::Error::new(SpokeAttemptParked(backstop));
+        assert!(parked_backstop.is::<SpokeAttemptParked>());
+        assert_eq!(parked_backstop.to_string(), backstop_display);
+        assert!(lease_backstop_elapsed(&parked_backstop));
+    }
 }

@@ -806,6 +806,30 @@ async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spendi
         );
         assert_never_failed(&fx, &execution.id);
         assert!(!released(&peer.commands()));
+
+        // A forced launch of the parked attempt still surfaces the underlying
+        // lease cause in its single-line Display (`to_string()`), not just a
+        // generic parked-attempt marker.
+        let forced = tokio::spawn({
+            let coordinator = Arc::clone(&env.coordinator);
+            let execution_id = execution.id.clone();
+            async move {
+                coordinator
+                    .force_dispatch(
+                        &execution_id,
+                        boss_execution_contracts::DispatchAdmission::OperatorForced,
+                    )
+                    .await
+            }
+        });
+        timing::advancing(|| forced.is_finished()).await;
+        let forced_err = forced.await.unwrap().unwrap_err();
+        assert!(
+            forced_err
+                .to_string()
+                .contains("cube workspace lease timed out after 1s"),
+            "force_dispatch should keep the underlying lease cause in to_string(): {forced_err:#}"
+        );
     })
     .await;
 }
