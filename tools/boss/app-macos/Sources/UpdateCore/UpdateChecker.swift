@@ -148,6 +148,12 @@ actor UpdateChecker {
     /// this to suppress auto-install while still surfacing update availability.
     nonisolated let isDevBuild: Bool
 
+    /// True when `BossFullVersion` carries the `-dev-unstamped` placeholder.
+    /// Unstamped local/CI builds have no tag-derived version to compare against
+    /// published releases, so update checks report `.upToDate` instead of
+    /// showing a permanent update badge.
+    nonisolated let isUnstampedBuild: Bool
+
     /// The running version the checker compares releases against (internal so
     /// `UpdateModel` can stamp it onto update-log records).
     let currentVersion: VersionTuple
@@ -174,6 +180,7 @@ actor UpdateChecker {
         self.currentVersion = VersionTuple.parse(currentVersionString)
             ?? VersionTuple(major: 0, minor: 0, patch: 0)
         self.isDevBuild = fullVersionString.contains("-dev-")
+        self.isUnstampedBuild = fullVersionString.contains("-dev-unstamped")
         self.userAgentVersion = currentVersionString
         self.fetcher = fetcher
     }
@@ -191,6 +198,10 @@ actor UpdateChecker {
     }
 
     func checkForUpdates() async -> UpdateCheckResult {
+        if isUnstampedBuild {
+            checkerLog.info("update check: unstamped build — reporting up-to-date")
+            return .upToDate
+        }
         let usingETag = storedETag != nil
         checkerLog.info(
             "update check: current=\(self.currentVersion.description, privacy: .public) url=\(Self.releasesURL.absoluteString, privacy: .public) conditionalRequest=\(usingETag, privacy: .public)"

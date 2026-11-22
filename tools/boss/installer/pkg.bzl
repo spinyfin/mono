@@ -6,11 +6,30 @@ Defines four rules:
   boss_pkg_unsigned       — runs pkgbuild to produce Boss-<sha>.pkg (unsigned)
   build_info_rs           — emits a Rust source file with stamped build constants
   boss_short_version_plist — emits a plist fragment with both CFBundleShortVersionString
-                             (full STABLE_BOSS_VERSION, e.g. "1.0.4-dev-f3be785") and
-                             CFBundleVersion (numeric STABLE_BOSS_BASE_VERSION, e.g.
-                             "1.0.4") so the About panel shows the full version while
-                             keeping CFBundleVersion Apple-compliant.
+                             (numeric STABLE_BOSS_BASE_VERSION, e.g. "1.0.4") and
+                             BossFullVersion (full STABLE_BOSS_VERSION, e.g.
+                             "1.0.4-dev-f3be785") so the About panel shows the full
+                             version while keeping CFBundleVersion Apple-compliant.
+
+`build_info_rs` and `boss_short_version_plist` follow `--stamp`: unstamped builds
+write a constant placeholder and do not read `ctx.info_file`, so a new `boss-v*`
+tag does not change their action keys (or those of engine_lib / cli / tests).
+Release builds pass `--config=release` (`--stamp`) and embed the tag-derived
+version.
 """
+
+load(":stamp.bzl", "attrs_with_stamp", "is_stamping_enabled")
+
+# Placeholder version compiled into non-release (unstamped) builds. Constant so
+# the generated file's action key is independent of git tags.
+UNSTAMPED_BOSS_VERSION = "0.0.0-dev"
+
+# Apple-required numeric CFBundleVersion / CFBundleShortVersionString when
+# unstamped. BossFullVersion carries `-dev-` so UpdateChecker treats local/CI
+# app builds as dev builds and will not auto-install a published release over
+# them.
+UNSTAMPED_BOSS_BASE_VERSION = "0.0.0"
+UNSTAMPED_BOSS_FULL_VERSION = "0.0.0-dev-unstamped"
 
 # ── boss_pkg_payload ──────────────────────────────────────────────────────────
 
@@ -164,85 +183,86 @@ notarize, and staple the final artifact.
 
 # ── build_info_rs ─────────────────────────────────────────────────────────────
 
+def _build_info_rs_source(version):
+    return (
+        "pub const BOSS_VERSION: &str = \"%s\";\n" % version +
+        "#[allow(dead_code)]\n" +
+        "pub const BOSS_GIT_SHA: &str = \"unknown\";\n" +
+        "#[allow(dead_code)]\n" +
+        "pub const BOSS_BUILD_TIME: &str = \"unknown\";\n"
+    )
+
 def _build_info_rs_impl(ctx):
-    """Emits a Rust source file with stamped build constants."""
+    """Emits a Rust source file with stamped (or placeholder) build constants."""
     output = ctx.actions.declare_file(ctx.attr.out)
 
-    # ctx.info_file is the non-volatile status file (stable-status.txt)
-    info_file = ctx.info_file
-
-    # Read ONLY STABLE_BOSS_BASE_VERSION (the numeric, tag-derived version, e.g.
-    # "1.0.4") from stable-status.txt and emit a Rust source file with pub
-    # constants. BOSS_GIT_SHA and BOSS_BUILD_TIME are intentionally emitted as
-    # the literal "unknown" rather than stamped.
+    # This file is compiled into engine_lib, boss, and bossctl. Reading
+    # stable-status.txt here — even only the tag-derived base version — makes
+    # every new boss-v* tag a new action key for those crates and the 40–80
+    # tests downstream of them. Unstamped builds therefore write a constant
+    # placeholder with ctx.actions.write and do not take ctx.info_file as an
+    # input. Release builds (`--config=release` / `--stamp`) read
+    # STABLE_BOSS_BASE_VERSION from stable-status.txt.
     #
-    # Why not stamp the SHA / build time here: this file is compiled into
-    # engine_lib (and the cli/bossctl crates). The git SHA changes on every
-    # commit and a wall-clock build time changes on every build, so stamping
-    # either one made the generated file change constantly, which busted the
-    # Rust action cache and forced a full recompile of the largest crate in the
-    # tree on every CI run. Reading only the base version — which changes only
-    # when a new boss-v* release tag is cut — keeps this file byte-stable across
-    # commits, so the downstream rustc actions hit the disk cache.
-    #
-    # The runtime "which binary am I?" signal that actually matters lives in
-    # engine::build_info::binary_fingerprint() (a hash of the engine binary's
-    # own bytes), and the user-facing release version is stamped separately into
-    # Info.plist by boss_short_version_plist. So nothing of value is lost here.
-    command = (
-        "set -euo pipefail\n" +
-        "VERSION=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "[ -z \"$VERSION\" ] && VERSION=unknown\n" +
-        "printf 'pub const BOSS_VERSION: &str = \"%s\";\\n" +
-        "#[allow(dead_code)]\\n" +
-        "pub const BOSS_GIT_SHA: &str = \"unknown\";\\n" +
-        "#[allow(dead_code)]\\n" +
-        "pub const BOSS_BUILD_TIME: &str = \"unknown\";\\n' " +
-        "\"$VERSION\" > " + output.path + "\n"
-    )
-
-    ctx.actions.run_shell(
-        inputs = [info_file],
-        outputs = [output],
-        command = command,
-        mnemonic = "BuildInfoRs",
-        progress_message = "Generating build_info_generated.rs",
-    )
+    # SHA and wall-clock time stay the literal "unknown" even when stamped:
+    # those values live in build_provenance_rs (a leaf crate only the engine
+    # binaries link). See that rule's doc comment.
+    if is_stamping_enabled(ctx):
+        info_file = ctx.file.status_file if ctx.attr.status_file else ctx.info_file
+        tmpl = ctx.actions.declare_file(ctx.attr.out + ".tmpl")
+        ctx.actions.write(
+            output = tmpl,
+            content = _build_info_rs_source("@BOSS_VERSION@"),
+        )
+        command = (
+            "set -euo pipefail\n" +
+            "VERSION=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
+            " | cut -d' ' -f2 2>/dev/null || true)\n" +
+            "[ -z \"$VERSION\" ] && VERSION=unknown\n" +
+            "sed \"s|@BOSS_VERSION@|${VERSION}|g\" " + tmpl.path + " > " + output.path + "\n"
+        )
+        ctx.actions.run_shell(
+            inputs = [tmpl, info_file],
+            outputs = [output],
+            command = command,
+            mnemonic = "BuildInfoRs",
+            progress_message = "Generating build_info_generated.rs",
+        )
+    else:
+        ctx.actions.write(
+            output = output,
+            content = _build_info_rs_source(UNSTAMPED_BOSS_VERSION),
+        )
 
     return [DefaultInfo(files = depset([output]))]
 
 build_info_rs = rule(
     implementation = _build_info_rs_impl,
-    attrs = {
+    attrs = attrs_with_stamp({
         "out": attr.string(
             mandatory = True,
             doc = "Output filename for the generated Rust source file.",
         ),
-    },
+        "status_file": attr.label(
+            allow_single_file = True,
+            doc = "Optional test fixture overriding ctx.info_file when stamped.",
+        ),
+    }),
     doc = """
 Generates a Rust source file containing build constants.
 
-Emits:
-  pub const BOSS_VERSION: &str = "<base-version>";   // e.g. "1.0.4"
-  pub const BOSS_GIT_SHA: &str = "unknown";          // intentionally not stamped
-  pub const BOSS_BUILD_TIME: &str = "unknown";       // intentionally not stamped
+Unstamped (`--nostamp`, the default for check / developer builds):
+  pub const BOSS_VERSION: &str = "0.0.0-dev";
+  The action does not read stable-status.txt, so a new boss-v* tag does not
+  change this file or anything that compiles it in.
 
-BOSS_VERSION is the numeric, tag-derived base version (STABLE_BOSS_BASE_VERSION),
-consumed by engine_lib, boss, and bossctl for --version output. It changes only
-when a new boss-v* release tag is cut, so this file stays byte-stable across
-commits and the crates that compile it in keep hitting the Bazel action cache.
+Stamped (`--stamp` / `--config=release`):
+  pub const BOSS_VERSION: &str = "<STABLE_BOSS_BASE_VERSION>";  // e.g. "1.0.4"
 
-BOSS_GIT_SHA and BOSS_BUILD_TIME are emitted as the literal "unknown" on purpose:
-stamping per-commit / per-build values directly into this file — which is
-`include!`d straight into engine_lib's own source — forced a full recompile of
-engine_lib on every CI build. The reliable runtime build identity is
-engine::build_info::binary_fingerprint(); the user-facing release version is
-stamped separately into Info.plist by boss_short_version_plist. The real,
-checkable build sha/dirty/build-time DO get stamped — see `build_provenance_rs`
-below, which stamps them into a separate, dedicated leaf crate that only the
-`engine` rust_binary targets link (never engine_lib), so a new commit relinks
-the binary without recompiling the library or re-executing its tests.
+BOSS_GIT_SHA and BOSS_BUILD_TIME are the literal "unknown" in both cases.
+Per-commit identity lives in `build_provenance_rs` (leaf crate, engine
+binaries only). The user-facing release version in the app bundle is
+`boss_short_version_plist`, which is also stamp-gated.
 """,
 )
 
@@ -268,14 +288,24 @@ def _build_provenance_rs_impl(ctx):
     # values appear in the live-status debug report.
     #
     # VERSION is STABLE_BOSS_VERSION (`1.0.N` on a release tag, `1.0.N-dev-<sha>`
-    # otherwise). It already changes every commit on a dev build, so stamping
-    # it here does not add cache churn beyond GIT_SHA. Empty / `0.0.0` fall
-    # back to `unknown` — never the Cargo-crate placeholder.
+    # otherwise) when `--stamp` is set, and UNSTAMPED_BOSS_VERSION (`0.0.0-dev`)
+    # when unstamped so the tag-derived version only reaches release binaries.
+    # SHA, dirty, and build-time are always populated here because this leaf
+    # crate already changes every commit/build and is isolated to the engine
+    # binaries. Empty / `0.0.0` when stamped fall back to `unknown` — never
+    # the Cargo-crate placeholder.
+    if is_stamping_enabled(ctx):
+        version_cmd = (
+            "VERSION=$(grep '^STABLE_BOSS_VERSION ' " + ctx.info_file.path +
+            " | cut -d' ' -f2 2>/dev/null || true)\n" +
+            "if [ -z \"$VERSION\" ] || [ \"$VERSION\" = \"0.0.0\" ]; then VERSION=unknown; fi\n"
+        )
+    else:
+        version_cmd = "VERSION=\"" + UNSTAMPED_BOSS_VERSION + "\"\n"
+
     command = (
         "set -euo pipefail\n" +
-        "VERSION=$(grep '^STABLE_BOSS_VERSION ' " + ctx.info_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "if [ -z \"$VERSION\" ] || [ \"$VERSION\" = \"0.0.0\" ]; then VERSION=unknown; fi\n" +
+        version_cmd +
         "SHA=$(grep '^STABLE_BOSS_GIT_SHA_FULL ' " + ctx.info_file.path +
         " | cut -d' ' -f2 2>/dev/null || true)\n" +
         "[ -z \"$SHA\" ] && SHA=unknown\n" +
@@ -304,17 +334,17 @@ def _build_provenance_rs_impl(ctx):
 
 build_provenance_rs = rule(
     implementation = _build_provenance_rs_impl,
-    attrs = {
+    attrs = attrs_with_stamp({
         "out": attr.string(
             mandatory = True,
             doc = "Output filename for the generated Rust source file.",
         ),
-    },
+    }),
     doc = """
-Generates a Rust source file containing the engine's real build provenance.
+Generates a Rust source file containing the engine's build provenance.
 
 Emits:
-  pub const VERSION: &str = "<1.0.N or 1.0.N-dev-<sha>, else unknown>";
+  pub const VERSION: &str = "0.0.0-dev" (unstamped) or "<1.0.N or 1.0.N-dev-<sha>, else unknown>" (stamped);
   pub const GIT_SHA: &str = "<full commit sha>";
   pub const GIT_DIRTY: bool = <true|false>;
   pub const BUILD_TIME: &str = "<ISO-8601 UTC>";
@@ -335,66 +365,96 @@ tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.m
 
 # ── boss_short_version_plist ──────────────────────────────────────────────────
 
-def _boss_short_version_plist_impl(ctx):
-    """Emits a plist fragment with both version keys stamped from workspace status."""
-    output = ctx.actions.declare_file(ctx.attr.out)
-    info_file = ctx.info_file
+def _boss_version_plist_xml(base_version, full_version):
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"" +
+        " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
+        "<plist version=\"1.0\"><dict>\n" +
+        "<key>CFBundleShortVersionString</key><string>%s</string>\n" % base_version +
+        "<key>CFBundleVersion</key><string>%s</string>\n" % base_version +
+        "<key>BossFullVersion</key><string>%s</string>\n" % full_version +
+        "</dict></plist>\n"
+    )
 
-    # Read STABLE_BOSS_VERSION (full, e.g. "1.0.4-dev-f3be785") and
-    # STABLE_BOSS_BASE_VERSION (numeric-only, e.g. "1.0.4") from stable-status.txt.
+def _boss_short_version_plist_impl(ctx):
+    """Emits a plist fragment with version keys, stamp-gated."""
+    output = ctx.actions.declare_file(ctx.attr.out)
+
+    # Same stamp gate as build_info_rs: mac-app-build and developer builds
+    # must not rebuild the app bundle when a new boss-v* tag is cut. The
+    # placeholder BossFullVersion contains "-dev-" so UpdateChecker treats
+    # those builds as dev builds.
     #
     # CFBundleVersion and CFBundleShortVersionString must be period-separated
     # non-negative integers (plisttool enforces Apple's requirement). The full
-    # version including the "-dev-<sha>" suffix goes in the custom BossFullVersion
-    # key; the macOS app reads it via Bundle.main and passes it to
-    # orderFrontStandardAboutPanel(options:) so the About panel shows the complete
-    # version string. When not stamped, fallbacks are "0.0.0" / "dev" respectively.
-    command = (
-        "set -euo pipefail\n" +
-        "V=$(grep '^STABLE_BOSS_VERSION ' " + info_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "B=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
-        " | cut -d' ' -f2 2>/dev/null || true)\n" +
-        "[ -z \"$V\" ] && V=dev\n" +
-        "[ -z \"$B\" ] && B=0.0.0\n" +
-        "printf '<?xml version=\"1.0\" encoding=\"UTF-8\"?>\\n" +
-        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"" +
-        " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\\n" +
-        "<plist version=\"1.0\"><dict>\\n" +
-        "<key>CFBundleShortVersionString</key><string>%s</string>\\n" +
-        "<key>CFBundleVersion</key><string>%s</string>\\n" +
-        "<key>BossFullVersion</key><string>%s</string>\\n" +
-        "</dict></plist>\\n' \"$B\" \"$B\" \"$V\" > " + output.path + "\n"
-    )
-
-    ctx.actions.run_shell(
-        inputs = [info_file],
-        outputs = [output],
-        command = command,
-        mnemonic = "BossShortVersionPlist",
-        progress_message = "Generating Boss version plist",
-    )
+    # version including the "-dev-<sha>" suffix goes in the custom
+    # BossFullVersion key; the macOS app reads it via Bundle.main and passes
+    # it to orderFrontStandardAboutPanel(options:).
+    if is_stamping_enabled(ctx):
+        info_file = ctx.file.status_file if ctx.attr.status_file else ctx.info_file
+        tmpl = ctx.actions.declare_file(ctx.attr.out + ".tmpl")
+        ctx.actions.write(
+            output = tmpl,
+            content = _boss_version_plist_xml("@BOSS_BASE_VERSION@", "@BOSS_FULL_VERSION@"),
+        )
+        command = (
+            "set -euo pipefail\n" +
+            "V=$(grep '^STABLE_BOSS_VERSION ' " + info_file.path +
+            " | cut -d' ' -f2 2>/dev/null || true)\n" +
+            "B=$(grep '^STABLE_BOSS_BASE_VERSION ' " + info_file.path +
+            " | cut -d' ' -f2 2>/dev/null || true)\n" +
+            "[ -z \"$V\" ] && V=dev\n" +
+            "[ -z \"$B\" ] && B=0.0.0\n" +
+            "sed -e \"s|@BOSS_BASE_VERSION@|${B}|g\" -e \"s|@BOSS_FULL_VERSION@|${V}|g\" " +
+            tmpl.path + " > " + output.path + "\n"
+        )
+        ctx.actions.run_shell(
+            inputs = [tmpl, info_file],
+            outputs = [output],
+            command = command,
+            mnemonic = "BossShortVersionPlist",
+            progress_message = "Generating Boss version plist",
+        )
+    else:
+        ctx.actions.write(
+            output = output,
+            content = _boss_version_plist_xml(
+                UNSTAMPED_BOSS_BASE_VERSION,
+                UNSTAMPED_BOSS_FULL_VERSION,
+            ),
+        )
 
     return [DefaultInfo(files = depset([output]))]
 
 boss_short_version_plist = rule(
     implementation = _boss_short_version_plist_impl,
-    attrs = {
+    attrs = attrs_with_stamp({
         "out": attr.string(
             mandatory = True,
             doc = "Output filename for the generated plist fragment.",
         ),
-    },
+        "status_file": attr.label(
+            allow_single_file = True,
+            doc = "Optional test fixture overriding ctx.info_file when stamped.",
+        ),
+    }),
     doc = """
-Generates a minimal Info.plist fragment with version keys stamped from stable-status.txt:
+Generates a minimal Info.plist fragment with version keys.
+
+Unstamped (`--nostamp`):
+  CFBundleShortVersionString = CFBundleVersion = "0.0.0"
+  BossFullVersion            = "0.0.0-dev-unstamped"
+  The action does not read stable-status.txt.
+
+Stamped (`--stamp` / `--config=release`):
   CFBundleShortVersionString = STABLE_BOSS_BASE_VERSION (e.g. "1.0.4")  — numeric only
   CFBundleVersion            = STABLE_BOSS_BASE_VERSION (e.g. "1.0.4")  — numeric only
   BossFullVersion            = STABLE_BOSS_VERSION      (e.g. "1.0.4-dev-f3be785")
 
-CFBundleVersion and CFBundleShortVersionString must be numeric-only (plisttool enforces
-Apple's requirement). The full version including the "-dev-<sha>" dev suffix goes in
-BossFullVersion (custom key, not validated); the macOS app reads it at runtime and
-passes it to orderFrontStandardAboutPanel(options:) so the About panel shows the
-complete version string on dev builds.
+CFBundleVersion and CFBundleShortVersionString must be numeric-only (plisttool
+enforces Apple's requirement). The full version including the "-dev-<sha>"
+suffix goes in BossFullVersion (custom key, not validated); the macOS app
+reads it at runtime and passes it to orderFrontStandardAboutPanel(options:).
 """,
 )

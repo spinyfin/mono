@@ -27,12 +27,15 @@ common --disk_cache=~/.cache/bazelcache
 build --experimental_disk_cache_gc_max_size=250G
 build --experimental_disk_cache_gc_max_age=7d
 
-# Always run the workspace-status script so the version plist, build_info_rs
-# and build_provenance_rs actions can read the git-derived version/sha from
-# ctx.info_file (stable-status.txt) and dev builds show a meaningful version
-# string (e.g. "1.0.9-dev-a58a932") in the About panel instead of "0.0.0".
-# Bazel runs the script and writes stable-status.txt on every build whether
-# or not --stamp is set, and those rules read ctx.info_file unconditionally.
+# Always run the workspace-status script so stamped actions can read the
+# git-derived version/sha from ctx.info_file (stable-status.txt). Bazel
+# runs the script and writes stable-status.txt on every build whether or
+# not --stamp is set. build_info_rs and boss_short_version_plist consume
+# those keys only under --stamp; unstamped builds write a constant
+# 0.0.0-dev placeholder and do not take stable-status.txt as an input, so
+# a new boss-v* tag does not rebuild engine_lib, boss, bossctl, or their
+# tests. build_provenance_rs still reads the sha on every build — that
+# crate is a leaf linked only by the engine binaries.
 #
 # --stamp is deliberately OFF for ordinary builds. rules_rust's rust_binary
 # defaults to `stamp = -1` (follow --stamp), and a stamped Rustc action takes
@@ -50,8 +53,9 @@ build --experimental_disk_cache_gc_max_age=7d
 common --workspace_status_command=tools/boss/installer/workspace-status.sh
 
 # Release config: the same status script plus Bazel-level stamping, kept as a
-# named config so release.sh and CI can use --config=release to opt into
-# release-only settings. A release build is a one-off, so the per-binary
+# named config so release.sh and the boss-release CI step can use
+# --config=release to embed the tag-derived version in About, --version,
+# and the published zip. A release build is a one-off, so the per-binary
 # recompiles --stamp causes do not matter there.
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp

@@ -76,6 +76,9 @@ echo "[boss-release] credentials loaded (APP_ID=[REDACTED])"
 # Prints the tag on stdout, or nothing when this run is a no-op (exit 0).
 # The tag is pushed before the build so workspace-status.sh can
 # `git describe --exact-match` and stamp the binary with 1.0.N.
+# `--config=release` turns on `--stamp` so build_info_rs and the
+# version plist consume that tag; check builds stay on the 0.0.0-dev
+# placeholder and keep their action cache across releases.
 log "[boss-release] prepare"
 TAG="$(bin/release prepare --config "${CONFIG}")"
 if [[ -z "${TAG}" ]]; then
@@ -94,12 +97,13 @@ tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 # compile action's cache key + env (option_env! reads them at compile time);
 # --action_env alone does not affect the rustc action.
 #
-# CRITICAL: the build flags below (especially -c opt) change the output
-# directory bazel-out is configured into. The path-discovery cquery MUST use
-# the IDENTICAL flag set, otherwise it resolves a different configuration's
-# output dir — specifically the credential-free `fastbuild` Boss.zip left
-# behind by the mac-app-build step (`bazel build //tools/boss/app-macos/...`,
-# no -c opt, no creds) — and the smoke test ends up verifying the wrong binary.
+# CRITICAL: the build flags below (especially -c opt and --config=release)
+# change the output directory bazel-out is configured into. The path-discovery
+# cquery MUST use the IDENTICAL flag set, otherwise it resolves a different
+# configuration's output dir — specifically the credential-free `fastbuild`
+# Boss.zip left behind by the mac-app-build step (`bazel build
+# //tools/boss/app-macos/...`, no -c opt, no creds, no --stamp) — and the
+# smoke test ends up verifying the wrong binary.
 # That mismatch is exactly what made every prior fix attempt "pass locally" but
 # fail in CI: the credentials were embedded correctly in the opt artifact, but
 # the smoke test extracted the fastbuild one. Keep BUILD_FLAGS the single
@@ -116,6 +120,7 @@ tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 # This is plain `bazel build`, not bazel_verify_only: the zip is uploaded
 # below, so it has to be downloaded to the agent.
 BUILD_FLAGS=(
+  --config=release
   -c opt
   --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID"
   --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID"
@@ -138,6 +143,40 @@ fi
 
 [[ -f "${ZIP_PATH}" ]] || die "Boss.zip not found at discovered path: ${ZIP_PATH}"
 echo "[boss-release] Boss.zip: ${ZIP_PATH}"
+
+# ── verify stamped version in Boss.zip ───────────────────────────────────────
+# Release correctness depends on --config=release flipping the stamp_flag select
+# so Boss.app's Info.plist and bundled binaries embed the tag-derived version
+# instead of the unstamped 0.0.0-dev placeholder. Verify the zip before upload.
+log "[boss-release] verifying stamped version in Boss.zip"
+EXPECTED_VERSION="${TAG#boss-v}"
+VERIFY_DIR=$(mktemp -d)
+(
+  # Subshell keeps this cleanup trap isolated from ci-env.sh's outer EXIT trap.
+  trap 'rm -rf "${VERIFY_DIR}"' EXIT
+  unzip -q "${ZIP_PATH}" -d "${VERIFY_DIR}"
+
+  APP_PLIST="${VERIFY_DIR}/Boss.app/Contents/Info.plist"
+  [[ -f "${APP_PLIST}" ]] || die "Boss.app/Contents/Info.plist missing from ${ZIP_PATH}"
+
+  for key in CFBundleShortVersionString CFBundleVersion BossFullVersion; do
+    actual=$(plutil -extract "${key}" raw -o - "${APP_PLIST}" 2>/dev/null || true)
+    if [[ "${actual}" != "${EXPECTED_VERSION}" ]] || [[ "${actual}" == *-dev-* ]]; then
+      die "Version mismatch in ${APP_PLIST} for ${key}: got '${actual}', expected '${EXPECTED_VERSION}' (no -dev-)"
+    fi
+  done
+
+  actual_boss_ver=$("${VERIFY_DIR}/Boss.app/Contents/Resources/bin/boss" --version)
+  if [[ "${actual_boss_ver}" != "boss ${EXPECTED_VERSION}" ]]; then
+    die "Version mismatch for bundled boss --version: got '${actual_boss_ver}', expected 'boss ${EXPECTED_VERSION}'"
+  fi
+
+  actual_bossctl_ver=$("${VERIFY_DIR}/Boss.app/Contents/Resources/bin/bossctl" --version)
+  if [[ "${actual_bossctl_ver}" != "bossctl ${EXPECTED_VERSION}" ]]; then
+    die "Version mismatch for bundled bossctl --version: got '${actual_bossctl_ver}', expected 'bossctl ${EXPECTED_VERSION}'"
+  fi
+)
+echo "[boss-release] verified version ${EXPECTED_VERSION} in Info.plist, boss, and bossctl"
 
 log "[boss-release] uploading Boss-{version}.zip"
 bin/release upload --config "${CONFIG}" --tag "${TAG}" \

@@ -2,7 +2,7 @@
 
 This document is the operator checklist for the **Boss release step** — the `boss-release` step in the existing `mono` pipeline that builds `Boss.app` and publishes it as `Boss-1.0.N.zip` on a GitHub Release of `spinyfin/mono` tagged `boss-v1.0.N`. Unlike checkleft, Boss is **not** a separately registered pipeline: it is one step inside [`.buildkite/pipeline.yml`](../../../.buildkite/pipeline.yml), gated on `main` and on the three PR steps going green.
 
-Version resolution, skip/idempotency, notes, the draft GitHub Release, the `.sha256` sidecar, verification, and publish are owned by the shared `//tools/release` tool. This step keeps only what is unique to Boss: loading `BOSS_SHAKE_*` compile secrets, the GhosttyKit stub, `bazel build -c opt --define=...`, and `.zip` `cquery` discovery.
+Version resolution, skip/idempotency, notes, the draft GitHub Release, the `.sha256` sidecar, verification, and publish are owned by the shared `//tools/release` tool. This step keeps only what is unique to Boss: loading `BOSS_SHAKE_*` compile secrets, the GhosttyKit stub, `bazel build --config=release -c opt --define=...`, and `.zip` `cquery` discovery.
 
 The pipeline also needs the shake credentials (for embedding GitHub App credentials into the release binary). Those are documented separately in [`buildkite-shake-secrets-setup.md`](buildkite-shake-secrets-setup.md).
 
@@ -190,11 +190,24 @@ A scheduled build that finds a draft for the current `HEAD` refuses to resume it
 ## How it works (summary)
 
 - **Version:** `patch-counter` with literal `major_minor = "1.0"`. The next N is `highest published (or tagged) boss-v1.0.* + 1`, starting at `boss-v1.0.0` when none exist. The bump is never committed to `main`; it lives only in the tag and the GitHub Release. The release **commit** (`HEAD`) is tagged `boss-v1.0.N` _before_ Bazel runs, so `workspace-status.sh` can `git describe --exact-match` and stamp the binary with `1.0.N`.
-- **Build tool:** `bazel build -c opt --define=BOSS_SHAKE_*=... //tools/boss/app-macos:Boss`. The `.zip` path is discovered with the same flag set via `cquery` (a different configuration would resolve the credential-free `fastbuild` zip left by `mac-app-build`). `BOSS_SHAKE_*` are compile inputs and never enter the shared tool.
+- **Build tool:** `bazel build --config=release -c opt --define=BOSS_SHAKE_*=... //tools/boss/app-macos:Boss`. `--config=release` turns on `--stamp` so the tag-derived version is compiled into `--version`, About, and the zip; check builds (`bazel-build-test`, `mac-app-build`, `checks`) stay unstamped and keep a constant `0.0.0-dev` placeholder. The `.zip` path is discovered with the same flag set via `cquery` (a different configuration would resolve the credential-free `fastbuild` zip left by `mac-app-build`). `BOSS_SHAKE_*` are compile inputs and never enter the shared tool.
 - **Structure:** one Buildkite step, three tool calls (`prepare` → build → `upload` → `publish`). The release is created as a **draft** and published only after the required zip and sidecar re-download and checksum-verify.
 - **Loop prevention:** `pipeline.yml` only schedules the step on `main` + schedule/ui/api; the tool also refuses any other `BUILDKITE_SOURCE`; no commit is pushed to `main` (only a tag); and the idempotency guard no-ops any run whose `HEAD` is already the latest published release commit.
 
 ---
+
+## How the version is stamped
+
+`tools/boss/installer/workspace-status.sh` is the workspace-status command for every Bazel invocation (`.bazelrc`). It prints `STABLE_BOSS_VERSION` / `STABLE_BOSS_BASE_VERSION` from the nearest `boss-v*` tag, plus the commit sha. Bazel always runs the script; what changes between a check build and a release is **whether rules consume those keys**.
+
+| Build                                                                  | Flag                           | Version compiled into engine_lib / `boss --version` / About                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bazel-build-test`, `checks`, `mac-app-build`, developer `bazel build` | `--nostamp` (default)          | Constant placeholder `0.0.0-dev` (About: `0.0.0-dev-unstamped`). `build_info_rs` and the version plist do not read `stable-status.txt`, so a new `boss-v*` tag does not change their action keys or rebuild the crates and tests downstream of them. `UpdateChecker` treats `-dev-unstamped` as up-to-date so local builds do not show a permanent update badge. |
+| `boss-release` CI step, `bazel run //tools/boss/installer:release`     | `--config=release` (`--stamp`) | Tag-derived `1.0.N` (or `1.0.N-dev-<sha>` off a tag). The published zip, `boss --version` / `bossctl --version`, and the app About panel report this value.                                                                                                                                                                                                      |
+
+The engine binary still links a separate leaf crate (`boss-build-provenance`) that always embeds the commit sha, dirty flag, and build time, while its `VERSION` field is also gated on `--stamp` (`0.0.0-dev` when unstamped, `STABLE_BOSS_VERSION` when stamped). That crate is not a dependency of `engine_lib` or of the CLI tests, so a new commit only relinks the engine binary.
+
+`--stamp` is scoped to `build:release` because rules_rust's `rust_binary` defaults to `stamp = -1`: with `--stamp` on, every rust_binary in the repo takes `stable-status.txt` as an input and recompiles. That cost is accepted for a one-off release build and must not be paid on every PR.
 
 ## Related
 

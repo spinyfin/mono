@@ -1,8 +1,10 @@
 //! Shared build-info stamping and `--version` handling for Boss binaries.
 //!
 //! Three Boss binaries — `boss` (cli), `bossctl`, and `boss-engine`
-//! (engine/core) — each embed a Bazel-stamped base version and print it
-//! for `--version` / `-V`. The stamping mechanism has one hard
+//! (engine/core) — each embed a Bazel build-info version and print it
+//! for `--version` / `-V`. Unstamped builds report `0.0.0-dev`; a
+//! `--config=release` (`--stamp`) build reports the tag-derived base
+//! version. The stamping mechanism has one hard
 //! constraint: the version constant is injected per-binary via
 //! `include!(env!("BOSS_BUILD_INFO_RS"))`, and each `rust_binary` sets
 //! its own `BOSS_BUILD_INFO_RS` in `rustc_env`. So the `include!` MUST

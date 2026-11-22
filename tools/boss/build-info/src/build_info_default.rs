@@ -4,7 +4,8 @@
 // BOSS_BUILD_INFO_RS at this one file so `include!(env!(...))` compiles
 // without Bazel. Bazel builds override BOSS_BUILD_INFO_RS via
 // compile_data + rustc_env to point at installer:build_info_rs, which
-// stamps BOSS_VERSION with the real tag-derived value.
+// writes BOSS_VERSION = "0.0.0-dev" unless the build is stamped
+// (`--config=release`), in which case it embeds the tag-derived value.
 //
 // BOSS_GIT_SHA / BOSS_BUILD_TIME are part of the stamped file's shape so
 // the default and stamped files match, but not every consumer reads them

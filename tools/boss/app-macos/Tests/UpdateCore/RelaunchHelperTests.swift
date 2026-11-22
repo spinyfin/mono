@@ -426,12 +426,13 @@ extension RelaunchHelperTests {
         case .hangsWithoutFlag:
             newApp = "#!/bin/sh\ntrap 'kill $! 2>/dev/null; exit 0' TERM\nsleep 20 &\nwait\n"
         case .exitsImmediately:
-            // Lives just long enough to be observed starting (a crash during launch);
-            // a process gone before the helper's first poll is indistinguishable from
-            // one that never started and is classified `launch-not-started`.
-            newApp = "#!/bin/sh\nsleep 0.5\nexit 3\n"
+            // Lives long enough to be observed starting AND for exit-observer to
+            // attach its kqueue watch before exiting; a process gone before the
+            // helper's first poll becomes `launch-not-started`, and one gone before
+            // exit-observer attaches reports `observerUnavailable=3` (ESRCH).
+            newApp = "#!/bin/sh\nsleep 2\nexit 3\n"
         case .signalExit:
-            newApp = "#!/bin/sh\nsleep 0.5\nkill -TERM $$\n"
+            newApp = "#!/bin/sh\nsleep 2\nkill -TERM $$\n"
         case .writesFlag:
             newApp = "#!/bin/sh\ntrap 'kill $! 2>/dev/null; exit 0' TERM\nsleep 0.2\ntouch \"\(flag.path)\"\nsleep 3 &\nwait\n"
         }

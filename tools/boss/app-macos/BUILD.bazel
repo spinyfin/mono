@@ -489,11 +489,13 @@ app_test_shards(
     principal_srcs = _BOSS_TESTS_PRINCIPAL_SRCS,
 )
 
-# Stamps CFBundleShortVersionString (full version, e.g. "1.0.4-dev-f3be785") and
-# CFBundleVersion (numeric-only, e.g. "1.0.4") from workspace-status.sh stable keys.
-# Both keys are in one plist to ensure our values are the final word — using
-# apple_bundle_version alongside infoplists caused apple_bundle_version's version
-# provider to be merged after infoplists, silently overriding CFBundleShortVersionString.
+# Version keys for Info.plist. Unstamped (mac-app-build, developer builds)
+# writes 0.0.0 / 0.0.0-dev-unstamped and does not read stable-status.txt, so a
+# new boss-v* tag does not rebuild the app. `--config=release` (`--stamp`)
+# embeds STABLE_BOSS_BASE_VERSION / STABLE_BOSS_VERSION. Both keys are in one
+# plist to ensure our values are the final word — using apple_bundle_version
+# alongside infoplists caused apple_bundle_version's version provider to be
+# merged after infoplists, silently overriding CFBundleShortVersionString.
 boss_short_version_plist(
     name = "boss_version_plist",
     out = "BossVersion.plist",
