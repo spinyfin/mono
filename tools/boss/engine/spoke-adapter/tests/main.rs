@@ -240,6 +240,31 @@ async fn frozen_until_does_not_auto_advance_virtual_time() {
     thaw_clock();
 }
 
+/// `until_io` may advance timers that must fire, then parks on wall time so a
+/// sweep or command deadline cannot expire while gRPC is still entering send.
+#[tokio::test]
+async fn frozen_until_io_caps_virtual_time() {
+    freeze_clock();
+    let virtual_start = tokio::time::Instant::now();
+    let ready = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ready);
+    let sleeper = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        flag.store(true, Ordering::SeqCst);
+    });
+    until_io("late wall-time flag", || ready.load(Ordering::SeqCst), TICK).await;
+    assert!(
+        tokio::time::Instant::now() - virtual_start <= TICK,
+        "I/O waits must not keep advancing after the virtual budget"
+    );
+    assert!(!sleeper.is_finished(), "the 5s timer must still be pending");
+    sleeper.abort();
+    thaw_clock();
+}
+
 fn peer_command(id: &str) -> Command {
     Command {
         command_id: id.into(),

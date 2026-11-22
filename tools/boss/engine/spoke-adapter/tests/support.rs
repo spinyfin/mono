@@ -43,6 +43,23 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server,
 pub const STEP: Duration = Duration::from_secs(10);
 pub const HOST: &str = "host";
 
+/// Real TCP / gRPC connect. A paused clock auto-advances `timeout` when no
+/// task is runnable, so frozen tests keep a yield loop instead of a virtual
+/// STEP bound.
+async fn connect_within_step<T, E>(op: impl std::future::Future<Output = Result<T, E>>) -> T
+where
+    E: std::fmt::Debug,
+{
+    if clock_frozen() {
+        crate::timing::guarded(op).await.expect("spoke connect")
+    } else {
+        tokio::time::timeout(STEP, op)
+            .await
+            .expect("spoke connect timed out")
+            .expect("spoke connect")
+    }
+}
+
 /// Wall-clock bound for event waits. Virtual time (`tokio::time::timeout`) does
 /// not move while the clock is paused, so a hang must be detected on `Instant`.
 const WAIT: Duration = Duration::from_secs(20);
@@ -89,13 +106,6 @@ impl FrozenClock {
         if self.frozen {
             thaw_clock();
             self.frozen = false;
-        }
-    }
-
-    pub(crate) fn freeze(&mut self) {
-        if !self.frozen {
-            freeze_clock();
-            self.frozen = true;
         }
     }
 }
@@ -217,6 +227,35 @@ pub(crate) async fn until_elapsed(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// Wait for I/O-driven `ready` under a paused clock.
+///
+/// Advances virtual time by at most `max_virtual` so timers that must fire
+/// can run, then parks on wall time only. Callers that need a timer to fire
+/// first should `until_elapsed` for that signal, then `until` for `send_command`.
+pub(crate) async fn until_io(what: &str, mut ready: impl FnMut() -> bool, max_virtual: Duration) {
+    debug_assert!(clock_frozen());
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut advanced = Duration::ZERO;
+    loop {
+        if ready() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+        if ready() {
+            return;
+        }
+        wall_park(TICK).await;
+        if ready() {
+            return;
+        }
+        if advanced + TICK <= max_virtual {
+            tokio::time::advance(TICK).await;
+            advanced += TICK;
+        }
+    }
+}
+
 /// Freeze timers until `stored` (command on the wire), then advance virtual
 /// time until `ready` (retries exhausted, parked, attention). Use when `ready`
 /// is driven by tokio timers, not wall-clock assignment age.
@@ -226,15 +265,16 @@ pub(crate) async fn until_ready_after_stored(
     ready_what: &str,
     ready: impl FnMut() -> bool,
 ) {
-    let _clock = FrozenClock::new();
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
     until(stored_what, stored).await;
     until_elapsed(ready_what, ready).await;
 }
 
-/// Freeze timers until `stored`, fire `deadline` once, then thaw. Use when the
-/// next wait is wall-clock (lease `attention_after` is assignment age).
+/// Freeze timers until `stored`, fire `deadline` once, then thaw if this
+/// call paused the clock. Use when the next wait is wall-clock (lease
+/// `attention_after` is assignment age).
 pub(crate) async fn fire_after_stored(stored_what: &str, stored: impl FnMut() -> bool, deadline: Duration) {
-    let _clock = FrozenClock::new();
+    let _clock = (!clock_frozen()).then(FrozenClock::new);
     until(stored_what, stored).await;
     elapse(deadline).await;
 }
@@ -996,18 +1036,11 @@ impl Fixture {
         })
         .await
         .unwrap();
-        let channel = tokio::time::timeout(STEP, self.dialer.connect())
-            .await
-            .unwrap()
-            .unwrap();
-        let mut incoming = tokio::time::timeout(
-            STEP,
-            spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .into_inner();
+        let channel = connect_within_step(self.dialer.connect()).await;
+        let mut incoming =
+            connect_within_step(spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)))
+                .await
+                .into_inner();
         incoming.message().await.unwrap().unwrap().body.expect("hub frame")
     }
 
@@ -1074,15 +1107,11 @@ impl Fixture {
         })
         .await
         .unwrap();
-        let channel = tokio::time::timeout(STEP, dialer.connect()).await.unwrap().unwrap();
-        let mut incoming = tokio::time::timeout(
-            STEP,
-            spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .into_inner();
+        let channel = connect_within_step(dialer.connect()).await;
+        let mut incoming =
+            connect_within_step(spoke_hub_client::SpokeHubClient::new(channel).connect(ReceiverStream::new(rx)))
+                .await
+                .into_inner();
         let Some(hub_frame::Body::Welcome(welcome)) = incoming.message().await.unwrap().unwrap().body else {
             panic!("expected a welcome")
         };
