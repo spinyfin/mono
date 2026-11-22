@@ -14,6 +14,11 @@ set -euo pipefail
 # decides whether it does (see remote-execution.sh). It qualifies because
 # nothing it passes to bazel is a credential. checkleft and
 # repobin build the tools they then run, which downloads those outputs as usual.
+#
+# Do not set CI_BAZEL_VERIFY_ONLY: the main bazel work is checkleft reading
+# CI_BAZEL_FLAGS (fastbuild, no ci-strip). ci-env.sh defaults tool-install to
+# the same flags. Adding ci-strip here would discard the analysis cache when
+# checkleft runs.
 CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 

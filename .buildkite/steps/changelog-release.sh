@@ -106,6 +106,9 @@ NOTES_FILE=""
 # scoping: the binary's source, the release script, and the pipeline wiring.
 CHANGE_PATHS_RE='^(tools/changelog/|\.buildkite/steps/changelog-release\.sh|\.buildkite/pipeline-changelog-release\.yml|\.buildkite/pipeline-changelog-release-builds\.yml)'
 
+# Match `bazel build -c opt` below. Override ci-env.sh's default fastbuild so
+# tool-install does not discard the analysis cache when the product build starts.
+CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }

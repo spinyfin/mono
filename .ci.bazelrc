@@ -64,9 +64,11 @@ common:ci-darwin --repo_env=DEVELOPER_DIR=/Applications/Xcode-27.2.0.app/Content
 # ==========================================
 # SMALLER BINARIES FOR VERIFICATION BUILDS
 # ==========================================
-# Selected by bazel_verify_only in .buildkite/steps/ci-env.sh, i.e. only by
-# commands that build or test for their pass/fail result. Never selected by a
-# release build, whose binaries ship and keep their symbols.
+# Selected by bazel_verify_only in .buildkite/steps/ci-env.sh, and by
+# tool-install when the step sets CI_BAZEL_VERIFY_ONLY=1 before sourcing
+# that file, so the analysis cache survives from repobin into the main
+# build. Never selected by a release build, whose binaries ship and keep
+# their symbols.
 #
 # Rust executables and test binaries are by far the largest artifacts a CI
 # build uploads to the remote cache. They carry no DWARF in a fastbuild (rules_rust

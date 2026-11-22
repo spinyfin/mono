@@ -11,6 +11,9 @@
 set -euo pipefail
 
 RELEASE_LOG_PREFIX="spoke-release"
+# Match `bazel build -c opt` below. Override ci-env.sh's default fastbuild so
+# tool-install does not discard the analysis cache when the product build starts.
+CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 CONFIG="tools/boss/spoke-release.toml"

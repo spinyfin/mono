@@ -30,6 +30,7 @@ else
 fi
 
 CI_REMOTE_EXECUTION_ALLOWED=1
+CI_BAZEL_VERIFY_ONLY=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 evidence_dir=$(mktemp -d "${TMPDIR:-/tmp}/boss-tag-cache.XXXXXX")
