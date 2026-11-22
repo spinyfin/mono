@@ -1193,6 +1193,13 @@ mod floor_tests {
                     .unwrap();
             }),
         ));
+        steps.push((
+            "20261122_0745_operator_question_supersede_close",
+            Box::new(|c| {
+                c.execute_batch("ALTER TABLE operator_questions ADD COLUMN supersede_close_json TEXT")
+                    .unwrap();
+            }),
+        ));
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
             apply(&expected);

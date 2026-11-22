@@ -565,7 +565,8 @@ pub struct RunDoneProposalPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_ci_evidence: Option<super::QueueCiEvidence>,
     /// Superseding PR reference (URL, `owner/repo#N`, `#N`, or number) when
-    /// the run closed its bound PR as superseded with approval.
+    /// asking to close the bound PR as superseded (`blocked` with `yes_no`)
+    /// or when declaring `delivered` after closing it with approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
 }
@@ -1352,6 +1353,16 @@ pub struct OperatorQuestionDismissal {
     pub note: Option<String>,
 }
 
+/// Structured close-as-superseded authorization carried by an operator
+/// question when a worker asks to close `closed_pr` as superseded by
+/// `superseding_pr`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SupersedeCloseAuthorization {
+    pub closed_pr: String,
+    pub superseding_pr: String,
+}
+
 /// Immutable question and durable answer/withdrawal history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
@@ -1366,6 +1377,8 @@ pub struct OperatorQuestionRecord {
     pub withdrawn_reason: Option<String>,
     #[serde(default)]
     pub dismissal: Option<OperatorQuestionDismissal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersede_close: Option<SupersedeCloseAuthorization>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

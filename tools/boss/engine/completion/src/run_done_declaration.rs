@@ -95,9 +95,7 @@
 //!   hold/ask sequence ends in a visible failure for those attempts.
 
 use super::*;
-use boss_github::pr_url::{
-    canonical_pr_url, compact_pr_label, parse_pr_url_parts, parse_product_slug, same_pr, validate_pr_url,
-};
+use boss_github::pr_url::same_pr;
 use boss_protocol::{OperatorAnswer, OperatorAnswerType, OperatorQuestionStatus};
 
 /// Upper bound on each GitHub call the `delivered` resolver makes inline
@@ -889,7 +887,8 @@ enum SupersedeCloseApproval {
 /// Recorded owner approval to close `closed_pr` as superseded by `superseding_pr`.
 ///
 /// Looks at answered Yes/No questions on this work item (any execution in the
-/// chain) whose text names both PRs. The latest matching answer wins.
+/// chain) that carry a structured `supersede_close` authorization matching
+/// both PRs in their respective roles. The latest matching answer wins.
 fn supersede_close_approval(
     work_db: &crate::work::WorkDb,
     work_item_id: &str,
@@ -913,7 +912,9 @@ fn supersede_close_approval(
             record.status == OperatorQuestionStatus::Answered
                 && matches!(record.question.answer_type, OperatorAnswerType::YesNo)
                 && matches!(record.answer, Some(OperatorAnswer::YesNo { .. }))
-                && question_names_pr_pair(record, closed_pr, superseding_pr)
+                && record.supersede_close.as_ref().is_some_and(|auth| {
+                    same_pr(&auth.closed_pr, closed_pr) && same_pr(&auth.superseding_pr, superseding_pr)
+                })
         })
         .collect();
     matching.sort_by(|left, right| {
@@ -928,58 +929,6 @@ fn supersede_close_approval(
     }
 }
 
-fn question_names_pr_pair(
-    record: &boss_protocol::OperatorQuestionRecord,
-    closed_pr: &str,
-    superseding_pr: &str,
-) -> bool {
-    let mut haystack = String::new();
-    haystack.push_str(&record.question.text);
-    haystack.push('\n');
-    haystack.push_str(&record.question.explanation);
-    if let Some(summary) = record.question.run_summary.as_deref() {
-        haystack.push('\n');
-        haystack.push_str(summary);
-    }
-    haystack_mentions_pr(&haystack, closed_pr) && haystack_mentions_pr(&haystack, superseding_pr)
-}
-
-fn haystack_mentions_pr(haystack: &str, pr_url: &str) -> bool {
-    let lowered = haystack.to_ascii_lowercase();
-    if let Some(canonical) = canonical_pr_url(pr_url)
-        && lowered.contains(&canonical.to_ascii_lowercase())
-    {
-        return true;
-    }
-    if lowered.contains(&pr_url.to_ascii_lowercase()) {
-        return true;
-    }
-    if let Some(label) = compact_pr_label(pr_url)
-        && lowered.contains(&label.to_ascii_lowercase())
-    {
-        return true;
-    }
-    let Some(number) = parse_pr_url_parts(pr_url)
-        .map(|(_, _, number)| number)
-        .or_else(|| pr_number_from_url(pr_url))
-    else {
-        return false;
-    };
-    token_present(&lowered, &format!("#{number}")) || token_present(&lowered, &format!("/pull/{number}"))
-}
-
-fn token_present(haystack: &str, needle: &str) -> bool {
-    let mut search = haystack;
-    while let Some(idx) = search.find(needle) {
-        let after = &search[idx + needle.len()..];
-        if !after.starts_with(|c: char| c.is_ascii_digit()) {
-            return true;
-        }
-        search = after;
-    }
-    false
-}
-
 /// Resolve a worker-supplied `superseded_by` reference to a canonical PR URL
 /// in `repo_remote_url`, rejecting the closed PR itself and other repos.
 fn resolve_superseding_pr_url(reference: &str, repo_remote_url: &str, closed_pr: &str) -> Result<String, String> {
@@ -987,44 +936,11 @@ fn resolve_superseding_pr_url(reference: &str, repo_remote_url: &str, closed_pr:
     if trimmed.is_empty() {
         return Err("superseded_by is empty".to_owned());
     }
-    let resolved = if let Some(url) = canonical_pr_url(trimmed) {
-        validate_pr_url(&url, repo_remote_url)?;
-        url
-    } else if let Some((repo, num)) = trimmed.split_once('#') {
-        let number = parse_pr_number_token(num).ok_or_else(|| {
-            format!("`{trimmed}` is not a PR reference; expected a GitHub PR URL, owner/repo#N, #N, or PR number")
-        })?;
-        let product = parse_product_slug(repo_remote_url)
-            .ok_or_else(|| format!("could not parse product repo slug from `{repo_remote_url}`"))?;
-        if repo.is_empty() {
-            format!("https://github.com/{product}/pull/{number}")
-        } else {
-            if repo.to_ascii_lowercase() != product {
-                return Err(format!(
-                    "superseding PR repo `{repo}` does not match product repo `{product}`"
-                ));
-            }
-            format!("https://github.com/{product}/pull/{number}")
-        }
-    } else {
-        let number = parse_pr_number_token(trimmed).ok_or_else(|| {
-            format!("`{trimmed}` is not a PR reference; expected a GitHub PR URL, owner/repo#N, #N, or PR number")
-        })?;
-        let product = parse_product_slug(repo_remote_url)
-            .ok_or_else(|| format!("could not parse product repo slug from `{repo_remote_url}`"))?;
-        format!("https://github.com/{product}/pull/{number}")
-    };
+    let resolved = boss_github::pr_url::resolve_pr_reference(trimmed, repo_remote_url)?;
     if same_pr(&resolved, closed_pr) {
         return Err(format!("superseding PR {resolved} is the same as the closed PR"));
     }
     Ok(resolved)
-}
-
-fn parse_pr_number_token(text: &str) -> Option<u64> {
-    if text.is_empty() || text == "0" || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok()
 }
 
 /// The body of [`WorkerCompletionHandler::spawn_declared_delivery_audit`]'s
@@ -1615,21 +1531,5 @@ mod supersede_reference_tests {
                 .unwrap_err()
                 .contains("does not match")
         );
-    }
-
-    #[test]
-    fn question_text_matches_hash_and_url_forms() {
-        assert!(haystack_mentions_pr(
-            "Close PR #2927 as superseded by #2977?",
-            "https://github.com/spinyfin/mono/pull/2927"
-        ));
-        assert!(haystack_mentions_pr(
-            "Close https://github.com/spinyfin/mono/pull/2927",
-            "https://github.com/spinyfin/mono/pull/2927"
-        ));
-        assert!(!haystack_mentions_pr(
-            "Close PR #29270",
-            "https://github.com/spinyfin/mono/pull/2927"
-        ));
     }
 }

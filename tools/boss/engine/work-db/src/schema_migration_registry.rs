@@ -453,6 +453,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: pr_flow::migrate_operator_question_stuck_classification,
         },
         Migration {
+            id: "20261122_0745_operator_question_supersede_close".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "operator_questions", "supersede_close_json")? {
+                    conn.execute_batch("ALTER TABLE operator_questions ADD COLUMN supersede_close_json TEXT")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261108_2100_parking_cancel_provenance".into(),
             legacy_version: None,
             apply: parking_reconcile::migrate_cancel_provenance,

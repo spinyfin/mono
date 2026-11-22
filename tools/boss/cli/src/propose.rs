@@ -545,8 +545,9 @@ pub(crate) struct RunDoneArgs {
     queue_ci_evidence_file: Option<PathBuf>,
 
     /// Superseding PR reference (URL, `owner/repo#N`, `#N`, or number) when
-    /// declaring `--outcome delivered` after closing the bound PR as
-    /// superseded with approval.
+    /// asking to close the bound PR as superseded (`--outcome blocked
+    /// --answer-type yes-no`) or when declaring `--outcome delivered` after
+    /// closing it with approval.
     #[arg(long)]
     superseded_by: Option<String>,
     /// How the run ended. `delivered` = the deliverable exists;

@@ -6,7 +6,9 @@
 //! as a link question so Yes cannot create a second owner for the same PR.
 
 use super::*;
-use boss_github::pr_url::{canonical_pr_url, same_pr};
+use boss_github::pr_url::{
+    canonical_pr_url, canonical_slug_pr, parse_pr_number_only, parse_slug_pr, same_pr, scan_pr_refs,
+};
 use boss_protocol::{OperatorAnswerType, OperatorQuestion, Task, TaskKind, TaskStatus};
 
 pub(crate) const SAME_CHAIN_REJECTION: &str = "this change cannot wait on the pull request it is already revising";
@@ -177,64 +179,6 @@ fn unique_pr_from_create_text(
     }
 }
 
-fn scan_pr_refs(text: &str, out: &mut Vec<String>) {
-    let mut rest = text;
-    while let Some(start) = rest.find("https://github.com/") {
-        let candidate = &rest[start..];
-        let end = candidate
-            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | '"' | '\'' | ']'))
-            .unwrap_or(candidate.len());
-        let url = candidate[..end].trim_end_matches(['.', ';', ':']);
-        if let Some(canonical) = canonical_pr_url(url) {
-            out.push(canonical);
-        }
-        rest = &candidate[end.max(1)..];
-    }
-    let mut rest = text;
-    while let Some(hash) = rest.find('#') {
-        if let Some((slug, number)) = slug_pr_at(rest, hash)
-            && let Some(canonical) = canonical_slug_pr(&slug, number)
-        {
-            out.push(canonical);
-        }
-        rest = &rest[hash + 1..];
-    }
-}
-
-fn slug_pr_at(text: &str, hash: usize) -> Option<(String, u64)> {
-    let after = text.get(hash + 1..)?;
-    let digits_end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
-    if digits_end == 0 {
-        return None;
-    }
-    let number: u64 = after[..digits_end].parse().ok()?;
-    let before = text.get(..hash)?;
-    // One space between the slug and '#' ("owner/repo #12") is a common
-    // written form; more whitespace still fails so "#12" on its own is not
-    // pulled into an earlier word.
-    let before = before.strip_suffix(' ').unwrap_or(before);
-    let slug_start = before
-        .char_indices()
-        .rev()
-        .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')))
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let slug = before.get(slug_start..)?.trim();
-    if slug.contains('/') && !slug.starts_with('/') && !slug.ends_with('/') {
-        Some((slug.to_owned(), number))
-    } else {
-        None
-    }
-}
-
-fn canonical_slug_pr(slug: &str, number: u64) -> Option<String> {
-    let (owner, repo) = slug.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return None;
-    }
-    canonical_pr_url(&format!("https://github.com/{owner}/{repo}/pull/{number}"))
-}
-
 enum ExistingError {
     Missing(String),
     Invalid(String),
@@ -368,7 +312,7 @@ fn resolve_named_pr(
 ) -> Result<Result<Option<Task>, ExistingError>> {
     let trimmed = raw.trim();
     if let Some(url) = canonical_pr_url(trimmed)
-        .or_else(|| parse_slug_pr(trimmed).and_then(|(slug, number)| canonical_slug_pr(&slug, number)))
+        .or_else(|| parse_slug_pr(trimmed).and_then(|(slug, number)| canonical_slug_pr(slug, number)))
     {
         return match lookup_pr_owner(conn, asking, &url, required)? {
             Ok(found) => Ok(Ok(found)),
@@ -384,21 +328,6 @@ fn resolve_named_pr(
     Ok(Err(ExistingError::invalid(format!(
         "`{trimmed}` is not a GitHub pull request URL, owner/repo#number, or PR number"
     ))))
-}
-
-fn parse_slug_pr(raw: &str) -> Option<(String, u64)> {
-    let (slug, rest) = raw.split_once('#')?;
-    let number: u64 = rest.trim().parse().ok()?;
-    let slug = slug.trim();
-    slug.contains('/').then(|| (slug.to_owned(), number))
-}
-
-fn parse_pr_number_only(raw: &str) -> Option<u64> {
-    raw.trim()
-        .trim_start_matches('#')
-        .parse()
-        .ok()
-        .filter(|_| raw.trim().trim_start_matches('#').bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn asking_chain_pr_url(conn: &Connection, asking: &Task) -> Result<Option<String>> {

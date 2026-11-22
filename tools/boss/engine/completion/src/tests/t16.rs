@@ -1452,11 +1452,26 @@ const SUPERSEDE_SUPERSEDING_PR: &str = "https://github.com/spinyfin/mono/pull/29
 
 async fn ask_close_as_superseded(db: &Arc<WorkDb>, workspace: &Path, chore_id: &str, execution_id: &str, answer: bool) {
     use crate::work::SubmitWorkerProposalInput;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            [chore_id, SUPERSEDE_CLOSED_PR],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+            [execution_id, SUPERSEDE_CLOSED_PR],
+        )
+        .unwrap();
     let q_payload = serde_json::json!({
         "outcome": "blocked",
         "summary": "PR #2927 is superseded by #2977; asking to close.",
+        "superseded_by": "#2977",
         "question": {
-            "text": "Close PR #2927 as superseded by #2977?",
+            "text": "Close this PR as superseded by #2977?",
             "answer_type": { "kind": "yes_no" },
             "explanation": "Context:\nPR #2977 supersedes #2927.\nYes:\nClose #2927.\nNo:\nKeep #2927.\nRecommendation:\nYes."
         }
@@ -1928,4 +1943,188 @@ async fn open_pr_with_superseded_declaration_is_refused() {
         "open PR with superseded_by must fail, got {outcome:?}"
     );
     assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
+async fn yes_to_keeping_pr_open_does_not_authorize_supersede_close() {
+    use crate::work::SubmitWorkerProposalInput;
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, first_exec_id) = followup_fixture(workspace.path());
+    let q_payload = serde_json::json!({
+        "outcome": "blocked",
+        "summary": "Asking whether to keep #2927 open while #2977 is evaluated.",
+        "question": {
+            "text": "Keep #2927 open while #2977 is evaluated?",
+            "answer_type": { "kind": "yes_no" },
+            "explanation": "Context:\nEvaluating #2977 alongside #2927.\nYes:\nKeep #2927 open.\nNo:\nClose #2927.\nRecommendation:\nYes."
+        }
+    })
+    .to_string();
+    let _ = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &first_exec_id,
+            work_item_id: &chore_id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: &q_payload,
+            idempotency_key: "ask-keep-open",
+        })
+        .unwrap();
+    let ask_handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()));
+    let _ = ask_handler
+        .finalize_declared_run_done(&first_exec_id, boss_protocol::RunDoneOutcome::Blocked)
+        .await;
+    db.answer_operator_question(&chore_id, boss_protocol::OperatorAnswer::YesNo { value: true })
+        .unwrap();
+
+    let (exec_id, outcome) = finalize_closed_superseded_delivery(
+        db.clone(),
+        workspace.path(),
+        &chore_id,
+        "#2977",
+        StubPrDetector::ok(None),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail }
+                if detail.contains("no recorded owner approval")
+        ),
+        "unrelated Yes mentioning both PRs must not authorize close, got {outcome:?}"
+    );
+    assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
+async fn reverse_direction_supersede_approval_does_not_authorize_forward_close() {
+    use crate::work::SubmitWorkerProposalInput;
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, first_exec_id) = followup_fixture(workspace.path());
+    // Bound to #2977 and approved to close #2977 as superseded by #2927 (reverse).
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_url = ?2 WHERE id = ?1",
+            [&chore_id, SUPERSEDE_SUPERSEDING_PR],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+            [&first_exec_id, SUPERSEDE_SUPERSEDING_PR],
+        )
+        .unwrap();
+    let q_payload = serde_json::json!({
+        "outcome": "blocked",
+        "summary": "Close #2977 as superseded by #2927?",
+        "superseded_by": "#2927",
+        "question": {
+            "text": "Close #2977 as superseded by #2927?",
+            "answer_type": { "kind": "yes_no" },
+            "explanation": "Context:\n#2927 supersedes #2977.\nYes:\nClose #2977.\nNo:\nKeep #2977.\nRecommendation:\nYes."
+        }
+    })
+    .to_string();
+    let _ = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &first_exec_id,
+            work_item_id: &chore_id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: &q_payload,
+            idempotency_key: "ask-reverse-supersede",
+        })
+        .unwrap();
+    let ask_handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()));
+    let _ = ask_handler
+        .finalize_declared_run_done(&first_exec_id, boss_protocol::RunDoneOutcome::Blocked)
+        .await;
+    db.answer_operator_question(&chore_id, boss_protocol::OperatorAnswer::YesNo { value: true })
+        .unwrap();
+
+    let (exec_id, outcome) = finalize_closed_superseded_delivery(
+        db.clone(),
+        workspace.path(),
+        &chore_id,
+        "#2977",
+        StubPrDetector::ok(None),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail }
+                if detail.contains("no recorded owner approval")
+        ),
+        "reverse-direction approval must not authorize closing #2927, got {outcome:?}"
+    );
+    assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
+async fn unrelated_yes_after_declined_supersede_does_not_override_no() {
+    use crate::work::SubmitWorkerProposalInput;
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, chore_id, first_exec_id) = followup_fixture(workspace.path());
+    ask_close_as_superseded(&db, workspace.path(), &chore_id, &first_exec_id, false).await;
+
+    let second_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("https://github.com/spinyfin/mono.git")
+                .pr_url(SUPERSEDE_CLOSED_PR)
+                .build(),
+        )
+        .unwrap();
+    let unrelated_payload = serde_json::json!({
+        "outcome": "blocked",
+        "summary": "Following up on PR #2927 and #2977.",
+        "question": {
+            "text": "Proceed with the fallback approach?",
+            "answer_type": { "kind": "yes_no" },
+            "explanation": "Context:\nPR #2927 vs #2977.\nYes:\nProceed.\nNo:\nStop.\nRecommendation:\nYes."
+        }
+    })
+    .to_string();
+    let _ = db
+        .submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &second_exec.id,
+            work_item_id: &chore_id,
+            kind: boss_protocol::ProposalKind::RunDone,
+            payload_json: &unrelated_payload,
+            idempotency_key: "ask-unrelated-later",
+        })
+        .unwrap();
+    let ask_handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_feature_flags(flags_on_run_done(workspace.path()));
+    let _ = ask_handler
+        .finalize_declared_run_done(&second_exec.id, boss_protocol::RunDoneOutcome::Blocked)
+        .await;
+    db.answer_operator_question(&chore_id, boss_protocol::OperatorAnswer::YesNo { value: true })
+        .unwrap();
+
+    let (exec_id, outcome) = finalize_closed_superseded_delivery(
+        db.clone(),
+        workspace.path(),
+        &chore_id,
+        "#2977",
+        StubPrDetector::ok(None),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            StopOutcome::RunDoneDeclaredWithoutDelivery { ref detail } if detail.contains("declined")
+        ),
+        "later unrelated Yes must not override declined close authorization, got {outcome:?}"
+    );
+    assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Failed);
 }

@@ -299,12 +299,16 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
             });
             let superseded_by = reader.optional_text("superseded_by", MAX_SHORT_FIELD_CHARS);
             if let Some(ref pr) = superseded_by {
-                if outcome != Some(RunDoneOutcome::Delivered) {
+                let is_blocked_yes_no = outcome == Some(RunDoneOutcome::Blocked)
+                    && question
+                        .as_ref()
+                        .is_some_and(|q| matches!(q.answer_type, boss_protocol::OperatorAnswerType::YesNo));
+                if outcome != Some(RunDoneOutcome::Delivered) && !is_blocked_yes_no {
                     reader.error(
                         "superseded_by",
-                        "superseded_by is only meaningful on a delivered declaration",
+                        "superseded_by is only meaningful on a delivered declaration or a blocked yes-no approval question",
                     );
-                } else if pr.contains(['\n', '\r']) || !is_pr_reference(pr) {
+                } else if pr.contains(['\n', '\r']) || !boss_github::pr_url::is_pr_reference(pr) {
                     reader.error(
                         "superseded_by",
                         format!(
@@ -582,31 +586,6 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
     }
-}
-
-/// Shape check for `run_done.superseded_by`: a GitHub PR URL, `owner/repo#N`,
-/// `#N`, or a bare PR number. Resolution against the execution's repo and
-/// rejection of the closed PR itself happen at delivery finalization.
-fn is_pr_reference(text: &str) -> bool {
-    if text.is_empty() || text.chars().any(char::is_whitespace) {
-        return false;
-    }
-    if boss_github::pr_url::parse_pr_url_parts(text).is_some() {
-        return true;
-    }
-    if let Some((repo, num)) = text.split_once('#') {
-        let valid_num = !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && num != "0";
-        if !valid_num {
-            return false;
-        }
-        if repo.is_empty() {
-            return true;
-        }
-        return repo
-            .split_once('/')
-            .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'));
-    }
-    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) && text != "0"
 }
 
 /// Serialise a payload struct to its canonical stored form.

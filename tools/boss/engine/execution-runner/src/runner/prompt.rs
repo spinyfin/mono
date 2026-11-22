@@ -1292,6 +1292,11 @@ pub(crate) fn run_done_directive(
     } else {
         String::new()
     };
+    let superseded_ask_hint = if standard_worker {
+        " To request that approval first, declare `--outcome blocked --answer-type yes-no --superseded-by <PR>` with `--question` and `--explanation-file`."
+    } else {
+        ""
+    };
     format!(
         "\n## Declaring your run finished\n\n\
      When your run is over, say so — as the ABSOLUTE LAST thing you do:\n\n\
@@ -1305,7 +1310,7 @@ pub(crate) fn run_done_directive(
      - `delivered` — the deliverable exists (you opened or pushed to the PR, wrote the review, \
      posted the reply). If you closed the bound PR as superseded with approval, also pass \
      `--superseded-by <PR>` (URL, `owner/repo#N`, `#N`, or PR number) so the engine records \
-     a non-merged completion instead of treating the closed PR as a failure.\n\
+     a non-merged completion instead of treating the closed PR as a failure.{superseded_ask_hint}\n\
      - `no-changes-needed` — you verified there was nothing to produce. End your turn after submitting; \
      the engine checks command evidence at that boundary. If refused, verify again and redeclare.\n\
      - `blocked` — a genuine external blocker or mandated approval stop prevents delivery. This fails \

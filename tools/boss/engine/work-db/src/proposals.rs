@@ -537,6 +537,9 @@ impl WorkDb {
                     now,
                 ],
             )?;
+            if input.kind == ProposalKind::RunDone && state == ProposalState::Applied {
+                record_supersede_close_authorization(&tx, &id, input.execution_id, &payload_json)?;
+            }
             tx.commit()?;
 
             (
@@ -1060,6 +1063,64 @@ impl WorkDb {
             .flatten();
         Ok(at.is_some_and(|s| !s.is_empty()))
     }
+}
+
+fn record_supersede_close_authorization(
+    conn: &Connection,
+    proposal_id: &str,
+    execution_id: &str,
+    payload_json: &str,
+) -> Result<()> {
+    let Ok(payload) = serde_json::from_str::<boss_protocol::RunDoneProposalPayload>(payload_json) else {
+        return Ok(());
+    };
+    let Some(question) = payload.question.as_ref() else {
+        return Ok(());
+    };
+    if !matches!(question.answer_type, boss_protocol::OperatorAnswerType::YesNo) {
+        return Ok(());
+    }
+    let Some(raw_superseded_by) = payload.superseded_by.as_deref() else {
+        return Ok(());
+    };
+    let Some(execution) = query_execution(conn, execution_id)? else {
+        return Ok(());
+    };
+    let Some(task) = query_task(conn, &execution.work_item_id)? else {
+        return Ok(());
+    };
+    let closed_pr = execution
+        .pr_url
+        .as_deref()
+        .filter(|url| !url.is_empty())
+        .or_else(|| task.pr_url.as_deref().filter(|url| !url.is_empty()))
+        .map(str::to_owned)
+        .or_else(|| {
+            get_chain_root_task(conn, &task.id)
+                .ok()
+                .flatten()
+                .and_then(|root| root.pr_url)
+                .filter(|url| !url.is_empty())
+        });
+    let Some(closed) = closed_pr else {
+        return Ok(());
+    };
+    let canonical_closed = boss_github::pr_url::canonical_pr_url(&closed).unwrap_or(closed);
+    let Ok(resolved) = boss_github::pr_url::resolve_pr_reference(raw_superseded_by, &execution.repo_remote_url) else {
+        return Ok(());
+    };
+    if boss_github::pr_url::same_pr(&resolved, &canonical_closed) {
+        return Ok(());
+    }
+    let auth_json = serde_json::to_string(&boss_protocol::SupersedeCloseAuthorization {
+        closed_pr: canonical_closed,
+        superseding_pr: resolved,
+    })?;
+    conn.execute(
+        "UPDATE operator_questions SET supersede_close_json = ?2 WHERE proposal_id = ?1",
+        params![proposal_id, auth_json],
+    )?;
+    Ok(())
 }
 
 // ---- tests ----

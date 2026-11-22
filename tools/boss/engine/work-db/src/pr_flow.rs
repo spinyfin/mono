@@ -2553,6 +2553,11 @@ pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRe
         .map(|json| serde_json::from_str::<boss_protocol::OperatorQuestionDismissal>(&json))
         .transpose()
         .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err)))?;
+    let supersede_close = row
+        .get::<_, Option<String>>("supersede_close_json")?
+        .map(|json| serde_json::from_str::<boss_protocol::SupersedeCloseAuthorization>(&json))
+        .transpose()
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err)))?;
     Ok(OperatorQuestionRecord::builder()
         .question(
             OperatorQuestionView::builder()
@@ -2581,6 +2586,7 @@ pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRe
             row.get::<_, Option<String>>("withdrawn_reason")?
         })
         .maybe_dismissal(dismissal)
+        .maybe_supersede_close(supersede_close)
         .build())
 }
 

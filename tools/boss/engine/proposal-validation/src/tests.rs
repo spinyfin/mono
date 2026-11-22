@@ -942,4 +942,20 @@ fn run_done_superseded_by_accepts_pr_references_only_on_delivered() {
             "expected superseded_by error for ref={invalid_ref:?}, got {errors:?}"
         );
     }
+
+    let blocked_canonical = ok(
+        ProposalKind::RunDone,
+        json!({
+            "outcome": "blocked",
+            "summary": "asking to close PR #2927 as superseded by #2977",
+            "superseded_by": "#2977",
+            "question": {
+                "text": "Close PR #2927 as superseded by #2977?",
+                "answer_type": {"kind": "yes_no"},
+                "explanation": "Context:\nPR #2977 supersedes #2927.\nYes:\nClose #2927.\nNo:\nKeep #2927.\nRecommendation:\nYes."
+            }
+        }),
+    );
+    let parsed: RunDoneProposalPayload = serde_json::from_str(&blocked_canonical).unwrap();
+    assert_eq!(parsed.superseded_by.as_deref(), Some("#2977"));
 }
