@@ -343,14 +343,22 @@ async fn collector_settles_a_not_found_directory_read() {
     let rest_base = "rest-base";
     let head = "head";
     let merge = "merge-base";
-    let metadata = rest_metadata(rest_base, head, 1);
+    let metadata = rest_metadata(rest_base, head, 2);
     let mut trees = HashMap::new();
     trees.insert(
         (merge.to_owned(), String::new()),
         tree(merge, vec![tree_blob("lib.rs", Some(4))]),
     );
     trees.insert(
+        (merge.to_owned(), "nested".to_owned()),
+        tree(merge, vec![tree_blob("a.rs", Some(3))]),
+    );
+    trees.insert(
         (head.to_owned(), String::new()),
+        tree(head, vec![tree_blob("lib.rs", Some(6))]),
+    );
+    trees.insert(
+        (head.to_owned(), "nested".to_owned()),
         Err(boss_github::trees::TreeApiError {
             kind: boss_github::trees::TreeApiErrorKind::NotFound,
             message: "Not Found".to_owned(),
@@ -358,10 +366,15 @@ async fn collector_settles_a_not_found_directory_read() {
     );
     let mut blobs = HashMap::new();
     blobs.insert((merge.to_owned(), "lib.rs".to_owned()), b"old\n".to_vec());
+    blobs.insert((merge.to_owned(), "nested/a.rs".to_owned()), b"was\n".to_vec());
+    blobs.insert((head.to_owned(), "lib.rs".to_owned()), b"after\n".to_vec());
     let transport = FixtureTransport {
         latest: metadata.clone(),
         merge_base: merge.to_owned(),
-        inventory: vec![inventory_entry("lib.rs", None, "modified", Some("@@"))],
+        inventory: vec![
+            inventory_entry("lib.rs", None, "modified", Some("@@")),
+            inventory_entry("nested/a.rs", None, "modified", Some("@@")),
+        ],
         trees,
         blobs,
     };
@@ -380,9 +393,50 @@ async fn collector_settles_a_not_found_directory_read() {
     .unwrap();
     assert!(
         packet.is_complete(),
-        "a NotFound tree read must settle rather than retry forever"
+        "a NotFound directory at a visible SHA must settle rather than retry forever"
     );
-    assert_eq!(packet.files[0].after.as_ref().unwrap().terminal, Some(true));
+    assert_eq!(packet.files[1].after.as_ref().unwrap().terminal, Some(true));
+}
+
+#[tokio::test]
+async fn collector_all_not_found_tree_reads_stay_retryable() {
+    let rest_base = "rest-base";
+    let head = "head";
+    let merge = "merge-base";
+    let metadata = rest_metadata(rest_base, head, 1);
+    let mut trees = HashMap::new();
+    let not_found = Err(boss_github::trees::TreeApiError {
+        kind: boss_github::trees::TreeApiErrorKind::NotFound,
+        message: "Not Found".to_owned(),
+    });
+    trees.insert((merge.to_owned(), String::new()), not_found.clone());
+    trees.insert((head.to_owned(), String::new()), not_found);
+    let transport = FixtureTransport {
+        latest: metadata.clone(),
+        merge_base: merge.to_owned(),
+        inventory: vec![inventory_entry("lib.rs", None, "modified", Some("@@"))],
+        trees,
+        blobs: HashMap::new(),
+    };
+    let packet = collect_pinned_source_packet_with_transport(
+        "https://github.com/acme/widget/pull/4",
+        &PinnedComparison {
+            base_sha: rest_base.to_owned(),
+            head_sha: head.to_owned(),
+        },
+        None,
+        metadata,
+        false,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !packet.is_complete(),
+        "an all-404 tree read is ambiguous with a private-repo authorization failure and must stay retryable"
+    );
+    assert_eq!(packet.files[0].before.as_ref().unwrap().terminal, Some(false));
+    assert_eq!(packet.files[0].after.as_ref().unwrap().terminal, Some(false));
 }
 
 #[tokio::test]
