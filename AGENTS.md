@@ -98,6 +98,10 @@ root-cause rule as the section below.
   pass does and does not lose, the `merge_detection_stalled` health issue,
   and the per-phase timing to read when a pass is slow):
   [`tools/boss/docs/merge-poller-detection-pass.md`](tools/boss/docs/merge-poller-detection-pass.md)
+- Answer latency (the per-hop log lines from clicking an answer on a
+  question card to the card clearing, in the app and the engine, and which
+  reads an answer does and does not wait for):
+  [`tools/boss/docs/operator-answer-latency.md`](tools/boss/docs/operator-answer-latency.md)
 - Dispatch focus mode (`bossctl dispatch focus`: restrict automatic
   dispatch to chosen projects/products; scope rules, precedence against the
   pause and force-launch, the `focus_mode` hold reason):

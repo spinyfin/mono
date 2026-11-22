@@ -233,6 +233,7 @@ The repo owner recorded this answer. It is explicit, human-granted approval for 
         }} if state == "answered"));
 }
 
+mod answer_latency;
 mod chore_questions;
 mod dismissal;
 mod force_launched_resume;

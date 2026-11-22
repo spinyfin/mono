@@ -9,6 +9,8 @@ use crate::app::handler_helpers::{BoardRefusal, board_dispatch_refusal, send_ref
 use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
 
 use super::*;
+use std::future::Future;
+
 use boss_protocol::{BoardRefusalCode, WorkItemPatch};
 
 /// Resolve the caller tier for a work-item write that may carry a
@@ -82,7 +84,13 @@ pub(super) async fn handle_list_task_field_audit(ctx: Dispatch, req: FrontendReq
     }
 }
 
+/// Answer or dismiss a question card.
+///
+/// Each hop of a mutation logs one `operator answer ...` line carrying the
+/// request id, so a slow answer can be attributed to the hop that was slow:
+/// see `tools/boss/docs/operator-answer-latency.md`.
 pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest) {
+    use boss_metrics::population_timing::elapsed_ms;
     let Dispatch {
         server_state,
         work_db,
@@ -90,6 +98,7 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         session_id,
         request_id,
         peer_pid,
+        recv_instant,
         ..
     } = ctx;
     let dismissal = match &req {
@@ -150,6 +159,11 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
     )
     .await;
     let is_dismissal = dismissal.is_some();
+    let verb = if is_dismissal { "dismiss" } else { "answer" };
+    tracing::info!(%request_id, target_id = %id, verb, elapsed_ms = elapsed_ms(recv_instant), "operator answer handler entered");
+    // Includes any wait for the shared connection; a wait or hold of 100 ms or
+    // more also logs `work DB connection lock timing` with this request id.
+    let write_started = Instant::now();
     let result = if let Some((question_id, note)) = dismissal {
         work_db.dismiss_operator_question_from(&id, question_id.as_deref(), note.as_deref(), actor, Some(&provenance))
     } else {
@@ -162,8 +176,10 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             suppress,
         )
     };
+    let write_ms = elapsed_ms(write_started);
     match result {
         Ok(outcome) => {
+            tracing::info!(%request_id, verb, elapsed_ms = write_ms, "operator answer durable write completed");
             let mut item = outcome.item;
             // "Archive it", the owner's answer to the engine's question about an
             // item progression could not unstick, archives through the ordinary
@@ -190,6 +206,48 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
             let mut changed = vec![work_item_id(&item)];
             changed.extend(outcome.prerequisite_work_item_id);
             changed.extend(outcome.touched_work_item_ids);
+            if let Some(dispatch_id) = outcome.dispatch_work_item_id {
+                let launch_started = Instant::now();
+                let coordinator = server_state.execution_coordinator.clone();
+                let launch_request_id = request_id.clone();
+                // The answer is committed and the execution it created or
+                // resumed is marked operator-forced. Launching is best-effort:
+                // when it cannot launch now (a writer is live on the PR, the
+                // pool is at its hard cap, preflight, a predecessor lease)
+                // the flag stays until the work is admitted or cancelled, and
+                // the drain dispatches it as operator-forced once it is ready.
+                //
+                // First poll takes the dispatch reservation on this task so
+                // the invalidation kick cannot defer the row as pool-exhausted
+                // first. Cube lease and pane spawn stay off the handler.
+                let mut launch = Box::pin(async move {
+                    match coordinator.launch_answered_work(&dispatch_id).await {
+                        Ok(worker) => tracing::info!(
+                            request_id = %launch_request_id,
+                            work_item_id = %dispatch_id,
+                            launched = worker.is_some(),
+                            elapsed_ms = elapsed_ms(launch_started),
+                            "operator answer: launched the work it created",
+                        ),
+                        Err(err) => tracing::warn!(
+                            request_id = %launch_request_id,
+                            work_item_id = %dispatch_id,
+                            error = %format!("{err:#}"),
+                            elapsed_ms = elapsed_ms(launch_started),
+                            "operator answer: could not launch the work it created; operator-forced admission is kept",
+                        ),
+                    }
+                });
+                let finished = std::future::poll_fn(|cx| match launch.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => std::task::Poll::Ready(true),
+                    std::task::Poll::Pending => std::task::Poll::Ready(false),
+                })
+                .await;
+                if !finished {
+                    boss_work_db::db_diagnostics::spawn(launch);
+                }
+            }
+            let publication_started = Instant::now();
             let revision = publish_work_invalidation(
                 &server_state,
                 &session_id,
@@ -204,40 +262,31 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 changed,
             )
             .await;
-            if let Some(dispatch_id) = outcome.dispatch_work_item_id {
-                // The answer is committed and the execution it created or
-                // resumed is marked operator-forced. Launching is best-effort:
-                // when it cannot launch now (a writer is live on the PR, the
-                // pool is at its hard cap, preflight, a predecessor lease)
-                // the flag stays until the work is admitted or cancelled, and
-                // the drain dispatches it as operator-forced once it is ready.
-                match server_state
-                    .execution_coordinator
-                    .launch_answered_work(&dispatch_id)
-                    .await
-                {
-                    Ok(worker) => tracing::info!(
-                        work_item_id = %dispatch_id,
-                        launched = worker.is_some(),
-                        "operator answer: launched the work it created",
-                    ),
-                    Err(err) => tracing::warn!(
-                        work_item_id = %dispatch_id,
-                        error = %format!("{err:#}"),
-                        "operator answer: could not launch the work it created; operator-forced admission is kept",
-                    ),
-                }
-            }
-            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+            tracing::info!(%request_id, verb, elapsed_ms = elapsed_ms(publication_started), "operator answer board publication completed");
+            let delivered = sink.enqueue_response_awaiting_delivery(FrontendEventEnvelope::response_with_revision(
+                request_id.clone(),
+                revision,
+                FrontendEvent::WorkItemUpdated { item },
+            ));
+            tracing::info!(%request_id, verb, elapsed_ms = elapsed_ms(recv_instant), "operator answer reply enqueued");
+            // The last engine hop: the reply frame leaving the socket. Logged
+            // off the handler so a slow client never holds the session.
+            boss_task_scope::spawn(async move {
+                let written = delivered.await.unwrap_or(false);
+                tracing::info!(%request_id, verb, written, elapsed_ms = elapsed_ms(recv_instant), "operator answer reply socket write completed");
+            });
         }
-        Err(err) => match err.downcast_ref::<boss_protocol::OperatorQuestionError>() {
-            Some(error) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::OperatorQuestionError { error: error.clone() },
-            ),
-            None => send_work_error(&sink, &request_id, &err),
-        },
+        Err(err) => {
+            tracing::info!(%request_id, verb, elapsed_ms = write_ms, error = %format!("{err:#}"), "operator answer refused");
+            match err.downcast_ref::<boss_protocol::OperatorQuestionError>() {
+                Some(error) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::OperatorQuestionError { error: error.clone() },
+                ),
+                None => send_work_error(&sink, &request_id, &err),
+            }
+        }
     }
 }
 

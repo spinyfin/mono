@@ -43,6 +43,8 @@ extension ChatViewModel {
             return false
         }
         operatorAnswerInFlightByTaskID[task.id] = requestID
+        beginOperatorAnswerTiming(
+            taskID: task.id, questionID: question.id, requestID: requestID, isDismissal: answer == nil)
         return true
     }
 
@@ -57,6 +59,7 @@ extension ChatViewModel {
             return
         }
         operatorAnswerInFlightByTaskID.removeValue(forKey: taskID)
+        recordOperatorAnswerRefused(taskID: taskID)
         setOperatorAnswerError(message, taskID: taskID, questionID: task(withID: taskID)?.operatorQuestion?.id)
     }
 
@@ -84,6 +87,7 @@ extension ChatViewModel {
         guard let taskID = taskIDForOperatorAnswer(requestId: requestId) else { return false }
         abandonBackgroundWorkRequest(requestId: requestId)
         operatorAnswerInFlightByTaskID.removeValue(forKey: taskID)
+        recordOperatorAnswerRefused(taskID: taskID)
         setOperatorAnswerError(message, taskID: taskID, questionID: task(withID: taskID)?.operatorQuestion?.id)
         workErrorMessage = message
         return true

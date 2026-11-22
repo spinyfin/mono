@@ -893,6 +893,10 @@ pub struct ExecutionCoordinator {
     /// kick without waiting on a silent host.
     #[builder(default)]
     in_doubt_sweep_active: AtomicBool,
+    /// Read-only connection the heartbeat's queued-display pass reads
+    /// through, opened on first use. See [`Self::queued_display_db`].
+    #[builder(skip)]
+    queued_display_reader: std::sync::OnceLock<Arc<WorkDb>>,
 }
 
 mod allocation_refusal;

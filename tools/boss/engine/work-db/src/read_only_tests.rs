@@ -27,6 +27,28 @@ fn inspection_never_migrates_or_waits_for_the_wal_writer() {
 }
 
 #[test]
+fn bulk_reader_uses_the_shared_connection_busy_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let reader_ms: i64 = db
+        .reader()
+        .unwrap()
+        .connect()
+        .unwrap()
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(reader_ms, super::SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    let inspection_ms: i64 = WorkDb::open_read_only(path)
+        .unwrap()
+        .connect()
+        .unwrap()
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(inspection_ms, 250);
+}
+
+#[test]
 fn inspection_does_not_create_missing_databases() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("missing.db");

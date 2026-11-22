@@ -261,6 +261,7 @@ extension ChatViewModel {
             let isChore: Bool
             if case .chore = item { isChore = true } else { isChore = false }
             applyIncrementalTaskUpdate(updatedTask, isChore: isChore)
+            recordOperatorAnswerReplyApplied(taskID: updatedTask.id)
             reconcileNavigatorSelection()
             // Reconcile optimistic overrides now that the local store reflects
             // the confirmed state — the update above already wrote the new
