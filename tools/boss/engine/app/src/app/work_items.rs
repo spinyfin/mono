@@ -181,6 +181,16 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
         Ok(outcome) => {
             tracing::info!(%request_id, verb, elapsed_ms = write_ms, "operator answer durable write completed");
             let item = outcome.item;
+            // An answer that archived the item (the owner's "Archive" choice)
+            // frees the latest execution's pane and workspace lease exactly as
+            // the ordinary update path does. Idempotent when already released,
+            // and a no-op for any item the answer left open.
+            if let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
+                let handler = server_state.completion_handler.clone();
+                boss_task_scope::spawn(async move {
+                    handler.force_release(&execution_id).await;
+                });
+            }
             let product_id = item.product_id().to_string();
             // A Yes on a prerequisite proposal also created (or linked) a
             // task; the board must refresh that card too.

@@ -271,7 +271,7 @@ fn disposition_payload(choice: &str) -> Value {
 
 #[tokio::test]
 async fn owner_archive_choices_archive_once_without_a_new_worker_or_question() {
-    for choice in ["Archive", "Archive this chore", "Archive it", "Archive this item"] {
+    for choice in ["Archive this chore", "Archive this item", "Archive this task"] {
         let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice)).await;
         let question = question_task(&state, &task_id).operator_question.unwrap();
         for _ in 0..2 {
@@ -304,8 +304,25 @@ async fn owner_archive_choices_archive_once_without_a_new_worker_or_question() {
     }
 }
 
+fn open_continuations(state: &Arc<ServerState>, task_id: &str) -> usize {
+    state
+        .work_db
+        .list_executions(Some(task_id))
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.status,
+                boss_protocol::ExecutionStatus::Ready
+                    | boss_protocol::ExecutionStatus::Queued
+                    | boss_protocol::ExecutionStatus::WaitingDependency
+            )
+        })
+        .count()
+}
+
 #[tokio::test]
-async fn owner_park_choice_parks_without_resuming_and_unparks_without_an_answer_hold() {
+async fn owner_park_choice_parks_without_launching_and_unparks_into_one_continuation() {
     for revision in [false, true] {
         let (state, _dir, _, task_id) =
             parked_task_with_question_kind(disposition_payload("Park this item"), revision).await;
@@ -322,7 +339,16 @@ async fn owner_park_choice_parks_without_resuming_and_unparks_without_an_answer_
         assert!(state.work_db.is_parked(&root_id).unwrap());
         assert!(task.operator_question.is_none());
         assert_eq!(task.status, boss_protocol::TaskStatus::Todo);
-        assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+        assert!(task.autostart, "unpark must restore dispatch eligibility");
+        assert!(task.description.contains("Operator chose:** Park this item"));
+        assert_eq!(open_continuations(&state, &task_id), 0, "nothing launches while parked");
+        // A repeated answer neither mints nor launches anything.
+        assert!(matches!(
+            choose(&state, &question.id, "Park this item").await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
+        assert_eq!(open_continuations(&state, &task_id), 0);
+
         state
             .work_db
             .park_work_item_as_actor(&root_id, false, None, "human")
@@ -331,7 +357,69 @@ async fn owner_park_choice_parks_without_resuming_and_unparks_without_an_answer_
         assert!(task.parked_at.is_none());
         assert!(task.blocked_reason.is_none());
         assert!(task.operator_question.is_none());
+        if !revision {
+            // The fixture builds a project-less project task, which the
+            // execution reconcile does not mint for; present it as the
+            // ordinary chore the un-park sequence reconciles.
+            let conn = state.work_db.connect().unwrap();
+            conn.execute("UPDATE tasks SET kind = 'chore' WHERE id = ?1", [&task_id])
+                .unwrap();
+            conn.execute(
+                "UPDATE work_executions SET kind = 'chore_implementation' WHERE work_item_id = ?1",
+                [&task_id],
+            )
+            .unwrap();
+        }
+        // The un-park sequence reconciles the released item's executions.
+        state.work_db.reconcile_item_execution(&task_id).unwrap();
+        assert_eq!(
+            open_continuations(&state, &task_id),
+            1,
+            "unpark resumes exactly one continuation (revision: {revision}): {:?}",
+            state.work_db.list_executions(Some(&task_id)).unwrap()
+        );
+        state.work_db.reconcile_item_execution(&task_id).unwrap();
+        assert_eq!(open_continuations(&state, &task_id), 1);
     }
+}
+
+#[tokio::test]
+async fn owner_park_choice_with_an_unmet_prerequisite_records_the_answer_and_stays_gated() {
+    let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Park this item")).await;
+    let task = question_task(&state, &task_id);
+    let question = task.operator_question.clone().unwrap();
+    let prerequisite =
+        boss_engine_runtime::test_support::create_test_chore_manual(&state.work_db, &task.product_id, "Gate").id;
+    state
+        .work_db
+        .add_dependency(boss_protocol::AddDependencyInput {
+            dependent: task_id.clone(),
+            prerequisite: prerequisite.clone(),
+            relation: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        choose(&state, &question.id, "Park this item").await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    let task = question_task(&state, &task_id);
+    assert!(task.operator_question.is_none());
+    assert_eq!(
+        state.work_db.list_operator_questions(&task_id).unwrap()[0].status,
+        boss_protocol::OperatorQuestionStatus::Answered
+    );
+    assert!(state.work_db.is_parked(&task_id).unwrap());
+    assert_eq!(task.status, boss_protocol::TaskStatus::Blocked);
+    assert_eq!(task.blocked_reason.as_deref(), Some("dependency"));
+    assert!(
+        state
+            .work_db
+            .gating_prereqs_for(&task_id)
+            .unwrap()
+            .contains(&prerequisite),
+        "the dependency edge survives"
+    );
+    assert_eq!(open_continuations(&state, &task_id), 0);
 }
 
 #[tokio::test]
@@ -353,7 +441,7 @@ async fn ordinary_choices_still_resume_including_pr_selection_and_keep_trying() 
 
 #[tokio::test]
 async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
-    let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Archive")).await;
+    let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload("Archive this item")).await;
     let question = question_task(&state, &task_id).operator_question.unwrap();
     state
         .work_db
@@ -365,7 +453,7 @@ async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
         )
         .unwrap();
     assert!(!matches!(
-        choose(&state, &question.id, "Archive").await,
+        choose(&state, &question.id, "Archive this item").await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
     assert_eq!(
@@ -383,7 +471,7 @@ async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
         .execute_batch("DROP TRIGGER refuse_test_archive")
         .unwrap();
     assert!(matches!(
-        choose(&state, &question.id, "Archive").await,
+        choose(&state, &question.id, "Archive this item").await,
         FrontendEvent::WorkItemUpdated { .. }
     ));
     assert_eq!(
@@ -393,25 +481,70 @@ async fn failed_archive_rolls_back_the_answer_so_the_owner_can_retry() {
 }
 
 #[tokio::test]
-async fn disposition_answers_do_not_grant_workers_owner_authority() {
-    for choice in ["Archive", "Park"] {
+async fn disposition_labels_chosen_by_a_non_owner_resume_the_worker_instead_of_acting() {
+    for (actor, choice) in [
+        ("worker", "Archive this item"),
+        ("worker", "Park this item"),
+        ("boss", "Archive this item"),
+        ("boss", "Park this item"),
+    ] {
         let (state, _dir, _, task_id) = parked_task_with_question(disposition_payload(choice)).await;
         let question = question_task(&state, &task_id).operator_question.unwrap();
-        let result = state.work_db.answer_operator_question_from(
-            &question.id,
-            boss_protocol::OperatorAnswer::MultipleChoice { value: choice.into() },
-            state.pr_state_checker.as_ref(),
-            "worker",
-            None,
-            false,
-        );
-        assert!(result.is_err());
-        assert_eq!(
-            question_task(&state, &task_id).operator_question.unwrap().id,
-            question.id
-        );
-        assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 1);
+        state
+            .work_db
+            .answer_operator_question_from(
+                &question.id,
+                boss_protocol::OperatorAnswer::MultipleChoice { value: choice.into() },
+                state.pr_state_checker.as_ref(),
+                actor,
+                None,
+                false,
+            )
+            .unwrap();
+        let task = question_task(&state, &task_id);
+        assert_eq!(task.status, boss_protocol::TaskStatus::Todo, "{actor} {choice}");
+        assert!(task.parked_at.is_none(), "{actor} {choice} must not park");
+        assert!(task.description.contains(&format!("Operator chose:** {choice}")));
     }
+}
+
+#[tokio::test]
+async fn bare_archive_and_park_labels_on_an_unrelated_question_resume_the_worker() {
+    for choice in ["Archive", "Park", "Archive it", "Park it"] {
+        let mut payload = multiple_choice_payload();
+        payload["question"]["text"] = json!("What should happen to the old output?");
+        payload["question"]["answer_type"]["choices"] = json!([choice, "Delete", "Keep"]);
+        let (state, _dir, _, task_id) = parked_task_with_question(payload).await;
+        let question = question_task(&state, &task_id).operator_question.unwrap();
+        assert!(matches!(
+            choose(&state, &question.id, choice).await,
+            FrontendEvent::WorkItemUpdated { .. }
+        ));
+        let task = question_task(&state, &task_id);
+        assert_eq!(task.status, boss_protocol::TaskStatus::Todo, "{choice}");
+        assert!(task.parked_at.is_none(), "{choice}");
+        assert!(task.description.contains(&format!("Operator chose:** {choice}")));
+        assert_eq!(state.work_db.list_executions(Some(&task_id)).unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn owner_archive_choice_archives_a_revision() {
+    let (state, _dir, _, task_id) =
+        parked_task_with_question_kind(disposition_payload("Archive this revision"), true).await;
+    let question = question_task(&state, &task_id).operator_question.unwrap();
+    assert!(matches!(
+        choose(&state, &question.id, "Archive this revision").await,
+        FrontendEvent::WorkItemUpdated { .. }
+    ));
+    let task = question_task(&state, &task_id);
+    assert_eq!(task.status, boss_protocol::TaskStatus::Archived);
+    assert_eq!(task.last_status_actor, "human");
+    assert!(task.operator_question.is_none());
+    assert_eq!(
+        state.work_db.list_operator_questions(&task_id).unwrap()[0].status,
+        boss_protocol::OperatorQuestionStatus::Answered
+    );
 }
 
 #[tokio::test]

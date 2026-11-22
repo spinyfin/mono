@@ -2675,6 +2675,14 @@ impl WorkDb {
         let mut archive_reason = None;
         let ladder_question = crate::progression_ladder::is_ladder_question(&tx, &question.question.id)?;
         let mismatch_attempt = super::conflict_mismatch::attempt_for_question(&tx, &question.question.id)?;
+        // Only the owner's choice of an item-local disposition acts on the item;
+        // any other answerer's choice of the same label resumes the worker.
+        let disposition = match &answer {
+            OperatorAnswer::MultipleChoice { value } if actor == LAST_STATUS_ACTOR_HUMAN => {
+                crate::operator_disposition::known_choice(value)
+            }
+            _ => None,
+        };
         match (answer, &question.question.answer_type) {
             // The engine's own question when progression ran out of attempts.
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
@@ -2758,24 +2766,25 @@ impl WorkDb {
                 minted_execution = restart.minted;
                 dispatch_work_item_id = restart.dispatch_work_item_id;
             }
-            (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
-                if crate::operator_disposition::known_choice(&value).is_some() =>
+            (OperatorAnswer::MultipleChoice { .. }, OperatorAnswerType::MultipleChoice { .. })
+                if disposition == Some(crate::operator_disposition::Disposition::Archive) =>
             {
-                let disposition = crate::operator_disposition::known_choice(&value).expect("known choice");
-                match disposition {
-                    crate::operator_disposition::Disposition::Archive => {
-                        archive_reason = Some("the owner chose to archive this item in an operator question");
-                    }
-                    crate::operator_disposition::Disposition::Park => {
-                        touched_work_item_ids = self.park_answer_in_tx(
-                            &tx,
-                            &mut pending,
-                            &task,
-                            &now,
-                            crate::task_status_audit::WriteAttribution { actor, provenance },
-                        )?;
-                    }
-                }
+                archive_reason = Some("the owner chose to archive this item in an operator question");
+            }
+            (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
+                if disposition == Some(crate::operator_disposition::Disposition::Park) =>
+            {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = choice_block(&question.question, &value, &timestamp);
+                touched_work_item_ids = crate::operator_disposition::park_answer_in_tx(
+                    &tx,
+                    &mut pending,
+                    &task,
+                    &question.question,
+                    &block,
+                    &now,
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();

@@ -427,9 +427,9 @@ impl WorkDb {
     ) -> Result<WorkItem> {
         let actor = attribution.actor;
         let basis = attribution.provenance.unwrap_or(DEFAULT_UPDATE_BASIS);
-        // Validate the incoming
-        // value only (never a value already sitting in a row from before
-        // this limit existed — see `validate_blocked_reason_length`).
+        // Validate the incoming value only (never a value already sitting in a
+        // row from before this limit existed — see
+        // `validate_blocked_reason_length`).
         if let Some(reason) = patch.blocked_reason.as_deref() {
             validate_blocked_reason_length(reason)?;
         }
