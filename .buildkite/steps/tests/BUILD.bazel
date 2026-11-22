@@ -66,3 +66,17 @@ sh_test(
     srcs = ["bazel_server_lock_test.sh"],
     data = ["//.buildkite/steps:bazel-server-lock.sh"],
 )
+
+# Script-level test for the boss-v* tag sync ci-env.sh runs before its first
+# bazel call: missing boss-v* tags are fetched, deleted boss-v* tags are
+# pruned, moved boss-v* tags are updated, unrelated tags are untouched, and
+# unreachable remotes fail non-zero.
+sh_test(
+    name = "fetch_boss_tags_test",
+    size = "small",
+    srcs = ["fetch_boss_tags_test.sh"],
+    data = [
+        "//.buildkite/steps:ci-env.sh",
+        "//.buildkite/steps:fetch-boss-tags.sh",
+    ],
+)

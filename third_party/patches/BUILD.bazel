@@ -1,1 +1,19 @@
-exports_files(glob(["*.patch"]))
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+exports_files(glob(
+    ["*.patch"],
+    exclude = ["rustix-1.1.4-clean-probe.patch"],
+))
+
+exports_files(
+    ["rustix-1.1.4-clean-probe.patch"],
+    visibility = ["//:__pkg__"],
+)
+
+sh_test(
+    name = "rustix_probe_cleanup_test",
+    size = "small",
+    srcs = ["rustix_probe_cleanup_test.sh"],
+    args = ["$(rootpath @rustix_probe//:build_script_build)"],
+    data = ["@rustix_probe//:build_script_build"],
+)

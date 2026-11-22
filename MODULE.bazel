@@ -315,6 +315,17 @@ register_toolchains("@rust_toolchains//:all")
 register_toolchains("//third_party/prost:prost_toolchain")
 
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+# Feature-detection metadata is temporary, but cargo_build_script exports
+# OUT_DIR to all consumers. Remove the unused probe so per-agent compiler
+# metadata cannot invalidate otherwise identical downstream Rust actions.
+crate.annotation(
+    crate = "rustix",
+    patch_args = ["-p1"],
+    patches = ["//third_party/patches:rustix-1.1.4-clean-probe.patch"],
+    repositories = ["mono_crates"],
+    version = "1.1.4",
+)
 crate.annotation(
     # SQLITE_DEFAULT_MEMSTATUS=0 removes SQLite's process-global malloc
     # tracking mutex, which otherwise serializes every allocation across all
@@ -391,7 +402,7 @@ crate.from_cargo(
         "x86_64-unknown-nixos-gnu",
     ],
 )
-use_repo(crate, "mono_crates")
+use_repo(crate, "mono_crates", rustix_probe = "mono_crates__rustix-1.1.4")
 
 swift_deps = use_extension(
     "@rules_swift_package_manager//:extensions.bzl",

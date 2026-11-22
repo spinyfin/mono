@@ -6,6 +6,7 @@ exports_files(
         "bazel-server-lock.sh",
         "ci-env.sh",
         "disk-cache-gc-cap.sh",
+        "fetch-boss-tags.sh",
         "remote-execution.sh",
         "report-flaky-tests.py",
     ],

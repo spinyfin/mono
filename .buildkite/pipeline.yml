@@ -20,6 +20,17 @@
 # a frozen hub is worse.
 
 steps:
+  # Both jobs rendezvous while running, guaranteeing distinct agents; the
+  # second waits for the first to populate the cache before invoking Bazel.
+  - label: "Boss tag cache: %n"
+    if: build.env("BOSS_VERIFY_TAG_CACHE") == "1"
+    parallelism: 2
+    command: "bash .buildkite/steps/verify-boss-tag-cache.sh"
+    agents:
+      queue: "bazel-any"
+      os: "${BOSS_TAG_CACHE_OS:-darwin}"
+      arch: "${BOSS_TAG_CACHE_ARCH:-arm64}"
+
   - label: ":bazel: bazel-build-test"
     key: "bazel-build-test"
     command: ".buildkite/steps/bazel-build-test.sh"
