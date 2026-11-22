@@ -101,7 +101,7 @@ impl MergeProbe for CommandMergeProbe {
             ));
         }
         let (owner, repo, _) = parse_pr_url_parts(pr_url).context("invalid GitHub PR URL")?;
-        let default_branch = cached_default_branch(owner, repo).await?;
+        let default_branch = boss_github::trees::fetch_default_branch_cached(owner, repo).await?;
         let mut document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         document["defaultBranch"] = default_branch.into();
         let stdout = document.to_string();
@@ -127,32 +127,6 @@ impl MergeProbe for CommandMergeProbe {
     async fn probe_batch(&self, pr_urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
         self.probe_batch_via_graphql(pr_urls).await
     }
-}
-
-/// How long a repository's default branch is reused by the single-PR probe.
-/// The default branch almost never changes, so one REST call per repository
-/// per window replaces one per probe.
-const DEFAULT_BRANCH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-
-type DefaultBranchCache = std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>;
-
-/// The repository's default branch, cached per `owner/repo`. A failed lookup
-/// is never cached, so the probe retries on its next pass.
-async fn cached_default_branch(owner: &str, repo: &str) -> Result<String> {
-    static CACHE: std::sync::OnceLock<DefaultBranchCache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let key = format!("{owner}/{repo}");
-    if let Ok(guard) = cache.lock()
-        && let Some((branch, fetched)) = guard.get(&key)
-        && fetched.elapsed() < DEFAULT_BRANCH_CACHE_TTL
-    {
-        return Ok(branch.clone());
-    }
-    let branch = boss_github::trees::fetch_default_branch(owner, repo).await?;
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, (branch.clone(), std::time::Instant::now()));
-    }
-    Ok(branch)
 }
 
 /// Shared GraphQL selection set for one PR's lifecycle fields, reused for

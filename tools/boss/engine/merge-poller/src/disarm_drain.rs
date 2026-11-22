@@ -8,7 +8,7 @@ use super::*;
 ///
 /// A PR that has already merged or closed has no auto-merge left to turn off:
 /// its pending disarm is retired instead of being retried on every sweep.
-pub(super) async fn drain_pending_merge_disarms(
+pub(crate) async fn drain_pending_merge_disarms(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,

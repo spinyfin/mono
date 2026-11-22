@@ -1161,6 +1161,100 @@ async fn late_recovery_checks_base_for_fresh_and_merged_prs() {
     }
 }
 
+#[tokio::test]
+async fn late_recovery_dedupes_an_identical_open_base_refusal() {
+    use crate::work::{FakePrStateChecker, PrBaseVerdict, PrOpenState};
+    let (_dir, db, _, work_item_id, execution_id) = abandoned_execution_fixture();
+    let TestHarness { handler, publisher, .. } = TestHarness::new(
+        db.clone(),
+        StubPrDetector::ok_status(PrStatus::Fresh { url: OWN_PR.into() }),
+    );
+    let handler = handler.with_pr_state_checker(Arc::new(
+        FakePrStateChecker::always(PrOpenState::Open).with_base(PrBaseVerdict::Refused("feature/parent".into())),
+    ));
+    let candidate = crate::work::LatePrCandidate {
+        execution_id: execution_id.clone(),
+        work_item_id: work_item_id.clone(),
+        repo_remote_url: "git@github.com:spinyfin/mono.git".into(),
+        branch_naming: BranchNaming::BossExecPrefix,
+        worker_branch_prefix: None,
+    };
+    assert!(matches!(
+        handler.recheck_for_pr_late(&candidate).await,
+        StopOutcome::PrBaseRefused { .. }
+    ));
+    // `upsert_work_item_attention` reuses the open row and stamps
+    // `last_raised_at` without inserting. A skip that still re-raises
+    // would keep the row count at one; a frozen sentinel is what
+    // proves the second pass did not write.
+    const LAST_RAISED_SENTINEL: &str = "1";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_attention_items SET last_raised_at = ?1
+             WHERE work_item_id = ?2 AND kind = ?3 AND status = 'open'",
+            rusqlite::params![
+                LAST_RAISED_SENTINEL,
+                work_item_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        handler.recheck_for_pr_late(&candidate).await,
+        StopOutcome::PrBaseRefused { .. }
+    ));
+    let last_raised_at: String = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT last_raised_at FROM work_attention_items
+             WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open'",
+            rusqlite::params![
+                work_item_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        last_raised_at, LAST_RAISED_SENTINEL,
+        "an identical open refusal must not re-stamp last_raised_at"
+    );
+    let open: Vec<_> = db
+        .list_attention_items_for_work_item(&work_item_id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED && item.status == "open"
+        })
+        .collect();
+    assert_eq!(open.len(), 1);
+    let raised: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM work_attention_items WHERE work_item_id = ?1 AND kind = ?2",
+            rusqlite::params![
+                work_item_id,
+                boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raised, 1, "an identical open refusal must not insert a second row");
+    let refusals = publisher
+        .events
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, id, reason)| {
+            id == &work_item_id && reason == boss_engine_storage_values::attention_kinds::PR_BASE_REFUSED
+        })
+        .count();
+    assert_eq!(refusals, 1, "an identical open refusal must publish once");
+}
+
 struct CountingBaseChecker(std::sync::atomic::AtomicUsize);
 impl crate::work::PrStateChecker for CountingBaseChecker {
     fn check(&self, _: &str) -> anyhow::Result<crate::work::PrOpenState> {

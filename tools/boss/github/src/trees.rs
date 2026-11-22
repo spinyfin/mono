@@ -174,6 +174,49 @@ pub async fn fetch_default_branch(owner: &str, repo: &str) -> TreeResult<String>
     Ok(branch)
 }
 
+/// How long [`DefaultBranchCache`] reuses a repository's default branch. The
+/// default branch almost never changes, so one lookup per repository per
+/// window replaces one per caller pass.
+pub const DEFAULT_BRANCH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A per-repository cache of default-branch names with a time-to-live. A
+/// failed lookup is never cached, so the caller retries on its next pass.
+#[derive(Default)]
+pub struct DefaultBranchCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+}
+
+impl DefaultBranchCache {
+    /// The cached default branch for `key` (e.g. `owner/repo`), or the result
+    /// of `fetch`, which is then cached.
+    pub async fn get_or_fetch<E, F, Fut>(&self, key: &str, fetch: F) -> Result<String, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, E>>,
+    {
+        if let Ok(guard) = self.entries.lock()
+            && let Some((branch, fetched)) = guard.get(key)
+            && fetched.elapsed() < DEFAULT_BRANCH_CACHE_TTL
+        {
+            return Ok(branch.clone());
+        }
+        let branch = fetch().await?;
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.insert(key.to_owned(), (branch.clone(), std::time::Instant::now()));
+        }
+        Ok(branch)
+    }
+}
+
+/// [`fetch_default_branch`] served from a process-wide [`DefaultBranchCache`].
+pub async fn fetch_default_branch_cached(owner: &str, repo: &str) -> TreeResult<String> {
+    static CACHE: std::sync::OnceLock<DefaultBranchCache> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(Default::default)
+        .get_or_fetch(&format!("{owner}/{repo}"), || fetch_default_branch(owner, repo))
+        .await
+}
+
 /// The commit sha at the tip of `git_ref`.
 ///
 /// `Accept: application/vnd.github.sha` makes GitHub return the bare

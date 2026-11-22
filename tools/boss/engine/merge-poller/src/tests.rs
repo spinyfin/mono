@@ -1,8 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
+use crate::metrics::Registry;
 use anyhow::Result;
 use async_trait::async_trait;
-use boss_execution_contracts::{CubeRepoSummary, CubeWorkspaceStatus};
+use boss_execution_contracts::{CubeClient, CubeRepoSummary, CubeWorkspaceStatus, ExecutionPublisher};
+use boss_observation_contracts::DesignDetection;
 use boss_protocol::ExecutionKind;
 #[cfg(test)]
 use tempfile::tempdir;
@@ -13,8 +17,8 @@ use crate::test_support::*;
 #[cfg(test)]
 use crate::work::{CommentAnchor, CreateCommentInput, WorkItem};
 use crate::work::{
-    CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, FinishExecutionRunInput, WorkDb,
-    WorkItemPatch,
+    CreateExecutionInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, FinishExecutionRunInput,
+    PendingMergeCheck, PrStateChecker, WorkDb, WorkItemPatch,
 };
 
 pub struct StubProbe {
@@ -82,6 +86,87 @@ impl StubProbe {
 
     pub fn set_err(&self, url: &str, msg: &str) {
         self.states.lock().unwrap().insert(url.to_owned(), Err(msg.to_owned()));
+    }
+}
+
+/// Sweep host that records `disarm_stopped_merge` and no-ops everything else.
+#[derive(Default)]
+pub struct NoopSweepHost {
+    pub disarms: AtomicUsize,
+}
+
+struct NoopSweepPasses;
+
+#[async_trait]
+impl SweepPasses for NoopSweepPasses {
+    async fn run_speculative_pass(&mut self, _: &WorkDb, _: &dyn CubeClient, _: &Registry, _: &[PendingMergeCheck]) {}
+
+    fn stacking_pass_due(&self, _: Instant) -> bool {
+        false
+    }
+
+    async fn run_stacking_pass(
+        &mut self,
+        _: &WorkDb,
+        _: &dyn ExecutionPublisher,
+        _: &Registry,
+        _: &[PendingMergeCheck],
+    ) {
+    }
+}
+
+#[async_trait]
+impl ConflictHandling for NoopSweepHost {
+    async fn on_conflict_detected(
+        &self,
+        _: &WorkDb,
+        _: &dyn ExecutionPublisher,
+        _: ConflictResponse<'_>,
+        _: &dyn PrStateChecker,
+        _: &PendingMergeCheck,
+        _: &PrLifecycleProbe,
+    ) -> bool {
+        false
+    }
+
+    async fn on_conflict_resolved(
+        &self,
+        _: &WorkDb,
+        _: &dyn ExecutionPublisher,
+        _: Option<&dyn CubeClient>,
+        _: &PendingMergeCheck,
+        _: ConflictCleared<'_>,
+    ) -> bool {
+        false
+    }
+
+    async fn disarm_stopped_merge(&self, _: &WorkDb, _: &dyn ExecutionPublisher, _: &PendingMergeCheck) {
+        self.disarms.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn retire_moot_conflict_revisions(&self, _: &WorkDb, _: &PendingMergeCheck, _: &[String]) -> usize {
+        0
+    }
+}
+
+#[async_trait]
+impl DesignDetection for NoopSweepHost {
+    async fn on_task_doc_pr_detected(&self, _: &WorkDb, _: &str, _: &str, _: &str) {}
+
+    async fn on_task_doc_pr_merged(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: Option<&str>) {}
+
+    async fn on_design_pr_detected(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: &str) {}
+
+    async fn on_design_pr_merged(&self, _: &WorkDb, _: &str, _: &str, _: &str, _: &str, _: Option<&str>) {}
+}
+
+impl PopulationRequests for NoopSweepHost {
+    fn enqueue_from_merge(&self, _: &WorkDb, _: PopulationRequest) {}
+}
+
+impl LoopPasses for NoopSweepHost {
+    fn start_passes(&self) -> Box<dyn SweepPasses> {
+        Box::new(NoopSweepPasses)
     }
 }
 
