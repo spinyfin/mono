@@ -632,6 +632,137 @@ async fn yielded_codex_command_blocks_a_same_turn_no_op_proposal() {
         state.work_db.get_worker_proposal(&proposal.id).unwrap().state,
         ProposalState::Superseded
     );
+
+    // A later turn with no new unobserved command, and a fresh declaration,
+    // must close: proposal acceptance is not task completion, but a verified
+    // no-op after the refusal is consumed is.
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "no_changes_needed", "summary": "Already fixed"}),
+            ),
+        )
+        .await,
+    );
+    session
+        .normalize_progress_events(&json!({"type": "event_msg", "payload": {"type": "task_started"}}))
+        .unwrap();
+    let later = session
+        .normalize_progress_events(&json!({
+            "type": "event_msg", "payload": {"type": "task_complete"}
+        }))
+        .unwrap();
+    let mut completed = false;
+    for event in later {
+        let incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+            &driver,
+            event,
+            Some(execution_id.clone()),
+            None,
+            None,
+        );
+        crate::app::worker_events::dispatch_codex_unobserved_command_on_notification(&state, &incoming);
+        if let Some(boundary) = incoming.turn_boundary() {
+            assert!(matches!(
+                state
+                    .completion_handler
+                    .on_stop_with_turn_end(&execution_id, Some(boundary))
+                    .await,
+                boss_engine_completion::StopOutcome::NoChangesNeeded { .. }
+            ));
+            completed = true;
+        }
+    }
+    assert!(completed);
+    assert_eq!(
+        state.work_db.get_execution(&execution_id).unwrap().status,
+        boss_protocol::ExecutionStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn a_completed_functions_exec_wrapper_does_not_block_no_op_completion() {
+    use boss_engine_driver::{AgentDriver, CodexDriver, ProgressSessionConfig, ProgressStreamSource};
+    let (state, _dir, execution_id, work_item_id) = live_chore_execution();
+    let driver = CodexDriver::default();
+    let mut session = driver
+        .progress_session(&ProgressSessionConfig {
+            source: ProgressStreamSource::AgentJsonlFile,
+            ..Default::default()
+        })
+        .unwrap();
+    for envelope in [
+        json!({"type": "session_meta", "payload": {"id": "thread-no-op"}}),
+        json!({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "name": "functions.exec", "call_id": "validation",
+            "input": concat!(
+                r#"let r = await tools.exec_command({cmd: "bazel test //tools/boss/engine/codex-rollout:codex-rollout_test", yield_time_ms: 30000});"#,
+                r#"while (!("exit_code" in r)) { r = await tools.write_stdin({session_id: r.session_id, chars: ""}); }"#,
+                "text(JSON.stringify(r));"
+            )
+        }}),
+        json!({"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "validation",
+            "output": [
+                {"type":"input_text","text":"Script completed\nWall time 17.7 seconds\nOutput:\n"},
+                {"type":"input_text","text":"{\"chunk_id\":\"done\",\"session_id\":8467,\"exit_code\":0,\"output\":\"2 tests passed\\n\"}"}
+            ]
+        }}),
+    ] {
+        session.normalize_progress_events(&envelope).unwrap();
+    }
+    submitted(
+        call_with_peer(
+            &state,
+            Some(std::process::id() as libc::pid_t),
+            submit_request(
+                &execution_id,
+                ProposalKind::RunDone,
+                json!({"outcome": "no_changes_needed", "summary": "Already fixed"}),
+            ),
+        )
+        .await,
+    );
+    let events = session
+        .normalize_progress_events(&json!({
+            "type": "event_msg", "payload": {"type": "task_complete"}
+        }))
+        .unwrap();
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, boss_protocol::WorkerEvent::Notification { message, .. }
+            if message.contains("[codex-unobserved-command]"))
+        ),
+        "completed wrapper must not emit an unobserved-command notification: {events:?}"
+    );
+    for event in events {
+        let incoming = boss_engine_runtime::events_socket::IncomingHookEvent::resolve(
+            &driver,
+            event,
+            Some(execution_id.clone()),
+            None,
+            None,
+        );
+        crate::app::worker_events::dispatch_codex_unobserved_command_on_notification(&state, &incoming);
+        if let Some(boundary) = incoming.turn_boundary() {
+            assert!(matches!(
+                state
+                    .completion_handler
+                    .on_stop_with_turn_end(&execution_id, Some(boundary))
+                    .await,
+                boss_engine_completion::StopOutcome::NoChangesNeeded { .. }
+            ));
+        }
+    }
+    assert_eq!(
+        state.work_db.get_execution(&execution_id).unwrap().status,
+        boss_protocol::ExecutionStatus::Completed
+    );
+    assert_eq!(task_status(&state, &work_item_id), boss_protocol::TaskStatus::Done);
 }
 
 /// Hold both original and replay RPCs at response delivery, let Stop consume

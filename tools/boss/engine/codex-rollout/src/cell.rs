@@ -40,7 +40,9 @@
 //! `wait` continuation is the consumer's job — see
 //! `boss_engine_driver::codex::rollout_calls`.
 
-use serde_json::Value;
+use std::iter::Peekable;
+
+use serde_json::{Map, Value};
 
 use crate::coerce_command_to_string;
 
@@ -52,9 +54,9 @@ pub const CELL_WAIT_TOOL: &str = "wait";
 
 /// `tools.*` helpers inside a cell script that run a shell command, in the
 /// order they are searched. `write_stdin` is deliberately absent: it
-/// continues an existing shell session whose id only ever appears in a
-/// prior cell's *output*, so it carries no command of its own and cannot be
-/// attributed to one from the script text alone.
+/// continues an existing shell session and carries no command of its own.
+/// Its literal session id, when the script names one, is read by
+/// [`write_stdin_session_id_from_script`].
 const COMMAND_BEARING_CELL_CALLS: &[&str] = &["exec_command", "shell"];
 
 /// Header line prefix of a yield placeholder, followed by the cell id.
@@ -74,9 +76,20 @@ const WALL_TIME_SUFFIX: &str = " seconds";
 /// Marker line separating the harness's own header from the cell's output.
 const OUTPUT_MARKER: &str = "\nOutput:";
 
+/// Strip the OpenAI `functions.` qualifier some rollouts put on tool names
+/// (`functions.exec`, `functions.wait`, `functions.write_stdin`).
+pub fn dialect_tool_name(tool_name: &str) -> &str {
+    tool_name.strip_prefix("functions.").unwrap_or(tool_name)
+}
+
 /// Whether `tool_name` is the cell harness's continuation poll.
 pub fn is_cell_wait_tool(tool_name: &str) -> bool {
-    tool_name == CELL_WAIT_TOOL
+    dialect_tool_name(tool_name) == CELL_WAIT_TOOL
+}
+
+/// Whether `tool_name` is a `write_stdin` poll of an existing shell session.
+pub fn is_write_stdin_tool(tool_name: &str) -> bool {
+    dialect_tool_name(tool_name) == "write_stdin"
 }
 
 /// The cell id a `wait` call targets, from its canonicalised tool input
@@ -178,17 +191,36 @@ fn is_wall_time_line(line: &str) -> bool {
 /// be still-running here. A bare `7` projection (`text(r.exit_code)`) and
 /// truncation-warning prose are not chunks at all.
 pub fn payload_is_running_chunk(payload: &str) -> bool {
-    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
-        return false;
-    };
-    chunk.contains_key("chunk_id") && !payload_reports_exit_code(payload)
+    value_is_running_chunk(&parse_json_value(payload))
 }
 
 /// Whether a structured harness chunk reports the command's exit status.
 pub fn payload_reports_exit_code(payload: &str) -> bool {
-    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
-        return false;
-    };
+    value_reports_exit_code(&parse_json_value(payload))
+}
+
+/// Whether `output` is already a structured object that reports `exit_code`.
+///
+/// Direct `write_stdin` polls sometimes carry the chunk as a JSON object
+/// rather than a JSON string. Flattening that object keeps only a `text`
+/// field, so callers must inspect the raw value before flattening.
+pub fn value_reports_exit_code(value: &Value) -> bool {
+    value.as_object().is_some_and(object_reports_exit_code)
+}
+
+/// Whether `output` is already a structured running chunk (`chunk_id`, no
+/// `exit_code`). Same object-form gap as [`value_reports_exit_code`].
+pub fn value_is_running_chunk(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|chunk| chunk.contains_key("chunk_id") && !object_reports_exit_code(chunk))
+}
+
+fn parse_json_value(payload: &str) -> Value {
+    serde_json::from_str(payload).unwrap_or(Value::Null)
+}
+
+fn object_reports_exit_code(chunk: &Map<String, Value>) -> bool {
     chunk.contains_key("exit_code")
         || chunk
             .get("metadata")
@@ -230,18 +262,40 @@ pub fn payload_session_id(payload: &str) -> Option<String> {
         })
 }
 
+/// Whether `source` contains a command-bearing `exec_command` / `shell` call,
+/// even when the argument object cannot be parsed far enough to recover the
+/// command string. Used to distinguish a command cell from a pure
+/// `write_stdin` continuation (or a compute-only cell) without requiring
+/// JSON-quoted keys.
+pub fn script_issues_command(source: &str) -> bool {
+    next_command_bearing_call(source).is_some()
+}
+
+/// Whether `source` is a cell that only polls an existing shell session.
+///
+/// A wrapper that starts a command and then polls it with `write_stdin` is
+/// command-bearing, not this. A plain argv/string `exec` input (`echo hi`)
+/// is also not this: it never mentions `write_stdin` and still issues a
+/// command.
+pub fn script_is_continuation_only(source: &str) -> bool {
+    find_js_call(source, "write_stdin").is_some() && !script_issues_command(source)
+}
+
 /// The shell command(s) a cell script issues, in source order.
 ///
 /// The cell's tool input is JavaScript source, so it never parses as JSON
 /// and the command lives inside a `tools.exec_command({…})` argument. That
-/// argument object is extracted by brace balancing and decoded as static
-/// literals, including bare JavaScript property names and single-quoted
-/// strings. Dynamic expressions yield nothing rather than a guessed command.
+/// argument object is JSON in some transcripts and JavaScript object
+/// shorthand (`{cmd:"echo hi"}`) in the 0.160.1 dialect; both are recovered
+/// here by decoding static literals, including bare property names and
+/// single-quoted strings. Dynamic expressions yield nothing rather than a
+/// guessed command.
 ///
-/// Empty means "no command-bearing call in this script": a pure
+/// Empty means "no recoverable command string in this script": a pure
 /// continuation cell (`tools.write_stdin`), a `store`/`load` cell, or a
-/// shape this parser does not recognise. Callers must not read that as
-/// "the cell ran no command".
+/// command-bearing call whose argument this parser does not recognise.
+/// [`script_issues_command`] is the "did this cell start a command" bit;
+/// callers must not read an empty vec as "the cell ran no command".
 pub fn commands_from_cell_script(source: &str) -> Vec<String> {
     let mut commands = Vec::new();
     let mut rest = source;
@@ -258,6 +312,37 @@ pub fn commands_from_cell_script(source: &str) -> Vec<String> {
     commands
 }
 
+/// The shell-session id a `write_stdin` cell script polls, when the argument
+/// object names one. Used to bind a continuation cell to the command that
+/// started the session even when the cell's output dropped `session_id`
+/// (`text(p.output)`).
+pub fn write_stdin_session_id_from_script(source: &str) -> Option<String> {
+    let mut rest = source;
+    while let Some(at) = find_js_call(rest, "write_stdin") {
+        let after = &rest[at + "write_stdin(".len()..];
+        if let Some(object) = balanced_object_literal(after)
+            && let Some(session_id) = object_literal_string_field(object, "session_id")
+        {
+            return Some(session_id);
+        }
+        rest = after;
+    }
+    None
+}
+
+/// `session_id` on a canonicalised `write_stdin` tool input (JSON args, or
+/// the id recovered from a continuation cell script).
+pub fn write_stdin_session_id(tool_input: &Value) -> Option<String> {
+    match tool_input.get("session_id") {
+        Some(Value::String(text)) => Some(text.trim().to_owned()).filter(|text| !text.is_empty()),
+        Some(Value::Number(number)) => Some(number.to_string()),
+        _ => tool_input
+            .get("script")
+            .and_then(Value::as_str)
+            .and_then(write_stdin_session_id_from_script),
+    }
+}
+
 /// A single display/gate string for the commands a cell script issues, or
 /// `None` when it issues none.
 ///
@@ -271,20 +356,240 @@ pub fn cell_script_command(source: &str) -> Option<String> {
     (!commands.is_empty()).then(|| commands.join("\n"))
 }
 
-/// Offset and needle length of the earliest `tools.<fn>(` call in `source`
-/// that runs a command, so a script mixing helpers is read in source order.
+/// Offset and needle length of the earliest command-bearing call in
+/// `source`. Matches `tools.exec_command(` and the bare `exec_command(`
+/// form some cells emit, so a script mixing helpers is read in source order.
+/// Requires an identifier boundary before the name (`.` is allowed) and
+/// ignores matches inside string literals, so `spawnshell(` and `"shell("`
+/// in a string are not command-bearing.
 fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
     COMMAND_BEARING_CELL_CALLS
         .iter()
-        .filter_map(|name| {
-            let needle = format!("tools.{name}(");
-            source.find(&needle).map(|at| (at, needle.len()))
-        })
+        .filter_map(|name| find_js_call(source, name).map(|at| (at, name.len() + 1)))
         .min_by_key(|(at, _)| *at)
 }
 
+/// Byte offset of `name(` at an identifier boundary, skipping string
+/// literals and comments. `.` may precede the name so `tools.write_stdin(`
+/// matches; `spawnshell(`, a quoted `"shell("`, and a commented-out
+/// `shell(` do not.
+fn find_js_call(source: &str, name: &str) -> Option<usize> {
+    let mut chars = source.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        match ch {
+            '/' => match chars.peek().map(|&(_, next)| next) {
+                Some('/') => {
+                    chars.next();
+                    skip_js_line_comment(&mut chars);
+                }
+                Some('*') => {
+                    chars.next();
+                    skip_js_block_comment(&mut chars);
+                }
+                _ if js_regex_allowed_before(source, at) => skip_js_regex_literal(&mut chars),
+                _ if js_call_at(source, at, name) => return Some(at),
+                _ => {}
+            },
+            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
+            '`' => skip_js_quoted_string(&mut chars, ch, true),
+            _ if js_call_at(source, at, name) => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn js_call_at(source: &str, at: usize, name: &str) -> bool {
+    let Some(rest) = source.get(at..) else {
+        return false;
+    };
+    rest.starts_with(name)
+        && rest.get(name.len()..).is_some_and(|tail| tail.starts_with('('))
+        && js_ident_boundary_at(source, at)
+}
+
+fn js_ident_boundary_at(source: &str, at: usize) -> bool {
+    let Some(preceding) = source.get(..at).and_then(|prefix| prefix.chars().next_back()) else {
+        return true;
+    };
+    !preceding.is_ascii_alphanumeric() && preceding != '_' && preceding != '$'
+}
+
+/// Whether a `/` at byte offset `at` begins a regular-expression literal
+/// rather than a division, judged from the previous significant token
+/// after comments, strings, and whitespace are skipped. A regex can follow
+/// the start of input, an operator or opening punctuation, or a keyword
+/// such as `return`; it cannot follow an identifier, number, string or
+/// closing bracket. When the previous token is unclear, treat the slash as
+/// division so a later command stays visible.
+fn js_regex_allowed_before(source: &str, at: usize) -> bool {
+    let Some(prefix) = source.get(..at) else {
+        return false;
+    };
+    match last_js_token(prefix) {
+        LastJsToken::Start | LastJsToken::RegexPunct => true,
+        LastJsToken::Word { start, end } => matches!(
+            prefix.get(start..end),
+            Some(
+                "return"
+                    | "typeof"
+                    | "case"
+                    | "do"
+                    | "else"
+                    | "in"
+                    | "of"
+                    | "void"
+                    | "delete"
+                    | "throw"
+                    | "new"
+                    | "yield"
+                    | "await"
+            )
+        ),
+        LastJsToken::Operand => false,
+    }
+}
+
+/// Last significant token in `prefix` after skipping comments, strings, and
+/// whitespace. Used only to tell a regex literal from division.
+enum LastJsToken {
+    Start,
+    Word { start: usize, end: usize },
+    Operand,
+    RegexPunct,
+}
+
+fn last_js_token(prefix: &str) -> LastJsToken {
+    let mut chars = prefix.char_indices().peekable();
+    let mut last = LastJsToken::Start;
+    while let Some((at, ch)) = chars.next() {
+        match ch {
+            '/' => match chars.peek().map(|&(_, next)| next) {
+                Some('/') => {
+                    chars.next();
+                    skip_js_line_comment(&mut chars);
+                }
+                Some('*') => {
+                    chars.next();
+                    skip_js_block_comment(&mut chars);
+                }
+                _ => last = LastJsToken::RegexPunct,
+            },
+            '"' | '\'' => {
+                skip_js_quoted_string(&mut chars, ch, false);
+                last = LastJsToken::Operand;
+            }
+            '`' => {
+                skip_js_quoted_string(&mut chars, ch, true);
+                last = LastJsToken::Operand;
+            }
+            ch if ch.is_whitespace() => {}
+            ')' | ']' => last = LastJsToken::Operand,
+            ch if js_ident_part(ch) => {
+                let mut end = at + ch.len_utf8();
+                while let Some(&(next_at, next)) = chars.peek() {
+                    if js_ident_part(next) {
+                        end = next_at + next.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                last = if ch.is_ascii_digit() {
+                    LastJsToken::Operand
+                } else {
+                    LastJsToken::Word { start: at, end }
+                };
+            }
+            ch if ch.is_ascii() => last = LastJsToken::RegexPunct,
+            // Non-ASCII punctuation is not a reliable regex opener; fail
+            // toward division so a later command stays visible.
+            _ => last = LastJsToken::Operand,
+        }
+    }
+    last
+}
+
+fn js_ident_part(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
+}
+
+/// Skip a regex literal body (the opening `/` is already consumed): ends at
+/// the first unescaped `/` outside a `[...]` class, or at a newline.
+fn skip_js_regex_literal(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>) {
+    let mut in_class = false;
+    while let Some((_, ch)) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next();
+            }
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => return,
+            '\n' => return,
+            _ => {}
+        }
+    }
+}
+
+fn skip_js_line_comment(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>) {
+    for (_, ch) in chars.by_ref() {
+        if ch == '\n' {
+            break;
+        }
+    }
+}
+
+fn skip_js_block_comment(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>) {
+    let mut prev_star = false;
+    for (_, ch) in chars.by_ref() {
+        if prev_star && ch == '/' {
+            return;
+        }
+        prev_star = ch == '*';
+    }
+}
+
+/// Skip a JS string whose opening quote has already been consumed.
+/// Single and double quoted strings end at an unescaped newline (they are
+/// a SyntaxError in JS; treating the newline as the end keeps later code
+/// visible). Template literals may contain newlines.
+fn skip_js_quoted_string(chars: &mut Peekable<impl Iterator<Item = (usize, char)>>, quote: char, allow_newline: bool) {
+    let mut escaped = false;
+    for (_, ch) in chars.by_ref() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            break;
+        }
+        if !allow_newline && (ch == '\n' || ch == '\r') {
+            break;
+        }
+    }
+}
+
+/// A string/number field on a JSON object or a JavaScript object literal
+/// (`{cmd:"echo hi"}`, `{session_id:8467}`). Nested objects/arrays are
+/// skipped; a missing or non-scalar field yields `None`.
+fn object_literal_string_field(object: &str, field: &str) -> Option<String> {
+    let parsed = cell_object::parse_literal_object(object)?;
+    match parsed.get(field)? {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        other => Some(coerce_command_to_string(other)),
+    }
+    .filter(|text| !text.is_empty())
+}
+
 /// Take the balanced `{…}` object literal at the start of `source` (after
-/// any leading whitespace), respecting quoted string literals and escapes.
+/// any leading whitespace), respecting quoted string literals, comments,
+/// regex literals, and escapes.
 fn balanced_object_literal(source: &str) -> Option<&str> {
     let trimmed = source.trim_start();
     let offset = source.len() - trimmed.len();
@@ -292,20 +597,23 @@ fn balanced_object_literal(source: &str) -> Option<&str> {
         return None;
     }
     let mut depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in trimmed.char_indices() {
-        if let Some(delimiter) = quote {
-            match ch {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                ch if ch == delimiter => quote = None,
-                _ => {}
-            }
-            continue;
-        }
+    let mut chars = trimmed.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
         match ch {
-            '"' | '\'' => quote = Some(ch),
+            '/' => match chars.peek().map(|&(_, next)| next) {
+                Some('/') => {
+                    chars.next();
+                    skip_js_line_comment(&mut chars);
+                }
+                Some('*') => {
+                    chars.next();
+                    skip_js_block_comment(&mut chars);
+                }
+                _ if js_regex_allowed_before(trimmed, index) => skip_js_regex_literal(&mut chars),
+                _ => {}
+            },
+            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
+            '`' => skip_js_quoted_string(&mut chars, ch, true),
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -384,8 +692,20 @@ mod tests {
     fn javascript_bare_property_name_preserves_the_literal_command() {
         let source = r#"await tools.exec_command({cmd: "echo hi"});"#;
         assert_eq!(cell_script_command(source).as_deref(), Some("echo hi"));
+        assert!(script_issues_command(source));
         let source = r#"await tools.exec_command({cmd: 'echo }', yield_time_ms: 1000});"#;
         assert_eq!(cell_script_command(source).as_deref(), Some("echo }"));
+        let compact = r#"text(await tools.exec_command({cmd:"echo hello-boss-qual"}));"#;
+        assert_eq!(cell_script_command(compact).as_deref(), Some("echo hello-boss-qual"));
+    }
+
+    #[test]
+    fn javascript_object_shorthand_survives_sibling_fields() {
+        let source = r#"text(await tools.exec_command({cmd:"sleep 45 && echo late-output",yield_time_ms:1000}));"#;
+        assert_eq!(
+            cell_script_command(source).as_deref(),
+            Some("sleep 45 && echo late-output")
+        );
     }
 
     #[test]
@@ -397,6 +717,33 @@ mod tests {
         ] {
             assert_eq!(cell_script_command(source), None);
         }
+    }
+
+    #[test]
+    fn bare_exec_command_call_without_tools_prefix_is_still_command_bearing() {
+        let source = r#"const r = await exec_command({"cmd":"jj status"});"#;
+        assert_eq!(cell_script_command(source).as_deref(), Some("jj status"));
+        assert!(script_issues_command(source));
+    }
+
+    #[test]
+    fn write_stdin_session_id_reads_json_and_shorthand_object_literals() {
+        assert_eq!(
+            write_stdin_session_id_from_script(r#"const p = await tools.write_stdin({"session_id":8467,"chars":""});"#)
+                .as_deref(),
+            Some("8467")
+        );
+        assert_eq!(
+            write_stdin_session_id_from_script(
+                r#"text(await tools.write_stdin({session_id:80143,chars:"",yield_time_ms:30000}));"#
+            )
+            .as_deref(),
+            Some("80143")
+        );
+        assert_eq!(
+            write_stdin_session_id_from_script("const r = await tools.exec_command({cmd:\"echo hi\"});"),
+            None
+        );
     }
 
     #[test]
@@ -555,9 +902,188 @@ mod tests {
     }
 
     #[test]
-    fn wait_is_the_only_recognised_continuation_tool() {
+    fn wait_and_write_stdin_are_the_recognised_continuation_tools() {
         assert!(is_cell_wait_tool(CELL_WAIT_TOOL));
+        assert!(is_cell_wait_tool("functions.wait"));
         assert!(!is_cell_wait_tool("Bash"));
         assert!(!is_cell_wait_tool("wait_agent"));
+        assert!(is_write_stdin_tool("write_stdin"));
+        assert!(is_write_stdin_tool("functions.write_stdin"));
+        assert!(!is_write_stdin_tool("exec"));
+    }
+
+    #[test]
+    fn continuation_only_script_does_not_issue_a_command() {
+        let source = concat!(
+            "const r = load(\"run\");\n",
+            r#"const p = await tools.write_stdin({"session_id":r.session_id,"chars":"","yield_time_ms":30000});"#,
+        );
+        assert!(!script_issues_command(source));
+        assert!(script_is_continuation_only(source));
+        assert!(!script_is_continuation_only("echo rollout"));
+        assert!(!script_is_continuation_only("sleep 999"));
+        let wrapper = concat!(
+            r#"let r = await tools.exec_command({cmd: "bazel test //tools/boss/engine/...", yield_time_ms: 30000});"#,
+            r#"while (!("exit_code" in r)) { r = await tools.write_stdin({session_id: r.session_id, chars: ""}); }"#,
+            "text(JSON.stringify(r));",
+        );
+        assert!(script_issues_command(wrapper));
+        assert!(!script_is_continuation_only(wrapper));
+        assert_eq!(
+            cell_script_command(wrapper).as_deref(),
+            Some("bazel test //tools/boss/engine/...")
+        );
+    }
+
+    #[test]
+    fn javascript_object_expressions_are_not_guessed_as_a_command() {
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd: "cd " + dir + " && make"});"#),
+            None
+        );
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd: `cd ${dir}`});"#),
+            None
+        );
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd: cond ? "a" : "b"});"#),
+            None
+        );
+        assert!(script_issues_command(
+            r#"await tools.exec_command({cmd: "cd " + dir + " && make"});"#
+        ));
+    }
+
+    #[test]
+    fn command_bearing_calls_require_an_identifier_boundary() {
+        assert!(!script_issues_command(r#"await tools.spawnshell({cmd:"x"});"#));
+        let poll = concat!(
+            r#"const p = await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#"const note = "shell(";"#,
+        );
+        assert!(script_is_continuation_only(poll));
+        assert!(!script_issues_command(poll));
+    }
+
+    #[test]
+    fn an_apostrophe_in_a_comment_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// Don't wait\n",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_dont_comment_before_a_lone_exec_command_still_recovers_the_cmd() {
+        let source = concat!("// don't\n", r#"await tools.exec_command({cmd:"echo hi"});"#);
+        assert!(script_issues_command(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn a_pure_poll_with_commented_out_shell_text_is_still_a_continuation() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\n// await tools.shell({cmd:\"echo hi\"});\n",
+            "/* also didn't run exec_command({cmd:\"sleep 1\"}); */",
+        );
+        assert!(!script_issues_command(source));
+        assert!(script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source), None);
+    }
+
+    #[test]
+    fn js_quoted_cmd_decodes_unicode_and_hex_escapes() {
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd:"echo \u0041\u{42}\x43"});"#).as_deref(),
+            Some("echo ABC")
+        );
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({cmd:'a\0b\tc'});"#).as_deref(),
+            Some("a\0b\tc")
+        );
+        assert_eq!(
+            cell_script_command(r#"await tools.exec_command({env:"a\.b", cmd:"echo \$HOME \q"});"#).as_deref(),
+            Some("echo $HOME q")
+        );
+        for malformed in [
+            r#"echo \x4"#,
+            r#"echo \u00G1"#,
+            r#"echo \u{110000}"#,
+            r#"echo \7"#,
+            r#"echo \01"#,
+        ] {
+            let script = format!(r#"await tools.exec_command({{cmd:"{malformed}"}});"#);
+            assert_eq!(cell_script_command(&script), None, "{malformed}");
+            assert!(script_issues_command(&script));
+        }
+    }
+
+    const REGEX_SLASH_CELL: &str = r#"await tools.write_stdin({session_id:8467,chars:""}); const n = "a/b".replace(/\//g, "_"); await tools.exec_command({cmd:"sleep 999"});"#;
+
+    #[test]
+    fn a_regex_literal_containing_slashes_does_not_hide_a_later_exec_command() {
+        assert!(script_issues_command(REGEX_SLASH_CELL));
+        assert!(!script_is_continuation_only(REGEX_SLASH_CELL));
+        assert_eq!(cell_script_command(REGEX_SLASH_CELL).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_regex_that_looks_like_a_block_comment_does_not_hide_later_lines() {
+        let script = "await tools.write_stdin({session_id:8467,chars:\"\"});\nconst r = s.replace(/\\/*/g, \"\");\nawait tools.exec_command({cmd:\"sleep 999\"});\n";
+        assert!(!script_is_continuation_only(script));
+        assert_eq!(cell_script_command(script).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn division_after_a_block_comment_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const ratio = 4 /* units */ / 2; "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn division_after_a_non_ascii_identifier_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = café2 / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+        let pi = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = πx / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(pi));
+        assert_eq!(cell_script_command(pi).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn value_helpers_read_object_form_exit_and_running_chunks() {
+        assert!(value_reports_exit_code(
+            &json!({"chunk_id":"done","session_id":8467,"exit_code":0,"output":"done"})
+        ));
+        assert!(!value_is_running_chunk(
+            &json!({"chunk_id":"done","session_id":8467,"exit_code":0,"output":"done"})
+        ));
+        assert!(value_is_running_chunk(
+            &json!({"chunk_id":"d0540d","session_id":8467,"output":"tick"})
+        ));
+        assert!(!value_reports_exit_code(
+            &json!({"chunk_id":"d0540d","session_id":8467,"output":"tick"})
+        ));
+        assert!(!value_reports_exit_code(&json!({"type":"output_text","text":"done"})));
     }
 }
