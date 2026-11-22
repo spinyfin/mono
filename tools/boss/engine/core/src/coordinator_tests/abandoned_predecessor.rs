@@ -200,3 +200,132 @@ async fn a_successors_dispatch_does_not_start_the_first_release_of_a_run_another
     s.drain().await;
     wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
 }
+
+/// Owning-host adapter for a remote run whose worker has exited: the registry
+/// still lists the lease, occupancy is empty, and the pid probe confirms death.
+struct AbandonedRemote {
+    workspace: PathBuf,
+    force_releases: std::sync::Mutex<Vec<String>>,
+}
+
+crate::stub_host_adapter! { AbandonedRemote {
+    fn host_id(&self) -> &str { "remote" }
+    async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+        self.force_releases.lock().unwrap().push(lease_id.to_owned());
+        Ok(())
+    }
+    async fn list_workspaces(&self) -> anyhow::Result<Vec<CubeWorkspaceStatus>> {
+        Ok(vec![CubeWorkspaceStatus::builder()
+            .workspace_id("workspace-old")
+            .workspace_path(self.workspace.clone())
+            .state("leased")
+            .lease_id("lease-old")
+            .build()])
+    }
+    async fn probe_remote_worker_alive(&self, _: i64) -> anyhow::Result<Option<bool>> {
+        Ok(Some(false))
+    }
+    async fn cleanup_execution_processes(&self, _: &str, _: &Path) -> anyhow::Result<Occupancy> {
+        Ok(Occupancy::Empty)
+    }
+    async fn confirm_workspace_recovery(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&recovery::PreservedTip>,
+        since_unix: Option<i64>,
+    ) -> anyhow::Result<recovery::PreserveOutcome> {
+        recovery::preserve_from(
+            &LocalJj,
+            record,
+            workspace,
+            recorded,
+            since_unix,
+            recovery::WorkspaceTipSource::Live,
+        )
+        .await
+    }
+    async fn confirm_workspace_recovery_from(
+        &self,
+        record: &recovery::ExecutionBookmark,
+        workspace: &Path,
+        recorded: Option<&recovery::PreservedTip>,
+        since_unix: Option<i64>,
+        tip_source: recovery::WorkspaceTipSource,
+    ) -> anyhow::Result<recovery::PreserveOutcome> {
+        recovery::preserve_from(&LocalJj, record, workspace, recorded, since_unix, tip_source).await
+    }
+} }
+
+struct AbandonedRemoteProvider {
+    local: Arc<dyn HostAdapter>,
+    remote: Arc<AbandonedRemote>,
+}
+
+#[async_trait]
+impl HostAdapterProvider for AbandonedRemoteProvider {
+    async fn adapter_for(&self, host: &crate::host_registry::Host) -> anyhow::Result<Arc<dyn HostAdapter>> {
+        if host.id == "local" {
+            Ok(self.local.clone())
+        } else {
+            Ok(self.remote.clone())
+        }
+    }
+}
+
+/// Bind the stalled run to a remote host whose worker is confirmed gone.
+fn bind_abandoned_remote(s: &mut Stalled) -> Arc<AbandonedRemote> {
+    let adapter = Arc::new(AbandonedRemote {
+        workspace: s.repo.worker.clone(),
+        force_releases: Default::default(),
+    });
+    let local = s.coordinator.host_adapter();
+    Arc::get_mut(&mut s.coordinator)
+        .unwrap()
+        .set_host_adapter_provider(Arc::new(AbandonedRemoteProvider {
+            local,
+            remote: adapter.clone(),
+        }));
+    s.db().add_host("remote", "user@remote", 4, &[]).unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET host_id = 'remote', remote_pid = 4242 WHERE execution_id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    s.db()
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET host_id = 'remote' WHERE id = ?1",
+            [&s.stalled_id],
+        )
+        .unwrap();
+    adapter
+}
+
+/// A remote run abandoned by an explicit start is the request's to release:
+/// a confirmed remote exit is the same proof a dead local shell is, and the
+/// successor dispatches once that lease is returned.
+#[tokio::test]
+async fn a_remote_run_abandoned_by_an_explicit_start_returns_its_lease_and_its_successor_dispatches() {
+    let mut s = Stalled::new(true).await;
+    let adapter = bind_abandoned_remote(&mut s);
+    let successor = start_explicitly(&s, false);
+
+    s.drain().await;
+    wait_for_execution_status(s.db(), &successor.id, ExecutionStatus::Running).await;
+
+    assert!(
+        s.stalled().cube_lease_id.is_none(),
+        "the abandoned remote run's lease was returned"
+    );
+    assert_eq!(*adapter.force_releases.lock().unwrap(), ["lease-old"]);
+    assert!(
+        s.db().preserved_tip(&s.stalled_id).unwrap().is_some(),
+        "the unpublished work was recorded as the preserved tip"
+    );
+    assert!(s.wait_reason(&successor.id).is_none(), "dispatching clears the hold");
+}

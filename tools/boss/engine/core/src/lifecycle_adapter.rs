@@ -86,6 +86,22 @@ fn map_pid_status(status: crate::dead_pid_sweep::PidStatus) -> PidStatus {
     }
 }
 
+/// Whether this remote adapter recorded a worker pid that the owning host now
+/// reports as exited. Local adapters always return false: they use the
+/// recorded shell pid instead.
+async fn remote_worker_confirmed_gone(db: &WorkDb, adapter: &dyn HostAdapter, execution_id: &str) -> bool {
+    if adapter.host_id() == "local" {
+        return false;
+    }
+    let Ok(Some(run)) = db.latest_remote_run_for_execution(execution_id) else {
+        return false;
+    };
+    let Some(pid) = run.remote_pid else {
+        return false;
+    };
+    matches!(adapter.probe_remote_worker_alive(pid).await, Ok(Some(false)))
+}
+
 /// Merge-parent deletion tripwire, reached through
 /// [`LifecycleServices::verify_deletion_tripwire`].
 async fn verify_deletion_tripwire(repo_slug: &str, head_before: &str, base_sha: &str, pr_number: u64) -> Vec<String> {
@@ -279,10 +295,16 @@ impl LifecycleServices for CoreLifecycleServices {
         let Some(lease_id) = execution.cube_lease_id.as_deref() else {
             return;
         };
-        if retry_pane_status(&self.work_db, is_live, execution) != PaneStatus::Gone {
+        let remote_gone = remote_worker_confirmed_gone(&self.work_db, adapter.as_ref(), &execution.id).await;
+        // Local rows need a dead recorded shell (or occupancy-keep evidence that
+        // already passed the pane gate). Remote rows have no local shell pid, so
+        // an Own first release uses a confirmed remote exit as the same proof.
+        if retry_pane_status(&self.work_db, is_live, execution) != PaneStatus::Gone
+            && !(release == PredecessorRelease::Own && remote_gone)
+        {
             return;
         }
-        if adapter.host_id() != "local" {
+        if adapter.host_id() != "local" && !remote_gone {
             match self.work_db.latest_remote_run_for_execution(&execution.id) {
                 Ok(Some(run)) => {
                     if let Some(pid) = run.remote_pid {
@@ -362,11 +384,15 @@ impl LifecycleServices for CoreLifecycleServices {
         // re-check normally only repeats a release that an earlier attempt
         // kept for occupancy. A caller that ended the run itself performs that
         // first release here, on the proof the leftover-lease sweep releases
-        // on: a recorded worker shell that is confirmed dead. A run that never
-        // recorded a shell stays with the sweeps.
+        // on: a recorded local worker shell that is confirmed dead, or a
+        // recorded remote pid whose owning host reports the worker has exited.
+        // A run that never recorded a shell or remote pid stays with the sweeps.
         let owns_first_release = release == PredecessorRelease::Own
-            && adapter.host_id() == "local"
-            && crate::workspace_lease_release::recorded_shell_confirmed_dead(&self.work_db, &execution.id);
+            && if adapter.host_id() == "local" {
+                crate::workspace_lease_release::recorded_shell_confirmed_dead(&self.work_db, &execution.id)
+            } else {
+                remote_gone
+            };
         if !owns_first_release && !crate::workspace_lease_release::previous_occupancy_keep(&self.work_db, execution) {
             return;
         }

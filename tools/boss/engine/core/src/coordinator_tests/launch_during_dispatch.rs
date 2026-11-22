@@ -51,7 +51,6 @@ async fn explicit_live_check_and_reservation_db_lookup_do_not_deadlock() {
     db.start_execution_run(&s.queued.id, "worker", "mono", "lease", "workspace", "/tmp/workspace")
         .unwrap();
     let inflight = s.coordinator.inflight_dispatches_for_test();
-    let _reservation = inflight.try_reserve(&s.queued, db).unwrap();
     let (inside_tx, inside_rx) = std::sync::mpsc::channel();
     let (table_tx, table_rx) = std::sync::mpsc::channel();
     let (request_tx, request_rx) = std::sync::mpsc::channel();
@@ -75,6 +74,10 @@ async fn explicit_live_check_and_reservation_db_lookup_do_not_deadlock() {
     inside_rx
         .recv_timeout(wait)
         .expect("live check must hold the DB connection");
+    // Reserve after the request's starting-set snapshot so `has_worker` cannot
+    // short-circuit on that snapshot. The lookup then holds the table while
+    // the in-transaction read must `try_lock` it.
+    let _reservation = inflight.try_reserve(&s.queued, db).expect("reserve after the snapshot");
     let id = s.queued.id.clone();
     let lookup_coordinator = s.coordinator.clone();
     let lookup = std::thread::spawn(move || {
@@ -248,8 +251,9 @@ impl Dispatched {
     }
 }
 
-/// The reported incident: the dispatcher starts a run, and a launch for the
-/// same item arrives while that run's pane is still being created.
+/// A launch for the same item arrives while the run the dispatcher just
+/// started is still creating its pane: the launch reports that run and leaves
+/// it running.
 #[tokio::test]
 async fn a_launch_right_behind_a_dispatch_reports_the_run_being_started_and_leaves_it_running() {
     let s = Dispatched::new(
