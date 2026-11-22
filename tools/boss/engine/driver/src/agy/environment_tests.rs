@@ -210,3 +210,12 @@ fn changed_override_is_rejected_after_installation() {
     assert_eq!(fs::read(&owned).unwrap(), b"original");
     fs::set_permissions(root.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+#[test]
+fn missing_host_binary_is_typed_not_installed() {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("no-agy");
+    let _guard = EnvGuard::set(&[(AGY_BIN_ENV, missing.to_str().unwrap())]);
+    let error = resolve_agy_binary_with(&tmp.path().join("homes"), |_| Ok(())).unwrap_err();
+    assert!(error.downcast_ref::<AgyNotInstalled>().is_some(), "{error:#}");
+}

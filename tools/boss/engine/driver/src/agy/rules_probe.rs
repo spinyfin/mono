@@ -8,17 +8,10 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use boss_ssh_transport::shell_quote;
-use serde_json::json;
 
 use super::environment::{AgyProcessEnvironment, run_agy_bounded};
 use super::home::{agent_rules_path_for_run, provision_agy_home};
-
-fn deny_command(attempts: &Path) -> String {
-    format!(
-        "/usr/bin/printf attempt >> {0} || exit 2; /bin/cat >> {0} || exit 2; /usr/bin/printf '%s\\n' '{{\"decision\":\"deny\",\"reason\":\"Rules probe forbids all tools\"}}'; exit 2",
-        shell_quote(&attempts.display().to_string())
-    )
-}
+use super::probe_isolation;
 
 fn verify_response(stdout: &[u8], canary: &str, attempts: &[u8], started: bool) -> anyhow::Result<()> {
     ensure!(
@@ -55,15 +48,13 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
     let attempts = evidence.join("tool-attempts.log");
     fs::write(&attempts, "")?;
     let started = evidence.join("session-started");
-    // Same shape as production: the top-level key names a hook group, and
-    // `SessionStart` is a bare handler while `PreToolUse` takes a matcher group.
-    let hooks = json!({"boss": {
-        "SessionStart": [{"type": "command", "command": format!("/usr/bin/touch {}", shell_quote(&started.display().to_string()))}],
-        "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": deny_command(&attempts)}]}]
-    }});
-    fs::write(
-        runtime.process_home.join(".gemini/config/hooks.json"),
-        serde_json::to_vec_pretty(&hooks)?,
+    let settings = evidence.join("session-settings.json");
+    probe_isolation::install_standard_fail_closed_posture(
+        &runtime,
+        &workspace,
+        &settings,
+        &format!("/usr/bin/touch {}", shell_quote(&started.display().to_string())),
+        &attempts,
     )?;
     let environment = AgyProcessEnvironment::resolve(
         &runtime.process_home,
@@ -76,18 +67,6 @@ pub fn run(evidence: &Path) -> anyhow::Result<()> {
     let version = run_agy_bounded(version.arg("--version"), Duration::from_secs(10))?;
     ensure!(version.status.success(), "agy --version failed");
     fs::write(evidence.join("version.txt"), version.stdout)?;
-    let settings = evidence.join("session-settings.json");
-    let rules_path = agent_rules_path_for_run("rules-probe")?;
-    let rendered = super::permissions::render_settings(
-        &super::permissions::SettingsPlan::builder()
-            .worker_kind(crate::WorkerKind::Standard)
-            .workspace(&fs::canonicalize(&workspace)?)
-            .hooks_dir(&runtime.process_home.join(".gemini/config"))
-            .control_dir(runtime.session_settings_path.parent().context("control directory")?)
-            .rules_root(rules_path.parent().context("rules root")?)
-            .build(),
-    )?;
-    fs::write(&settings, rendered.to_json()?)?;
     let mut command = Command::new(&runtime.agy_binary);
     environment.apply_to_command(&mut command);
     command
@@ -138,33 +117,5 @@ mod tests {
         assert!(verify_response(b"the token is TOKEN", "TOKEN", b"", true).is_err());
         assert!(verify_response(b"TOKEN", "TOKEN", b"", false).is_err());
         assert!(verify_response(b"MISSING", "TOKEN", b"", true).is_err());
-    }
-
-    #[test]
-    fn deny_hook_records_attempt_and_fails_closed() {
-        use std::io::Write;
-        use std::process::Stdio;
-        let tmp = tempfile::tempdir().unwrap();
-        let attempts = tmp.path().join("attempts with spaces");
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", &deny_command(&attempts)])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"{\"tool\":\"read_file\"}\n")
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        assert_eq!(
-            fs::read_to_string(attempts).unwrap(),
-            "attempt{\"tool\":\"read_file\"}\n"
-        );
-        let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(reply["decision"], "deny");
     }
 }

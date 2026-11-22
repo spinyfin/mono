@@ -35,18 +35,20 @@ fn outcome_from_usage_result(joined: Result<anyhow::Result<String>, tokio::task:
 }
 
 fn map_runner_error(err: &anyhow::Error) -> DriverQuotaOutcome {
-    let detail = format!("{err:#}");
-    if looks_not_installed(&detail) {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<boss_engine_driver::agy::AgyNotInstalled>()
+            .is_some()
+    }) {
         return unavailable(
             DriverQuotaFailureKind::NotInstalled,
             "agy is not installed or not on PATH",
         );
     }
-    unavailable(DriverQuotaFailureKind::ProbeFailed, user_facing_reason(&detail))
-}
-
-fn looks_not_installed(detail: &str) -> bool {
-    detail.contains("which agy") || detail.contains("install Antigravity CLI")
+    unavailable(
+        DriverQuotaFailureKind::ProbeFailed,
+        user_facing_reason(&format!("{err:#}")),
+    )
 }
 
 fn user_facing_reason(detail: &str) -> String {
@@ -72,13 +74,27 @@ mod tests {
 
     #[test]
     fn binary_resolution_failure_maps_to_not_installed() {
-        let err = anyhow::anyhow!("`which agy` failed; install Antigravity CLI or set BOSS_AGY_BIN");
+        let err = anyhow::Error::new(boss_engine_driver::agy::AgyNotInstalled(
+            "`which agy` failed; install Antigravity CLI or set BOSS_AGY_BIN".into(),
+        ));
         match map_runner_error(&err) {
             DriverQuotaOutcome::Unavailable {
                 kind: DriverQuotaFailureKind::NotInstalled,
                 ..
             } => {}
             other => panic!("expected NotInstalled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn free_text_which_agy_message_does_not_map_to_not_installed() {
+        let err = anyhow::anyhow!("`which agy` failed; install Antigravity CLI or set BOSS_AGY_BIN");
+        match map_runner_error(&err) {
+            DriverQuotaOutcome::Unavailable {
+                kind: DriverQuotaFailureKind::ProbeFailed,
+                ..
+            } => {}
+            other => panic!("expected ProbeFailed without a typed error, got {other:?}"),
         }
     }
 

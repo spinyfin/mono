@@ -8,10 +8,10 @@ use anyhow::Context;
 
 use super::environment::{AgyProcessEnvironment, run_agy_bounded};
 use super::home::{
-    AgyRuntimeState, agy_homes_root, agy_run_container_for_run, provision_quota_home, quota_probe_run_id,
-    reclaim_quota_probe_container,
+    QUOTA_PROBE_RUN_ID, agy_homes_root, agy_run_container_for_run, provision_quota_home, reclaim_quota_probe_container,
+    reclaim_stale_quota_probe_containers,
 };
-use super::permissions;
+use super::probe_isolation;
 
 // A timed-out cache reader must not start a second CLI in the same home
 // while its blocking probe is still being reaped.
@@ -29,7 +29,8 @@ pub fn usage_json() -> anyhow::Result<String> {
 }
 
 fn usage_in(workspace: &Path) -> anyhow::Result<String> {
-    let container = agy_run_container_for_run(&quota_probe_run_id())?;
+    reclaim_stale_quota_probe_containers()?;
+    let container = agy_run_container_for_run(QUOTA_PROBE_RUN_ID)?;
     let runtime = match provision_quota_home(workspace) {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -38,7 +39,14 @@ fn usage_in(workspace: &Path) -> anyhow::Result<String> {
         }
     };
     let result = (|| {
-        install_quota_fail_closed_posture(&runtime, workspace)?;
+        let attempts = runtime.control_dir.join("tool-attempts.log");
+        probe_isolation::install_standard_fail_closed_posture(
+            &runtime,
+            workspace,
+            &runtime.session_settings_path,
+            "true",
+            &attempts,
+        )?;
         let environment = AgyProcessEnvironment::resolve(
             &runtime.process_home,
             &runtime.log_file,
@@ -67,48 +75,6 @@ fn usage_in(workspace: &Path) -> anyhow::Result<String> {
     }
 }
 
-/// Pin `agentMode` / `toolPermission` through `--settings` and install a
-/// deny-all PreToolUse hook so a qualified binary that treated `/usage` as a
-/// prompt cannot run an auto-approving tool turn in this HOME.
-fn install_quota_fail_closed_posture(runtime: &AgyRuntimeState, workspace: &Path) -> anyhow::Result<()> {
-    let workspace_abs = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let hooks_dir = runtime.process_home.join(".gemini/config");
-    let rules_root = runtime
-        .process_home
-        .parent()
-        .context("quota probe container")?
-        .join("rules-root");
-    let settings = permissions::render_settings(
-        &permissions::SettingsPlan::builder()
-            .worker_kind(crate::WorkerKind::Standard)
-            .workspace(&workspace_abs)
-            .hooks_dir(&hooks_dir)
-            .control_dir(&runtime.control_dir)
-            .rules_root(&rules_root)
-            .build(),
-    )?;
-    std::fs::write(&runtime.session_settings_path, settings.to_json()?).with_context(|| {
-        format!(
-            "writing quota session settings {}",
-            runtime.session_settings_path.display()
-        )
-    })?;
-    std::fs::write(hooks_dir.join("hooks.json"), quota_deny_all_hooks_json())
-        .with_context(|| format!("writing quota deny-all hooks under {}", hooks_dir.display()))?;
-    Ok(())
-}
-
-fn quota_deny_all_hooks_json() -> String {
-    serde_json::to_string_pretty(&serde_json::json!({"boss": {
-        "SessionStart": [{"type": "command", "command": "true"}],
-        "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command":
-            "/usr/bin/printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"quota probe forbids tools\"}'"
-        }]}]
-    }}))
-    .expect("quota deny-all hooks are serializable")
-        + "\n"
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::environment::{AGY_BIN_ENV, AGY_SKIP_BINARY_ASSERT_ENV};
@@ -117,8 +83,10 @@ mod tests {
     use super::*;
 
     fn leftover_probe_paths(homes: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        let id = format!("quota-probe-{}", std::process::id());
-        (homes.join(&id), transcript_store_for(homes).join(&id))
+        (
+            homes.join(QUOTA_PROBE_RUN_ID),
+            transcript_store_for(homes).join(QUOTA_PROBE_RUN_ID),
+        )
     }
 
     #[test]
@@ -138,7 +106,7 @@ mod tests {
 test -L "$HOME/Library/Keychains/login.keychain-db" || exit 1
 test "$AGY_CLI_DISABLE_AUTO_UPDATE" = true || exit 2
 test "$AGY_CLI_HIDE_ACCOUNT_INFO" = true || exit 3
-case "$HOME" in */quota-probe-*/process-home) ;; *) exit 4;; esac
+case "$HOME" in */quota-probe/process-home) ;; *) exit 4;; esac
 settings=
 print=
 format=
@@ -157,6 +125,8 @@ test -n "$settings" || exit 6
 grep -q '"agentMode": ""' "$settings" || exit 7
 grep -q '"toolPermission": "request-review"' "$settings" || exit 8
 grep -q 'PreToolUse' "$HOME/.gemini/config/hooks.json" || exit 9
+grep -q '/bin/cat' "$HOME/.gemini/config/hooks.json" || exit 10
+grep -q 'exit 2' "$HOME/.gemini/config/hooks.json" || exit 11
 printf '%s' '{"status":"SUCCESS","num_turns":0}'
 "#,
         )
@@ -208,6 +178,41 @@ printf '%s' '{"status":"SUCCESS","num_turns":0}'
             !transcripts.exists(),
             "failed quota probe left a transcript-store entry: {}",
             transcripts.display()
+        );
+    }
+
+    #[test]
+    fn stale_quota_probe_container_is_removed_before_provision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let host = tmp.path().join("host");
+        let keychain = host.join(crate::scoped_home::LOGIN_KEYCHAIN_LEAF);
+        std::fs::create_dir_all(keychain.parent().unwrap()).unwrap();
+        std::fs::write(&keychain, "dummy").unwrap();
+        let _home = crate::test_support::home_override(&host);
+        let homes = tmp.path().join("homes");
+        let _env = env_for_provision_with_home_override(&homes);
+        std::fs::create_dir_all(homes.join("bin")).unwrap();
+        crate::hook_guards::write_executable(
+            &homes.join("bin/agy"),
+            r#"#!/bin/sh
+printf '%s' '{"status":"SUCCESS","num_turns":0}'
+"#,
+        )
+        .unwrap();
+        let stale = homes.join(QUOTA_PROBE_RUN_ID);
+        let leftover_pid = homes.join("quota-probe-99999");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("marker"), "old").unwrap();
+        std::fs::create_dir_all(&leftover_pid).unwrap();
+        std::fs::write(leftover_pid.join("marker"), "old").unwrap();
+        assert_eq!(usage_json().unwrap(), r#"{"status":"SUCCESS","num_turns":0}"#);
+        assert!(!stale.exists(), "canonical stale quota container leaked");
+        assert!(!leftover_pid.exists(), "pid-keyed leftover quota container leaked");
+        let (container, transcripts) = leftover_probe_paths(&homes);
+        assert!(!container.exists(), "quota container must be deleted after the probe");
+        assert!(
+            !transcripts.exists(),
+            "quota probe must not leave a transcript-store entry"
         );
     }
 }

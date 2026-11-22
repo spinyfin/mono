@@ -428,13 +428,13 @@ pub fn provision_agy_home(workspace: &Path, prompt_text: &str, run_id: &str) -> 
     provision_home(workspace, prompt_text, run_id, true)
 }
 
-pub(super) fn quota_probe_run_id() -> String {
-    format!("quota-probe-{}", std::process::id())
-}
+/// One engine, one serialized probe: a fixed id so a crashed engine's leftover
+/// container is the next probe's reclaim target.
+pub(super) const QUOTA_PROBE_RUN_ID: &str = "quota-probe";
 
 /// The quota command itself exercises authentication; avoid a redundant models request.
 pub(super) fn provision_quota_home(workspace: &Path) -> anyhow::Result<AgyRuntimeState> {
-    provision_home(workspace, "unused", &quota_probe_run_id(), false)
+    provision_home(workspace, "unused", QUOTA_PROBE_RUN_ID, false)
 }
 
 fn provision_home(
@@ -752,7 +752,7 @@ fn probe_agy_models(environment: &AgyProcessEnvironment) -> anyhow::Result<()> {
 /// Quota probes are not recorded on `work_executions`, so the agy
 /// home-retention sweep never owns them. Worker teardown
 /// ([`reclaim_agy_run`]) keeps `control/` and the durable transcript target;
-/// that would leak a `quota-probe-<pid>` directory on every engine restart.
+/// that would leak a `quota-probe` directory on every engine restart.
 pub(super) fn reclaim_quota_probe_container(container: &Path) -> anyhow::Result<()> {
     assert_agy_home_safe_to_delete(container)?;
     match fs::remove_dir_all(container) {
@@ -760,6 +760,31 @@ pub(super) fn reclaim_quota_probe_container(container: &Path) -> anyhow::Result<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("deleting quota probe container {}", container.display())),
     }
+}
+
+/// Remove the canonical quota-probe container and any leftover `quota-probe-*`
+/// siblings from a previous pid-keyed scheme. Called before provisioning so
+/// an engine crash mid-probe cannot leave an unowned home.
+pub(super) fn reclaim_stale_quota_probe_containers() -> anyhow::Result<()> {
+    let root = agy_homes_root();
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&root).with_context(|| format!("listing agy homes {}", root.display()))? {
+        let entry = entry.with_context(|| format!("reading agy homes entry under {}", root.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name != QUOTA_PROBE_RUN_ID && !name.starts_with("quota-probe-") {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        reclaim_quota_probe_container(&entry.path())?;
+    }
+    Ok(())
 }
 
 /// Remove run state at teardown.

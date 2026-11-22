@@ -3,6 +3,9 @@ fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("usage: agy_rules_probe <new absolute evidence directory>; BOSS_AGY_BIN selects the host CLI")
     })?;
     let directory = std::path::PathBuf::from(directory);
-    boss_engine_driver::agy::probe_isolation::prepare_evidence_dir(&directory)?;
+    // SAFETY: this binary has not started any threads.
+    unsafe {
+        boss_engine_driver::agy::probe_isolation::prepare_evidence_dir(&directory)?;
+    }
     boss_engine_driver::agy::rules_probe::run(&directory)
 }
