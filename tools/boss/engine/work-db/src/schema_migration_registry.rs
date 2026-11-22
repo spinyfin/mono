@@ -438,6 +438,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: parking::migrate_membership,
         },
         Migration {
+            id: project_postmortem::TASK_CHANGED_TRIGGER_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: project_postmortem::migrate_task_changed_trigger_project_index,
+        },
+        Migration {
             id: "20261109_1930_preserved_archive_cleanup".into(),
             legacy_version: None,
             apply: preserved_cleanup::migrate_archive_cleanup,
@@ -491,6 +496,11 @@ pub(super) fn all() -> Vec<Migration> {
             id: "20261102_2105_recovery_fresh_start".into(),
             legacy_version: None,
             apply: execution_recovery_rearm::migrate_fresh_start,
+        },
+        Migration {
+            id: recurring_read_indexes::MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: recurring_read_indexes::migrate,
         },
         Migration {
             id: "20261114_1800_refresh_blocked_reason_audit_trigger".into(),

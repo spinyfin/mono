@@ -149,10 +149,66 @@ pub(super) fn find_worker_proposal_by_id(conn: &Connection, id: &str) -> Result<
         .map_err(Into::into)
 }
 
+/// Undecided proposals of one kind, oldest first. `state = 'proposed'` is a
+/// literal so the partial index `worker_proposals_undecided_idx` serves the
+/// statement and supplies its order: the read costs what is undecided, not
+/// what the ledger has accumulated.
+pub(super) fn list_undecided_proposals(conn: &Connection, kind: ProposalKind) -> Result<Vec<WorkerProposal>> {
+    let sql = format!(
+        "{SELECT_WORKER_PROPOSAL}
+         WHERE state = 'proposed' AND kind = ?1
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![kind.as_str()], map_worker_proposal)?;
+    rows.map(|r| r.map_err(Into::into)).collect()
+}
+
 // ---- WorkDb accessors ----
 
 #[work_db_boundary::instrument]
 impl WorkDb {
+    /// Remove disposable worker messages after 90 days. Both the decision and
+    /// terminal execution must be older than the cutoff. Review and attention
+    /// pointers retain their payloads indefinitely; pending/unknown states and
+    /// missing timestamps fail closed. Freed pages remain available for reuse.
+    pub fn prune_decided_worker_proposals(&self, now_epoch: i64) -> Result<usize> {
+        let cutoff = now_epoch.saturating_sub(90 * 24 * 60 * 60);
+        let terminal = boss_protocol::ExecutionStatus::ALL
+            .iter()
+            .filter(|status| status.is_terminal())
+            .map(|status| format!("'{}'", status.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = self.connect()?;
+        // Materialize references once instead of scanning report and attention
+        // history for each candidate. One statement makes checking and deleting
+        // atomic with respect to new references.
+        Ok(conn.execute(
+            &format!(
+                "DELETE FROM worker_proposals
+                 WHERE state IN ('applied', 'rejected', 'superseded', 'expired')
+                   AND CAST(decided_at AS INTEGER) > 0
+                   AND CAST(decided_at AS INTEGER) < ?1
+                   AND execution_id IN (
+                       SELECT id FROM work_executions WHERE status IN ({terminal})
+                         AND CAST(finished_at AS INTEGER) > 0
+                         AND CAST(finished_at AS INTEGER) < ?1)
+                   AND id NOT IN (
+                       SELECT proposal_id FROM pr_review_verdicts WHERE proposal_id IS NOT NULL
+                       UNION SELECT report_proposal_id FROM pr_review_batch_members
+                           WHERE report_proposal_id IS NOT NULL
+                       UNION SELECT final_verdict_proposal_id FROM pr_review_batches
+                           WHERE final_verdict_proposal_id IS NOT NULL
+                       UNION SELECT source_proposal_id FROM attentions
+                           WHERE source_proposal_id IS NOT NULL
+                       UNION SELECT proposal_id FROM operator_questions
+                       UNION SELECT proposal_id FROM progression_actions)"
+            ),
+            params![cutoff],
+        )?)
+    }
+
     /// Append `line` verbatim to the work item's description.
     ///
     /// The engine's audit trail (`[engine-reconcile]`, `[deferred-scope]`,
@@ -966,6 +1022,132 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use boss_protocol::{PROPOSAL_CAP_PER_KIND_PER_EXECUTION, PROPOSAL_CAP_TOTAL_PER_EXECUTION, ProposalErrorCode};
+
+    #[test]
+    fn proposal_retention_keeps_pending_recent_live_and_referenced_payloads() {
+        let (_dir, db) = open_db();
+        let (execution, task) = execution_for_new_chore(&db, "Retention");
+        let (live, _) = execution_for_new_chore(&db, "Live");
+        let (recent, _) = execution_for_new_chore(&db, "Recently finished");
+        let now = 2_000_000_000_i64;
+        let cutoff = now - 90 * 24 * 60 * 60;
+        let old = (cutoff - 1).to_string();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = ?2 WHERE id = ?1",
+            params![execution, old],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = ?2 WHERE id = ?1",
+            params![recent, cutoff.to_string()],
+        )
+        .unwrap();
+        for (id, state, owner, decided) in [
+            ("applied", "applied", &execution, Some(old.clone())),
+            ("rejected", "rejected", &execution, Some(old.clone())),
+            ("superseded", "superseded", &execution, Some(old.clone())),
+            ("expired", "expired", &execution, Some(old.clone())),
+            ("pending", "proposed", &execution, Some(old.clone())),
+            ("unknown", "future-state", &execution, Some(old.clone())),
+            ("missing", "applied", &execution, None),
+            ("boundary", "applied", &execution, Some(cutoff.to_string())),
+            ("live", "applied", &live, Some(old.clone())),
+            ("recent", "applied", &recent, Some(old.clone())),
+            ("attention", "applied", &execution, Some(old.clone())),
+            ("question", "applied", &execution, Some(old.clone())),
+            ("action", "applied", &execution, Some(old.clone())),
+            ("report", "applied", &execution, Some(old.clone())),
+            ("final", "applied", &execution, Some(old.clone())),
+            ("verdict", "applied", &execution, Some(old.clone())),
+        ] {
+            conn.execute(
+                "INSERT INTO worker_proposals
+                 (id, execution_id, work_item_id, kind, payload_json, idempotency_key, state, created_at, decided_at)
+                 VALUES (?1, ?2, ?3, 'review_report', 'preserved body', ?1, ?4, ?5, ?6)",
+                params![id, owner, task, state, old, decided],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO pr_review_batches
+             (id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number,
+              pr_url, status, target_sha, updated_at, final_verdict_proposal_id)
+             VALUES ('retention', ?1, 'base', '{}', ?2, 'pre_merge', 1,
+                     'https://github.com/test/repo/pull/1', 'completed', 'head', ?2, 'final')",
+            params![task, old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attention_groups
+             (id, product_id, kind, association_task_id, source_kind, grouping_key, created_at)
+             SELECT 'retention', product_id, 'followup', id, 'worker', 'retention', ?2 FROM tasks WHERE id = ?1",
+            params![task, old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attentions (id, group_id, ordinal, created_at, source_proposal_id)
+             VALUES ('retention', 'retention', 1, ?1, 'attention')",
+            [&old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_batch_members
+             (id, batch_id, attempt, created_at, provider_effort, requested_driver,
+              resolved_model, role, status, updated_at, execution_id, report_proposal_id)
+             VALUES ('member', 'retention', 1, ?1, 'medium', 'codex',
+                     'test-model', 'codex_reviewer', 'reported', ?1, ?2, 'report')",
+            params![old, execution],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pr_review_verdicts
+             (id, execution_id, work_item_id, gate_outcome, created_at, proposal_id)
+             VALUES ('verdict', ?1, ?2, 'passed', ?3, 'verdict')",
+            params![execution, task, old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO operator_questions
+             (id, work_item_id, execution_id, proposal_id, question_json, status, created_at)
+             VALUES ('question', ?1, ?2, 'question', '{}', 'open', ?3)",
+            params![task, execution, old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO progression_actions
+             (id, work_item_id, execution_id, proposal_id, fingerprint, stuck_kind, verb, created_at)
+             VALUES ('action', ?1, ?2, 'action', 'fingerprint', 'stuck', 'retry', ?3)",
+            params![task, execution, old],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(db.prune_decided_worker_proposals(now).unwrap(), 4);
+        assert_eq!(db.prune_decided_worker_proposals(now).unwrap(), 0);
+        for id in [
+            "pending",
+            "unknown",
+            "missing",
+            "boundary",
+            "live",
+            "recent",
+            "attention",
+            "question",
+            "action",
+            "report",
+            "final",
+            "verdict",
+        ] {
+            let body: String = db
+                .connect()
+                .unwrap()
+                .query_row("SELECT payload_json FROM worker_proposals WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(body, "preserved body", "{id}");
+        }
+    }
 
     #[test]
     fn no_op_validation_upgrade_preserves_applied_proposals_without_authorizing_completion() {

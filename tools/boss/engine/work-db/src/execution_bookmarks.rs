@@ -62,7 +62,8 @@ impl WorkDb {
     pub fn terminal_bookmark_executions(&self, grace: i64, lookback: i64) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id FROM work_executions WHERE started_at IS NOT NULL
+            "SELECT id FROM work_executions INDEXED BY work_executions_finished_at_idx
+            WHERE started_at IS NOT NULL
             AND status IN ('completed', 'failed', 'cancelled', 'orphaned', 'abandoned')
             AND CAST(finished_at AS INTEGER) <= unixepoch('now') - ?1
             AND CAST(finished_at AS INTEGER) >= unixepoch('now') - ?2

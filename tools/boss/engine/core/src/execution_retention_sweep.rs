@@ -71,6 +71,11 @@ pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
     let _ = crate::agy_home_retention_sweep::run_one_pass(work_db, false).await;
 
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+    match work_db.prune_decided_worker_proposals(now_epoch) {
+        Ok(deleted) if deleted > 0 => tracing::info!(deleted, "pruned decided worker proposals older than 90 days"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "worker proposal retention failed"),
+    }
     prune_spoke_commands(work_db, now_epoch);
     reclaim_spoke_custody(work_db, now_epoch);
 
@@ -202,8 +207,35 @@ mod tests {
             .unwrap();
         }
 
+        let completed = db
+            .request_execution(
+                boss_protocol::RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'completed', started_at = ?2, finished_at = ?2 WHERE id = ?1",
+                rusqlite::params![completed.id, very_old.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO worker_proposals
+                 (id, execution_id, kind, payload_json, idempotency_key, state, created_at, decided_at)
+                 VALUES ('old_message', ?1, 'wait', '{}', 'retention', 'applied', ?2, ?2)",
+                rusqlite::params![completed.id, very_old.to_string()],
+            )
+            .unwrap();
+        }
         let db = Arc::new(db);
         let outcome = run_one_pass(db.as_ref()).await;
+        assert!(db.worker_proposal("old_message").unwrap().is_none());
+        assert!(
+            db.get_execution(&completed.id).is_ok(),
+            "message retention keeps its execution"
+        );
         assert!(outcome.deleted > 0, "first pass must clean up the pre-existing backlog");
 
         let remaining = db.list_executions(Some(&work_item_id)).unwrap();

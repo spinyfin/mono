@@ -104,6 +104,46 @@ pub fn take_backup(work_db: &WorkDb, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Snapshots between size reports: the first after startup, then one a day
+/// at the default hourly interval.
+const SIZE_REPORT_EVERY: u64 = 24;
+static SNAPSHOTS_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Tables and indexes named in a size report line.
+const SIZE_REPORT_TOP: usize = 12;
+
+/// Log where the database's bytes are, measured from the snapshot at
+/// `snapshot` so the walk over every page never touches the live database.
+/// The live file's own size and free-page count are two header reads.
+/// Best-effort like the backup itself.
+fn log_size_report(work_db: &WorkDb, snapshot: &Path) {
+    let live = work_db.connect().and_then(|conn| {
+        let pragma = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0));
+        Ok((pragma("page_count")?, pragma("freelist_count")?))
+    });
+    let (live_pages, live_free_pages) = match live {
+        Ok(counts) => counts,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "database-backup: size report skipped (non-fatal)");
+            return;
+        }
+    };
+    match crate::work::db_diagnostics::size_report::measure_snapshot(snapshot) {
+        Ok(report) => tracing::info!(
+            live_pages,
+            live_free_pages,
+            page_size = report.page_size,
+            snapshot_bytes = report.total_bytes(),
+            objects = report.objects.len(),
+            largest = %report.summary(SIZE_REPORT_TOP),
+            "database size report",
+        ),
+        Err(err) => tracing::warn!(
+            error = %format!("{err:#}"),
+            "database-backup: size report failed (non-fatal)",
+        ),
+    }
+}
+
 /// Delete the oldest `state.db.bak-*` files in `backup_dir`, keeping at
 /// most `keep`. Files that do not match the backup prefix are untouched.
 pub fn apply_retention(backup_dir: &Path, keep: usize) -> Result<()> {
@@ -182,10 +222,18 @@ pub fn run_backup_with_offsite(
     let ts = utc_timestamp();
     let dest = backup_dir.join(format!("{BACKUP_FILE_PREFIX}{ts}"));
     match take_backup(work_db, &dest) {
-        Ok(()) => tracing::info!(
-            path = %dest.display(),
-            "database-backup: snapshot complete",
-        ),
+        Ok(()) => {
+            tracing::info!(
+                path = %dest.display(),
+                "database-backup: snapshot complete",
+            );
+            if SNAPSHOTS_TAKEN
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(SIZE_REPORT_EVERY)
+            {
+                log_size_report(work_db, &dest);
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 error = %format!("{err:#}"),

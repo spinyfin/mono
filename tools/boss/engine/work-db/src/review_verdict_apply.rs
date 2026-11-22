@@ -655,20 +655,18 @@ impl WorkDb {
         Ok(remediating_task_id.is_some().then_some(applied_ref))
     }
 
-    /// `list_worker_proposals` orders newest-first (its `bossctl` callers
-    /// want that); this applier processes oldest-first so proposals apply in
-    /// the order the batches were decided, so the result is reversed here
-    /// rather than by adding a second `ORDER BY` variant of the same query.
+    /// Undecided review verdicts, oldest first, so they apply in the order
+    /// the batches were decided. `list_undecided_proposals` already returns
+    /// that order (`ORDER BY created_at ASC, id ASC`).
+    ///
+    /// This runs every ten seconds, so it reads only undecided rows:
+    /// `state = 'proposed'` is spelled as a literal so the statement is
+    /// served by the partial index `worker_proposals_undecided_idx`, in the
+    /// index's own oldest-first order, instead of walking every proposal the
+    /// ledger has ever stored.
     pub fn list_proposed_review_verdicts(&self) -> Result<Vec<WorkerProposal>> {
-        let mut rows = self.list_worker_proposals(
-            None,
-            None,
-            Some(ProposalKind::ReviewVerdict),
-            Some(ProposalState::Proposed),
-            None,
-        )?;
-        rows.reverse();
-        Ok(rows)
+        let conn = self.connect()?;
+        super::proposals::list_undecided_proposals(&conn, ProposalKind::ReviewVerdict)
     }
 
     pub fn worker_proposal(&self, proposal_id: &str) -> Result<Option<WorkerProposal>> {

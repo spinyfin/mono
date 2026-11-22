@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod read_volume;
+pub mod size_report;
+
 /// Counts the statements a connection runs while this is alive, including
 /// nested helper queries, through a temporary SQLite statement trace callback
 /// that is removed on drop.
@@ -16,6 +19,10 @@ use std::{
 /// Install one per projection and read [`Self::total`] at the points of
 /// interest: a connection has a single trace callback, so a second counter on
 /// the same connection would replace this one and remove it when dropped.
+///
+/// The callback is shared with [`read_volume`]: while a counter is installed
+/// it keeps forwarding finished statements there, and dropping it puts the
+/// read-volume callback back.
 pub(super) struct StatementCounter<'conn> {
     conn: &'conn rusqlite::Connection,
     // Boxed so the address SQLite holds stays put when the counter moves.
@@ -25,7 +32,18 @@ pub(super) struct StatementCounter<'conn> {
 impl<'conn> StatementCounter<'conn> {
     pub(super) fn install(conn: &'conn rusqlite::Connection) -> Self {
         use std::ffi::{c_int, c_uint, c_void};
-        unsafe extern "C" fn count(_: c_uint, context: *mut c_void, _: *mut c_void, _: *mut c_void) -> c_int {
+        unsafe extern "C" fn count(
+            event: c_uint,
+            context: *mut c_void,
+            subject: *mut c_void,
+            detail: *mut c_void,
+        ) -> c_int {
+            if event == rusqlite::ffi::SQLITE_TRACE_PROFILE as c_uint {
+                // SAFETY: a profile event carries the finished statement and
+                // a pointer to its run time in nanoseconds.
+                unsafe { read_volume::statement_finished(subject.cast(), *detail.cast::<i64>()) };
+                return 0;
+            }
             // SAFETY: the cell lives until the trace is removed in `drop`.
             // SQLite invokes this callback synchronously on the connection's
             // thread, never while `total` is reading the cell.
@@ -39,7 +57,7 @@ impl<'conn> StatementCounter<'conn> {
         unsafe {
             rusqlite::ffi::sqlite3_trace_v2(
                 conn.handle(),
-                rusqlite::ffi::SQLITE_TRACE_STMT as c_uint,
+                (rusqlite::ffi::SQLITE_TRACE_STMT | rusqlite::ffi::SQLITE_TRACE_PROFILE) as c_uint,
                 Some(count),
                 std::ptr::from_ref::<std::cell::Cell<u64>>(&statements)
                     .cast_mut()
@@ -57,9 +75,10 @@ impl<'conn> StatementCounter<'conn> {
 
 impl Drop for StatementCounter<'_> {
     fn drop(&mut self) {
-        // SAFETY: the borrowed connection outlives this counter, including
-        // during unwinding; after this no callback refers to the cell.
-        unsafe { rusqlite::ffi::sqlite3_trace_v2(self.conn.handle(), 0, None, std::ptr::null_mut()) };
+        // The borrowed connection outlives this counter, including during
+        // unwinding. Replacing the callback is what stops SQLite referring to
+        // the cell; the replacement takes no context.
+        read_volume::install(self.conn);
     }
 }
 
@@ -127,6 +146,7 @@ boss_metrics::register_counter!(
 
 pub fn register_metrics(registry: &boss_metrics::Registry) {
     registry.register_counter(&DATABASE_BUSY);
+    read_volume::register_metrics(registry);
 }
 
 #[derive(bon::Builder)]
@@ -138,6 +158,7 @@ pub(super) struct Observation {
     metrics: std::sync::Arc<boss_metrics::Registry>,
     query_time: std::cell::Cell<Duration>,
     writing: std::cell::Cell<bool>,
+    reads: read_volume::Tracker,
 }
 
 thread_local! {
@@ -183,6 +204,7 @@ pub(super) fn start(
             .metrics(metrics)
             .query_time(std::cell::Cell::new(Duration::ZERO))
             .writing(std::cell::Cell::new(false))
+            .reads(read_volume::Tracker::start(conn))
             .build(),
     );
     ACTIVE.with_borrow_mut(|active| active.insert(id, observation.clone()));
@@ -225,9 +247,20 @@ impl std::ops::DerefMut for OwnedConnection {
 
 impl Drop for OwnedConnection {
     fn drop(&mut self) {
+        let reads = self.connection.as_ref().map(|conn| self.observation.finish_reads(conn));
         drop(self.connection.take());
         finish(self.id);
         let held = self.acquired.elapsed();
+        if let Some(reads) = &reads {
+            // An independent connection is the backup's: it copies the file.
+            read_volume::record(
+                self.observation.caller,
+                &self.observation.attribution,
+                held,
+                reads,
+                read_volume::Scope::WholeFile,
+            );
+        }
         if held >= Duration::from_millis(100) {
             tracing::warn!(wait_ms = 0, held_ms = held.as_millis() as u64,
                 query_ms = self.observation.query_time().as_secs_f64() * 1000.0,
@@ -245,6 +278,11 @@ pub(super) fn finish(id: usize) {
 impl Observation {
     pub(super) fn query_time(&self) -> Duration {
         self.query_time.get()
+    }
+
+    /// Close this hold's read accounting. Call while `conn` is still held.
+    pub(super) fn finish_reads(&self, conn: &rusqlite::Connection) -> read_volume::HoldReads {
+        self.reads.finish(conn)
     }
 
     fn set_writing(&self, id: usize, writing: bool) {
@@ -268,9 +306,16 @@ impl Observation {
     }
 }
 
+/// Read-only connections install no write observers but still report what
+/// they read.
+pub(super) fn install_read_observer(conn: &rusqlite::Connection) {
+    read_volume::install(conn);
+}
+
 /// Called once a write actually changes a row, including autocommit writes
 /// that may still be executing when another connection reports BUSY.
 pub(super) fn install_update_observer(conn: &rusqlite::Connection) {
+    read_volume::install(conn);
     // SAFETY: callbacks run synchronously on this connection's thread. The
     // progress callback only inspects transaction state; it never executes SQL.
     let id = unsafe { conn.handle() } as usize;

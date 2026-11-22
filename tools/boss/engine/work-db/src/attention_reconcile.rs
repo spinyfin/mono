@@ -304,7 +304,7 @@ fn clear_stale_dispatch_failures(conn: &Connection) -> Result<usize> {
         "clear_stale_dispatch_failures",
         "engine",
         &format!(
-            "UPDATE tasks
+            "UPDATE tasks INDEXED BY tasks_dispatch_failed_idx
          SET dispatch_failed_reason = NULL,
              dispatch_failed_error  = NULL,
              dispatch_failed_at     = NULL
