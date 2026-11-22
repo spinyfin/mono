@@ -1094,6 +1094,7 @@ pub use review_section::*;
 pub use review_verdict_apply::ReviewVerdictApplyStats;
 pub use review_verdict_apply::*;
 pub use revision_helpers::*;
+pub use task_status_audit::RECONCILIATION_PROPERTY;
 pub use task_targets::*;
 
 pub use attachments::{SubmitAttachmentInput, SubmitAttachmentOutcome, check_attachment_caps};

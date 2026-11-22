@@ -61,7 +61,7 @@ fn upgrade_moves_all_history_and_preserves_authored_bytes_and_timestamps() {
                 .list_task_field_audit(id)
                 .unwrap()
                 .into_iter()
-                .filter(|row| row.property == "reconciliation")
+                .filter(|row| row.property == RECONCILIATION_PROPERTY)
                 .collect();
             assert_eq!(history.len(), 46, "reopening must not duplicate migrated history");
             for row in &history[..45] {
@@ -126,10 +126,90 @@ fn failed_upgrade_rolls_back_history_and_description_together() {
     assert_eq!(stored, original);
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM task_status_audit WHERE property = 'reconciliation'",
-            [],
+            "SELECT COUNT(*) FROM task_status_audit WHERE property = ?1",
+            [RECONCILIATION_PROPERTY],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn upgrade_ignores_four_space_indented_fence_markers_inside_fenced_blocks() {
+    let (_dir, db) = test_support::open_db();
+    let product = test_support::create_test_product_named(&db, "audit-indented-fence");
+    let authored = "Brief\r\n```text\r\n    ```\r\n[engine-reconcile] epoch 1: example.\r\n```\r\n";
+    let real_event = "[engine-reconcile] epoch 2: real event.";
+    let full_description = format!("{authored}\n{real_event}");
+
+    let path = db.path().to_path_buf();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE products SET description = ?2 WHERE id = ?1",
+        params![product.id, full_description],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM schema_migrations WHERE id = ?1", [MIGRATION_ID])
+        .unwrap();
+    drop(conn);
+    drop(db);
+
+    for _ in 0..2 {
+        let db = WorkDb::open(path.clone()).unwrap();
+        let WorkItem::Product(item) = db.get_work_item(&product.id).unwrap() else {
+            panic!("product")
+        };
+        assert_eq!(item.description, authored);
+        let history: Vec<_> = db
+            .list_task_field_audit(&product.id)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.property == RECONCILIATION_PROPERTY)
+            .collect();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].detail.as_deref(), Some(real_event));
+        assert_eq!(history[0].changed_at, "2");
+        assert_eq!(history[0].basis, "legacy_description");
+    }
+}
+
+#[test]
+fn upgrade_rescans_unclosed_fence_so_trailing_records_still_move() {
+    let (_dir, db) = test_support::open_db();
+    let product = test_support::create_test_product_named(&db, "audit-unclosed-fence");
+    let authored = "Brief\r\n```text\r\nunclosed authored example\r\n";
+    let real_event = "[engine-reconcile] epoch 2: real event.";
+    let parking_event = "[parking] epoch 3: refresh_pr: PR is still open.";
+    let full_description = format!("{authored}\n{real_event}\n{parking_event}");
+
+    let path = db.path().to_path_buf();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE products SET description = ?2 WHERE id = ?1",
+        params![product.id, full_description],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM schema_migrations WHERE id = ?1", [MIGRATION_ID])
+        .unwrap();
+    drop(conn);
+    drop(db);
+
+    for _ in 0..2 {
+        let db = WorkDb::open(path.clone()).unwrap();
+        let WorkItem::Product(item) = db.get_work_item(&product.id).unwrap() else {
+            panic!("product")
+        };
+        assert_eq!(item.description, authored);
+        let history: Vec<_> = db
+            .list_task_field_audit(&product.id)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.property == RECONCILIATION_PROPERTY)
+            .collect();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].detail.as_deref(), Some(real_event));
+        assert_eq!(history[0].changed_at, "2");
+        assert_eq!(history[1].detail.as_deref(), Some(parking_event));
+        assert_eq!(history[1].changed_at, "3");
+    }
 }

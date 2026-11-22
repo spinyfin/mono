@@ -12,6 +12,9 @@ pub(super) const EXECUTION_ABANDON_MIGRATION_ID: &str = "20261118_1530_execution
 /// delete; the ledger row stays).
 pub(crate) const EXECUTION_ABANDONED_PROPERTY: &str = "execution_abandoned";
 
+/// `task_status_audit.property` for reconciliation and parking audit entries.
+pub const RECONCILIATION_PROPERTY: &str = "reconciliation";
+
 /// Recorded in `reason_code` and `basis` for a write that reached the ledger
 /// without going through a helper in this module.
 pub(crate) const UNATTRIBUTED_WRITE: &str = "unattributed_write";
@@ -492,7 +495,7 @@ impl WorkDb {
                     execution_ever_ran, item_ever_ran
              FROM task_status_audit a
              WHERE work_item_id = ?1
-               AND (property = 'reconciliation' OR property IN (?2, ?3, ?4)
+               AND (property = ?5 OR property IN (?2, ?3, ?4)
                     OR (property = 'status' AND operation_id IS NOT NULL AND operation_id IN (
                         SELECT operation_id FROM task_status_audit
                         WHERE work_item_id = ?1 AND property IN (?2, ?3, ?4))))
@@ -504,7 +507,8 @@ impl WorkDb {
                     work_item_id,
                     FLAG_PROPERTIES[0],
                     FLAG_PROPERTIES[1],
-                    EXECUTION_ABANDONED_PROPERTY
+                    EXECUTION_ABANDONED_PROPERTY,
+                    RECONCILIATION_PROPERTY
                 ],
                 |row| {
                     Ok(boss_protocol::TaskFieldAuditRow {

@@ -32,7 +32,7 @@ fn reconciliation_history_cannot_enter_worker_prompts() {
         db.list_task_field_audit(&chore.id)
             .unwrap()
             .iter()
-            .filter(|row| row.property == "reconciliation")
+            .filter(|row| row.property == crate::work::RECONCILIATION_PROPERTY)
             .count(),
         45
     );

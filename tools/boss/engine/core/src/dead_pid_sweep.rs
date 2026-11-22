@@ -1165,7 +1165,7 @@ mod tests {
         );
 
         assert!(db.list_task_field_audit(&work_item_id).unwrap().iter().any(|row| {
-            row.property == "reconciliation"
+            row.property == crate::work::RECONCILIATION_PROPERTY
                 && row
                     .detail
                     .as_deref()

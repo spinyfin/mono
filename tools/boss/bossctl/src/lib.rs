@@ -2266,7 +2266,7 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
         .list_task_field_audit(&work_item_id)
         .context("listing reconciliation history")?
         .into_iter()
-        .filter(|row| row.property == "reconciliation")
+        .filter(|row| row.property == boss_engine::work::RECONCILIATION_PROPERTY)
         .collect();
     let host_ids = db
         .execution_host_ids_for_item(&work_item_id)

@@ -1545,7 +1545,7 @@ mod tests {
         );
     }
 
-    /// Storage owns the remaining non-reconciliation description appends:
+    /// Storage owns description-trail appends:
     /// it adds the line verbatim after the existing text.
     #[test]
     fn append_work_item_description_line_adds_the_line_verbatim_to_the_description() {

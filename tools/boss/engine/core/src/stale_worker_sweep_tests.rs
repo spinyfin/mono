@@ -22,7 +22,7 @@ fn reconciliation_audit(db: &WorkDb, id: &str) -> String {
     db.list_task_field_audit(id)
         .unwrap()
         .into_iter()
-        .filter(|row| row.property == "reconciliation")
+        .filter(|row| row.property == crate::work::RECONCILIATION_PROPERTY)
         .map(|row| row.detail.unwrap())
         .collect::<Vec<_>>()
         .join("\n")

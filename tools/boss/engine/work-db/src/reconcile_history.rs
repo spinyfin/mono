@@ -18,10 +18,71 @@ fn insert(conn: &Connection, id: &str, epoch: i64, detail: &str, basis: &str) ->
     conn.execute(
         "INSERT INTO task_status_audit
             (work_item_id, property, actor, changed_at, basis, detail)
-         VALUES (?1, 'reconciliation', 'engine', ?2, ?3, ?4)",
-        params![id, epoch.to_string(), basis, detail],
+         VALUES (?1, ?2, 'engine', ?3, ?4, ?5)",
+        params![id, RECONCILIATION_PROPERTY, epoch.to_string(), basis, detail],
     )?;
     Ok(())
+}
+
+fn fence_after_indent(line: &str) -> Option<&str> {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    (indent <= 3).then(|| &line[indent..])
+}
+
+fn open_fence(line: &str) -> Option<(char, usize)> {
+    let after = fence_after_indent(line)?;
+    if after.starts_with("```") {
+        let width = after.bytes().take_while(|&b| b == b'`').count();
+        (!after[width..].contains('`')).then_some(('`', width))
+    } else if after.starts_with("~~~") {
+        let width = after.bytes().take_while(|&b| b == b'~').count();
+        Some(('~', width))
+    } else {
+        None
+    }
+}
+
+fn is_closing_fence(line: &str, marker: char, width: usize) -> bool {
+    let Some(after) = fence_after_indent(line) else {
+        return false;
+    };
+    let count = after.bytes().take_while(|&b| b as char == marker).count();
+    count >= width && after[count..].trim().is_empty()
+}
+
+fn partition_legacy_records(description: &str) -> (String, Vec<(i64, &str)>) {
+    let mut ignored_openers = HashSet::new();
+    loop {
+        let mut brief = String::new();
+        let mut records = Vec::new();
+        let mut fence: Option<(usize, char, usize)> = None;
+        // Appenders owned the newline BEFORE their record. Preserve all
+        // other bytes, including authored trailing newlines and CRLF.
+        for (index, line) in description.split('\n').enumerate() {
+            if let Some((_, marker, width)) = fence {
+                if is_closing_fence(line, marker, width) {
+                    fence = None;
+                }
+            } else if let Some((marker, width)) =
+                (!ignored_openers.contains(&index)).then(|| open_fence(line)).flatten()
+            {
+                fence = Some((index, marker, width));
+            } else if let Some(epoch) = legacy_epoch(line) {
+                records.push((epoch, line));
+                continue;
+            }
+            if index > 0 {
+                brief.push('\n');
+            }
+            brief.push_str(line);
+        }
+        match fence {
+            Some((opener_index, _, _)) => {
+                ignored_openers.insert(opener_index);
+            }
+            None => return (brief, records),
+        }
+    }
 }
 
 /// Move legacy appended lines in the same startup transaction that removes
@@ -38,34 +99,11 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (id, description) in items {
-            let mut brief = String::new();
-            let mut moved = false;
-            let mut fence: Option<(char, usize)> = None;
-            // Appenders owned the newline BEFORE their record. Preserve all
-            // other bytes, including authored trailing newlines and CRLF.
-            for (index, line) in description.split('\n').enumerate() {
-                let trimmed = line.trim_start();
-                if let Some((marker, width)) = fence {
-                    if trimmed.chars().take_while(|c| *c == marker).count() >= width
-                        && trimmed.trim_start_matches(marker).trim().is_empty()
-                    {
-                        fence = None;
-                    }
-                } else if trimmed.starts_with("```") {
-                    fence = Some(('`', trimmed.chars().take_while(|c| *c == '`').count()));
-                } else if trimmed.starts_with("~~~") {
-                    fence = Some(('~', trimmed.chars().take_while(|c| *c == '~').count()));
-                } else if let Some(epoch) = legacy_epoch(line) {
+            let (brief, records) = partition_legacy_records(&description);
+            if !records.is_empty() {
+                for (epoch, line) in records {
                     insert(conn, &id, epoch, line, "legacy_description")?;
-                    moved = true;
-                    continue;
                 }
-                if index > 0 {
-                    brief.push('\n');
-                }
-                brief.push_str(line);
-            }
-            if moved {
                 conn.execute(
                     &format!("UPDATE {table} SET description = ?2 WHERE id = ?1"),
                     params![id, brief],

@@ -2,8 +2,9 @@ pub const DEFERRED_SCOPE_MARKER: &str = "[deferred-scope]";
 
 pub const PROCESSED_MARKER: &str = "[postmortem-followups]";
 
-/// `[engine-reconcile]` audit-line marker, shared with
-/// [`ENGINE_AUDIT_LINE_PREFIXES`].
+/// `[engine-reconcile]` audit-line marker: written only to `task_status_audit`
+/// (never appended to descriptions), and retained in [`ENGINE_AUDIT_LINE_PREFIXES`]
+/// so legacy description text is still recognised and stripped.
 pub const ENGINE_RECONCILE_MARKER: &str = "[engine-reconcile]";
 
 /// `[doc-detector]` audit-line marker, shared with
@@ -17,24 +18,25 @@ pub const DOC_DETECTOR_MARKER: &str = "[doc-detector]";
 pub const PR_REVIEW_SKIP_MARKER: &str = "[pr-review-skip]";
 
 /// `[parking]` audit-line marker: one line per step of the un-park
-/// reconciliation sequence, appended by `unpark_reconcile` in the engine core
-/// crate. Shared with [`ENGINE_AUDIT_LINE_PREFIXES`] so the trail is stripped
-/// from the brief a worker or reviewer reads.
+/// reconciliation sequence, written only to `task_status_audit` (never
+/// appended to descriptions). Retained in [`ENGINE_AUDIT_LINE_PREFIXES`] so
+/// legacy description text is still recognised and stripped from the brief a
+/// worker or reviewer reads.
 pub const PARKING_MARKER: &str = "[parking]";
 
-/// Prefixes of engine-appended description lines. Shared by
-/// `WorkDb::append_work_item_description_line` writers and [`strip_engine_audit_lines`] so the
-/// vocabulary of audit lines lives in one place: a line whose trimmed text
-/// starts with one of these is engine-owned, not human-authored brief.
+/// Prefixes of engine-owned audit lines. Shared by active
+/// `WorkDb::append_work_item_description_line` writers and
+/// [`strip_engine_audit_lines`] so the vocabulary of audit lines lives in one
+/// place: a line whose trimmed text starts with one of these is engine-owned,
+/// not human-authored brief.
 ///
-/// Every `append_description_line` writer's marker must appear here — this
-/// list is the single source of truth for what counts as an engine audit
-/// line rather than human-authored brief text. See
-/// `engine_audit_line_prefixes_cover_every_known_writer` (in
-/// `core/src/reconcile_audit.rs`), which pins
-/// each writer's marker constant against this list so a new writer that
-/// forgets to register here fails a test instead of silently poisoning
-/// empty-brief detection.
+/// Every `append_description_line` writer's marker must appear here, along with
+/// legacy markers (`ENGINE_RECONCILE_MARKER`, `PARKING_MARKER`) that now write
+/// only to `task_status_audit` so legacy description text is still recognised
+/// and stripped. See `engine_audit_line_prefixes_cover_every_known_writer` (in
+/// `completion/src/reconcile_audit.rs`), which pins each marker constant against
+/// this list so a new writer that forgets to register here fails a test instead
+/// of silently poisoning empty-brief detection.
 pub const ENGINE_AUDIT_LINE_PREFIXES: &[&str] = &[
     DOC_DETECTOR_MARKER,
     ENGINE_RECONCILE_MARKER,

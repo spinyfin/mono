@@ -1,5 +1,6 @@
-//! Shared reconciliation audit writers. Full narratives remain queryable in
-//! the work-item audit ledger without changing the authored brief or recovery interface.
+//! Shared reconciliation audit writers. Reconciliation and parking narratives
+//! are recorded in `task_status_audit` (property `reconciliation`) without
+//! changing the authored brief or recovery interface.
 
 use crate::work::WorkDb;
 
@@ -42,9 +43,8 @@ pub fn append_parking_audit(
     )
 }
 
-/// Append `line` verbatim to `work_item_id`'s description for the remaining
-/// non-reconciliation writers, including
-/// [`crate::WorkerCompletionHandler::record_deferred_scope_item`].
+/// Append `line` verbatim to `work_item_id`'s description for description-trail
+/// writers such as [`crate::WorkerCompletionHandler::record_deferred_scope_item`].
 /// [`WorkDb::append_work_item_description_line`] owns the update so
 /// the proposal path can append its post-commit line without calling back
 /// into engine core.
@@ -94,7 +94,7 @@ mod tests {
         db.list_task_field_audit(id)
             .unwrap()
             .into_iter()
-            .filter(|row| row.property == "reconciliation")
+            .filter(|row| row.property == crate::work::RECONCILIATION_PROPERTY)
             .map(|row| row.detail.unwrap())
             .collect::<Vec<_>>()
             .join("\n")
@@ -252,8 +252,11 @@ mod tests {
         assert!(!is_engine_audit_line("mentions [doc-detector] in prose"));
     }
 
-    /// The explicitly listed writer markers must match the registered audit
-    /// prefixes. New writers must be added to both lists; this test does not
+    /// The explicitly listed marker constants must match [`ENGINE_AUDIT_LINE_PREFIXES`],
+    /// covering both active `append_description_line` writers and legacy markers
+    /// (`ENGINE_RECONCILE_MARKER`, `PARKING_MARKER`) that now write only to
+    /// `task_status_audit` so legacy description text is still recognised and
+    /// stripped. New writers must be added to both lists; this test does not
     /// discover writers or detect unregistered markers elsewhere in the code.
     #[test]
     fn engine_audit_line_prefixes_cover_every_known_writer() {
