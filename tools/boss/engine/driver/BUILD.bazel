@@ -95,12 +95,6 @@ rust_test(
         "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
     },
     shard_count = 12,
-    # Thirty real app-server trust observations retain the production 10s
-    # deadline. Run after parallel engine shards instead of contending with
-    # them; the production deadline is unchanged. `exclusive-if-local` and
-    # not `exclusive`: the latter also forces local execution, so the test
-    # could not be scheduled on a remote worker at all.
-    tags = ["exclusive-if-local"],
     deps = [
         "//tools/boss/codex_auth",
         "//tools/boss/command-runner",

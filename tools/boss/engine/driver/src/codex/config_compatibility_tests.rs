@@ -4,15 +4,27 @@
 use super::*;
 use boss_engine_codex_hook_trust::read_attestation_file;
 
+/// Sized to `driver_test`'s `size = "small"` 60s per-shard budget so tests wait
+/// for the real `codex app-server` reply under contention rather than racing
+/// the 10s production deadline.
+const TEST_OBSERVE_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[test]
-fn every_worker_config_arms_hooks_on_pinned_codex() {
+fn pinned_codex_version_matches_declared_version() {
     let version = Command::new(resolve_codex_bin()).arg("--version").output().unwrap();
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
         format!("codex-cli {}", env!("CODEX_CLI_VERSION")),
     );
+}
 
+fn assert_worker_config_arms_hooks_on_pinned_codex(
+    kind: WorkerKind,
+    remote: bool,
+    execution_kind: &str,
+    task_kind: Option<&str>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let _homes = crate::test_support::codex_homes_override(&root.join("homes"));
@@ -28,64 +40,89 @@ fn every_worker_config_arms_hooks_on_pinned_codex() {
         .enable_all()
         .build()
         .unwrap();
-    let driver = CodexDriver::default();
+    let driver = CodexDriver::with_observe_timeout(TEST_OBSERVE_TIMEOUT);
 
-    for kind in [
-        WorkerKind::Standard,
-        WorkerKind::Reviewer,
-        WorkerKind::Triage,
-        WorkerKind::AnswerAgent,
-        WorkerKind::ReviewGuide,
-        WorkerKind::Progression,
-    ] {
-        for remote in [false, true] {
-            for (execution_kind, task_kind) in [
-                ("task_implementation", None),
-                ("revision_implementation", None),
-                ("task_implementation", Some("revision")),
-            ] {
-                let run_id = format!("{kind:?}-{remote}-{execution_kind}-{task_kind:?}");
-                let input = PermissionInput::builder()
-                    .worker_kind(kind)
-                    .workspace_path(workspace.clone())
-                    .events_socket_path(root.join("events.sock"))
-                    .frontend_socket_path(root.join("frontend.sock"))
-                    .boss_event_path(root.join("boss-event"))
-                    .run_id(&run_id)
-                    .lease_id("compatibility-lease")
-                    .execution_kind(execution_kind)
-                    .maybe_task_kind(task_kind)
-                    .is_remote(remote)
-                    .path_guard_script(path_guard.clone())
-                    .checkleft_guard_script(checkleft_guard.clone())
-                    .build();
-                let home = codex_home_for_run(&run_id).unwrap();
-                fs::create_dir_all(&home).unwrap();
-                let artifacts = rt
-                    .block_on(driver.write_permission_config(&input, &root))
-                    .unwrap_or_else(|error| panic!("{run_id}: permission materialization failed: {error:#}"));
-                assert_eq!(artifacts.config_files, vec![home.join("config.toml")]);
-                let attestation = read_attestation_file(&guard_chain::attestation_path(&home)).unwrap();
-                let expected = expected_guards(
-                    kind,
-                    remote,
-                    execution_kind == "revision_implementation" || task_kind.is_some(),
-                );
-                assert_eq!(attestation.hooks.len(), expected.len(), "{run_id}");
-                for (index, (hook, name)) in attestation.hooks.iter().zip(expected).enumerate() {
-                    assert_eq!(hook.event, "pre_tool_use", "{run_id}: {name}");
-                    assert_eq!(hook.observed_trust_status, "trusted", "{run_id}: {name}");
-                    assert!(hook.guard_content_sha256.is_some(), "{run_id}: {name}");
-                    assert_eq!(
-                        Path::new(&hook.command).file_name().unwrap().to_str().unwrap(),
-                        format!("{index:02}_{name}.sh"),
-                        "{run_id}",
-                    );
-                }
-            }
-        }
+    let run_id = format!("{kind:?}-{remote}-{execution_kind}-{task_kind:?}");
+    let input = PermissionInput::builder()
+        .worker_kind(kind)
+        .workspace_path(workspace.clone())
+        .events_socket_path(root.join("events.sock"))
+        .frontend_socket_path(root.join("frontend.sock"))
+        .boss_event_path(root.join("boss-event"))
+        .run_id(&run_id)
+        .lease_id("compatibility-lease")
+        .execution_kind(execution_kind)
+        .maybe_task_kind(task_kind)
+        .is_remote(remote)
+        .path_guard_script(path_guard)
+        .checkleft_guard_script(checkleft_guard)
+        .build();
+    let home = codex_home_for_run(&run_id).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let artifacts = rt
+        .block_on(driver.write_permission_config(&input, &root))
+        .unwrap_or_else(|error| panic!("{run_id}: permission materialization failed: {error:#}"));
+    assert_eq!(artifacts.config_files, vec![home.join("config.toml")]);
+    let attestation = read_attestation_file(&guard_chain::attestation_path(&home)).unwrap();
+    let expected = expected_guards(
+        kind,
+        remote,
+        execution_kind == "revision_implementation" || task_kind.is_some(),
+    );
+    assert_eq!(attestation.hooks.len(), expected.len(), "{run_id}");
+    for (index, (hook, name)) in attestation.hooks.iter().zip(expected).enumerate() {
+        assert_eq!(hook.event, "pre_tool_use", "{run_id}: {name}");
+        assert_eq!(hook.observed_trust_status, "trusted", "{run_id}: {name}");
+        assert!(hook.guard_content_sha256.is_some(), "{run_id}: {name}");
+        assert_eq!(
+            Path::new(&hook.command).file_name().unwrap().to_str().unwrap(),
+            format!("{index:02}_{name}.sh"),
+            "{run_id}",
+        );
     }
 }
+
+macro_rules! worker_config_arming_case {
+    ($name:ident, $kind:expr, $remote:expr, $exec_kind:expr, $task_kind:expr) => {
+        #[test]
+        fn $name() {
+            assert_worker_config_arms_hooks_on_pinned_codex($kind, $remote, $exec_kind, $task_kind);
+        }
+    };
+}
+
+macro_rules! worker_config_arming_kind {
+    ($kind_mod:ident, $kind:expr) => {
+        mod $kind_mod {
+            use super::*;
+            worker_config_arming_case!(local_task, $kind, false, "task_implementation", None);
+            worker_config_arming_case!(local_revision_exec, $kind, false, "revision_implementation", None);
+            worker_config_arming_case!(
+                local_revision_task,
+                $kind,
+                false,
+                "task_implementation",
+                Some("revision")
+            );
+            worker_config_arming_case!(remote_task, $kind, true, "task_implementation", None);
+            worker_config_arming_case!(remote_revision_exec, $kind, true, "revision_implementation", None);
+            worker_config_arming_case!(
+                remote_revision_task,
+                $kind,
+                true,
+                "task_implementation",
+                Some("revision")
+            );
+        }
+    };
+}
+
+worker_config_arming_kind!(worker_config_arms_hooks_standard, WorkerKind::Standard);
+worker_config_arming_kind!(worker_config_arms_hooks_reviewer, WorkerKind::Reviewer);
+worker_config_arming_kind!(worker_config_arms_hooks_triage, WorkerKind::Triage);
+worker_config_arming_kind!(worker_config_arms_hooks_answer_agent, WorkerKind::AnswerAgent);
+worker_config_arming_kind!(worker_config_arms_hooks_review_guide, WorkerKind::ReviewGuide);
+worker_config_arming_kind!(worker_config_arms_hooks_progression, WorkerKind::Progression);
 
 fn expected_guards(kind: WorkerKind, remote: bool, revision: bool) -> Vec<&'static str> {
     let mut names = Vec::new();
@@ -152,6 +189,7 @@ fn missing_review_guide_permissions_reports_loader_error() {
                 .build(),
         ],
         codex_bin: binary,
+        observe_timeout: Some(TEST_OBSERVE_TIMEOUT),
     };
 
     // Reproduce the pre-fix failure through the unchanged production gate.
@@ -215,7 +253,7 @@ fn symlinked_progression_run(run_id: &str) -> SymlinkedProgressionRun {
 
     let path_guard = root.join("path-guard.py");
     write_executable(&path_guard, "#!/usr/bin/env python3\n").unwrap();
-    let driver = CodexDriver::default();
+    let driver = CodexDriver::with_observe_timeout(TEST_OBSERVE_TIMEOUT);
     let input = PermissionInput::builder()
         .worker_kind(WorkerKind::Progression)
         .workspace_path(workspace.clone())

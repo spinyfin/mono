@@ -236,6 +236,7 @@ fn arm_refuses_when_no_hooks_configured() {
         cwd: fx.cwd.clone(),
         hooks: vec![],
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let err = arm_and_attest_with_observer(&req, &FakeObserver::new()).unwrap_err();
     assert!(matches!(err, TrustGateError::NoHooksConfigured));
@@ -261,6 +262,7 @@ fn arm_refuses_when_guard_executable_missing() {
         cwd: fx.cwd.clone(),
         hooks,
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let err = arm_and_attest_with_observer(&req, &FakeObserver::new()).unwrap_err();
     assert!(matches!(err, TrustGateError::GuardExecutableMissing { .. }));
@@ -280,6 +282,7 @@ fn arm_refuses_when_guard_not_executable() {
         cwd: fx.cwd.clone(),
         hooks: standard_hooks(&fx),
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let err = arm_and_attest_with_observer(&req, &FakeObserver::new()).unwrap_err();
     assert!(matches!(err, TrustGateError::GuardExecutableNotExecutable { .. }));
@@ -297,6 +300,7 @@ fn arm_refuses_when_observation_is_silent() {
         cwd: fx.cwd.clone(),
         hooks: standard_hooks(&fx),
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let err = arm_and_attest_with_observer(&req, &observer).unwrap_err();
     match err {
@@ -325,6 +329,7 @@ fn arm_refuses_when_hook_listed_but_untrusted() {
         cwd: fx.cwd.clone(),
         hooks,
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let err = arm_and_attest_with_observer(&req, &observer).unwrap_err();
     assert!(matches!(err, TrustGateError::HookNotTrusted { .. }));
@@ -348,6 +353,7 @@ fn arm_refuses_when_hook_listed_but_disabled() {
         cwd: fx.cwd.clone(),
         hooks,
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let err = arm_and_attest_with_observer(&req, &observer).unwrap_err();
     assert!(matches!(err, TrustGateError::HookNotEnabled { .. }));
@@ -369,6 +375,7 @@ fn verify_attestation_refuses_when_guard_loses_executable_bit() {
         cwd: fx.cwd.clone(),
         hooks: hooks.clone(),
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let att = arm_and_attest_with_observer(&req, &observer).unwrap();
     verify_attestation(&att, &hooks).expect("fresh attestation must verify");
@@ -396,6 +403,7 @@ fn arm_refuses_when_observed_hash_mismatches_stamp() {
         cwd: fx.cwd.clone(),
         hooks,
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let err = arm_and_attest_with_observer(&req, &observer).unwrap_err();
     assert!(matches!(err, TrustGateError::HashMismatch { .. }));
@@ -418,6 +426,7 @@ fn arm_succeeds_when_observer_reports_trusted_matching_hashes() {
         cwd: fx.cwd.clone(),
         hooks: hooks.clone(),
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let att = arm_and_attest_with_observer(&req, &observer).expect("arm should succeed");
     assert_eq!(att.hooks.len(), 2);
@@ -584,6 +593,7 @@ fn write_attestation_round_trips() {
         cwd: fx.cwd.clone(),
         hooks,
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let att = arm_and_attest_with_observer(&req, &observer).unwrap();
     let path = fx.codex_home.join("hook-trust-attestation.json");
@@ -615,6 +625,7 @@ fn armed_fixture() -> (Fixture, HookTrustAttestation) {
         cwd: fx.cwd.clone(),
         hooks,
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let att = arm_and_attest_with_observer(&req, &observer).expect("arm should succeed");
     (fx, att)
@@ -771,6 +782,7 @@ fn live_codex_observer_reports_trusted_after_stamp() {
         cwd: fx.cwd.clone(),
         hooks: hooks.clone(),
         codex_bin: codex_bin.clone(),
+        observe_timeout: Some(Duration::from_secs(45)),
     };
     let att = arm_and_attest(&req).expect("live arm_and_attest must succeed with codex on PATH");
     assert_eq!(att.hooks.len(), 2);
@@ -844,7 +856,7 @@ echo 'STDERR-LINE-1' >&2
 fn observe_with_fake(script: &str) -> Result<Observation, TrustGateError> {
     let (_tmp, bin) = fake_codex(script);
     let home = tempfile::tempdir().unwrap();
-    CodexAppServerObserver { codex_bin: bin }.observe(home.path(), home.path())
+    CodexAppServerObserver::new(bin).observe(home.path(), home.path())
 }
 
 #[test]
@@ -918,6 +930,35 @@ fn short_timeout_server(bin: PathBuf, timeout: Duration) -> app_server::AppServe
 }
 
 #[test]
+fn injected_observe_timeout_refuses_hung_app_server_with_observation_failed() {
+    let fx = setup_fixture("#!/bin/sh\necho guard\n");
+    let hooks = standard_hooks(&fx);
+    let (_tmp, bin) = stalling_fake_codex(&format!("{FAKE_HANDSHAKE}exec sleep 30"));
+    let short_deadline = Duration::from_secs(2);
+    let req = ArmRequest::builder()
+        .codex_home(fx.codex_home.clone())
+        .config_path(fx.config_path.clone())
+        .cwd(fx.cwd.clone())
+        .hooks(hooks)
+        .codex_bin(bin)
+        .observe_timeout(short_deadline)
+        .build();
+    let started = std::time::Instant::now();
+    let err = arm_and_attest(&req).unwrap_err();
+    assert!(
+        started.elapsed() < OBSERVE_TIMEOUT,
+        "injected deadline must govern before production OBSERVE_TIMEOUT: {:?}",
+        started.elapsed()
+    );
+    match err {
+        TrustGateError::ObservationFailed { detail } => {
+            assert!(detail.contains("timed out after 2s"), "got: {detail}");
+        }
+        other => panic!("expected ObservationFailed, got {other:?}"),
+    }
+}
+
+#[test]
 fn timeout_keeps_a_config_warning_read_before_the_stall() {
     let (_tmp, bin) = stalling_fake_codex(&format!("{FAKE_HANDSHAKE}exec sleep 30"));
     let err = short_timeout_server(bin, STALL_TIMEOUT)
@@ -982,6 +1023,7 @@ fn post_observation_refusal_carries_codex_diagnostics_without_changing_the_decis
         cwd: fx.cwd.clone(),
         hooks,
         codex_bin: PathBuf::from("codex"),
+        observe_timeout: None,
     };
     let observer = DiagnosticObserver {
         hooks: observed,

@@ -1728,7 +1728,7 @@ fn guide_permission_materialization_requires_socket_and_writes_named_profile() {
         .enable_all()
         .build()
         .unwrap();
-    let driver = CodexDriver::default();
+    let driver = CodexDriver::with_observe_timeout(Duration::from_secs(45));
     let error = rt
         .block_on(driver.write_permission_config(&input, tmp.path()))
         .unwrap_err();
