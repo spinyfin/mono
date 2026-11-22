@@ -1,0 +1,9 @@
+exports_files(
+    [
+        "com.brianduff.node_exporter.plist",
+        "run-macos.sh",
+        "setup-macos.sh",
+        "setup-ubuntu.sh",
+    ],
+    visibility = ["//tools/remote-execution/prometheus:__pkg__"],
+)

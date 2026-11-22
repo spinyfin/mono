@@ -1,5 +1,5 @@
 {
-  "description": "Per-worker view of the macOS remote-execution pool, from the hub's own metrics. The host name is the prefix of the worker id. Machine-level figures (CPU, memory, disk) are in Beszel, not here.",
+  "description": "Per-worker view of the macOS remote-execution pool, from the hub's own metrics. The host name is the prefix of the worker id. Host CPU, memory and swap come from node_exporter (Prometheus job node).",
   "editable": true,
   "links": [
     {
@@ -24,28 +24,615 @@
       },
       "id": 36,
       "panels": [],
-      "title": "Host resources",
+      "title": "Worker host resources (macOS)",
       "type": "row"
     },
     {
       "datasource": {
-        "type": "grafana",
-        "uid": "-- Grafana --"
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
       },
-      "description": "",
+      "description": "Current figures per macOS worker host from node_exporter. CPU and memory turn yellow at 80% and red at 95%; swap at 50% and 80%; load per core at 1.5 and 3.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CPU busy"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 80
+                    },
+                    {
+                      "color": "red",
+                      "value": 95
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "mode": "basic",
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Memory used"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 80
+                    },
+                    {
+                      "color": "red",
+                      "value": 95
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "mode": "basic",
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Swap used"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 50
+                    },
+                    {
+                      "color": "red",
+                      "value": 80
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "mode": "basic",
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Load per core"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 3
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "mode": "basic",
+                  "type": "color-background"
+                }
+              }
+            ]
+          }
+        ]
+      },
       "gridPos": {
-        "h": 3,
-        "w": 24,
+        "h": 8,
+        "w": 12,
         "x": 0,
         "y": 1
       },
-      "id": 35,
+      "id": 43,
       "options": {
-        "content": "**Per-worker CPU and memory panels go here.** They will be added once host exporters are installed on the workers; until then NativeLink exports no host-level metrics.",
-        "mode": "markdown"
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": false,
+            "displayName": "Host"
+          }
+        ]
       },
-      "title": "",
-      "type": "text"
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"}[5m])))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * (max by (instance) (node_memory_internal_bytes{job=\"node\",platform=\"macos\"}) - on(instance) max by (instance) (node_memory_purgeable_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_wired_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_compressed_bytes{job=\"node\",platform=\"macos\"})) / on(instance) max by (instance) (node_memory_total_bytes{job=\"node\",platform=\"macos\"})",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * max by (instance) (node_memory_swap_used_bytes{job=\"node\",platform=\"macos\"}) / on(instance) max by (instance) (node_memory_swap_total_bytes{job=\"node\",platform=\"macos\"})",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max by (instance) (node_load1{job=\"node\",platform=\"macos\"}) / on(instance) count by (instance) (node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"})",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "D"
+        }
+      ],
+      "title": "Worker hosts now",
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "instance": 0
+            },
+            "renameByName": {
+              "Value #A": "CPU busy",
+              "Value #B": "Memory used",
+              "Value #C": "Swap used",
+              "Value #D": "Load per core",
+              "instance": "Host"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Share of CPU time not idle, averaged over all cores.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "id": 44,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max"],
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"}[5m])))",
+          "instant": false,
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "CPU busy, by worker host",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "App (internal minus purgeable) plus wired plus compressed memory, as a share of physical memory. Sustained high values with rising swap point to memory pressure.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 45,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max"],
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * (max by (instance) (node_memory_internal_bytes{job=\"node\",platform=\"macos\"}) - on(instance) max by (instance) (node_memory_purgeable_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_wired_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_compressed_bytes{job=\"node\",platform=\"macos\"})) / on(instance) max by (instance) (node_memory_total_bytes{job=\"node\",platform=\"macos\"})",
+          "instant": false,
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Memory used, by worker host",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Share of the swap files in use.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 47,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max"],
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * max by (instance) (node_memory_swap_used_bytes{job=\"node\",platform=\"macos\"}) / on(instance) max by (instance) (node_memory_swap_total_bytes{job=\"node\",platform=\"macos\"})",
+          "instant": false,
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Swap used, by worker host",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "1-minute load average divided by core count.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "decimals": 2,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1.5
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "id": 46,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max"],
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max by (instance) (node_load1{job=\"node\",platform=\"macos\"}) / on(instance) count by (instance) (node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"})",
+          "instant": false,
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Load per core, by worker host",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Bytes written to swap per second. Sustained non-zero paging means the host is short of memory.",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "id": 48,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max"],
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max by (instance) (rate(node_memory_swapped_out_bytes_total{job=\"node\",platform=\"macos\"}[5m]))",
+          "instant": false,
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Paging out to swap, by worker host",
+      "type": "timeseries"
     },
     {
       "collapsed": false,
@@ -57,7 +644,403 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 4
+        "y": 25
+      },
+      "id": 49,
+      "panels": [],
+      "title": "Hub host (headcrash)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "headcrash runs the hub, cache and scheduler; it is not one of the worker slots.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 26
+      },
+      "id": 50,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",instance=\"headcrash\",mode=\"idle\"}[5m])))",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Hub CPU busy",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "1 - MemAvailable / MemTotal.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 26
+      },
+      "id": 51,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * (1 - max by (instance) (node_memory_MemAvailable_bytes{job=\"node\",instance=\"headcrash\"}) / on(instance) max by (instance) (node_memory_MemTotal_bytes{job=\"node\",instance=\"headcrash\"}))",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Hub memory used",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Share of swap in use.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 26
+      },
+      "id": 52,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * (1 - max by (instance) (node_memory_SwapFree_bytes{job=\"node\",instance=\"headcrash\"}) / on(instance) max by (instance) (node_memory_SwapTotal_bytes{job=\"node\",instance=\"headcrash\"}))",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Hub swap used",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "1-minute load average divided by core count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 2,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1.5
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 26
+      },
+      "id": 53,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max by (instance) (node_load1{job=\"node\",instance=\"headcrash\"}) / on(instance) count by (instance) (node_cpu_seconds_total{job=\"node\",instance=\"headcrash\",mode=\"idle\"})",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Hub load per core",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Pages written to swap per second (node_vmstat_pswpout).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 26
+      },
+      "id": 54,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max by (instance) (rate(node_vmstat_pswpout{job=\"node\",instance=\"headcrash\"}[5m]))",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Hub pages swapped out per second",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Processes the Linux OOM killer ended on headcrash in the last 24 hours.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 26
+      },
+      "id": 55,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max by (instance) (increase(node_vmstat_oom_kill{job=\"node\",instance=\"headcrash\"}[24h]))",
+          "instant": false,
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Hub OOM kills (24h)",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "grafana",
+        "uid": "-- Grafana --"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
       },
       "id": 37,
       "panels": [],
@@ -85,7 +1068,7 @@
         "h": 5,
         "w": 4,
         "x": 0,
-        "y": 5
+        "y": 32
       },
       "id": 17,
       "options": {
@@ -132,7 +1115,7 @@
         "h": 5,
         "w": 4,
         "x": 4,
-        "y": 5
+        "y": 32
       },
       "id": 18,
       "options": {
@@ -197,7 +1180,7 @@
         "h": 5,
         "w": 4,
         "x": 8,
-        "y": 5
+        "y": 32
       },
       "id": 21,
       "options": {
@@ -245,7 +1228,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 5
+        "y": 32
       },
       "id": 15,
       "options": {
@@ -292,7 +1275,7 @@
         "h": 5,
         "w": 6,
         "x": 18,
-        "y": 5
+        "y": 32
       },
       "id": 16,
       "options": {
@@ -336,7 +1319,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 10
+        "y": 37
       },
       "id": 19,
       "options": {
@@ -383,7 +1366,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 10
+        "y": 37
       },
       "id": 20,
       "options": {
@@ -431,7 +1414,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 45
       },
       "id": 6,
       "options": {
@@ -471,7 +1454,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 53
       },
       "id": 38,
       "panels": [],
@@ -495,7 +1478,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 54
       },
       "id": 5,
       "options": {
@@ -541,7 +1524,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 27
+        "y": 54
       },
       "id": 12,
       "options": {
@@ -591,7 +1574,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 62
       },
       "id": 3,
       "options": {
@@ -627,7 +1610,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 68
       },
       "id": 39,
       "panels": [],
@@ -651,7 +1634,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 42
+        "y": 69
       },
       "id": 7,
       "options": {
@@ -697,7 +1680,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 42
+        "y": 69
       },
       "id": 8,
       "options": {
@@ -744,7 +1727,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 50
+        "y": 77
       },
       "id": 9,
       "options": {
@@ -790,7 +1773,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 50
+        "y": 77
       },
       "id": 10,
       "options": {
@@ -837,7 +1820,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 58
+        "y": 85
       },
       "id": 11,
       "options": {
@@ -883,7 +1866,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 58
+        "y": 85
       },
       "id": 13,
       "options": {
@@ -923,7 +1906,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 66
+        "y": 93
       },
       "id": 40,
       "panels": [],
@@ -953,7 +1936,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 67
+        "y": 94
       },
       "id": 4,
       "options": {
@@ -1001,7 +1984,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 67
+        "y": 94
       },
       "id": 22,
       "options": {
@@ -1038,7 +2021,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 75
+        "y": 102
       },
       "id": 41,
       "panels": [],
@@ -1067,7 +2050,7 @@
         "h": 5,
         "w": 5,
         "x": 0,
-        "y": 76
+        "y": 103
       },
       "id": 23,
       "options": {
@@ -1127,7 +2110,7 @@
         "h": 5,
         "w": 5,
         "x": 5,
-        "y": 76
+        "y": 103
       },
       "id": 24,
       "options": {
@@ -1175,7 +2158,7 @@
         "h": 5,
         "w": 5,
         "x": 10,
-        "y": 76
+        "y": 103
       },
       "id": 25,
       "options": {
@@ -1223,7 +2206,7 @@
         "h": 5,
         "w": 5,
         "x": 15,
-        "y": 76
+        "y": 103
       },
       "id": 26,
       "options": {
@@ -1271,7 +2254,7 @@
         "h": 5,
         "w": 4,
         "x": 20,
-        "y": 76
+        "y": 103
       },
       "id": 27,
       "options": {
@@ -1315,7 +2298,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 81
+        "y": 108
       },
       "id": 28,
       "options": {
@@ -1373,7 +2356,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 81
+        "y": 108
       },
       "id": 29,
       "options": {
@@ -1432,7 +2415,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 81
+        "y": 108
       },
       "id": 30,
       "options": {
@@ -1472,7 +2455,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 89
+        "y": 116
       },
       "id": 42,
       "panels": [],
@@ -1499,7 +2482,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 90
+        "y": 117
       },
       "id": 1,
       "options": {
@@ -1547,7 +2530,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 90
+        "y": 117
       },
       "id": 2,
       "options": {
@@ -1607,7 +2590,7 @@
         "h": 5,
         "w": 6,
         "x": 12,
-        "y": 90
+        "y": 117
       },
       "id": 33,
       "options": {
@@ -1671,7 +2654,7 @@
         "h": 5,
         "w": 6,
         "x": 18,
-        "y": 90
+        "y": 117
       },
       "id": 31,
       "options": {
@@ -1734,7 +2717,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 95
+        "y": 122
       },
       "id": 34,
       "options": {
@@ -1812,7 +2795,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 95
+        "y": 122
       },
       "id": 14,
       "options": {
@@ -1877,7 +2860,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 95
+        "y": 122
       },
       "id": 32,
       "options": {

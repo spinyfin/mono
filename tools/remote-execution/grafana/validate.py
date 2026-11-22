@@ -80,8 +80,17 @@ def normalize_dashboard(dashboard, uid):
 
     def fill_datasources(items):
         for panel in items:
-            if panel.get("type") in ("row", "text") and not panel.get("datasource"):
-                panel["datasource"] = {"type": "grafana", "uid": "-- Grafana --"}
+            if not panel.get("datasource"):
+                if panel.get("type") in ("row", "text"):
+                    panel["datasource"] = {"type": "grafana", "uid": "-- Grafana --"}
+                else:
+                    target_ds = [
+                        t["datasource"]
+                        for t in panel.get("targets", [])
+                        if isinstance(t, dict) and isinstance(t.get("datasource"), dict)
+                    ]
+                    if target_ds:
+                        panel["datasource"] = target_ds[0]
             fill_datasources(panel.get("panels", []))
 
     fill_datasources(dashboard.get("panels", []))

@@ -1,8 +1,10 @@
 steps:
-  - label: ":grafana: publish NativeLink dashboards"
+  - label: ":grafana: publish NativeLink dashboards & Prometheus config"
     key: "publish-nativelink-grafana"
     if: build.branch == "main" && build.pull_request.id == null
-    if_changed: "tools/remote-execution/grafana/**"
+    if_changed:
+      - "tools/remote-execution/grafana/**"
+      - "tools/remote-execution/prometheus/**"
     command: "bash tools/remote-execution/grafana/publish.sh"
     agents:
       queue: "nativelink-grafana"

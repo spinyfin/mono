@@ -21,7 +21,7 @@ class DashboardsTest(unittest.TestCase):
         self.bundle = load_bundle(HERE)
 
     def test_live_exports_and_queue_time(self):
-        self.assertEqual([24, 42], [len(self.bundle[name]["panels"]) for name in DASHBOARDS])
+        self.assertEqual([24, 54], [len(self.bundle[name]["panels"]) for name in DASHBOARDS])
         panel = next(p for p in self.bundle[DASHBOARDS[0]]["panels"] if p.get("title") == "Queue time")
         self.assertEqual(["p50", "p90", "p99", "mean", "oldest queued"], [t["legendFormat"] for t in panel["targets"]])
         self.assertIn("nativelink_execution_queue_time_seconds", panel["targets"][0]["expr"])

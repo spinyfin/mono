@@ -11,9 +11,11 @@ set -euo pipefail
 }
 here="$(dirname "${BASH_SOURCE[0]}")"
 # A slow older build must not undo a newer publication. Unrelated main
-# changes are fine; changed dashboard sources require the newer build.
+# changes are fine; changed dashboard or Prometheus sources require the newer build.
 git fetch origin main
-git diff --exit-code HEAD FETCH_HEAD -- tools/remote-execution/grafana
+git diff --exit-code HEAD FETCH_HEAD -- tools/remote-execution/grafana tools/remote-execution/prometheus
 # pipefail propagates validation, sudo, write and service failures to Buildkite.
 python3 "${here}/validate.py" --bundle |
   sudo -n /usr/local/libexec/nativelink-grafana/install.py
+python3 "${here}/../prometheus/validate.py" --print |
+  sudo -n /usr/local/libexec/nativelink-prometheus/install.py

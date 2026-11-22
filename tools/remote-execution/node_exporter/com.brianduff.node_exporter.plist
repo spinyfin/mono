@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  launchd agent for Prometheus node_exporter on macOS RBE workers.
+  Replaces Homebrew's sh.brew.node_exporter (which has KeepAlive=false and
+  stays down if Tailscale is not ready at login). Installed by setup-macos.sh
+  to ~/Library/LaunchAgents/com.brianduff.node_exporter.plist with USER_HOME
+  substituted.
+-->
+<dict>
+  <key>Label</key>
+  <string>com.brianduff.node_exporter</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>USER_HOME/Library/Application Support/com.brianduff.node_exporter/run.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>USER_HOME/Library/Logs/node_exporter/node_exporter.log</string>
+  <key>StandardErrorPath</key>
+  <string>USER_HOME/Library/Logs/node_exporter/node_exporter.log</string>
+</dict>
+</plist>

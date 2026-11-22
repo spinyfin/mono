@@ -1,0 +1,17 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "prometheus_test",
+    size = "small",
+    srcs = ["test.sh"],
+    data = [
+        "install.py",
+        "prometheus.yml",
+        "test_prometheus.py",
+        "validate.py",
+        "//tools/remote-execution/node_exporter:com.brianduff.node_exporter.plist",
+        "//tools/remote-execution/node_exporter:run-macos.sh",
+        "//tools/remote-execution/node_exporter:setup-macos.sh",
+        "//tools/remote-execution/node_exporter:setup-ubuntu.sh",
+    ],
+)
