@@ -22,7 +22,10 @@
 #        action takes stable-status.txt (which carries the commit sha) as an
 #        input and recompiles on every commit. Under any verb (`build`,
 #        `common`, `test`) and any config (`build:ci`, ...) it is allowed only
-#        in `build:release`.
+#        in `build:release`. `--config=release` is what the boss-release
+#        step and installer:release pass so build_info_rs embeds the tagged
+#        version; check builds stay unstamped and keep the 0.0.0-dev
+#        placeholder.
 #
 # Pure bash on purpose: the hermetic test wrapper strips PATH, and reading a
 # file with `$(<file)` needs no external tool.

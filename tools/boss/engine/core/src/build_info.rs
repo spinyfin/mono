@@ -4,12 +4,14 @@
 //! problem ("you merged the fix but rebuilt this morning's engine?")
 //! is immediately visible without guessing.
 //!
-//! BOSS_VERSION (the numeric, tag-derived base version, e.g. "1.0.4") is
-//! stamped at Bazel build time via workspace-status.sh + the
-//! build_info_rs genrule, threaded through compile_data + $(execpath) in
+//! BOSS_VERSION is stamped at Bazel build time via workspace-status.sh +
+//! the build_info_rs rule, threaded through compile_data + $(execpath) in
 //! rustc_env, and included directly into engine_lib's own compilation
-//! (`build_info_stamp` below). Cargo builds fall back to "unknown" via
-//! build.rs.
+//! (`build_info_stamp` below). Unstamped (check / developer) builds get
+//! the constant `"0.0.0-dev"` so a new `boss-v*` tag does not rebuild
+//! this crate or its tests; `--config=release` (`--stamp`) embeds the
+//! numeric tag-derived base version (e.g. `"1.0.4"`). Cargo builds fall
+//! back to `"unknown"` via build.rs.
 //!
 //! [`version`], [`git_sha`], [`git_dirty`], and [`build_time`] are NOT
 //! compiled into this crate. The per-commit / per-build values live in
@@ -131,9 +133,10 @@ pub fn install_provenance(provenance: Provenance) -> Result<(), Provenance> {
 
 /// Format the canonical `--version` string for a bundled Boss binary.
 ///
-/// Output: `<name> <version>`, e.g. `boss-engine 1.0.4`. The numeric
-/// tag-derived base version is cache-stable (see `build_info_rs`); the
-/// full `1.0.N-dev-<sha>` identity is [`version`].
+/// Output: `<name> <version>`, e.g. `boss-engine 1.0.4` on a stamped
+/// release build, `boss-engine 0.0.0-dev` otherwise. The unstamped
+/// placeholder is cache-stable across `boss-v*` tags (see `build_info_rs`);
+/// the full `1.0.N-dev-<sha>` identity is [`version`].
 pub fn version_string(binary_name: &str) -> String {
     format!("{binary_name} {}", build_info_stamp::BOSS_VERSION)
 }
@@ -363,6 +366,19 @@ mod tests {
         assert_eq!(stamped_or_unknown("unknown"), "unknown");
         assert_eq!(stamped_or_unknown("1.0.694"), "1.0.694");
         assert_eq!(stamped_or_unknown("1.0.694-dev-abc"), "1.0.694-dev-abc");
+    }
+
+    #[test]
+    fn version_string_is_placeholder_when_unstamped() {
+        // engine_lib_test is an unstamped rust_test, so Bazel injects the
+        // constant 0.0.0-dev placeholder. Cargo points BOSS_BUILD_INFO_RS at
+        // build_info_default.rs ("unknown"). A --stamp / stamp=1 build is
+        // covered by //tools/boss/installer:build_info_stamp_test.
+        let s = version_string("boss-engine");
+        assert!(
+            s == "boss-engine 0.0.0-dev" || s == "boss-engine unknown",
+            "unstamped --version must be the placeholder, got {s}"
+        );
     }
 
     #[test]

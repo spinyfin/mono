@@ -76,6 +76,9 @@ echo "[boss-release] credentials loaded (APP_ID=[REDACTED])"
 # Prints the tag on stdout, or nothing when this run is a no-op (exit 0).
 # The tag is pushed before the build so workspace-status.sh can
 # `git describe --exact-match` and stamp the binary with 1.0.N.
+# `--config=release` turns on `--stamp` so build_info_rs and the
+# version plist consume that tag; check builds stay on the 0.0.0-dev
+# placeholder and keep their action cache across releases.
 log "[boss-release] prepare"
 TAG="$(bin/release prepare --config "${CONFIG}")"
 if [[ -z "${TAG}" ]]; then
@@ -94,12 +97,13 @@ tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 # compile action's cache key + env (option_env! reads them at compile time);
 # --action_env alone does not affect the rustc action.
 #
-# CRITICAL: the build flags below (especially -c opt) change the output
-# directory bazel-out is configured into. The path-discovery cquery MUST use
-# the IDENTICAL flag set, otherwise it resolves a different configuration's
-# output dir — specifically the credential-free `fastbuild` Boss.zip left
-# behind by the mac-app-build step (`bazel build //tools/boss/app-macos/...`,
-# no -c opt, no creds) — and the smoke test ends up verifying the wrong binary.
+# CRITICAL: the build flags below (especially -c opt and --config=release)
+# change the output directory bazel-out is configured into. The path-discovery
+# cquery MUST use the IDENTICAL flag set, otherwise it resolves a different
+# configuration's output dir — specifically the credential-free `fastbuild`
+# Boss.zip left behind by the mac-app-build step (`bazel build
+# //tools/boss/app-macos/...`, no -c opt, no creds, no --stamp) — and the
+# smoke test ends up verifying the wrong binary.
 # That mismatch is exactly what made every prior fix attempt "pass locally" but
 # fail in CI: the credentials were embedded correctly in the opt artifact, but
 # the smoke test extracted the fastbuild one. Keep BUILD_FLAGS the single
@@ -116,6 +120,7 @@ tools/boss/app-macos/scripts/stub-ghosttykit-xcframework.sh
 # This is plain `bazel build`, not bazel_verify_only: the zip is uploaded
 # below, so it has to be downloaded to the agent.
 BUILD_FLAGS=(
+  --config=release
   -c opt
   --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID"
   --define=BOSS_SHAKE_INSTALLATION_ID="$BOSS_SHAKE_INSTALLATION_ID"

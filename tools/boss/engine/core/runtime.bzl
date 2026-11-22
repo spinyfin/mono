@@ -72,7 +72,8 @@ def runtime_libraries():
             "//tools/boss/event-shim:src/main.rs",
             "//tools/boss/engine/driver:agy_blocked_marker_capture",
             "remote/boss-remote-run.sh",
-            # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+            # Build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
+            # Unstamped: 0.0.0-dev placeholder. --stamp: tag-derived version.
             # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
             "//tools/boss/installer:build_info_rs",
             # Read by boss_construct_scan.rs's self-test to assert the CHECKS.yaml
