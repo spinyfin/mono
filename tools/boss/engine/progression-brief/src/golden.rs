@@ -558,7 +558,7 @@ You are a restricted unstick agent. You hold no code checkout. Diagnose this stu
 Prerequisites:
 - (none)
 Dependents:
-- (none)
+- task_ID (chore, blocked, blocks)
 
 ## Executions (item and revision chain)
 
@@ -584,7 +584,7 @@ Parent PR (owned by chain root task_ID); this item is a revision.
 
 ### AI review
 
-- ai_review_state: not_reviewed
+- ai_review_state: (none)
 - review_cycle: 0
 - latest verdict: (none recorded; unknown, not clean)
 

@@ -179,12 +179,7 @@ pub(super) fn build(
             .chain(progression_wait.iter())
             .any(|reason| boss_engine_storage_values::dispatch_wait::is_capacity_wait_reason(reason));
         let progression = progression_runs.get(&id).copied().unwrap_or_default();
-        let dependency_cycle = shared.get(&id).is_some_and(|clauses| clauses.dependency_cycle);
-        let classification = if dependency_cycle {
-            "S4_dependency_cycle".into()
-        } else {
-            classification(conn, &task, wait.as_deref())?
-        };
+        let classification = classification(conn, &task, wait.as_deref())?;
         let dependency = task.blocked_reason.as_deref() == Some("dependency") && progressing_prerequisite(&id);
         let bucket = if parked_holder.is_some() {
             StuckBucket::Parked
@@ -215,8 +210,6 @@ pub(super) fn build(
             // inside the cooldown that follows a completed run (four times as long, capped at 24 hours, after a
             // run that judged the item not stuck).
             StuckBucket::ProgressionInFlight
-        } else if dependency_cycle {
-            StuckBucket::EngineStuck
         } else if super::stuck_activity::has_pending_execution(conn, &id)?
             || (super::stuck_activity::has_waiting_dependency_execution(conn, &id)? && progressing_prerequisite(&id))
         {
