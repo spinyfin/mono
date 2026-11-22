@@ -1140,7 +1140,7 @@ impl WorkDb {
     /// per-owner review projections from `caches` instead of rebuilding
     /// them from point queries. Returns exactly the tree the uncached path
     /// would for the same snapshot.
-    pub(crate) fn get_work_tree_cached(
+    pub fn get_work_tree_cached(
         &self,
         product_id: &str,
         trace: &mut PopulationTrace,

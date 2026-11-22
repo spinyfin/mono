@@ -173,6 +173,25 @@ pub(crate) fn latest_pr_review_attempt_sql(alias: &str, later: &str) -> String {
     )
 }
 
+/// SQL boolean over a `tasks` row (`task`) and its `work_executions` row
+/// (`exec`, with `later` as a free alias for the inner latest-attempt check):
+/// the task and execution form a dead `pr_review` recovery candidate. Shared by
+/// [`WorkDb::list_dead_pr_review_candidates`] and the board's `review_due`
+/// projection so both agree on eligibility, PR URL requirement, dead status,
+/// and latest-attempt selection.
+pub(crate) fn dead_pr_review_candidate_where_sql(task: &str, exec: &str, later: &str) -> String {
+    let eligible = dead_review_recovery_eligible_sql(task);
+    let dead = dead_pr_review_attempt_sql(exec);
+    let latest = latest_pr_review_attempt_sql(exec, later);
+    format!(
+        "({eligible}
+          AND NULLIF({task}.pr_url, '') IS NOT NULL
+          AND {exec}.kind = 'pr_review'
+          AND {dead}
+          AND {latest})"
+    )
+}
+
 /// SQL boolean over a `tasks` row aliased `task`: the review recovery sweep may
 /// act on it — live, not done/archived, not parked, not held by a positioning
 /// refusal, and not routed through batch admission by a deferred marker.
@@ -276,19 +295,23 @@ fn map_review_verdict(row: &rusqlite::Row) -> rusqlite::Result<ReviewVerdict> {
 /// displaces the real verdict as "latest" (which would, for example, make an
 /// already-reviewed head look unreviewed).
 fn latest_review_verdict_in(conn: &rusqlite::Connection, work_item_id: &str) -> Result<Option<ReviewVerdict>> {
-    conn.query_row(
+    let placeholders = (0..SKIPPED_GATE_OUTCOMES.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
         "SELECT id, execution_id, work_item_id, head_sha, findings_count,
                 revision_warranted, gate_outcome, revision_task_id, created_at
          FROM pr_review_verdicts
          WHERE work_item_id = ?1
-           AND gate_outcome NOT IN (?2, ?3)
+           AND gate_outcome NOT IN ({placeholders})
          ORDER BY created_at DESC, id DESC
-         LIMIT 1",
-        params![work_item_id, SKIPPED_GATE_OUTCOMES[0], SKIPPED_GATE_OUTCOMES[1]],
-        map_review_verdict,
-    )
-    .optional()
-    .map_err(Into::into)
+         LIMIT 1"
+    );
+    let params = std::iter::once(work_item_id).chain(SKIPPED_GATE_OUTCOMES.iter().copied());
+    conn.query_row(&sql, rusqlite::params_from_iter(params), map_review_verdict)
+        .optional()
+        .map_err(Into::into)
 }
 
 #[work_db_boundary::instrument]

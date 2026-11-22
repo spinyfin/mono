@@ -989,9 +989,7 @@ impl WorkDb {
     /// died," not "is a pr_review the single most recent row of any kind."
     pub fn list_dead_pr_review_candidates(&self) -> Result<Vec<DeadPrReviewCandidate>> {
         let conn = self.connect()?;
-        let eligible = super::review_verdicts::dead_review_recovery_eligible_sql("t");
-        let dead = super::review_verdicts::dead_pr_review_attempt_sql("we");
-        let latest = super::review_verdicts::latest_pr_review_attempt_sql("we", "we2");
+        let candidate_where = super::review_verdicts::dead_pr_review_candidate_where_sql("t", "we", "we2");
         // Releasing a never-started batch abandons its leaves and removes
         // their membership rows. The deferred marker (part of `eligible`)
         // routes those roots back through batch admission rather than minting
@@ -1003,11 +1001,7 @@ impl WorkDb {
             "SELECT t.id, we.id, we.status
              FROM tasks t INDEXED BY tasks_open_idx
              CROSS JOIN work_executions we ON we.work_item_id = t.id
-             WHERE {eligible}
-               AND t.pr_url IS NOT NULL AND t.pr_url != ''
-               AND we.kind = 'pr_review'
-               AND {dead}
-               AND {latest}
+             WHERE {candidate_where}
              ORDER BY t.updated_at ASC, t.id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;

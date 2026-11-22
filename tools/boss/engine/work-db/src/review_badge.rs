@@ -84,9 +84,10 @@ pub(super) fn fetch_current_heads(
 /// change) no longer counts as unresolved: nothing will ever re-review that
 /// unchanged head, so the badge would otherwise stay orange forever. It
 /// resolves to `review_not_required` once a skip verdict records that no review
-/// will run at that head, and to `not_reviewed` until then, the same state a
-/// commit-based fix shows until its new head is reviewed. A newer verdict for
-/// the same head still wins because it is selected before this check.
+/// will run at that head; until then it is `due_dependent`, yielding
+/// `not_reviewed` only while a review is due and `review_not_required`
+/// otherwise. A newer verdict for the same head still wins because it is
+/// selected before this check.
 pub(super) fn fetch_verdict_heads(
     conn: &Connection,
     ids: &[String],
@@ -119,6 +120,7 @@ pub(super) fn fetch_verdict_heads(
                 if skipped_at_head {
                     (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None)
                 } else {
+                    due_dependent = true;
                     (AI_REVIEW_STATE_NOT_REVIEWED, None)
                 }
             }
@@ -606,7 +608,7 @@ fn review_due_sql() -> String {
     let dead_we = super::review_verdicts::dead_pr_review_attempt_sql("we");
     let dead_we3 = super::review_verdicts::dead_pr_review_attempt_sql("we3");
     let latest_we = super::review_verdicts::latest_pr_review_attempt_sql("we", "we2");
-    let eligible = super::review_verdicts::dead_review_recovery_eligible_sql("root");
+    let candidate_where = super::review_verdicts::dead_pr_review_candidate_where_sql("cand", "we", "we2");
     let churn_cutoff = boss_engine_utils::epoch_time::now_epoch_secs() - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
     let churn_threshold = ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
     // Family probes start from the CTE and seek each member's executions /
@@ -624,22 +626,26 @@ fn review_due_sql() -> String {
                   AND ai.kind = 'pr_review_admission_deferred'
                   AND ai.status = 'open')";
     let latest_dead_pr_review = format!(
-        "EXISTS(SELECT 1 FROM work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
-                WHERE we.work_item_id = root.id AND we.kind = 'pr_review'
+        "EXISTS(SELECT 1 FROM family f
+                CROSS JOIN work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
+                  ON we.work_item_id = f.id AND we.kind = 'pr_review'
+                WHERE f.root = root.id
                   AND {dead_we} AND {latest_we})"
     );
     let recoverable_dead_pr_review = format!(
-        "(EXISTS(SELECT 1 FROM work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
-                 WHERE we.work_item_id = root.id AND we.kind = 'pr_review'
-                   AND {dead_we} AND {latest_we}
-                   AND NOT EXISTS(SELECT 1 FROM pr_review_batch_members m WHERE m.execution_id = we.id))
-          AND {eligible}
-          AND NOT {batch_owns}
-          AND (SELECT COUNT(*) FROM work_executions we3 INDEXED BY work_executions_item_kind_status_finished_idx
-               WHERE we3.work_item_id = root.id
-                 AND we3.kind = 'pr_review'
-                 AND CAST(we3.created_at AS INTEGER) >= {churn_cutoff}
-                 AND {dead_we3}) < {churn_threshold})"
+        "(NOT {batch_owns}
+          AND EXISTS(SELECT 1 FROM family f
+                     JOIN tasks cand ON cand.id = f.id
+                     CROSS JOIN work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
+                       ON we.work_item_id = cand.id
+                     WHERE f.root = root.id
+                       AND {candidate_where}
+                       AND NOT EXISTS(SELECT 1 FROM pr_review_batch_members m WHERE m.execution_id = we.id)
+                       AND (SELECT COUNT(*) FROM work_executions we3 INDEXED BY work_executions_item_kind_status_finished_idx
+                            WHERE we3.work_item_id = cand.id
+                              AND we3.kind = 'pr_review'
+                              AND CAST(we3.created_at AS INTEGER) >= {churn_cutoff}
+                              AND {dead_we3}) < {churn_threshold}))"
     );
     format!(
         "(NULLIF(root.pr_head_sha, '') IS NULL AND NOT {latest_dead_pr_review})

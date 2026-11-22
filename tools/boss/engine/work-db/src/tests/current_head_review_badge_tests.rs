@@ -373,13 +373,17 @@ fn current_head_review_badge_findings_revision_delivered_without_head_change_is_
         Some(boss_engine_storage_values::dispatch_wait::DISPATCH_WAIT_REASON_AWAITING_MERGE)
     );
     let delivered = card(&db, &product, &root);
-    assert_eq!(delivered.ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(delivered.ai_review_state.as_deref(), Some("review_not_required"));
     assert!(delivered.ai_review_findings_revision_id.is_none());
     let badge = delivered.ai_review_badge.unwrap();
-    assert_eq!(badge.label, "Findings addressed");
-    assert_eq!(badge.system_image, "checkmark.circle");
+    assert_eq!(badge.label, "No AI review scheduled");
+    assert_eq!(badge.system_image, "minus.circle");
     assert!(badge.tooltip.contains("Last reviewed h1"));
-    assert!(badge.tooltip.contains("No subsequent AI review is recorded"));
+    assert!(
+        badge
+            .tooltip
+            .contains("No AI review of the current PR head is running or scheduled")
+    );
     assert!(badge.tooltip.contains("(Review)"));
     let tree = db.get_work_tree(&product).unwrap();
     let revision_card = tree.tasks.iter().find(|row| row.id == revision).unwrap();
@@ -557,9 +561,31 @@ fn current_head_review_badge_findings_revision_delivered_unmoved_with_skip_is_no
     complete_revision_execution(&db, &revision, None);
     assert_eq!(
         card(&db, &product, &root).ai_review_state.as_deref(),
-        Some("not_reviewed"),
-        "without a skip verdict the unmoved head is still awaiting a decision"
+        Some("review_not_required"),
+        "without a skip verdict or any scheduled review, the unmoved head does not wait"
     );
+
+    let queued_review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&root)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_queued"),
+        "with a queued review, the unmoved head waits"
+    );
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'cancelled' WHERE id = ?1",
+            [&queued_review.id],
+        )
+        .unwrap();
 
     let execution = skip_execution(&db, &revision);
     db.record_skip_review_verdict(&execution, &root, Some("h1"), "skipped_noop")
@@ -668,6 +694,93 @@ fn dead_review_recovery_eligibility_matches_the_recovery_sweep() {
             "INSERT INTO pr_review_batches(id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at, generation, explicit)
              VALUES ('eq-batch', ?1, 'b', '{}', '1', 'pre_merge', 8010, 'https://github.com/spinyfin/mono/pull/8010', 'failed', 'other', '1', 9, 0)",
             [&root],
+        )
+        .unwrap();
+    assert!(!sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+}
+
+/// Legacy revision-owned dead reviews carry their own `pr_url` and execution
+/// on the revision child while batch ownership still resolves to the cycle
+/// root. The board projection and recovery sweep must agree on them too.
+#[test]
+fn dead_review_recovery_eligibility_matches_the_recovery_sweep_for_legacy_revision_owned_attempt() {
+    let db = WorkDb::open(temp_db_path("dead-review-legacy-revision-equivalence")).unwrap();
+    let product = make_revision_product(&db, "dead-review-legacy-revision-equivalence");
+    let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8011");
+    observe(&db, &root, Some("h1"), "success", "mergeable");
+
+    let revision = insert_revision_row(&db, &product, &root);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/spinyfin/mono/pull/8011' WHERE id = ?1",
+            [&revision],
+        )
+        .unwrap();
+
+    let dead = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(&revision)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("UPDATE work_executions SET status = 'failed' WHERE id = ?1", [&dead.id])
+        .unwrap();
+
+    let sweep_would_refire = |db: &WorkDb| {
+        db.list_dead_pr_review_candidates()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.work_item_id == revision)
+            && !db.pre_merge_batch_owns_review_recovery(&root).unwrap()
+    };
+
+    assert!(sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("not_reviewed")
+    );
+
+    // A failed newest batch on the cycle root takes ownership: neither re-fires.
+    db.connect()
+        .unwrap()
+        .execute(
+            "INSERT INTO pr_review_batches(id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at, generation, explicit)
+             VALUES ('eq-rev-batch', ?1, 'b', '{}', '1', 'pre_merge', 8011, 'https://github.com/spinyfin/mono/pull/8011', 'failed', 'other', '1', 9, 0)",
+            [&root],
+        )
+        .unwrap();
+    assert!(!sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+
+    // Removing the batch restores recovery; parking the revision child stops it.
+    db.connect()
+        .unwrap()
+        .execute("DELETE FROM pr_review_batches WHERE id = 'eq-rev-batch'", [])
+        .unwrap();
+    assert!(sweep_would_refire(&db));
+    assert_eq!(
+        card(&db, &product, &root).ai_review_state.as_deref(),
+        Some("not_reviewed")
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+            [&revision],
         )
         .unwrap();
     assert!(!sweep_would_refire(&db));
