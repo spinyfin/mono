@@ -442,6 +442,121 @@ def conversation_scratch_path(candidate, cwd, payload):
     return conversation_scratch_contains(canonical(candidate, cwd), base)
 
 
+SCRATCH_SAFE_PROGRAMS = frozenset((
+    "cat", "head", "tail", "wc", "ls", "echo", "printf", "true", "false", ":",
+    "pwd", "test", "[", "dirname", "basename", "cd", "pushd", "popd",
+))
+SHELL_PROGRAMS = frozenset(("sh", "bash", "zsh", "dash", "ksh"))
+COMMAND_DELIMS = frozenset(("&&", "||", ";", "|", "&", "|&"))
+WRAPPER_PROGRAMS = frozenset((
+    "env", "command", "builtin", "exec", "nohup", "stdbuf", "setsid",
+    "caffeinate", "time", "nice",
+))
+
+
+def lex_shell(text):
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def split_token_groups(tokens):
+    groups, current = [], []
+    for token in tokens:
+        if token in COMMAND_DELIMS:
+            if current:
+                groups.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def c_bodies(tokens):
+    bodies = []
+    for index, token in enumerate(tokens):
+        prog = os.path.basename(token.lstrip("({"))
+        if prog not in SHELL_PROGRAMS:
+            continue
+        for j, arg in enumerate(tokens[index + 1:], index + 1):
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and j + 1 < len(tokens):
+                bodies.append(tokens[j + 1])
+                break
+    return bodies
+
+
+def program_uses_pattern_file(tokens):
+    prog = os.path.basename(tokens[0].lstrip("({")) if tokens else ""
+    flags = {"grep": ("-f", "--file"), "rg": ("-f", "--file"), "sed": ("-f", "--file")}.get(prog, ())
+    for arg in tokens[1:]:
+        if arg == "--":
+            break
+        if arg in flags or any(arg.startswith(flag + "=") for flag in flags if flag.startswith("--")):
+            return True
+        if arg.startswith("-") and not arg.startswith("--"):
+            for flag in flags:
+                if len(flag) == 2 and flag[1] in arg[1:]:
+                    return True
+    return False
+
+
+def sed_is_scratch_safe(tokens):
+    has_n = False
+    for arg in tokens[1:]:
+        if arg == "--":
+            break
+        if arg in ("-i", "--in-place") or arg.startswith("--in-place="):
+            return False
+        if arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]:
+            return False
+        if arg in ("-n", "--quiet", "--silent") or (
+                arg.startswith("-") and not arg.startswith("--") and "n" in arg[1:]):
+            has_n = True
+    return has_n
+
+
+def group_program_tokens(tokens):
+    index = 0
+    while index < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]):
+        index += 1
+    while index < len(tokens) and os.path.basename(tokens[index].lstrip("({")) in WRAPPER_PROGRAMS:
+        index += 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            if tokens[index] == "--":
+                index += 1
+                break
+            index += 1
+    return tokens[index:]
+
+
+def group_is_scratch_safe(tokens):
+    rest = group_program_tokens(tokens)
+    if not rest:
+        return True
+    prog = os.path.basename(rest[0].lstrip("({"))
+    if prog in SCRATCH_SAFE_PROGRAMS:
+        return True
+    if prog in ("grep", "rg") and not program_uses_pattern_file(rest):
+        return True
+    if prog == "sed" and sed_is_scratch_safe(rest):
+        return True
+    return False
+
+
+def flatten_token_groups(tokens):
+    groups = []
+    for group in split_token_groups(tokens):
+        groups.append(group)
+        for body in c_bodies(group):
+            inner = lex_shell(body)
+            nested, _ = flatten_token_groups(inner)
+            groups.extend(nested)
+    return groups, True
+
+
 def main():
     raw_dir = os.environ.get("BOSS_DATA_DIR", "").strip()
     if not raw_dir:
@@ -476,7 +591,7 @@ def main():
     raw_command = ""
     tokens = []
     creates_link = False
-    plant_link = False
+    bash_groups = None
     if tool == "Bash":
         command = tool_input.get("command")
         if not isinstance(command, str):
@@ -486,26 +601,27 @@ def main():
             command = masked
         raw_command = command
         try:
-            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
+            tokens = lex_shell(command)
         except Exception:
             tokens = command.split()
-        candidates.extend(tokens)
+        try:
+            bash_groups, _ = flatten_token_groups(tokens)
+        except Exception:
+            emit("block", MALFORMED + " Detail: a nested -c body could not be parsed.")
+        for group in bash_groups:
+            candidates.extend(group)
         # Creating a link inside the conversation allowance is how a later
         # (or same-command) read walks out of scratch. `ln` / `cp -s` / `cp -l`
-        # never get the scratch skip. Interpreters, `mv`, `cp -a`/`-R`, tar,
-        # rsync and git can plant a link that lexical realpath of a missing
-        # scratch component will not follow, so those only skip existing paths.
-        for index, token in enumerate(tokens):
-            prog = os.path.basename(token.lstrip("({"))
-            if prog == "ln":
-                creates_link = True
-                break
-            rest = tokens[index + 1:]
-            if prog == "cp":
-                for w in rest:
+        # never get the scratch skip, including when wrapped in `bash -c`.
+        for group in bash_groups:
+            for index, token in enumerate(group):
+                prog = os.path.basename(token.lstrip("({"))
+                if prog == "ln":
+                    creates_link = True
+                    break
+                if prog != "cp":
+                    continue
+                for w in group[index + 1:]:
                     if w == "--":
                         break
                     clustered = w.startswith("-") and not w.startswith("--")
@@ -514,18 +630,10 @@ def main():
                     ):
                         creates_link = True
                         break
-                    if w in ("-a", "--archive", "-R", "-r", "--recursive", "-d", "--no-dereference") or w.startswith("--preserve") or (
-                        clustered and any(flag in w[1:] for flag in "aRrd")
-                    ):
-                        plant_link = True
                 if creates_link:
                     break
-            if prog in ("mv", "tar", "bsdtar", "gtar", "rsync", "git"):
-                plant_link = True
-            if re.fullmatch(r"(?:python|pypy|ipython)[0-9.]*[a-z]*", prog):
-                plant_link = True
-            if "symlink" in token or "os.link" in token or re.search(r"(?<![A-Za-z0-9_])link\s*\(", token):
-                plant_link = True
+            if creates_link:
+                break
         # Worker shells do not inherit BOSS_DATA_DIR. Any expansion of
         # $BOSS_DATA_DIR or ${BOSS_DATA_DIR} is therefore empty or
         # attacker-controlled, while expandvars still resolves this process's
@@ -550,19 +658,37 @@ def main():
         candidates.extend(patch_target_paths(patch))
 
     scratch_candidates = []
-    for candidate in candidates:
+
+    def consider(candidate, skip_scratch):
         try:
             resolved = canonical(candidate, cwd)
-            skip_scratch = (not creates_link) and conversation_scratch_path(candidate, cwd, payload)
-            if skip_scratch and plant_link and not os.path.lexists(resolved):
-                skip_scratch = False
-            if skip_scratch:
+            if skip_scratch and conversation_scratch_path(candidate, cwd, payload):
                 scratch_candidates.append(candidate)
-                continue
+                return
             if is_inside(resolved, data_dir):
                 emit("block", RECOVERY)
         except Exception:
-            continue
+            return
+
+    if bash_groups is not None:
+        seen = set()
+        for index, group in enumerate(bash_groups):
+            others_safe = all(group_is_scratch_safe(g) for i, g in enumerate(bash_groups) if i != index)
+            skip = (not creates_link) and others_safe
+            for candidate in group:
+                key = (index, candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                consider(candidate, skip)
+        named = [c for c in candidates if isinstance(c, str)]
+        for candidate in named:
+            if any(candidate in group for group in bash_groups):
+                continue
+            consider(candidate, not creates_link)
+    else:
+        for candidate in candidates:
+            consider(candidate, not creates_link)
 
     # Second, independent boundary: refuse to *start* a recursive walk of the
     # machine. A traversal rooted at /, at a home directory, or at a volume

@@ -140,6 +140,29 @@ fn conversation_allowance_is_scoped_in_both_path_and_substring_checks() {
     );
 }
 
+fn relative_from(from_dir: &Path, to: &Path) -> std::path::PathBuf {
+    let from = std::fs::canonicalize(from_dir).unwrap();
+    let to = if to.exists() {
+        std::fs::canonicalize(to).unwrap()
+    } else {
+        to.to_path_buf()
+    };
+    let mut cursor = from.as_path();
+    let mut up = std::path::PathBuf::new();
+    loop {
+        if to.starts_with(cursor) {
+            return up.join(to.strip_prefix(cursor).unwrap());
+        }
+        match cursor.parent() {
+            Some(parent) => {
+                up.push("..");
+                cursor = parent;
+            }
+            None => return up.join(&to),
+        }
+    }
+}
+
 #[test]
 fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
     let tmp = tempfile::tempdir().unwrap();
@@ -149,10 +172,19 @@ fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
     std::fs::write(data.join("state.db"), "secret\n").unwrap();
     let brain = tmp.path().join("brain");
     std::os::unix::fs::symlink(&sessions, &brain).unwrap();
-    std::os::unix::fs::symlink(&data, sessions.join("c1/scratch/up")).unwrap();
-    std::os::unix::fs::symlink(&data, tmp.path().join("prepared-up")).unwrap();
-    std::os::unix::fs::symlink(&data, tmp.path().join("prepared-link")).unwrap();
     let scratch = brain.join("c1/scratch");
+    // Relative target that, from tmp, stays outside data, but after a move
+    // into scratch resolves at data. Destination names are absent so the
+    // skip cannot lean on a pre-existing scratch/up link.
+    let to_data = relative_from(&scratch, &data);
+    std::os::unix::fs::symlink(&to_data, tmp.path().join("prepared-up")).unwrap();
+    std::os::unix::fs::symlink(&to_data, tmp.path().join("prepared-link")).unwrap();
+    std::fs::create_dir_all(sessions.join("c1/scratch/d")).unwrap();
+    std::fs::write(sessions.join("c1/scratch/d/state.db"), "decoy\n").unwrap();
+    std::fs::write(sessions.join("c1/scratch/file"), "decoy\n").unwrap();
+    let prepared_up = tmp.path().join("prepared-up");
+    let prepared_link = tmp.path().join("prepared-link");
+    let old_dir = tmp.path().join("old-d");
     for command in [
         format!("ln -s ../../../../../../.. {}/climb", scratch.display()),
         format!("echo ok\nln -s ../../../../../../.. {}/climb", scratch.display()),
@@ -176,14 +208,46 @@ fn link_creation_and_unmodeled_bracket_globs_do_not_skip_scratch() {
             scratch.display()
         ),
         format!(
-            "mv {} {}/up && cat {}/up/state.db",
-            tmp.path().join("prepared-up").display(),
+            "mv {} {}/planted && cat {}/planted/state.db",
+            prepared_up.display(),
             scratch.display(),
             scratch.display()
         ),
         format!(
-            "cp -a {} {}/up && cat {}/up/state.db",
-            tmp.path().join("prepared-link").display(),
+            "cp -a {} {}/planted-cp && cat {}/planted-cp/state.db",
+            prepared_link.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {} && mv {} {}/d && cat {}/d/state.db",
+            scratch.join("d").display(),
+            old_dir.display(),
+            prepared_up.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv -f {} {}/file && cat {}/file",
+            prepared_up.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "cp -a {} {}/file && cat {}/file",
+            prepared_link.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "ditto {} {}/planted-ditto && cat {}/planted-ditto/state.db",
+            prepared_up.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "bash -c 'mv {} {}/planted-bash' && cat {}/planted-bash/state.db",
+            prepared_up.display(),
             scratch.display(),
             scratch.display()
         ),

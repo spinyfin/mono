@@ -569,6 +569,9 @@ fn same_command_symlink_in_scratch_cannot_reach_protected_state() {
     let to_hooks = relative_from(&scratch, &hooks);
     std::os::unix::fs::symlink(&to_data, fx.workspace().join("prepared-up")).unwrap();
     std::os::unix::fs::symlink(&to_data, fx.workspace().join("prepared-link")).unwrap();
+    fs::create_dir_all(scratch.join("d")).unwrap();
+    fs::write(scratch.join("d/state.db"), "decoy\n").unwrap();
+    fs::write(scratch.join("file"), "decoy\n").unwrap();
     let home_scratch = format!("$HOME/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch");
     for command in [
         format!(
@@ -604,6 +607,38 @@ fn same_command_symlink_in_scratch_cannot_reach_protected_state() {
         format!(
             "cp -a {} {}/up && cat {}/up/state.db",
             fx.workspace().join("prepared-link").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/old-d && mv {} {}/d && cat {}/d/state.db",
+            scratch.join("d").display(),
+            fx.workspace().display(),
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv -f {} {}/file && cat {}/file",
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "cp -a {} {}/file && cat {}/file",
+            fx.workspace().join("prepared-link").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "ditto {} {}/planted && cat {}/planted/state.db",
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "bash -c 'mv {} {}/planted-bash' && cat {}/planted-bash/state.db",
+            fx.workspace().join("prepared-up").display(),
             scratch.display(),
             scratch.display()
         ),
@@ -729,6 +764,48 @@ fn python_bodies_cannot_open_settings_hooks_or_other_conversations() {
             "python3 - <<'PY'\nprint(open(\"{}/work dir/file.rs\").read())\nPY",
             scratch.display()
         ),
+    );
+    for command in [
+        r#"python3 -c 'print(open(os.path.expanduser("~/\x2egemini/config/hooks.json")).read())'"#.to_owned(),
+        r#"python3 -c 'print(open(os.path.expanduser("~/\u002egemini/config/hooks.json")).read())'"#.to_owned(),
+        r#"python3 -c 'print(open(os.path.expanduser("~/\056gemini/config/hooks.json")).read())'"#.to_owned(),
+        "python3 - <<'PY'\nprint(open(os.path.expanduser(\"~/\\x2egemini/config/hooks.json\")).read())\nPY".to_owned(),
+        "python3 - <<'PY'\nprint(open(os.path.expanduser(\"~/\\u002egemini/config/hooks.json\")).read())\nPY"
+            .to_owned(),
+        "python3 - <<'PY'\nprint(open(os.path.expanduser(\"~/\\056gemini/config/hooks.json\")).read())\nPY".to_owned(),
+        format!(
+            "cd {} && python3 -c 'print(open(\"../.system_generated/logs/transcript_full.jsonl\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "cd {} && python3 - <<'PY'\nprint(open(\"../.system_generated/logs/transcript_full.jsonl\").read())\nPY",
+            scratch.display()
+        ),
+        format!(
+            "cd {} && python3 -c 'print(open(\"../../../../../../../state.db\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "cd {} && python3 -c 'print(open(\"../../c2/scratch/x.py\").read())'",
+            scratch.display()
+        ),
+    ] {
+        let reason = assert_command_denied(&fx, &command);
+        assert!(
+            reason.contains("protected") || reason.contains("denied"),
+            "{command}: {reason}"
+        );
+    }
+    assert_command_allowed(&fx, "cat <<'EOF'\n~/.gemini/config/hooks.json\nsymlink\nEOF");
+    assert_command_allowed(&fx, "cat <<<'symlink ~/.gemini/config/hooks.json'");
+    assert_command_allowed(
+        &fx,
+        "python3 -c 'from pathlib import Path; print(Path(\"x\").is_symlink())'",
+    );
+    assert_command_allowed(&fx, "python3 -c 'import os; os.stat(\"x\", follow_symlinks=False)'");
+    assert_command_allowed(
+        &fx,
+        &format!("grep -rn symlink src && cat {}/lib.rs", scratch.display()),
     );
 }
 

@@ -9,6 +9,7 @@ is not an authorization. Never emit allow, ask, or force_ask.
 The engine probes this installed command with harmless sentinels and checks
 content binding. Native SessionStart is not a pre-prompt readiness signal.
 """
+import codecs
 import glob
 import hashlib
 import json
@@ -528,7 +529,9 @@ def nested_shell_bodies(group):
 PYTHON_PROGRAM_RE = re.compile(r"(?:python|pypy|ipython)[0-9.]*[a-z]*")
 PYTHON_PATH_ESCAPE_RE = re.compile(r"\\(?:x|u|U|N|[0-7])")
 PYTHON_DOTDOT_TOKEN_RE = re.compile(r"(?:^|[/\\'\"\s])\.\.(?:[/\\'\"\s]|$)")
-PYTHON_LINK_RE = re.compile(r"symlink(?:_to)?|os\s*\.\s*link|(?<![A-Za-z0-9_])link\s*\(")
+PYTHON_LINK_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:os\s*\.\s*)?(?:symlink|link)\s*\(|(?:symlink_to|hardlink_to)\s*\("
+)
 PYTHON_JOIN_RE = re.compile(r"(?:os\s*\.\s*path\s*\.\s*join|pathlib\s*\.\s*Path|(?<![A-Za-z0-9_])Path)\s*\(")
 PYTHON_PATH_DIV_RE = re.compile(r"/\s*['\"]\.\.|\.\.['\"]\s*/")
 
@@ -562,6 +565,11 @@ def python_c_bodies_after(rest, start):
     return bodies
 
 
+def group_runs_python(group):
+    rest = strip_prefixes(group)
+    return any(is_python_program(os.path.basename(arg)) for arg in rest)
+
+
 def python_inline_bodies(group):
     rest = strip_prefixes(group)
     # Launchers such as uv/poetry/pipx can precede the interpreter, and
@@ -571,6 +579,10 @@ def python_inline_bodies(group):
     for start, arg in enumerate(rest):
         if is_python_program(os.path.basename(arg)):
             bodies.extend(python_c_bodies_after(rest, start))
+    # Heredocs and here-strings are Python source only when this group is a
+    # Python consumer. The same text fed to cat/tee is data.
+    if not group_runs_python(group):
+        return bodies
     body = getattr(group, "body", "") or ""
     if body:
         bodies.append(body)
@@ -581,10 +593,9 @@ def python_inline_bodies(group):
 
 
 def python_group_source_bodies(group):
+    if not group_runs_python(group):
+        return []
     bodies = list(python_inline_bodies(group))
-    rest = strip_prefixes(group)
-    if not any(is_python_program(os.path.basename(arg)) for arg in rest):
-        return bodies
     for source in getattr(group, "pipe_sources", None) or []:
         if source:
             bodies.append(shlex.join(list(source)))
@@ -664,6 +675,21 @@ def allowed_scratch_spellings(policy):
     return unique
 
 
+PYTHON_UNESCAPE_RE = re.compile(
+    r"\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{1,3}|N\{[^}]+\})"
+)
+
+
+def python_unescape_string(content):
+    def repl(match):
+        try:
+            return codecs.decode(match.group(0), "unicode_escape")
+        except Exception:
+            return match.group(0)
+
+    return PYTHON_UNESCAPE_RE.sub(repl, content)
+
+
 def python_literal_escapes_scratch(content, spellings):
     for spelling in spellings:
         if not spelling or spelling not in content:
@@ -683,24 +709,57 @@ def python_literal_escapes_scratch(content, spellings):
     return False
 
 
-def python_body_touches_protected(body, policy):
+def python_cwd_needs_traversal_scan(cwd, policy):
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    try:
+        resolved = os.path.realpath(cwd)
+    except Exception:
+        return True
+    if within_conversation_scratch(resolved, policy):
+        return True
+    workspace = policy.get("workspace_path")
+    if isinstance(workspace, str) and workspace:
+        try:
+            return resolved != os.path.realpath(workspace)
+        except Exception:
+            return True
+    return True
+
+
+def python_body_has_traversal(body, spellings):
+    if PYTHON_PATH_ESCAPE_RE.search(body) or PYTHON_DOTDOT_TOKEN_RE.search(body):
+        return True
+    if PYTHON_JOIN_RE.search(body) and ".." in body:
+        return True
+    if PYTHON_PATH_DIV_RE.search(body):
+        return True
+    contents = python_string_contents(body)
+    if any(python_literal_escapes_scratch(content, spellings) for content in contents):
+        return True
+    for content in contents:
+        decoded = python_unescape_string(content)
+        if decoded != content and (
+                python_literal_escapes_scratch(decoded, spellings) or PYTHON_DOTDOT_TOKEN_RE.search(decoded)):
+            return True
+    return False
+
+
+def python_body_touches_protected(body, policy, cwd=None):
     # Literal scan only: the body is Python, so `$()` is not shell. Mask this
     # run's allowed scratch/steps/tasks spellings first so a body that opens
     # `{scratch}/lib.rs` stays allowed. Scratch-adjacent `..`, escapes that
     # can spell `.` or `/`, and link creation are denied because a glued
     # `[^\s"']*` suffix misses whitespace, `\x2e`, adjacent literals and
-    # `os.path.join`.
+    # `os.path.join`. Decode string literals before the needle scan so
+    # `\x2e` / `\056` / `\u002e` cannot hide `.gemini`. When the tracked cwd
+    # is inside scratch (or anywhere other than the workspace), apply the
+    # traversal rules to the whole body, including relative `..`.
     if python_body_creates_link(body):
         return True
     spellings = allowed_scratch_spellings(policy)
-    if any(spelling and spelling in body for spelling in spellings):
-        if PYTHON_PATH_ESCAPE_RE.search(body) or PYTHON_DOTDOT_TOKEN_RE.search(body):
-            return True
-        if PYTHON_JOIN_RE.search(body) and ".." in body:
-            return True
-        if PYTHON_PATH_DIV_RE.search(body):
-            return True
-        if any(python_literal_escapes_scratch(content, spellings) for content in python_string_contents(body)):
+    if python_cwd_needs_traversal_scan(cwd, policy) or any(spelling and spelling in body for spelling in spellings):
+        if python_body_has_traversal(body, spellings):
             return True
     text = body
     for spelling in spellings:
@@ -713,13 +772,24 @@ def python_body_touches_protected(body, policy):
         gemini = os.path.join(process_home, ".gemini")
         needles.extend(protected_spellings(gemini))
         needles.extend(["~/.gemini", "$HOME/.gemini", "${HOME}/.gemini"])
-    for needle in needles:
-        if needle and needle in text:
-            return True
+    def mask_scratch(blob):
+        for spelling in spellings:
+            blob = blob.replace(spelling, "ALLOWED_SCRATCH")
+        return blob
+
+    decoded = [python_unescape_string(content) for content in python_string_contents(body)]
+    haystacks = [text]
+    haystacks.extend(mask_scratch(blob) for blob in decoded)
+    if decoded:
+        haystacks.append(mask_scratch("".join(decoded)))
     conv = policy.get("conversation_id")
-    for match in re.finditer(r"(?:antigravity-cli/)?brain[/\\]([A-Za-z0-9][A-Za-z0-9_-]{0,127})", text):
-        if not isinstance(conv, str) or match.group(1) != conv:
-            return True
+    for haystack in haystacks:
+        for needle in needles:
+            if needle and needle in haystack:
+                return True
+        for match in re.finditer(r"(?:antigravity-cli/)?brain[/\\]([A-Za-z0-9][A-Za-z0-9_-]{0,127})", haystack):
+            if not isinstance(conv, str) or match.group(1) != conv:
+                return True
     return False
 
 
@@ -1038,7 +1108,7 @@ def within_conversation_scratch(resolved, policy):
 def path_is_protected(path, policy, cwd=None, pre_expanded=False, trust_missing_scratch=True):
     expanded = resolve_path(path, policy, cwd, pre_expanded=pre_expanded)
     if within_conversation_scratch(expanded, policy):
-        if trust_missing_scratch or os.path.lexists(expanded):
+        if trust_missing_scratch:
             return False
     for root in policy.get("protected_paths", []):
         for spelling in protected_spellings(root):
@@ -1414,31 +1484,77 @@ def cp_preserves_links(rest):
     return False
 
 
-LINK_MOVE_PROGRAMS = {"ln", "mv", "tar", "bsdtar", "gtar", "rsync", "git"}
+SCRATCH_SAFE_PROGRAMS = {
+    "cat", "head", "tail", "wc", "ls", "echo", "printf", "true", "false", ":",
+    "pwd", "test", "[", "dirname", "basename", "cd", "pushd", "popd",
+}
 
 
-def group_may_create_or_move_link(rest):
-    if not rest:
+def program_uses_pattern_file(rest):
+    program = os.path.basename(rest[0]) if rest else ""
+    flags = FILE_FLAGS.get(program, ())
+    if not flags:
         return False
+    for arg in rest[1:]:
+        if arg == "--":
+            break
+        if arg in flags:
+            return True
+        if any(arg.startswith(flag + "=") for flag in flags if flag.startswith("--")):
+            return True
+        if arg.startswith("-") and not arg.startswith("--"):
+            for flag in flags:
+                if len(flag) == 2 and flag[1] in arg[1:]:
+                    return True
+    return False
+
+
+def sed_is_scratch_safe(args):
+    has_n = False
+    for arg in args:
+        if arg == "--":
+            break
+        if arg in ("-i", "--in-place") or arg.startswith("--in-place="):
+            return False
+        if arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]:
+            return False
+        if arg in ("-n", "--quiet", "--silent") or (
+                arg.startswith("-") and not arg.startswith("--") and "n" in arg[1:]):
+            has_n = True
+    return has_n
+
+
+def group_is_scratch_safe(group):
+    rest = strip_prefixes(group)
+    if not rest:
+        return True
     program = os.path.basename(rest[0])
-    if program in LINK_MOVE_PROGRAMS:
+    if program in SCRATCH_SAFE_PROGRAMS:
         return True
-    if program == "cp" and (cp_creates_links(rest) or cp_preserves_links(rest)):
+    if program in ("grep", "rg") and not program_uses_pattern_file(rest):
         return True
-    if is_python_program(program):
+    if program == "sed" and sed_is_scratch_safe(rest[1:]):
         return True
     return False
 
 
-def command_may_create_or_move_link(groups):
-    for group in groups:
-        rest = strip_prefixes(group)
-        if group_may_create_or_move_link(rest):
-            return True
-        joined = " ".join(group)
-        if "symlink" in joined or PYTHON_LINK_RE.search(joined):
-            return True
-    return False
+def nested_command_groups(group):
+    nested = []
+    for body in nested_shell_bodies(group):
+        inner = command_groups(body)
+        nested.extend(inner)
+        for child in inner:
+            nested.extend(nested_command_groups(child))
+    return nested
+
+
+def other_groups_are_scratch_safe(groups, index):
+    others = []
+    for i, group in enumerate(groups):
+        if i != index:
+            others.append(group)
+        others.extend(nested_command_groups(group))
+    return all(group_is_scratch_safe(group) for group in others)
 
 
 def link_creation_touches_protected(rest, policy, current):
@@ -1494,8 +1610,7 @@ def command_touches_protected(command, policy, cwd):
     current = cwd
     groups = command_groups(command)
     reject_trusted_rebinding(command, groups)
-    trust_missing_scratch = not command_may_create_or_move_link(groups)
-    for group in groups:
+    for group_index, group in enumerate(groups):
         rest = strip_prefixes(group)
         inner = stdin_argv_program(group)
         if inner is not None and inner not in STDIN_ARGV_SAFE:
@@ -1507,8 +1622,12 @@ def command_touches_protected(command, policy, cwd):
         # shell. Protected-root spellings in those bodies are scanned by
         # python_body_touches_protected.
         for body in python_group_source_bodies(group):
-            if python_body_touches_protected(body, policy):
+            if python_body_touches_protected(body, policy, current):
                 return True
+        # Scratch operands are trusted only when every other group, including
+        # nested shell bodies, is a read-only program. Existence at check
+        # time is not trust: an earlier group can replace the path.
+        trust_missing_scratch = other_groups_are_scratch_safe(groups, group_index)
         rest_ids = strip_prefix_indices(group)
         program_index = rest_ids[0] if rest_ids else None
         for index, role in sorted(path_operand_positions(group).items()):
@@ -1533,6 +1652,8 @@ def command_touches_protected(command, policy, cwd):
                 # after `cd` into scratch. Missing-scratch distrust applies to
                 # real operands (`cat up/state.db`), not to `python3` itself.
                 token_trust = trust_missing_scratch or index == program_index
+                if program in ("cd", "pushd", "popd"):
+                    token_trust = True
                 if candidate and not candidate.startswith('&') and operand_touches_protected(
                         candidate, policy, current, program, is_redirect, cand_literal, cand_segments,
                         token_trust):
@@ -1550,7 +1671,10 @@ def command_touches_protected(command, policy, cwd):
             if "$" in expanded:
                 return True
             current = resolve_path(expanded, policy, current, pre_expanded=True)
-            if path_is_protected(current, policy, pre_expanded=True, trust_missing_scratch=trust_missing_scratch):
+            # realpath already follows a planted link out of scratch. Trust
+            # the conversation directory itself so `cd <scratch> && python3`
+            # keeps a tracked cwd for the Python scan.
+            if path_is_protected(current, policy, pre_expanded=True, trust_missing_scratch=True):
                 return True
         for body in nested_shell_bodies(group):
             if command_touches_protected(body, policy, current):
