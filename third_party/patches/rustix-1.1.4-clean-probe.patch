@@ -1,0 +1,27 @@
+diff --git a/build.rs b/build.rs
+--- a/build.rs
++++ b/build.rs
+@@ -261,7 +261,7 @@
+         .arg("--target")
+         .arg(target)
+         .arg("-o")
+-        .arg(out_file)
++        .arg(&out_file)
+         .stdout(Stdio::null()); // We don't care about the output (only whether it builds or not)
+ 
+     // If Cargo wants to set RUSTFLAGS, use that.
+@@ -285,5 +285,13 @@
+ 
+     writeln!(child.stdin.take().unwrap(), "{}", test.as_ref()).unwrap();
+ 
+-    child.wait().unwrap().success()
++    let success = child.wait().unwrap().success();
++    // Only the compilation result is used. Leaving metadata in OUT_DIR
++    // makes Bazel propagate incidental compiler bytes to every consumer.
++    match std::fs::remove_file(&out_file) {
++        Ok(()) => {}
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++        Err(error) => panic!("could not remove feature probe: {error}"),
++    }
++    success
+ }

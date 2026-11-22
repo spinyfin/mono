@@ -41,6 +41,8 @@ bazel_verify_only test --test_output=errors \
   --execution_log_json_file="${evidence_dir}/test-execution.json" \
   --profile="${evidence_dir}/test-profile.json.gz" \
   //tools/boss/cli:boss_test //tools/boss/build-info:build-info_test
+cp bazel-out/stable-status.txt "${evidence_dir}/bazel-stable-status.txt"
+cp bazel-out/volatile-status.txt "${evidence_dir}/bazel-volatile-status.txt"
 buildkite-agent artifact upload "${evidence_dir}/*"
 if (( role == 0 )); then
   buildkite-agent meta-data set "${probe_key}-result" passed
