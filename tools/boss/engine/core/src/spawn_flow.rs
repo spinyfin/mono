@@ -1065,3 +1065,59 @@ pub fn viewer_attach_failure_reason(response: &EngineToAppResponse) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod checkleft_bin_env_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn env_with_worker_bin(dir: &Path) -> Vec<EnvVar> {
+        vec![EnvVar {
+            key: boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
+            value: dir.display().to_string(),
+        }]
+    }
+
+    #[test]
+    fn undeclared_workspace_does_not_export_checkleft_bin() {
+        let workspace = TempDir::new().unwrap();
+        let worker_bin = TempDir::new().unwrap();
+        let mut env = env_with_worker_bin(worker_bin.path());
+        apply_checkleft_bin_env(&mut env, workspace.path());
+        assert!(
+            !env.iter().any(|e| e.key == boss_engine_worker_bin::CHECKLEFT_BIN_ENV),
+            "a repository without a REPOBIN.toml checkleft declaration must retain PATH behaviour",
+        );
+    }
+
+    #[test]
+    fn declared_checkleft_exports_the_worker_bin_launcher() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("REPOBIN.toml"), "[tools.checkleft]\n").unwrap();
+        let worker_bin = TempDir::new().unwrap();
+        std::fs::write(worker_bin.path().join("checkleft"), b"#!/bin/sh\n").unwrap();
+        let mut env = env_with_worker_bin(worker_bin.path());
+        apply_checkleft_bin_env(&mut env, workspace.path());
+        let expected = worker_bin.path().join("checkleft").display().to_string();
+        assert_eq!(
+            env.iter()
+                .find(|e| e.key == boss_engine_worker_bin::CHECKLEFT_BIN_ENV)
+                .map(|e| e.value.as_str()),
+            Some(expected.as_str()),
+            "declared checkleft must name the worker-bin launcher",
+        );
+    }
+
+    #[test]
+    fn declared_checkleft_without_a_written_launcher_is_not_exported() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("REPOBIN.toml"), "[tools.checkleft]\n").unwrap();
+        let worker_bin = TempDir::new().unwrap();
+        let mut env = env_with_worker_bin(worker_bin.path());
+        apply_checkleft_bin_env(&mut env, workspace.path());
+        assert!(
+            !env.iter().any(|e| e.key == boss_engine_worker_bin::CHECKLEFT_BIN_ENV),
+            "must not export CHECKLEFT_BIN when the launcher file was never written",
+        );
+    }
+}
