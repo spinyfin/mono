@@ -28,6 +28,25 @@ fn enable_pr_created_and_run_done_seams() -> (Arc<crate::feature_flags::FeatureF
     (flags, flags_dir)
 }
 
+/// `source` values on `finalize_pr_transition`'s terminalize/teardown log
+/// for `execution_id`. SHA-delta and the proposal arm produce the same URL,
+/// detector-zero, fallback-zero, and head-stamp outcomes for a matching-URL
+/// revision, so tests that must prove `stop_proposal` inspect this instead.
+fn terminalized_finalize_sources(captured: &str, execution_id: &str) -> Vec<String> {
+    captured
+        .lines()
+        .filter(|line| {
+            line.contains(execution_id) && line.contains("pr completion: execution terminalized; teardown in flight")
+        })
+        .filter_map(|line| {
+            line.split_whitespace().find_map(|tok| {
+                tok.strip_prefix("source=")
+                    .map(|value| value.trim_matches('"').to_owned())
+            })
+        })
+        .collect()
+}
+
 /// Proposal path wins over the cold-reconstruction ladder — and, because
 /// this test never populates `StagedPrUrlCache` (the default empty cache,
 /// exactly what an engine restart between the worker's `cube pr create` and
@@ -751,6 +770,8 @@ async fn pr_created_proposal_for_revision_matching_bound_pr_finalizes_on_stop() 
     verifier
         .set_head_oid(Ok("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()))
         .await;
+    let logs = crate::test_support::log_capture::install();
+    let log_offset = logs.lock().len();
     let outcome = handler
         .with_feature_flags(flags)
         .with_metrics(metrics.clone())
@@ -763,6 +784,15 @@ async fn pr_created_proposal_for_revision_matching_bound_pr_finalizes_on_stop() 
             StopOutcome::PrDetected { pr_url } | StopOutcome::ReviewerEnqueued { pr_url } if pr_url == bound_pr_url
         ),
         "a revision declaring its chain-root PR must finalize via the proposal, got {outcome:?}",
+    );
+    let captured = String::from_utf8_lossy(&logs.lock()[log_offset..]).into_owned();
+    assert_eq!(
+        terminalized_finalize_sources(&captured, &execution_id),
+        vec![crate::PR_CREATED_PROPOSAL_STOP_SOURCE.to_owned()],
+        "this fixture must finalize through the proposal arm (`{}`); \
+         SHA-delta would also stamp the head, skip the detector, and leave the fallback counter at 0. \
+         captured:\n{captured}",
+        crate::PR_CREATED_PROPOSAL_STOP_SOURCE,
     );
     assert_eq!(detector.call_count(), 0);
     assert_eq!(
@@ -804,19 +834,28 @@ async fn pr_created_proposal_for_revision_falls_through_when_the_contribution_ga
 
     let (flags, _flags_dir) = enable_pr_created_seam();
     let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+    let logs = crate::test_support::log_capture::install();
+    let log_offset = logs.lock().len();
     let outcome = handler
         .with_feature_flags(flags)
-        .with_branch_verifier(verifier.clone())
+        .with_branch_verifier(verifier)
         .on_stop(&execution_id)
         .await;
+    assert_eq!(
+        outcome,
+        StopOutcome::AwaitingInput,
+        "an unchanged head must refuse the proposal arm and land on the SHA-delta no-contribution nudge, got {outcome:?}",
+    );
+    let captured = String::from_utf8_lossy(&logs.lock()[log_offset..]).into_owned();
     assert!(
-        !matches!(&outcome, StopOutcome::ReviewerEnqueued { pr_url } if pr_url == bound_pr_url),
-        "an unchanged head must not finalize the revision via the proposal arm, got {outcome:?}",
+        captured.lines().any(|line| line.contains(&execution_id)
+            && line.contains("proposal-URL finalize refused by revision contribution gate")),
+        "the proposal arm must refuse and fall through; captured:\n{captured}",
     );
     assert!(
-        verifier.head_oid_calls_snapshot().len() >= 3,
-        "contribution-gate refuse must fall through to SHA-delta, which fetches the head again; got {:?}",
-        verifier.head_oid_calls_snapshot(),
+        terminalized_finalize_sources(&captured, &execution_id).is_empty(),
+        "contribution-gate refuse must not terminalize via `{}` or any other finalize source; captured:\n{captured}",
+        crate::PR_CREATED_PROPOSAL_STOP_SOURCE,
     );
     match db.get_work_item(&revision_id).unwrap() {
         WorkItem::Task(task) => assert_eq!(task.status, TaskStatus::Active),

@@ -1259,28 +1259,23 @@ impl WorkerCompletionHandler {
         let row_existed = !proposals.is_empty();
         let Some(applied) = proposals.iter().find(|p| p.state == ProposalState::Applied) else {
             if let Some(latest) = proposals.first() {
-                match latest.state {
-                    ProposalState::Rejected => {
-                        tracing::info!(
-                            execution_id,
-                            proposal_id = %latest.id,
-                            reason = latest.decision_reason.as_deref().unwrap_or("no reason recorded"),
-                            "pr_created_proposals_seam: newest pr_created proposal was rejected at submission \
-                             and no Applied row remains; falling back to the legacy ladder",
-                        );
-                    }
-                    ProposalState::Proposed | ProposalState::Superseded | ProposalState::Expired => {
-                        tracing::warn!(
-                            execution_id,
-                            proposal_id = %latest.id,
-                            state = %latest.state,
-                            "pr_created_proposals_seam: newest pr_created proposal is unexpectedly not \
-                             Applied/Rejected and no Applied row remains; falling back to the legacy ladder",
-                        );
-                    }
-                    ProposalState::Applied => {
-                        unreachable!("find() already skipped Applied rows");
-                    }
+                if latest.state == ProposalState::Rejected {
+                    tracing::info!(
+                        execution_id,
+                        proposal_id = %latest.id,
+                        state = %latest.state,
+                        reason = latest.decision_reason.as_deref().unwrap_or("no reason recorded"),
+                        "pr_created_proposals_seam: newest pr_created proposal was rejected at submission \
+                         and no Applied row remains; falling back to the legacy ladder",
+                    );
+                } else {
+                    tracing::warn!(
+                        execution_id,
+                        proposal_id = %latest.id,
+                        state = %latest.state,
+                        "pr_created_proposals_seam: newest pr_created proposal is unexpectedly not \
+                         Applied/Rejected and no Applied row remains; falling back to the legacy ladder",
+                    );
                 }
             }
             return (None, row_existed);

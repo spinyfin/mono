@@ -949,20 +949,24 @@ fn supersede_prior_automation_outcomes(tx: &Transaction<'_>, execution_id: &str,
 
 /// `pr_created` auto-applies with verification mirroring the legacy
 /// hook-observed path: URL shape + product-repo slug
-/// ([`boss_github::pr_url::validate_pr_url`]) and,
-/// when the worker supplied a `branch`, a branch-name match against the
-/// execution ([`boss_engine_storage_values::branch_identity::expected_branch_name`] /
-/// [`boss_engine_storage_values::branch_identity::branches_identify_same_work_item`] — the same
-/// prefix-agnostic suffix match `verified_staged_pr_url` uses,
-/// `completion.rs:1248`).
+/// ([`boss_github::pr_url::validate_pr_url`]) and, when a non-revision
+/// worker supplied a `branch`, a branch-name match against this execution
+/// plus the work item's other primary-execution branches
+/// ([`boss_engine_storage_values::branch_identity::expected_branch_name`] /
+/// [`boss_engine_storage_values::branch_identity::head_identifies_any_branch`]
+/// — the same prefix-agnostic suffix match Stop-time `verified_staged_pr_url`
+/// uses). A revision's optional `branch` is not compared: revisions push to
+/// the chain root's branch, which is never this execution's expected name,
+/// and Stop identifies a revision by bound-PR URL equality.
 ///
 /// Unlike `verified_staged_pr_url`, this cannot make the async GitHub API
 /// call that verifies a PR's actual head ref — appliers run synchronously
 /// inside a DB transaction. The branch check here is therefore a pure,
 /// synchronous string comparison against the worker-supplied `branch` field;
-/// when the worker omits it, only the URL/repo check runs. The full
-/// network-verified check stays at Stop-time finalization, which reads this
-/// proposal row instead of the in-memory `StagedPrUrlCache`.
+/// when the worker omits it, or the execution is a revision, only the
+/// URL/repo check runs. The full network-verified check stays at Stop-time
+/// finalization, which reads this proposal row instead of the in-memory
+/// `StagedPrUrlCache`.
 ///
 /// With `pr_created_proposals_seam_enabled` true: a declaration that names a
 /// different PR than the task's existing binding is rejected; non-revision
@@ -1015,7 +1019,15 @@ fn apply_pr_created(
         return Ok(ApplyDecision::Rejected(reason));
     }
 
-    if let Some(branch) = payload.branch.as_deref() {
+    // Revisions push to the chain root's branch. `query_primary_execution_branches`
+    // excludes `revision_implementation`, so the accepted set would otherwise
+    // be only this execution's own expected name — which never exists.
+    // Stop identifies a revision by bound-PR URL equality, so skip the
+    // optional `branch` comparison here rather than reject a legitimate
+    // chain-root branch.
+    if execution.kind != ExecutionKind::RevisionImplementation
+        && let Some(branch) = payload.branch.as_deref()
+    {
         let mut branches = vec![boss_engine_storage_values::branch_identity::expected_branch_name(
             execution_id,
             &execution.branch_naming,
@@ -1497,6 +1509,73 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        let after = query_task(&db.connect().unwrap(), &revision.id).unwrap().unwrap();
+        assert!(
+            after.pr_url.is_none(),
+            "revision tasks never own a PR URL when the seam is on"
+        );
+        let root_after = query_task(&db.connect().unwrap(), &root_id).unwrap().unwrap();
+        assert_eq!(root_after.pr_url.as_deref(), Some(url));
+    }
+
+    /// A revision declaring the chain root's branch (the branch it actually
+    /// pushes to) must apply. The optional `branch` check is skipped for
+    /// `revision_implementation` because the accepted set would otherwise be
+    /// only the revision execution's own expected name.
+    #[test]
+    fn revision_pr_created_accepts_the_chain_root_branch() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let root = crate::test_support::create_test_chore(&db, product.id, "Root");
+        let root_id = root.id.clone();
+        let root_execution = crate::test_support::create_ready_chore_execution(&db, root_id.clone());
+        let chain_root_branch = boss_engine_storage_values::branch_identity::expected_branch_name(
+            &root_execution.id,
+            &root_execution.branch_naming,
+            root_execution.worker_branch_prefix.as_deref(),
+        );
+        let url = "https://github.com/spinyfin/mono/pull/77";
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = ?2, status = 'in_review' WHERE id = ?1",
+                params![&root_id, url],
+            )
+            .unwrap();
+        let revision = db
+            .create_revision(
+                boss_protocol::CreateRevisionInput::builder()
+                    .parent_task_id(root_id.clone())
+                    .description("Address review findings")
+                    .build(),
+                &crate::FakePrStateChecker::always(crate::PrOpenState::Open),
+            )
+            .unwrap();
+        let execution = db.list_executions(Some(&revision.id)).unwrap().pop().unwrap();
+        let payload = serde_json::json!({
+            "pr_url": url,
+            "branch": chain_root_branch,
+        })
+        .to_string();
+        let outcome = db
+            .submit_worker_proposal_with_flags(
+                SubmitWorkerProposalInput {
+                    execution_id: &execution.id,
+                    work_item_id: &revision.id,
+                    kind: ProposalKind::PrCreated,
+                    payload_json: &payload,
+                    idempotency_key: "revision-pr-chain-root-branch",
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome.proposal.state,
+            ProposalState::Applied,
+            "a revision declaring the chain-root branch must apply; got {:?}",
+            outcome.proposal.decision_reason
+        );
         let after = query_task(&db.connect().unwrap(), &revision.id).unwrap().unwrap();
         assert!(
             after.pr_url.is_none(),
