@@ -452,37 +452,46 @@ def list_non_system_deps(macho_path, is_dylib):
 def resolve_dep(dep, parent_real_path):
     if dep.startswith("@loader_path/"):
         rel = dep[len("@loader_path/"):]
-        return os.path.realpath(os.path.join(os.path.dirname(parent_real_path), rel))
-    return os.path.realpath(dep)
+        raw = os.path.normpath(os.path.join(os.path.dirname(parent_real_path), rel))
+    else:
+        raw = dep
+    return raw, os.path.realpath(raw)
 
 os.makedirs(out_lib_dir, exist_ok=True)
 copied = {}  # resolved_src_path -> basename
+watched = {src_bin}
 queue = []
 
 for dep in list_non_system_deps(out_bin, False):
-    resolved = resolve_dep(dep, src_bin)
+    raw_dep, resolved = resolve_dep(dep, src_bin)
+    watched.add(raw_dep)
+    watched.add(resolved)
     base = os.path.basename(resolved)
     if resolved not in copied:
         copied[resolved] = base
         queue.append((resolved, base))
-    subprocess.check_call(["install_name_tool", "-change", dep, "@loader_path/lib/" + base, out_bin])
+    subprocess.check_call(["install_name_tool", "-change", dep, "@loader_path/lib/" + base, out_bin], stdout=subprocess.DEVNULL)
 
 while queue:
     resolved_src, base = queue.pop(0)
     dst_lib = os.path.join(out_lib_dir, base)
     shutil.copy2(resolved_src, dst_lib)
     os.chmod(dst_lib, 0o755)
-    subprocess.check_call(["install_name_tool", "-id", "@loader_path/" + base, dst_lib])
+    subprocess.check_call(["install_name_tool", "-id", "@loader_path/" + base, dst_lib], stdout=subprocess.DEVNULL)
     for dep in list_non_system_deps(dst_lib, True):
-        dep_resolved = resolve_dep(dep, resolved_src)
+        raw_dep, dep_resolved = resolve_dep(dep, resolved_src)
+        watched.add(raw_dep)
+        watched.add(dep_resolved)
         dep_base = os.path.basename(dep_resolved)
         if dep_resolved not in copied:
             copied[dep_resolved] = dep_base
             queue.append((dep_resolved, dep_base))
-        subprocess.check_call(["install_name_tool", "-change", dep, "@loader_path/" + dep_base, dst_lib])
-    subprocess.check_call(["codesign", "--force", "--sign", "-", dst_lib])
+        subprocess.check_call(["install_name_tool", "-change", dep, "@loader_path/" + dep_base, dst_lib], stdout=subprocess.DEVNULL)
+    subprocess.check_call(["codesign", "--force", "--sign", "-", dst_lib], stdout=subprocess.DEVNULL)
 
-subprocess.check_call(["codesign", "--force", "--sign", "-", out_bin])
+subprocess.check_call(["codesign", "--force", "--sign", "-", out_bin], stdout=subprocess.DEVNULL)
+for watched_path in sorted(watched):
+    print(watched_path)
 """
 
 def _host_tmux_repository_impl(repository_ctx):
@@ -520,6 +529,10 @@ def _host_tmux_repository_impl(repository_ctx):
                 ])
                 if result.return_code != 0:
                     fail("failed to bundle macOS host tmux dylibs: " + result.stderr)
+                repository_ctx.watch(path)
+                for watched_path in result.stdout.splitlines():
+                    if watched_path:
+                        repository_ctx.watch(watched_path)
                 repository_ctx.file("host_tmux.bzl", content = _HOST_TMUX_RULE_BZL, executable = False)
                 repository_ctx.file(
                     "BUILD.bazel",

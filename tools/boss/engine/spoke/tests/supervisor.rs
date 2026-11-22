@@ -104,6 +104,7 @@ impl CubeJsonTransport for ListingCube {
 }
 
 async fn live_tmux(root: &Path) -> (Tmux, TmuxServerGuard) {
+    install_fixture_claude();
     let program = declared_tmux_binary().expect("host tmux");
     let socket = root.join("tmux.sock");
     let tmux = Tmux::from_path_with_socket(&program, &socket).unwrap();
@@ -311,13 +312,16 @@ async fn stop_is_token_verified_and_leaves_siblings() {
     assert!(!names.contains(&session_name("drop")), "{names:?}");
 }
 
-/// Executable fixture standing in for the `claude` CLI. The pane's `PATH` comes
-/// from the hermetic test environment and ignores the session environment, so
-/// the fixture lives in the private home's `.nix-profile/bin`, which that
-/// `PATH` starts with. `FIXTURE_MODE=exit` makes it quit without reading the
-/// brief; otherwise it satisfies the relay's readiness markers, shows the
-/// paste placeholder once it has read a whole paste (the relay sends Return
-/// only then), and appends every byte it receives to `$FIXTURE_OUT`.
+/// Executable fixture standing in for the `claude` CLI. On Nix-installed Macs
+/// `/etc/bashrc` adds `$HOME/.nix-profile/bin` to `PATH`, but on non-Nix
+/// hosts (including remote macOS workers) `hermetic_test_wrapper.sh` seals
+/// `PATH` to the audited runtime without it. `install_fixture_claude` writes
+/// the fixture into the private home's `.nix-profile/bin` and prepends that
+/// directory to `PATH` before any test starts a private `tmux` server.
+/// `FIXTURE_MODE=exit` makes it quit without reading the brief; otherwise it
+/// satisfies the relay's readiness markers, shows the paste placeholder once it
+/// has read a whole paste (the relay sends Return only then), and appends every
+/// byte it receives to `$FIXTURE_OUT`.
 const FIXTURE_CLAUDE: &str = r#"#!/bin/sh
 [ "$FIXTURE_MODE" = exit ] && exit 0
 exec python3 -c '
@@ -348,6 +352,17 @@ fn install_fixture_claude() {
         std::fs::write(&tmp, FIXTURE_CLAUDE).unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::rename(&tmp, bin.join("claude")).unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        if !old_path.split(':').any(|p| Path::new(p) == bin) {
+            let new_path = if old_path.is_empty() {
+                bin.display().to_string()
+            } else {
+                format!("{}:{old_path}", bin.display())
+            };
+            // SAFETY: called once inside `live_tmux` before any test spawns a
+            // tmux server or reads `PATH` concurrently.
+            unsafe { std::env::set_var("PATH", new_path) };
+        }
     });
 }
 
