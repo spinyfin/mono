@@ -694,6 +694,13 @@ pub(super) async fn submit_for_caller(
         payload_json: canonical_json,
         idempotency_key,
     };
+    // Only `apply_pr_created` reads this; every other kind ignores it.
+    // Composed the same way the prompt-composition call site does
+    // (`worker_proposals` master flag AND the per-seam flag) — see
+    // `work::proposal_apply::apply_pr_created`'s doc for why gating this
+    // unconditionally-hardened behaviour on the flag matters.
+    let pr_created_proposals_seam_enabled = server_state.feature_flags.is_enabled("worker_proposals")
+        && server_state.feature_flags.is_enabled("pr_created_proposals_seam");
     // A progression verb mutates the taxonomy, so it never takes the generic
     // auto-apply route: it is scope-checked and applied in its own transaction,
     // and only a live progression run may submit one (a worker's identical
@@ -701,7 +708,11 @@ pub(super) async fn submit_for_caller(
     let outcome = if kind.is_progression_verb() {
         work_db.submit_progression_verb(submission, server_state.pr_state_checker.as_ref())
     } else {
-        boss_engine_runtime::review_guide_validation::submit_worker_proposal(work_db, submission)
+        boss_engine_runtime::review_guide_validation::submit_worker_proposal_with_flags(
+            work_db,
+            submission,
+            pr_created_proposals_seam_enabled,
+        )
     };
 
     match outcome {
