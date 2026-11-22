@@ -971,6 +971,9 @@ impl WorkDb {
                      WHERE dependent_id = ?1 OR prerequisite_id = ?1",
                     params![id],
                 )?;
+                if crate::work_dependencies::cycle::any_member(&tx, &[id])? {
+                    crate::work_dependencies::cycle::rebuild_members(&tx)?;
+                }
                 if let Some(before) = before {
                     let after = query_task(&tx, id).require("task", id)?;
                     boothby::capture_task_update(&tx, self, actor, &before, &after, &now)?;

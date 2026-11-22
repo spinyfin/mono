@@ -2,7 +2,7 @@
 //!
 //! Edge creation walks only from the new edge's endpoints. Board, GetWorkTree,
 //! task-runtime and queued-display reads look up stored membership; they never
-//! rebuild the graph. Membership is recomputed when a `blocks` edge changes
+//! rebuild the graph. Membership is recomputed on repairs involving existing cycles
 //! and when the engine opens a database.
 use super::{RELATION_BLOCKS, prerequisites_of};
 use anyhow::Result;
@@ -29,8 +29,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     rebuild_members(conn)
 }
 
-/// Rebuild stored cycle membership from the current graph. Runs on edge
-/// writes and at open, never on the board or queued-display hot path.
+/// Whether a graph repair touches stored cycle membership. Each endpoint is
+/// sought by primary key; acyclic edge deletion needs no graph traversal.
+pub(crate) fn any_member(conn: &Connection, ids: &[&str]) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT 1 FROM dependency_cycle_members WHERE work_item_id = ?1")?;
+    for id in ids {
+        if stmt.exists([id])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Rebuild stored cycle membership after structural repairs and at open,
+/// never on the board or queued-display hot path.
 pub(crate) fn rebuild_members(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_MEMBERS_TABLE)?;
     let members = members_from_graph(conn)?;
@@ -195,18 +207,18 @@ fn reaches(adj: &HashMap<String, Vec<String>>, start: &str, goal: &str) -> bool 
     false
 }
 
-/// Structural health and the gates dispatch should honour, without scanning
-/// the whole graph. One statement seeks membership by primary key and this
-/// item's `blocks` rows by dependent.
-pub(super) fn prerequisites(conn: &Connection, id: &str) -> Result<(bool, Vec<String>)> {
-    let mut stmt = conn.prepare(
-        "SELECT m.work_item_id IS NOT NULL, d.prerequisite_id
+pub(crate) const PREREQUISITES_SQL: &str = "SELECT m.work_item_id IS NOT NULL, d.prerequisite_id
          FROM (SELECT ?1 AS id) item
          LEFT JOIN dependency_cycle_members m ON m.work_item_id = item.id
          LEFT JOIN work_item_dependencies d
            ON d.dependent_id = item.id AND d.relation = 'blocks'
-         ORDER BY d.created_at, d.prerequisite_id",
-    )?;
+         ORDER BY d.created_at, d.prerequisite_id";
+
+/// Structural health and the gates dispatch should honour, without scanning
+/// the whole graph. One statement seeks membership by primary key and this
+/// item's `blocks` rows by dependent.
+pub(super) fn prerequisites(conn: &Connection, id: &str) -> Result<(bool, Vec<String>)> {
+    let mut stmt = conn.prepare(PREREQUISITES_SQL)?;
     let mut cyclic = false;
     let mut gates = Vec::new();
     for row in stmt.query_map([id], |row| {

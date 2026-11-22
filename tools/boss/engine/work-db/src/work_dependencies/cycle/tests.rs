@@ -5,6 +5,7 @@ fn fixture() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE tasks (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT DEFAULT 'chore', parent_task_id TEXT);
+         CREATE INDEX idx_tasks_parent_kind_id ON tasks(parent_task_id, kind, id);
          CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
          CREATE TABLE work_item_dependencies (
             dependent_id TEXT, prerequisite_id TEXT, relation TEXT, created_at TEXT,
@@ -327,4 +328,49 @@ fn gating_one_item_does_not_scan_thousands_of_unrelated_edges() {
     assert!(cycle.path.iter().any(|step| step.id == "a"));
     assert!(cycle.path.iter().any(|step| step.id == "b"));
     assert!(query_edge(&conn, "b", "a", RELATION_BLOCKS).unwrap().is_none());
+}
+
+#[test]
+fn ordinary_edge_writes_do_not_scan_tasks() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let conn = fixture();
+    conn.execute_batch(
+        "WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n < 9999)
+         INSERT INTO tasks(id, name) SELECT printf('unrelated%d', n), 'Unrelated' FROM s",
+    )
+    .unwrap();
+    let steps = Arc::new(AtomicUsize::new(0));
+    let count = steps.clone();
+    conn.progress_handler(
+        100,
+        Some(move || {
+            count.fetch_add(100, Ordering::Relaxed);
+            false
+        }),
+    );
+    add(&conn, "a", "b");
+    assert!(super::super::delete_edge(&conn, "a", "b", RELATION_BLOCKS).unwrap());
+    let steps = steps.load(Ordering::Relaxed);
+    assert!(
+        steps < 2000,
+        "ordinary edge writes used {steps} VM steps; must not scan 10000 tasks"
+    );
+}
+
+#[test]
+fn deleting_a_legacy_cycle_edge_refreshes_membership() {
+    let conn = fixture();
+    conn.execute_batch(
+        "INSERT INTO work_item_dependencies VALUES ('a', 'b', 'blocks', '1'), ('b', 'a', 'blocks', '1')",
+    )
+    .unwrap();
+    rebuild_members(&conn).unwrap();
+    assert!(any_member(&conn, &["a", "b"]).unwrap());
+    assert!(super::super::delete_edge(&conn, "a", "b", RELATION_BLOCKS).unwrap());
+    assert!(!any_member(&conn, &["a", "b"]).unwrap());
+    assert!(!prerequisites(&conn, "a").unwrap().0);
+    assert!(!prerequisites(&conn, "b").unwrap().0);
 }

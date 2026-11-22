@@ -640,3 +640,51 @@ fn revision_waiting_on_its_own_pr_is_a_named_cycle_even_with_archived_prerequisi
         TaskStatus::Blocked
     );
 }
+
+#[test]
+fn graph_repairs_clear_cycle_membership_without_reopening() {
+    for convert in [false, true] {
+        let f = fixture();
+        let root = f.chore("PR root");
+        let revision = f.revision_of(&root, "Review findings");
+        let prerequisite = f.chore("Split-out prerequisite");
+        // The root's edge closes a loop through the revision-parent edge.
+        f.sql(&format!(
+            "INSERT INTO work_item_dependencies (dependent_id, prerequisite_id, relation, created_at)
+             VALUES ('{root}', '{prerequisite}', 'blocks', '1'),
+                    ('{prerequisite}', '{revision}', 'blocks', '1')"
+        ));
+        f.stick(&revision, "status = 'blocked', blocked_reason = 'dependency'", 3);
+        assert_eq!(f.clauses(&revision).stuck_kind.as_deref(), Some("S4_dependency_cycle"));
+        assert!(f.db.gating_prereqs_for(&revision).unwrap().contains(&root));
+        if convert {
+            let mut conn = f.db.connect().unwrap();
+            let tx = conn.transaction().unwrap();
+            let rev = query_task(&tx, &revision).unwrap().unwrap();
+            let (changed, _) = crate::review_findings_followup::convert_revision_to_review_findings_followup(
+                &tx,
+                &rev,
+                &root,
+                &now_string(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(changed, 1);
+            tx.commit().unwrap();
+        } else {
+            f.db.delete_work_item(&prerequisite).unwrap();
+        }
+        let conn = f.db.connect().unwrap();
+        assert!(!crate::work_dependencies::cycle::any_member(&conn, &[&root, &revision, &prerequisite]).unwrap());
+        drop(conn);
+        assert!(f.db.gating_prereqs_for(&revision).unwrap().is_empty());
+        assert_ne!(f.clauses(&revision).stuck_kind.as_deref(), Some("S4_dependency_cycle"));
+        let report = f.db.stuck_report(0, now(), &observed_live_pid).unwrap();
+        assert!(
+            report
+                .rows
+                .iter()
+                .all(|row| row.classification != "S4_dependency_cycle")
+        );
+    }
+}

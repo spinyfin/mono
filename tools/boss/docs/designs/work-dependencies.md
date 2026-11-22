@@ -713,8 +713,11 @@ rows, revision parents, and a revision's external prerequisites onto its PR
 root. A rejected approval leaves the question unanswered and its transaction
 unchanged. Existing cycles remain gated and are reported as
 `S4_dependency_cycle` by progression and the stuck report, including when a
-member is archived. Membership is stored when a `blocks` edge changes and
-looked up by primary key on board, GetWorkTree, task-runtime, and queued-display
+member is archived. Membership is rebuilt on database open, after deleting a
+`blocks` edge touching a cycle member, after deleting a cycle member's task
+edges, and after converting a revision into standalone follow-up work.
+Validated inserts cannot create cycles and leave membership unchanged.
+Membership is looked up by primary key on board, GetWorkTree, task-runtime, and queued-display
 reads; those paths do not rebuild the graph. A `waiting_dependency` execution
 in the cycle does not count as live progress. Repair requires an explicit
 correction of the dependency; diagnosis never drops edges, archives the

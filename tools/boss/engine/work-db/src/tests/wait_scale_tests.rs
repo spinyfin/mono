@@ -773,6 +773,28 @@ fn board_runtime_and_queued_display_do_not_rescan_the_dependency_graph() {
     conn.execute_batch("ANALYZE").unwrap();
     drop(conn);
 
+    for _ in 0..3 {
+        let started = Instant::now();
+        let mut trace = PopulationTrace::new(PRODUCT, "wait-scale-cycle", None, started);
+        let tree = {
+            let mut connection = db.connect().unwrap();
+            let transaction = connection.transaction().unwrap();
+            WorkDb::assemble_work_tree_in(&transaction, PRODUCT, &mut trace, None, 1_800_000_000, None).unwrap()
+        };
+        let (compute_ms, _, _) = trace
+            .segment_counts(segment::DB_TASK_RUNTIMES_COMPUTE)
+            .expect("task-runtime compute is measured");
+        let queued_started = Instant::now();
+        let queued = db.queued_displays(1_800_000_000, &Default::default()).unwrap();
+        let queued_ms = queued_started.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "wait-scale cycle-hot-path cards={} compute_ms={compute_ms:.1} queued_ms={queued_ms:.1} queued={}",
+            tree.tasks.len() + tree.chores.len(),
+            queued.len()
+        );
+        assert_eq!(tree.tasks.len() + tree.chores.len(), BOARD_CARDS);
+    }
+
     let plan_of = |sql: &str| {
         let conn = db.connect().unwrap();
         conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -782,32 +804,27 @@ fn board_runtime_and_queued_display_do_not_rescan_the_dependency_graph() {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
     };
-    let members = plan_of("SELECT 1 FROM dependency_cycle_members WHERE work_item_id = ?1");
-    assert!(
-        members
-            .iter()
-            .any(|step| step.contains("work_item_id=?") || step.contains("PRIMARY KEY")),
-        "cycle membership must seek: {members:#?}"
-    );
-    let blocks =
-        plan_of("SELECT prerequisite_id FROM work_item_dependencies WHERE dependent_id = ?1 AND relation = 'blocks'");
-    assert!(
-        blocks.iter().any(|step| step.contains("dependent_id=?")),
-        "gating edges must seek by dependent: {blocks:#?}"
-    );
-    let gating = plan_of(
-        "SELECT m.work_item_id IS NOT NULL, d.prerequisite_id
-         FROM (SELECT ?1 AS id) item
-         LEFT JOIN dependency_cycle_members m ON m.work_item_id = item.id
-         LEFT JOIN work_item_dependencies d
-           ON d.dependent_id = item.id AND d.relation = 'blocks'",
-    );
-    assert!(
-        gating.iter().all(|step| !step.contains("SCAN tasks")),
-        "gating must not scan tasks: {gating:#?}"
-    );
+    let gating = plan_of(crate::work_dependencies::cycle::PREREQUISITES_SQL);
+    for (alias, key) in [("m", "work_item_id=?"), ("d", "dependent_id=?")] {
+        assert!(
+            gating
+                .iter()
+                .any(|step| step.starts_with(&format!("SEARCH {alias} ")) && step.contains(key)),
+            "gating must seek {alias} by {key}: {gating:#?}"
+        );
+    }
+    assert!(gating.iter().all(|step| !step.contains("SCAN tasks")), "{gating:#?}");
 
     let mut connection = db.connect().unwrap();
+    let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = steps.clone();
+    connection.progress_handler(
+        1000,
+        Some(move || {
+            counter.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    );
     connection.trace_v2(
         rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
         Some(|event| {
@@ -821,43 +838,28 @@ fn board_runtime_and_queued_display_do_not_rescan_the_dependency_graph() {
         let transaction = connection.transaction().unwrap();
         let mut trace = PopulationTrace::new(PRODUCT, "wait-scale-cycle-sql", None, Instant::now());
         WorkDb::assemble_work_tree_in(&transaction, PRODUCT, &mut trace, None, 1_800_000_000, None).unwrap();
+        let (_, cards, statements) = trace.segment_counts(segment::DB_TASK_RUNTIMES_COMPUTE).unwrap();
+        assert_eq!(
+            (cards, statements),
+            (Some(6535), Some(19136)),
+            "uncached compute statement budget"
+        );
     }
+    let board_steps = steps.swap(0, std::sync::atomic::Ordering::Relaxed);
+    drop(connection);
+    db.queued_displays(1_800_000_000, &Default::default()).unwrap();
+    let queued_steps = steps.load(std::sync::atomic::Ordering::Relaxed);
+    // Per-card whole-graph reads exceed these deterministic
+    // budgets; unlike elapsed time, they are independent of machine load.
+    assert!(board_steps <= 4_000_000, "board used {board_steps} VM steps");
+    assert!(queued_steps <= 16_000, "queued displays used {queued_steps} VM steps");
+    let connection = db.connect().unwrap();
+    connection.progress_handler(0, None::<fn() -> bool>);
     connection.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
     drop(connection);
     let sql = SQL.with(|rows| rows.borrow().join("\n"));
     assert!(
-        !sql.contains("dependency_roots") && !sql.contains("dependency_graph"),
-        "board reads must not rebuild the whole task graph"
-    );
-
-    let started = Instant::now();
-    let mut trace = PopulationTrace::new(PRODUCT, "wait-scale-cycle", None, started);
-    let tree = {
-        let mut connection = db.connect().unwrap();
-        let transaction = connection.transaction().unwrap();
-        WorkDb::assemble_work_tree_in(&transaction, PRODUCT, &mut trace, None, 1_800_000_000, None).unwrap()
-    };
-    let (compute_ms, _, _) = trace
-        .segment_counts(segment::DB_TASK_RUNTIMES_COMPUTE)
-        .expect("task-runtime compute is measured");
-    let queued_started = Instant::now();
-    let queued = db.queued_displays(1_800_000_000, &Default::default()).unwrap();
-    let queued_ms = queued_started.elapsed().as_secs_f64() * 1000.0;
-    println!(
-        "wait-scale cycle-hot-path cards={} compute_ms={compute_ms:.1} queued_ms={queued_ms:.1} queued={}",
-        tree.tasks.len() + tree.chores.len(),
-        queued.len()
-    );
-    assert_eq!(tree.tasks.len() + tree.chores.len(), BOARD_CARDS);
-    // The shipped whole-graph CTE ran this compute at ~5.6s median (max 10s)
-    // and queued-display lock holds at ~7.4s. Indexed membership lookups must
-    // stay well below that even with thousands of extra edges.
-    assert!(
-        compute_ms < 1500.0,
-        "db.task_runtimes.compute took {compute_ms:.1} ms with 2000 extra edges"
-    );
-    assert!(
-        queued_ms < 250.0,
-        "queued_display_refresh took {queued_ms:.1} ms with 2000 extra edges"
+        !sql.to_uppercase().contains("WITH RECURSIVE"),
+        "board and queued-display reads must not recursively rebuild the task graph"
     );
 }

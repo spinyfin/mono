@@ -60,11 +60,9 @@ pub fn insert_edge(
             return Ok((edge, EdgeInsertOutcome::AlreadyExists));
         }
         cycle::validate(conn, dependent_id, prerequisite_id, relation)?;
-        let inserted = insert_validated_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)?;
-        if relation == RELATION_BLOCKS && inserted.1 == EdgeInsertOutcome::Inserted {
-            cycle::rebuild_members(conn)?;
-        }
-        Ok(inserted)
+        // Validation proves this edge cannot create a cycle, so existing cycle
+        // membership is unchanged. Do not scan the graph on ordinary inserts.
+        insert_validated_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)
     })();
     if result.is_err() {
         conn.execute_batch("ROLLBACK TO dependency_edge_insert")?;
@@ -106,7 +104,7 @@ pub fn delete_edge(conn: &Connection, dependent_id: &str, prerequisite_id: &str,
         params![dependent_id, prerequisite_id, relation],
     )?;
     let removed = rows > 0;
-    if removed && relation == RELATION_BLOCKS {
+    if removed && relation == RELATION_BLOCKS && cycle::any_member(conn, &[dependent_id, prerequisite_id])? {
         cycle::rebuild_members(conn)?;
     }
     Ok(removed)
