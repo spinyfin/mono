@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
 use crate::external::ExternalCheckImplementationRef;
-use crate::http_retry::{GetRetryPolicy, get_bytes_with_retry};
+use crate::http_retry::{GET_MAX_RETRY_DELAY, GetRetryPolicy, get_bytes_with_retry};
 use crate::output::{Location, Severity};
 use crate::path::validate_relative_path;
 use crate::path_scope::PathScope;
@@ -1946,6 +1946,7 @@ async fn fetch_external_checks_file(client: &reqwest::Client, url: reqwest::Url)
     let policy = GetRetryPolicy {
         max_attempts: EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS,
         base_delay: EXTERNAL_CHECKS_FETCH_BASE_DELAY,
+        max_delay: GET_MAX_RETRY_DELAY,
         not_found_base_delay: Some(EXTERNAL_CHECKS_FETCH_404_BASE_DELAY),
         remaining: None,
     };

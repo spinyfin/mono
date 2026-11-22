@@ -19,6 +19,9 @@ pub struct GetRetryPolicy<'a> {
     pub max_attempts: u32,
     /// Delay before the second attempt; doubles on each later attempt.
     pub base_delay: Duration,
+    /// Cap on one backoff sleep, including a server-supplied `Retry-After`.
+    /// Production callers use [`GET_MAX_RETRY_DELAY`].
+    pub max_delay: Duration,
     /// When set, a 404 is treated as transient (e.g. a just-published file)
     /// and retried with this base delay. When unset, a 404 fails at once.
     pub not_found_base_delay: Option<Duration>,
@@ -50,7 +53,7 @@ impl<'a> RetrySettings<'a> {
         Self {
             max_attempts: policy.max_attempts,
             base_delay: policy.base_delay,
-            max_delay: GET_MAX_RETRY_DELAY,
+            max_delay: policy.max_delay,
             jitter: false,
             not_found_base_delay: policy.not_found_base_delay,
             remaining: policy.remaining,
@@ -475,6 +478,7 @@ mod tests {
         GetRetryPolicy {
             max_attempts: 3,
             base_delay: Duration::from_millis(5),
+            max_delay: super::GET_MAX_RETRY_DELAY,
             not_found_base_delay,
             remaining: None,
         }
@@ -717,24 +721,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_retryable_error_under_budget_is_not_labelled_deadline() {
+    async fn budgetless_get_retries_after_capped_retry_after() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/file"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "3600"))
+            .up_to_n_times(1)
             .expect(1)
             .mount(&server)
             .await;
-        let remaining = || Duration::from_secs(10);
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
         let policy = GetRetryPolicy {
-            base_delay: Duration::from_secs(120),
+            max_delay: Duration::from_millis(40),
+            remaining: None,
+            ..policy(None)
+        };
+        let started = Instant::now();
+        let bytes = get_bytes_with_retry(&client(), &url(&server), "thing", &policy)
+            .await
+            .expect("capped Retry-After should retry");
+        let elapsed = started.elapsed();
+        assert_eq!(bytes, b"payload");
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "budgetless GET must sleep the capped Retry-After, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "3600s Retry-After must be capped, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_attempt_does_not_set_budget_stopped() {
+        let remaining = || Duration::from_secs(60);
+        let settings = RetrySettings {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            jitter: false,
+            not_found_base_delay: None,
+            remaining: Some(&remaining),
+            request_timeout: None,
+        };
+        let mut attempts = 0;
+        let (outcome, budget_stopped) = super::retry_loop_detailed(
+            &settings,
+            |_attempt, _timeout| {
+                attempts += 1;
+                async {
+                    Err(super::AttemptFailure {
+                        kind: super::FailureKind::Http {
+                            status: reqwest::StatusCode::BAD_REQUEST,
+                            body: Vec::new(),
+                        },
+                        retryable: false,
+                        retry_after: None,
+                        cause: "HTTP 400".to_owned(),
+                    })
+                }
+            },
+            |_| {},
+        )
+        .await;
+        assert_eq!(attempts, 1);
+        assert!(
+            !budget_stopped,
+            "a non-retryable failure with budget remaining must not be budget-stopped"
+        );
+        match outcome {
+            super::SendOutcome::Http {
+                status, attempts: 1, ..
+            } => {
+                assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            }
+            other => panic!("expected HTTP 400 after one attempt, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_under_budget_is_not_labelled_deadline() {
+        let remaining = || Duration::from_secs(60);
+        let url: reqwest::Url = "ftp://127.0.0.1/file".parse().expect("url");
+        let policy = GetRetryPolicy {
             remaining: Some(&remaining),
             ..policy(None)
         };
-        let error = get_bytes_with_retry(&client(), &url(&server), "thing", &policy)
+        let error = get_bytes_with_retry(&client(), &url, "thing", &policy)
             .await
-            .expect_err("fails");
-        assert!(error.to_string().contains("deadline exhausted"), "{error}");
+            .expect_err("unsupported scheme should fail without retry");
+        let message = error.to_string();
+        assert!(
+            !message.contains("deadline exhausted"),
+            "non-retryable send error with budget remaining must not be labelled deadline exhausted: {message}"
+        );
+        assert!(message.contains("after 1 attempts"), "{message}");
     }
 
     #[tokio::test]
