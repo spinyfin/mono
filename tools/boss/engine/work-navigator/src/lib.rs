@@ -574,9 +574,9 @@ fn backlog_reason(family: &Family, members: &[&Member]) -> Wait {
             };
         }
         match pr.health.ai_review {
-            AiReview::Reviewing | AiReview::Queued | AiReview::NotReviewed => return Wait::ReviewQueued,
+            AiReview::Reviewing | AiReview::Queued => return Wait::ReviewQueued,
             AiReview::Findings => return Wait::RepairQueued,
-            AiReview::AllClear | AiReview::CleanPending | AiReview::NotRequired => {}
+            AiReview::NotReviewed | AiReview::AllClear | AiReview::CleanPending | AiReview::NotRequired => {}
         }
         if matches!(pr.health.ci, Ci::Pending | Ci::Unknown) {
             return Wait::WaitingChecks;

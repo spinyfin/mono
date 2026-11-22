@@ -116,7 +116,7 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
     assert_eq!(old.ai_review_findings_revision_id.as_deref(), Some(revision.as_str()));
 
     observe(&db, &root, Some("fixed"), "success", "mergeable");
-    for status in ["active", "in_review"] {
+    for (status, expected) in [("active", "not_reviewed"), ("in_review", "review_not_required")] {
         db.connect()
             .unwrap()
             .execute(
@@ -124,10 +124,7 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
                 rusqlite::params![root, status],
             )
             .unwrap();
-        assert_eq!(
-            card(&db, &product, &root).ai_review_state.as_deref(),
-            Some("not_reviewed")
-        );
+        assert_eq!(card(&db, &product, &root).ai_review_state.as_deref(), Some(expected));
     }
     verdict(&db, &root, "fixed", "completed_clean");
     let clean = card(&db, &product, &root);
@@ -176,7 +173,7 @@ fn current_head_review_badge_findings_revision_clean_then_new_unreviewed_head() 
 
     assert_eq!(
         card(&db, &product, &root).ai_review_state.as_deref(),
-        Some("not_reviewed")
+        Some("review_not_required")
     );
     verdict(&db, &root, "next", "completed_with_findings");
     assert_eq!(
@@ -421,7 +418,17 @@ fn current_head_review_badge_findings_revision_with_new_commit_keeps_head_rules(
         Some("reviewed_with_findings")
     );
 
-    // Once the new head is observed, it is simply not yet reviewed.
+    // Once the new head is observed with a review due, it is not yet reviewed.
+    db.create_attention_item(CreateAttentionItemInput {
+        work_item_id: Some(root.clone()),
+        kind: "pr_review_admission_deferred".to_owned(),
+        title: "Review deferred".to_owned(),
+        body_markdown: "Waiting for review pool slot.".to_owned(),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    })
+    .unwrap();
     observe(&db, &root, Some("h2"), "success", "mergeable");
     let badge = card(&db, &product, &root).ai_review_badge.unwrap();
     assert_eq!(badge.label, "Not reviewed: latest commit");
@@ -473,6 +480,16 @@ fn review_badge_does_not_attribute_a_headless_verdict_to_a_legacy_reviewed_sha()
     let db = WorkDb::open(temp_db_path("review-badge-headless-verdict")).unwrap();
     let product = make_revision_product(&db, "review-badge-headless-verdict");
     let root = make_in_review_chore(&db, &product, "https://github.com/spinyfin/mono/pull/8011");
+    db.create_attention_item(CreateAttentionItemInput {
+        work_item_id: Some(root.clone()),
+        kind: "pr_review_admission_deferred".to_owned(),
+        title: "Review deferred".to_owned(),
+        body_markdown: "Waiting for review pool slot.".to_owned(),
+        execution_id: None,
+        status: None,
+        resolved_at: None,
+    })
+    .unwrap();
     observe(&db, &root, Some("current-head"), "success", "mergeable");
     let execution = verdict(&db, &root, "unknown", "completed_clean");
     db.connect()

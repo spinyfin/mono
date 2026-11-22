@@ -82,7 +82,8 @@ fn quorum_fails_the_batch_when_fewer_than_two_leaves_report() {
         .into_iter()
         .find(|card| card.id == cycle_root.id)
         .unwrap();
-    assert_eq!(card.ai_review_badge.unwrap().label, "Not reviewed: latest commit");
+    assert_eq!(card.ai_review_state.as_deref(), Some("review_not_required"));
+    assert_eq!(card.ai_review_badge.unwrap().label, "AI review not required");
 }
 
 /// Reviewers that never reached a session (pre-start dispatch failures) are
@@ -226,7 +227,8 @@ fn quorum_failure_names_reviewers_that_never_started_and_the_spent_generation_ca
     assert!(badge.tooltip.contains("generation 2"), "{}", badge.tooltip);
     assert!(badge.tooltip.contains(error), "{}", badge.tooltip);
 
-    // A new head leaves the spent batch behind: the card is simply not yet reviewed.
+    // A new head leaves the spent batch behind: with no review scheduled,
+    // no automatic review is required for it.
     db.connect()
         .unwrap()
         .execute(
@@ -234,5 +236,7 @@ fn quorum_failure_names_reviewers_that_never_started_and_the_spent_generation_ca
             rusqlite::params![cycle_root.id],
         )
         .unwrap();
-    assert_eq!(card(&db).ai_review_badge.unwrap().label, "Not reviewed: latest commit");
+    let newer_card = card(&db);
+    assert_eq!(newer_card.ai_review_state.as_deref(), Some("review_not_required"));
+    assert_eq!(newer_card.ai_review_badge.unwrap().label, "AI review not required");
 }

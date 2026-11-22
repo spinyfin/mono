@@ -191,10 +191,14 @@ fn cached_board_matches_uncached_through_every_review_input() {
     assert_eq!(board.assert_equivalent(), Pass { misses: 1, queries: 4 });
     assert_eq!(board.assert_equivalent(), Pass { misses: 0, queries: 2 });
 
-    // The observed head moved: the clean verdict no longer matches.
+    // The observed head moved: the clean verdict no longer matches, and no
+    // review is scheduled for the unproduced head.
     board.observe(&root, "h2", "success", "mergeable");
     assert_eq!(board.assert_equivalent().misses, 1);
-    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
 
     // A findings verdict on the new head, then linked to its revision.
     let findings = board.verdict(&root, "h2", "completed_with_findings");

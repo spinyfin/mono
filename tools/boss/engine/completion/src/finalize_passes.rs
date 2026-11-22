@@ -2162,15 +2162,15 @@ impl WorkerCompletionHandler {
     /// whose `PureRebaseGateOutcome::post_head` carries it) pass it
     /// straight in, avoiding a second identical `fetch_pr_head_oid` round
     /// trip for the same PR. `None` when no gate ran ahead of this one.
-    pub(super) async fn check_noop_skip(
+    pub(super) async fn check_noop_skip_outcome(
         &self,
         pr_url: &str,
         producing: &crate::work::WorkExecution,
         review_cycle: i64,
         last_reviewed_sha: Option<&str>,
         head_oid_hint: Option<String>,
-    ) -> Option<&'static str> {
-        noop_skip_reason(
+    ) -> NoopSkipOutcome {
+        noop_skip_outcome(
             self.branch_verifier.as_ref(),
             pr_url,
             producing,
@@ -2385,13 +2385,18 @@ fn record_pure_rebase_skip(
     }
 }
 
-/// Free-function body of [`WorkerCompletionHandler::check_noop_skip`] — see
-/// that method's doc for the four-rule description. Shared with the
+pub(super) struct NoopSkipOutcome {
+    pub(super) reason: Option<&'static str>,
+    pub(super) head_sha: Option<String>,
+}
+
+/// Free-function body of [`WorkerCompletionHandler::check_noop_skip_outcome`] — see
+/// `check_noop_skip`'s doc for the four-rule description. Shared with the
 /// declared-delivery completion path
 /// ([`super::run_done_declaration::maybe_enqueue_declared_delivery_reviewer`])
 /// so a future change to the skip rules cannot silently apply to only one of
 /// the two completion paths.
-pub(super) async fn noop_skip_reason(
+pub(super) async fn noop_skip_outcome(
     branch_verifier: &dyn BranchVerifier,
     pr_url: &str,
     producing: &crate::work::WorkExecution,
@@ -2399,12 +2404,18 @@ pub(super) async fn noop_skip_reason(
     last_reviewed_sha: Option<&str>,
     head_oid_hint: Option<String>,
     min_review_changed_lines: u64,
-) -> Option<&'static str> {
+) -> NoopSkipOutcome {
     let Some(last_sha) = last_reviewed_sha else {
-        return None; // first review
+        return NoopSkipOutcome {
+            reason: None,
+            head_sha: head_oid_hint,
+        }; // first review
     };
     if review_cycle == 0 {
-        return None; // first review (belt-and-suspenders; last_sha is None when cycle=0)
+        return NoopSkipOutcome {
+            reason: None,
+            head_sha: head_oid_hint,
+        }; // first review (belt-and-suspenders; last_sha is None when cycle=0)
     }
 
     // Parse repo slug and PR number for GitHub API calls.
@@ -2416,7 +2427,10 @@ pub(super) async fn noop_skip_reason(
                 ?err,
                 "pr_review noop gate: cannot parse repo slug; proceeding with review",
             );
-            return None;
+            return NoopSkipOutcome {
+                reason: None,
+                head_sha: head_oid_hint,
+            };
         }
     };
     let Some(pr_number) = pr_number_from_url(pr_url) else {
@@ -2424,7 +2438,10 @@ pub(super) async fn noop_skip_reason(
             pr_url,
             "pr_review noop gate: cannot parse PR number; proceeding with review",
         );
-        return None;
+        return NoopSkipOutcome {
+            reason: None,
+            head_sha: head_oid_hint,
+        };
     };
 
     // Fetch current PR head SHA, unless the pure-rebase gate already
@@ -2439,14 +2456,20 @@ pub(super) async fn noop_skip_reason(
                     ?err,
                     "pr_review noop gate: cannot fetch PR head OID; proceeding with review",
                 );
-                return None;
+                return NoopSkipOutcome {
+                    reason: None,
+                    head_sha: None,
+                };
             }
         },
     };
 
     // Rule 2: exact SHA match — nothing changed since last review.
     if current_head == last_sha {
-        return Some("sha_unchanged");
+        return NoopSkipOutcome {
+            reason: Some("sha_unchanged"),
+            head_sha: Some(current_head),
+        };
     }
 
     // Rules 3 & 4: compare effective diff between last-reviewed head and
@@ -2464,19 +2487,31 @@ pub(super) async fn noop_skip_reason(
                 ?err,
                 "pr_review noop gate: cannot fetch diff line count; proceeding with review",
             );
-            return None;
+            return NoopSkipOutcome {
+                reason: None,
+                head_sha: Some(current_head),
+            };
         }
     };
 
     if diff_lines == 0 {
-        return Some("empty_diff");
+        return NoopSkipOutcome {
+            reason: Some("empty_diff"),
+            head_sha: Some(current_head),
+        };
     }
 
     if min_review_changed_lines > 0 && diff_lines < min_review_changed_lines {
-        return Some("trivial_diff");
+        return NoopSkipOutcome {
+            reason: Some("trivial_diff"),
+            head_sha: Some(current_head),
+        };
     }
 
-    None
+    NoopSkipOutcome {
+        reason: None,
+        head_sha: Some(current_head),
+    }
 }
 
 /// Outcome of [`WorkerCompletionHandler::collect_remote_structured_output`],

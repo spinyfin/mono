@@ -64,11 +64,12 @@ pub(super) fn fetch_current_heads(
             row.get::<_, Option<String>>(4)?,
             row.get::<_, bool>(5)?,
             row.get::<_, bool>(6)?,
+            row.get::<_, bool>(7)?,
         ))
     })?;
     let mut result = HashMap::new();
     for row in rows {
-        let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved) = row?;
+        let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved, review_due) = row?;
         let (state, findings_revision_id) = match outcome.as_deref() {
             Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS) if revision_delivered_unmoved => {
                 (AI_REVIEW_STATE_NOT_REVIEWED, None)
@@ -85,7 +86,11 @@ pub(super) fn fetch_current_heads(
                     };
                 (state, None)
             }
-            _ => (AI_REVIEW_STATE_NOT_REVIEWED, None),
+            Some(REVIEW_GATE_OUTCOME_SKIPPED_NOOP | REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP) => {
+                (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None)
+            }
+            _ if review_due => (AI_REVIEW_STATE_NOT_REVIEWED, None),
+            _ => (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None),
         };
         result.insert(
             id,
@@ -494,11 +499,68 @@ fn informative_gate_outcomes_sql() -> String {
         .join(",")
 }
 
+fn current_head_gate_outcomes_sql() -> String {
+    super::review_verdicts::INFORMATIVE_GATE_OUTCOMES
+        .iter()
+        .chain(super::review_verdicts::SKIPPED_GATE_OUTCOMES.iter())
+        .map(|outcome| format!("'{outcome}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Production SQL for [`fetch_current_heads`]. Exposed so the query-plan test
 /// can `EXPLAIN` the same statement the board runs.
 pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
-    let outcomes = informative_gate_outcomes_sql();
+    let informative_outcomes = informative_gate_outcomes_sql();
+    let all_outcomes = current_head_gate_outcomes_sql();
     let family = review_family_cte(placeholders, key);
+    let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("root.id");
+    let none_started = super::review_batches::NO_BATCH_MEMBER_STARTED;
+    let cap = super::review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS;
+    let stale_head = super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD;
+    let unproductive_we = super::review_verdicts::unproductive_completed_pr_review_sql_for("we");
+    let unproductive_we3 = super::review_verdicts::unproductive_completed_pr_review_sql_for("we3");
+    let upkeep = super::parking::upkeep_eligible_task_sql("root");
+    let not_held = super::dispatch_helpers::not_positioning_held_sql("root");
+    let churn_cutoff = boss_engine_utils::epoch_time::now_epoch_secs() - ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS;
+    let churn_threshold = ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD;
+    let latest_dead_pr_review = format!(
+        "EXISTS(SELECT 1 FROM work_executions we
+                WHERE we.work_item_id = root.id
+                  AND we.kind = 'pr_review'
+                  AND (we.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {unproductive_we})
+                  AND NOT EXISTS(SELECT 1 FROM work_executions we2
+                                 WHERE we2.work_item_id = root.id
+                                   AND we2.kind = 'pr_review'
+                                   AND (we2.created_at > we.created_at
+                                        OR (we2.created_at = we.created_at AND we2.id > we.id))))"
+    );
+    let recoverable_dead_pr_review = format!(
+        "({latest_dead_pr_review}
+          AND root.deleted_at IS NULL
+          AND root.status NOT IN ('done', 'archived')
+          AND {upkeep}
+          AND {not_held}
+          AND NOT EXISTS(SELECT 1 FROM pr_review_batch_members m
+                         JOIN work_executions we ON we.id = m.execution_id
+                         WHERE we.work_item_id = root.id
+                           AND we.kind = 'pr_review'
+                           AND NOT EXISTS(SELECT 1 FROM work_executions we2
+                                          WHERE we2.work_item_id = root.id
+                                            AND we2.kind = 'pr_review'
+                                            AND (we2.created_at > we.created_at
+                                                 OR (we2.created_at = we.created_at AND we2.id > we.id))))
+          AND NOT EXISTS(SELECT 1 FROM pr_review_batches b
+                         WHERE b.id = (SELECT latest.id FROM pr_review_batches latest
+                                       WHERE latest.cycle_root_id = root.id AND latest.phase = 'pre_merge'
+                                       ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC LIMIT 1)
+                           AND b.status != 'completed')
+          AND (SELECT COUNT(*) FROM work_executions we3
+               WHERE we3.work_item_id = root.id
+                 AND we3.kind = 'pr_review'
+                 AND CAST(we3.created_at AS INTEGER) >= {churn_cutoff}
+                 AND (we3.status IN ('orphaned', 'abandoned', 'failed', 'cancelled') OR {unproductive_we3})) < {churn_threshold})"
+    );
     format!(
         "{family}
          SELECT o.card, v.gate_outcome, v.revision_task_id,
@@ -514,14 +576,40 @@ pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
                                                    WHERE e.work_item_id = r.id AND e.status = 'completed'
                                                      AND e.kind = 'revision_implementation'
                                                    ORDER BY e.finished_at DESC, e.id DESC LIMIT 1)
-                                      AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha)))
+                                      AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha))),
+                (
+                    (NULLIF(root.pr_head_sha, '') IS NULL AND NOT {latest_dead_pr_review})
+                    OR (root.status = 'active' AND root.parked_at IS NULL AND root.deleted_at IS NULL)
+                    OR EXISTS(SELECT 1 FROM family f JOIN work_executions we ON we.work_item_id = f.id
+                              WHERE f.root = root.id AND we.kind = 'pr_review'
+                                AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned'))
+                    OR EXISTS(SELECT 1 FROM pr_review_batches b
+                              WHERE b.cycle_root_id = root.id AND b.phase = 'pre_merge'
+                                AND b.status NOT IN ('completed', 'failed'))
+                    OR EXISTS(SELECT 1 FROM family f JOIN work_attention_items ai ON ai.work_item_id = f.id
+                              WHERE f.root = root.id
+                                AND ai.kind = 'pr_review_admission_deferred'
+                                AND ai.status = 'open')
+                    OR {needs_readmission}
+                    OR EXISTS(SELECT 1 FROM pr_review_batches b
+                              WHERE b.id = (SELECT latest.id FROM pr_review_batches latest
+                                            WHERE latest.cycle_root_id = root.id AND latest.phase = 'pre_merge'
+                                            ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC LIMIT 1)
+                                AND b.status = 'failed'
+                                AND b.target_sha = NULLIF(root.pr_head_sha, '')
+                                AND b.generation >= {cap}
+                                AND NOT EXISTS(SELECT 1 FROM pr_review_verdicts v2
+                                               WHERE v2.batch_id = b.id AND v2.gate_outcome != '{stale_head}')
+                                AND {none_started})
+                    OR {recoverable_dead_pr_review}
+                ) AS review_due
          FROM owners o JOIN tasks root ON root.id = o.id
          LEFT JOIN pr_review_verdicts v ON v.id = (
              SELECT rv.id FROM pr_review_verdicts rv
              JOIN family f ON f.id = rv.work_item_id AND f.root = root.id
              WHERE rv.head_sha = NULLIF(root.pr_head_sha, '')
-               AND rv.gate_outcome IN ({outcomes})
-             ORDER BY rv.created_at DESC, rv.id DESC LIMIT 1
+               AND rv.gate_outcome IN ({all_outcomes})
+             ORDER BY (rv.gate_outcome IN ({informative_outcomes})) DESC, rv.created_at DESC, rv.id DESC LIMIT 1
          )
          WHERE NULLIF(root.pr_url, '') IS NOT NULL"
     )

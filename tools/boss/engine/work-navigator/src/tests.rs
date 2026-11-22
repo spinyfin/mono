@@ -709,3 +709,21 @@ fn activity_picker_uses_creation_while_working_rows_use_first_current_start() {
         SortKey::Working(Reverse(1), 50, "root".into())
     );
 }
+
+#[test]
+fn review_queued_wait_requires_a_reservation_or_queued_review() {
+    let mut f = family();
+    let mut p = pr();
+    p.health.ai_review = AiReview::NotReviewed;
+    p.health.ci = Ci::Success;
+    f.pr = Some(p);
+    f.root.wait = None;
+    assert_eq!(reason(&f), Reason::Waiting(Wait::WaitingReview));
+
+    f.root.wait = Some(Wait::ReviewQueued);
+    assert_eq!(reason(&f), Reason::Waiting(Wait::ReviewQueued));
+
+    f.root.wait = None;
+    f.pr.as_mut().unwrap().health.ai_review = AiReview::Queued;
+    assert_eq!(reason(&f), Reason::Waiting(Wait::ReviewQueued));
+}

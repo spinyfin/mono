@@ -805,9 +805,12 @@ fn classify_review(conn: &Connection, tasks: &[&Task], waits: &mut HashMap<Strin
             let merge_only = has_pr(owner.pr_url.as_deref())
                 && matches!(owner.review_required_state.as_deref(), None | Some("unknown"))
                 && (task_kind_excluded_from_ai_review(&owner.kind)
-                    || reviews
-                        .get(root)
-                        .is_some_and(|review| review.state == AI_REVIEW_STATE_NOT_REVIEWED));
+                    || reviews.get(root).is_some_and(|review| {
+                        matches!(
+                            review.state,
+                            AI_REVIEW_STATE_NOT_REVIEWED | AI_REVIEW_STATE_REVIEW_NOT_REQUIRED
+                        )
+                    }));
             if merge_only {
                 merging.push(task);
             } else {

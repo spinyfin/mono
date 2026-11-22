@@ -32,6 +32,20 @@ pub const REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED: &str = "revision_creatio
 /// sweep's re-admission arm if nothing else did). Non-informative: it says
 /// nothing about the head the card shows, so the badge keeps "Not reviewed".
 pub const REVIEW_GATE_OUTCOME_STALE_HEAD: &str = "stale_head";
+/// The completion gate skipped automated review because the push was a no-op
+/// (`sha_unchanged`, `empty_diff`, `trivial_diff`, or `pure_rebase`). Recorded
+/// per-head on the chain root without moving `last_reviewed_sha`.
+pub const REVIEW_GATE_OUTCOME_SKIPPED_NOOP: &str = "skipped_noop";
+/// The completion gate skipped automated review because the PR's review-cycle
+/// counter reached `max_review_cycles`. Recorded per-head on the chain root
+/// without moving `last_reviewed_sha`.
+pub const REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP: &str = "skipped_cycle_cap";
+
+/// Gate outcomes that mean the completion gate explicitly declined to run an
+/// AI review for this head, so the current-head projection treats no review as
+/// due (`review_not_required`) without forging an informative clean/findings
+/// verdict or moving `last_reviewed_sha`.
+pub const SKIPPED_GATE_OUTCOMES: [&str; 2] = [REVIEW_GATE_OUTCOME_SKIPPED_NOOP, REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP];
 
 /// Gate outcomes that represent a real completed judgement about a pass —
 /// the only ones the AI-review badge (`attach_ai_review_state`) will ever
@@ -104,19 +118,24 @@ pub const PR_REVIEW_VERDICTS_SINCE_METADATA_KEY: &str = "pr_review_verdicts_sinc
 /// yank the card back to Doing, re-review the same SHA, drop as a
 /// duplicate again, and loop until the churn guard parks it.
 pub(crate) fn unproductive_completed_pr_review_sql() -> String {
+    unproductive_completed_pr_review_sql_for("we")
+}
+
+/// Parameterized alias form of [`unproductive_completed_pr_review_sql`].
+pub(crate) fn unproductive_completed_pr_review_sql_for(alias: &str) -> String {
     format!(
-        "(we.status = 'completed' AND (
+        "({alias}.status = 'completed' AND (
             EXISTS (
                 SELECT 1 FROM pr_review_verdicts rv
-                WHERE rv.execution_id = we.id
+                WHERE rv.execution_id = {alias}.id
                   AND rv.gate_outcome = '{gave_up}'
             )
             OR (
                 NOT EXISTS (
                     SELECT 1 FROM pr_review_verdicts rv
-                    WHERE rv.execution_id = we.id
+                    WHERE rv.execution_id = {alias}.id
                 )
-                AND CAST(we.created_at AS INTEGER) >= COALESCE(
+                AND CAST({alias}.created_at AS INTEGER) >= COALESCE(
                     (SELECT CAST(value AS INTEGER) FROM metadata WHERE key = '{since_key}'),
                     0
                 )
@@ -287,6 +306,59 @@ impl WorkDb {
             ],
         )?;
         Ok(id)
+    }
+
+    /// Record a per-head skip verdict (`skipped_noop` or `skipped_cycle_cap`)
+    /// on `cycle_root_id` without modifying `last_reviewed_sha` or
+    /// `review_cycle`. Falls back to `cycle_root_id`'s stored `pr_head_sha`
+    /// when the caller had no `head_sha`, and is idempotent per
+    /// `(execution_id, work_item_id, head_sha, gate_outcome)`.
+    pub fn record_skip_review_verdict(
+        &self,
+        execution_id: &str,
+        cycle_root_id: &str,
+        head_sha: Option<&str>,
+        gate_outcome: &'static str,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let resolved_head: Option<String> = match head_sha.filter(|sha| !sha.is_empty()) {
+            Some(sha) => Some(sha.to_owned()),
+            None => tx
+                .query_row(
+                    "SELECT NULLIF(pr_head_sha, '') FROM tasks WHERE id = ?1",
+                    params![cycle_root_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten(),
+        };
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pr_review_verdicts
+                WHERE execution_id = ?1
+                  AND work_item_id = ?2
+                  AND gate_outcome = ?3
+                  AND COALESCE(head_sha, '') = COALESCE(?4, '')
+            )",
+            params![execution_id, cycle_root_id, gate_outcome, resolved_head],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            Self::insert_review_verdict_in_tx(
+                &tx,
+                execution_id,
+                cycle_root_id,
+                &ReviewVerdictInput {
+                    head_sha: resolved_head,
+                    findings_count: 0,
+                    revision_warranted: false,
+                    gate_outcome,
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Record that the revision a verdict predicted (`gate_outcome =

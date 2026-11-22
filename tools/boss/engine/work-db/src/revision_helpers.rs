@@ -1013,7 +1013,8 @@ pub(crate) fn attach_ai_review_state_with(
                     .map(|history| history.trimmed_for(current_head.as_ref().map(|head| head.state)));
                 let review = std::sync::Arc::new(OwnerReview { current_head, history });
                 owner_reviews.insert(id.clone(), std::sync::Arc::clone(&review));
-                fresh.push((id.clone(), keys[&id].clone(), review));
+                let key = keys.get(&id).cloned().unwrap_or_else(|| vec![(id.clone(), 0)]);
+                fresh.push((id.clone(), key, review));
             }
         }
         cache.complete(product_id, lookup.pass, fresh);

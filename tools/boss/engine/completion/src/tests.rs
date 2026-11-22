@@ -2144,6 +2144,8 @@ mod nudge_staged_pr;
 #[cfg(test)]
 mod pr_created_seam;
 #[cfg(test)]
+mod review_skip_verdicts;
+#[cfg(test)]
 mod revision_delivery;
 #[cfg(test)]
 mod status_ledger;
