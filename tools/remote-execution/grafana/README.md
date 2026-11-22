@@ -1,6 +1,6 @@
 # NativeLink Grafana dashboards
 
-These exports came from headcrash on 2026-11-22, including the overview's Queue time panel (p50/p90/p99/mean and oldest queued action). Dashboard UIDs, queries, panel IDs and positions are preserved. Dashboard-level `id` and `version` are omitted, object keys are sorted, and each panel has an explicit datasource. Text and row panels use Grafana's built-in datasource; metric panels retain the host's Prometheus UID `PBFA97CFB590B2093`.
+These exports came from headcrash on 2026-11-22, including the overview's Hub health and Cache eviction rows, Hub restart / OOM-kill annotations, Queue time panel (p50/p90/p99/mean and oldest queued action), and workers host-resource queries that aggregate `by (instance)` so extra target labels do not split series. Dashboard UIDs, queries, panel IDs and positions are preserved. Dashboard-level `id` and `version` are omitted, object keys are sorted, and each panel has an explicit datasource. Text and row panels use Grafana's built-in datasource; metric panels retain the host's Prometheus UID `PBFA97CFB590B2093`.
 
 ## Publishing
 

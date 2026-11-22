@@ -22,11 +22,35 @@ class DashboardsTest(unittest.TestCase):
         self.bundle = load_bundle(HERE)
 
     def test_live_exports_and_queue_time(self):
-        self.assertEqual([24, 54], [len(self.bundle[name]["panels"]) for name in DASHBOARDS])
-        panel = next(p for p in self.bundle[DASHBOARDS[0]]["panels"] if p.get("title") == "Queue time")
+        overview, workers = (self.bundle[name]["panels"] for name in DASHBOARDS)
+        self.assertEqual([37, 54], [len(overview), len(workers)])
+        titles = [p.get("title") for p in overview]
+        self.assertIn("Hub health", titles)
+        self.assertIn("Cache eviction", titles)
+        self.assertEqual(
+            ["Hub uptime", "Hub restarts (24h)", "OOM kills on headcrash (24h)", "Hub unit state"],
+            [p.get("title") for p in overview if p.get("title") in {
+                "Hub uptime", "Hub restarts (24h)", "OOM kills on headcrash (24h)", "Hub unit state",
+            }],
+        )
+        annotations = [a.get("name") for a in self.bundle[DASHBOARDS[0]].get("annotations", {}).get("list", [])]
+        self.assertIn("Hub restart", annotations)
+        self.assertIn("OOM kill on headcrash", annotations)
+        panel = next(p for p in overview if p.get("title") == "Queue time")
         self.assertEqual(["p50", "p90", "p99", "mean", "oldest queued"], [t["legendFormat"] for t in panel["targets"]])
         self.assertIn("nativelink_execution_queue_time_seconds", panel["targets"][0]["expr"])
         self.assertEqual("max(nativelink_scheduler_queue_oldest_age_seconds)", panel["targets"][-1]["expr"])
+        eviction = next(p for p in overview if p.get("title") == "Evicted in the last hour")
+        self.assertTrue(any("nativelink_hub_cas_evicted_bytes_total" in t["expr"] for t in eviction["targets"]))
+        node_exprs = [
+            t["expr"]
+            for p in workers
+            for t in p.get("targets") or []
+            if isinstance(t, dict) and "node_" in t.get("expr", "")
+        ]
+        self.assertEqual(15, len(node_exprs))
+        for expr in node_exprs:
+            self.assertIn("by (instance)", expr)
 
     def test_bad_panels(self):
         mutations = {

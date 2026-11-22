@@ -1,6 +1,49 @@
 {
   "annotations": {
-    "list": []
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "enable": true,
+        "expr": "changes(nativelink_hub_start_time_seconds[1m]) > 0",
+        "hide": false,
+        "iconColor": "red",
+        "name": "Hub restart",
+        "step": "30s",
+        "textFormat": "",
+        "titleFormat": "NativeLink hub restarted",
+        "useValueForTime": false
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "PBFA97CFB590B2093"
+        },
+        "enable": true,
+        "expr": "max by (instance)(increase(node_vmstat_oom_kill{instance=\"headcrash\"}[2m])) > 0",
+        "hide": false,
+        "iconColor": "orange",
+        "name": "OOM kill on headcrash",
+        "step": "60s",
+        "textFormat": "",
+        "titleFormat": "Kernel OOM kill on {{instance}}",
+        "useValueForTime": false
+      }
+    ]
   },
   "editable": true,
   "fiscalYearStartMonth": 0,
@@ -382,6 +425,291 @@
         "x": 0,
         "y": 16
       },
+      "id": 126,
+      "panels": [],
+      "title": "Hub health",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Time since the hub's current process started (systemd user unit nativelink-macos-hub.service). Red under 1 h: it restarted recently.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 3600
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 17
+      },
+      "id": 127,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "time() - nativelink_hub_start_time_seconds",
+          "instant": true,
+          "legendFormat": "__auto",
+          "refId": "A"
+        }
+      ],
+      "title": "Hub uptime",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Times the hub process was (re)started in the last 24 h, from the start-time metric. Counts systemd automatic restarts (e.g. after an OOM kill) and manual restarts. History starts 2026-11-21 23:43 PST.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 17
+      },
+      "id": 128,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "changes(nativelink_hub_start_time_seconds[24h])",
+          "instant": true,
+          "legendFormat": "__auto",
+          "refId": "A"
+        }
+      ],
+      "title": "Hub restarts (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Kernel OOM kills on the hub host in the last 24 h (any process, not only the hub). History starts 2026-11-21 22:28 PST.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 17
+      },
+      "id": 129,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "round(max by (instance)(increase(node_vmstat_oom_kill{instance=\"headcrash\"}[24h])))",
+          "instant": true,
+          "legendFormat": "__auto",
+          "refId": "A"
+        }
+      ],
+      "title": "OOM kills on headcrash (24h)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Whether systemd reports the hub unit active.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "index": 0,
+                  "text": "DOWN"
+                },
+                "1": {
+                  "index": 1,
+                  "text": "UP"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 17
+      },
+      "id": 130,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "nativelink_hub_up",
+          "instant": true,
+          "legendFormat": "__auto",
+          "refId": "A"
+        }
+      ],
+      "title": "Hub unit state",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "grafana",
+        "uid": "-- Grafana --"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
       "id": 124,
       "panels": [],
       "title": "Execution",
@@ -407,7 +735,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 17
+        "y": 22
       },
       "id": 6,
       "options": {
@@ -458,7 +786,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 17
+        "y": 22
       },
       "id": 7,
       "options": {
@@ -516,7 +844,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 25
+        "y": 30
       },
       "id": 10,
       "options": {
@@ -565,7 +893,7 @@
         "h": 8,
         "w": 18,
         "x": 6,
-        "y": 25
+        "y": 30
       },
       "id": 11,
       "options": {
@@ -623,7 +951,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 33
+        "y": 38
       },
       "id": 8,
       "options": {
@@ -679,7 +1007,7 @@
         "h": 8,
         "w": 18,
         "x": 6,
-        "y": 33
+        "y": 38
       },
       "id": 13,
       "options": {
@@ -770,7 +1098,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 37
+        "y": 42
       },
       "id": 9,
       "options": {
@@ -810,7 +1138,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 46
       },
       "id": 114,
       "panels": [],
@@ -847,7 +1175,7 @@
         "h": 6,
         "w": 5,
         "x": 0,
-        "y": 42
+        "y": 47
       },
       "id": 115,
       "options": {
@@ -876,7 +1204,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "The hub evicts the least recently used entries once the cache reaches its cap. Eviction counts are not reported: that needs the hub's stores wrapped with cache_metrics, a config change and a hub restart. Below the cap nothing is evicted.",
+      "description": "The hub evicts the least recently used entries once the CAS reaches its cap. See the Cache eviction row for eviction volume and how long entries survive.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -902,7 +1230,7 @@
         "h": 6,
         "w": 4,
         "x": 5,
-        "y": 42
+        "y": 47
       },
       "id": 116,
       "options": {
@@ -964,7 +1292,7 @@
         "h": 6,
         "w": 5,
         "x": 9,
-        "y": 42
+        "y": 47
       },
       "id": 117,
       "options": {
@@ -1018,7 +1346,7 @@
         "h": 6,
         "w": 5,
         "x": 14,
-        "y": 42
+        "y": 47
       },
       "id": 118,
       "options": {
@@ -1072,7 +1400,7 @@
         "h": 6,
         "w": 5,
         "x": 19,
-        "y": 42
+        "y": 47
       },
       "id": 119,
       "options": {
@@ -1101,7 +1429,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "The hub evicts the least recently used entries once the cache reaches its cap. Eviction counts are not reported: that needs the hub's stores wrapped with cache_metrics, a config change and a hub restart. Below the cap nothing is evicted.",
+      "description": "The hub evicts the least recently used entries once the CAS reaches its cap. See the Cache eviction row for eviction volume and how long entries survive.",
       "fieldConfig": {
         "defaults": {
           "min": 0,
@@ -1113,7 +1441,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 53
       },
       "id": 120,
       "options": {
@@ -1175,7 +1503,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 53
       },
       "id": 122,
       "options": {
@@ -1245,7 +1573,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 61
       },
       "id": 121,
       "options": {
@@ -1338,7 +1666,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 56
+        "y": 61
       },
       "id": 125,
       "options": {
@@ -1374,6 +1702,490 @@
         }
       ],
       "title": "Action cache hit rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": {
+        "type": "grafana",
+        "uid": "-- Grafana --"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "id": 131,
+      "panels": [],
+      "title": "Cache eviction",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Bytes in the CAS (sum of entry sizes) as a share of the cap the running hub evicts at. The action cache is not included. At about 100% every write evicts the least recently used entries. Measured by worker-slots-exporter.py (inotify on the hub's CAS directories; see its comments).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 95
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "text",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "text",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 70
+      },
+      "id": 132,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "orientation": "vertical",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "100 * max(nativelink_hub_cas_content_bytes) / max(nativelink_hub_cache_cap_bytes)",
+          "legendFormat": "fill",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max(nativelink_hub_cas_content_bytes)",
+          "legendFormat": "used",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max(nativelink_hub_cache_cap_bytes)",
+          "legendFormat": "cap",
+          "refId": "C"
+        }
+      ],
+      "title": "CAS fill",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "How long an entry nobody touches survives in the CAS: now minus the median last-access time (atime) of the last 1000 entries evicted, i.e. the LRU frontier. It keeps rising while nothing is evicted. A cached action result is served only while all its outputs are still in the CAS, so this is roughly how long a cached test result stays usable. Red under 24 h. Measured by worker-slots-exporter.py (inotify on the hub's CAS directories; see its comments).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 86400
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 70
+      },
+      "id": 133,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max(nativelink_hub_cas_oldest_entry_age_seconds)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Oldest cached entry",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Bytes and entries the hub evicted from the CAS in the last hour. Measured by worker-slots-exporter.py (inotify on the hub's CAS directories; see its comments).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "text",
+            "mode": "fixed"
+          },
+          "decimals": 1,
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 70
+      },
+      "id": 134,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "orientation": "vertical",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(increase(nativelink_hub_cas_evicted_bytes_total[1h]))",
+          "legendFormat": "bytes",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(increase(nativelink_hub_cas_evicted_entries_total[1h]))",
+          "legendFormat": "entries",
+          "refId": "B"
+        }
+      ],
+      "title": "Evicted in the last hour",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Bytes evicted from the CAS per hour (5 min rate), with bytes written for comparison: at the cap the two match. Measured by worker-slots-exporter.py (inotify on the hub's CAS directories; see its comments).",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 76
+      },
+      "id": 135,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(nativelink_hub_cas_evicted_bytes_total[5m])) * 3600",
+          "legendFormat": "evicted",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(nativelink_hub_cas_inserted_bytes_total[5m])) * 3600",
+          "legendFormat": "written",
+          "refId": "B"
+        }
+      ],
+      "title": "Evicted (bytes/h)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Entries evicted from the CAS per hour (5 min rate), with entries written for comparison. Measured by worker-slots-exporter.py (inotify on the hub's CAS directories; see its comments).",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 76
+      },
+      "id": 136,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(nativelink_hub_cas_evicted_entries_total[5m])) * 3600",
+          "legendFormat": "evicted",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(nativelink_hub_cas_inserted_entries_total[5m])) * 3600",
+          "legendFormat": "written",
+          "refId": "B"
+        }
+      ],
+      "title": "Evicted entries/h",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Bytes written into the CAS per second (new entries renamed into the store, 5 min rate). At the cap, the CAS turns over once every cap / write rate. Measured by worker-slots-exporter.py (inotify on the hub's CAS directories; see its comments).",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
+      "id": 137,
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "sum(rate(nativelink_hub_cas_inserted_bytes_total[5m]))",
+          "legendFormat": "written",
+          "refId": "A"
+        }
+      ],
+      "title": "CAS write rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "description": "Oldest cached entry: now minus the median atime of the last 1000 evicted entries. Lifetime: median time from write to eviction of those entries. Oldest atime on disk (from a walk every 15 min) overstates retention: the hub's LRU also promotes entries on existence checks, which do not update atime, so a few old files linger. Measured by worker-slots-exporter.py (inotify on the hub's CAS directories; see its comments).",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 84
+      },
+      "id": 138,
+      "options": {
+        "legend": {
+          "calcs": ["min", "mean", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max(nativelink_hub_cas_oldest_entry_age_seconds)",
+          "legendFormat": "oldest cached entry (LRU frontier)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "max(nativelink_hub_cas_evicted_lifetime_seconds)",
+          "legendFormat": "write-to-eviction lifetime (median)",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "expr": "time() - min(nativelink_hub_cas_oldest_atime_seconds)",
+          "legendFormat": "oldest atime on disk",
+          "refId": "C"
+        }
+      ],
+      "title": "Cache retention over time",
       "type": "timeseries"
     }
   ],
