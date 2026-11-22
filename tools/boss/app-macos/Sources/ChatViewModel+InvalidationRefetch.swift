@@ -171,7 +171,14 @@ extension ChatViewModel {
                 ? Set(executionsConsumerTokensByTaskID.keys)
                 : burst.itemIDs
             for taskID in candidates.sorted() where hasOpenExecutionsConsumer(taskID: taskID) {
-                engine.sendListExecutions(taskId: taskID)
+                if hasLiveExecutionsConsumer(taskID: taskID) {
+                    executionsStaleTaskIDs.remove(taskID)
+                    engine.sendListExecutions(taskId: taskID)
+                } else {
+                    // Hidden History keeps its prefetch cache; refetch on
+                    // the next activation instead of fanning out now.
+                    executionsStaleTaskIDs.insert(taskID)
+                }
             }
         }
         if burst.scope.contains(.backgroundWork) {
@@ -194,18 +201,49 @@ extension ChatViewModel {
 
     // MARK: - Executions consumers
 
-    /// Whether a card popover or transcript viewer currently shows `taskID`'s
-    /// execution history, and so wants it kept fresh.
+    /// Whether a card popover, transcript viewer, or History tab currently
+    /// holds `taskID`'s execution history (including a hidden prefetch).
     func hasOpenExecutionsConsumer(taskID: String) -> Bool {
         executionsConsumerTokensByTaskID[taskID] != nil
     }
 
+    /// Whether any registered consumer for `taskID` is on screen.
+    func hasLiveExecutionsConsumer(taskID: String) -> Bool {
+        !(executionsLiveConsumerTokensByTaskID[taskID] ?? []).isEmpty
+    }
+
     /// A view that shows `taskID`'s execution history appeared: register it
     /// and load the history. `token` identifies this view instance, so two
-    /// views on one task don't evict each other.
-    func beginExecutionsConsumer(taskID: String, token: UUID) {
+    /// views on one task don't evict each other. Pass `live: false` for a
+    /// mounted-but-hidden History tab: it still prefetches and shares the
+    /// cache, but invalidations wait until the tab is shown.
+    func beginExecutionsConsumer(taskID: String, token: UUID, live: Bool = true) {
         executionsConsumerTokensByTaskID[taskID, default: []].insert(token)
-        loadExecutions(taskId: taskID)
+        setExecutionsConsumerLive(taskID: taskID, token: token, live: live)
+        refreshExecutionsIfNeeded(taskID: taskID, live: live)
+    }
+
+    /// Toggle whether `token` is on screen. Becoming live reloads a cache
+    /// that went stale (or failed) while History was hidden. Tab switches
+    /// with a fresh cache do not refetch.
+    func setExecutionsConsumerLive(taskID: String, token: UUID, live: Bool) {
+        guard executionsConsumerTokensByTaskID[taskID]?.contains(token) == true else { return }
+        let wasLive = hasLiveExecutionsConsumer(taskID: taskID)
+        var liveTokens = executionsLiveConsumerTokensByTaskID[taskID] ?? []
+        if live {
+            liveTokens.insert(token)
+            executionsLiveConsumerTokensByTaskID[taskID] = liveTokens
+            if !wasLive {
+                refreshExecutionsIfNeeded(taskID: taskID, live: true)
+            }
+        } else {
+            liveTokens.remove(token)
+            if liveTokens.isEmpty {
+                executionsLiveConsumerTokensByTaskID.removeValue(forKey: taskID)
+            } else {
+                executionsLiveConsumerTokensByTaskID[taskID] = liveTokens
+            }
+        }
     }
 
     /// The view registered under `token` went away. The last consumer of a
@@ -215,11 +253,56 @@ extension ChatViewModel {
         guard var tokens = executionsConsumerTokensByTaskID[taskID], tokens.remove(token) != nil else { return }
         if tokens.isEmpty {
             executionsConsumerTokensByTaskID.removeValue(forKey: taskID)
+            executionsLiveConsumerTokensByTaskID.removeValue(forKey: taskID)
             executionsByTaskID[taskID] = nil
             executionsInFlightTaskIDs.remove(taskID)
             executionsLoadFailureByTaskID.removeValue(forKey: taskID)
+            executionsStaleTaskIDs.remove(taskID)
         } else {
             executionsConsumerTokensByTaskID[taskID] = tokens
+            var liveTokens = executionsLiveConsumerTokensByTaskID[taskID] ?? []
+            liveTokens.remove(token)
+            if liveTokens.isEmpty {
+                executionsLiveConsumerTokensByTaskID.removeValue(forKey: taskID)
+            } else {
+                executionsLiveConsumerTokensByTaskID[taskID] = liveTokens
+            }
+        }
+    }
+
+    /// Drop in-flight loads and cached rows for registered consumers so a
+    /// reconnect cannot leave History spinning or showing pre-disconnect
+    /// rows as current.
+    func noteExecutionsDisconnected() {
+        executionsInFlightTaskIDs.removeAll()
+        for taskID in executionsConsumerTokensByTaskID.keys {
+            executionsByTaskID[taskID] = nil
+            executionsLoadFailureByTaskID.removeValue(forKey: taskID)
+            executionsStaleTaskIDs.insert(taskID)
+        }
+    }
+
+    /// Re-read every still-registered consumer after the socket comes back,
+    /// including a hidden History prefetch. Skips a load already in flight
+    /// (a Retry that queued while disconnected).
+    func reloadRegisteredExecutionsConsumers() {
+        for taskID in executionsConsumerTokensByTaskID.keys.sorted()
+        where !executionsInFlightTaskIDs.contains(taskID) {
+            loadExecutions(taskId: taskID)
+        }
+    }
+
+    /// Load when there is no cache yet (prefetch / first viewer). Reload a
+    /// failed or stale cache only for a live consumer, so tab switches keep
+    /// their shared result and hidden invalidations wait for activation.
+    func refreshExecutionsIfNeeded(taskID: String, live: Bool) {
+        if executionsInFlightTaskIDs.contains(taskID) { return }
+        if executionsByTaskID[taskID] == nil {
+            loadExecutions(taskId: taskID)
+            return
+        }
+        if live, executionsLoadFailureByTaskID[taskID] != nil || executionsStaleTaskIDs.contains(taskID) {
+            loadExecutions(taskId: taskID)
         }
     }
 }

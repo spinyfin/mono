@@ -112,10 +112,20 @@ final class ChatViewModel: ObservableObject {
     /// [[BoardLoadTracker]].
     @Published var boardLoad = BoardLoadTracker()
     /// Views currently showing a task's execution history (card popover,
-    /// transcript viewer), by task id, each identified by a per-view token.
-    /// A task with no entry has no consumer: its history is not cached and
-    /// is not refetched on invalidation.
+    /// transcript viewer, History tab — including a hidden prefetch), by
+    /// task id, each identified by a per-view token. A task with no entry
+    /// has no consumer: its history is not cached and is not refetched on
+    /// invalidation.
     var executionsConsumerTokensByTaskID: [String: Set<UUID>] = [:]
+    /// Subset of [[executionsConsumerTokensByTaskID]] whose views are
+    /// actually on screen. Hidden History stays registered so it can
+    /// prefetch and share a cache, but invalidations for background-only
+    /// tasks mark [[executionsStaleTaskIDs]] instead of refetching.
+    var executionsLiveConsumerTokensByTaskID: [String: Set<UUID>] = [:]
+    /// Tasks whose cached rows missed an invalidation or a disconnect while
+    /// no live consumer was showing them. A later activation or reconnect
+    /// reloads them.
+    var executionsStaleTaskIDs: Set<String> = []
 
     /// Projects whose navigator "Archive" gesture has been sent to the
     /// engine and not yet answered. This is the gesture's immediate

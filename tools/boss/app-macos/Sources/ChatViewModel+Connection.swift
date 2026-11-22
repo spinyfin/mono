@@ -53,6 +53,7 @@ extension ChatViewModel {
             refreshEngineAttempts()
         }
         startBackgroundWorkPolling()
+        reloadRegisteredExecutionsConsumers()
         if resyncOnlyReadsOwed {
             resyncOnlyReadsOwed = false
             sendResyncOnlyReads()

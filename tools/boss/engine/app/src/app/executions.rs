@@ -264,6 +264,8 @@ pub(super) async fn handle_evaluate_dispatch_admission(ctx: Dispatch, req: Front
 }
 
 pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) {
+    let started = Instant::now();
+    let admission_ms = ctx.recv_instant.elapsed().as_secs_f64() * 1000.0;
     let Dispatch {
         server_state,
         work_db,
@@ -279,7 +281,9 @@ pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) 
         unreachable!()
     };
     let work_item_id = match work_item_id {
-        Some(id) => match server_state.resolve_work_item_id(&id).await {
+        // Resolution must use the admitted connection too. The shared writer
+        // can be occupied by unrelated snapshots even when this read is cheap.
+        Some(id) => match server_state.resolve_work_item_id_with_db(&work_db, &id).await {
             Ok(id) => Some(id),
             Err(err) => {
                 send_work_error(&sink, &request_id, &err);
@@ -288,6 +292,7 @@ pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) 
         },
         None => None,
     };
+    let resolved = Instant::now();
     {
         let result = if include_revision_chain {
             match work_item_id.as_deref() {
@@ -297,6 +302,14 @@ pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) 
         } else {
             work_db.list_executions(work_item_id.as_deref())
         };
+        tracing::info!(
+            %request_id,
+            work_item_id = work_item_id.as_deref().unwrap_or(""),
+            admission_ms,
+            resolve_ms = resolved.duration_since(started).as_secs_f64() * 1000.0,
+            query_ms = resolved.elapsed().as_secs_f64() * 1000.0,
+            "execution history read ready"
+        );
         match result {
             Ok(executions) => {
                 send_response(

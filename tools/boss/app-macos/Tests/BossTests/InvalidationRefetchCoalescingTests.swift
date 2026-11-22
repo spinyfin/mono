@@ -190,6 +190,51 @@ final class InvalidationRefetchCoalescingTests: XCTestCase {
         XCTAssertEqual(recorder.executionFetches, ["task_1"])
     }
 
+    func testHiddenExecutionsConsumerMarksStaleUntilActivation() async {
+        let (model, recorder) = makeModel()
+        let token = UUID()
+        model.beginExecutionsConsumer(taskID: "task_1", token: token, live: false)
+        model.applyEventForTest(.executionsList(taskId: "task_1", executions: []))
+        recorder.reset()
+
+        model.applyEventForTest(invalidation(itemIDs: ["task_1"]))
+        await waitForBurst(model, recorder)
+
+        XCTAssertEqual(recorder.executionFetches, [], "A hidden History prefetch must not refetch on invalidation")
+        XCTAssertTrue(model.executionsStaleTaskIDs.contains("task_1"))
+        XCTAssertNotNil(model.executionsByTaskID["task_1"])
+
+        model.setExecutionsConsumerLive(taskID: "task_1", token: token, live: true)
+        XCTAssertEqual(recorder.executionFetches, ["task_1"], "Showing History must refetch the stale cache")
+        XCTAssertTrue(model.hasLiveExecutionsConsumer(taskID: "task_1"))
+    }
+
+    func testStaleFlagSetDuringHiddenPrefetchIsDrainedWhenHistoryBecomesLive() async {
+        let (model, recorder) = makeModel()
+        let token = UUID()
+        model.beginExecutionsConsumer(taskID: "task_1", token: token, live: false)
+        XCTAssertEqual(recorder.executionFetches, ["task_1"], "the hidden prefetch is in flight")
+
+        model.applyEventForTest(invalidation(itemIDs: ["task_1"]))
+        await waitForBurst(model, recorder)
+        XCTAssertTrue(model.executionsStaleTaskIDs.contains("task_1"))
+
+        model.setExecutionsConsumerLive(taskID: "task_1", token: token, live: true)
+        XCTAssertEqual(recorder.executionFetches, ["task_1"], "the in-flight guard defers to the reply")
+
+        recorder.reset()
+        model.applyEventForTest(.executionsList(taskId: "task_1", executions: []))
+        XCTAssertEqual(recorder.executionFetches, ["task_1"], "the pre-invalidation reply triggers one follow-up load")
+        XCTAssertNil(model.executionsByTaskID["task_1"], "stale rows must not be shown as loaded")
+        XCTAssertTrue(model.executionsInFlightTaskIDs.contains("task_1"))
+        XCTAssertFalse(model.executionsStaleTaskIDs.contains("task_1"))
+
+        model.applyEventForTest(.executionsList(taskId: "task_1", executions: []))
+        XCTAssertEqual(recorder.executionFetches, ["task_1"], "the fresh reply does not load again")
+        XCTAssertNotNil(model.executionsByTaskID["task_1"])
+        XCTAssertFalse(model.executionsInFlightTaskIDs.contains("task_1"))
+    }
+
     func testClosingTheLastConsumerStopsItsExecutionsRefetchAndEvictsTheHistory() async {
         let (model, recorder) = makeModel()
         let popover = UUID()
