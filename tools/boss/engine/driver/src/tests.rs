@@ -797,8 +797,8 @@ fn interrupt_plan_defaults_to_none_and_agrees_with_the_transport() {
 }
 
 /// Every interruptible driver, including one restricted to explicit pins,
-/// must declare a runnable plan agreeing with its transport. Launch-ready
-/// drivers must also support interruption.
+/// must declare a runnable plan agreeing with its transport. Drivers with
+/// `launch_implemented()` must also support interruption.
 ///
 /// Asserted over `DriverRegistry::slugs()` rather than a hand-listed set, so a
 /// driver added tomorrow is covered the day it is registered rather than the
@@ -811,7 +811,7 @@ fn supported_interrupts_have_valid_plans_including_pinned_drivers() {
         if driver.interrupt() == InterruptDelivery::Unsupported {
             assert!(
                 !driver.launch_implemented(),
-                "launch-ready driver {slug} cannot interrupt"
+                "implemented driver {slug} cannot interrupt"
             );
             assert!(driver.interrupt_plan().is_none(), "{slug}");
             continue;

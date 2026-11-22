@@ -7,7 +7,7 @@
 
 use super::*;
 
-use boss_protocol::PauseReason;
+use boss_protocol::{DriverTrafficSplit, PauseReason};
 
 pub(super) async fn handle_workspace_pool_summary(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -702,43 +702,91 @@ pub(super) async fn handle_codex_sol_percentage(ctx: Dispatch, req: FrontendRequ
 }
 
 pub(super) async fn handle_set_driver_traffic_split(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch {
-        work_db,
-        sink,
-        request_id,
-        ..
-    } = ctx;
     let FrontendRequest::SetDriverTrafficSplit { split } = req else {
         unreachable!()
     };
-    // `set_driver_traffic_split` validates (shares must sum to exactly 100)
-    // and persists to `state.db` itself — see its doc comment. A split that
-    // does not validate is rejected here as a `WorkError`, never repaired
-    // into something valid-looking. Nothing in-memory to update: every
-    // allocation reads the metadata KV fresh at insertion, dispatch claim,
-    // and launch composition. Running workers retain their saved routing.
-    match work_db.set_driver_traffic_split(split) {
+    // Share writes keep the stored launch flags, so a stale Settings
+    // snapshot cannot reopen a driver another writer just closed.
+    let result = ctx.work_db.set_driver_traffic_shares(split);
+    reply_driver_traffic_split(ctx, split, result).await;
+}
+
+pub(super) async fn handle_set_driver_launch_flag(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::SetDriverLaunchFlag { driver, enabled } = req else {
+        unreachable!()
+    };
+    let result = ctx.work_db.set_driver_launch_flag(&driver, enabled);
+    let proposed = result.as_ref().ok().copied().unwrap_or_default();
+    reply_driver_traffic_split(ctx, proposed, result).await;
+}
+
+fn log_driver_traffic_split(split: DriverTrafficSplit, err: Option<&dyn std::fmt::Display>) {
+    if let Some(err) = err {
+        tracing::warn!(
+            grok = split.grok,
+            claude = split.claude,
+            codex = split.codex,
+            agy = split.agy,
+            launch_enabled_grok = split.launch_enabled.grok,
+            launch_enabled_claude = split.launch_enabled.claude,
+            launch_enabled_codex = split.launch_enabled.codex,
+            launch_enabled_agy = split.launch_enabled.agy,
+            launch_exclusions = ?split.launch_exclusions(),
+            %err,
+            "driver_traffic_split: rejected",
+        );
+    } else {
+        tracing::info!(
+            grok = split.grok,
+            claude = split.claude,
+            codex = split.codex,
+            agy = split.agy,
+            launch_enabled_grok = split.launch_enabled.grok,
+            launch_enabled_claude = split.launch_enabled.claude,
+            launch_enabled_codex = split.launch_enabled.codex,
+            launch_enabled_agy = split.launch_enabled.agy,
+            launch_exclusions = ?split.launch_exclusions(),
+            "driver_traffic_split: updated",
+        );
+    }
+}
+
+async fn reply_driver_traffic_split(
+    ctx: Dispatch,
+    proposed: DriverTrafficSplit,
+    result: anyhow::Result<DriverTrafficSplit>,
+) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        session_id,
+        ..
+    } = ctx;
+    match result {
         Ok(applied) => {
-            tracing::info!(
-                grok = applied.grok,
-                claude = applied.claude,
-                codex = applied.codex,
-                "driver_traffic_split: updated",
-            );
+            log_driver_traffic_split(applied, None);
             send_response(
                 &sink,
                 &request_id,
                 FrontendEvent::DriverTrafficSplitResult { split: applied },
             );
+            let envelope = FrontendEventEnvelope::push(FrontendEvent::DriverTrafficSplitResult { split: applied });
+            let sinks = {
+                let inner = server_state.topic_broker.inner.lock().await;
+                inner
+                    .sinks
+                    .iter()
+                    .filter(|(id, _)| id.as_str() != session_id)
+                    .map(|(_, other)| other.clone())
+                    .collect::<Vec<_>>()
+            };
+            for other in sinks {
+                let _ = other.enqueue(envelope.clone());
+            }
         }
         Err(err) => {
-            tracing::warn!(
-                grok = split.grok,
-                claude = split.claude,
-                codex = split.codex,
-                %err,
-                "driver_traffic_split: rejected",
-            );
+            log_driver_traffic_split(proposed, Some(&err));
             send_work_error(&sink, &request_id, err);
         }
     }

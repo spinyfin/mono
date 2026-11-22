@@ -80,6 +80,16 @@ extension EngineClient {
         ])
     }
 
+    /// Flip one driver's persisted launch flag. Replies with
+    /// `driver_traffic_split_result`.
+    func sendSetDriverLaunchFlag(_ driver: DriverSlug, enabled: Bool) {
+        sendLine([
+            "type": "set_driver_launch_flag",
+            "driver": driver.rawValue,
+            "enabled": enabled,
+        ])
+    }
+
     /// Ask the engine for the per-driver provider quota snapshot — what
     /// each driver's own provider reports the maintainer has consumed of the
     /// current subscription window.

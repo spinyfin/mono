@@ -70,7 +70,7 @@ pub(crate) async fn run(
         .or_else(|| disable.map(|driver| (driver, false)))
     {
         split.launch_enabled.set(&driver, enabled).map_err(anyhow::Error::msg)?;
-        split = request(socket_path, FrontendRequest::SetDriverTrafficSplit { split }).await?;
+        split = request(socket_path, FrontendRequest::SetDriverLaunchFlag { driver, enabled }).await?;
     }
     println!("{}", render(split, json)?);
     Ok(())
@@ -132,11 +132,12 @@ mod tests {
                 let request: boss_protocol::FrontendRequestEnvelope = serde_json::from_str(&line).unwrap();
                 let split = match request.payload {
                     FrontendRequest::GetDriverTrafficSplit => original,
-                    FrontendRequest::SetDriverTrafficSplit { split } => {
+                    FrontendRequest::SetDriverLaunchFlag { driver, enabled } => {
+                        assert_eq!(driver, "agy");
+                        assert!(!enabled);
                         let mut expected = original;
                         expected.launch_enabled.agy = false;
-                        assert_eq!(split, expected);
-                        split
+                        expected
                     }
                     other => panic!("unexpected request: {other:?}"),
                 };

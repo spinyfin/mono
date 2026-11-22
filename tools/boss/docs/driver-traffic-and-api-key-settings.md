@@ -17,9 +17,15 @@ new and queued allocations; explicit pins remain available for canaries.
 
 `bossctl dispatch traffic-split` shows the same state (also available with
 `--json`). Use `bossctl dispatch traffic-split --disable agy` to close allocated
-Antigravity launches, or `--enable agy` to reopen them. Allocation snapshots in
+Antigravity launches, or `--enable agy` to reopen them. Flag changes are
+field-scoped: the engine flips one launch flag in a single write and does
+not take the rest of a client's cached split. Share edits keep the stored
+flags, so a Settings window opened before a `bossctl --disable` cannot
+silently reopen that driver on the next stepper click. Connected sessions
+receive the updated split. Allocation snapshots in
 `execution_driver_decisions.split_at_decision` include the flags and an
-`exclusions` array such as `agy excluded: launch flag off`.
+`exclusions` array such as `agy excluded: launch flag off`, including when
+allocation is refused because every funded driver was closed.
 
 - **PR reviews and automation keep their own pinned driver, outside the
   split.** This is the single most useful fact here: it explains why a

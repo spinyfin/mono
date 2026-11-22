@@ -4,7 +4,7 @@
 //! (which funnels into `insert_execution`) rather than calling
 //! `decide_execution_driver` directly, so they exercise the same path real
 //! insertion takes: decide, persist, read back. `dispatch_tests` covers
-//! revalidation when a queued execution is claimed or launched.
+//! revalidation when a queued execution is claimed or launched (`launch_tests`).
 
 use super::*;
 use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
@@ -122,10 +122,11 @@ fn unparseable_or_invalid_persisted_split_fails_loudly() {
     }
 }
 
-/// Eligibility combines driver launch readiness with the dispatch capability
-/// gate. Asserted against `check_dispatch` for every kind, so a
-/// `KindRequirements` or `CapabilitySet` change moves both together or
-/// fails here.
+/// Code-level eligibility is the dispatch capability gate ∩
+/// `launch_implemented()`. Persisted `launch_enabled` flags are applied
+/// later, after the current split is read. Asserted against `check_dispatch`
+/// for every kind, so a `KindRequirements` or `CapabilitySet` change moves
+/// both together or fails here.
 ///
 /// Exercised at `ChoreImplementation` — the execution kind every real
 /// allocation site in this file's other tests actually produces
@@ -134,7 +135,7 @@ fn unparseable_or_invalid_persisted_split_fails_loudly() {
 /// (`ConflictResolution` / `CiRemediation`) are covered separately by
 /// `conflict_resolution_and_ci_remediation_are_never_allocated`.
 #[test]
-fn eligibility_requires_launch_readiness_and_the_dispatch_gate() {
+fn eligibility_requires_the_capability_gate_and_launch_implemented() {
     let registry = boss_engine_driver::DriverRegistry::default();
     let execution_kind = ExecutionKind::ChoreImplementation;
     for kind in TaskKind::ALL {
@@ -148,7 +149,7 @@ fn eligibility_requires_launch_readiness_and_the_dispatch_gate() {
             assert_eq!(
                 eligible.contains(&driver),
                 gate_ok && registry.get(driver).is_some_and(|driver| driver.launch_implemented()),
-                "{driver} eligibility for {kind} must require both readiness and the gate",
+                "{driver} eligibility for {kind} must require the capability gate and launch_implemented()",
             );
         }
     }
@@ -657,7 +658,13 @@ fn design_tier_fails_when_only_grok_is_funded() {
     set_task_kind(&db, &task.id, &TaskKind::Design);
 
     let err = decide_execution_driver(&db.connect().unwrap(), &task.id, ExecutionKind::TaskImplementation).unwrap_err();
-    assert!(err.to_string().contains("0 share"), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("0 share"), "{text}");
+    assert!(
+        !text.contains("launch flag off"),
+        "design-tier refusal must not attach launch-flag exclusions for drivers that were not eligible: {text}",
+    );
+    assert!(!text.ends_with("; "), "{text}");
 }
 
 /// An empty eligible set is an error too, never the engine default.

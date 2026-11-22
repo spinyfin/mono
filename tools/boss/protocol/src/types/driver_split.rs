@@ -54,7 +54,7 @@ pub struct DriverTrafficSplit {
     pub grok: u8,
     /// Share routed to the `agy` (Antigravity) driver.
     pub agy: u8,
-    /// Operator launch gate for allocated work; explicit pins remain available.
+    /// Per-driver gate for allocated work, persisted with the split; explicit pins ignore it.
     /// Older stored splits open all implemented drivers, including Antigravity.
     #[serde(default)]
     pub launch_enabled: DriverLaunchFlags,

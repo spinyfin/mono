@@ -2481,6 +2481,15 @@ pub enum FrontendRequest {
         scope: Option<DispatchPauseScope>,
     },
 
+    /// Flip one driver's persisted launch flag inside a single metadata
+    /// transaction. Shares are left untouched. Replies with
+    /// [`FrontendEvent::DriverTrafficSplitResult`] to the caller and pushes
+    /// the same snapshot to every other connected session.
+    SetDriverLaunchFlag {
+        driver: String,
+        enabled: bool,
+    },
+
     /// Set the driver traffic split: how eligible `standard`-reasoning
     /// implementation work (`task_implementation`, `chore_implementation`,
     /// `revision_implementation`) is allocated four ways between the
@@ -2503,8 +2512,10 @@ pub enum FrontendRequest {
     /// lands on the same driver. Changing the split moves the boundaries
     /// and therefore reallocates some not-yet-dispatched rows, which is
     /// intended. An explicit `--driver` on a row, or a product's
-    /// `default_driver`, always wins over the split. Replies with
-    /// [`FrontendEvent::DriverTrafficSplitResult`].
+    /// `default_driver`, always wins over the split. Launch flags on this
+    /// payload are ignored: the engine keeps the stored flags so a stale
+    /// share edit cannot reopen a driver another writer just closed.
+    /// Replies with [`FrontendEvent::DriverTrafficSplitResult`].
     SetDriverTrafficSplit {
         split: DriverTrafficSplit,
     },

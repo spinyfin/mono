@@ -12,11 +12,13 @@
 //! dispatch capability gate, `CapabilityResolver::check_dispatch`, resolving
 //! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
 //! [`eligible_drivers_for`]) against each driver's declared `CapabilitySet` —
-//! which of the four drivers may run a work item of that kind, and
-//! excludes drivers whose launch is not ready, then renormalises over that subset
-//! ([`DriverTrafficSplit::driver_for_bucket_among`]). One source of truth: a
-//! launch-ready driver declared eligible for a kind can receive it, one that is not
-//! cannot, and widening or narrowing eligibility is a `KindRequirements` /
+//! which of the four drivers may run a work item of that kind, then keeps
+//! only drivers whose `launch_implemented()` bit is set **and** whose
+//! persisted `launch_enabled` flag is on, then renormalises over that subset
+//! ([`DriverTrafficSplit::driver_for_bucket_among`]). Eligibility is therefore
+//! the capability gate ∩ `launch_implemented()` ∩ the persisted launch flags.
+//! A driver that fails any of those three cannot receive allocated traffic, and
+//! widening or narrowing the capability half is a `KindRequirements` /
 //! `CapabilitySet` change that this path picks up with no edit of its own.
 //! The earlier narrow slice (implementation kinds at `standard` reasoning
 //! only) was an artifact of the original Codex experiment, not a statement
@@ -128,9 +130,15 @@ pub const REASON_ALLOCATION_FAILED: &str = "allocation_failed";
 /// recognised. A distinct type so dispatch can tell this scoped, per-execution
 /// refusal from a database or other infrastructure error and fail that one
 /// execution visibly instead of retrying it on every drain.
+///
+/// `split_at_decision` is the split (and therefore the launch flags) that
+/// produced the refusal, when one was loaded. Claim and launch persist it on
+/// the `allocation_failed` decision so the audit trail names the exclusions
+/// even when no driver was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverAllocationRefused {
     pub message: String,
+    pub split_at_decision: Option<DriverTrafficSplit>,
 }
 
 impl std::fmt::Display for DriverAllocationRefused {
@@ -142,7 +150,17 @@ impl std::fmt::Display for DriverAllocationRefused {
 impl std::error::Error for DriverAllocationRefused {}
 
 fn allocation_refused(message: String) -> anyhow::Error {
-    anyhow::Error::new(DriverAllocationRefused { message })
+    anyhow::Error::new(DriverAllocationRefused {
+        message,
+        split_at_decision: None,
+    })
+}
+
+fn allocation_refused_with_split(message: String, split: DriverTrafficSplit) -> anyhow::Error {
+    anyhow::Error::new(DriverAllocationRefused {
+        message,
+        split_at_decision: Some(split),
+    })
 }
 
 /// The reason value written by the superseded single-Codex-percentage
@@ -155,8 +173,9 @@ pub const REASON_LEGACY_PERCENTAGE: &str = "percentage";
 /// [`REASON_DEFAULT`] and [`REASON_ALLOCATION_FAILED`] — an ineligible row, which falls through to the normal
 /// row → product → engine default resolution. [`REASON_POOL`] names the
 /// fixed driver the execution will actually run on. `split_at_decision` is
-/// set for [`REASON_ALLOCATION`] so a later analysis can tell which split a
-/// given row was placed against.
+/// set for [`REASON_ALLOCATION`] and [`REASON_ALLOCATION_FAILED`] so a later
+/// analysis can tell which split (and launch flags) a given row was placed
+/// against, including when every funded driver was excluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverDecision {
     pub driver: Option<String>,
@@ -189,11 +208,11 @@ impl DriverDecision {
         }
     }
 
-    pub(crate) fn allocation_failed() -> Self {
+    pub(crate) fn allocation_failed(split: Option<DriverTrafficSplit>) -> Self {
         Self {
             driver: None,
             reason: REASON_ALLOCATION_FAILED,
-            split_at_decision: None,
+            split_at_decision: split,
         }
     }
 
@@ -209,8 +228,9 @@ impl DriverDecision {
 /// The drivers that may take a work item of `kind`, resolved from the
 /// dispatch capability gate and nothing else.
 ///
-/// This resolves allocation's code-level restrictions; the persisted launch
-/// flags are applied separately after reading the current split. It builds the same
+/// This resolves allocation's code-level restrictions (capability gate ∩
+/// `launch_implemented()`); the persisted `launch_enabled` flags are applied
+/// separately after reading the current split. It builds the same
 /// [`boss_engine_driver::DriverRegistry`] `runner::worker_spawn` builds and asks
 /// the same `check_dispatch` question the gate asks immediately before a
 /// pane spawns, so allocation cannot choose a driver that the gate would
@@ -299,6 +319,16 @@ pub(crate) fn load_driver_traffic_split_conn(conn: &Connection) -> Result<Driver
     Ok(split)
 }
 
+fn store_driver_traffic_split_conn(conn: &Connection, split: DriverTrafficSplit) -> Result<DriverTrafficSplit> {
+    split.validate()?;
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![METADATA_KEY_DRIVER_TRAFFIC_SPLIT, serde_json::to_string(&split)?],
+    )?;
+    Ok(split)
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// [`load_driver_traffic_split_conn`], but opens its own connection.
@@ -318,9 +348,40 @@ impl WorkDb {
     /// zero-share drivers from launching. Running workers are unaffected.
     /// Written as one metadata row, so dispatch never reads a partial edit.
     pub fn set_driver_traffic_split(&self, split: DriverTrafficSplit) -> Result<DriverTrafficSplit> {
+        let conn = self.connect()?;
+        store_driver_traffic_split_conn(&conn, split)
+    }
+
+    /// Persist the four shares from `split` while keeping the stored launch
+    /// flags. Share edits from a stale client snapshot therefore cannot
+    /// reopen a driver another writer just closed.
+    pub fn set_driver_traffic_shares(&self, split: DriverTrafficSplit) -> Result<DriverTrafficSplit> {
         split.validate()?;
-        self.set_metadata(METADATA_KEY_DRIVER_TRAFFIC_SPLIT, &serde_json::to_string(&split)?)?;
-        Ok(split)
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored = load_driver_traffic_split_conn(&tx)?;
+        let mut next = split;
+        next.launch_enabled = stored.launch_enabled;
+        let applied = store_driver_traffic_split_conn(&tx, next)?;
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    /// Flip one driver's persisted launch flag inside an IMMEDIATE
+    /// transaction. Concurrent writers each touch a single field of the
+    /// stored value, so a share edit or another flag toggle cannot silently
+    /// undo this one.
+    pub fn set_driver_launch_flag(&self, driver: &str, enabled: bool) -> Result<DriverTrafficSplit> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut split = load_driver_traffic_split_conn(&tx)?;
+        split
+            .launch_enabled
+            .set(driver, enabled)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        let applied = store_driver_traffic_split_conn(&tx, split)?;
+        tx.commit()?;
+        Ok(applied)
     }
 
     /// Look up the recorded routing decision for `execution_id`, or `None`
@@ -482,8 +543,11 @@ pub fn pin_is_honourable(
 /// 5. Not a `tasks` row at all — no override.
 ///
 /// Errors when the kind is unrecognised, no driver is eligible, or eligible
-/// drivers hold no share. Model, reasoning and launch-readiness restrictions
-/// never turn that failure into an engine-default fallback: zero means zero.
+/// drivers hold no share. Model, reasoning, `launch_implemented()`, and
+/// persisted `launch_enabled` restrictions never turn that failure into an
+/// engine-default fallback: zero means zero. The refusal carries the split
+/// that produced it so an `allocation_failed` decision can persist the
+/// launch exclusions.
 pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: ExecutionKind) -> Result<DriverDecision> {
     let row = conn
         .query_row(
@@ -573,13 +637,39 @@ pub fn decide_execution_driver(conn: &Connection, work_item_id: &str, kind: Exec
         .filter(|model| !model.is_empty());
     let eligible = eligible_drivers_for(&task_kind, &kind, model_override, design_or_investigation_tier);
     let split = load_driver_traffic_split_conn(conn)?;
-    let eligible: Vec<_> = eligible
-        .into_iter()
-        .filter(|driver| split.launch_enabled.enabled(driver))
-        .collect();
-    let driver = allocate_among(split, work_item_id, &task_kind, &eligible)
-        .map_err(|err| allocation_refused(format!("{err}; {}", split.launch_exclusions().join("; "))))?;
+    let launch_eligible = filter_launch_enabled(&split, &eligible);
+    let exclusions = launch_exclusions_among(&split, &eligible);
+    let driver = allocate_among(split, work_item_id, &task_kind, &launch_eligible).map_err(|err| {
+        let message = if exclusions.is_empty() {
+            err.to_string()
+        } else {
+            format!("{err}; {}", exclusions.join("; "))
+        };
+        allocation_refused_with_split(message, split)
+    })?;
     Ok(DriverDecision::allocated(driver, split))
+}
+
+/// Drivers from `eligible` whose persisted launch flag is on.
+fn filter_launch_enabled<'a>(split: &DriverTrafficSplit, eligible: &[&'a str]) -> Vec<&'a str> {
+    eligible
+        .iter()
+        .copied()
+        .filter(|driver| split.launch_enabled.enabled(driver))
+        .collect()
+}
+
+/// Launch-flag exclusions for drivers that were otherwise eligible for this
+/// kind. Closed flags on drivers the capability gate already refused are
+/// omitted so the error names only the flags that actually removed a
+/// candidate.
+fn launch_exclusions_among(split: &DriverTrafficSplit, eligible: &[&str]) -> Vec<String> {
+    eligible
+        .iter()
+        .copied()
+        .filter(|driver| !split.launch_enabled.enabled(driver))
+        .map(|driver| format!("{driver} excluded: launch flag off"))
+        .collect()
 }
 
 /// Place `work_item_id` on `split`'s bucket line restricted to `eligible`,
@@ -1191,9 +1281,6 @@ pub(super) mod sol_selection {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod dispatch_tests;
 
 #[cfg(test)]
 mod launch_tests;
