@@ -724,6 +724,19 @@ pub(super) fn release_budget_deferred_claim(
     true
 }
 
+pub(super) fn format_duration_ms(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h", seconds / (60 * 60))
+    } else {
+        format!("{}d", seconds / (24 * 60 * 60))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

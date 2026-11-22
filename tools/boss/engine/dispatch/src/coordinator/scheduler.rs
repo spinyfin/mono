@@ -2,6 +2,7 @@
 //! drain, chain-serialization holds, and automation preemption. Part of the
 //! `coordinator` module split; see [`super`] for the struct and shared types.
 use super::predecessor_hold::PredecessorHold;
+use super::spoke_in_doubt::format_duration_ms;
 use super::*;
 
 /// A queued answer agent older than this is unusual enough to require an
@@ -2989,18 +2990,5 @@ impl Drop for DrainDispatchClaim {
                 "failed to release dispatch claim on drain defer"
             );
         }
-    }
-}
-
-fn format_duration_ms(milliseconds: u64) -> String {
-    let seconds = milliseconds / 1_000;
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 60 * 60 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 24 * 60 * 60 {
-        format!("{}h", seconds / (60 * 60))
-    } else {
-        format!("{}d", seconds / (24 * 60 * 60))
     }
 }
