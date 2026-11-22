@@ -19,6 +19,10 @@ TARGET="//tools/release:release"
 
 phase_prepare() {
   echo "[release-release] agent: $(uname -a)"
+  # Deliberately runs in opt (inherited from CI_BAZEL_STEP_FLAGS) so this
+  # gate shares the analysis cache and compiled crates with tool-install's
+  # bin/release build; release_lib_test does not rely on debug_assert!-only
+  # checks.
   bazel test //tools/release:release_lib_test
   local tag
   tag="$(bin/release prepare --config "${CONFIG}")"

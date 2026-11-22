@@ -403,16 +403,18 @@ bazel() {
 # flags. Do not use it for a build whose output is then executed, uploaded or
 # inspected -- on a remotely executing step that file will not be on the agent.
 #
-# It also selects --config=ci-strip (see .ci.bazelrc): nothing run through here
+# It also relies on --config=ci-strip (see .ci.bazelrc): nothing run through here
 # ships or is debugged from its binaries, so Rust executables and test binaries
 # are linked without symbol tables, which roughly halves what each one adds to
 # the remote cache. Release builds do not go through this function and keep
 # their symbols.
 #
 # The step must set CI_BAZEL_VERIFY_ONLY=1 before sourcing this file so
-# tool-install already carries --config=ci-strip and --compilation_mode=fastbuild.
-# Calling this without that opt-in would add ci-strip only here, and Bazel
-# would discard the analysis cache between repobin and the main build.
+# CI_BAZEL_FLAGS (and therefore tool-install and this command) already carries
+# --config=ci-strip and --compilation_mode=fastbuild. Do not pass --config=ci-strip
+# again here: extra_rustc_flag is a repeatable string_list setting, so selecting
+# ci-strip twice produces a different configuration than tool-install's single
+# selection and discards the analysis cache.
 bazel_verify_only() {
   if [[ "${CI_BAZEL_VERIFY_ONLY:-}" != "1" ]]; then
     echo "^^^ +++"
@@ -421,7 +423,7 @@ bazel_verify_only() {
   fi
   local subcommand="$1"
   shift
-  bazel "$subcommand" --config=ci-strip $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
+  bazel "$subcommand" $CI_BAZEL_VERIFY_ONLY_FLAGS "$@"
 }
 
 # Shared by the release step scripts (checkleft-release.sh, release-release.sh)

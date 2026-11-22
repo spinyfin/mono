@@ -118,6 +118,8 @@ for script in bazel-build-test.sh mac-app-build.sh integrity-bazel.sh verify-bos
 done
 
 for script in checks.sh integrity-checkleft.sh; do
+  assert_before_source "$script" '^CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"' \
+    "checkleft step ${script} must set opt before sourcing"
   assert_absent "$script" '^CI_BAZEL_VERIFY_ONLY=1' \
     "checkleft step ${script} must not select ci-strip"
 done

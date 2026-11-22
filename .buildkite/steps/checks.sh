@@ -15,10 +15,14 @@ set -euo pipefail
 # nothing it passes to bazel is a credential. checkleft and
 # repobin build the tools they then run, which downloads those outputs as usual.
 #
-# Do not set CI_BAZEL_VERIFY_ONLY: the main bazel work is checkleft reading
-# CI_BAZEL_FLAGS (fastbuild, no ci-strip). ci-env.sh defaults tool-install to
-# the same flags. Adding ci-strip here would discard the analysis cache when
-# checkleft runs.
+# Build bin/checkleft in opt rather than fastbuild: checkleft JIT-compiles wasm
+# check components via embedded wasmtime/Cranelift (~17x slower in unoptimized
+# builds per docs/investigations/checkleft-lib-test-wasm-compile-timeout.md),
+# and fastbuild regressed this step from 9 s (main build 28592) to 19 s
+# (build 28596), wiping out the 2-5 s analysis-cache saving. checkleft's own
+# bazel invocations read CI_BAZEL_FLAGS, so the analysis cache stays shared.
+# Do not set CI_BAZEL_VERIFY_ONLY: ci-strip is not used here.
+CI_BAZEL_STEP_FLAGS="--compilation_mode=opt"
 CI_REMOTE_EXECUTION_ALLOWED=1
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
