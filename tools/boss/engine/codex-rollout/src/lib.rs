@@ -92,7 +92,7 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
 
     let issues_command = match provider_name {
         "exec" | "exec_command" => exec_input_issues_command(&parsed_input),
-        "write_stdin" => false,
+        name if cell::is_write_stdin_tool(name) => false,
         _ => true,
     };
     let (tool_name, tool_input) = match provider_name {
@@ -131,7 +131,7 @@ fn exec_input_issues_command(parsed_input: &Value) -> bool {
         return true;
     }
     match parsed_input.as_str() {
-        Some(source) => !cell::script_is_continuation_only(source),
+        Some(source) => !is_non_command_cell(source),
         // An unrecognised non-string shape (an argv array with no
         // `cmd`/`command` key, say) defaults to `true`: treating it as a
         // pure continuation would let `observe_output` silently subsume
@@ -169,13 +169,20 @@ fn exec_command(parsed_input: &Value) -> Option<String> {
             if let Some(command) = cell::cell_script_command(source) {
                 return Some(command);
             }
-            if cell::script_is_continuation_only(source) {
+            if is_non_command_cell(source) {
                 return None;
             }
             Some(source.to_owned())
         }
         None => Some(coerce_command_to_string(parsed_input)),
     }
+}
+
+/// Whether a cell script is positively identified as starting no command: a
+/// `write_stdin` poll of an existing session, or a compute-only cell that
+/// just uses the cell builtins (`text` / `load` / `store` / `notify`).
+fn is_non_command_cell(source: &str) -> bool {
+    cell::script_is_continuation_only(source) || cell::script_is_compute_only(source)
 }
 
 /// Canonical input for a cell that did not start a command: never a
@@ -415,6 +422,52 @@ mod tests {
             .unwrap()
             .clone();
         canonical_rollout_tool_call("custom_tool_call", &payload).expect("call")
+    }
+
+    fn assert_recovers_sleep_999(source: &str) {
+        let call = canonical_exec_script(source);
+        assert!(call.issues_command, "script: {source}");
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999"),
+            "script: {source}"
+        );
+    }
+
+    #[test]
+    fn a_regex_with_comment_lookalike_does_not_hide_a_later_exec_command() {
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\nconst r = s.replace(/\\/*/g, \"\");\n",
+            r#"const half = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const u = url.replace(/\/\//g, "/"); const n = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+    }
+
+    #[test]
+    fn a_template_substitution_is_scanned_as_code() {
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\ntext(`${JSON.stringify(await tools.exec_command({cmd:\"sleep 999\"}))}`);",
+        ));
+    }
+
+    #[test]
+    fn a_compute_only_cell_claims_no_command() {
+        for source in [
+            r#"text(load("r").output);"#,
+            r#"store("k", 1); notify("hi");"#,
+            "const v = `a ${1 + 1} b`;\ntext(v);",
+        ] {
+            let call = canonical_exec_script(source);
+            assert!(!call.issues_command, "script: {source}");
+            assert_eq!(call.tool_input.get("command"), None, "script: {source}");
+        }
+        // A computed `tools[...]` access could reach a shell: stay conservative.
+        assert!(canonical_exec_script(r#"text(await tools["exec_command"]({cmd:"sleep 999"}));"#).issues_command);
     }
 
     #[test]

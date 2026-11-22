@@ -29,7 +29,7 @@ use super::guard_chain::{self, ArmedChainStatus};
 use super::guard_trace;
 use super::rollout_calls::{
     CallDisposition, CorrelationError, MAX_TRACKED_TRANSCRIPT_TOOL_CALLS, OutputDisposition, RolloutCallSnapshot,
-    RolloutCallTracker, RolloutToolCall, cell_aware_tool_output, rollout_call_command_display,
+    RolloutCallTracker, RolloutToolCall, abandoned_call_display, cell_aware_tool_output,
 };
 use crate::{ProgressIdentityStore, ProgressSessionNormalizer, TranscriptSessionNormalizer};
 
@@ -231,7 +231,7 @@ impl CodexRolloutProgressSession {
     /// [`WorkerEvent::Notification`] carrying
     /// [`super::UNOBSERVED_COMMAND_MARKER`], oldest-first. Scoped to
     /// exec/shell-shaped calls only — those whose `tool_input` carries a
-    /// `command` field, matching what [`rollout_call_command_display`]
+    /// `command` field, matching what [`abandoned_call_display`]
     /// prefers and mirroring the stdout dialect, which only tracks
     /// `command_execution`. A pending non-shell call (`apply_patch`, file
     /// reads, MCP tools) is dropped from tracking without a notification;
@@ -257,11 +257,10 @@ impl CodexRolloutProgressSession {
         self.calls
             .drain_open_calls()
             .into_iter()
-            .filter(|call| call.issues_command)
-            .filter(|call| call.tool_input.get("command").and_then(Value::as_str).is_some())
-            .map(|call| WorkerEvent::Notification {
+            .filter_map(|call| abandoned_call_display(&call))
+            .map(|display| WorkerEvent::Notification {
                 session_id: session_id.to_owned(),
-                message: super::unobserved_command_notification(&rollout_call_command_display(&call)),
+                message: super::unobserved_command_notification(&display),
             })
             .collect()
     }

@@ -119,6 +119,27 @@ pub(super) fn rollout_call_command_display(call: &RolloutToolCall) -> String {
     }
 }
 
+/// The unobserved-command display for a call still open at a turn boundary,
+/// or `None` when the call should not be flagged.
+///
+/// A call that issued a shell command is flagged by its command. A `write_stdin`
+/// poll that never resolved to a tracked origin (the session was started in an
+/// earlier turn, so the tracker had no binding) and is still open is itself the
+/// only observation of that command and says it has not finished, so it is
+/// flagged too, by the session it polled. Compute-only cells and non-shell
+/// tools carry neither and are dropped.
+pub(super) fn abandoned_call_display(call: &RolloutToolCall) -> Option<String> {
+    if call.issues_command {
+        return call
+            .tool_input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|_| rollout_call_command_display(call));
+    }
+    write_stdin_session_id(&call.tool_input)
+        .map(|session_id| format!("write_stdin session {session_id} (still running)"))
+}
+
 /// What a consumer should do with a tool-call record.
 #[derive(Debug)]
 pub(super) enum CallDisposition {
@@ -1422,5 +1443,60 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["echo hi"]
         );
+    }
+
+    #[test]
+    fn a_compute_only_cell_is_never_flagged_abandoned() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call("c", cell_exec("c", r#"text(load("r").output);"#))
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("c", &completed("plain text")),
+            Ok(OutputDisposition::UnconfirmedResult(_))
+        ));
+        let flagged: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert!(flagged.is_empty(), "{flagged:?}");
+    }
+
+    #[test]
+    fn a_cross_turn_poll_that_finds_the_command_still_running_is_flagged() {
+        let mut tracker = RolloutCallTracker::default();
+        // Turn 1: the wrapper is still running when the turn ends.
+        tracker
+            .observe_call(
+                "wrap",
+                cell_exec("wrap", r#"text(await tools.exec_command({cmd:"slow build"}));"#),
+            )
+            .unwrap();
+        tracker.observe_output("wrap", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let first: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(first, ["slow build"]);
+        // Turn 2: a re-poll of that session has no tracked origin and is
+        // still running at the boundary.
+        tracker
+            .observe_call(
+                "poll",
+                cell_exec(
+                    "poll",
+                    r#"text(JSON.stringify(await tools.write_stdin({session_id:8467,chars:""})));"#,
+                ),
+            )
+            .unwrap();
+        tracker.observe_output("poll", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let second: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(second, ["write_stdin session 8467 (still running)"]);
     }
 }

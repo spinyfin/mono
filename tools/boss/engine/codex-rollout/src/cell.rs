@@ -281,6 +281,47 @@ pub fn script_is_continuation_only(source: &str) -> bool {
     find_js_call(source, "write_stdin").is_some() && !script_issues_command(source)
 }
 
+/// Cell builtins that compute, print or stash data without running a command.
+const CELL_BUILTIN_CALLS: &[&str] = &["text", "load", "store", "notify"];
+
+/// Whether `source` is positively a cell script that runs no command and
+/// polls no session: it calls a cell builtin (`text`, `load`, `store`,
+/// `notify`) and never mentions a command-bearing tool (`exec_command`,
+/// `shell`, or computed `tools[...]` access that could reach one).
+///
+/// Such a cell is ordinary code-mode work, not a shell command, so it must not
+/// be announced or drained as one with its JavaScript as the "command". A
+/// string that does not look like a cell (`echo hi`) is not this.
+pub fn script_is_compute_only(source: &str) -> bool {
+    if script_mentions_command_tool(source) {
+        return false;
+    }
+    CELL_BUILTIN_CALLS
+        .iter()
+        .any(|name| find_js_call(source, name).is_some())
+}
+
+/// Whether `source` names a command-bearing helper anywhere in code (not only
+/// as a call), or reaches `tools` through computed property access.
+fn script_mentions_command_tool(source: &str) -> bool {
+    let mut lexer = JsLexer::new(source);
+    while let Some((at, ch)) = lexer.next_code() {
+        if !js_ident_part(ch) {
+            continue;
+        }
+        let rest = &source[at..];
+        let ident_len = rest.find(|c: char| !js_ident_part(c)).unwrap_or(rest.len());
+        let ident = &rest[..ident_len];
+        if COMMAND_BEARING_CELL_CALLS.contains(&ident) {
+            return true;
+        }
+        if ident == "tools" && rest[ident_len..].trim_start().starts_with('[') {
+            return true;
+        }
+    }
+    false
+}
+
 /// The shell command(s) a cell script issues, in source order.
 ///
 /// The cell's tool input is JavaScript source, so it never parses as JSON
@@ -374,26 +415,10 @@ fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
 /// matches; `spawnshell(`, a quoted `"shell("`, and a commented-out
 /// `shell(` do not.
 fn find_js_call(source: &str, name: &str) -> Option<usize> {
-    let mut chars = source.char_indices().peekable();
-    while let Some((at, ch)) = chars.next() {
-        match ch {
-            '/' => match chars.peek().map(|&(_, next)| next) {
-                Some('/') => {
-                    chars.next();
-                    skip_js_line_comment(&mut chars);
-                }
-                Some('*') => {
-                    chars.next();
-                    skip_js_block_comment(&mut chars);
-                }
-                _ if js_regex_allowed_before(source, at) => skip_js_regex_literal(&mut chars),
-                _ if js_call_at(source, at, name) => return Some(at),
-                _ => {}
-            },
-            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
-            '`' => skip_js_quoted_string(&mut chars, ch, true),
-            _ if js_call_at(source, at, name) => return Some(at),
-            _ => {}
+    let mut lexer = JsLexer::new(source);
+    while let Some((at, _)) = lexer.next_code() {
+        if js_call_at(source, at, name) {
+            return Some(at);
         }
     }
     None
@@ -415,43 +440,9 @@ fn js_ident_boundary_at(source: &str, at: usize) -> bool {
     !preceding.is_ascii_alphanumeric() && preceding != '_' && preceding != '$'
 }
 
-/// Whether a `/` at byte offset `at` begins a regular-expression literal
-/// rather than a division, judged from the previous significant token
-/// after comments, strings, and whitespace are skipped. A regex can follow
-/// the start of input, an operator or opening punctuation, or a keyword
-/// such as `return`; it cannot follow an identifier, number, string or
-/// closing bracket. When the previous token is unclear, treat the slash as
-/// division so a later command stays visible.
-fn js_regex_allowed_before(source: &str, at: usize) -> bool {
-    let Some(prefix) = source.get(..at) else {
-        return false;
-    };
-    match last_js_token(prefix) {
-        LastJsToken::Start | LastJsToken::RegexPunct => true,
-        LastJsToken::Word { start, end } => matches!(
-            prefix.get(start..end),
-            Some(
-                "return"
-                    | "typeof"
-                    | "case"
-                    | "do"
-                    | "else"
-                    | "in"
-                    | "of"
-                    | "void"
-                    | "delete"
-                    | "throw"
-                    | "new"
-                    | "yield"
-                    | "await"
-            )
-        ),
-        LastJsToken::Operand => false,
-    }
-}
-
-/// Last significant token in `prefix` after skipping comments, strings, and
-/// whitespace. Used only to tell a regex literal from division.
+/// Last significant token seen by [`JsLexer`], used only to tell a regex
+/// literal from division.
+#[derive(Clone, Copy)]
 enum LastJsToken {
     Start,
     Word { start: usize, end: usize },
@@ -459,55 +450,169 @@ enum LastJsToken {
     RegexPunct,
 }
 
-fn last_js_token(prefix: &str) -> LastJsToken {
-    let mut chars = prefix.char_indices().peekable();
-    let mut last = LastJsToken::Start;
-    while let Some((at, ch)) = chars.next() {
-        match ch {
-            '/' => match chars.peek().map(|&(_, next)| next) {
-                Some('/') => {
-                    chars.next();
-                    skip_js_line_comment(&mut chars);
-                }
-                Some('*') => {
-                    chars.next();
-                    skip_js_block_comment(&mut chars);
-                }
-                _ => last = LastJsToken::RegexPunct,
-            },
-            '"' | '\'' => {
-                skip_js_quoted_string(&mut chars, ch, false);
-                last = LastJsToken::Operand;
-            }
-            '`' => {
-                skip_js_quoted_string(&mut chars, ch, true);
-                last = LastJsToken::Operand;
-            }
-            ch if ch.is_whitespace() => {}
-            ')' | ']' => last = LastJsToken::Operand,
-            ch if js_ident_part(ch) => {
-                let mut end = at + ch.len_utf8();
-                while let Some(&(next_at, next)) = chars.peek() {
-                    if js_ident_part(next) {
-                        end = next_at + next.len_utf8();
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                last = if ch.is_ascii_digit() {
-                    LastJsToken::Operand
-                } else {
-                    LastJsToken::Word { start: at, end }
-                };
-            }
-            ch if ch.is_ascii() => last = LastJsToken::RegexPunct,
-            // Non-ASCII punctuation is not a reliable regex opener; fail
-            // toward division so a later command stays visible.
-            _ => last = LastJsToken::Operand,
+/// A single forward pass over JavaScript cell source that yields only *code*:
+/// string, template-text, comment and regex-literal bodies are skipped, while
+/// template `${…}` substitutions are scanned as code (tracking brace depth).
+/// The previous significant token is tracked as the scan advances, so a `/`
+/// is classified as a regex opener or division from state the scanner already
+/// holds rather than by re-lexing the prefix.
+///
+/// Each item is the byte offset and first character of an identifier/number
+/// token (consumed whole) or of a single punctuation character; whitespace is
+/// not reported. When the previous token is unclear a slash is treated as
+/// division, so a later command stays visible.
+struct JsLexer<'a> {
+    source: &'a str,
+    chars: Peekable<std::str::CharIndices<'a>>,
+    last: LastJsToken,
+    depth: usize,
+    /// Brace depth at which each open template `${` substitution began.
+    template_depths: Vec<usize>,
+}
+
+impl<'a> JsLexer<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            chars: source.char_indices().peekable(),
+            last: LastJsToken::Start,
+            depth: 0,
+            template_depths: Vec::new(),
         }
     }
-    last
+
+    /// Whether a `/` here begins a regex literal rather than a division. A
+    /// regex can follow the start of input, an operator or opening
+    /// punctuation, or a keyword such as `return`; it cannot follow an
+    /// identifier, number, string or closing bracket.
+    fn regex_allowed(&self) -> bool {
+        match self.last {
+            LastJsToken::Start | LastJsToken::RegexPunct => true,
+            LastJsToken::Word { start, end } => matches!(
+                self.source.get(start..end),
+                Some(
+                    "return"
+                        | "typeof"
+                        | "case"
+                        | "do"
+                        | "else"
+                        | "in"
+                        | "of"
+                        | "void"
+                        | "delete"
+                        | "throw"
+                        | "new"
+                        | "yield"
+                        | "await"
+                )
+            ),
+            LastJsToken::Operand => false,
+        }
+    }
+
+    /// Skip template-literal text up to the closing backtick, or up to and
+    /// including a `${` that opens a code substitution.
+    fn skip_template_text(&mut self) {
+        let mut escaped = false;
+        while let Some((_, ch)) = self.chars.next() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '`' => {
+                    self.last = LastJsToken::Operand;
+                    return;
+                }
+                '$' if self.chars.peek().map(|&(_, next)| next) == Some('{') => {
+                    self.chars.next();
+                    self.template_depths.push(self.depth);
+                    self.depth += 1;
+                    self.last = LastJsToken::RegexPunct;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn next_code(&mut self) -> Option<(usize, char)> {
+        while let Some((at, ch)) = self.chars.next() {
+            match ch {
+                '/' => match self.chars.peek().map(|&(_, next)| next) {
+                    Some('/') => {
+                        self.chars.next();
+                        skip_js_line_comment(&mut self.chars);
+                    }
+                    Some('*') => {
+                        self.chars.next();
+                        skip_js_block_comment(&mut self.chars);
+                    }
+                    _ if self.regex_allowed() => {
+                        skip_js_regex_literal(&mut self.chars);
+                        self.last = LastJsToken::Operand;
+                    }
+                    _ => {
+                        self.last = LastJsToken::RegexPunct;
+                        return Some((at, ch));
+                    }
+                },
+                '"' | '\'' => {
+                    skip_js_quoted_string(&mut self.chars, ch, false);
+                    self.last = LastJsToken::Operand;
+                }
+                '`' => self.skip_template_text(),
+                ch if ch.is_whitespace() => {}
+                '{' => {
+                    self.depth += 1;
+                    self.last = LastJsToken::RegexPunct;
+                    return Some((at, ch));
+                }
+                '}' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.template_depths.last() == Some(&self.depth) {
+                        self.template_depths.pop();
+                        self.skip_template_text();
+                    } else {
+                        self.last = LastJsToken::RegexPunct;
+                        return Some((at, ch));
+                    }
+                }
+                ')' | ']' => {
+                    self.last = LastJsToken::Operand;
+                    return Some((at, ch));
+                }
+                ch if js_ident_part(ch) => {
+                    let mut end = at + ch.len_utf8();
+                    while let Some(&(next_at, next)) = self.chars.peek() {
+                        if !js_ident_part(next) {
+                            break;
+                        }
+                        end = next_at + next.len_utf8();
+                        self.chars.next();
+                    }
+                    self.last = if ch.is_ascii_digit() {
+                        LastJsToken::Operand
+                    } else {
+                        LastJsToken::Word { start: at, end }
+                    };
+                    return Some((at, ch));
+                }
+                ch if ch.is_ascii() => {
+                    self.last = LastJsToken::RegexPunct;
+                    return Some((at, ch));
+                }
+                // Non-ASCII punctuation is not a reliable regex opener; fail
+                // toward division so a later command stays visible.
+                _ => {
+                    self.last = LastJsToken::Operand;
+                    return Some((at, ch));
+                }
+            }
+        }
+        None
+    }
 }
 
 fn js_ident_part(ch: char) -> bool {
@@ -597,26 +702,12 @@ fn balanced_object_literal(source: &str) -> Option<&str> {
         return None;
     }
     let mut depth = 0usize;
-    let mut chars = trimmed.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
+    let mut lexer = JsLexer::new(trimmed);
+    while let Some((index, ch)) = lexer.next_code() {
         match ch {
-            '/' => match chars.peek().map(|&(_, next)| next) {
-                Some('/') => {
-                    chars.next();
-                    skip_js_line_comment(&mut chars);
-                }
-                Some('*') => {
-                    chars.next();
-                    skip_js_block_comment(&mut chars);
-                }
-                _ if js_regex_allowed_before(trimmed, index) => skip_js_regex_literal(&mut chars),
-                _ => {}
-            },
-            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
-            '`' => skip_js_quoted_string(&mut chars, ch, true),
             '{' => depth += 1,
             '}' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let end = offset + index + ch.len_utf8();
                     return Some(&source[offset..end]);
