@@ -298,3 +298,75 @@ async fn missing_usage_is_visible_and_a_late_measurement_clears_the_reason() {
         "truncation must not erase the missing-usage reason"
     );
 }
+
+#[tokio::test]
+async fn model_less_agy_snapshots_keep_the_launch_model_until_observed_or_mixed() {
+    let (dir, db) = open_db();
+    let product = create_product(&db);
+    let task = create_test_chore(&db, &product, "launch model");
+    let execution = create_ready_chore_execution(&db, &task.id);
+    db.record_execution_launch_config(&execution.id, "agy", "gemini-launch", None)
+        .unwrap();
+    db.create_run(
+        boss_protocol::CreateRunInput::builder()
+            .execution_id(&execution.id)
+            .agent_id("worker")
+            .status("completed")
+            .build(),
+    )
+    .unwrap();
+    let path = dir.path().join("agy.jsonl");
+    let capture = RunCostCapture::new();
+    let step = |index: i64, model: Option<&str>| {
+        let mut value = json!({"type":"PLANNER_RESPONSE","source":"MODEL","step_index":index,
+            "input_tokens":10,"output_tokens":5,"cache_read_tokens":0});
+        if let Some(model) = model {
+            value["model"] = json!(model);
+        }
+        format!("{value}\n")
+    };
+    let model_of_report = |db: &crate::work::WorkDb| {
+        let records = db.cost_records_for_window(0, i64::MAX).unwrap();
+        let report = crate::cost_report::build_window_cost_report(0, i64::MAX, &records, true, 0);
+        (
+            records[0].model.clone(),
+            report
+                .by_model
+                .iter()
+                .map(|bucket| bucket.label.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    // Model-less response: the transcript replacement keeps the launch model.
+    std::fs::write(&path, step(1, None)).unwrap();
+    capture
+        .capture_and_persist(&db, &execution.id, &path, None)
+        .await
+        .unwrap();
+    let (model, labels) = model_of_report(&db);
+    assert_eq!(model.as_deref(), Some("gemini-launch"));
+    assert_eq!(labels, vec!["gemini-launch".to_owned()]);
+
+    // An observed model takes precedence over the launch model.
+    std::fs::write(&path, step(1, Some("gemini-observed"))).unwrap();
+    capture.forget(&execution.id);
+    capture
+        .capture_and_persist(&db, &execution.id, &path, None)
+        .await
+        .unwrap();
+    assert_eq!(model_of_report(&db).0.as_deref(), Some("gemini-observed"));
+
+    // Mixed observed models clear the model rather than reverting to the launch model.
+    std::fs::write(
+        &path,
+        format!("{}{}", step(1, Some("gemini-observed")), step(2, Some("gemini-other"))),
+    )
+    .unwrap();
+    capture.forget(&execution.id);
+    capture
+        .capture_and_persist(&db, &execution.id, &path, None)
+        .await
+        .unwrap();
+    assert_eq!(model_of_report(&db).0, None);
+}

@@ -68,6 +68,7 @@ impl NativeUsage {
         let cache_read_tokens = sum(|row| row.cache_read_tokens);
         Some(RunCostSnapshot {
             full_replacement: true,
+            model_mixed: models.len() > 1,
             model,
             input_tokens,
             output_tokens,

@@ -339,7 +339,11 @@ impl WorkDb {
                      WHEN ?12 = 1 OR ?4 IS NOT NULL OR ?13 IS NOT NULL THEN ?13
                      ELSE usage_unavailable
                  END,
-                 model = CASE WHEN ?12 = 1 THEN ?2 ELSE COALESCE(?2, model) END,
+                 model = CASE
+                     WHEN ?14 = 1 THEN NULL
+                     WHEN ?12 = 1 THEN COALESCE(?2, (SELECT model FROM work_executions WHERE id = ?15))
+                     ELSE COALESCE(?2, model)
+                 END,
                  output_tokens = CASE WHEN ?12 = 1 THEN ?3 ELSE COALESCE(?3, output_tokens) END,
                  input_tokens = CASE WHEN ?12 = 1 THEN ?4 ELSE COALESCE(?4, input_tokens) END,
                  cache_creation_tokens = CASE
@@ -382,6 +386,8 @@ impl WorkDb {
                 snapshot.agent_active_ms,
                 snapshot.full_replacement,
                 snapshot.usage_unavailable,
+                snapshot.model_mixed,
+                execution_id,
             ],
         )?;
         Ok(updated > 0 || attempt_updated > 0)

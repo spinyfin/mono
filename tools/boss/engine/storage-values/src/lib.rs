@@ -89,6 +89,11 @@ pub struct RunCostSnapshot {
     /// not survive from the obsolete generation.
     #[builder(default)]
     pub full_replacement: bool,
+    /// The replayed transcript contains more than one distinct model, so no
+    /// single model describes the run: persisted `model` is cleared to NULL
+    /// even when the run was seeded with a launch model.
+    #[builder(default)]
+    pub model_mixed: bool,
     pub model: Option<String>,
     pub output_tokens: Option<i64>,
     pub input_tokens: Option<i64>,
