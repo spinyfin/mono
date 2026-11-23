@@ -50,7 +50,9 @@ class DashboardsTest(unittest.TestCase):
         ]
         self.assertEqual(15, len(node_exprs))
         for expr in node_exprs:
-            self.assertIn("by (instance)", expr)
+            # Fleet panels group by (instance, platform); the hub panels by (instance) alone.
+            self.assertRegex(expr, r"by \(instance(, platform)?\)")
+            self.assertNotIn("without", expr)
 
     def test_bad_panels(self):
         mutations = {

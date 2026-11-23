@@ -27,7 +27,7 @@ class PrometheusConfigTest(unittest.TestCase):
         self.assertEqual({"prometheus", "nativelink", "nativelink-pool", "node"}, set(jobs))
         instances = [sc["labels"]["instance"] for sc in jobs["node"]["static_configs"]]
         self.assertEqual(
-            ["headcrash", "anaplian", "arbitrary", "determinist", "rascal", "skaffen", "zakalwe"],
+            ["headcrash", "empiricist", "diziet", "zoologist", "anaplian", "arbitrary", "determinist", "rascal", "skaffen", "zakalwe"],
             instances,
         )
         run_promtool(HERE / "prometheus.yml", syntax_only=True)

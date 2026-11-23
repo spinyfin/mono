@@ -1,7 +1,6 @@
 # Prometheus for the NativeLink hub on this host. The hub pushes its metrics
-# here over OTLP (see OTEL_* in ~bduff/nativelink-macos-hub/hub.env), and this
-# config scrapes Prometheus itself, the NativeLink OTLP collector (nativelink),
-# hub pool metrics (nativelink-pool), and per-host node_exporter targets (node).
+# over OTLP to the collector on this host; the scrape jobs below read that
+# collector, the worker-slots exporter and each worker host's node_exporter.
 # Listens on loopback only.
 #
 # This runs the upstream binary in /usr/local/bin, not Ubuntu's: the Ubuntu
@@ -40,13 +39,21 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:9108"]
   # Host CPU, memory, load and swap per RBE worker host, from node_exporter.
-  # The macOS workers (this hub's pool) run node_exporter bound to their
-  # Tailscale address; this host runs Ubuntu's package on loopback for its
-  # Linux worker (hub on empiricist; no worker id prefix).
+  # Every worker of the one hub, macOS and Linux. The macOS workers run
+  # Homebrew's node_exporter bound to their Tailscale address. This host runs
+  # Ubuntu's package on loopback. The other Linux workers run a copy of that
+  # binary as a user unit (node-exporter.service) on their Tailscale address.
+  # worker_id is the prefix of the worker's id on the hub.
   - job_name: node
     static_configs:
       - targets: ["127.0.0.1:9100"]
-        labels: { instance: headcrash, platform: linux, pool: linux }
+        labels: { instance: headcrash, platform: linux, worker_id: headcrash, pool: linux }
+      - targets: ["100.66.247.57:9100"]
+        labels: { instance: empiricist, platform: linux, worker_id: empiricist, pool: linux }
+      - targets: ["100.71.137.100:9100"]
+        labels: { instance: diziet, platform: linux, worker_id: diziet, pool: linux }
+      - targets: ["100.126.104.100:9100"]
+        labels: { instance: zoologist, platform: linux, worker_id: zoologist, pool: linux }
       - targets: ["100.96.159.44:9100"]
         labels: { instance: anaplian, platform: macos, worker_id: anaplian, pool: macos }
       - targets: ["100.116.216.85:9100"]

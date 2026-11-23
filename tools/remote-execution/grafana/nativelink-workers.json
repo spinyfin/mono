@@ -1,5 +1,5 @@
 {
-  "description": "Per-worker view of the macOS remote-execution pool, from the hub's own metrics. The host name is the prefix of the worker id. Host CPU, memory and swap come from node_exporter (Prometheus job node).",
+  "description": "Per-worker view of the remote-execution pool: the macOS and the Linux workers of the one hub, from the hub's own metrics. The host name is the prefix of the worker id. Host CPU, memory and swap come from node_exporter on each worker host (Prometheus job node, label platform).",
   "editable": true,
   "links": [
     {
@@ -24,7 +24,7 @@
       },
       "id": 36,
       "panels": [],
-      "title": "Worker host resources (macOS)",
+      "title": "Worker host resources (macOS and Linux)",
       "type": "row"
     },
     {
@@ -32,7 +32,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Current figures per macOS worker host from node_exporter. CPU and memory turn yellow at 80% and red at 95%; swap at 50% and 80%; load per core at 1.5 and 3.",
+      "description": "Current figures per worker host, macOS and Linux, from node_exporter. CPU and memory turn yellow at 80% and red at 95%; swap at 50% and 80%; load per core at 1.5 and 3. Memory is app plus wired plus compressed on macOS and memory not available to new work on Linux. A Linux host with no swap has an empty swap cell.",
       "fieldConfig": {
         "defaults": {},
         "overrides": [
@@ -232,7 +232,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"}[5m])))",
+          "expr": "100 * (1 - avg by (instance, platform) (rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[5m])))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -244,7 +244,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "100 * (max by (instance) (node_memory_internal_bytes{job=\"node\",platform=\"macos\"}) - on(instance) max by (instance) (node_memory_purgeable_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_wired_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_compressed_bytes{job=\"node\",platform=\"macos\"})) / on(instance) max by (instance) (node_memory_total_bytes{job=\"node\",platform=\"macos\"})",
+          "expr": "(100 * (max by (instance, platform) (node_memory_internal_bytes{job=\"node\",platform=\"macos\"}) - on(instance, platform) max by (instance, platform) (node_memory_purgeable_bytes{job=\"node\",platform=\"macos\"}) + on(instance, platform) max by (instance, platform) (node_memory_wired_bytes{job=\"node\",platform=\"macos\"}) + on(instance, platform) max by (instance, platform) (node_memory_compressed_bytes{job=\"node\",platform=\"macos\"})) / on(instance, platform) max by (instance, platform) (node_memory_total_bytes{job=\"node\",platform=\"macos\"})) or (100 * (1 - max by (instance, platform) (node_memory_MemAvailable_bytes{job=\"node\",platform=\"linux\"}) / on(instance, platform) max by (instance, platform) (node_memory_MemTotal_bytes{job=\"node\",platform=\"linux\"})))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -256,7 +256,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "100 * max by (instance) (node_memory_swap_used_bytes{job=\"node\",platform=\"macos\"}) / on(instance) max by (instance) (node_memory_swap_total_bytes{job=\"node\",platform=\"macos\"})",
+          "expr": "(100 * max by (instance, platform) (node_memory_swap_used_bytes{job=\"node\",platform=\"macos\"}) / on(instance, platform) max by (instance, platform) (node_memory_swap_total_bytes{job=\"node\",platform=\"macos\"})) or (100 * (1 - max by (instance, platform) (node_memory_SwapFree_bytes{job=\"node\",platform=\"linux\"}) / on(instance, platform) (max by (instance, platform) (node_memory_SwapTotal_bytes{job=\"node\",platform=\"linux\"}) > 0)))",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -268,7 +268,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "max by (instance) (node_load1{job=\"node\",platform=\"macos\"}) / on(instance) count by (instance) (node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"})",
+          "expr": "max by (instance, platform) (node_load1{job=\"node\"}) / on(instance, platform) count by (instance, platform) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -289,18 +289,20 @@
               "Time": true
             },
             "indexByName": {
-              "Value #A": 1,
-              "Value #B": 2,
-              "Value #C": 3,
-              "Value #D": 4,
-              "instance": 0
+              "Value #A": 2,
+              "Value #B": 3,
+              "Value #C": 4,
+              "Value #D": 5,
+              "instance": 0,
+              "platform": 1
             },
             "renameByName": {
               "Value #A": "CPU busy",
               "Value #B": "Memory used",
               "Value #C": "Swap used",
               "Value #D": "Load per core",
-              "instance": "Host"
+              "instance": "Host",
+              "platform": "OS"
             }
           }
         }
@@ -367,7 +369,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"}[5m])))",
+          "expr": "100 * (1 - avg by (instance, platform) (rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[5m])))",
           "instant": false,
           "legendFormat": "{{instance}}",
           "range": true,
@@ -382,7 +384,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "App (internal minus purgeable) plus wired plus compressed memory, as a share of physical memory. Sustained high values with rising swap point to memory pressure.",
+      "description": "macOS: app (internal minus purgeable) plus wired plus compressed memory, as a share of physical memory. Linux: memory not available to new work (1 - MemAvailable / MemTotal). Sustained high values with rising swap point to memory pressure.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -437,7 +439,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "100 * (max by (instance) (node_memory_internal_bytes{job=\"node\",platform=\"macos\"}) - on(instance) max by (instance) (node_memory_purgeable_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_wired_bytes{job=\"node\",platform=\"macos\"}) + on(instance) max by (instance) (node_memory_compressed_bytes{job=\"node\",platform=\"macos\"})) / on(instance) max by (instance) (node_memory_total_bytes{job=\"node\",platform=\"macos\"})",
+          "expr": "(100 * (max by (instance, platform) (node_memory_internal_bytes{job=\"node\",platform=\"macos\"}) - on(instance, platform) max by (instance, platform) (node_memory_purgeable_bytes{job=\"node\",platform=\"macos\"}) + on(instance, platform) max by (instance, platform) (node_memory_wired_bytes{job=\"node\",platform=\"macos\"}) + on(instance, platform) max by (instance, platform) (node_memory_compressed_bytes{job=\"node\",platform=\"macos\"})) / on(instance, platform) max by (instance, platform) (node_memory_total_bytes{job=\"node\",platform=\"macos\"})) or (100 * (1 - max by (instance, platform) (node_memory_MemAvailable_bytes{job=\"node\",platform=\"linux\"}) / on(instance, platform) max by (instance, platform) (node_memory_MemTotal_bytes{job=\"node\",platform=\"linux\"})))",
           "instant": false,
           "legendFormat": "{{instance}}",
           "range": true,
@@ -507,7 +509,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "100 * max by (instance) (node_memory_swap_used_bytes{job=\"node\",platform=\"macos\"}) / on(instance) max by (instance) (node_memory_swap_total_bytes{job=\"node\",platform=\"macos\"})",
+          "expr": "(100 * max by (instance, platform) (node_memory_swap_used_bytes{job=\"node\",platform=\"macos\"}) / on(instance, platform) max by (instance, platform) (node_memory_swap_total_bytes{job=\"node\",platform=\"macos\"})) or (100 * (1 - max by (instance, platform) (node_memory_SwapFree_bytes{job=\"node\",platform=\"linux\"}) / on(instance, platform) (max by (instance, platform) (node_memory_SwapTotal_bytes{job=\"node\",platform=\"linux\"}) > 0)))",
           "instant": false,
           "legendFormat": "{{instance}}",
           "range": true,
@@ -577,7 +579,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "max by (instance) (node_load1{job=\"node\",platform=\"macos\"}) / on(instance) count by (instance) (node_cpu_seconds_total{job=\"node\",platform=\"macos\",mode=\"idle\"})",
+          "expr": "max by (instance, platform) (node_load1{job=\"node\"}) / on(instance, platform) count by (instance, platform) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"})",
           "instant": false,
           "legendFormat": "{{instance}}",
           "range": true,
@@ -592,7 +594,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Bytes written to swap per second. Sustained non-zero paging means the host is short of memory.",
+      "description": "Bytes written to swap per second (on Linux, pages swapped out times the 4 KiB page size). Sustained non-zero paging means the host is short of memory.",
       "fieldConfig": {
         "defaults": {
           "min": 0,
@@ -624,7 +626,7 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "max by (instance) (rate(node_memory_swapped_out_bytes_total{job=\"node\",platform=\"macos\"}[5m]))",
+          "expr": "(max by (instance, platform) (rate(node_memory_swapped_out_bytes_total{job=\"node\",platform=\"macos\"}[5m]))) or (4096 * max by (instance, platform) (rate(node_vmstat_pswpout{job=\"node\",platform=\"linux\"}[5m])))",
           "instant": false,
           "legendFormat": "{{instance}}",
           "range": true,
@@ -648,7 +650,7 @@
       },
       "id": 49,
       "panels": [],
-      "title": "Hub host (headcrash)",
+      "title": "Hub host (headcrash, which is also a Linux worker)",
       "type": "row"
     },
     {
@@ -1052,6 +1054,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
+      "description": "Slots offered by the connected workers of each operating system. The hub routes an action on its OSFamily, so the macOS and the Linux workers are two pools: a build can only use the slots of its own.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1074,9 +1077,11 @@
       "options": {
         "colorMode": "value",
         "graphMode": "none",
+        "orientation": "horizontal",
         "reduceOptions": {
           "calcs": ["lastNotNull"]
-        }
+        },
+        "textMode": "value_and_name"
       },
       "targets": [
         {
@@ -1084,14 +1089,14 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(nativelink_pool_worker_slots)",
+          "expr": "sum by (os) (nativelink_pool_worker_slots)",
           "instant": true,
-          "legendFormat": "",
+          "legendFormat": "{{os}}",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Total slots",
+      "title": "Total slots, by OS",
       "type": "stat"
     },
     {
@@ -1121,9 +1126,11 @@
       "options": {
         "colorMode": "value",
         "graphMode": "none",
+        "orientation": "horizontal",
         "reduceOptions": {
           "calcs": ["lastNotNull"]
-        }
+        },
+        "textMode": "value_and_name"
       },
       "targets": [
         {
@@ -1131,14 +1138,14 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "sum(nativelink_pool_worker_running_actions)",
+          "expr": "sum by (os) (nativelink_pool_worker_running_actions)",
           "instant": true,
-          "legendFormat": "",
+          "legendFormat": "{{os}}",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Slots in use",
+      "title": "Slots in use, by OS",
       "type": "stat"
     },
     {
@@ -1146,7 +1153,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Running actions as a share of all slots offered. Yellow from 80%, red when every slot is busy.",
+      "description": "Running actions as a share of the slots offered, for each operating system. Yellow from 80%, red when every slot is busy. One pool can be full while the other is idle.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1186,9 +1193,11 @@
       "options": {
         "colorMode": "value",
         "graphMode": "none",
+        "orientation": "horizontal",
         "reduceOptions": {
           "calcs": ["lastNotNull"]
-        }
+        },
+        "textMode": "value_and_name"
       },
       "targets": [
         {
@@ -1196,14 +1205,14 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "100 * sum(nativelink_pool_worker_running_actions) / sum(nativelink_pool_worker_slots)",
+          "expr": "100 * sum by (os) (nativelink_pool_worker_running_actions) / sum by (os) (nativelink_pool_worker_slots)",
           "instant": true,
-          "legendFormat": "",
+          "legendFormat": "{{os}}",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Pool slots in use (%)",
+      "title": "Slots in use (%), by OS",
       "type": "stat"
     },
     {
