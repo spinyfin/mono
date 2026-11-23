@@ -2708,6 +2708,7 @@ impl WorkDb {
             }
             _ => None,
         };
+        let chosen = answer.clone();
         match (answer, &question.question.answer_type) {
             // The engine's own question when progression ran out of attempts.
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
@@ -2865,6 +2866,9 @@ impl WorkDb {
             // `check_answer` above refuses every other pairing.
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
         }
+        // A board change bound to the chosen answer is made here, or the answer is refused.
+        let changed = crate::answer_actions::apply_bound_in_tx(&mut pending, &tx, &task, &question, &chosen, actor)?;
+        touched_work_item_ids.extend(changed);
 
         if let Some(reason) = archive_reason {
             anyhow::ensure!(

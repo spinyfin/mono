@@ -1099,7 +1099,12 @@ pub(crate) async fn sweep_one(
     // Merged / closed-unmerged probes are skipped — the row will
     // transition away from `in_review` and the indicators become moot.
     if let PrLifecycleState::Open(open) = &probe_result.state {
-        retire_moot_revisions(work_db, publisher, host, candidate, &probe_result, open).await;
+        if retire_moot_revisions(work_db, publisher, host, candidate, &probe_result, open).await {
+            // The reaper's snapshot may be the attempt that just ended; a
+            // merge-queue one would pin the stored CI state to failing for
+            // another pass. Let the poll-state write read the truth.
+            known_active_queue_failure = None;
+        }
         update_pr_poll_state(
             work_db,
             publisher,
@@ -1524,6 +1529,11 @@ pub(crate) async fn dispatch_ci_axis(
 /// sweep needs a definitive `Clean` mergeability; `Unknown` and `Conflict`
 /// leave conflict revisions alone. Publishes a work-item invalidation when
 /// anything was archived, since neither retire path notifies the board.
+///
+/// A green head also retires CI-fix attempts that are still *active* but can
+/// no longer run (`ci_watch::retire_moot_pending_ci_fixes`). Returns whether
+/// any was, so the caller does not write the PR's poll state from a snapshot
+/// of an attempt that has just ended.
 async fn retire_moot_revisions(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -1531,8 +1541,9 @@ async fn retire_moot_revisions(
     candidate: &PendingMergeCheck,
     probe_result: &PrLifecycleProbe,
     open: &OpenPrStatus,
-) {
+) -> bool {
     let mut closed = 0;
+    let mut attempts_retired = 0;
     if open.mergeability == OpenPrMergeability::Clean
         && let Some(host) = host
     {
@@ -1540,12 +1551,20 @@ async fn retire_moot_revisions(
     }
     if matches!(open.ci, OpenPrCiStatus::Clean) {
         closed += ci_watch::retire_moot_ci_fix_revisions(work_db, candidate, &probe_result.labels);
+        attempts_retired = ci_watch::retire_moot_pending_ci_fixes(
+            work_db,
+            publisher,
+            candidate,
+            open.mergeability == OpenPrMergeability::Conflict,
+        )
+        .await;
     }
-    if closed > 0 {
+    if closed + attempts_retired > 0 {
         publisher
             .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "moot_revisions_closed")
             .await;
     }
+    attempts_retired > 0
 }
 
 /// Polymorphic retire dispatch (design §Q5 / Phase 10 #31).

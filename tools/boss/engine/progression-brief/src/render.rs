@@ -501,7 +501,8 @@ fn render_questions(out: &mut String, packet: &ProgressionBriefPacket) {
         out.push_str(
             "\nThe owner has answered a question an earlier progression run asked (listed above with its answer). \
              This run exists to act on that answer: do what it decides, with the verbs below, before anything else. \
-             Do not ask the same question again.\n",
+             A board change that was bound to the chosen answer has already been made by the engine, and the \
+             item's description says so: do not repeat it. Do not ask the same question again.\n",
         );
     }
     out.push('\n');

@@ -2344,6 +2344,71 @@ pub(crate) fn retire_moot_ci_fix_revisions(
     }
     closed
 }
+
+/// Retire the work item's active CI-fix attempts that are moot now that every
+/// required check on the PR head is green, close their revisions, and release
+/// whatever was queued behind them. Returns the number of attempts retired.
+///
+/// [`retire_moot_ci_fix_revisions`] closes the revision of an attempt that has
+/// already *ended*. This is the other half: an attempt that is still active
+/// because nothing will ever finish it, whose revision no worker is on. Its
+/// run was cancelled, or it was left with automatic start off, and from then
+/// on it holds every later revision of the pull request behind it, pins the
+/// PR's stored CI state to failing (for a merge-queue failure) and keeps the
+/// "ci failing" badge up. See `boss_work_db`'s `moot_ci_fix` module for which
+/// attempts qualify. A revision a worker is on is always left alone, and a
+/// merge-queue failure is never judged by green head CI alone: that one is
+/// moot when the PR conflicts with its base (`pr_conflicting`), or when the
+/// fix was stopped and another writer on the PR is queued behind it.
+///
+/// Runs on every open probe with green head CI, whatever the mergeability,
+/// because the case it exists for is a PR that is green *and* conflicting:
+/// the conflict arm of the sweep runs no CI retire path, and a conflict whose
+/// resolution is deferred never reaches the conflict watcher's own "conflict
+/// pre-empts CI" supersede.
+///
+/// Deliberately not gated on the auto-maintenance opt-outs: this starts no
+/// remediation and pushes nothing, it only ends one that can no longer run.
+/// A parked item is left alone by the work-db call.
+pub(crate) async fn retire_moot_pending_ci_fixes(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    pr_conflicting: bool,
+) -> usize {
+    let retired = match work_db.retire_moot_pending_ci_fixes(&candidate.work_item_id, pr_conflicting) {
+        Ok(retired) => retired,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "ci_watch: failed to retire moot pending CI-fix attempts",
+            );
+            return 0;
+        }
+    };
+    if retired.is_empty() {
+        return 0;
+    }
+    for retirement in &retired {
+        tracing::info!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            attempt_id = %retirement.attempt.id,
+            revision_task_id = retirement.attempt.revision_task_id.as_deref().unwrap_or(""),
+            failure_kind = retirement.attempt.failure_kind.as_deref().unwrap_or(""),
+            reason = retirement.reason.as_str(),
+            revision_archived = retirement.revision_archived,
+            "ci_watch: retired a moot CI-fix attempt; head CI is green and no worker was on its revision",
+        );
+    }
+    // The badge follows the newest attempt row and is cleared only by an
+    // explicit event that carries that row as it now stands.
+    crate::remediation_push::publish_ci_failure_cleared(work_db, publisher, candidate).await;
+    retired.len()
+}
+
 /// Post-commit effects after a retire transaction commits: release a
 /// succeeded conflict attempt's cube lease and publish the typed CI /
 /// conflict completion events. Shared by the poller retire paths and

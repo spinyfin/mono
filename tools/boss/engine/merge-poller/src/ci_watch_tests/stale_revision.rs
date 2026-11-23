@@ -242,3 +242,180 @@ async fn queue_side_abandoned_attempt_revision_is_closed_when_head_is_green() {
         assert_closed(&db, &revision);
     }
 }
+
+// ── An attempt that is still active but can no longer run ────────────────────
+//
+// `retire_moot_ci_fix_revisions` above needs the attempt to have ended. These
+// cover `retire_moot_pending_ci_fixes`: the attempt is still `pending`, no
+// worker is on its revision, and nothing else would ever end it.
+
+fn executions_to(db: &WorkDb, revision: &str, status: &str) {
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = ?2 WHERE work_item_id = ?1",
+            rusqlite::params![revision, status],
+        )
+        .unwrap();
+}
+
+fn attempt(db: &WorkDb, id: &str) -> crate::work::CiRemediation {
+    db.list_ci_remediations(None, &[], None, None)
+        .unwrap()
+        .into_iter()
+        .find(|attempt| attempt.id == id)
+        .expect("attempt row")
+}
+
+#[tokio::test]
+async fn a_pending_head_fix_no_worker_started_is_retired_once_the_head_is_green() {
+    // Whatever the mergeability: the conflict arm of the sweep runs no other
+    // CI retire path, so a green-and-conflicting PR is the case that matters.
+    for conflicting in [false, true] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/710";
+        let (product, chore) = make_in_review(&db, "C-moot-head-fix", pr);
+        let (attempt_id, revision) = spawn_ci_fix(&db, &product, &chore, pr, "head-1").await;
+        // Its worker was cancelled before it did anything.
+        executions_to(&db, &revision, "cancelled");
+
+        let pub_ = RecordingPublisher::default();
+        assert_eq!(
+            retire_moot_pending_ci_fixes(&db, &pub_, &candidate(&product, &chore, pr), conflicting).await,
+            1,
+            "conflicting={conflicting}"
+        );
+        assert_closed(&db, &revision);
+        let ended = attempt(&db, &attempt_id);
+        assert_eq!(ended.status, "abandoned");
+        assert_eq!(ended.failure_reason.as_deref(), Some("moot_head_ci_green"));
+        assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
+        assert!(!db.has_in_flight_ci_fix_revision(&chore).unwrap());
+        assert_eq!(
+            pub_.ci_failure_cleared_count(pr).await,
+            1,
+            "the badge is driven by active attempts and needs the explicit clear"
+        );
+        // Nothing left to do on the next pass.
+        assert_eq!(
+            retire_moot_pending_ci_fixes(&db, &pub_, &candidate(&product, &chore, pr), conflicting).await,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fix_a_worker_is_on_is_never_retired_from_under_it() {
+    for status in ["claimed", "running", "waiting_human"] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/711";
+        let (product, chore) = make_in_review(&db, "C-moot-running", pr);
+        let (attempt_id, revision) = spawn_ci_fix(&db, &product, &chore, pr, "head-1").await;
+        executions_to(&db, &revision, status);
+
+        let pub_ = RecordingPublisher::default();
+        assert_eq!(
+            retire_moot_pending_ci_fixes(&db, &pub_, &candidate(&product, &chore, pr), true).await,
+            0,
+            "{status}"
+        );
+        assert_ne!(task(&db, &revision).status, TaskStatus::Archived, "{status}");
+        assert_eq!(attempt(&db, &attempt_id).status, "pending", "{status}");
+        assert_eq!(pub_.ci_failure_cleared_count(pr).await, 0, "{status}");
+    }
+}
+
+/// The whole pass, for the state that left a pull request stuck for days. A
+/// merge-queue build failed and a CI-fix revision was created for it; the fix
+/// worker was cancelled and the revision left unstarted; the PR then
+/// conflicted with its base, and the work to resolve the conflict queued
+/// behind the dead revision. Every check on the PR head passed throughout.
+#[tokio::test]
+async fn sweep_retires_a_cancelled_queue_fix_once_the_green_pr_conflicts() {
+    use crate::tests::StubProbe;
+
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/712";
+    let (product, chore) = make_in_review(&db, "C-queue-fix-cancelled", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    assert!(
+        on_merge_queue_rebounce_detected(
+            &db,
+            crate::queue_ci_contract::test_context(publisher.as_ref()),
+            &candidate(&product, &chore, pr),
+            "head-1",
+            "queue-commit-1",
+            None,
+            &one_failure(),
+        )
+        .await
+    );
+    let queue_attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("queue attempt");
+    assert_eq!(queue_attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
+    let revision = queue_attempt.revision_task_id.clone().expect("queue fix revision");
+    executions_to(&db, &revision, "cancelled");
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET autostart = 0 WHERE id = ?1", [&revision])
+        .unwrap();
+
+    let probe = StubProbe::new();
+    let green = |mergeability| {
+        PrLifecycleState::Open(OpenPrStatus {
+            mergeability,
+            ci: OpenPrCiStatus::Clean,
+        })
+    };
+
+    // Green and mergeable, with nothing waiting on the stopped fix: head CI
+    // says nothing about a merge-queue failure, so nothing moves and the
+    // stored CI state is still the queue's failure.
+    probe.set_with_base_head(pr, green(OpenPrMergeability::Clean), "base-1", "head-1");
+    crate::run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(attempt(&db, &queue_attempt.id).status, "pending");
+    assert_eq!(task(&db, &revision).status, TaskStatus::Todo);
+    assert_eq!(task(&db, &chore).ci_required_state.as_deref(), Some("fail"));
+
+    // The next writer on the PR waits behind the dead revision.
+    let conflict_work = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(chore.clone())
+                .description("Resolve the conflicts with the base branch")
+                .force_duplicate(true)
+                .build(),
+            &fix_checker(),
+        )
+        .unwrap();
+    assert_eq!(
+        db.gating_prereqs_for(&conflict_work.id).unwrap(),
+        vec![revision.clone()],
+        "precondition: the conflict work is queued behind the dead CI-fix revision"
+    );
+
+    // Green and conflicting: the fix cannot matter at this head any more.
+    probe.set_with_base_head(pr, green(OpenPrMergeability::Conflict), "base-1", "head-1");
+    crate::run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let ended = attempt(&db, &queue_attempt.id);
+    assert_eq!(ended.status, "abandoned");
+    assert_eq!(
+        ended.failure_reason.as_deref(),
+        Some("moot_conflict_preempts_queue_fix")
+    );
+    assert_closed(&db, &revision);
+    assert!(
+        db.gating_prereqs_for(&conflict_work.id).unwrap().is_empty(),
+        "the conflict work must no longer wait on the closed revision"
+    );
+    assert_ne!(task(&db, &conflict_work.id).status, TaskStatus::Blocked);
+    // The same pass writes the head's real CI state and clears the badge.
+    assert_eq!(task(&db, &chore).ci_required_state.as_deref(), Some("success"));
+    assert!(publisher.ci_failure_cleared_count(pr).await >= 1);
+}

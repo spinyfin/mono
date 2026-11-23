@@ -102,6 +102,10 @@ root-cause rule as the section below.
   question card to the card clearing, in the app and the engine, and which
   reads an answer does and does not wait for):
   [`tools/boss/docs/operator-answer-latency.md`](tools/boss/docs/operator-answer-latency.md)
+- Owner answers (how an answer to a progression question is carried out by
+  the engine, what such a question may not ask the owner to do, and how a
+  CI-fix attempt that can no longer run is retired):
+  [`tools/boss/docs/owner-answers.md`](tools/boss/docs/owner-answers.md)
 - Dispatch focus mode (`bossctl dispatch focus`: restrict automatic
   dispatch to chosen projects/products; scope rules, precedence against the
   pause and force-launch, the `focus_mode` hold reason):

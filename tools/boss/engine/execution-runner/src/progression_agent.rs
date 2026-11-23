@@ -98,6 +98,9 @@ pub fn render_progression_claude_md(scratch_dir: &str, boss: &str) -> String {
        A bare `blocked` is refused. Ask only under one of the four numbered criteria in\n\
        your brief, and never to confirm something you may do directly. For\n\
        `multiple-choice` omit Yes:/No: and say in Context what each option leads to.\n\
+       Never ask the owner to change the board themselves. When an answer means a\n\
+       board change, add `--on-answer '<answer>=<change>'` and the engine makes it\n\
+       when the owner picks that answer; your brief lists the changes it can make.\n\
      \n\
      ## Your working directory\n\
      \n\
@@ -156,6 +159,9 @@ mod tests {
         assert!(md.contains("Ending the run (REQUIRED)"));
         assert!(md.contains("`no disposition`"));
         assert!(md.contains("--criterion 1|2|3|4"));
+        // An answer is carried out by the engine, never left to the owner.
+        assert!(md.contains("Never ask the owner to change the board themselves"));
+        assert!(md.contains("--on-answer '<answer>=<change>'"));
         assert!(md.contains("A bare `blocked` is refused"));
         // `done` is enabled for this tier, so the rules must not tell the agent
         // its declaration may be refused.

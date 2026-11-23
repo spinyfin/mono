@@ -959,3 +959,93 @@ fn run_done_superseded_by_accepts_pr_references_only_on_delivered() {
     let parsed: RunDoneProposalPayload = serde_json::from_str(&blocked_canonical).unwrap();
     assert_eq!(parsed.superseded_by.as_deref(), Some("#2977"));
 }
+
+#[test]
+fn done_answer_actions_bind_a_change_to_an_answer_of_the_question() {
+    let yes_no =
+        json!({"text": "Skip the build-fix?", "answer_type": {"kind": "yes_no"}, "explanation": "Context:\nc"});
+    let with = |question: &serde_json::Value, actions: serde_json::Value| {
+        json!({"outcome": "blocked", "summary": "Needs the owner", "question": question, "criterion": "2",
+               "answer_actions": actions})
+    };
+    let archive = |answer: &str| json!({"answer": answer, "action": {"kind": "archive_revision", "revision": "T12"}});
+
+    // Stored beside the typed payload, with `Yes` folded to its canonical spelling.
+    let canonical = ok(ProposalKind::RunDone, with(&yes_no, json!([archive("Yes")])));
+    assert_eq!(
+        canonical,
+        ok(ProposalKind::RunDone, with(&yes_no, json!([archive("yes")])))
+    );
+    let stored = boss_protocol::run_done_answer_actions(&canonical).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].answer, "yes");
+    assert_eq!(
+        stored[0].action,
+        boss_protocol::OwnerAction::ArchiveRevision { revision: "T12".into() }
+    );
+    // The criterion and the typed payload are still readable.
+    assert!(boss_protocol::run_done_question_criterion(&canonical).is_some());
+    assert!(serde_json::from_str::<RunDoneProposalPayload>(&canonical).is_ok());
+    // Binding a different change is a different submission; binding none adds no key.
+    let start = json!([{"answer": "yes", "action": {"kind": "start", "item": "T12"}}]);
+    assert_ne!(ok(ProposalKind::RunDone, with(&yes_no, start)), canonical);
+    assert!(!ok(ProposalKind::RunDone, with(&yes_no, json!([]))).contains("answer_actions"));
+
+    let field = boss_protocol::ANSWER_ACTIONS_KEY;
+    let refused = |payload: serde_json::Value| errs(ProposalKind::RunDone, payload).iter().any(|e| e.field == field);
+    // An answer the question does not offer, two changes for one answer, a
+    // malformed id, an unknown change, and a change with no question.
+    assert!(refused(with(&yes_no, json!([archive("maybe")]))));
+    assert!(refused(with(&yes_no, json!([archive("yes"), archive("YES")]))));
+    assert!(refused(with(
+        &yes_no,
+        json!([{"answer": "yes", "action": {"kind": "start", "item": "the build fix"}}])
+    )));
+    assert!(refused(with(
+        &yes_no,
+        json!([{"answer": "yes", "action": {"kind": "delete", "item": "T12"}}])
+    )));
+    assert!(refused(
+        json!({"outcome": "blocked", "summary": "stuck", "answer_actions": [archive("yes")]})
+    ));
+
+    // A multiple-choice question binds by option label.
+    let choices = json!({"text": "Which first?", "explanation": "Context:\nc",
+        "answer_type": {"kind": "multiple_choice", "choices": ["Skip the build-fix", "Run it first"]}});
+    let bound = ok(
+        ProposalKind::RunDone,
+        with(&choices, json!([archive("Skip the build-fix")])),
+    );
+    assert_eq!(
+        boss_protocol::run_done_answer_actions(&bound).unwrap()[0].answer,
+        "Skip the build-fix"
+    );
+    assert!(refused(with(&choices, json!([archive("yes")]))));
+}
+
+#[test]
+fn done_choice_that_speaks_as_the_person_answering_is_refused() {
+    let with = |choices: serde_json::Value| {
+        json!({"outcome": "blocked", "summary": "Needs a decision",
+               "question": {"text": "Which first?", "explanation": "Context:\nc",
+                            "answer_type": {"kind": "multiple_choice", "choices": choices}}})
+    };
+    let refused = errs(
+        ProposalKind::RunDone,
+        with(json!([
+            "I will delete the cancelled row now",
+            "Start the cancelled build-fix"
+        ])),
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|e| e.field == "question.answer_type.choices" && e.message.contains("speaks as the person answering")),
+        "{refused:?}"
+    );
+    // Options that name what happens are fine, whatever they start with.
+    ok(
+        ProposalKind::RunDone,
+        with(json!(["Ignore the failure", "Start the cancelled build-fix"])),
+    );
+}
