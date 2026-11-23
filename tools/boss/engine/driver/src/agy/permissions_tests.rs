@@ -276,9 +276,11 @@ fn allow_by_default_kinds_have_no_allowlist() {
 }
 
 #[test]
-fn every_shared_allowlist_entry_translates_to_a_valid_rule() {
+fn every_shared_allowlist_entry_is_enforced_somewhere() {
     // Each table is translated entry by entry: a new entry shape that has no
-    // `agy` equivalent fails here instead of silently changing a capability.
+    // `agy` equivalent fails here instead of silently changing a capability,
+    // and every entry lands in exactly one place: a native read grant in the
+    // session settings, or a command grant for the hook adapter.
     for kind in [
         WorkerKind::AnswerAgent,
         WorkerKind::ReviewGuide,
@@ -287,67 +289,119 @@ fn every_shared_allowlist_entry_translates_to_a_valid_rule() {
         let claude = claude_allowlist(kind);
         assert!(!claude.is_empty(), "{kind:?}");
         let allow = rendered(kind);
+        let grants = command_grants(kind).unwrap();
         assert!(!allow.allow_rules().is_empty(), "{kind:?}");
+        assert!(!grants.is_empty(), "{kind:?}");
         for claude_rule in &claude {
-            let translated = translate_claude_allow_rule(claude_rule, Path::new(WORKSPACE))
-                .unwrap_or_else(|error| panic!("{kind:?}: {error:#}"));
-            assert!(!translated.is_empty(), "{kind:?}: {claude_rule}");
-            for rule in &translated {
-                validate_rule(RuleList::Allow, rule).unwrap();
-                assert!(allow.allow_rules().contains(rule), "{kind:?}: {rule}");
+            match translate_claude_allow_rule(claude_rule, Path::new(WORKSPACE))
+                .unwrap_or_else(|error| panic!("{kind:?}: {error:#}"))
+            {
+                AllowEntry::NativeRead(rules) => {
+                    assert!(!rules.is_empty(), "{kind:?}: {claude_rule}");
+                    for rule in &rules {
+                        validate_rule(RuleList::Allow, rule).unwrap();
+                        assert!(allow.allow_rules().contains(rule), "{kind:?}: {rule}");
+                    }
+                }
+                AllowEntry::Command(prefix) => {
+                    assert_eq!(claude_rule, &format!("Bash({prefix}:*)"), "{kind:?}");
+                    assert!(grants.contains(&prefix), "{kind:?}: {prefix}");
+                }
             }
         }
     }
 }
 
 #[test]
+fn the_session_allowlist_holds_native_read_grants_and_no_command_rule() {
+    // A `command(...)` allow rule is matched by the CLI, and the CLI grants a
+    // rule whose program is a shell variable only on its exact text. Command
+    // grants are never rendered into the settings, in any spelling.
+    for kind in [
+        WorkerKind::AnswerAgent,
+        WorkerKind::ReviewGuide,
+        WorkerKind::Progression,
+    ] {
+        assert_eq!(
+            rendered(kind).allow_rules(),
+            [format!("read_file({WORKSPACE})")],
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn allow_by_default_kinds_have_no_command_grants() {
+    for kind in [WorkerKind::Standard, WorkerKind::Reviewer, WorkerKind::Triage] {
+        assert!(command_grants(kind).unwrap().is_empty(), "{kind:?}");
+    }
+}
+
+#[test]
 fn answer_agent_may_read_its_workspace_and_post_one_reply_only() {
+    assert_eq!(command_grants(WorkerKind::AnswerAgent).unwrap(), ["boss comment reply"]);
+}
+
+#[test]
+fn progression_grants_are_the_shared_table_with_no_vcs_or_cube() {
+    // The whole table, in both spellings of the Boss CLI: the one a
+    // progression agent is taught is `"$BOSS_BIN"`, and every verb it needs
+    // (including the `propose done` that ends its run) takes arguments.
     assert_eq!(
-        rendered(WorkerKind::AnswerAgent).allow_rules(),
+        command_grants(WorkerKind::Progression).unwrap(),
         [
-            format!("read_file({WORKSPACE})"),
-            "command(boss comment reply)".to_owned()
+            "boss propose",
+            "boss task show",
+            "boss task list",
+            "boss pr status",
+            r#""$BOSS_BIN" propose"#,
+            r#""$BOSS_BIN" task show"#,
+            r#""$BOSS_BIN" task list"#,
+            r#""$BOSS_BIN" pr status"#,
+            "gh pr view",
+            "gh pr checks",
         ]
     );
 }
 
 #[test]
-fn progression_allowlist_is_the_shared_table_with_no_vcs_or_cube() {
-    let settings = rendered(WorkerKind::Progression);
-    let allow = settings.allow_rules();
-    for expected in [
-        format!("read_file({WORKSPACE})"),
-        "command(boss propose)".to_owned(),
-        r#"command("$BOSS_BIN" propose)"#.to_owned(),
-        "command(boss pr status)".to_owned(),
-        "command(gh pr view)".to_owned(),
-        "command(gh pr checks)".to_owned(),
-    ] {
-        assert!(allow.contains(&expected), "missing {expected} in {allow:?}");
+fn review_guide_grants_keep_the_narrow_command_shapes() {
+    let grants = command_grants(WorkerKind::ReviewGuide).unwrap();
+    for expected in ["git show", "sed -n", "wc -l", "nl"] {
+        assert!(grants.contains(&expected.to_owned()), "missing {expected}");
     }
-    for rule in allow {
-        for forbidden in [
-            "command(jj",
-            "command(git",
-            "command(cube",
-            "command(gh api",
-            "command(sh",
-        ] {
-            assert!(!rule.starts_with(forbidden), "{rule}");
-        }
+    // Broader prefixes of the same commands would admit mutating forms.
+    for broad in ["git", "sed", "wc"] {
+        assert!(!grants.contains(&broad.to_owned()), "{broad} widens the table");
     }
 }
 
 #[test]
-fn review_guide_allowlist_keeps_the_narrow_command_shapes() {
-    let settings = rendered(WorkerKind::ReviewGuide);
-    let allow = settings.allow_rules();
-    for expected in ["command(git show)", "command(sed -n)", "command(wc -l)", "command(nl)"] {
-        assert!(allow.contains(&expected.to_owned()), "missing {expected}");
+fn a_command_grant_is_one_line_of_words() {
+    for prefix in [
+        "gh pr view",
+        r#""$BOSS_BIN" propose"#,
+        r#""${BOSS_BIN}" propose review-guide"#,
+    ] {
+        validate_command_grant(prefix).unwrap();
     }
-    // Broader prefixes of the same commands would admit mutating forms.
-    for broad in ["command(git)", "command(sed)", "command(wc)"] {
-        assert!(!allow.contains(&broad.to_owned()), "{broad} widens the table");
+    // Anything that could make a prefix more than one simple command.
+    for prefix in [
+        "",
+        " gh pr view",
+        "gh pr view ",
+        "gh pr view; rm",
+        "gh pr view && rm",
+        "gh pr view | tee",
+        "gh pr view > out",
+        "gh pr view < in",
+        "gh pr view $(id)",
+        "gh pr view `id`",
+        "gh pr\nview",
+        "gh pr view\\",
+        "'gh' pr view",
+    ] {
+        assert!(validate_command_grant(prefix).is_err(), "accepted {prefix:?}");
     }
 }
 
@@ -391,25 +445,32 @@ fn malformed_rules_from_the_study_are_rejected_before_they_can_fail_open() {
 }
 
 #[test]
-fn command_rules_are_never_deny_rules() {
+fn command_rules_are_never_rendered_in_either_list() {
+    // A command deny is evaded by spelling. A command allow is matched by the
+    // CLI as a prefix only when its program is a plain word: the rule that
+    // named `"$BOSS_BIN"` granted its exact text and nothing with an argument.
     for rule in [
         "command(printf)",
         "command(git push)",
         "command(sudo)",
         "command(bossctl)",
+        "command(gh pr view)",
+        "command(boss propose)",
+        r#"command("$BOSS_BIN" propose)"#,
     ] {
-        let error = validate_rule(RuleList::Deny, rule).unwrap_err();
-        assert!(format!("{error:#}").contains("native file rules only"), "{error:#}");
-        // The same string is a fine allow rule: the restriction is the list.
-        validate_rule(RuleList::Allow, rule).unwrap();
+        for list in [RuleList::Deny, RuleList::Allow] {
+            let error = validate_rule(list, rule).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("native file rules only"),
+                "{list:?} {rule}: {error:#}"
+            );
+        }
     }
 }
 
 #[test]
 fn well_formed_rules_are_accepted() {
     for rule in [
-        "command(git push)",
-        r#"command("$BOSS_BIN" propose)"#,
         "read_file(/tmp/x)",
         "write_file(/Users/someone/Library/Application Support/Boss)",
     ] {

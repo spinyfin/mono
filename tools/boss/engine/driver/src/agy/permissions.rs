@@ -34,9 +34,26 @@
 //!   refuses a `command(...)` deny so the combination cannot be reintroduced by
 //!   accident.
 //! - `permissions.allow` — only for the deny-by-default kinds
-//!   ([`permission_mode_for_worker_kind`] is `Some`). The hook answers
-//!   `deny_unless_prior_grant` for them, so this list is the whole set of
-//!   calls that can run once the guards have passed.
+//!   ([`permission_mode_for_worker_kind`] is `Some`), and **native read grants
+//!   only**: `read_file` of the workspace. The hook answers
+//!   `deny_unless_prior_grant` for these kinds, so this list is the whole set
+//!   of native file calls that can run once the guards have passed.
+//! - **No command allow rules.** A kind's command allowlist is not rendered
+//!   here; it goes to the `PreToolUse` hook adapter as [`command_grants`], and
+//!   the adapter answers `auto_approve` for a command it covers. The CLI's own
+//!   matcher cannot carry it. Observed on 1.5.14 in progression runs (permission
+//!   study, section 5, 2026-11-23 addendum): `command("$BOSS_BIN" task list)`
+//!   granted the command `"$BOSS_BIN" task list` and refused `"$BOSS_BIN" task
+//!   list --product boss`, as it did every `"$BOSS_BIN" task show`, `pr status`
+//!   and `propose` call that carried an argument, while `command(gh pr view)`
+//!   in the same list granted `gh pr view` with arguments. A rule whose program
+//!   is a shell variable is matched against the exact command text, not as a
+//!   prefix. The bare `boss` spelling is no alternative: the Boss launch guard
+//!   in the hook chain refuses a `PATH` lookup of `boss` before the allowlist
+//!   is consulted. So no Boss verb with an argument could run, and a run could
+//!   not declare how it ended.
+//!   [`validate_rule`] refuses a `command(...)` allow rule so that dependence
+//!   on the CLI's matcher cannot be reintroduced by accident.
 //! - No `permissions.ask`: an ask rule overrides a hook `auto_approve` and
 //!   raises a dialog nobody is there to answer.
 //!
@@ -99,7 +116,8 @@ pub fn permission_mode_for_worker_kind(worker_kind: WorkerKind) -> Option<&'stat
 pub enum VerdictPosture {
     /// Allow-by-default behind guards: `auto_approve` once the guards pass.
     GuardedApproval,
-    /// Deny-by-default: `deny_unless_prior_grant`, with `permissions.allow`.
+    /// Deny-by-default: `deny_unless_prior_grant`, with native read grants in
+    /// `permissions.allow` and [`command_grants`] decided by the adapter.
     GuardedAllowlist,
 }
 
@@ -396,23 +414,61 @@ fn reject_self_fencing(plan: &SettingsPlan<'_>, deny: &[String]) -> anyhow::Resu
 // Allowlist translation
 // ---------------------------------------------------------------------------
 
-/// Translate a kind's shared Claude-grammar allowlist into `agy` rules.
+/// Where one entry of a shared Claude-grammar allowlist is enforced for `agy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AllowEntry {
+    /// `Read` / `Grep` / `Glob`: `read_file(<workspace>)` rules in
+    /// `permissions.allow`, one per spelling of the workspace (`/var` and
+    /// `/private/var`, `/tmp` and `/private/tmp`), mirroring the deny side:
+    /// allow-path matching is not known to be spelling-insensitive, and every
+    /// spelling names the same directory, so this does not widen the grant.
+    /// Narrower than Claude's unscoped tool grant: nothing outside the
+    /// workspace is allowed.
+    NativeRead(Vec<String>),
+    /// `Bash(<prefix>:*)`: the command prefix, decided by the hook adapter.
+    Command(String),
+}
+
+/// Translate one shared allowlist entry.
 ///
-/// - `Read` / `Grep` / `Glob` → `read_file(<workspace>)`. Narrower than
-///   Claude's unscoped tool grant: nothing outside the workspace is allowed.
-/// - `Bash(<prefix>:*)` → `command(<prefix>)`. `agy` matches a command rule as
-///   a word-by-word prefix, which is what the `:*` form means.
-///
-/// Anything else is an error rather than a silent drop or a widening: the
-/// tables are static, so a new entry shape fails the tests that translate
-/// every table instead of quietly changing a worker's capabilities. An allow
-/// rule is not a write barrier (a redirect or a substitution rides on an
-/// allowed command), which is why the hook's guards decide first.
+/// Anything unrecognised is an error rather than a silent drop or a widening:
+/// the tables are static, so a new entry shape fails the tests that translate
+/// every table instead of quietly changing a worker's capabilities.
+fn translate_claude_allow_rule(rule: &str, workspace: &Path) -> anyhow::Result<AllowEntry> {
+    if matches!(rule, "Read" | "Grep" | "Glob") {
+        return Ok(AllowEntry::NativeRead(
+            trust_path_variants(workspace)
+                .into_iter()
+                .map(|spelling| format!("read_file({spelling})"))
+                .collect(),
+        ));
+    }
+    if let Some(prefix) = rule.strip_prefix("Bash(").and_then(|rest| rest.strip_suffix(":*)")) {
+        validate_command_grant(prefix)?;
+        return Ok(AllowEntry::Command(prefix.to_owned()));
+    }
+    bail!("no agy equivalent for allow rule {rule:?}; extend the translation deliberately")
+}
+
+/// Every entry of the kind's shared allowlist, translated in table order.
+fn allow_entries(worker_kind: WorkerKind, workspace: &Path) -> anyhow::Result<Vec<AllowEntry>> {
+    claude_allowlist(worker_kind)
+        .iter()
+        .map(|claude_rule| {
+            translate_claude_allow_rule(claude_rule, workspace)
+                .with_context(|| format!("translating allow rule {claude_rule:?} for {worker_kind:?}"))
+        })
+        .collect()
+}
+
+/// The `permissions.allow` list for a deny-by-default kind: its native read
+/// grants. The kind's command grants are [`command_grants`].
 fn allow_rules(worker_kind: WorkerKind, workspace: &Path) -> anyhow::Result<Vec<String>> {
     let mut rules: Vec<String> = Vec::new();
-    for claude_rule in claude_allowlist(worker_kind) {
-        let translated = translate_claude_allow_rule(&claude_rule, workspace)
-            .with_context(|| format!("translating allow rule {claude_rule:?} for {worker_kind:?}"))?;
+    for entry in allow_entries(worker_kind, workspace)? {
+        let AllowEntry::NativeRead(translated) = entry else {
+            continue;
+        };
         for rule in translated {
             if !rules.contains(&rule) {
                 rules.push(rule);
@@ -422,22 +478,45 @@ fn allow_rules(worker_kind: WorkerKind, workspace: &Path) -> anyhow::Result<Vec<
     Ok(rules)
 }
 
-/// One Claude rule becomes one or more `agy` rules. A read grant is emitted
-/// once per spelling of the workspace (`/var` and `/private/var`, `/tmp` and
-/// `/private/tmp`), mirroring the deny side: allow-path matching is not known
-/// to be spelling-insensitive, and every spelling names the same directory,
-/// so this does not widen the grant.
-fn translate_claude_allow_rule(rule: &str, workspace: &Path) -> anyhow::Result<Vec<String>> {
-    if matches!(rule, "Read" | "Grep" | "Glob") {
-        return Ok(trust_path_variants(workspace)
-            .into_iter()
-            .map(|spelling| format!("read_file({spelling})"))
-            .collect());
+/// The command prefixes a deny-by-default kind may run, for the hook adapter
+/// to decide: the `Bash(<prefix>:*)` entries of the kind's shared allowlist,
+/// in table order. Empty for allow-by-default kinds.
+///
+/// A prefix is granted word by word, which is what the `:*` form means: a
+/// command is covered when it is one simple command whose leading words are
+/// the prefix. The adapter matches after resolving the engine-provided path
+/// variables on both sides, so `"$BOSS_BIN" propose` names the program
+/// `BOSS_BIN` holds and not a spelling of it. A grant is not a write barrier:
+/// the adapter's structural checks and the guard chain decide first, and a
+/// grant only ever applies to a call they have already passed.
+pub fn command_grants(worker_kind: WorkerKind) -> anyhow::Result<Vec<String>> {
+    let mut grants: Vec<String> = Vec::new();
+    // No path enters a command grant; the workspace only shapes read grants.
+    for entry in allow_entries(worker_kind, Path::new("/"))? {
+        if let AllowEntry::Command(prefix) = entry
+            && !grants.contains(&prefix)
+        {
+            grants.push(prefix);
+        }
     }
-    if let Some(inner) = rule.strip_prefix("Bash(").and_then(|rest| rest.strip_suffix(":*)")) {
-        return Ok(vec![format!("command({inner})")]);
+    Ok(grants)
+}
+
+/// Check one command prefix before it is handed to the adapter. The adapter
+/// tokenises it with the same lexer it reads commands with, so the prefix must
+/// be a single line of words with nothing that could make it more than one
+/// simple command.
+fn validate_command_grant(prefix: &str) -> anyhow::Result<()> {
+    if prefix.is_empty() || prefix.trim() != prefix {
+        bail!("agy command grant {prefix:?}: empty or surrounded by whitespace");
     }
-    bail!("no agy equivalent for allow rule {rule:?}; extend the translation deliberately")
+    if let Some(found) = prefix
+        .chars()
+        .find(|c| c.is_control() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | '\\' | '\''))
+    {
+        bail!("agy command grant {prefix:?}: {found:?} cannot appear in a command prefix");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -484,21 +563,20 @@ fn split_rule(rule: &str) -> anyhow::Result<(&str, &str)> {
 /// Check one rule against the grammar `agy` accepts, mirroring the failures it
 /// would otherwise only log: an unknown action, a missing parenthesis, a space
 /// before it, or a bare action name. Stricter than the CLI where its behaviour
-/// is unmeasured: only the actions the permission study exercised are allowed,
-/// a path rule needs an absolute path, and a `command` rule may not be a
-/// regular expression (regex denies were measured not to be a substring
-/// filter).
+/// is unmeasured or measured not to hold: only native file actions are
+/// rendered, and a path rule needs an absolute path.
 ///
-/// Deny rules are file rules only; see the module documentation.
+/// Both lists are file rules only. A `command(...)` deny is evaded by
+/// spelling, and a `command(...)` allow is matched as a prefix only when its
+/// program is a plain word; see the module documentation. Command policy
+/// belongs to the hook adapter in both directions.
 pub fn validate_rule(list: RuleList, rule: &str) -> anyhow::Result<()> {
     let (action, target) = split_rule(rule)?;
-    let allowed = matches!(
-        (list, action),
-        (RuleList::Deny, "read_file" | "write_file") | (RuleList::Allow, "command" | "read_file" | "write_file")
-    );
-    if !allowed {
+    if !matches!(action, "read_file" | "write_file") {
         bail!(
-            "agy {} rule {rule:?}: action {action:?} is not permitted here (deny rules are native file rules only)",
+            "agy {} rule {rule:?}: action {action:?} is not permitted here ({} rules are native file rules only; \
+             command policy is decided by the hook adapter)",
+            list.label(),
             list.label()
         );
     }
@@ -514,21 +592,12 @@ pub fn validate_rule(list: RuleList, rule: &str) -> anyhow::Result<()> {
             list.label()
         );
     }
-    match action {
-        "command" => {
-            if target.starts_with("regex:") {
-                bail!("agy allow rule {rule:?}: regular-expression command rules are not used");
-            }
-        }
-        _ => {
-            let path = Path::new(target);
-            if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
-                bail!(
-                    "agy {} rule {rule:?}: path must be absolute with no `..` component",
-                    list.label()
-                );
-            }
-        }
+    let path = Path::new(target);
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!(
+            "agy {} rule {rule:?}: path must be absolute with no `..` component",
+            list.label()
+        );
     }
     Ok(())
 }

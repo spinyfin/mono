@@ -59,6 +59,8 @@ use progress::AgyProgressSession;
 use transcript::AgyTranscriptSession;
 
 pub mod probe_isolation;
+/// Manual authenticated probe of the verbs a progression run can execute.
+pub mod progression_probe;
 pub mod quota;
 /// Manual authenticated rules-discovery conformance probe.
 pub mod rules_probe;

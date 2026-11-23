@@ -120,6 +120,11 @@ def load_policy():
     kinds = {"standard", "reviewer", "triage", "answer_agent", "review_guide", "progression"}
     if policy.get("worker_kind") not in kinds:
         fail_closed("authorization policy has unknown worker kind")
+    grants = policy.setdefault("command_grants", [])
+    if not isinstance(grants, list) or any(not isinstance(grant, str) or not grant.strip() for grant in grants):
+        fail_closed("authorization policy has malformed command grants")
+    if grants and approval != "deny_unless_prior_grant":
+        fail_closed("authorization policy grants commands to a kind that is not allowlisted")
     for key in ("process_home", "workspace_path", "forwarder", "attestation_path"):
         if not isinstance(policy.get(key), str) or not os.path.isabs(policy[key]):
             fail_closed("authorization policy requires an absolute " + key)
@@ -307,8 +312,8 @@ def emit(decision, reason=None, overwrite=None):
     sys.exit(0)
 
 
-def authorized(policy, overwrite=None):
-    emit(policy["approval"], overwrite=overwrite)
+def authorized(policy, canonical, overwrite=None):
+    emit(approval_for_call(policy, canonical), overwrite=overwrite)
 
 
 # REVIEWER_BLOCKED_FRAGMENT
@@ -2187,6 +2192,83 @@ def forward_progress(raw_stdin, policy):
         )
 
 
+def single_simple_command(command):
+    # The one command group of `command`, or None when it is anything more
+    # than a single simple command: a list, pipeline, background job, subshell
+    # or brace group, a leading assignment, a launcher prefix, or anything
+    # holding a command substitution.
+    if has_substitution(command):
+        return None
+    records = command_records(command)
+    if any(record.error or record.boundary not in (None, ";") for record in records):
+        return None
+    groups = [record for record in records if record]
+    if len(groups) != 1:
+        return None
+    group = groups[0]
+    words = [group[index] for index in without_redirection_indices(group)]
+    if not words or strip_prefix_offset(expand_env_split_string(words)) != 0:
+        return None
+    return group
+
+
+def resolved_words(group, count):
+    # The first `count` words of a simple command as bash passes them, with
+    # the engine-provided path variables resolved. None when there are fewer
+    # words, or a word's quoting cannot be followed. A single-quoted or escaped
+    # `$` is text and stays; so does an expansion of any other variable.
+    indices = without_redirection_indices(group)
+    if len(indices) < count:
+        return None
+    words = []
+    for index in indices[:count]:
+        token = group[index]
+        if "$" in token:
+            segments = token_segments(group, index)
+            if segments is None:
+                return None
+            token = expand_exported(token, token_literal(group, index), segments, shell_token=True)
+        words.append(token)
+    return words
+
+
+def command_grant_covers(command, grants):
+    # A grant is a command prefix: it covers one simple command whose leading
+    # words are the prefix. Words are compared as resolved, so a grant for
+    # `"$BOSS_BIN" propose` names the program BOSS_BIN holds, however the
+    # expansion is quoted, and never a literal `$BOSS_BIN`. A grant with an
+    # expansion this process cannot resolve covers nothing.
+    group = single_simple_command(command)
+    if group is None:
+        return False
+    for grant in grants:
+        prefix = single_simple_command(grant)
+        if prefix is None:
+            continue
+        wanted = resolved_words(prefix, len(without_redirection_indices(prefix)))
+        if not wanted or any("$" in word for word in wanted):
+            continue
+        if resolved_words(group, len(wanted)) == wanted:
+            return True
+    return False
+
+
+def approval_for_call(policy, canonical):
+    # Reached only after the structural checks and every guard have passed.
+    # An allowlist kind's commands are decided here rather than by the CLI's
+    # allow rules: the CLI grants a rule whose program is a shell variable
+    # only on its exact text, so `"$BOSS_BIN" propose done ...` never ran.
+    # Everything a grant does not cover keeps the kind's deny-by-default
+    # answer, which leaves native file calls to the session's read grants.
+    approval = policy["approval"]
+    if approval != "deny_unless_prior_grant" or canonical.get("tool_name") != "Bash":
+        return approval
+    command = canonical["tool_input"].get("command")
+    if isinstance(command, str) and command_grant_covers(command, policy["command_grants"]):
+        return "auto_approve"
+    return approval
+
+
 def authorize_payload(payload, policy, raw_stdin):
     if not isinstance(payload, dict):
         fail_closed("stdin payload was not a JSON object")
@@ -2201,7 +2283,7 @@ def authorize_payload(payload, policy, raw_stdin):
         emit("deny", reason=reason)
     run_guards(policy, canonical)
     overwrite = {key: value for key, value in canonical["_native_args"].items() if key not in args or args[key] != value}
-    authorized(policy, overwrite=overwrite)
+    authorized(policy, canonical, overwrite=overwrite)
 
 
 def main():
