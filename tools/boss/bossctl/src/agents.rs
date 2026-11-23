@@ -1,15 +1,11 @@
-//! `bossctl agents` — control verbs for live worker panes (status,
-//! focus, send, interrupt, stop, reap, retire-pane, transcript,
-//! launch, list, pools), the reference-resolution helpers shared with
-//! `bossctl probe`, and the small neighboring `work start` / `work
-//! cancel` / `reveal` / `open` verbs that were interleaved with them in
-//! `lib.rs`.
+//! Agent-control handlers for `bossctl` (`agents status` / `focus` /
+//! `send` / `interrupt` / `stop` / `reap` / `retire-pane` /
+//! `transcript` / `launch` / `list` / `pools`), the reference-resolution
+//! helpers shared with `bossctl probe`, and the neighboring `work start`
+//! / `work cancel` / `reveal` / `open` verbs.
 //!
-//! Split out of `lib.rs` for file-size hygiene; behavior is
-//! unchanged from when these lived inline. Uses `use super::*` (like
-//! the `app/*.rs` submodule split in `boss-engine`) rather than
-//! explicit imports, since this is a large mechanical extraction of
-//! already-reviewed code rather than a fresh module boundary.
+//! Grouped here so `lib.rs` stays focused on dispatch. Shared command
+//! types and helpers come in through `use super::*`.
 
 use super::*;
 

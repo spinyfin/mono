@@ -211,11 +211,17 @@ The engine binary still links a separate leaf crate (`boss-build-provenance`) th
 
 PR CI is `fastbuild` (and unstamped). The release step is `-c opt --config=release` plus `--define=BOSS_SHAKE_APP_ID/INSTALLATION_ID/PRIVATE_KEY_PEM=<secrets>`. `compilation_mode` already means PR `fastbuild` and release `opt` do not share rustc action keys, so a first-time opt compile of the Boss graph is the bulk of a cold release.
 
-The shake defines are a second, independent key split. `//tools/boss/github` compiles those three values into `rustc_env`, and `runtime`, `app`, `boss_lib`, and `bossctl_lib` all depend on it. Every other build uses the empty `.bazelrc` defaults, so a credential-free `-c opt` of `//tools/boss/app-macos:Boss` — scheduled on `main` or on a PR agent — misses on those crates. Release opt shares keys only with a build that passes identical `--define=BOSS_SHAKE_*` values, which means a warm-up job has to run the release secrets on a non-release agent.
+The shake credentials split the opt cache in two independent ways.
 
-Warming opt on every PR would also roughly double `mac-app-build` / `bazel-build-test`; that cost is why it is not in the PR pipeline. A scheduled main-branch opt job is a different trade-off: it would help the next release only if it carried the same shake defines. Consecutive releases of unchanged sources already reuse the opt `rust_library` cache (only the version leaf, provenance leaf, plist, and links re-run) because they share those defines.
+`--define=BOSS_SHAKE_*` is the rustc_env split. `//tools/boss/github` compiles those three values into `rustc_env`, and `runtime`, `app`, `boss_lib`, and `bossctl_lib` all depend on it. Every other build uses the empty `.bazelrc` defaults, so a credential-free `-c opt` of `//tools/boss/app-macos:Boss` misses on those crates.
 
-The same leaf principle that isolated stamp values would remove the credential constraint: move the three `BOSS_SHAKE_*` values out of `boss_github`'s `rustc_env` into a leaf crate that only the binaries link and hand to the library at startup, as `boss_build_provenance` does. A credential-free scheduled `-c opt` build could then actually warm the release.
+`--action_env=BOSS_SHAKE_*` is a wider split. `.bazelrc` inherits those names from the client environment into every action's `default_shell_env`. `.buildkite/steps/boss-release.sh` exports the secrets before `bazel build`. Pinned rules_rust 0.70.0 copies `ctx.configuration.default_shell_env` into every Rustc action (`rust/private/rustc.bzl`), so the set values are part of every Rust compile's cache key — including crates that never read the credentials. Confirmed with `bazel aquery` on `//lib/rust/git_utils:git_utils` (no shake `rustc_env`): `--action_env=BOSS_SHAKE_APP_ID=<value>` appears in `Environment` and changes `ActionKey`.
+
+A warm-up job therefore has to match both the `--define` values and the `--action_env` values. That means running the release secrets on a non-release agent, not only passing the same defines.
+
+Warming opt on every PR would also roughly double `mac-app-build` / `bazel-build-test`; that cost is why it is not in the PR pipeline. A scheduled main-branch opt job is a different trade-off: it would help the next release only if it carried the same shake defines _and_ the same inherited action_env values. Consecutive releases of unchanged sources already reuse the opt `rust_library` cache (only the version leaf, provenance leaf, plist, and links re-run) because they share both.
+
+Moving the three `BOSS_SHAKE_*` values out of `boss_github`'s `rustc_env` into a leaf crate (the same pattern as `boss_build_provenance`) would remove the define split. It would not by itself let a credential-free scheduled `-c opt` warm the release: the `build --action_env=BOSS_SHAKE_*` lines would also have to be dropped, or the release step would have to unexport the vars and pass them only via `--define`.
 
 ## Related
 

@@ -70,12 +70,17 @@ build:release --stamp
 # shell (or via direnv) before running bazel build //tools/boss/cli:boss.
 # See tools/boss/cli/README.md for the one-time developer setup instructions.
 #
-# --action_env is kept for belt-and-suspenders (non-rust actions, tooling).
+# --action_env inherits these names from the client environment into every
+# action's default_shell_env. Pinned rules_rust copies that map into every
+# Rustc action (rust/private/rustc.bzl), so a set value is part of every
+# Rust compile's cache key — not only //tools/boss/github. Confirmed with
+# `bazel aquery` on //lib/rust/git_utils:git_utils (no shake rustc_env):
+# --action_env=BOSS_SHAKE_APP_ID=<value> appears in Environment and changes
+# ActionKey; omitting the value does not.
 # --define supplies the values to the rustc_env Make-variable expansion on
-# the rust_binary target; rules_rust does not forward --action_env into the
-# rustc compile action's env or cache key, but --define IS part of the key.
-# Empty defaults here mean dev builds compile cleanly; the release pipeline
-# overrides via --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID" etc.
+# //tools/boss/github. Empty defaults here mean dev builds compile cleanly;
+# the release pipeline exports the secrets (so inherit picks them up) and
+# also passes --define=BOSS_SHAKE_APP_ID="$BOSS_SHAKE_APP_ID" etc.
 build --action_env=BOSS_SHAKE_APP_ID
 build --action_env=BOSS_SHAKE_INSTALLATION_ID
 build --action_env=BOSS_SHAKE_PRIVATE_KEY_PEM
