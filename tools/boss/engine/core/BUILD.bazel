@@ -260,6 +260,7 @@ sh_test(
         "--from-fingerprint",
     ],
     data = ["@codex_probe_runtime//codex:login-shell"],
+    target_compatible_with = ["@platforms//os:macos"],
 )
 
 # Public contracts live outside src/ so test edits do not invalidate engine_lib.
