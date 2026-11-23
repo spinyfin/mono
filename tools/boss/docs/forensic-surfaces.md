@@ -223,11 +223,13 @@ What a row carries:
 | `execution_ever_ran` / `item_ever_ran` | Whether the execution, and any execution of the item, had started or produced a run at that moment                      |
 
 Rows written before this ledger captured causes keep `NULL` in every added
-field: nothing is inferred for them, and attribution that was never recorded
+field: the columns are not backfilled, and attribution that was never recorded
 (which caller, which transaction) cannot be recovered retrospectively.
 `autostart` and `status` rows take their `reason_code` from the writer's
 helper name (the first word of `basis`); abandonment rows carry an explicit
 code per writer (`abandon_cause` in `work-db/src/task_status_audit.rs`).
+`basis` itself was recorded from the start, so a pre-enrichment autostart
+writer is still named there even when `reason_code` is NULL.
 Conflict-resolution and CI-remediation attempts that are marked `abandoned`
 are separate tables, not executions: they appear here only through the
 execution changes they cause.
@@ -255,6 +257,17 @@ starts, when an execution is queued again, when autostart is turned back on
 (autostart-off notices), or when a human acknowledges it. The card names
 whether autostart was turned off, the queued run was withdrawn, or both
 (one operation), plus the reason code and time of the latest stop.
+
+Autostart rows recorded before migration `20261118_1530_execution_abandon_audit`
+keep NULL `reason_code`. The notice query derives the code the same way the
+trigger does (`COALESCE(reason_code, first word of basis)`), so those rows
+still raise when they otherwise qualify, labelled with the writer `basis`
+already named rather than `unattributed_write`. A pre-enrichment run-start
+consumption is excluded by that derived code, not only by the later-run
+timestamp. Abandonment rows from the same era keep NULL `execution_ever_ran`
+and therefore never raise: that branch requires `execution_ever_ran = 0`.
+Writes that bypass the helpers still raise as `unattributed_write`, because
+the trigger records that code.
 
 Acknowledgment is the existing `UpdateWorkItem` request with
 `acknowledge_auto_stop_through = <audit_id>` (the id the card showed). It is
