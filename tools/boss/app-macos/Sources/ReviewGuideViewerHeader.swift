@@ -21,14 +21,15 @@ struct ReviewGuideViewerHeader: View {
     @ObservedObject var chatModel: ChatViewModel
     @ObservedObject private var drafts: GuideCommentDrafts
 
-    /// `findingsInitiallyExpanded` seeds the addendum disclosure; the
-    /// viewer leaves it at the default, the screenshot fixture
-    /// (`BossReviewGuideCapture`) uses it to photograph the collapsed state.
+    /// `findingsInitiallyExpanded` seeds the addendum disclosure. The
+    /// default is collapsed so the generated explanation stays on screen;
+    /// the screenshot fixture (`BossReviewGuideCapture`) passes `true` to
+    /// photograph the expanded list.
     init(
         chatModel: ChatViewModel,
         rootTaskId: String,
         generatedAt: String?,
-        findingsInitiallyExpanded: Bool = true,
+        findingsInitiallyExpanded: Bool = false,
         inlineGuide: InlineReviewGuideHeader? = nil,
         isReadOnly: Bool = false,
         isActive: Bool = true
