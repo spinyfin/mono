@@ -37,7 +37,7 @@ fn payload_for(conversation: Option<&str>, tool: &str, args: Value) -> Value {
     payload
 }
 
-fn command_in(fx: &Fixture, conversation: Option<&str>, command: &str) -> Value {
+pub(super) fn command_in(fx: &Fixture, conversation: Option<&str>, command: &str) -> Value {
     payload_for(
         conversation,
         "run_command",
@@ -53,12 +53,12 @@ fn verdict(fx: &Fixture, payload: &Value) -> (String, String) {
     )
 }
 
-fn assert_allowed(fx: &Fixture, payload: &Value, what: &str) {
+pub(super) fn assert_allowed(fx: &Fixture, payload: &Value, what: &str) {
     let (decision, detail) = verdict(fx, payload);
     assert_eq!(decision, "auto_approve", "{what}: {detail}");
 }
 
-fn assert_denied(fx: &Fixture, payload: &Value, what: &str) -> String {
+pub(super) fn assert_denied(fx: &Fixture, payload: &Value, what: &str) -> String {
     let (decision, detail) = verdict(fx, payload);
     assert_eq!(decision, "deny", "{what}: {detail}");
     detail

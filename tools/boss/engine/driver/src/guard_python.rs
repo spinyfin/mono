@@ -63,7 +63,11 @@ def glob_expand_conservative(expanded):
     # directory the earlier components reached, so a link planted in one
     # component is followed into the next. A component Python cannot model
     # (see glob_wildcard_uses_unmodeled_brackets) matches every entry, and
-    # fnmatch does not hide dotfiles the way bash does.
+    # fnmatch does not hide dotfiles the way bash does. Returns
+    # `(matches, complete)`: a walk that grows past GLOB_EXPANSION_LIMIT stops
+    # and reports `complete=False`, because a truncated list is no longer a
+    # superset and every caller must treat that as unknown, never as a match
+    # set it can approve.
     parts = expanded.split(os.sep)
     current = [os.sep] if expanded.startswith(os.sep) else [""]
     for part in parts[1:] if expanded.startswith(os.sep) else parts:
@@ -84,8 +88,10 @@ def glob_expand_conservative(expanded):
             else:
                 matched = fnmatch.filter(names, part)
             following.extend(os.path.join(base, name) for name in matched)
-        current = following[:GLOB_EXPANSION_LIMIT]
-    return current
+        if len(following) > GLOB_EXPANSION_LIMIT:
+            return following[:GLOB_EXPANSION_LIMIT], False
+        current = following
+    return current, True
 "#
     };
 }

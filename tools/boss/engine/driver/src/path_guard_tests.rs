@@ -476,3 +476,104 @@ fn executable_heredoc_bodies_are_inspected_but_data_heredocs_are_not() {
     assert_eq!(bash_verdict(&data, &brain, &command), "approve", "{command}");
     assert_eq!(bash_verdict(&data, &brain, "bash <<'EOF'\necho hi\nEOF"), "approve");
 }
+
+fn data_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("Boss state");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("state.db"), "secret\n").unwrap();
+    let brain = tmp.path().join("brain");
+    std::fs::create_dir_all(&brain).unwrap();
+    (tmp, data, brain)
+}
+
+#[test]
+fn heredocs_piped_into_executors_or_written_then_run_are_inspected() {
+    let (tmp, data, brain) = data_fixture();
+    let alias = tmp.path().join("boss-alias");
+    std::os::unix::fs::symlink(&data, &alias).unwrap();
+    let target = alias.join("state.db");
+    let t = target.display();
+    for command in [
+        format!("cat <<'EOF' | bash\ncat {t}\nEOF"),
+        format!("cat <<EOF | sh\ncat {t}\nEOF"),
+        format!("tee /dev/null <<'EOF' | bash\ncat {t}\nEOF"),
+        format!("cat <<'EOF' | python3 -\nprint(open(\"{t}\").read())\nEOF"),
+        format!("cat <<'EOF' > s.sh\ncat {t}\nEOF\nbash s.sh"),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain, &command), "block", "{command}");
+    }
+    for command in [
+        format!("cat <<'EOF' | grep x\n{t}\nEOF"),
+        "cat <<'EOF' | bash\necho hi\nEOF".to_owned(),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain, &command), "approve", "{command}");
+    }
+}
+
+#[test]
+fn wildcards_keep_the_literal_check_and_native_paths_are_not_expanded() {
+    let (tmp, data, brain) = data_fixture();
+    let d = data.display();
+    for command in [
+        format!("touch {d}/x*"),
+        format!("mkdir {d}/d?"),
+        format!("touch {d}/[n]ew"),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain, &command), "block", "{command}");
+    }
+    // Same-command plant-and-read: the expansion is empty when the guard runs.
+    let sessions = data.join("executions/run/transcripts/agy/sessions");
+    std::fs::create_dir_all(sessions.join("c1/scratch")).unwrap();
+    std::os::unix::fs::symlink(&sessions, tmp.path().join("brain2")).unwrap();
+    let brain2 = tmp.path().join("brain2");
+    let s = brain2.join("c1/scratch");
+    let s = s.display();
+    for command in [
+        format!("mv /tmp/p {s}/up; cat {s}/u*/state.db"),
+        format!("mv /tmp/p {s}/up; cat {s}/[u]p/state.db"),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain2, &command), "block", "{command}");
+    }
+    // A native tool's path is a literal name: a bracket is not a wildcard.
+    let alias = tmp.path().join("alias1");
+    std::os::unix::fs::symlink(data.join("state.db"), &alias).unwrap();
+    let bracketed = tmp.path().join("alias[1]");
+    std::os::unix::fs::symlink(data.join("state.db"), &bracketed).unwrap();
+    let native = |tool: &str, key: &str, path: &Path| {
+        verdict(
+            &data,
+            &brain,
+            json!({"session_id": "c1", "tool_name": tool, "tool_input": {key: path}}),
+        )
+    };
+    assert_eq!(native("Read", "file_path", &bracketed), "block");
+    assert_eq!(native("Write", "file_path", &data.join("new[1].txt")), "block");
+    assert_eq!(native("Write", "file_path", &data.join("new*.txt")), "block");
+    assert_eq!(
+        native("NotebookEdit", "notebook_path", &data.join("n[1].ipynb")),
+        "block"
+    );
+    let patch = format!("*** Begin Patch\n*** Add File: {}/p[1].txt\n+x\n*** End Patch", d);
+    assert_eq!(
+        verdict(
+            &data,
+            &brain,
+            json!({"session_id": "c1", "tool_name": "apply_patch", "tool_input": {"input": patch}}),
+        ),
+        "block"
+    );
+    assert_eq!(native("Read", "file_path", &tmp.path().join("plain[1].txt")), "approve");
+}
+
+#[test]
+fn glob_expansion_past_the_limit_fails_closed() {
+    let (tmp, data, brain) = data_fixture();
+    let aliases = tmp.path().join("aliases");
+    for index in 0..2001 {
+        std::fs::create_dir_all(aliases.join(format!("d{index:04}"))).unwrap();
+    }
+    std::os::unix::fs::symlink(&data, aliases.join("zz")).unwrap();
+    let command = format!("cat {}/*/state.db", aliases.display());
+    assert_eq!(bash_verdict(&data, &brain, &command), "block", "{command}");
+}
