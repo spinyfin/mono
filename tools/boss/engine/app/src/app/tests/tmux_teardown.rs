@@ -619,6 +619,22 @@ struct RunUsageFields {
     usage_unavailable: Option<String>,
 }
 
+async fn wait_for_run_usage_unavailable(db: &WorkDb, execution_id: &str, expected: &str) -> RunUsageFields {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let fields = read_run_usage_fields(db, execution_id);
+        if fields.usage_unavailable.as_deref() == Some(expected) {
+            return fields;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "usage_unavailable={:?} did not become {expected:?} for {execution_id}",
+            fields.usage_unavailable
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 fn read_run_usage_fields(db: &WorkDb, execution_id: &str) -> RunUsageFields {
     let conn = db.connect().unwrap();
     conn.query_row(
@@ -901,11 +917,11 @@ async fn grok_missing_turn_completed_reaps_after_bound_with_specific_reason() {
     let log_start = buffer.lock().len();
 
     let (state, dir) = test_server_state();
-    // The settle deadline covers driver lookup (spawn_blocking), the first
-    // transcript poll, the interrupt send, and the wait for turn_completed.
-    // 120ms is enough on an idle host and failed in CI when lookup queued
-    // behind other blocking work, so Escape never left. Keep this well under
-    // the 5s production bound while leaving room for that lookup.
+    // The settle deadline also covers driver lookup (spawn_blocking), the first
+    // transcript poll and the interrupt send. Under CPU load the lookup alone
+    // can use a large part of a sub-second window, so a much smaller window can
+    // expire before Escape is sent. Keep this well under the 5s production bound
+    // while leaving room for that lookup.
     let settle_window = Duration::from_millis(500);
     state.set_grok_teardown_settle_window_for_test(settle_window);
     let db = state.work_db.as_ref();
@@ -998,8 +1014,14 @@ async fn grok_missing_turn_completed_reaps_after_bound_with_specific_reason() {
         "session must still be killed after bound: {calls:?}"
     );
 
+    let fields = wait_for_run_usage_unavailable(
+        db,
+        &execution_id,
+        crate::app::tmux_teardown::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
+    )
+    .await;
     assert_eq!(
-        read_run_usage_fields(db, &execution_id),
+        fields,
         RunUsageFields::builder()
             .usage_unavailable(crate::app::tmux_teardown::GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON)
             .build(),
@@ -1100,11 +1122,56 @@ async fn grok_already_completed_turn_captures_usage_without_escape() {
     );
 }
 
+fn seed_open_grok_run(
+    state: &crate::app::ServerState,
+    dir: &tempfile::TempDir,
+    session_name: &str,
+    token: &str,
+) -> String {
+    seed_grok_run(
+        state,
+        dir,
+        session_name,
+        token,
+        concat!(
+            r#"{"type":"turn_started","session_id":"sess-grok-open","turn_number":0}"#,
+            "\n",
+        ),
+        concat!(
+            r#"{"method":"session/update","params":{"sessionId":"sess-grok-open","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command"}}}"#,
+            "\n",
+        ),
+    )
+}
+
 fn seed_completed_grok_run(
     state: &crate::app::ServerState,
     dir: &tempfile::TempDir,
     session_name: &str,
     token: &str,
+) -> String {
+    seed_grok_run(
+        state,
+        dir,
+        session_name,
+        token,
+        concat!(
+            r#"{"type":"turn_started","session_id":"sess-grok-3","turn_number":0}"#,
+            "\n",
+            r#"{"type":"turn_ended","outcome":"completed"}"#,
+            "\n",
+        ),
+        &format!("{}\n", grok_turn_completed_line("prompt-done", "end_turn")),
+    )
+}
+
+fn seed_grok_run(
+    state: &crate::app::ServerState,
+    dir: &tempfile::TempDir,
+    session_name: &str,
+    token: &str,
+    events: &str,
+    updates: &str,
 ) -> String {
     let db = state.work_db.as_ref();
     let product_id = create_product(db);
@@ -1132,22 +1199,9 @@ fn seed_completed_grok_run(
 
     let session_dir = dir.path().join(format!("{session_name}-session"));
     std::fs::create_dir_all(&session_dir).unwrap();
-    std::fs::write(
-        session_dir.join("events.jsonl"),
-        concat!(
-            r#"{"type":"turn_started","session_id":"sess-grok-3","turn_number":0}"#,
-            "\n",
-            r#"{"type":"turn_ended","outcome":"completed"}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
+    std::fs::write(session_dir.join("events.jsonl"), events).unwrap();
     let updates_path = session_dir.join("updates.jsonl");
-    std::fs::write(
-        &updates_path,
-        format!("{}\n", grok_turn_completed_line("prompt-done", "end_turn")),
-    )
-    .unwrap();
+    std::fs::write(&updates_path, updates).unwrap();
     db.set_run_transcript_path_if_unset(&execution_id, updates_path.to_str().unwrap())
         .unwrap();
     execution_id
@@ -1193,6 +1247,40 @@ async fn grok_dead_pane_captures_usage_without_escape() {
     assert_eq!(
         read_run_usage_fields(state.work_db.as_ref(), &execution_id),
         expected_completed_grok_usage(),
+    );
+}
+
+/// A Grok pane already dead mid-turn (turn_started, no turn_completed) must
+/// not be labelled as if usage capture failed after observing turn_completed.
+#[tokio::test]
+async fn grok_dead_pane_without_turn_completed_does_not_claim_ingest_failed() {
+    let (state, dir) = test_server_state();
+    let execution_id = seed_open_grok_run(&state, &dir, "boss-1-grok-dead-open", "tok-grok-dead-open");
+    let runner = ScriptedGrokTmuxRunner::dead_pane("tok-grok-dead-open");
+    let tmux =
+        boss_tmux::Tmux::with_runner_and_socket("/opt/homebrew/bin/tmux", runner.clone(), boss_tmux::TEST_SOCKET_PATH)
+            .unwrap();
+    state.set_tmux_override_for_test(tmux);
+
+    assert_eq!(
+        state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::Reaped
+    );
+    let calls = runner.calls();
+    assert!(
+        !calls.iter().any(|args| args.iter().any(|a| a == "send-keys")),
+        "a dead Grok pane must not send Escape: {calls:?}"
+    );
+    let fields = read_run_usage_fields(state.work_db.as_ref(), &execution_id);
+    assert_ne!(
+        fields.usage_unavailable.as_deref(),
+        Some(crate::app::tmux_teardown::GROK_TEARDOWN_INGEST_FAILED_REASON),
+        "a crashed mid-turn Grok pane must not be labelled as if turn_completed was observed"
+    );
+    assert_eq!(
+        fields.usage_unavailable.as_deref(),
+        Some("No provider token usage observed"),
+        "dead mid-turn Grok teardown keeps the generic usage_unavailable default"
     );
 }
 

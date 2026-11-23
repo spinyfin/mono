@@ -1023,6 +1023,38 @@ impl InterruptPlan {
     }
 }
 
+/// Per-key transport for [`send_interrupt_gesture`].
+///
+/// Local pane ops, Grok teardown settle, and tests each implement this so the
+/// fallback key, press count, and inter-press gap live in one place.
+#[async_trait]
+pub trait InterruptKeySink {
+    type Error;
+    async fn send_interrupt_key(&mut self, key: &'static str) -> Result<(), Self::Error>;
+}
+
+/// Execute one interrupt attempt's key sequence.
+///
+/// Falls back to a single `Escape` when `plan` is `None`, matching the
+/// operator `agents interrupt` behaviour for a run whose driver could not be
+/// resolved. Callers for which a missing plan is meaningful check first and
+/// never reach here with `None`.
+pub async fn send_interrupt_gesture<S: InterruptKeySink + ?Sized>(
+    plan: Option<&InterruptPlan>,
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    let key = plan.map(|plan| plan.gesture.key).unwrap_or("Escape");
+    let presses = plan.map(|plan| plan.gesture.presses.max(1)).unwrap_or(1);
+    let press_interval = plan.map(|plan| plan.gesture.press_interval).unwrap_or(Duration::ZERO);
+    for press in 0..presses {
+        if press > 0 && !press_interval.is_zero() {
+            tokio::time::sleep(press_interval).await;
+        }
+        sink.send_interrupt_key(key).await?;
+    }
+    Ok(())
+}
+
 /// How the engine should stop a worker (graceful path before process kill).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopDelivery {

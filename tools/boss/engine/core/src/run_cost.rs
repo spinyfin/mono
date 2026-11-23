@@ -9,7 +9,9 @@
 //! up to its last hook.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -50,13 +52,40 @@ impl std::error::Error for CaptureError {}
 impl From<TailError> for CaptureError {
     fn from(error: TailError) -> Self {
         match error {
-            TailError::Io(error) => Self::Transient(format!("transcript io: {error}")),
+            TailError::Io(error) => {
+                let message = format!("transcript io: {error}");
+                if io_error_is_permanent(&error) {
+                    Self::Permanent(message)
+                } else {
+                    Self::Transient(message)
+                }
+            }
             TailError::Containment(message) => Self::Permanent(format!("transcript containment: {message}")),
             TailError::Utf8(error) => Self::Permanent(format!("transcript bytes are not valid utf-8: {error}")),
             TailError::Json { error, line } => {
                 Self::Permanent(format!("transcript line is not valid JSON: {error} (line: {line:?})"))
             }
         }
+    }
+}
+
+fn io_error_is_permanent(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::IsADirectory
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::Unsupported
+    )
+}
+
+fn capture_error_from_custody(error: anyhow::Error) -> CaptureError {
+    if error.downcast_ref::<crate::hub::projection::CustodyRefused>().is_some() {
+        CaptureError::Permanent(error.to_string())
+    } else {
+        CaptureError::Transient(error.to_string())
     }
 }
 
@@ -410,6 +439,7 @@ impl RunCostTail {
 #[derive(Default)]
 pub struct RunCostCapture {
     inner: StdMutex<HashMap<String, Arc<Mutex<RunCostTail>>>>,
+    #[cfg(any(test, feature = "test-support"))]
     persist_blocked: AtomicBool,
 }
 
@@ -420,14 +450,7 @@ pub fn transcript_read_limit(db: &crate::work::WorkDb, path: &Path) -> Result<Op
         .map_err(|error| CaptureError::Permanent(error.to_string()))?;
     crate::hub::projection::Custody::new(db.clone(), root)
         .read_limit_at(path)
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("halted") || message.contains("invalid") {
-                CaptureError::Permanent(message)
-            } else {
-                CaptureError::Transient(message)
-            }
-        })
+        .map_err(capture_error_from_custody)
 }
 
 impl RunCostCapture {
@@ -437,6 +460,7 @@ impl RunCostCapture {
 
     /// Hold [`Self::capture_and_persist`] in the transient-failure path so a
     /// later drain can replay the same transcript chunk.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_persist_blocked_for_test(&self, blocked: bool) {
         self.persist_blocked.store(blocked, Ordering::SeqCst);
     }
@@ -448,6 +472,7 @@ impl RunCostCapture {
         transcript_path: &Path,
         containment_root: Option<&Path>,
     ) -> Result<bool, CaptureError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.persist_blocked.load(Ordering::SeqCst) {
             return Err(CaptureError::Transient("run-cost persist blocked for test".to_owned()));
         }
@@ -695,6 +720,37 @@ mod tests {
             "contained run-cost tail must reject path replacement: {error}",
         );
         assert_eq!(tail.snapshot().unwrap().input_tokens, Some(1));
+    }
+
+    #[test]
+    fn permission_and_directory_io_errors_are_permanent() {
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::IsADirectory] {
+            let error = CaptureError::from(TailError::Io(io::Error::from(kind)));
+            assert!(
+                !error.is_transient(),
+                "{kind:?} on a hub transcript must not retry forever"
+            );
+        }
+        let transient = CaptureError::from(TailError::Io(io::Error::from(io::ErrorKind::TimedOut)));
+        assert!(transient.is_transient());
+    }
+
+    #[test]
+    fn halted_and_invalid_custody_refusals_are_permanent() {
+        for (state, reason) in [
+            (boss_work_db::CustodyState::Halted, "a hole"),
+            (boss_work_db::CustodyState::Invalid, "unusable"),
+        ] {
+            let error = capture_error_from_custody(anyhow::Error::from(crate::hub::projection::CustodyRefused {
+                state,
+                reason: reason.to_owned(),
+            }));
+            assert!(
+                !error.is_transient(),
+                "{state:?} custody must not hold the projector cursor"
+            );
+            assert!(error.to_string().contains(state.as_str()));
+        }
     }
 }
 

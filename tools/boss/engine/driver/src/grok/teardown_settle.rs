@@ -218,26 +218,28 @@ pub trait GrokSettleTransport {
     fn on_send_error(&mut self, _error: Self::Error) {}
 }
 
-/// Execute the driver's interrupt gesture sequence (falling back to one `Escape`
-/// press when no plan is supplied) using the caller's key-sending transport.
-async fn send_interrupt_gesture_via<T: GrokSettleTransport + ?Sized>(
+struct SettleInterruptSink<'a, T: ?Sized>(&'a mut T);
+
+#[async_trait::async_trait]
+impl<T: GrokSettleTransport + Send + ?Sized> crate::InterruptKeySink for SettleInterruptSink<'_, T> {
+    type Error = T::Error;
+
+    async fn send_interrupt_key(&mut self, key: &'static str) -> Result<(), Self::Error> {
+        self.0.send_key(key).await
+    }
+}
+
+/// Execute the driver's interrupt gesture sequence using the caller's
+/// key-sending transport. Sequencing lives in [`crate::send_interrupt_gesture`].
+async fn send_interrupt_gesture_via<T: GrokSettleTransport + Send + ?Sized>(
     plan: Option<InterruptPlan>,
     transport: &mut T,
 ) -> Result<(), T::Error> {
-    let key = plan.map(|p| p.gesture.key).unwrap_or("Escape");
-    let presses = plan.map(|p| p.gesture.presses.max(1)).unwrap_or(1);
-    let press_interval = plan.map(|p| p.gesture.press_interval).unwrap_or(Duration::ZERO);
-    for press in 0..presses {
-        if press > 0 && !press_interval.is_zero() {
-            tokio::time::sleep(press_interval).await;
-        }
-        transport.send_key(key).await?;
-    }
-    Ok(())
+    crate::send_interrupt_gesture(plan.as_ref(), &mut SettleInterruptSink(transport)).await
 }
 
 /// Bounded Grok ACP settle state machine over caller-supplied [`GrokSettleTransport`].
-pub async fn settle_open_turn<T: GrokSettleTransport + ?Sized>(
+pub async fn settle_open_turn<T: GrokSettleTransport + Send + ?Sized>(
     deadline: tokio::time::Instant,
     poll_interval: Duration,
     plan: Option<InterruptPlan>,

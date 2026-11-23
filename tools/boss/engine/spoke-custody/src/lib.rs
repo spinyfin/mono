@@ -189,6 +189,30 @@ use write::Extended;
 pub use boss_engine_structured_output::StructuredOutputKind;
 pub use boss_work_db::{CustodyState, SpokeCustody};
 
+/// A custody row whose state forbids opening the file.
+///
+/// Halted and invalid rows are an error, not a silent miss, so a caller
+/// cannot fall through to another path. Classifiers downcast this instead of
+/// matching the display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyRefused {
+    pub state: CustodyState,
+    pub reason: String,
+}
+
+impl std::fmt::Display for CustodyRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the hub's copy of this transcript is {}: {}",
+            self.state.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for CustodyRefused {}
+
 /// The transcript resource a gap with no generation names: the spoke could not
 /// say which transcript, or that it ever attached one.
 pub const BARE_TRANSCRIPT: &str = "transcript";
@@ -899,11 +923,11 @@ impl Custody {
         };
         match row.state {
             CustodyState::Halted | CustodyState::Invalid => {
-                anyhow::bail!(
-                    "the hub's copy of this transcript is {}: {}",
-                    row.state.as_str(),
-                    row.reason.as_deref().unwrap_or("unusable")
-                );
+                return Err(CustodyRefused {
+                    state: row.state,
+                    reason: row.reason.clone().unwrap_or_else(|| "unusable".to_owned()),
+                }
+                .into());
             }
             _ => {}
         }
@@ -1400,6 +1424,18 @@ mod tests {
         assert!(is_halted(&f.custody.apply_transcript(&f.source(6), &bad).unwrap()));
         // A generation nobody damaged is untouched.
         assert!(matches!(f.transcript(7, "3-1", 0, b"ok"), Applied::Wrote { .. }));
+    }
+
+    #[test]
+    fn read_limit_at_refuses_a_halted_row_with_a_typed_error() {
+        let f = fixture();
+        f.transcript(1, "0-1", 0, b"abcd");
+        assert!(is_halted(&f.transcript(2, "0-1", 9, b"x")), "a hole is not filled in");
+        let error = f.custody.read_limit_at(&f.file("transcript:0-1")).unwrap_err();
+        let refused = error
+            .downcast_ref::<CustodyRefused>()
+            .expect("halted rows must be a typed refusal, not a stringly-typed anyhow");
+        assert_eq!(refused.state, CustodyState::Halted);
     }
 
     #[test]
