@@ -275,6 +275,12 @@ fn api_error(row: &Map<String, Value>) -> Value {
     )
 }
 
+#[path = "background_task.rs"]
+mod background_task;
+pub use background_task::BackgroundTaskCorrelation;
+#[cfg(test)]
+use background_task::reader_has_live_background_task;
+
 #[cfg(test)]
 #[path = "transcript_tests.rs"]
 mod tests;

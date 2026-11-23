@@ -911,6 +911,8 @@ struct ServerState {
     /// run lacks the field. See [`TranscriptPathCache`] for why this
     /// is the structural fix for the 2026-05-12 incident.
     transcript_path_cache: Arc<boss_engine_runtime::live_status_loop::TranscriptPathCache>,
+    #[builder(default = Arc::new(boss_engine_completion::agy_background_task::BackgroundTaskScanCache::new()))]
+    agy_background_tasks: Arc<boss_engine_completion::agy_background_task::BackgroundTaskScanCache>,
     /// Incremental transcript tails and cumulative raw usage per execution.
     /// The dispatcher snapshots these counters to `work_runs` before any
     /// completion gate, preserving spend for runs that become orphaned.
@@ -2249,8 +2251,7 @@ impl ServerState {
             }
             self.live_worker_states.release_persona_for_run(run_id);
             self.agent_jsonl_progress_manager.stop_run(run_id);
-            self.transcript_path_cache.forget(run_id);
-            self.run_cost_capture.forget(run_id);
+            self.forget_run_caches(run_id);
             self.forget_approval_watch(run_id);
             boss_engine_runtime::stale_worker_sweep::resolve_stale_worker_attention(&self.work_db, run_id);
             self.broadcast_live_worker_states().await;
@@ -2376,12 +2377,8 @@ impl ServerState {
         // doesn't await the task's exit so a wedged Anthropic call
         // can't block the release path.
         self.live_status_manager.stop_slot_for_run(slot_id, run_id);
-        // Drop the cached transcript path for this run so the cache
-        // doesn't grow without bound across long engine lifetimes.
-        // No correctness consequence — the work_runs row is the
-        // durable source of truth — but a bounded cache is hygienic.
-        self.transcript_path_cache.forget(run_id);
-        self.run_cost_capture.forget(run_id);
+        // Bounded per-run caches; work_runs remains the durable source.
+        self.forget_run_caches(run_id);
         self.forget_approval_watch(run_id);
         self.broadcast_live_worker_states().await;
         // A slot was mapped, so a worker had finished spawning: its pane
@@ -2436,10 +2433,15 @@ impl ServerState {
                 self.broadcast_live_worker_states().await;
             }
         }
-        self.transcript_path_cache.forget(run_id);
-        self.run_cost_capture.forget(run_id);
+        self.forget_run_caches(run_id);
         self.forget_approval_watch(run_id);
         PaneReleaseOutcome::Reaped
+    }
+
+    fn forget_run_caches(&self, run_id: &str) {
+        self.transcript_path_cache.forget(run_id);
+        self.run_cost_capture.forget(run_id);
+        self.agy_background_tasks.forget(run_id);
     }
 
     fn current_work_revision(&self) -> u64 {

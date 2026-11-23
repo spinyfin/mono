@@ -78,6 +78,7 @@ pub use hooks::{
     AuthorizationProbeReport, adapter_path, attestation_path, hooks_file_path, install_authorization, policy_path,
     probe_authorization, verify_attestation, verify_startup_authorization,
 };
+pub use transcript::BackgroundTaskCorrelation;
 
 // ---------------------------------------------------------------------------
 // Descriptor

@@ -144,18 +144,126 @@ impl ServerState {
             }
         }
         for state in &mut states {
-            state.hung_since = boss_engine_runtime::hung_worker::hung_since(
-                state,
-                self.live_worker_states
-                    .semantic_progress_for_slot(state.slot_id)
-                    .as_ref(),
-                self.live_worker_states.progress_fidelity_for_slot(state.slot_id),
-                self.hold_registry.is_held(&state.run_id),
-                self.live_worker_states.tool_completed_since_prompt(state.slot_id),
-                now,
-            );
+            let checkpoint = self.live_worker_states.semantic_progress_for_slot(state.slot_id);
+            let fidelity = self.live_worker_states.progress_fidelity_for_slot(state.slot_id);
+            let held = self.hold_registry.is_held(&state.run_id);
+            let has_active_wait = self.wait_registry.active(&state.run_id, now).is_some();
+            let tool_completed = self.live_worker_states.tool_completed_since_prompt(state.slot_id);
+            let mut signals = boss_engine_runtime::hung_worker::HungSignals {
+                held,
+                has_active_wait,
+                has_blocking_tool_poll: false,
+                tool_completed_since_prompt: tool_completed,
+            };
+            // Scan the transcript only when hang detection would otherwise fire.
+            let preliminary =
+                boss_engine_runtime::hung_worker::hung_since(state, checkpoint.as_ref(), fidelity, signals, now);
+            if preliminary.is_some() {
+                let threshold = boss_engine_runtime::hung_worker::hang_threshold_secs(checkpoint.as_ref(), signals);
+                signals.has_blocking_tool_poll = self.agy_has_live_background_task(&state.run_id, now, threshold);
+                state.hung_since =
+                    boss_engine_runtime::hung_worker::hung_since(state, checkpoint.as_ref(), fidelity, signals, now);
+            } else {
+                state.hung_since = None;
+            }
         }
         states
+    }
+
+    /// Whether `execution_id` is an `agy` run whose transcript currently shows
+    /// a background task (`GENERIC` `RUNNING`) without a matching completion
+    /// `SYSTEM_MESSAGE`, and whose worker/task process is still alive within
+    /// the unmatched-`RUNNING` horizon.
+    fn agy_has_live_background_task(&self, execution_id: &str, now: i64, hang_threshold_secs: i64) -> bool {
+        let Some(driver) =
+            boss_engine_completion::driver_transcript::driver_for_spawned_execution(&self.work_db, execution_id)
+        else {
+            return false;
+        };
+        if driver.descriptor().name != "agy" {
+            return false;
+        }
+        let transcript_path = self
+            .transcript_path_cache
+            .get(execution_id)
+            .or_else(|| self.work_db.transcript_path_for_execution(execution_id).ok().flatten());
+        let Some(transcript_path) = transcript_path else {
+            return false;
+        };
+        let containment_root = match driver.transcript_containment_root(execution_id) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(execution_id, %error, "agy transcript containment check failed");
+                return false;
+            }
+        };
+        self.agy_background_tasks.poll_with_probe(
+            execution_id,
+            std::path::Path::new(&transcript_path),
+            containment_root.as_deref(),
+            now,
+            |log_paths| {
+                self.probe_background_task_liveness(
+                    execution_id,
+                    log_paths,
+                    containment_root.as_deref(),
+                    now,
+                    hang_threshold_secs,
+                )
+            },
+        )
+    }
+
+    fn probe_background_task_liveness(
+        &self,
+        execution_id: &str,
+        log_paths: &[&std::path::Path],
+        containment_root: Option<&std::path::Path>,
+        now: i64,
+        hang_threshold_secs: i64,
+    ) -> boss_engine_completion::agy_background_task::BackgroundTaskLiveness {
+        use boss_engine_completion::agy_background_task::BackgroundTaskLiveness;
+
+        let pid_liveness = match self.live_worker_states.shell_pid_for_run(execution_id) {
+            Some(pid) if pid > 0 && super::process_signals::pid_is_alive(pid as libc::pid_t) => {
+                BackgroundTaskLiveness::Alive
+            }
+            Some(pid) if pid > 0 => return BackgroundTaskLiveness::Exited,
+            _ => BackgroundTaskLiveness::Unknown,
+        };
+        if log_paths.is_empty() {
+            return pid_liveness;
+        }
+        let canonical_root = containment_root.and_then(|root| std::fs::canonicalize(root).ok());
+        for log_path in log_paths {
+            if let Some(root) = &canonical_root {
+                let Ok(meta) = std::fs::symlink_metadata(log_path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    continue;
+                }
+                let Ok(canonical_log) = std::fs::canonicalize(log_path) else {
+                    continue;
+                };
+                if !canonical_log.starts_with(root) {
+                    continue;
+                }
+            }
+            let Ok(meta) = std::fs::metadata(log_path) else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) else {
+                continue;
+            };
+            if now.saturating_sub(elapsed.as_secs() as i64) < hang_threshold_secs {
+                return BackgroundTaskLiveness::Alive;
+            }
+        }
+        BackgroundTaskLiveness::Exited
     }
 
     /// Push the current live-worker-state snapshot on the

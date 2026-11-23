@@ -84,8 +84,10 @@ async fn background_notification_preserves_hang_deadline_through_ingress() {
             &state.live_worker_states.get(SLOT).unwrap(),
             Some(&checkpoint),
             boss_engine_driver::ProgressFidelity::Rich,
-            false,
-            state.live_worker_states.tool_completed_since_prompt(SLOT),
+            boss_engine_runtime::hung_worker::HungSignals {
+                tool_completed_since_prompt: state.live_worker_states.tool_completed_since_prompt(SLOT),
+                ..Default::default()
+            },
             1900,
         ),
         Some(checkpoint.progress_at)
@@ -794,5 +796,305 @@ mod hung_workers {
         assert!(state.refresh_hung_workers(&mut previous));
         assert_eq!(previous.len(), 1);
         assert_eq!(open(&state), 1);
+    }
+
+    fn seed_agy_run(
+        state: &ServerState,
+        dir: &tempfile::TempDir,
+        slot: u8,
+        progress_at_epoch: i64,
+        transcript_lines: Option<&str>,
+    ) -> (String, String, std::path::PathBuf) {
+        let product = create_product(&state.work_db);
+        state
+            .work_db
+            .update_work_item(
+                &product,
+                boss_protocol::WorkItemPatch {
+                    default_driver: Some("agy".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let item = create_active_chore(&state.work_db, &product, "agy hung test");
+        let exec = state
+            .work_db
+            .request_execution(RequestExecutionInput::builder().work_item_id(item.clone()).build())
+            .unwrap();
+        let (_exec, run) = state
+            .work_db
+            .start_execution_run(&exec.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+            .unwrap();
+        finish_run_worker_pane_alive(&state.work_db, &exec.id, &run.id, Some("Spawned agy worker."));
+        state
+            .work_db
+            .record_execution_launch_config(&exec.id, "agy", "gemini-3.8-flash-low", None)
+            .unwrap();
+        let transcript_path = dir.path().join(format!("agy-{}.jsonl", exec.id));
+        if let Some(contents) = transcript_lines {
+            std::fs::write(&transcript_path, contents).unwrap();
+            state
+                .work_db
+                .set_run_transcript_path_if_unset(&exec.id, transcript_path.to_str().unwrap())
+                .unwrap();
+        }
+        state.live_worker_states.register_spawn(
+            slot,
+            &exec.id,
+            "gemini-4-hydrogen-medium",
+            std::process::id() as i32,
+            Some(WorkItemBinding {
+                work_item_id: item.clone(),
+                work_item_name: "agy hung test".into(),
+                execution_id: exec.id.clone(),
+            }),
+        );
+        state.live_worker_states.set_awaiting_input_capable(slot, false);
+        state
+            .live_worker_states
+            .set_progress_fidelity(slot, ProgressFidelity::Rich);
+        state.live_worker_states.seed_semantic_progress(
+            slot,
+            &SemanticProgressCheckpoint {
+                progress_at: boss_engine_live_worker_state::iso8601_utc(progress_at_epoch),
+                tool_condition: SemanticToolCondition::Idle,
+                turn_condition: SemanticTurnCondition::InTurn,
+            },
+        );
+        (exec.id, item, transcript_path)
+    }
+
+    #[tokio::test]
+    async fn agy_with_accepted_900s_wait_is_not_flagged_at_13_min_and_flagged_after_expiry() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        // 13 minutes since last progress (past the 600s first-response threshold),
+        // with an accepted 900s wait that still has 2 minutes remaining.
+        let (exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 13 * 60, None);
+        state
+            .wait_registry
+            .declare(&exec_id, "Waiting for CI checks".into(), None, 900, now - 13 * 60)
+            .unwrap();
+
+        let mut previous = HashMap::new();
+        state.refresh_hung_workers(&mut previous);
+        assert_eq!(open(&state), 0);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_none());
+
+        // Once the wait expires with no model progress, the worker is flagged.
+        state
+            .wait_registry
+            .declare(&exec_id, "Waiting for CI checks".into(), None, 900, now - 901)
+            .unwrap();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn agy_with_live_background_task_is_not_flagged_until_completion() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let running_transcript = concat!(
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"gh pr checks --watch"}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: cid-1/task-2\n"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for background task."}"#,
+            "\n",
+        );
+        let (_exec_id, _item, transcript_path) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(running_transcript));
+
+        let mut previous = HashMap::new();
+        state.refresh_hung_workers(&mut previous);
+        assert_eq!(open(&state), 0);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_none());
+
+        // Background task ends with no subsequent model progress -> flagged.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        use std::io::Write;
+        writeln!(
+            file,
+            r#"{{"step_index":4,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"[Message] sender=cid-1/task-2 content=Task id \"cid-1/task-2\" finished with result:\nCommand exited with code 0."}}"#
+        )
+        .unwrap();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn agy_silent_without_wait_or_background_task_is_still_flagged() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let (_exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, None);
+
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_some());
+    }
+
+    const RUNNING_TRANSCRIPT: &str = concat!(
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"gh pr checks --watch"}}]}"#,
+        "\n",
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task with task id: cid-1/task-2\n"}"#,
+        "\n",
+        r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for background task."}"#,
+        "\n",
+    );
+
+    #[tokio::test]
+    async fn agy_with_exited_background_task_is_flagged_despite_unmatched_running_row() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let task_log_path = dir.path().join("task-2.log");
+        {
+            let file = std::fs::File::create(&task_log_path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60))
+                .unwrap();
+        }
+        let transcript = format!(
+            "{}\n{}\n{}\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"gh pr checks --watch"}}]}"#,
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!(
+                    "Tool is running as a background task with task id: cid-1/task-2\nTask logs are available at: file://{}\n",
+                    task_log_path.display()
+                ),
+            }),
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for background task."}"#,
+        );
+        let (_exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(&transcript));
+
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn agy_launch_stamp_still_suppresses_after_the_pin_changes() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let (exec_id, item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(RUNNING_TRANSCRIPT));
+        let conn = state.work_db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET driver = 'claude' WHERE id = ?1",
+            rusqlite::params![&item],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE products SET default_driver = 'claude' WHERE id = (SELECT product_id FROM tasks WHERE id = ?1)",
+            rusqlite::params![&item],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            state.work_db.launched_driver_slug(&exec_id).unwrap().as_deref(),
+            Some("agy")
+        );
+        assert_ne!(
+            boss_engine_completion::driver_transcript::resolve_execution_driver_slug(&state.work_db, &exec_id)
+                .as_deref(),
+            Some("agy"),
+            "the live pin must no longer resolve to agy so this test actually covers the launch stamp"
+        );
+
+        let mut previous = HashMap::new();
+        state.refresh_hung_workers(&mut previous);
+        assert_eq!(open(&state), 0);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_agy_driver_with_running_transcript_row_is_still_flagged() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let product = create_product(&state.work_db);
+        let item = create_active_chore(&state.work_db, &product, "claude hung test");
+        let exec = state
+            .work_db
+            .request_execution(RequestExecutionInput::builder().work_item_id(item.clone()).build())
+            .unwrap();
+        let (_exec, run) = state
+            .work_db
+            .start_execution_run(&exec.id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+            .unwrap();
+        finish_run_worker_pane_alive(&state.work_db, &exec.id, &run.id, Some("Spawned claude worker."));
+        state
+            .work_db
+            .record_execution_launch_config(&exec.id, "claude", "opus", None)
+            .unwrap();
+        let transcript_path = dir.path().join(format!("claude-{}.jsonl", exec.id));
+        std::fs::write(&transcript_path, RUNNING_TRANSCRIPT).unwrap();
+        state
+            .work_db
+            .set_run_transcript_path_if_unset(&exec.id, transcript_path.to_str().unwrap())
+            .unwrap();
+        state.live_worker_states.register_spawn(
+            1,
+            &exec.id,
+            "opus",
+            std::process::id() as i32,
+            Some(WorkItemBinding {
+                work_item_id: item.clone(),
+                work_item_name: "claude hung test".into(),
+                execution_id: exec.id.clone(),
+            }),
+        );
+        state.live_worker_states.set_awaiting_input_capable(1, false);
+        state
+            .live_worker_states
+            .set_progress_fidelity(1, ProgressFidelity::Rich);
+        state.live_worker_states.seed_semantic_progress(
+            1,
+            &SemanticProgressCheckpoint {
+                progress_at: boss_engine_live_worker_state::iso8601_utc(now - 20 * 60),
+                tool_condition: SemanticToolCondition::Idle,
+                turn_condition: SemanticTurnCondition::InTurn,
+            },
+        );
+
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn agy_with_expired_wait_and_live_background_task_is_not_flagged() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let (exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(RUNNING_TRANSCRIPT));
+        state
+            .wait_registry
+            .declare(&exec_id, "Waiting for CI checks".into(), None, 900, now - 901)
+            .unwrap();
+
+        let mut previous = HashMap::new();
+        state.refresh_hung_workers(&mut previous);
+        assert_eq!(open(&state), 0);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn agy_with_dead_worker_pid_is_flagged_despite_unmatched_running_row() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let (exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(RUNNING_TRANSCRIPT));
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id() as i32;
+        let _ = child.wait_with_output();
+        state.live_worker_states.update_shell_pid(&exec_id, dead_pid);
+
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_some());
     }
 }
