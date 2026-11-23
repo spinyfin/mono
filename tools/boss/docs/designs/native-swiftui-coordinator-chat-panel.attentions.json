@@ -1,0 +1,21 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "The recommended design runs the coordinator through Claude Code's non-interactive mode on your Claude plan login, instead of as an interactive terminal session. Anthropic currently counts that against the same plan limits as interactive use, but announced a change to this in 2026 and then paused it, so it could move to a different usage pool later. Is that acceptable? Yes: the spike goes ahead. No: the structured options are both ruled out and the project is re-planned around keeping the terminal session and drawing a chat view over it.",
+    "anchor": "usage-metering-and-account-policy"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The chat panel needs a small helper program (the Claude Code ACP adapter) that is not part of Boss. How should it get onto a machine? The design assumes the first option until the chat panel is the default.",
+    "choices": [
+      "Require it to be installed on the machine, like claude and tmux; if it is missing, Boss says so and offers a one-click switch to the terminal coordinator",
+      "Bundle a pinned copy inside Boss before the chat panel becomes the default, accepting a larger download"
+    ],
+    "anchor": "adapter-provisioning"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Today any Claude Code session running under your account can send a message straight to the coordinator. That was a side effect of how Boss delivered its own messages, not a decision. With the chat panel Boss no longer needs it. Should other Claude Code sessions still be able to message the coordinator? Yes: keep it where it still works, shown in the panel as coming from another session. No: turn it off, so only you and Boss can put text in front of the coordinator.",
+    "anchor": "messages-from-other-claude-sessions"
+  }
+]
