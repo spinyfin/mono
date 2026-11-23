@@ -598,8 +598,10 @@ rust_test(
     ),
 )
 
-# Opt-in real-model behavior check. The hermetic wrapper strips API credentials;
-# running this requires an approved credential fixture and must fail without one.
+# Opt-in real-model behavior check. `hermetic_test_wrapper.sh` unconditionally
+# unsets `ANTHROPIC_API_KEY`, so this target cannot currently be supplied a key
+# via `bazel test` and stays unrunnable until an owner approves a credential
+# fixture.
 rust_test(
     name = "coordinator_inbox_real_model_test",
     size = "medium",

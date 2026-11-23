@@ -545,18 +545,23 @@ impl Injected {
         {
             return Err(error).context("closing the coordinator inbox write half");
         }
-        tokio::select! {
-            result = wait_for_input_record(transcript_file, &message_id, &prompt) => { stages.reached(if result.is_ok() { "transcript_confirmed" } else { "transcript_failed" }); result },
-            result = wait_for_receipt(listener, pid, &message_id) => { stages.reached(if result.is_ok() { "receipt_confirmed" } else { "receipt_failed" }); result },
+        // The transcript record's own uuid is what the assistant's reply
+        // chains from; installed Claude releases store a peer message under a
+        // uuid distinct from the frame's message id.
+        let input_uuid = tokio::select! {
+            result = wait_for_input_record(transcript_file, &message_id, &prompt) => { stages.reached(if result.is_ok() { "transcript_confirmed" } else { "transcript_failed" }); result.map(Some) },
+            result = wait_for_receipt(listener, pid, &message_id) => { stages.reached(if result.is_ok() { "receipt_confirmed" } else { "receipt_failed" }); result.map(|()| None) },
         }?;
         Ok(TurnObserver {
             file: turn_file,
             message_id,
+            seed_uuids: input_uuid.into_iter().collect(),
         })
     }
 }
 
-async fn wait_for_input_record(file: tokio::fs::File, message_id: &str, prompt: &str) -> Result<()> {
+/// Resolves with the matching record's uuid once it is appended.
+async fn wait_for_input_record(file: tokio::fs::File, message_id: &str, prompt: &str) -> Result<String> {
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     loop {
@@ -565,7 +570,7 @@ async fn wait_for_input_record(file: tokio::fs::File, message_id: &str, prompt: 
             if let Ok(value) = serde_json::from_slice::<Value>(&line)
                 && input_record_matches(&value, message_id, prompt)
             {
-                return Ok(());
+                return Ok(value["uuid"].as_str().unwrap_or(message_id).to_owned());
             }
             line.clear();
         } else {
@@ -620,5 +625,7 @@ fn input_record_matches(value: &Value, message_id: &str, prompt: &str) -> bool {
     let attributed = value["origin"]["kind"] == "peer"
         && value["origin"]["msg_id"] == message_id
         && content.starts_with(&format!("Another Claude session sent a message:\n{prompt}\n\n"));
-    value["type"] == "user" && value["uuid"] == message_id && (content == prompt || attributed)
+    // Older Claude releases store the input under the frame's message id;
+    // newer ones assign their own uuid and carry the id only in `origin`.
+    value["type"] == "user" && ((value["uuid"] == message_id && content == prompt) || attributed)
 }

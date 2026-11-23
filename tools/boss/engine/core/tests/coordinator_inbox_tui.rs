@@ -137,13 +137,25 @@ pub(super) async fn terminal_handoff(real_model: bool) -> Result<()> {
             && let Ok(bytes) = std::fs::read(config.join("sessions").join(format!("{claude_pid}.json")))
         {
             let value: Value = serde_json::from_slice(&bytes)?;
-            if value["status"] == "idle" && pane.contains("fixture ready") {
+            // The brief itself contains the phrase, so the composer echo alone
+            // is not readiness: wait for the model's reply as well.
+            if value["status"] == "idle" && pane.matches("fixture ready").count() >= 2 {
                 break value;
             }
         }
+        if started.elapsed() >= Duration::from_secs(30) {
+            // Let the launcher's own readiness deadline lapse so its log names why.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
         anyhow::ensure!(
             started.elapsed() < Duration::from_secs(30),
-            "Claude terminal did not become ready: {pane}"
+            "Claude terminal did not become ready: {pane}\nbrief delivery steps: {:?}\nstate: {:?}",
+            boss_engine::driver::initial_prompt::read_delivery_log(
+                &boss_engine::driver::initial_prompt::delivery_home(&input)
+            ),
+            boss_engine::driver::initial_prompt::delivery_state(&boss_engine::driver::initial_prompt::delivery_home(
+                &input
+            )),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };

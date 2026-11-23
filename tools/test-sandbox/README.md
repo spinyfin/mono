@@ -336,9 +336,9 @@ When the capability is set and `TMPDIR` is not an absolute path, the wrapper now
 
 ### Not yet remote-capable
 
-The audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, which the same rule generates), `host_lsof` and `worker_zsh` were converted. These repositories still hand a test a copy of a client binary:
+The audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, which the same rule generates), `host_lsof` and `worker_zsh` were converted. `host_tmux` in `repositories.bzl` is also remote-capable on macOS: it copies the client's Homebrew `tmux` binary along with its non-system dylibs into `lib/`, rewrites their load commands to `@loader_path/lib/...`, and re-signs the bundle with an ad-hoc `codesign` signature (it is still the client's Homebrew build rather than a pinned download). These repositories still hand a test a copy of a client binary without bundling:
 
-- `host_tmux`, `host_claude` and `codex_probe_runtime` in `repositories.bzl`. A copy of a system binary (the Codex probe's login shell is usually `/bin/zsh`) will not launch on a worker. A copy of anything else is the client's build, not the worker's.
+- `host_claude` and `codex_probe_runtime` in `repositories.bzl`. A copy of a system binary (the Codex probe's login shell is usually `/bin/zsh`) will not launch on a worker. A copy of anything else is the client's build, not the worker's.
 - `jj_test_tools` and `cube_jj_newer` ship a pinned download rather than a host binary.
 
 A test tagged `exclusive` cannot be scheduled remotely at all, because the tag also forces local execution. `exclusive-if-local` keeps the serial run locally and lets the test go to a worker.
@@ -397,7 +397,7 @@ Check that the summary reports the actions as `remote` and none as `linux-sandbo
 - **The test runs as the worker's login user**, in a user namespace that maps that one user. Files owned by anyone else show up as owned by `nobody`.
 - **Runfiles are real files in a real tree**, not symlinks into an execroot.
 - **Timers and CPU are shared with whatever else the worker is running**, which includes other tests and compiles up to its slot count, and the CI agent on the same host.
-- **A copied host tool runs.** `host_tmux`, `host_claude` and `codex_probe_runtime` hand a test a copy of the client's binary. On a Linux worker that is the same distribution's binary and it launches, unlike on a Mac, though it is still the client's build and not the worker's.
+- **A copied host tool runs.** `host_claude`, `codex_probe_runtime`, and (on Linux) `host_tmux` hand a test a copy of the client's binary. On a Linux worker that is the same distribution's binary and it launches, unlike on a Mac, though it is still the client's build and not the worker's.
 
 ## Remote execution from a developer's Mac
 

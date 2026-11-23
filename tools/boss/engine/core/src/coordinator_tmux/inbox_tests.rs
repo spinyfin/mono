@@ -8,6 +8,13 @@ fn claude_attribution_is_allowed_but_merged_drafts_and_other_messages_are_not() 
     assert!(!input_record_matches(&record, "other", "Write the handoff."));
     record["message"]["content"] = json!("operator draft Write the handoff.");
     assert!(!input_record_matches(&record, "message", "Write the handoff."));
+    // Newer Claude releases assign their own uuid; `origin.msg_id` correlates.
+    let own_uuid = json!({"type":"user", "uuid":"claude-assigned", "origin":{"kind":"peer", "msg_id":"message"},
+        "message":{"content":"Another Claude session sent a message:\nWrite the handoff.\n\nClaude attribution."}});
+    assert!(input_record_matches(&own_uuid, "message", "Write the handoff."));
+    assert!(!input_record_matches(&own_uuid, "other", "Write the handoff."));
+    let unattributed = json!({"type":"user", "uuid":"claude-assigned", "message":{"content":"Write the handoff."}});
+    assert!(!input_record_matches(&unattributed, "message", "Write the handoff."));
 }
 
 #[tokio::test]
@@ -428,4 +435,104 @@ fn a_deadline_expiry_names_the_furthest_stage_reached() {
         error.starts_with("coordinator prompt delivery deadline (15s) expired while writing"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn wait_for_input_record_returns_claude_uuid_and_falls_back_to_message_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let attributed_path = directory.path().join("attributed.jsonl");
+    let attributed = json!({
+        "type": "user",
+        "uuid": "claude-assigned",
+        "origin": {"kind": "peer", "msg_id": "expected"},
+        "message": {"content": "Another Claude session sent a message:\nprompt\n\nClaude attribution."}
+    });
+    std::fs::write(&attributed_path, format!("{attributed}\n")).unwrap();
+    let file = tokio::fs::File::open(&attributed_path).await.unwrap();
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_input_record(file, "expected", "prompt"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resolved, "claude-assigned");
+
+    let missing_uuid_path = directory.path().join("missing-uuid.jsonl");
+    let missing_uuid = json!({
+        "type": "user",
+        "origin": {"kind": "peer", "msg_id": "expected"},
+        "message": {"content": "Another Claude session sent a message:\nprompt\n\nClaude attribution."}
+    });
+    std::fs::write(&missing_uuid_path, format!("{missing_uuid}\n")).unwrap();
+    let file = tokio::fs::File::open(&missing_uuid_path).await.unwrap();
+    let fallback = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_input_record(file, "expected", "prompt"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fallback, "expected");
+}
+
+#[tokio::test]
+async fn receipt_winning_confirm_still_correlates_claude_uuid_to_end_turn() {
+    let (_directory, path, listener, transcript) = private_inbox();
+    let (observer_result, frame_msg_id) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            deliver_with_turn(
+                &path,
+                std::process::id() as libc::pid_t,
+                "session",
+                "prompt",
+                &transcript,
+            )
+        ),
+        async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let line = BufReader::new(stream).lines().next_line().await.unwrap().unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            let reply = frame["from"].as_str().unwrap().strip_prefix("uds:").unwrap();
+            let mut stream = UnixStream::connect(reply).await.unwrap();
+            let receipt = json!({
+                "action": "peer_message_status",
+                "orig_msg_id": frame["msg_id"],
+                "status": "delivered"
+            });
+            stream.write_all(format!("{receipt}\n").as_bytes()).await.unwrap();
+            frame["msg_id"].as_str().unwrap().to_owned()
+        }
+    );
+    let observer = observer_result.unwrap().unwrap();
+    let mut wait = Box::pin(observer.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut wait)
+            .await
+            .is_err(),
+        "turn observer must not complete before the correlated reply"
+    );
+    let user = json!({
+        "type": "user",
+        "uuid": "claude-assigned",
+        "origin": {"kind": "peer", "msg_id": frame_msg_id},
+        "message": {"content": "Another Claude session sent a message:\nprompt\n\nClaude attribution."}
+    });
+    let answer = json!({
+        "type": "assistant",
+        "uuid": "answer",
+        "parentUuid": "claude-assigned",
+        "message": {"stop_reason": "end_turn"}
+    });
+    let mut writer = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .await
+        .unwrap();
+    writer
+        .write_all(format!("{user}\n{answer}\n").as_bytes())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), wait).await.unwrap();
 }
