@@ -326,24 +326,29 @@ impl AutomationPreemptor for NoopAutomationPreemptor {
 pub const WORKER_PAGE_SIZE: usize = 8;
 
 /// Number of interactive-worker pages. Page 0 is "Bridge Crew" (the original
-/// 8 slots); page 1 is "Lower Decks", a strict spillover pool the dispatcher
-/// only claims into once every Bridge Crew slot is occupied. Bumping this is
-/// the single knob that adds another page of capacity.
+/// 8 slots); page 1 is "Lower Decks"; later pages are "Deck 3", "Deck 4".
+/// Every page after the first is a strict spillover page the dispatcher only
+/// claims into once every lower page is occupied. Bumping this is the single
+/// knob that adds another page of capacity — but a main index above 16 needs
+/// a legacy slot in the codec (`boss_protocol::worker_identity`), so growing
+/// past 4 pages also needs a new slot range there.
 ///
-/// Lower Decks is also the only page automation may spill into when the
-/// automation pool is full, and the only page a mainline item can reclaim
-/// a slot from by preempting such a spill — Bridge Crew is never touched
-/// by either mechanism. See `boss_engine::dispatch_spillover`.
-pub const WORKER_PAGE_COUNT: usize = 2;
+/// Every page after Bridge Crew is also where automation may spill when the
+/// automation pool is full, and where a mainline item can reclaim a slot from
+/// by preempting such a spill — Bridge Crew is never touched by either
+/// mechanism. See `boss_engine::dispatch_spillover`.
+pub const WORKER_PAGE_COUNT: usize = 4;
 
 /// Hard cap on the interactive/main worker pool. The runtime config can
 /// request a smaller pool, but values above this are clamped (with a
 /// warning). Derived from the page geometry: `WORKER_PAGE_SIZE *
-/// WORKER_PAGE_COUNT` (currently 16 = two pages of 8). All pool-namespace
+/// WORKER_PAGE_COUNT` (currently 32 = four pages of 8). Pool-namespace
 /// derivations (`worker_id_for_slot`, `slot_id_from_worker_id`, and the app's
-/// mirrored `workerSlotCount`) key off this constant so the interactive,
-/// automation, and review ranges stay disjoint and engine/app agree on the
-/// slot namespace across both pages.
+/// mirrored `interactivePoolSize`) must agree with it so the interactive,
+/// automation, review and progression ranges stay disjoint and engine/app
+/// agree on the slot namespace. Main indexes 1..=16 use legacy slots 1..=16
+/// and 17..=32 use legacy slots 45..=60 (see `boss_protocol::worker_identity`),
+/// so the other pools' slot numbers never moved.
 pub const MAX_WORKER_POOL_SIZE: usize = WORKER_PAGE_SIZE * WORKER_PAGE_COUNT;
 
 /// Hard cap on the automation worker pool. The runtime config can request a
@@ -785,9 +790,10 @@ impl WorkerPool {
             .collect()
     }
 
-    /// Claim a **Lower Decks** slot for an automation execution spilling
-    /// out of a full automation pool. Returns `None` when page 1 has no
-    /// free slot, or when the live-worker count is already at or above
+    /// Claim a spill-page slot (any page after Bridge Crew: Lower Decks and
+    /// the decks above it) for an automation execution spilling out of a
+    /// full automation pool. Returns `None` when no such page has a free
+    /// slot, or when the live-worker count is already at or above
     /// `max_concurrent_interactive_workers` — a spilled claim that has a
     /// workspace counts toward that cap exactly like a mainline claim
     /// does (see `MAX_CONCURRENT_INTERACTIVE_WORKERS`'s doc), so it must
@@ -1101,7 +1107,7 @@ pub use boss_engine_storage_values::pool_policy::{
 };
 
 /// Format a valid legacy slot using the shared protocol codec, or `None` for
-/// zero or unallocated slots (45 through 199).
+/// zero or unallocated slots (61 through 199).
 pub fn try_worker_id_for_slot(slot_id: u8) -> Option<String> {
     boss_protocol::worker_identity::WorkerSlotIdentity::from_legacy_slot(slot_id)
         .and_then(|identity| identity.to_legacy_worker_id())
@@ -1110,7 +1116,7 @@ pub fn try_worker_id_for_slot(slot_id: u8) -> Option<String> {
 /// Format a valid legacy slot using the shared protocol codec.
 ///
 /// # Panics
-/// Panics for zero or unallocated slots (45 through 199). Use
+/// Panics for zero or unallocated slots (61 through 199). Use
 /// [`try_worker_id_for_slot`] when accepting untrusted or unvalidated slot
 /// numbers.
 pub fn worker_id_for_slot(slot_id: u8) -> String {
@@ -1118,18 +1124,25 @@ pub fn worker_id_for_slot(slot_id: u8) -> String {
 }
 
 /// Human-readable page label for an interactive/main-pool `slot_id`, or
-/// `None` for slots outside the interactive pool (automation, review, or
-/// remote virtual slots). Page 0 is "Bridge Crew", page 1 is "Lower Decks";
-/// further pages fall back to `Deck N` so the label never panics if
-/// [`WORKER_PAGE_COUNT`] grows. Recorded into `dispatch.jsonl` details at
-/// claim/spawn time so a failure on a Lower Decks slot is distinguishable
-/// from a Bridge Crew one in `bossctl dispatch diagnose`.
+/// `None` for slots outside the interactive pool (automation, review,
+/// progression, or remote virtual slots). Page 0 is "Bridge Crew", page 1 is
+/// "Lower Decks"; further pages are `Deck N` (so slots 45..=60, main indexes
+/// 17..=32, label as "Deck 3" and "Deck 4"). Recorded into `dispatch.jsonl`
+/// details at claim/spawn time so a failure on a Lower Decks slot is
+/// distinguishable from a Bridge Crew one in `bossctl dispatch diagnose`.
 pub fn worker_page_label(slot_id: u8) -> Option<String> {
-    let slot = slot_id as usize;
-    if !(1..=MAX_WORKER_POOL_SIZE).contains(&slot) {
+    use boss_protocol::DispatchPool;
+    use boss_protocol::worker_identity::{WorkerSlotIdentity, WorkerSlotPool};
+
+    let identity = WorkerSlotIdentity::from_legacy_slot(slot_id)?;
+    if identity.pool != WorkerSlotPool::Local(DispatchPool::Main) {
         return None;
     }
-    Some(match (slot - 1) / WORKER_PAGE_SIZE {
+    let index = identity.index.get() as usize;
+    if index > MAX_WORKER_POOL_SIZE {
+        return None;
+    }
+    Some(match (index - 1) / WORKER_PAGE_SIZE {
         0 => "Bridge Crew".to_owned(),
         1 => "Lower Decks".to_owned(),
         n => format!("Deck {}", n + 1),
@@ -1381,7 +1394,7 @@ pub struct SetConcurrencyCapOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotView {
     /// Zero-based index into the pool's slot vector. `index / page_size`
-    /// is the page: 0 = Bridge Crew, 1 = Lower Decks.
+    /// is the page: 0 = Bridge Crew, 1 = Lower Decks, 2.. = further decks.
     pub index: usize,
     /// `true` when some execution currently holds this slot.
     pub occupied: bool,
@@ -1389,31 +1402,31 @@ pub struct SlotView {
     pub last_workspace_id: Option<String>,
 }
 
-/// Choose the Lower Decks slot an automation execution should spill into,
-/// or `None` when page 1 is full (or does not exist, e.g. a test pool
+/// Choose the slot an automation execution should spill into, or `None`
+/// when every page after the first is full (or none exists, e.g. a test pool
 /// smaller than one page).
 ///
 /// Deliberately *not* the same function as the mainline
 /// `select_claim_index` above: that one implements strict spillover for
 /// mainline (lowest free slot in the lowest non-full page, so Bridge Crew
-/// fills first). This one is the mirror image — it considers page 1 and
-/// nothing else, so a spilling automation can never take a Bridge Crew
-/// slot even when Bridge Crew is completely idle.
+/// fills first). This one is the mirror image — it considers every page
+/// after the first and nothing else, so a spilling automation can never take
+/// a Bridge Crew slot even when Bridge Crew is completely idle.
 ///
-/// Within Lower Decks, workspace affinity wins if an idle slot last ran
-/// the preferred workspace; otherwise the lowest free Lower Decks index
-/// is chosen. Fully deterministic — no RNG — matching `select_claim_index`
+/// Across the spill pages, workspace affinity wins if an idle slot last ran
+/// the preferred workspace; otherwise the lowest free spill index is chosen. Fully deterministic — no RNG — matching `select_claim_index`
 /// so engine and app never disagree about which slot a dispatch lands on.
 pub fn select_spill_claim_index(
     slots: &[SlotView],
     preferred_workspace_id: Option<&str>,
     page_size: usize,
 ) -> Option<usize> {
-    // Page 1 == Lower Decks. A pool with fewer than `page_size` slots has
-    // no page 1 at all, so `free` comes back empty and we return `None`.
+    // Every page after page 0 (Bridge Crew) is a spill page. A pool with
+    // fewer than `page_size` slots has none, so `free` comes back empty and
+    // we return `None`.
     let free: Vec<usize> = slots
         .iter()
-        .filter(|s| !s.occupied && s.index / page_size == 1)
+        .filter(|s| !s.occupied && s.index / page_size >= 1)
         .map(|s| s.index)
         .collect();
     let lowest_free = *free.first()?;
@@ -2112,6 +2125,11 @@ mod tests {
 
     const PAGE: usize = 8;
 
+    /// Legacy slots 1..=16 are the lower half of the main pool; automation,
+    /// review and progression follow them, and the upper half of the main
+    /// pool (indexes 17..=32) sits above progression at slots 45..=60.
+    const LOWER_MAIN_SLOTS: u8 = 16;
+
     fn slots(occupied: &[bool]) -> Vec<SlotView> {
         occupied
             .iter()
@@ -2179,22 +2197,47 @@ mod tests {
     /// numbering systems.
     #[test]
     fn worker_id_and_slot_id_round_trip() {
-        // Covers the full interactive pool — Bridge Crew (1..=8) and Lower
-        // Decks (9..=16) — so the second page round-trips 1:1 too.
-        for slot in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
+        // Covers the full interactive pool — Bridge Crew (1..=8), Lower
+        // Decks (9..=16) and the two upper decks (17..=32). Indexes 1..=16 map
+        // to the same legacy slot; 17..=32 map to slots 45..=60.
+        for index in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
+            let slot = if index <= LOWER_MAIN_SLOTS { index } else { index + 28 };
             let worker_id = worker_id_for_slot(slot);
-            assert_eq!(worker_id, format!("worker-{slot}"));
+            assert_eq!(worker_id, format!("worker-{index}"));
             assert_eq!(slot_id_from_worker_id(&worker_id), Some(slot));
         }
     }
 
     #[test]
+    fn a_full_main_pool_round_trips_through_worker_ids_and_slots() {
+        let pool_ids: Vec<String> = (1..=MAX_WORKER_POOL_SIZE).map(|n| format!("worker-{n}")).collect();
+        assert_eq!(pool_ids.len(), 32);
+        let slots: Vec<u8> = pool_ids.iter().map(|id| slot_id_from_worker_id(id).unwrap()).collect();
+        let mut unique = slots.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 32, "every main worker gets its own slot");
+        for (id, slot) in pool_ids.iter().zip(&slots) {
+            assert_eq!(&worker_id_for_slot(*slot), id);
+            assert!(
+                (1..=16).contains(slot) || (45..=60).contains(slot),
+                "main slot {slot} outside the main ranges"
+            );
+        }
+        // The non-main pools keep their slots and are not main slots.
+        for slot in 17u8..=44 {
+            assert!(!worker_id_for_slot(slot).starts_with("worker-"), "slot {slot}");
+            assert_eq!(worker_page_label(slot), None, "slot {slot}");
+        }
+    }
+
+    #[test]
     fn slot_id_from_worker_id_accepts_automation_pool_format() {
-        // Automation-pool ordinals are offset by MAX_WORKER_POOL_SIZE (16) so the
+        // Automation-pool ordinals are offset by the lower main range (16) so the
         // two pools occupy disjoint slot ranges: interactive 1..=16, automation 17..=24.
         for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
             let auto_worker_id = format!("auto-worker-{ordinal}");
-            let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8;
+            let expected_slot = ordinal + LOWER_MAIN_SLOTS;
             assert_eq!(
                 slot_id_from_worker_id(&auto_worker_id),
                 Some(expected_slot),
@@ -2208,24 +2251,30 @@ mod tests {
 
     #[test]
     fn worker_id_for_slot_round_trips_with_slot_id_from_worker_id() {
-        // Interactive pool: slots 1..=16 → "worker-N" → back to the same slot.
-        for slot in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
+        // Interactive pool: slots 1..=16 → "worker-N" → back to the same slot,
+        // and slots 45..=60 → "worker-17..=32".
+        for slot in 1u8..=LOWER_MAIN_SLOTS {
             let wid = worker_id_for_slot(slot);
             assert_eq!(wid, format!("worker-{slot}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
-        // Automation pool: slots 17..=24 → "auto-worker-M" → back to the same slot.
-        let automation_end = MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
-        for slot in (MAX_WORKER_POOL_SIZE as u8 + 1)..=automation_end {
+        for slot in 45u8..=60 {
             let wid = worker_id_for_slot(slot);
-            let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE;
+            assert_eq!(wid, format!("worker-{}", slot - 28));
+            assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
+        }
+        // Automation pool: slots 17..=24 → "auto-worker-M" → back to the same slot.
+        let automation_end = LOWER_MAIN_SLOTS + MAX_AUTOMATION_POOL_SIZE as u8;
+        for slot in (LOWER_MAIN_SLOTS + 1)..=automation_end {
+            let wid = worker_id_for_slot(slot);
+            let expected_ordinal = slot as usize - LOWER_MAIN_SLOTS as usize;
             assert_eq!(wid, format!("auto-worker-{expected_ordinal}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
         // Review pool: slots 25..=40 → "review-M" → back to the same slot.
         for slot in (automation_end + 1)..=(automation_end + MAX_REVIEW_POOL_SIZE as u8) {
             let wid = worker_id_for_slot(slot);
-            let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
+            let expected_ordinal = slot as usize - LOWER_MAIN_SLOTS as usize - MAX_AUTOMATION_POOL_SIZE;
             assert_eq!(wid, format!("review-{expected_ordinal}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
@@ -2238,7 +2287,7 @@ mod tests {
         // from every other pool.
         for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
             let review_worker_id = format!("review-{ordinal}");
-            let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
+            let expected_slot = ordinal + LOWER_MAIN_SLOTS + MAX_AUTOMATION_POOL_SIZE as u8;
             assert_eq!(
                 slot_id_from_worker_id(&review_worker_id),
                 Some(expected_slot),
@@ -2254,7 +2303,7 @@ mod tests {
     fn review_pool_slots_are_disjoint_from_other_pools() {
         // The slot IDs produced by review-N (25..=40) must not overlap
         // with any interactive-pool (1..=16) or automation-pool (17..=24) slot.
-        let automation_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE;
+        let automation_ceiling = LOWER_MAIN_SLOTS as usize + MAX_AUTOMATION_POOL_SIZE;
         for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
             let review_wid = format!("review-{ordinal}");
             let slot = slot_id_from_worker_id(&review_wid).unwrap();
@@ -2275,7 +2324,7 @@ mod tests {
     fn progression_pool_slots_follow_the_review_range_and_round_trip() {
         // progression-N maps past the interactive (16), automation (8) and
         // review (16) ranges, so it never collides with another pool.
-        let review_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE;
+        let review_ceiling = LOWER_MAIN_SLOTS as usize + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE;
         for ordinal in 1u8..=MAX_PROGRESSION_POOL_SIZE as u8 {
             let wid = format!("progression-{ordinal}");
             let slot = slot_id_from_worker_id(&wid).unwrap();
@@ -2301,17 +2350,25 @@ mod tests {
     #[test]
     fn worker_page_label_partitions_interactive_pool_only() {
         // Bridge Crew is page 0 (slots 1..=8), Lower Decks is page 1
-        // (slots 9..=16). Non-interactive slots (automation/review/remote)
-        // have no page label.
+        // (slots 9..=16), and main indexes 17..=24 / 25..=32 (slots 45..=52 /
+        // 53..=60) are "Deck 3" / "Deck 4". Non-interactive slots
+        // (automation/review/progression/remote) have no page label.
         for slot in 1u8..=WORKER_PAGE_SIZE as u8 {
             assert_eq!(worker_page_label(slot).as_deref(), Some("Bridge Crew"), "slot {slot}");
         }
-        for slot in (WORKER_PAGE_SIZE as u8 + 1)..=MAX_WORKER_POOL_SIZE as u8 {
+        for slot in (WORKER_PAGE_SIZE as u8 + 1)..=LOWER_MAIN_SLOTS {
             assert_eq!(worker_page_label(slot).as_deref(), Some("Lower Decks"), "slot {slot}");
         }
+        for slot in 45u8..=52 {
+            assert_eq!(worker_page_label(slot).as_deref(), Some("Deck 3"), "slot {slot}");
+        }
+        for slot in 53u8..=60 {
+            assert_eq!(worker_page_label(slot).as_deref(), Some("Deck 4"), "slot {slot}");
+        }
         assert_eq!(worker_page_label(0), None);
+        assert_eq!(worker_page_label(61), None, "unallocated slot has no page");
         assert_eq!(
-            worker_page_label(MAX_WORKER_POOL_SIZE as u8 + 1),
+            worker_page_label(LOWER_MAIN_SLOTS + 1),
             None,
             "first automation slot has no page"
         );
@@ -2330,8 +2387,8 @@ mod tests {
             let auto_wid = format!("auto-worker-{ordinal}");
             let slot = slot_id_from_worker_id(&auto_wid).unwrap();
             assert!(
-                slot as usize > MAX_WORKER_POOL_SIZE,
-                "auto-worker-{ordinal} must map to slot > {MAX_WORKER_POOL_SIZE}, got {slot}"
+                slot > LOWER_MAIN_SLOTS,
+                "auto-worker-{ordinal} must map to slot > {LOWER_MAIN_SLOTS}, got {slot}"
             );
             // Verify the reverse also works: the slot maps back to an auto-worker- id.
             let back = worker_id_for_slot(slot);
@@ -2349,7 +2406,7 @@ mod tests {
             assert_eq!(worker_id_for_slot(slot), id);
             assert_eq!(slot_id_from_worker_id(&id), Some(slot));
         }
-        for id in ["worker-17", "worker-32", "auto-worker-9", "review-17", "progression-5"] {
+        for id in ["worker-33", "worker-199", "auto-worker-9", "review-17", "progression-5"] {
             assert_eq!(slot_id_from_worker_id(id), None);
         }
     }
@@ -2357,9 +2414,11 @@ mod tests {
     #[test]
     fn try_worker_id_for_slot_handles_invalid_and_valid_slots() {
         assert_eq!(try_worker_id_for_slot(0), None);
-        for slot in 45..=199 {
+        for slot in 61..=199 {
             assert_eq!(try_worker_id_for_slot(slot), None, "slot {slot} must be unallocated");
         }
+        assert_eq!(try_worker_id_for_slot(45).as_deref(), Some("worker-17"));
+        assert_eq!(try_worker_id_for_slot(60).as_deref(), Some("worker-32"));
         assert_eq!(try_worker_id_for_slot(1).as_deref(), Some("worker-1"));
         assert_eq!(try_worker_id_for_slot(16).as_deref(), Some("worker-16"));
         assert_eq!(try_worker_id_for_slot(17).as_deref(), Some("auto-worker-1"));
@@ -2374,14 +2433,15 @@ mod tests {
         use boss_protocol::DispatchPool;
         use boss_protocol::worker_identity::{WorkerSlotIdentity, WorkerSlotPool};
 
-        let main_end = MAX_WORKER_POOL_SIZE as u8;
+        let main_end = LOWER_MAIN_SLOTS;
+        let upper_main_count = MAX_WORKER_POOL_SIZE as u8 - LOWER_MAIN_SLOTS;
         let auto_end = main_end + MAX_AUTOMATION_POOL_SIZE as u8;
         let review_end = auto_end + MAX_REVIEW_POOL_SIZE as u8;
         let progression_end = review_end + MAX_PROGRESSION_POOL_SIZE as u8;
 
         assert_eq!(
             WorkerSlotIdentity::from_legacy_slot(main_end),
-            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Main), MAX_WORKER_POOL_SIZE as u32)
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Main), LOWER_MAIN_SLOTS as u32)
         );
         assert_eq!(
             WorkerSlotIdentity::from_legacy_slot(main_end + 1),
@@ -2413,7 +2473,34 @@ mod tests {
                 MAX_PROGRESSION_POOL_SIZE as u32
             )
         );
-        assert_eq!(WorkerSlotIdentity::from_legacy_slot(progression_end + 1), None);
+        // The upper half of the main pool (indexes 17..=MAX_WORKER_POOL_SIZE)
+        // follows the progression range, so no other pool's slots moved.
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(progression_end + 1),
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Main), LOWER_MAIN_SLOTS as u32 + 1)
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(progression_end + upper_main_count),
+            WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Main), MAX_WORKER_POOL_SIZE as u32)
+        );
+        assert_eq!(
+            WorkerSlotIdentity::from_legacy_slot(progression_end + upper_main_count + 1),
+            None
+        );
+        // Every main index up to the pool ceiling encodes; the next does not.
+        for index in 1..=MAX_WORKER_POOL_SIZE as u32 {
+            let identity = WorkerSlotIdentity::new(WorkerSlotPool::Local(DispatchPool::Main), index).unwrap();
+            assert!(identity.to_legacy_slot().is_some(), "main index {index}");
+        }
+        assert_eq!(
+            WorkerSlotIdentity::new(
+                WorkerSlotPool::Local(DispatchPool::Main),
+                MAX_WORKER_POOL_SIZE as u32 + 1
+            )
+            .unwrap()
+            .to_legacy_slot(),
+            None
+        );
     }
 
     #[test]
@@ -2587,6 +2674,55 @@ mod tests {
         // Test/config pools smaller than one page have no page 1.
         let s = slots(&[false, false, false]);
         assert_eq!(select_spill_claim_index(&s, None, PAGE), None);
+    }
+
+    /// A 32-slot pool: `bridge_busy` of page 0 and `rest_busy` slots of pages
+    /// 1..=3 occupied, each filled from the low index.
+    fn paged_32(bridge_busy: usize, rest_busy: usize) -> Vec<SlotView> {
+        let flags: Vec<bool> = (0..MAX_WORKER_POOL_SIZE)
+            .map(|i| {
+                if i < PAGE {
+                    i < bridge_busy
+                } else {
+                    i - PAGE < rest_busy
+                }
+            })
+            .collect();
+        slots(&flags)
+    }
+
+    #[test]
+    fn spill_continues_onto_every_page_after_the_first() {
+        // Lower Decks (page 1) is full; spill moves on to page 2, then page 3,
+        // and Bridge Crew stays untouched throughout.
+        assert_eq!(select_spill_claim_index(&paged_32(0, 0), None, PAGE), Some(8));
+        assert_eq!(select_spill_claim_index(&paged_32(0, 8), None, PAGE), Some(16));
+        assert_eq!(select_spill_claim_index(&paged_32(8, 20), None, PAGE), Some(28));
+        assert_eq!(select_spill_claim_index(&paged_32(0, 24), None, PAGE), None);
+    }
+
+    #[test]
+    fn spill_affinity_can_pick_a_later_page_but_never_bridge_crew() {
+        let mut s = paged_32(0, 0);
+        s[20].last_workspace_id = Some("ws-warm".to_owned());
+        assert_eq!(select_spill_claim_index(&s, Some("ws-warm"), PAGE), Some(20));
+        let mut s = paged_32(0, 0);
+        s[2].last_workspace_id = Some("ws-warm".to_owned());
+        assert_eq!(select_spill_claim_index(&s, Some("ws-warm"), PAGE), Some(8));
+    }
+
+    #[tokio::test]
+    async fn a_full_32_slot_pool_claims_every_slot_in_order_then_refuses() {
+        let pool = WorkerPool::new(MAX_WORKER_POOL_SIZE);
+        assert_eq!(pool.capacity().await, 32);
+        for n in 1..=MAX_WORKER_POOL_SIZE {
+            let claimed = pool.claim_worker(&format!("e-{n}"), None).await.unwrap();
+            assert_eq!(claimed, format!("worker-{n}"));
+            assert!(slot_id_from_worker_id(&claimed).is_some());
+        }
+        assert!(pool.claim_worker("overflow", None).await.is_none());
+        assert!(pool.claim_worker_force("forced", None).await.is_none());
+        assert_eq!(pool.claim_worker_spill("spill", None, MAX_WORKER_POOL_SIZE).await, None);
     }
 
     #[test]

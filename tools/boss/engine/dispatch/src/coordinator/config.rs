@@ -1249,7 +1249,7 @@ impl ExecutionCoordinator {
     /// These two normally agree, and for most of the engine's history the
     /// worker-id prefix (`worker-` / `auto-worker-` / `review-`) was a
     /// sound proxy for both. Spillover breaks that proxy: an automation
-    /// execution that spilled into Lower Decks holds an ordinary
+    /// execution that spilled onto an interactive spill page holds an ordinary
     /// `worker-N` slot, so anything keying attribution off the prefix
     /// would silently report automation load as main-pool load. Diagnostic
     /// surfaces that answer "what kind of work is this?" must use this;

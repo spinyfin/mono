@@ -7,13 +7,20 @@ import PaneLayout
 @MainActor
 final class WorkersWorkspaceModel: ObservableObject {
     /// Interactive/main pool capacity. Mirrors `MAX_WORKER_POOL_SIZE`.
-    /// Slot ids 1...16 remain engine capacity handles; they are not
-    /// Agents-view pages.
-    static let workerSlotCount = 16
-    /// Automation pool occupies slot IDs immediately above the interactive pool.
+    /// Slot ids are engine capacity handles; they are not Agents-view pages.
+    static let workerSlotCount = 32
+    /// Main indexes 1...16 use slot ids 1...16, directly below the automation
+    /// range. Mirrors the lower main range of the engine's legacy slot codec
+    /// (`boss_protocol::worker_identity`).
+    static let lowerMainSlotRange = 1...16
+    /// Main indexes 17...32 use slot ids 45...60, above the progression range,
+    /// so the automation/review/progression slot ids never moved when the main
+    /// pool grew past 16.
+    static let upperMainSlotRange = 45...60
+    /// Automation pool occupies slot IDs immediately above the lower main range.
     /// Matches MAX_AUTOMATION_POOL_SIZE in coordinator.rs.
     static let automationSlotCount = 8
-    static let automationSlotBase = workerSlotCount + 1   // 17
+    static let automationSlotBase = lowerMainSlotRange.upperBound + 1   // 17
     static let automationSlotRange = automationSlotBase...(automationSlotBase + automationSlotCount - 1)  // 17...24
     /// Review pool occupies slot IDs immediately above the automation pool.
     /// The count is set dynamically via configureSlots(workerCount:automationCount:reviewCount:)
@@ -36,7 +43,7 @@ final class WorkersWorkspaceModel: ObservableObject {
 
     /// Engine-pushed pool sizes for the Agents pool strip. Existing
     /// viewers survive capacity changes until detached.
-    @Published private(set) var interactivePoolSize: Int = 16
+    @Published private(set) var interactivePoolSize: Int = WorkersWorkspaceModel.workerSlotCount
     @Published private(set) var automationPoolSize: Int = 8
     @Published private(set) var reviewSlotCount: Int = 16
 
@@ -231,6 +238,12 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
     }
 
+    /// Whether `slotId` is one of the engine's main-pool slot ids: 1...16 or
+    /// 45...60. The slot ids between them belong to other pools.
+    static func isMainSlot(_ slotId: Int) -> Bool {
+        lowerMainSlotRange.contains(slotId) || upperMainSlotRange.contains(slotId)
+    }
+
     func viewer(forRunId runId: String) -> WorkerSlot? {
         viewersByRunId[runId]
     }
@@ -256,8 +269,8 @@ final class WorkersWorkspaceModel: ObservableObject {
     /// this worker (`request.slotId`). An existing run keeps its surface and
     /// original slot metadata and succeeds before slot allocation checks.
     ///
-    /// Main-pool slots occupy 1...\(workerSlotCount); automation-pool
-    /// slots occupy \(automationSlotBase)...\(automationSlotBase + automationSlotCount - 1).
+    /// Main-pool slots occupy `lowerMainSlotRange` and `upperMainSlotRange`;
+    /// automation-pool slots occupy \(automationSlotBase)...\(automationSlotBase + automationSlotCount - 1).
     ///
     /// Returns:
     ///  - `.failure(.internalFailure)` if `slotId` is outside the known
@@ -272,7 +285,7 @@ final class WorkersWorkspaceModel: ObservableObject {
             return .success(slotId: existing.slotId)
         }
         let slotId = request.slotId
-        guard (1...Self.workerSlotCount).contains(slotId)
+        guard Self.isMainSlot(slotId)
                 || Self.automationSlotRange.contains(slotId)
                 || reviewSlotRange.contains(slotId)
                 || Self.progressionSlotRange.contains(slotId) else {

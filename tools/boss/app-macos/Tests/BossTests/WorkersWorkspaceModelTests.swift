@@ -298,7 +298,7 @@ final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
         let model = WorkersWorkspaceModel()
         // Progression follows the fixed review capacity, even when fewer
         // reviewers are configured.
-        model.configureSlots(workerCount: 16, automationCount: 8, reviewCount: 8)
+        model.configureSlots(workerCount: 32, automationCount: 8, reviewCount: 8)
         for slot in 41...44 {
             guard case .success = model.attachWorkerPane(makeAttachRequest(slot: slot, runId: "progression-\(slot)")) else {
                 return XCTFail("progression slot \(slot) must attach")
@@ -309,8 +309,8 @@ final class WorkersWorkspaceModelAttachSlotRoutingTests: XCTestCase {
             }
         }
         XCTAssertEqual(Set(model.listHostedPanes().map(\.slotId)), Set(41...44))
-        guard case .failure(.internalFailure) = model.attachWorkerPane(makeAttachRequest(slot: 45)) else {
-            return XCTFail("slots beyond the progression hard cap must be rejected")
+        guard case .failure(.internalFailure) = model.attachWorkerPane(makeAttachRequest(slot: 61)) else {
+            return XCTFail("slots outside every allocated range must be rejected")
         }
     }
 
@@ -581,9 +581,14 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
 
     func testInteractivePoolCapacityAndAutomationBaseStayPinned() {
         let model = WorkersWorkspaceModel()
-        XCTAssertEqual(WorkersWorkspaceModel.workerSlotCount, 16)
+        XCTAssertEqual(WorkersWorkspaceModel.workerSlotCount, 32)
+        // The automation, review and progression slot ids must not move when
+        // the main pool grows past 16.
         XCTAssertEqual(WorkersWorkspaceModel.automationSlotBase, 17)
-        XCTAssertEqual(model.interactivePoolSize, 16)
+        XCTAssertEqual(WorkersWorkspaceModel.reviewSlotBase, 25)
+        XCTAssertEqual(WorkersWorkspaceModel.progressionSlotBase, 41)
+        XCTAssertEqual(WorkersWorkspaceModel.progressionSlotRange, 41...44)
+        XCTAssertEqual(model.interactivePoolSize, 32)
         XCTAssertEqual(model.automationPoolSize, 8)
         XCTAssertEqual(model.reviewSlotCount, 16)
     }
@@ -607,6 +612,30 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
             return
         }
         XCTAssertEqual(model.viewersByRunId["run-ld8"]?.slotId, 16)
+    }
+
+    func testUpperMainSlotsAreAcceptedAndOtherGapsRejected() {
+        let model = WorkersWorkspaceModel()
+        for (index, slot) in [16, 17, 24, 25, 40, 41, 44, 45, 52, 53, 60].enumerated() {
+            let result = model.attachWorkerPane(makeAttachRequest(slot: slot, runId: "run-ok-\(index)"))
+            guard case .success = result else {
+                XCTFail("expected .success attaching slot \(slot), got \(result)")
+                return
+            }
+        }
+        for (index, slot) in [0, 61, 100, 199].enumerated() {
+            let result = model.attachWorkerPane(makeAttachRequest(slot: slot, runId: "run-bad-\(index)"))
+            guard case .failure(.internalFailure) = result else {
+                XCTFail("expected .internalFailure attaching slot \(slot), got \(result)")
+                return
+            }
+        }
+    }
+
+    func testIsMainSlotCoversExactlyTheTwoMainRanges() {
+        let main = (0...255).filter { WorkersWorkspaceModel.isMainSlot($0) }
+        XCTAssertEqual(main, Array(1...16) + Array(45...60))
+        XCTAssertEqual(main.count, WorkersWorkspaceModel.workerSlotCount)
     }
 
     func testConfigureSlotsPublishesEnginePoolSizes() {

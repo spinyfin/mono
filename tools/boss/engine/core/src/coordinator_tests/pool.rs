@@ -904,6 +904,66 @@ async fn default_pool_dispatches_five_concurrent_autostart_chores() {
     assert_eq!(coordinator.worker_pool().idle_count().await, MAX_WORKER_POOL_SIZE - 5);
 }
 
+/// The main pool's ceiling is 32: with the live cap raised to it
+/// (`bossctl dispatch concurrency --set 32`), 32 back-to-back autostart chores
+/// all reach `running` on 32 distinct main worker ids, each of which decodes to
+/// its own legacy slot, and a 33rd waits.
+#[tokio::test]
+async fn raised_cap_dispatches_thirty_two_concurrent_main_workers() {
+    const TOTAL: usize = 32;
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    for index in 0..=TOTAL {
+        create_test_chore(&db, product.id.clone(), format!("Chore {index}"));
+    }
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(MAX_WORKER_POOL_SIZE),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    ));
+    let outcome = coordinator.set_max_concurrent_interactive_workers(TOTAL).unwrap();
+    assert_eq!(outcome.applied, TOTAL);
+    assert_eq!(outcome.clamped_from, None);
+    coordinator.kick();
+
+    let running_count = || {
+        db.list_executions(None)
+            .unwrap()
+            .iter()
+            .filter(|execution| execution.status == ExecutionStatus::Running)
+            .count()
+    };
+    for _ in 0..1000 {
+        if running_count() == TOTAL {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(running_count(), TOTAL, "all 32 main workers must be admitted");
+    assert_eq!(coordinator.worker_pool().idle_count().await, 0);
+
+    let claims = coordinator.worker_pool().claims().await;
+    let slots: std::collections::BTreeSet<u8> = claims
+        .iter()
+        .map(|claim| slot_id_from_worker_id(&claim.worker_id).expect("main worker id must decode"))
+        .collect();
+    assert_eq!(slots.len(), TOTAL, "every main worker holds a distinct legacy slot");
+    assert!(
+        slots
+            .iter()
+            .all(|slot| (1..=16).contains(slot) || (45..=60).contains(slot)),
+        "main slots must stay in the main ranges, got {slots:?}"
+    );
+}
+
 /// `bossctl agents launch` (Phase 7 of the v2 plan) must dispatch
 /// even when every configured slot is busy — the verb's whole point
 /// is to *skip the queue*. We mirror the cap test above

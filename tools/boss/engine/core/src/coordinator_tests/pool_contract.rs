@@ -3,21 +3,24 @@ use super::helpers::*;
 
 #[tokio::test]
 async fn backend_pool_geometry_is_fixed() {
-    assert_eq!(MAX_WORKER_POOL_SIZE, 16);
+    assert_eq!(MAX_WORKER_POOL_SIZE, 32);
     assert_eq!(MAX_AUTOMATION_POOL_SIZE, 8);
     assert_eq!(MAX_REVIEW_POOL_SIZE, 16);
     assert_eq!(DEFAULT_REVIEW_POOL_SIZE, 16);
     assert_eq!(MAX_PROGRESSION_POOL_SIZE, 4);
     assert_eq!(MAX_CONCURRENT_INTERACTIVE_WORKERS, 8);
-    for (pool, prefix, first, last) in [
-        (WorkerPool::new(100), "worker-", 1u8, 16u8),
-        (WorkerPool::new_automation(100), "auto-worker-", 17, 24),
-        (WorkerPool::new_review(100), "review-", 25, 40),
-        (WorkerPool::new_progression(100), "progression-", 41, 44),
+    // Main indexes 1..=16 use legacy slots 1..=16 and indexes 17..=32 use
+    // slots 45..=60; the other pools sit between them and never moved.
+    let main_slots: Vec<u8> = (1u8..=16).chain(45..=60).collect();
+    for (pool, prefix, slots) in [
+        (WorkerPool::new(100), "worker-", main_slots),
+        (WorkerPool::new_automation(100), "auto-worker-", (17u8..=24).collect()),
+        (WorkerPool::new_review(100), "review-", (25u8..=40).collect()),
+        (WorkerPool::new_progression(100), "progression-", (41u8..=44).collect()),
     ] {
-        assert_eq!(pool.capacity().await, usize::from(last - first + 1));
-        for slot in first..=last {
-            let expected = format!("{prefix}{}", slot - first + 1);
+        assert_eq!(pool.capacity().await, slots.len());
+        for (ordinal, slot) in slots.into_iter().enumerate() {
+            let expected = format!("{prefix}{}", ordinal + 1);
             let worker = pool.claim_worker(&format!("exec-{slot}"), None).await.unwrap();
             assert_eq!(worker, expected);
             assert_eq!(slot_id_from_worker_id(&worker), Some(slot));

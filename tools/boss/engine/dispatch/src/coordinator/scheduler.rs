@@ -1049,7 +1049,7 @@ impl ExecutionCoordinator {
     ///    automation row that misses its full automation pool is instead
     ///    collected as a *spill candidate*.
     /// 2. **Spillover.** Each spill candidate tries to claim a free
-    ///    **Lower Decks** slot (page 1 of the interactive pool, never
+    ///    spill-page slot (any interactive page after Bridge Crew; never
     ///    Bridge Crew — see [`WorkerPool::claim_worker_spill`]).
     ///
     /// The pass boundary is the whole point: by the time any automation
@@ -1064,7 +1064,7 @@ impl ExecutionCoordinator {
     /// # Preemption: mainline's last resort
     ///
     /// When a *mainline* row misses its claim and the interactive pool is
-    /// full on both pages, the drain may stop one in-progress spilled
+    /// full across all pages, the drain may stop one in-progress spilled
     /// automation run and requeue its work to free a slot — see
     /// [`Self::try_preempt_automation_for`]. Never for a review or
     /// automation row, never against a mainline or review victim, and at
@@ -1349,7 +1349,7 @@ impl ExecutionCoordinator {
             let is_automation = !is_review && self.execution_targets_automation_pool(&execution);
             // A progression run is none of main, review, or automation: it
             // never counts against the interactive cap, never spills into
-            // Lower Decks, and nothing spills into its pool.
+            // the interactive pool, and nothing spills into its pool.
             let is_main = !is_review && !is_automation && !is_progression;
             // The `critical` exemptions apply to interactive (main-pool)
             // work only: review, automation and progression rows are governed
@@ -1515,7 +1515,7 @@ impl ExecutionCoordinator {
             // and attempt its home claim in order to be queued as a spill
             // candidate. Short-circuiting here would let only the FIRST
             // automation row of the pass ever reach the spill queue and
-            // leave the rest of Lower Decks idle. The redundant home claim
+            // leave the rest of the spill pages idle. The redundant home claim
             // this costs is one in-memory mutex acquisition per row.
             if is_review && review_pool_exhausted {
                 changed_waits.extend(self.record_dispatch_wait_reason(
@@ -2015,9 +2015,9 @@ impl ExecutionCoordinator {
 
                 // An automation row that missed its home pool is NOT
                 // finished yet: it becomes a spill candidate, and pass 2
-                // below tries to place it on a free Lower Decks slot once
-                // every mainline/review row in this snapshot has already
-                // had its claim attempt. Deferring it that way — rather
+                // below tries to place it on a free interactive spill-page
+                // slot once every mainline/review row in this snapshot has
+                // already had its claim attempt. Deferring it that way — rather
                 // than spilling inline here — is what makes "mainline
                 // beats automation for an interactive slot regardless of
                 // arrival order" structural instead of a property of the
@@ -2033,7 +2033,7 @@ impl ExecutionCoordinator {
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
                         pool_capacity,
-                        "automation pool exhausted — queued as a Lower Decks spill candidate"
+                        "automation pool exhausted — queued as an interactive spill-page candidate"
                     );
                     spill_candidates.push(execution);
                     continue;
@@ -2101,7 +2101,7 @@ impl ExecutionCoordinator {
                 .await;
         }
 
-        // ---- Pass 2: automation spillover into Lower Decks ----
+        // ---- Pass 2: automation spillover onto interactive spill pages ----
         //
         // Reached only after every mainline and review row above has
         // already claimed or been rejected, so any interactive slot still
@@ -2132,9 +2132,7 @@ impl ExecutionCoordinator {
                 )
                 .await
             else {
-                // No free Lower Decks slot either, or the interactive
-                // concurrency cap is already saturated: this automation
-                // row waits, exactly as it did before spillover existed.
+                // No free spill-page slot or concurrency cap saturated: wait.
                 let pool_capacity = self.automation_pool.capacity().await;
                 let live_workers = self.worker_pool.busy_count().await;
                 let cap = self.max_concurrent_interactive_workers();
@@ -2145,7 +2143,7 @@ impl ExecutionCoordinator {
                     live_workers,
                     cap,
                     pool = "automation",
-                    "spawn_attempt status=ready -> deferred reason=pool_exhausted (no Lower Decks slot to spill into, or interactive_concurrency_cap reached)"
+                    "spawn_attempt status=ready -> deferred reason=pool_exhausted (no interactive spill-page slot to spill into, or interactive_concurrency_cap reached)"
                 );
                 self.dispatch_events
                     .emit(
@@ -2172,7 +2170,7 @@ impl ExecutionCoordinator {
                 if execution.kind == ExecutionKind::AutomationTriage {
                     let detail = format!(
                         "automation pool exhausted ({pool_capacity}/{pool_capacity} busy) and no free \
-                         Lower Decks slot to spill into; triage queued, will dispatch when a slot frees"
+                         interactive spill-page slot to spill into; triage queued, will dispatch when a slot frees"
                     );
                     if let Err(err) = self
                         .work_db
@@ -2192,7 +2190,8 @@ impl ExecutionCoordinator {
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
                 worker_id = %worker_id,
-                "automation spilled into Lower Decks — automation pool full, no mainline work wanted this slot"
+                page = slot_id_from_worker_id(&worker_id).and_then(worker_page_label).as_deref().unwrap_or("unknown"),
+                "automation spilled onto interactive spill page after Bridge Crew — automation pool full, no mainline work wanted this slot"
             );
             let admission = Self::drain_row_admission(
                 Self::forced_admissible(operator_forced_ids.contains(&execution.id), pause.as_ref()),
@@ -2304,7 +2303,7 @@ impl ExecutionCoordinator {
             victim_work_item_id = %victim.work_item_id,
             victim_worker_id = %victim.worker_id,
             "preempting spilled automation run: mainline work is ready and every \
-             Bridge Crew and Lower Decks slot is occupied"
+             interactive slot is occupied"
         );
 
         // Graceful teardown: pane reap (full process-tree SIGTERM/SIGKILL
@@ -2467,7 +2466,7 @@ impl ExecutionCoordinator {
             {
                 Ok(retry) => {
                     let detail = format!(
-                        "preempted to free a Lower Decks slot for mainline work; requeued as {}",
+                        "preempted to free an interactive spill-page slot for mainline work; requeued as {}",
                         retry.id
                     );
                     if let Err(err) = self.work_db.requeue_automation_run_after_transient_spawn_failure(
@@ -2624,7 +2623,7 @@ impl ExecutionCoordinator {
     /// fails.
     ///
     /// `spilled` marks an automation execution that claimed an
-    /// interactive (Lower Decks) slot because its own pool was full. It
+    /// interactive spill-page slot because its own pool was full. It
     /// is threaded into the `worker_claimed` event rather than inferred
     /// downstream, because a spilled run's `worker_id` is an ordinary
     /// `worker-N` — indistinguishable by prefix from mainline work — and
@@ -2681,10 +2680,8 @@ impl ExecutionCoordinator {
         // or abort inside `schedule_execution` would leave the row
         // `claimed` until the next engine boot.
         let mut spawn_claim = DrainDispatchClaim::already_held(Arc::clone(&self.work_db), execution.id.clone());
-        // Record the physical slot + page the claim landed on so a later
-        // spawn failure on this slot is attributable to Bridge Crew vs
-        // Lower Decks in `bossctl dispatch diagnose` (the page is `null`
-        // for automation/review pools, which are single-page).
+        // Record the physical slot + page for `bossctl dispatch diagnose`
+        // (`null` for single-page non-interactive pools).
         let claimed_slot = slot_id_from_worker_id(worker_id);
         let claimed_page = claimed_slot.and_then(worker_page_label);
         self.dispatch_events
