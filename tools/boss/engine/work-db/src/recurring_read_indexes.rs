@@ -36,9 +36,7 @@ pub(super) const MERGE_QUEUE_INDEX_SQL: &str = "
           AND deleted_at IS NULL;";
 
 pub(super) fn migrate_merge_queue_index(conn: &Connection) -> Result<()> {
-    conn.execute_batch(MERGE_QUEUE_INDEX_SQL)?;
-    conn.execute_batch("ANALYZE tasks_merge_queue_live_idx;")?;
-    Ok(())
+    apply_with_stat1_guard(conn, MERGE_QUEUE_INDEX_SQL, "ANALYZE tasks_merge_queue_live_idx;")
 }
 
 fn execution_statuses_sql(terminal: bool) -> String {
@@ -190,10 +188,25 @@ mod tests {
             for index in &created {
                 conn.execute_batch(&format!("DROP INDEX IF EXISTS {index}")).unwrap();
             }
+            conn.execute_batch("DROP INDEX IF EXISTS tasks_merge_queue_live_idx")
+                .unwrap();
+            for index in super::PERIODIC_SWEEP_INDEXES_SQL
+                .split("CREATE INDEX IF NOT EXISTS ")
+                .skip(1)
+                .map(|statement| statement.split_whitespace().next().unwrap().to_owned())
+            {
+                conn.execute_batch(&format!("DROP INDEX IF EXISTS {index}")).unwrap();
+            }
             conn.execute_batch("DROP TABLE IF EXISTS sqlite_stat1; DROP TABLE IF EXISTS sqlite_stat4;")
                 .unwrap();
-            conn.execute("DELETE FROM schema_migrations WHERE id = ?1", [super::MIGRATION_ID])
-                .unwrap();
+            for id in [
+                super::MIGRATION_ID,
+                super::PERIODIC_SWEEP_MIGRATION_ID,
+                super::MERGE_QUEUE_INDEX_MIGRATION_ID,
+            ] {
+                conn.execute("DELETE FROM schema_migrations WHERE id = ?1", [id])
+                    .unwrap();
+            }
         }
         drop(db);
         let upgraded = crate::WorkDb::open(path).unwrap();

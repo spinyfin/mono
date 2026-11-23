@@ -86,14 +86,14 @@ Two follow-up migrations cover the periodic and retention sweeps:
 
 Same fixture, same isolated engine, idle, no app, no workers. Pages are 4 KiB.
 
-| Measure                                                     |        Before |         After |
-| ----------------------------------------------------------- | ------------: | ------------: |
-| One pass of the recurring reads (budget test)               | 233,146 pages |   6,506 pages |
-| Engine, steady state, pages per minute (`db read summary`)  | about 495,000 |  about 16,000 |
-| Engine, steady state, holds of 200 pages or more per minute |            45 |            25 |
-| Engine, first 10 s after start                              | 582,201 pages | 127,901 pages |
+| Measure                                                        |        Before |         After |
+| -------------------------------------------------------------- | ------------: | ------------: |
+| One pass of the 25 reads measured before the fix (budget test) | 233,146 pages |   6,506 pages |
+| Engine, steady state, pages per minute (`db read summary`)     | about 495,000 |  about 16,000 |
+| Engine, steady state, holds of 200 pages or more per minute    |            45 |            25 |
+| Engine, first 10 s after start                                 | 582,201 pages | 127,901 pages |
 
-The budget-test "before" is the 25 reads measured before the fix; "after" is those 25 plus five added since. The first ten seconds after the upgrade include the one-time index build, 82,809 pages; without it the figure is 45,092. The engine rows are single runs of about six minutes each on 2026-11-21. Re-measure with the recipe below before quoting them for a later build.
+The budget-test rows cover only the 25 reads measured before the fix, before and after. The budget test now covers more reads than that (the periodic-sweep reads added later, one of them 7,836 pages), so its total is higher than 6,506 and is not re-measured here. The first ten seconds after the upgrade include the one-time index build, 82,809 pages; without it the figure is 45,092. The engine rows are single runs of about six minutes each on 2026-11-21. Re-measure with the recipe below before quoting them for a later build.
 
 ## Rules for a recurring read
 
@@ -106,7 +106,7 @@ The budget-test "before" is the 25 reads measured before the fix; "after" is tho
 
 ## The budget test
 
-`tools/boss/engine/work-db/src/tests/sweep_read_budget_tests.rs` runs every recurring read against the fixture and fails any that fetches more than 2,500 pages, naming the read and its heaviest statement. It runs under four sets of planner statistics: none, fresh, average-only (as the system `sqlite3` writes them) and "analyzed before the upgrade".
+`tools/boss/engine/work-db/src/tests/sweep_read_budget_tests.rs` runs every recurring read against the fixture and fails any that fetches more than its own budget, naming the read and its heaviest statement. Each read carries its budget: 2,500 pages by default, 10,000 for the hourly full-stock `list_executions_with_driver_runtime_state` read. It runs under four sets of planner statistics: none, fresh, average-only (as the system `sqlite3` writes them) and "analyzed before the upgrade".
 
 ```sh
 bazel test //tools/boss/engine/work-db:work_db_test --test_filter=sweep_read_budget --test_output=all --test_arg=--nocapture
@@ -138,7 +138,7 @@ Measured on the same fixture after migration `20261122_0630_work_db_periodic_swe
 | Driver home retention: `list_executions_with_driver_runtime_state` (`executions_runs.rs`) | 3600 s |          7,836 |
 | Backup snapshot (`VACUUM INTO`)                                                           | 3600 s | the whole file |
 
-Both read the full stock by design: `list_executions_with_driver_runtime_state` classifies live vs terminal `driver_runtime_state` blobs across executions (budgeted at `10,000` pages in `sweep_read_budget_tests`), and the backup copies the whole file through `WorkDb::connect_new_for_snapshot()` (`Scope::WholeFile`).
+Both read the full stock by design: `list_executions_with_driver_runtime_state` is called by each of the Codex, Agy and Grok home retention sweeps (`codex_home_retention_sweep.rs`, `agy_home_retention_sweep.rs`, `grok_home_retention_sweep.rs`), so it is paid three times an hour (3 x 7,836 pages on the fixture). Each sweep needs every execution's driver runtime state to decide whether a home directory is still live or terminal, so the whole stock is classified rather than a live subset. It live vs terminal `driver_runtime_state` blobs across executions (budgeted at `10,000` pages in `sweep_read_budget_tests`), and the backup copies the whole file through `WorkDb::connect_new_for_snapshot()` (`Scope::WholeFile`).
 
 ## Size of the file
 
