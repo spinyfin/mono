@@ -68,6 +68,7 @@ pub mod coordinator_handoff;
 pub mod coordinator_tmux;
 pub mod cost_pricing;
 pub mod cost_report;
+pub mod metric_series;
 pub use boss_host_execution::cube as cube_commands;
 pub mod cube_client;
 pub mod cube_lease_heartbeat;

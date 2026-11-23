@@ -1005,6 +1005,10 @@ mod floor_tests {
                 Box::new(|c| merge_intent::migrate(c).unwrap()),
             ),
             (
+                "20261118_2100_metric_series_indexes",
+                Box::new(|c| metric_series_db::migrate_metric_series_indexes(c).unwrap()),
+            ),
+            (
                 "20261117_0212_no_op_completion_ready",
                 Box::new(|c| {
                     c.execute_batch(

@@ -392,6 +392,24 @@ fn coordinator_verbs_stay_closed() {
 }
 
 #[test]
+fn metric_series_verbs_stay_closed() {
+    for request in [
+        FrontendRequest::GetMetricCatalog,
+        FrontendRequest::GetMetricSeries {
+            series: "execution_outcomes".into(),
+            since_epoch_s: 0,
+            until_epoch_s: 1,
+            bucket: None,
+            filters: vec![],
+            group_by: None,
+        },
+    ] {
+        let denial = assert_denied(request);
+        assert_eq!(denial.reason, WorkerTierDenialReason::CoordinatorOnly);
+    }
+}
+
+#[test]
 fn every_denial_tells_the_worker_what_to_do_next() {
     // A bare "denied" is the failure mode this whole project exists to kill:
     // the worker on the other end has to decide what to do next, and prose
