@@ -1586,8 +1586,10 @@ mod tests {
         );
         assert!(!err.contains("no correlated rollout appeared"), "got: {err}");
         assert!(!err.contains("no file named"), "got: {err}");
+        // The elapsed time is whole seconds and a loaded host can stall the
+        // 350ms window past one, so assert the report's shape, not its value.
         assert!(
-            err.contains("scans over 0s"),
+            err.contains(" scans over ") && err.contains("longest gap between scans"),
             "the failure must report how often it looked; got: {err}"
         );
     }
