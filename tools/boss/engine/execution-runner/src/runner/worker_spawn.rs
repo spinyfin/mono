@@ -509,11 +509,11 @@ fn resolve_batch_reviewer_spawn(
 /// configuration must fail the spawn (a retryable pre-start failure through
 /// the normal execution retry path) rather than quietly run at a different
 /// model/effort. See design "Generation and read-only enforcement".
-fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -> anyhow::Result<SpawnConfig> {
-    const REVIEW_GUIDE_MODEL: &str = "gpt-6-astra";
-    const REVIEW_GUIDE_EFFORT: EffortLevel = EffortLevel::Medium;
-    const REVIEW_GUIDE_EFFORT_VALUE: &str = "high";
+const REVIEW_GUIDE_MODEL: &str = "gpt-6-astra";
+const REVIEW_GUIDE_EFFORT: EffortLevel = EffortLevel::Medium;
+const REVIEW_GUIDE_EFFORT_VALUE: &str = "high";
 
+fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -> anyhow::Result<SpawnConfig> {
     let input = SpawnResolutionInput::builder()
         .effort_level(REVIEW_GUIDE_EFFORT)
         .model_override(REVIEW_GUIDE_MODEL)
@@ -521,6 +521,14 @@ fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -
         .build();
     let config = resolve_spawn_config_in(registry, &input)
         .map_err(|error| anyhow::anyhow!("review-guide Astra profile resolution: {error}"))?;
+    ensure_review_guide_profile(&config)?;
+    Ok(config)
+}
+
+/// The security-relevant assertion that a review-guide spawn refuses any
+/// driver/model/effort fallback. Split out so tests can exercise each
+/// refusal without swapping the production registry.
+fn ensure_review_guide_profile(config: &SpawnConfig) -> anyhow::Result<()> {
     anyhow::ensure!(
         config.driver == REVIEW_GUIDE_DRIVER,
         "review-guide Astra profile refused: resolved driver `{}`, expected `{REVIEW_GUIDE_DRIVER}` \
@@ -538,7 +546,7 @@ fn resolve_review_guide_spawn_config(registry: &crate::driver::DriverRegistry) -
         "review-guide Astra profile refused: resolved effort value {:?}, expected exactly {REVIEW_GUIDE_EFFORT_VALUE:?}",
         config.effort_value,
     );
-    Ok(config)
+    Ok(())
 }
 
 /// Effort-level prompt addenda tell the worker to plan files it will

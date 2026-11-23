@@ -192,6 +192,70 @@ async fn finalize_review_guide_fails_the_attempt_when_the_output_does_not_valida
     );
 }
 
+#[tokio::test]
+async fn finalize_review_guide_fails_the_attempt_when_publish_errors() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, root, series_id, execution_id) = review_guide_execution_fixture(workspace.path());
+    submit_guide(
+        &db,
+        &execution_id,
+        "# The Guide\n\n## Orientation\nA plain-language summary.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation reported.\n",
+    );
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_publish BEFORE INSERT ON pr_review_guide_versions BEGIN SELECT RAISE(ABORT, 'injected publish failure'); END;",
+        )
+        .unwrap();
+    let handler = engine_harness(db.clone(), StubPrDetector::ok(None)).handler;
+    let execution = db.get_execution(&execution_id).unwrap();
+    let outcome = handler.on_stop(&execution.id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewGuide { published: false }),
+        "expected an unpublished outcome, got {outcome:?}"
+    );
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert!(summary.readable_version_id.is_none());
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&series_id)
+            .unwrap()
+            .is_empty(),
+        "a publish error must terminalise the attempt"
+    );
+}
+
+#[tokio::test]
+async fn finalize_review_guide_fails_the_attempt_when_the_comparison_lookup_errors() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, root, series_id, execution_id) = review_guide_execution_fixture(workspace.path());
+    submit_guide(
+        &db,
+        &execution_id,
+        "# The Guide\n\n## Orientation\nA plain-language summary.\n## Problem\n## Implementation\n## Example\n## Review\n## Evidence\nNo validation reported.\n",
+    );
+    db.connect()
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE pr_review_guide_source_comparisons RENAME TO pr_review_guide_source_comparisons_hidden;",
+        )
+        .unwrap();
+    let handler = engine_harness(db.clone(), StubPrDetector::ok(None)).handler;
+    let execution = db.get_execution(&execution_id).unwrap();
+    let outcome = handler.on_stop(&execution.id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewGuide { published: false }),
+        "expected an unpublished outcome, got {outcome:?}"
+    );
+    let summary = db.get_pr_review_guide_summary_for_root(&root).unwrap().unwrap();
+    assert!(summary.readable_version_id.is_none());
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&series_id)
+            .unwrap()
+            .is_empty(),
+        "a comparison-lookup error must terminalise the attempt"
+    );
+}
+
 fn submit_guide(db: &WorkDb, execution_id: &str, markdown: &str) -> boss_protocol::WorkerProposal {
     submit_guide_outcome(db, execution_id, markdown)
         .expect("the guide is accepted")

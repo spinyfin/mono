@@ -15,6 +15,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(fail_capture: bool) -> Self {
+        Self::build(fail_capture, false)
+    }
+
+    fn with_scheduler_wakeups() -> Self {
+        Self::build(false, true)
+    }
+
+    fn build(fail_capture: bool, enable_dispatch_ready_bus: bool) -> Self {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
         let mut packet = source_capture_packet(PR_URL, "base", "head");
@@ -35,8 +43,34 @@ impl Fixture {
         let collector = boss_engine_completion::review_guide_capture::SourcePacketCollector::fixture(collect, packet);
         // This test drives the manual capture path, which never consults
         // the branch verifier; any verifier satisfies the builder.
-        let (state, dir) =
-            test_server_state_with_source_collector(collector, Arc::new(SettableHeadRefVerifier::default()));
+        let (state, dir) = if enable_dispatch_ready_bus {
+            let (temp, db) = boss_work_db::test_support::open_db();
+            let cfg = Arc::new(RuntimeConfig::from_parts(
+                boss_engine_runtime::config::WorkConfig::builder()
+                    .cwd(temp.path().to_path_buf())
+                    .db_path(temp.path().join("state.db"))
+                    .enable_dispatch_ready_bus(true)
+                    .build(),
+                None,
+            ));
+            let state = ServerState::new_arc_with_app_pid_and_merge_probe(
+                cfg,
+                None,
+                None,
+                ServerStateOverrides {
+                    work_db: Some(db),
+                    cube_client: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsCube)),
+                    execution_runner: Some(Arc::new(boss_engine_runtime::test_support::AlwaysSucceedsRunner)),
+                    source_packet_collector: Some(collector),
+                    branch_verifier: Some(Arc::new(SettableHeadRefVerifier::default())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (state, temp)
+        } else {
+            test_server_state_with_source_collector(collector, Arc::new(SettableHeadRefVerifier::default()))
+        };
         let db = &state.work_db;
         let product = create_product(db);
         let root = create_active_chore(db, &product, "Existing PR");
@@ -128,6 +162,32 @@ impl Fixture {
             panic!("expected summary reply: {:?}", reply.payload)
         };
         summary
+    }
+
+    async fn retry(&self, token: Option<&str>) -> FrontendEvent {
+        let sink = make_session_sink();
+        let ctx = Dispatch::builder()
+            .server_state(self.state.clone())
+            .work_db(self.state.work_db.clone())
+            .sink(sink.clone())
+            .session_id("session")
+            .request_id("request")
+            .recv_instant(std::time::Instant::now())
+            .decode_ms(0.0)
+            .build();
+        crate::app::review_guide::handle_retry_review_guide(
+            ctx,
+            FrontendRequest::RetryReviewGuide {
+                root_task_id: self.root.clone(),
+                idempotency_token: token.map(str::to_owned),
+            },
+        )
+        .await;
+        sink.close();
+        let reply = sink.next().await.unwrap();
+        assert_eq!(reply.request_id.as_deref(), Some("request"));
+        assert!(sink.next().await.is_none());
+        reply.payload
     }
 
     async fn generate(&self, token: &str, already: bool) -> boss_protocol::ReviewGuideAttempt {
@@ -338,6 +398,58 @@ async fn manual_generation_captures_and_dispatches_with_both_flags_off() {
     db.fail_pr_review_guide_attempt(&attempt.id, "fixture failure").unwrap();
     assert_eq!(f.generate("second-click", true).await.id, attempt.id);
     assert_eq!(f.generate("initial", true).await.id, attempt.id);
+}
+
+async fn dispatch_ready_count(subscription: &mut boss_event_bus::Subscription) -> usize {
+    let mut count = 0;
+    while let Ok(Some(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), subscription.recv()).await {
+        count += 1;
+    }
+    count
+}
+
+/// Generate and Retry persist the queue write first, then kick the scheduler
+/// so a queued attempt does not wait for the next heartbeat.
+#[tokio::test]
+async fn generate_and_retry_wake_the_scheduler() {
+    let f = Fixture::with_scheduler_wakeups();
+    let mut wakeups = f
+        .state
+        .execution_coordinator
+        .event_bus()
+        .subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::DispatchReady,
+        ));
+    assert_eq!(
+        dispatch_ready_count(&mut wakeups).await,
+        0,
+        "nothing wakes before generate"
+    );
+    let attempt = f.generate("kick-generate", false).await;
+    assert!(
+        dispatch_ready_count(&mut wakeups).await >= 1,
+        "GenerateReviewGuide must kick the scheduler after the durable queue write"
+    );
+    let FrontendEvent::ReviewGuideRetryQueued { already_requested, .. } = f.retry(Some("kick-generate")).await else {
+        panic!("expected a retry reply while the first attempt is still live")
+    };
+    assert!(already_requested, "a live attempt must be the already-requested path");
+    assert!(
+        dispatch_ready_count(&mut wakeups).await >= 1,
+        "RetryReviewGuide must kick the scheduler on the already-requested path"
+    );
+    f.state
+        .work_db
+        .fail_pr_review_guide_attempt(&attempt.id, "fixture failure")
+        .unwrap();
+    let FrontendEvent::ReviewGuideRetryQueued { already_requested, .. } = f.retry(Some("kick-retry")).await else {
+        panic!("expected a retry reply after the first attempt failed")
+    };
+    assert!(!already_requested, "a failed attempt must admit a replacement");
+    assert!(
+        dispatch_ready_count(&mut wakeups).await >= 1,
+        "RetryReviewGuide must kick the scheduler after admitting a replacement"
+    );
 }
 
 #[tokio::test]

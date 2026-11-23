@@ -92,6 +92,90 @@ async fn first_prompt_sizes_by_driver_and_kind() {
     }
 }
 
+#[test]
+fn resolve_review_guide_spawn_config_pins_codex_astra_high() {
+    let config = resolve_review_guide_spawn_config(&crate::driver::DriverRegistry::default()).unwrap();
+    assert_eq!(config.driver, REVIEW_GUIDE_DRIVER);
+    assert_eq!(config.model, "gpt-6-astra");
+    assert_eq!(config.effort_value, Some("high"));
+}
+
+#[test]
+fn ensure_review_guide_profile_refuses_fallback_driver_model_or_effort() {
+    let ok = resolve_review_guide_spawn_config(&crate::driver::DriverRegistry::default()).unwrap();
+    ensure_review_guide_profile(&ok).unwrap();
+
+    let mut wrong_driver = ok.clone();
+    wrong_driver.driver = "claude".into();
+    let error = ensure_review_guide_profile(&wrong_driver).unwrap_err().to_string();
+    assert!(error.contains("resolved driver"), "{error}");
+    assert!(error.contains("claude"), "{error}");
+
+    let mut wrong_model = ok.clone();
+    wrong_model.model = "gpt-5.1".into();
+    let error = ensure_review_guide_profile(&wrong_model).unwrap_err().to_string();
+    assert!(error.contains("resolved model"), "{error}");
+    assert!(error.contains("gpt-5.1"), "{error}");
+
+    let mut wrong_effort = ok.clone();
+    wrong_effort.effort_value = Some("medium");
+    let error = ensure_review_guide_profile(&wrong_effort).unwrap_err().to_string();
+    assert!(error.contains("effort value"), "{error}");
+}
+
+#[tokio::test]
+async fn review_guide_prompt_falls_back_when_comparison_is_missing() {
+    let workspace = tempfile::tempdir().unwrap();
+    let db = WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap();
+    let execution = WorkExecution::builder()
+        .id("exec_rg_missing")
+        .work_item_id("missing-comparison")
+        .kind(ExecutionKind::PrReviewGuide)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:acme/widget.git")
+        .workspace_path(workspace.path().to_string_lossy())
+        .created_at("2026-05-15T00:00:00Z")
+        .build();
+    let task = Task::builder()
+        .id("task-rg")
+        .product_id("prod-rg")
+        .kind(TaskKind::Chore)
+        .name("Review guide")
+        .description("Generate a review guide.")
+        .status(TaskStatus::Todo)
+        .created_at("2026-05-15T00:00:00Z")
+        .updated_at("2026-05-15T00:00:00Z")
+        .build();
+    let composed = compose_worker_spawn(
+        &db,
+        "worker-rg",
+        &execution,
+        &WorkItem::Chore(task),
+        workspace.path(),
+        None,
+        WorkerSpawnOpts::builder().review_signal_checks(|_| &[]).build(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        composed.prompt_text.contains("essential context could not be obtained"),
+        "{}",
+        composed.prompt_text
+    );
+    assert!(
+        composed.prompt_text.contains("do not invent content"),
+        "{}",
+        composed.prompt_text
+    );
+    assert_eq!(composed.spawn_config.driver, REVIEW_GUIDE_DRIVER);
+    assert_eq!(composed.spawn_config.model, "gpt-6-astra");
+    assert_eq!(composed.spawn_config.effort_value, Some("high"));
+    assert_eq!(
+        worker_kind_for_execution(&ExecutionKind::PrReviewGuide),
+        crate::worker_setup::WorkerKind::ReviewGuide
+    );
+}
+
 #[cfg(test)]
 mod reviewer_pool_policy_tests {
     //! Verifies review/automation dispatch policy is decoupled from the
@@ -1197,6 +1281,7 @@ mod compose_worker_spawn_tests {
             ExecutionKind::AutomationTriage,
             ExecutionKind::AnswerAgent,
             ExecutionKind::Progression,
+            ExecutionKind::PrReviewGuide,
         ] {
             assert_eq!(
                 prompt_addendum_to_prepend(&kind, addendum),

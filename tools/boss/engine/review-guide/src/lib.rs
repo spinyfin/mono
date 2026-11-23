@@ -1318,6 +1318,28 @@ mod tests {
     }
 
     #[test]
+    fn invented_blob_reference_without_line_fragment_is_rejected() {
+        let bogus_sha = "f".repeat(40);
+        let href = format!("https://github.com/acme/widget/blob/{bogus_sha}/src/nonexistent.rs");
+        let link = format!("[the file]({href})");
+        let issues = validate_guide_output(&valid_guide_body(&link), &packet()).unwrap_err();
+        assert_eq!(issues, vec![GuideValidationIssue::InventedReference { href }]);
+    }
+
+    #[test]
+    fn fenced_shell_hash_comments_are_not_headings() {
+        let markdown = "```sh\n# build the thing\n# then ship it\n# then celebrate\n# then sleep\n```\n";
+        let issues = validate_guide_output(markdown, &packet()).unwrap_err();
+        assert!(issues.contains(&GuideValidationIssue::MissingTitle), "{issues:?}");
+        assert!(
+            issues
+                .iter()
+                .any(|issue| matches!(issue, GuideValidationIssue::TooFewSections { found: 0 })),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
     fn out_of_range_line_reference_is_rejected() {
         let href = format!(
             "https://github.com/acme/widget/blob/{}/src/retry.rs#L1-L99",

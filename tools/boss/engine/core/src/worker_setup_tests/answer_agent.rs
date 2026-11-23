@@ -28,6 +28,10 @@ fn worker_kind_for_execution_maps_every_kind() {
         worker_kind_for_execution(&ExecutionKind::AutomationTriage),
         WorkerKind::Triage
     );
+    assert_eq!(
+        worker_kind_for_execution(&ExecutionKind::PrReviewGuide),
+        WorkerKind::ReviewGuide
+    );
     // Everything else is a Standard implementer.
     for kind in [
         ExecutionKind::TaskImplementation,

@@ -1,4 +1,95 @@
 use super::*;
+use boss_observation_contracts::{CompletionRequests, ReviewBatchEnqueuer, StopOutcome};
+use boss_protocol::WorkExecution;
+use boss_work_db::ReviewBatchDispatch;
+use std::sync::Mutex;
+
+struct RecordingCompletionHandler {
+    released: Mutex<Vec<String>>,
+    enqueuer: NoopReviewBatchEnqueuer,
+}
+
+impl Default for RecordingCompletionHandler {
+    fn default() -> Self {
+        Self {
+            released: Mutex::new(Vec::new()),
+            enqueuer: NoopReviewBatchEnqueuer,
+        }
+    }
+}
+
+struct NoopReviewBatchEnqueuer;
+
+#[async_trait]
+impl ReviewBatchEnqueuer for NoopReviewBatchEnqueuer {
+    async fn enqueue(
+        &self,
+        _work_db: &WorkDb,
+        _work_item_id: &str,
+        _repo_remote_url: &str,
+        _pr_url: &str,
+        _review_pool_size: usize,
+    ) -> anyhow::Result<ReviewBatchDispatch> {
+        unreachable!("review batch fanout is off in this fixture")
+    }
+}
+
+#[async_trait]
+impl CompletionRequests for RecordingCompletionHandler {
+    fn review_guide_source_capture_enabled(&self) -> bool {
+        false
+    }
+    fn pending_background_nudge_execution_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+    async fn recheck_background_nudge(&self, _execution_id: &str) -> Option<StopOutcome> {
+        None
+    }
+    fn review_batch_fanout_enabled(&self) -> bool {
+        false
+    }
+    fn review_pool_size(&self) -> usize {
+        0
+    }
+    async fn force_release(&self, execution_id: &str) {
+        self.released.lock().unwrap().push(execution_id.to_owned());
+    }
+    async fn record_parent_pr_merge_cancellation(
+        &self,
+        _execution: &WorkExecution,
+        _prior_status: ExecutionStatus,
+        _chain_root_id: &str,
+    ) {
+    }
+    async fn force_stop_execution(&self, _execution_id: &str) {}
+    async fn recheck_for_pr(&self, _execution_id: &str) -> StopOutcome {
+        StopOutcome::AwaitingInput
+    }
+    async fn recheck_for_pr_late(&self, _candidate: &crate::work::LatePrCandidate) -> StopOutcome {
+        StopOutcome::AwaitingInput
+    }
+    fn reconcile_review_guide_source_from_probe(
+        &self,
+        _root_task_id: &str,
+        _pr_url: &str,
+        _base_sha: &str,
+        _head_sha: &str,
+        _observation_sequence: i64,
+    ) {
+    }
+    fn speculative_conflict_prediction_enabled(&self) -> bool {
+        false
+    }
+    fn stacked_pr_auto_structuring_enabled(&self) -> bool {
+        false
+    }
+    fn mechanical_rebase_enabled(&self) -> bool {
+        false
+    }
+    fn review_batch_enqueuer(&self) -> &dyn ReviewBatchEnqueuer {
+        &self.enqueuer
+    }
+}
 
 #[tokio::test]
 async fn merged_pr_is_promoted_and_publishes_invalidation() {
@@ -35,6 +126,125 @@ async fn merged_pr_is_promoted_and_publishes_invalidation() {
     assert!(
         !publisher.runtime_reasons().await.contains(&"pr_merged".to_owned()),
         "a merge moves the card between lanes: it must stay a full-board invalidation"
+    );
+}
+
+#[tokio::test]
+async fn merged_pr_cancels_live_review_guide_attempts() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/acme/widget/pull/9";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-merge", pr);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+    let (series, comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
+    let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let attempt = db.dispatch_pr_review_guide_attempt(&attempt.id, &chore_id).unwrap();
+    let execution_id = attempt.execution_id.clone().expect("dispatch binds an execution");
+
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::Merged);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let handler = RecordingCompletionHandler::default();
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(outcome.merged, 1);
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert_eq!(handler.released.lock().unwrap().clone(), vec![execution_id.clone()]);
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty(),
+        "a merged PR must cancel the in-flight review-guide attempt"
+    );
+}
+
+#[tokio::test]
+async fn closed_unmerged_pr_cancels_live_review_guide_attempts() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/acme/widget/pull/10";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-close", pr);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+    let (series, comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
+    let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let attempt = db.dispatch_pr_review_guide_attempt(&attempt.id, &chore_id).unwrap();
+    let execution_id = attempt.execution_id.clone().expect("dispatch binds an execution");
+
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::ClosedUnmerged);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let handler = RecordingCompletionHandler::default();
+    let _ = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert_eq!(handler.released.lock().unwrap().clone(), vec![execution_id.clone()]);
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty(),
+        "a closed-unmerged PR must cancel the in-flight review-guide attempt"
+    );
+}
+
+#[tokio::test]
+async fn delayed_terminal_observation_force_releases_only_the_observed_pr() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let old_pr = "https://github.com/acme/widget/pull/9";
+    let new_pr = "https://github.com/acme/widget/pull/11";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-rebind", new_pr);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+    let (old_series, old_comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, old_pr, "base", "head");
+    let old = db
+        .create_pr_review_guide_attempt(&old_series, &old_comparison, "test")
+        .unwrap();
+    let old = db.dispatch_pr_review_guide_attempt(&old.id, &chore_id).unwrap();
+    let old_execution = old.execution_id.clone().expect("dispatch binds an execution");
+    let (new_series, new_comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, new_pr, "base-b", "head-b");
+    let new = db
+        .create_pr_review_guide_attempt(&new_series, &new_comparison, "test")
+        .unwrap();
+    let new = db.dispatch_pr_review_guide_attempt(&new.id, &chore_id).unwrap();
+    let new_execution = new.execution_id.clone().expect("dispatch binds an execution");
+
+    let handler = RecordingCompletionHandler::default();
+    crate::sweep::stop_live_review_guides(&db, Some(&handler), &chore_id, old_pr, "parent PR merged").await;
+    assert_eq!(handler.released.lock().unwrap().clone(), vec![old_execution.clone()]);
+    assert_eq!(
+        db.get_execution(&old_execution).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert_eq!(db.get_execution(&new_execution).unwrap().status, ExecutionStatus::Ready);
+    assert!(
+        db.live_pr_review_guide_attempts_for_series(&old_series)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.live_pr_review_guide_attempts_for_series(&new_series).unwrap().len(),
+        1
     );
 }
 

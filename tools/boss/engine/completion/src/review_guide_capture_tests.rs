@@ -333,6 +333,42 @@ fn enqueue_without_repository_does_not_create_an_attempt() {
 }
 
 #[test]
+fn enqueue_is_a_no_op_when_generation_flag_is_off() {
+    let (_dir, db) = open_db();
+    let product = create_product(&db);
+    let root = create_active_chore(&db, &product, "flag off");
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = ?1 WHERE id = ?2",
+            ["https://github.com/acme/widget.git", root.as_str()],
+        )
+        .unwrap();
+    let packet = crate::test_support::source_capture_packet("https://github.com/acme/widget/pull/9", "base", "head");
+    let PrSourceCapturePersistOutcome::Stored(capture) = db
+        .persist_pr_review_guide_source_capture(&root, 1, PrSourceCaptureTrigger::Creation, &packet)
+        .unwrap()
+    else {
+        panic!("capture must persist")
+    };
+    let flags_dir = tempfile::tempdir().unwrap();
+    let flags = FeatureFlagsStore::new(flags_dir.path().join("flags.toml"));
+    flags.load().unwrap();
+    flags.set(REVIEW_GUIDE_GENERATION_FLAG, false).unwrap();
+    enqueue_review_guide_generation(&db, &flags, &capture);
+    let count: i64 = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pr_review_guide_attempts WHERE series_id = ?1",
+            [&capture.series_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
 fn enqueue_resolves_product_repository_and_task_override() {
     let product_repo = "https://github.com/acme/widget.git";
     let override_repo = "https://github.com/acme/override.git";

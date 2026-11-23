@@ -74,6 +74,8 @@ pub(super) async fn handle_generate_review_guide(ctx: Dispatch, req: FrontendReq
                 "review_guide_generation_queued",
             )
             .await;
+            // Persist queue intent before notifying the scheduler.
+            ctx.server_state.publisher.kick_scheduler();
             let (attempt, already_requested) = match outcome {
                 boss_work_db::RetryReviewGuideOutcome::Created(attempt) => (attempt, false),
                 boss_work_db::RetryReviewGuideOutcome::AlreadyRequested(attempt) => (attempt, true),
@@ -251,6 +253,8 @@ pub(super) async fn handle_retry_review_guide(ctx: Dispatch, req: FrontendReques
                 "review_guide_retry_queued",
             )
             .await;
+            // Persist queue intent before notifying the scheduler.
+            server_state.publisher.kick_scheduler();
             send_response(
                 &sink,
                 &request_id,
@@ -261,15 +265,18 @@ pub(super) async fn handle_retry_review_guide(ctx: Dispatch, req: FrontendReques
                 },
             )
         }
-        Ok(boss_work_db::RetryReviewGuideOutcome::AlreadyRequested(attempt)) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::ReviewGuideRetryQueued {
-                root_task_id: root_task_id.clone(),
-                attempt: wire_attempt(attempt),
-                already_requested: true,
-            },
-        ),
+        Ok(boss_work_db::RetryReviewGuideOutcome::AlreadyRequested(attempt)) => {
+            server_state.publisher.kick_scheduler();
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::ReviewGuideRetryQueued {
+                    root_task_id: root_task_id.clone(),
+                    attempt: wire_attempt(attempt),
+                    already_requested: true,
+                },
+            )
+        }
         Ok(boss_work_db::RetryReviewGuideOutcome::NoComparison) => send_work_error(
             &sink,
             &request_id,

@@ -37,6 +37,45 @@ fn claude_md_forbids_editor_fallthrough_for_commit_messages() {
 }
 
 #[test]
+fn review_guide_kind_renders_read_only_claude_md_without_pr_mandate() {
+    let mut input = sample_input();
+    input.worker_kind = WorkerKind::ReviewGuide;
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("review-guide"),
+        "review-guide CLAUDE.md must name the kind; got:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("propose review-guide"),
+        "review-guide CLAUDE.md must teach the submit verb; got:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("Pull requests are the deliverable"),
+        "review-guide CLAUDE.md must not include the standard PR-required reminder",
+    );
+    assert!(
+        !rendered.contains("A task is not complete until a PR exists"),
+        "review-guide CLAUDE.md must not teach PR creation",
+    );
+    assert!(rendered.contains(&input.lease_id));
+    assert!(rendered.contains(input.workspace_path.to_str().unwrap()));
+    assert!(
+        rendered.contains("`rg`"),
+        "review-guide CLAUDE.md must name the allowed search command; got:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("`grep`"),
+        "review-guide CLAUDE.md must not advertise grep, which the command guard denies; got:\n{rendered}",
+    );
+    for command in ["`cat`", "`nl`", "`head`", "`tail`", "`wc -l`", "`sed -n`"] {
+        assert!(
+            rendered.contains(command),
+            "review-guide CLAUDE.md must list allowed shell command {command}; got:\n{rendered}",
+        );
+    }
+}
+
+#[test]
 fn triage_kind_renders_triage_claude_md_without_pr_mandate() {
     let mut input = sample_input();
     input.worker_kind = WorkerKind::Triage;
