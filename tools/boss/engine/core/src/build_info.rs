@@ -4,35 +4,27 @@
 //! problem ("you merged the fix but rebuilt this morning's engine?")
 //! is immediately visible without guessing.
 //!
-//! BOSS_VERSION is stamped at Bazel build time via workspace-status.sh +
-//! the build_info_rs rule, threaded through compile_data + $(execpath) in
-//! rustc_env, and included directly into engine_lib's own compilation
-//! (`build_info_stamp` below). Unstamped (check / developer) builds get
-//! the constant `"0.0.0-dev"` so a new `boss-v*` tag does not rebuild
-//! this crate or its tests; `--config=release` (`--stamp`) embeds the
-//! numeric tag-derived base version (e.g. `"1.0.4"`). Cargo builds fall
-//! back to `"unknown"` via build.rs.
-//!
-//! [`version`], [`git_sha`], [`git_dirty`], and [`build_time`] are NOT
-//! compiled into this crate. The per-commit / per-build values live in
-//! the Bazel-stamped `boss_build_provenance` leaf crate, which only the
-//! `engine` binary targets link; the binary hands them to this library
-//! through [`install_provenance`] as the first thing it does at startup.
-//! Until (or unless) that happens the readers return the same `"unknown"`
-//! / `false` placeholders a Cargo (non-Bazel) build gets.
+//! Release version, git sha, dirty flag, and build time are NOT compiled
+//! into this crate. Those values live in the Bazel-stamped leaf crates
+//! `boss_build_provenance` (sha / dirty / time / full version) and
+//! `boss_build_info` (tag-derived base version for `--version`). Only the
+//! `engine` binary targets link them; the binary hands the provenance
+//! values to this library through [`install_provenance`] as the first
+//! thing it does at startup. Until (or unless) that happens the readers
+//! return the same `"unknown"` / `false` placeholders a Cargo (non-Bazel)
+//! build gets. `--version` is handled in the `engine` binary crate via
+//! `boss_build_info::version_string`, before `engine_lib` runs.
 //!
 //! Why a hand-off instead of a plain dependency: a Rust crate's compiled
 //! output changes whenever its source changes, and the stamped source
-//! embeds the commit sha, so a direct `engine_lib -> boss_build_provenance`
-//! edge would recompile `engine_lib`, every `rust_test(crate = ":engine_lib")`
-//! binary and every consumer (`boss`, `bossctl`) on every commit, and
-//! re-execute their tests even for docs-only changes.
-//! `//tools/boss/engine/core:stamped_provenance_isolation_test` guards the
-//! edge; the investigation is in
+//! embeds the commit sha or the release tag, so a direct
+//! `engine_lib -> boss_build_provenance` / `boss_build_info` edge would
+//! recompile `engine_lib`, every `rust_test(crate = ":engine_lib")`
+//! binary and every consumer (`boss`, `bossctl`) on every commit or
+//! every `boss-v*` tag, and re-execute their tests even for docs-only
+//! changes. `//tools/boss/engine/core:stamped_provenance_isolation_test`
+//! guards the edge; the investigation is in
 //! `tools/boss/docs/investigations/docs-only-pr-reexecutes-engine-tests-2026-10-21.md`.
-//! See installer/pkg.bzl's `build_info_rs` doc comment for why
-//! `BOSS_GIT_SHA`/`BOSS_BUILD_TIME` are left as the literal `"unknown"`
-//! in this crate's own stamp.
 //!
 //! Two more runtime signals round out "am I running the binary I think I
 //! am":
@@ -55,16 +47,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-
-// Build-info constants. Only BOSS_VERSION carries data (the base version);
-// BOSS_GIT_SHA and BOSS_BUILD_TIME are always "unknown" (see module docs).
-// BOSS_BUILD_INFO_RS is set to an absolute path by:
-//   - Bazel: via compile_data + $(execpath) in rustc_env (stamped base version)
-//   - Cargo: via build.rs pointing to the shared
-//     tools/boss/build-info/src/build_info_default.rs ("unknown" fallback)
-mod build_info_stamp {
-    include!(env!("BOSS_BUILD_INFO_RS"));
-}
 
 /// The per-commit / per-build identity Bazel stamps into a leaf binary
 /// (`//tools/boss/installer:build_provenance_rs` -> `boss_build_provenance`)
@@ -132,16 +114,6 @@ static PROVENANCE: ProvenanceCell = ProvenanceCell::new();
 /// recompiling the library or re-executing its tests (see module docs).
 pub fn install_provenance(provenance: Provenance) -> Result<(), Provenance> {
     PROVENANCE.install(provenance)
-}
-
-/// Format the canonical `--version` string for a bundled Boss binary.
-///
-/// Output: `<name> <version>`, e.g. `boss-engine 1.0.4` on a stamped
-/// release build, `boss-engine 0.0.0-dev` otherwise. The unstamped
-/// placeholder is cache-stable across `boss-v*` tags (see `build_info_rs`);
-/// the full `1.0.N-dev-<sha>` identity is [`version`].
-pub fn version_string(binary_name: &str) -> String {
-    format!("{binary_name} {}", build_info_stamp::BOSS_VERSION)
 }
 
 /// Stamped Boss version for forensic surfaces: `1.0.N` on a release
@@ -369,19 +341,6 @@ mod tests {
         assert_eq!(stamped_or_unknown("unknown"), "unknown");
         assert_eq!(stamped_or_unknown("1.0.694"), "1.0.694");
         assert_eq!(stamped_or_unknown("1.0.694-dev-abc"), "1.0.694-dev-abc");
-    }
-
-    #[test]
-    fn version_string_is_placeholder_when_unstamped() {
-        // engine_lib_test is an unstamped rust_test, so Bazel injects the
-        // constant 0.0.0-dev placeholder. Cargo points BOSS_BUILD_INFO_RS at
-        // build_info_default.rs ("unknown"). A --stamp / stamp=1 build is
-        // covered by //tools/boss/installer:build_info_stamp_test.
-        let s = version_string("boss-engine");
-        assert!(
-            s == "boss-engine 0.0.0-dev" || s == "boss-engine unknown",
-            "unstamped --version must be the placeholder, got {s}"
-        );
     }
 
     #[test]

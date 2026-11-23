@@ -1,20 +1,35 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files(["Cargo.toml"])
 
+_SRCS = glob(
+    ["src/**/*.rs"],
+    # Cargo-only fallback: build.rs points BOSS_BUILD_INFO_RS at this
+    # file so `include!(env!(...))` compiles without Bazel. The probe
+    # binary is a separate rust_binary.
+    exclude = [
+        "src/build_info_default.rs",
+        "src/version_probe.rs",
+    ],
+)
+
 rust_library(
     name = "build-info",
-    srcs = glob(
-        ["src/**/*.rs"],
-        # Cargo-only fallback: build.rs points BOSS_BUILD_INFO_RS at this
-        # file so `include!(env!(...))` compiles without Bazel. It is
-        # never a `mod` here (the stamp!-generated module in each binary
-        # crate include!s it), so keep it out of this crate's compile.
-        exclude = ["src/build_info_default.rs"],
-    ),
+    srcs = _SRCS,
+    compile_data = [
+        # Tag-derived version (or the unstamped 0.0.0-dev placeholder).
+        # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in lib.rs.
+        "//tools/boss/installer:build_info_rs",
+    ],
     crate_name = "boss_build_info",
     crate_root = "src/lib.rs",
     edition = "2024",
+    rustc_env = {
+        "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
+    },
+    # rust_library defaults to stamp = 0. The version lives in
+    # compile_data (build_info_rs), so --stamp does not independently
+    # invalidate this crate — only a changed generated file does.
     visibility = [
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/cli:__pkg__",
@@ -27,4 +42,60 @@ rust_test(
     size = "small",
     crate = ":build-info",
     edition = "2024",
+    rustc_env = {
+        "BOSS_EXPECTED_VERSION": "0.0.0-dev",
+    },
+)
+
+# Always-stamped sibling, used only by build_info_stamp_test / the
+# version_probe_stamped binary so a --stamp embed is asserted against a
+# fixture without putting stamp=1 on the production crate.
+rust_library(
+    name = "build-info-stamped",
+    testonly = True,
+    srcs = _SRCS,
+    compile_data = [
+        "//tools/boss/installer:build_info_rs_stamped",
+    ],
+    crate_name = "boss_build_info",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    rustc_env = {
+        "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs_stamped)",
+    },
+    visibility = ["//tools/boss/installer:__pkg__"],
+)
+
+rust_test(
+    name = "build-info-stamped_test",
+    size = "small",
+    crate = ":build-info-stamped",
+    edition = "2024",
+    rustc_env = {
+        "BOSS_EXPECTED_VERSION": "1.0.42",
+    },
+)
+
+# Production (follows --stamp) and always-stamped probes. stamp = 0 so
+# the binary crate itself does not take stable-status.txt; the version
+# comes from the leaf library.
+rust_binary(
+    name = "version_probe",
+    srcs = ["src/version_probe.rs"],
+    crate_root = "src/version_probe.rs",
+    edition = "2024",
+    stamp = 0,
+    visibility = ["//tools/boss/installer:__pkg__"],
+    deps = [":build-info"],
+)
+
+rust_binary(
+    name = "version_probe_stamped",
+    testonly = True,
+    srcs = ["src/version_probe.rs"],
+    crate_root = "src/version_probe.rs",
+    edition = "2024",
+    stamp = 0,
+    visibility = ["//tools/boss/installer:__pkg__"],
+    deps = [":build-info-stamped"],
 )

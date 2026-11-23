@@ -830,8 +830,8 @@ fn every_work_item_id_surface_routes_through_shared_resolver() {
 
     const HANDLER_MODULES: &[(&str, &str, &[&str])] = &[
         (
-            "main.rs",
-            include_str!("main.rs"),
+            "lib.rs",
+            include_str!("lib.rs"),
             &[
                 "resolve_work_item_ref_strict",
                 "resolve_work_item_ref",

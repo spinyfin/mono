@@ -2,12 +2,13 @@
 # Guard: non-release builds compile a constant placeholder version, and
 # stamped builds embed the tag-derived version from workspace-status.sh.
 #
-# build_info_rs is compiled into engine_lib, boss, and bossctl. If the
-# unstamped output read stable-status.txt, every new boss-v* tag would
-# change that file's action key and rebuild 40–80 downstream test
-# targets. Unstamped output must therefore be a byte-exact constant
-# (no stable-status.txt input). stamp=1 (always stamp) is the positive
-# control that --stamp still embeds STABLE_BOSS_BASE_VERSION.
+# build_info_rs is compiled only into the boss_build_info leaf crate. If
+# the unstamped output read stable-status.txt, every new boss-v* tag
+# would change that file's action key and rebuild the leaf plus every
+# binary that links it. Unstamped output must therefore be a byte-exact
+# constant (no stable-status.txt input). stamp=1 (always stamp) is the
+# positive control that --stamp still embeds STABLE_BOSS_BASE_VERSION.
+# engine_lib never compiles this file.
 #
 # Args:
 #   $1 — unstamped build_info_rs (stamp = -1, this test runs --nostamp)
@@ -17,6 +18,8 @@
 #   $5 — //tools/boss/cli:boss
 #   $6 — //tools/boss/bossctl
 #   $7 — unstamped build_provenance_rs (stamp = -1, this test runs --nostamp)
+#   $8 — unstamped //tools/boss/build-info:version_probe
+#   $9 — always-stamped //tools/boss/build-info:version_probe_stamped
 set -euo pipefail
 
 unstamped_rs="$1"
@@ -26,6 +29,8 @@ stamped_plist="$4"
 boss_bin="$5"
 bossctl_bin="$6"
 unstamped_provenance_rs="$7"
+unstamped_probe="$8"
+stamped_probe="$9"
 
 expect_line() {
   local file="$1" line="$2"
@@ -120,4 +125,16 @@ if [[ "$bossctl_version" != "bossctl 0.0.0-dev" ]]; then
   exit 1
 fi
 
-echo "OK: unstamped builds report 0.0.0-dev; stamped build_info_rs embeds ${stamped_version}."
+unstamped_probe_version="$("$unstamped_probe")"
+if [[ "$unstamped_probe_version" != "probe 0.0.0-dev" ]]; then
+  echo "ERROR: unstamped version_probe was '${unstamped_probe_version}', expected 'probe 0.0.0-dev'" >&2
+  exit 1
+fi
+
+stamped_probe_version="$("$stamped_probe")"
+if [[ "$stamped_probe_version" != "probe 1.0.42" ]]; then
+  echo "ERROR: stamped version_probe was '${stamped_probe_version}', expected 'probe 1.0.42'" >&2
+  exit 1
+fi
+
+echo "OK: unstamped builds report 0.0.0-dev; stamped leaf crate embeds ${stamped_version}."

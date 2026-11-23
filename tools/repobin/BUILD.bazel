@@ -25,6 +25,9 @@ rust_binary(
     crate_root = "src/main.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    # Bundled in the Boss engine/app; stamp = 0 so --config=release does not
+    # feed stable-status.txt into this rustc action on every release tag.
+    stamp = 0,
     visibility = [
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/engine/core:__pkg__",

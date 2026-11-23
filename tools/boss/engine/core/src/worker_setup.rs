@@ -984,7 +984,7 @@ fn log_guard_script_write(
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    let version = crate::build_info::version_string("boss-engine");
+    let version = crate::build_info::version();
     let git_sha = crate::build_info::git_sha();
     let binary_fingerprint = crate::build_info::binary_fingerprint();
     if existing_bytes_differ {

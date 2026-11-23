@@ -33,9 +33,11 @@ build --experimental_disk_cache_gc_max_age=7d
 # not --stamp is set. build_info_rs and boss_short_version_plist consume
 # those keys only under --stamp; unstamped builds write a constant
 # 0.0.0-dev placeholder and do not take stable-status.txt as an input, so
-# a new boss-v* tag does not rebuild engine_lib, boss, bossctl, or their
-# tests. build_provenance_rs still reads the sha on every build — that
-# crate is a leaf linked only by the engine binaries.
+# a new boss-v* tag does not rebuild the boss_build_info leaf crate,
+# engine_lib, or their tests. build_info_rs is compiled only into that
+# leaf crate; engine_lib never sees it. build_provenance_rs still reads
+# the sha on every build — that crate is a leaf linked only by the
+# engine binaries.
 #
 # --stamp is deliberately OFF for ordinary builds. rules_rust's rust_binary
 # defaults to `stamp = -1` (follow --stamp), and a stamped Rustc action takes
@@ -55,8 +57,11 @@ common --workspace_status_command=tools/boss/installer/workspace-status.sh
 # Release config: the same status script plus Bazel-level stamping, kept as a
 # named config so release.sh and the boss-release CI step can use
 # --config=release to embed the tag-derived version in About, --version,
-# and the published zip. A release build is a one-off, so the per-binary
-# recompiles --stamp causes do not matter there.
+# and the published zip. --stamp is what makes the leaf genrules
+# (build_info_rs, build_provenance_rs, version plist) read
+# stable-status.txt. Production rust_binary targets set stamp = 0 so
+# their rustc actions do not take that file; a new tag recompiles the
+# leaves and relinks.
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 

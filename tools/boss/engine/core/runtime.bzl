@@ -72,10 +72,6 @@ def runtime_libraries():
             "//tools/boss/event-shim:src/main.rs",
             "//tools/boss/engine/driver:agy_blocked_marker_capture",
             "remote/boss-remote-run.sh",
-            # Build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
-            # Unstamped: 0.0.0-dev placeholder. --stamp: tag-derived version.
-            # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
-            "//tools/boss/installer:build_info_rs",
             # Read by boss_construct_scan.rs's self-test to assert the CHECKS.yaml
             # boss-ism pattern stays byte-identical to BOSS_ID_RE.
             "//:CHECKS.yaml",
@@ -96,10 +92,6 @@ def runtime_libraries():
             "BOSS_EVENT_SHIM_SOURCE": "$(execpath //tools/boss/event-shim:src/main.rs)",
             # Native conformance captures are shared by all core test variants.
             "AGY_BLOCKED_MARKER_CAPTURE": "$(execpath //tools/boss/engine/driver:agy_blocked_marker_capture)",
-            # Absolute path to the generated build-info constants file.
-            # rules_rust prefixes $(execpath) values with ${pwd} and resolves
-            # them to absolute filesystem paths before invoking rustc.
-            "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
             # Absolute path to the root CHECKS.yaml, read by
             # boss_construct_scan.rs's self-test via include_str!(env!(...)). A
             # plain relative include_str! can't cross this package boundary: the
@@ -135,9 +127,11 @@ def runtime_libraries():
             "//tools/boss/engine/execution-contracts",
             "//tools/boss/engine/observation-contracts",
             "//lib/rust/git_utils",
-            # NOT "//tools/boss/build-provenance": that crate's source embeds
-            # the commit sha and changes every commit. It is linked only by the
-            # two `engine` rust_binary targets in `core/BUILD.bazel`, which hand the values to
+            # NOT "//tools/boss/build-provenance" and NOT "//tools/boss/build-info":
+            # those crates' generated source embeds the commit sha / tag-derived
+            # version, so they change on every commit or every boss-v* tag. They
+            # are linked only by the `engine` rust_binary targets in
+            # `core/BUILD.bazel`, which hand the values to
             # `build_info::install_provenance` at startup. See
             # `stamped_provenance_isolation_test` in `core/BUILD.bazel`.
             "//tools/boss/claude_client",
