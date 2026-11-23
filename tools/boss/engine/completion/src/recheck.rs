@@ -97,7 +97,9 @@ impl WorkerCompletionHandler {
                      declaration yet; declaration remains required — deferring proposal \
                      finalization",
                 );
-                return self.await_run_done_declaration(&execution, &proposed_pr_url).await;
+                return self
+                    .await_run_done_declaration(&execution, &proposed_pr_url, false)
+                    .await;
             }
             tracing::info!(
                 execution_id,

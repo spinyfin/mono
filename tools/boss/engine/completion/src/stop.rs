@@ -805,7 +805,7 @@ impl WorkerCompletionHandler {
                      declaration yet; declaration remains required — deferring proposal \
                      finalization",
                 );
-                return on_heap(|| self.await_run_done_declaration(&execution, &proposed_pr_url)).await;
+                return on_heap(|| self.await_run_done_declaration(&execution, &proposed_pr_url, true)).await;
             }
             let proposal_outcome = on_heap(|| {
                 self.finalize_pr_transition(
