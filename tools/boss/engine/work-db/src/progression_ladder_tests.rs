@@ -757,6 +757,65 @@ fn a_failed_launch_between_two_runs_that_died_neither_counts_nor_hides_them() {
     assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
 }
 
+const ENOTFOUND_ERROR: &str = "api_error (auto-resume attempt 1/3): API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+
+impl Fx {
+    fn set_error(&self, run: &str, error: &str) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute("UPDATE work_executions SET last_error = ?1 WHERE id = ?2", [error, run])
+            .unwrap();
+    }
+
+    fn environment_run(&self, id: &str, ago: i64) -> String {
+        let run = self.past_run(id, "orphaned", None, ago, "fp", S5);
+        self.set_error(&run, ENOTFOUND_ERROR);
+        run
+    }
+}
+
+#[test]
+fn two_enotfound_failures_are_retried_and_never_file_the_question() {
+    let fx = fx();
+    let id = fx.conflicted("DNS dropped while it was looking");
+    fx.environment_run(&id, 30 * HOUR);
+    fx.environment_run(&id, 20 * HOUR);
+
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(!fx.db.progression_clauses(&id).unwrap().unwrap().infrastructure_failing);
+    assert!(fx.open_question(&id).is_none());
+}
+
+#[test]
+fn two_progression_timeouts_still_file_the_infrastructure_question() {
+    let fx = fx();
+    let id = fx.conflicted("Genuinely out of time twice");
+    for ago in [30 * HOUR, 20 * HOUR] {
+        let run = fx.past_run(&id, "failed", None, ago, "fp", S5);
+        fx.set_error(&run, "progression-run-timeout: elapsed 1800s (limit 1800s)");
+    }
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (0, 1), "{pass:?}");
+    assert_eq!(pass.asked[0].reason, LadderReason::InfrastructureFailure);
+}
+
+#[test]
+fn a_question_filed_for_enotfound_runs_is_withdrawn_and_the_item_runs_again() {
+    let fx = fx();
+    let id = fx.conflicted("Asked about a DNS blip");
+    let first = fx.past_run(&id, "orphaned", None, 30 * HOUR, "fp", S5);
+    let second = fx.past_run(&id, "orphaned", None, 20 * HOUR, "fp", S5);
+    assert_eq!(fx.pass().asked.len(), 1);
+    fx.set_error(&first, ENOTFOUND_ERROR);
+    fx.set_error(&second, ENOTFOUND_ERROR);
+    let pass = fx.pass();
+    assert_eq!(pass.retracted, vec![id.clone()]);
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+}
+
 /// An item already parked on a question that was filed for two failed
 /// launches, while those still counted. The next pass takes the question back
 /// and nominates the item again, with nothing asked of the owner.

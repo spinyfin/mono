@@ -13,7 +13,7 @@
 //! | `ladder_exhausted` | two `progressed` runs in the episode were spent at the item's *current* fingerprint, so a third would face exactly what the second faced |
 //! | `worker_failed_cap` | the item is `blocked: worker_failed` and two `progressed` runs in the episode were spent on `S7_worker_failed`, **whatever the fingerprint was**: every failed redispatch yields a new terminal execution id, so the fingerprint alone never trips |
 //! | `no_action_streak` | the last three runs all judged `no_action` at the current fingerprint; one `no_action` files nothing and only earns the longer cooldown |
-//! | `infrastructure_failure` | the last two runs ended `failed \| orphaned \| abandoned`; the candidate view has already stopped nominating the item. A run that failed to launch is not one of them (see "Failed launches") |
+//! | `infrastructure_failure` | the last two runs ended `failed \| orphaned \| abandoned`; the candidate view has already stopped nominating the item. A run that failed to launch, or that died because the host could not reach the API, is not one of them (see "Failed launches") |
 //!
 //! ## The episode
 //!
@@ -44,17 +44,21 @@
 //! ## Failed launches
 //!
 //! A progression run whose agent never started (the spawn or its confirmation
-//! failed) is not an attempt on the item: no agent looked at it. Such a run is
-//! left out of the two runs the `infrastructure_failure` rung counts, so a
-//! driver whose launch is broken cannot turn the stuck items it is given into
-//! questions that blame the items. The item is retried when its separate launch backoff ends,
+//! failed) is not an attempt on the item: no agent looked at it. A run that
+//! started and then died because the host could not reach the API (DNS /
+//! ENOTFOUND / connection-refused) is the same: the agent never got to look at
+//! the item. Such a run is left out of the two runs the `infrastructure_failure`
+//! rung counts, so a driver whose launch is broken, or a laptop that slept and
+//! dropped DNS, cannot turn the stuck items it is given into questions that
+//! blame the items. The item is retried when its separate launch backoff ends,
 //! and the wait is reported by `WorkDb::progression_launch_backoff`.
 //!
-//! A question this rung filed while failed launches were still counted has no
-//! premise once they are not. Each pass withdraws such a question
-//! ([`retract_unwarranted_questions`]) and puts the item back as "keep trying"
-//! would, without the owner having to answer it. A question whose two runs did
-//! start and then died is untouched.
+//! A question this rung filed while failed launches or environment failures
+//! were still counted has no premise once they are not. Each pass withdraws
+//! such a question ([`retract_unwarranted_questions`]) and puts the item back
+//! as "keep trying" would, without the owner having to answer it. A question
+//! whose two runs did start and then died for a reason about the item is
+//! untouched.
 //!
 //! ## What is stored
 //!
@@ -185,9 +189,18 @@ pub struct LadderRun {
     /// attempt on the item, so the infrastructure-failure rung does not count it.
     #[builder(default)]
     pub launch_failed: bool,
+    /// The run died because the host could not reach the API. Not an attempt
+    /// on the item, so the infrastructure-failure rung does not count it.
+    #[builder(default)]
+    pub environment_failed: bool,
 }
 
 impl LadderRun {
+    /// True when this run is not evidence about the item.
+    fn skipped_as_item_failure(&self) -> bool {
+        self.launch_failed || self.environment_failed
+    }
+
     fn infrastructure_failure(&self) -> bool {
         matches!(self.status.as_str(), "failed" | "orphaned" | "abandoned")
     }
@@ -409,6 +422,8 @@ fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<Ladd
          ORDER BY x.created_at ASC, x.id ASC"
     ))?;
     let rows = stmt.query_map(params![item_id, since.secs, since.rowid], |row| {
+        let error: Option<String> = row.get(6)?;
+        let environment_failed = crate::progression_candidates::error_is_environment_failure(error.as_deref());
         Ok(LadderRun::builder()
             .execution_id(row.get::<_, String>(0)?)
             .status(row.get::<_, String>(1)?)
@@ -419,9 +434,10 @@ fn runs_since(conn: &Connection, item_id: &str, since: Floor) -> Result<Vec<Ladd
             .maybe_fingerprint(row.get::<_, Option<String>>(3)?)
             .maybe_stuck_kind(row.get::<_, Option<String>>(4)?)
             .maybe_summary(row.get::<_, Option<String>>(5)?)
-            .maybe_error(row.get::<_, Option<String>>(6)?)
+            .maybe_error(error)
             .created_at(row.get(7)?)
             .launch_failed(row.get(8)?)
+            .environment_failed(environment_failed)
             .build())
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -543,11 +559,12 @@ pub(crate) struct LadderRetraction {
 ///
 /// The one way an asked item stops being infrastructure-failing without an
 /// answer is that the runs the question counted are not counted any more:
-/// they were failed launches, which say nothing about the item (see the module
-/// documentation). The question's premise ("crashed or timed out twice in a row
-/// while looking at this item") was never true of them, so the engine takes
-/// its own question back instead of leaving the item parked on it. The ladder's
-/// reset point is not moved: there is nothing to forgive.
+/// they were failed launches or host-environment errors, which say nothing
+/// about the item (see the module documentation). The question's premise
+/// ("crashed or timed out twice in a row while looking at this item") was
+/// never true of them, so the engine takes its own question back instead of
+/// leaving the item parked on it. The ladder's reset point is not moved: there
+/// is nothing to forgive.
 pub(crate) fn retract_unwarranted_questions(
     tx: &mut rusqlite::Transaction<'_>,
     pending: &mut PendingEvents,
@@ -827,8 +844,9 @@ pub(crate) fn file_question(
     )?;
     if infrastructure {
         // The streak that tripped it, not the item's whole history. A failed
-        // launch is not part of the streak (the candidate view skips it too).
-        runs.retain(|run| !run.launch_failed);
+        // launch or host-environment error is not part of the streak (the
+        // candidate view skips it too).
+        runs.retain(|run| !run.skipped_as_item_failure());
         runs.drain(..runs.len().saturating_sub(INFRASTRUCTURE_FAILURE_CAP as usize));
     }
     let execution_id: String = conn

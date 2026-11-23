@@ -274,6 +274,73 @@ async fn exact_deadline_and_missing_start_time_use_the_published_limit() {
 }
 
 #[tokio::test]
+async fn a_suspend_gap_does_not_consume_the_run_timeout() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET started_at = ?1 WHERE id = ?2",
+            [&now.to_string(), &execution],
+        )
+        .unwrap();
+    let sweep = ProgressionTimeoutSweep::builder()
+        .work_db(db.clone())
+        .live_states(states)
+        .coordinator(coordinator.clone())
+        .pane_releaser(Arc::new(RecordingReaper::new(coordinator, db.clone())))
+        .hold_registry(Arc::new(crate::hold_registry::HoldRegistry::new()))
+        .dispatch_events(Arc::new(crate::dispatch_events::NoopDispatchEventSink))
+        .viewers(Arc::new(NoViewers))
+        .build();
+    assert_eq!(
+        sweep
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: now,
+                awake_secs: 0,
+            })
+            .await,
+        0
+    );
+    assert_eq!(
+        sweep
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: now + 8 * 3600,
+                awake_secs: 30,
+            })
+            .await,
+        0
+    );
+    assert_ne!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+    assert_eq!(
+        sweep
+            .run_deadline_pass(DeadlineClock {
+                wall_epoch_secs: now + 8 * 3600 + 30,
+                awake_secs: 60,
+            })
+            .await,
+        1
+    );
+    assert_eq!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_first_observation_after_a_long_wall_gap_is_treated_as_suspend() {
+    let (_dir, db, _item, execution, states, coordinator) = progression_fixture(Some(60)).await;
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET started_at = ?1 WHERE id = ?2",
+            [&now.saturating_sub(8 * 3600).to_string(), &execution],
+        )
+        .unwrap();
+    let reaper = RecordingReaper::new(coordinator.clone(), db.clone());
+    assert_eq!(sweep(&db, &states, &coordinator, &reaper).await, 0);
+    assert_ne!(db.get_execution(&execution).unwrap().status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
 async fn a_progression_run_inside_its_timeout_is_left_alone_even_when_it_looks_idle() {
     let (_dir, db, work_item_id, execution_id, live_states, coordinator) = progression_fixture(Some(3_600)).await;
     let before = description_of(&db, &work_item_id);

@@ -1716,3 +1716,53 @@ fn torn_down_driver_failures_count_toward_the_cap_without_launch_backoff() {
         f.assert_candidate(&id, false);
     }
 }
+
+const ENOTFOUND_ERROR: &str = "api_error (auto-resume attempt 1/3): API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+
+fn set_last_error(f: &Fixture, run: &str, error: &str) {
+    f.db.connect()
+        .unwrap()
+        .execute("UPDATE work_executions SET last_error = ?1 WHERE id = ?2", [error, run])
+        .unwrap();
+}
+
+#[test]
+fn enotfound_orphaned_runs_retry_and_do_not_count_as_infrastructure_failures() {
+    let f = fixture();
+    let id = f.stuck_chore("DNS dropped twice");
+    for ago in [30 * HOUR, 20 * HOUR] {
+        let run = finished_progression_run(&f, &id, ExecutionStatus::Orphaned, ago);
+        set_last_error(&f, &run, ENOTFOUND_ERROR);
+    }
+    let clauses = f.clauses(&id);
+    assert!(!clauses.infrastructure_failing && !clauses.in_cooldown, "{clauses:?}");
+    f.assert_candidate(&id, true);
+}
+
+#[test]
+fn a_recent_enotfound_run_uses_launch_backoff_not_the_calibrated_cooldown() {
+    let f = fixture();
+    let id = f.stuck_chore("DNS dropped a minute ago");
+    let run = finished_progression_run(&f, &id, ExecutionStatus::Orphaned, 60);
+    set_last_error(&f, &run, ENOTFOUND_ERROR);
+    let clauses = f.clauses(&id);
+    assert!(!clauses.infrastructure_failing && !clauses.in_cooldown, "{clauses:?}");
+    f.assert_candidate(&id, false);
+    assert_eq!(f.db.progression_launch_backoff().unwrap().unwrap().waiting_items, 1);
+}
+
+#[test]
+fn overloaded_api_errors_still_count_as_infrastructure_failures() {
+    let f = fixture();
+    let id = f.stuck_chore("API overloaded twice");
+    for ago in [30 * HOUR, 20 * HOUR] {
+        let run = finished_progression_run(&f, &id, ExecutionStatus::Orphaned, ago);
+        set_last_error(
+            &f,
+            &run,
+            "api_error (auto-resume attempt 3/3): API Error: overloaded_error",
+        );
+    }
+    assert!(f.clauses(&id).infrastructure_failing);
+    f.assert_candidate(&id, false);
+}
