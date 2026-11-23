@@ -171,6 +171,28 @@ pub(super) async fn handle_ci_failure_merge_rebase(ctx: CiFailureMergeRebaseCont
             return;
         }
 
+        // A Trunk intent whose `cancelPullRequest` is still owed cannot be
+        // retired by the post-rebase submit, so that submit would be refused
+        // after the branch was already force-pushed. Refuse before rebasing.
+        if matches!(
+            mechanism,
+            boss_engine_runtime::merge_mechanism::MergeMechanism::TrunkQueue { .. }
+        ) && let Ok(Some(active)) = work_db.get_active_trunk_merge_intent(&work_item_id)
+            && matches!(
+                active.last_trunk_state.as_deref(),
+                Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_WITHDRAW)
+                    | Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
+            )
+        {
+            refuse_merge_when_ready(
+                &sink,
+                &request_id,
+                &work_item_id,
+                "merge_when_ready: a previous queue withdrawal is still pending; try again shortly".to_owned(),
+            );
+            return;
+        }
+
         let base_branch = probe
             .base_ref_name
             .as_deref()

@@ -1199,7 +1199,7 @@ async fn direct_merge_executor_returning_pre_rebase_head_is_refused() {
     assert_eq!(rebase.rebased_head_sha, None);
 }
 
-/// C1: Trunk conflict handoff when a prior eviction left the active intent in
+/// Trunk conflict handoff when a prior eviction left the active intent in
 /// `'failed'` must stamp it `boss:superseded_by_conflict` so conflict
 /// retirement advances it to `boss:awaiting_resubmit` and the poller
 /// resubmits it to Trunk.
@@ -1317,7 +1317,7 @@ async fn rebase_conflict_on_trunk_with_failed_intent_stamps_superseded_and_resub
     server.verify().await;
 }
 
-/// C2: When the head wait sees the verified rebased SHA, the Direct merge
+/// When the head wait sees the verified rebased SHA, the Direct merge
 /// executor is pinned to that SHA rather than re-probing (even if an unpinned
 /// read would still return the pre-rebase SHA).
 #[tokio::test]
@@ -1362,7 +1362,7 @@ async fn direct_merge_pins_verified_rebased_head_without_reprobing_stale_sha() {
     assert_eq!(intent.head_sha, "head-rebased");
 }
 
-/// C3: When the first click times out waiting for GitHub to surface the
+/// When the first click times out waiting for GitHub to surface the
 /// rebased head, a second click once GitHub shows the new head and not-behind
 /// skips the rebase and arms the merge directly.
 #[tokio::test]
@@ -1435,10 +1435,11 @@ async fn retry_after_head_wait_timeout_arms_rebased_pr_without_rebasing_again() 
     assert_eq!(rebase.rebased_head_sha.as_deref(), Some("head-rebased"));
 }
 
-/// C4: Post-rebase Trunk retry must not retire an active `boss:withdraw`
-/// intent while its `cancelPullRequest` is still owed by the poller.
+/// A Merge click must not retire an active `boss:withdraw` intent while its
+/// `cancelPullRequest` is still owed by the poller, and must refuse before
+/// force-pushing a rebase that could never be submitted.
 #[tokio::test]
-async fn post_rebase_trunk_retry_refuses_while_withdraw_cancel_is_pending() {
+async fn trunk_merge_refuses_before_rebasing_while_withdraw_cancel_is_pending() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/submitPullRequest"))
@@ -1498,6 +1499,11 @@ async fn post_rebase_trunk_retry_refuses_while_withdraw_cancel_is_pending() {
         }
         other => panic!("expected WorkError refusal, got {other:?}"),
     }
+    assert_eq!(
+        cube.rebase_calls(),
+        0,
+        "refusal must happen before the rebase is pushed"
+    );
     let still_active = state
         .work_db
         .get_active_trunk_merge_intent(&chore_id)
@@ -1509,4 +1515,161 @@ async fn post_rebase_trunk_retry_refuses_while_withdraw_cancel_is_pending() {
         Some(boss_engine_merge_poller::trunk_merge::TRUNK_INTENT_WITHDRAW)
     );
     server.verify().await;
+}
+
+fn move_card_to_in_review(db: &WorkDb, work_item_id: &str) {
+    db.update_work_item(
+        work_item_id,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+/// After a first click pushes the rebase but times out waiting for the new
+/// head, an in-flight CI poll can return the card to review. The retry must
+/// still arm the rebased head: on Trunk, with the old intent left `failed`,
+/// that means retiring it and submitting exactly once, without rebasing again.
+#[tokio::test]
+async fn trunk_retry_after_head_wait_timeout_submits_once_after_card_returns_to_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/submitPullRequest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/418";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-old"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) =
+        seed_ci_blocked_chore(&state.work_db, "ci-trunk-retry-in-review", pr_url, false, true);
+    let failed_intent = state
+        .work_db
+        .insert_trunk_merge_intent(
+            boss_work_db::TrunkMergeIntentInsertInput::builder()
+                .work_item_id(&chore_id)
+                .pr_url(pr_url)
+                .pr_number(418)
+                .repo("spinyfin/mono")
+                .target_branch("main")
+                .build(),
+        )
+        .unwrap()
+        .expect("seeded intent");
+    state
+        .work_db
+        .record_trunk_merge_intent_state(&failed_intent.id, "failed")
+        .unwrap();
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    let first = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected refusal");
+    assert!(matches!(first.payload, FrontendEvent::WorkError { .. }));
+    assert_eq!(cube.rebase_calls(), 1);
+
+    // CI goes in flight on the rebased head: the card returns to review.
+    move_card_to_in_review(&state.work_db, &chore_id);
+    probe.set(failing_probe(pr_url, "head-rebased", "CLEAN"), false);
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    let second = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected accepted reply");
+    assert!(
+        matches!(second.payload, FrontendEvent::MergeWhenReadyAccepted { .. }),
+        "retry from review must submit the rebased PR, got {:?}",
+        second.payload
+    );
+    assert_eq!(cube.rebase_calls(), 1, "retry must not rebase a second time");
+    let rebase = state
+        .work_db
+        .get_ci_merge_rebase(&chore_id, pr_url)
+        .unwrap()
+        .expect("rebase marker updated");
+    assert_eq!(rebase.rebased_head_sha.as_deref(), Some("head-rebased"));
+    server.verify().await;
+}
+
+/// Same retry when CI on the rebased head went green before the click: the
+/// card is back in review and the Direct merge is still armed on the rebased
+/// head without a second rebase.
+#[tokio::test]
+async fn direct_retry_after_head_wait_timeout_arms_when_card_returned_to_review() {
+    let server = MockServer::start().await;
+    let pr_url = "https://github.com/spinyfin/mono/pull/419";
+    let direct_executor = Arc::new(FakeDirectMergeExecutor::returning("head-old"));
+    let cube = RebaseCube::clean_pushed();
+    let probe = ScriptedMergeProbe::new(failing_probe(pr_url, "head-old", "BEHIND"), true);
+    let (state, _temp) = test_server(
+        trunk_client_for(server.uri()),
+        direct_executor.clone(),
+        cube.clone(),
+        probe.clone(),
+    );
+    let (_product_id, chore_id) =
+        seed_ci_blocked_chore(&state.work_db, "ci-direct-retry-in-review", pr_url, false, false);
+    let sink = make_session_sink();
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    let first = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected refusal");
+    assert!(matches!(first.payload, FrontendEvent::WorkError { .. }));
+
+    // CI on the rebased head is green: the card is back in review.
+    move_card_to_in_review(&state.work_db, &chore_id);
+    probe.set(failing_probe(pr_url, "head-rebased", "CLEAN"), false);
+
+    handle_merge_when_ready(
+        dispatch_ctx(&state, &sink),
+        FrontendRequest::MergeWhenReady {
+            work_item_id: chore_id.clone(),
+            confirmed_revisions: vec![],
+        },
+    )
+    .await;
+    let second = tokio::time::timeout(Duration::from_secs(5), sink.next())
+        .await
+        .unwrap()
+        .expect("expected accepted reply");
+    assert!(matches!(second.payload, FrontendEvent::MergeWhenReadyAccepted { .. }));
+    assert_eq!(cube.rebase_calls(), 1);
+    assert_eq!(direct_executor.pinned_heads(), vec![Some("head-rebased".to_owned())]);
 }

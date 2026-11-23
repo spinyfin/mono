@@ -63,7 +63,18 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
             }
         };
         let ci_blocked_reason = if task_status == TaskStatus::InReview {
-            None
+            // A previous Merge click may have rebased the PR and pushed, then
+            // failed to arm (head-wait timeout, arming error). The pushed rebase
+            // abandons the CI remediations, so the next in-flight CI poll can
+            // move the card back to review. Keep routing such a click through
+            // the verified-head arming path until arming records the rebased
+            // head or a terminal outcome consumes the record.
+            pr_url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .and_then(|url| work_db.get_ci_merge_rebase(&work_item_id, url).ok().flatten())
+                .filter(|rebase| rebase.rebased_head_sha.is_none() && rebase.head_sha_before.is_some())
+                .map(|_| "ci_failure".to_owned())
         } else if task_status == TaskStatus::Blocked
             && matches!(blocked_reason.as_deref(), Some("ci_failure" | "ci_failure_exhausted"))
         {
