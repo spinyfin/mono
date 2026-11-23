@@ -3,8 +3,8 @@ use super::{short, support::*, timing, workspace_slack};
 
 pub(crate) use super::support::{
     FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, drive_resumed_deadline_pass, elapse,
-    fire_after_all_stored, fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_async,
-    until_elapsed, until_ready_after_stored,
+    fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_async, until_elapsed,
+    until_ready_after_stored,
 };
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
@@ -188,6 +188,23 @@ fn assert_never_failed(fx: &Fixture, execution_id: &str) {
     assert!(!row.status.is_terminal(), "{row:?}");
     assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
     assert_eq!(fx.db.list_executions(None).unwrap().len(), 1, "no second execution");
+}
+
+fn assert_parked_never_failed(fx: &Fixture, parked: &[WorkExecution]) {
+    for execution in parked {
+        let row = fx.db.get_execution(&execution.id).unwrap();
+        assert!(!row.status.is_terminal(), "{row:?}");
+        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    }
+}
+
+fn parked_without_charge(fx: &Fixture, execution_id: &str) -> bool {
+    fx.db
+        .get_execution(execution_id)
+        .unwrap()
+        .last_error
+        .as_deref()
+        .is_some_and(|err| err.contains("spoke lease unresolved"))
 }
 
 fn command_waiting(fx: &Fixture) -> bool {
@@ -1330,53 +1347,81 @@ async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released(
 
 #[tokio::test]
 async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_second_host() {
-    let fx = Fixture::with(workspace_slack(300)).await;
-    let env = env(&fx, 3).await;
-    let parked = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
-    let peer = fx
-        .spoke(
-            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
-            None,
-            0,
-        )
+    // The clock stays held and the fixture's liveness pulse cannot fire, so
+    // only the explicit advances below expire a command. Firing the 5s lease
+    // deadline on the default 2s pulse would close the stream; the 90s lease
+    // backstop would also fire if virtual time ran ahead of persist.
+    timing::hold();
+    timing::guarded(async {
+        let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
+        let env = env(&fx, 3).await;
+        let parked = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
+        let peer = fx
+            .spoke(
+                Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+                None,
+                0,
+            )
+            .await;
+        env.coordinator.kick();
+        // Observe the first stored lease before any virtual time passes.
+        // HOST_SLOTS is 1: the first attempt must park before the second
+        // persist can start. Advance only until that stored command parks,
+        // then hold the clock while the second persist runs so the 5s
+        // command deadline cannot overtake it.
+        timing::condition(|| peer.commands().iter().any(is_lease)).await;
+        timing::advancing(|| {
+            assert_parked_never_failed(&fx, &parked);
+            parked_without_charge(&fx, &parked[0].id)
+        })
         .await;
-    env.coordinator.kick();
-    fire_after_all_stored(
-        "an unanswered lease to be stored",
-        || peer.commands().iter().filter(|c| is_lease(c)).count(),
-        2,
-        Duration::from_secs(5),
-        HOST_SLOTS,
-    )
-    .await;
-    until("both unanswered leases to be parked", || {
-        parked.iter().all(|e| attention_open(&fx, &e.id))
+        // The park arms a 100 ms retry kick. Expire that timer, then wait
+        // with the clock held so the second persist cannot be overtaken by
+        // the 5s command deadline. Kick on each poll: a one-shot kick can
+        // be consumed while HOST_SLOTS=1 is still held, and
+        // `timing::condition` never moves the clock.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100) + TICK).await;
+        timing::condition(|| {
+            env.coordinator.kick();
+            assert_parked_never_failed(&fx, &parked);
+            peer.commands().iter().filter(|c| is_lease(c)).count() >= 2
+        })
+        .await;
+        timing::advancing(|| {
+            assert_parked_never_failed(&fx, &parked);
+            parked.iter().all(|e| attention_open(&fx, &e.id))
+        })
+        .await;
+        fx.db.set_host_enabled(HOST, false).unwrap();
+        fx.add_spoke_host("other", 8);
+        let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
+        let third = triage(&fx, &env, "third");
+        // Placement on the second host answers immediately. Hold the clock
+        // across persist and delivery: advancing here would spend virtual
+        // time against the 300 ms Spawn deadline while real I/O is still
+        // in flight. The park-delay timers were expired above. Kick on
+        // each poll so a wake consumed while the first host's slot is
+        // still draining is retried.
+        timing::condition(|| {
+            env.coordinator.kick();
+            assert_parked_never_failed(&fx, &parked);
+            other
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id)
+        })
+        .await;
+        assert!(
+            !peer
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id),
+            "the third execution must not spawn on the host whose leases are in doubt"
+        );
+        assert_parked_never_failed(&fx, &parked);
     })
     .await;
-    fx.db.set_host_enabled(HOST, false).unwrap();
-    fx.add_spoke_host("other", 8);
-    let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
-    let third = triage(&fx, &env, "third");
-    env.coordinator.kick();
-    until("the third execution to lease and spawn on the other host", || {
-        other
-            .commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id)
-    })
-    .await;
-    assert!(
-        !peer
-            .commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id),
-        "the third execution must not spawn on the host whose leases are in doubt"
-    );
-    for execution in &parked {
-        let row = fx.db.get_execution(&execution.id).unwrap();
-        assert!(!row.status.is_terminal(), "{row:?}");
-        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
-    }
 }
 
 #[tokio::test]

@@ -279,34 +279,6 @@ pub(crate) async fn fire_after_stored(stored_what: &str, stored: impl FnMut() ->
     elapse(deadline).await;
 }
 
-/// Freeze until `count` commands are persisted, then fire `deadline`.
-///
-/// `host_slots` is the host's concurrent assignment capacity. When it is
-/// less than `count`, attempts share a slot: fire `deadline` after each
-/// stored command so the next persist can start. When it is at least
-/// `count`, wait for every persist before firing, so a shared deadline
-/// cannot expire an in-flight append.
-pub(crate) async fn fire_after_all_stored(
-    first_what: &str,
-    mut stored_count: impl FnMut() -> usize,
-    count: usize,
-    deadline: Duration,
-    host_slots: usize,
-) {
-    let _clock = FrozenClock::new();
-    until(first_what, || stored_count() >= 1).await;
-    if host_slots >= count {
-        until("every unanswered command to be stored", || stored_count() >= count).await;
-    } else {
-        while stored_count() < count {
-            let target = stored_count() + 1;
-            elapse(deadline).await;
-            until("a later unanswered command to be stored", || stored_count() >= target).await;
-        }
-    }
-    elapse(deadline).await;
-}
-
 /// Freeze until spawn is stored and the pane pid is recorded, then advance
 /// virtual time until the prompt wait arms a Stop send. Persist still runs
 /// on wall time while the clock stays frozen, so the Stop deadline is not
