@@ -31,9 +31,10 @@
 -- task is done, so the engine has nothing to dispatch or recover.
 --
 -- Expected result over the whole history (also pinned by a test in the work
--- database): 19 runs = 14 measured, 2 partial (Grok, Antigravity: no cache
--- creation), 1 zero, 2 unmeasured (one pre-capture, one with a recorded
--- `usage_unavailable` reason); 3 executions with no task.
+-- database): 20 runs = 14 measured, 2 partial (Grok, Antigravity: no cache
+-- creation), 1 zero, 3 unmeasured (one pre-capture, one with a recorded
+-- `usage_unavailable` reason, one with no resolvable driver); 4 executions
+-- with no task.
 
 CREATE TEMP TABLE seed_clock (now INTEGER NOT NULL);
 INSERT INTO seed_clock VALUES (CAST(strftime('%s', 'now') AS INTEGER));
@@ -84,7 +85,10 @@ INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, cr
   ('exec_seed_j1', 'task_seed_j_design',     'product_design',              'completed', 'https://github.com/example/boss',  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 35 * 3600 FROM seed_clock),  'claude', 'opus',          'xhigh',  'local', NULL),
   ('exec_seed_t1', 'comment_seed_1',         'answer_agent',                'completed', 'https://github.com/example/boss',  (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'claude', 'sonnet',        'medium', 'local', NULL),
   ('exec_seed_t2', 'comparison_seed_1',      'pr_review_guide',             'completed', 'https://github.com/example/boss',  (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'codex',  'gpt-6-astra',   'high',   'local', NULL),
-  ('exec_seed_t3', 'automation_seed_1',      'automation_triage',           'completed', 'https://github.com/example/boss',  (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'claude', 'haiku',         'low',    'local', NULL);
+  ('exec_seed_t3', 'automation_seed_1',      'automation_triage',           'completed', 'https://github.com/example/boss',  (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'claude', 'haiku',         'low',    'local', NULL),
+  -- Taskless, not a pool-bound kind, NULL launch tuple: resolution returns
+  -- nothing, so driver_source stays unknown ("not recorded").
+  ('exec_seed_unresolved', 'not_a_task_seed', 'progression',                'completed', 'https://github.com/example/boss',  (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   (SELECT now - 4 * 3600 FROM seed_clock),   NULL,     NULL,            NULL,     'local', NULL);
 
 -- Runs. Token columns follow what each driver's capture records:
 --   * Claude: every class, with the 5m/1h cache-write split when the provider
@@ -113,6 +117,7 @@ INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, started_a
   ('run_seed_j1_1', 'exec_seed_j1', 'worker-2', 'completed', (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 36 * 3600 FROM seed_clock),  (SELECT now - 35 * 3600 FROM seed_clock),  'local', 'claude-opus-5-5',   900,    6500,  30000, 30000, 0,     480000, 20, 540000,  NULL),
   ('run_seed_t1_1', 'exec_seed_t1', 'answer-1', 'completed', (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   (SELECT now - 3 * 3600 FROM seed_clock),   'local', 'claude-sonnet-5-5', 400,    900,   3000,  3000,  0,     60000,  4,  60000,    NULL),
   ('run_seed_t2_1', 'exec_seed_t2', 'guide-1',  'completed', (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   (SELECT now - 2 * 3600 FROM seed_clock),   'local', 'gpt-6-astra',       40000,  1800,  0,     NULL,  NULL,  30000,  6,  90000,    NULL),
-  ('run_seed_t3_1', 'exec_seed_t3', 'triage-1', 'completed', (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'local', 'claude-haiku-5-5',  200,    300,   1000,  1000,  0,     20000,  2,  20000,    NULL);
+  ('run_seed_t3_1', 'exec_seed_t3', 'triage-1', 'completed', (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   (SELECT now - 1 * 3600 FROM seed_clock),   'local', 'claude-haiku-5-5',  200,    300,   1000,  1000,  0,     20000,  2,  20000,    NULL),
+  ('run_seed_unresolved_1', 'exec_seed_unresolved', 'worker-0', 'completed', (SELECT now - 4 * 3600 FROM seed_clock), (SELECT now - 4 * 3600 FROM seed_clock), (SELECT now - 4 * 3600 FROM seed_clock), 'local', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'No provider token usage observed');
 
 DROP TABLE seed_clock;

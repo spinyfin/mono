@@ -221,10 +221,10 @@ pub(crate) fn known_total(rec: &UsageRunRecord, coverage: RunCoverage) -> Option
 }
 
 pub(crate) fn driver_source(rec: &UsageRunRecord) -> DriverSource {
-    if rec.driver.as_deref().is_some_and(|driver| !driver.is_empty()) {
-        DriverSource::LaunchTuple
-    } else {
-        DriverSource::Unknown
+    match rec.driver.as_deref().filter(|driver| !driver.is_empty()) {
+        None => DriverSource::Unknown,
+        Some(_) if rec.driver_source == DriverSource::Resolved => DriverSource::Resolved,
+        Some(_) => DriverSource::LaunchTuple,
     }
 }
 

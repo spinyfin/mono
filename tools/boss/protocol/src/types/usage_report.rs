@@ -207,8 +207,13 @@ impl RunCoverage {
 pub enum DriverSource {
     /// Recorded at spawn on `work_executions.driver`.
     LaunchTuple,
-    /// Not recorded (executions from before the launch tuple). Shown as
-    /// "not recorded", never assumed to be Claude.
+    /// The launch tuple was NULL; filled from the same chain
+    /// `driver_transcript::resolve_execution_driver_slug` uses (`tasks.driver`
+    /// → product default → pool policy → engine default). This is the task's
+    /// current routing, not a frozen record of what ran.
+    Resolved,
+    /// Not recorded and not resolvable. Shown as "not recorded", never
+    /// assumed to be Claude.
     Unknown,
 }
 

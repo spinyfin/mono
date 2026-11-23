@@ -2960,6 +2960,9 @@ pub(crate) struct CostRowsArgs {
     /// Keep runs whose value for DIMENSION is one of the listed values, e.g.
     /// `--filter driver=claude,codex`. Repeat to filter on several
     /// dimensions: filters AND across dimensions and OR within one.
+    /// Repeating the same dimension unions its values, so
+    /// `--filter driver=claude --filter driver=codex` equals
+    /// `--filter driver=claude,codex`.
     #[arg(long = "filter", value_name = "DIMENSION=VALUE[,VALUE…]", value_parser = parse_usage_filter)]
     pub(crate) filters: Vec<boss_protocol::UsageFilter>,
 

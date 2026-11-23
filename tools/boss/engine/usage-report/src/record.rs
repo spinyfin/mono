@@ -6,6 +6,8 @@
 //! `None` exactly when the column is NULL; nothing here coalesces a NULL to a
 //! default, because a NULL token count means "unknown", never zero.
 
+use boss_protocol::DriverSource;
+
 /// One `work_runs` row with its owning execution. Task context is looked up
 /// by [`Self::work_item_id`] in [`UsageWindowRecords::tasks`]; an execution
 /// whose work item has no task row (answer agent, review guide, automation
@@ -42,8 +44,14 @@ pub struct UsageRunRecord {
     pub execution_finished_at_epoch_s: Option<i64>,
     pub execution_pr_url: Option<String>,
     pub execution_host_id: Option<String>,
-    /// `work_executions.driver`, written once at spawn.
+    /// Effective driver: the launch tuple when present, otherwise the slug
+    /// resolved for a NULL launch tuple, otherwise `None`.
     pub driver: Option<String>,
+    /// How [`Self::driver`] was obtained. Defaults to [`DriverSource::Unknown`]
+    /// so a test that only sets `driver` is still classified as a launch
+    /// tuple when the slug is present (see `classify::driver_source`).
+    #[builder(default = DriverSource::Unknown)]
+    pub driver_source: DriverSource,
     /// `work_executions.model`: the model alias the execution launched with.
     pub execution_model: Option<String>,
     /// `work_executions.effort_level`: the effort the execution launched with.

@@ -6,12 +6,15 @@
 //! [`WorkDb::usage_records_for_window`] is the same fetch widened for the
 //! usage rows request: every execution is kept (a left join to `tasks`, so the
 //! kinds that have no task row are not silently dropped), plus the launch
-//! tuple, timestamps and chain roots that request groups by. The builders
+//! tuple, timestamps and chain roots that request groups by. NULL launch
+//! tuples are then filled once per distinct execution from the same chain
+//! `driver_transcript::resolve_execution_driver_slug` uses. The builders
 //! live in `boss_usage_report`; this file still only fetches.
 
 use super::*;
 
 use boss_engine_storage_values::CostRunRecord;
+use boss_protocol::DriverSource;
 use boss_usage_report::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 
 const COST_RECORD_COLUMNS: &str = "
@@ -114,6 +117,13 @@ const USAGE_RUN_COLUMNS: &str = "
 ";
 
 fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
+    let driver: Option<String> = row.get(25)?;
+    let driver = driver.filter(|slug| !slug.is_empty());
+    let driver_source = if driver.is_some() {
+        DriverSource::LaunchTuple
+    } else {
+        DriverSource::Unknown
+    };
     Ok(UsageRunRecord {
         run_id: row.get(0)?,
         run_status: row.get(1)?,
@@ -140,10 +150,40 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         execution_finished_at_epoch_s: row.get(22)?,
         execution_pr_url: row.get(23)?,
         execution_host_id: row.get(24)?,
-        driver: row.get(25)?,
+        driver,
+        driver_source,
         execution_model: row.get(26)?,
         execution_effort: row.get(27)?,
     })
+}
+
+/// Fill a NULL launch tuple from [`WorkDb::get_execution_driver_slug`], once
+/// per distinct execution. That is the same chain
+/// `driver_transcript::resolve_execution_driver_slug` uses; calling it here
+/// (after the snapshot is released) avoids a lookup per run and avoids
+/// holding the pooled connection while that chain re-enters `WorkDb`.
+fn fill_resolved_drivers(db: &WorkDb, runs: &mut [UsageRunRecord]) -> Result<()> {
+    let mut resolved: HashMap<String, Option<String>> = HashMap::new();
+    for run in runs {
+        if run.driver.as_deref().is_some_and(|slug| !slug.is_empty()) {
+            continue;
+        }
+        if !resolved.contains_key(&run.execution_id) {
+            let slug = db.get_execution_driver_slug(&run.execution_id)?;
+            resolved.insert(run.execution_id.clone(), slug.filter(|s| !s.is_empty()));
+        }
+        match resolved.get(&run.execution_id).and_then(|slug| slug.as_deref()) {
+            Some(slug) => {
+                run.driver = Some(slug.to_owned());
+                run.driver_source = DriverSource::Resolved;
+            }
+            None => {
+                run.driver = None;
+                run.driver_source = DriverSource::Unknown;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Task columns of [`UsageTaskRecord`] in field order of [`map_usage_task_record`],
@@ -282,46 +322,53 @@ impl WorkDb {
     /// entry for them. The task list carries each referenced task plus its
     /// chain root, so a root with no run of its own in the window is available
     /// to nest its revisions under. Chain roots come from the same walk the
-    /// rest of the engine uses. All of it is read in one snapshot.
+    /// rest of the engine uses. All of it is read in one snapshot. After the
+    /// snapshot is released, executions whose launch tuple is NULL are
+    /// resolved once each via [`Self::get_execution_driver_slug`].
     pub fn usage_records_for_window(&self, since_epoch_s: i64, until_epoch_s: i64) -> Result<UsageWindowRecords> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
-        let sql = format!(
-            "SELECT {USAGE_RUN_COLUMNS}
-             FROM work_runs wr
-             JOIN work_executions we ON we.id = wr.execution_id
-             WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
-             ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
-        );
-        let runs = tx
-            .prepare(&sql)?
-            .query_map(params![since_epoch_s, until_epoch_s], map_usage_run_record)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut runs;
+        let tasks;
+        {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            let sql = format!(
+                "SELECT {USAGE_RUN_COLUMNS}
+                 FROM work_runs wr
+                 JOIN work_executions we ON we.id = wr.execution_id
+                 WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
+                 ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+            );
+            runs = tx
+                .prepare(&sql)?
+                .query_map(params![since_epoch_s, until_epoch_s], map_usage_run_record)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut work_item_ids: Vec<&str> = runs.iter().map(|run| run.work_item_id.as_str()).collect();
-        work_item_ids.sort_unstable();
-        work_item_ids.dedup();
-        let roots = chain_helpers::chain_roots(&tx, &work_item_ids)?;
-        let mut task_ids: Vec<&str> = work_item_ids.clone();
-        task_ids.extend(roots.values().map(String::as_str));
-        task_ids.sort_unstable();
-        task_ids.dedup();
+            let mut work_item_ids: Vec<&str> = runs.iter().map(|run| run.work_item_id.as_str()).collect();
+            work_item_ids.sort_unstable();
+            work_item_ids.dedup();
+            let roots = chain_helpers::chain_roots(&tx, &work_item_ids)?;
+            let mut task_ids: Vec<&str> = work_item_ids.clone();
+            task_ids.extend(roots.values().map(String::as_str));
+            task_ids.sort_unstable();
+            task_ids.dedup();
 
-        let sql = format!(
-            "SELECT {USAGE_TASK_COLUMNS}
-             FROM tasks t
-             LEFT JOIN products p ON p.id = t.product_id
-             LEFT JOIN projects pr ON pr.id = t.project_id
-             WHERE t.id IN (SELECT value FROM json_each(?1))
-             ORDER BY t.id"
-        );
-        let tasks = tx
-            .prepare(&sql)?
-            .query_map([query_ensure::id_array(&task_ids)], |row| {
-                map_usage_task_record(row, &roots)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        tx.commit()?;
+            let sql = format!(
+                "SELECT {USAGE_TASK_COLUMNS}
+                 FROM tasks t
+                 LEFT JOIN products p ON p.id = t.product_id
+                 LEFT JOIN projects pr ON pr.id = t.project_id
+                 WHERE t.id IN (SELECT value FROM json_each(?1))
+                 ORDER BY t.id"
+            );
+            tasks = tx
+                .prepare(&sql)?
+                .query_map([query_ensure::id_array(&task_ids)], |row| {
+                    map_usage_task_record(row, &roots)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            tx.commit()?;
+        }
+        fill_resolved_drivers(self, &mut runs)?;
         Ok(UsageWindowRecords { runs, tasks })
     }
 
@@ -636,10 +683,22 @@ mod tests {
     }
 
     fn insert_run(conn: &Connection, run_id: &str, execution_id: &str, work_item_id: &str, kind: &str, created: i64) {
+        insert_run_with_driver(conn, run_id, execution_id, work_item_id, kind, created, Some("claude"));
+    }
+
+    fn insert_run_with_driver(
+        conn: &Connection,
+        run_id: &str,
+        execution_id: &str,
+        work_item_id: &str,
+        kind: &str,
+        created: i64,
+        driver: Option<&str>,
+    ) {
         conn.execute(
             "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, driver)
-             VALUES (?1, ?2, ?3, 'completed', 'https://example.test/repo', ?4, 'claude')",
-            params![execution_id, work_item_id, kind, created.to_string()],
+             VALUES (?1, ?2, ?3, 'completed', 'https://example.test/repo', ?4, ?5)",
+            params![execution_id, work_item_id, kind, created.to_string(), driver],
         )
         .unwrap();
         conn.execute(
@@ -710,6 +769,91 @@ mod tests {
             "the root's run is outside the window but counted"
         );
         assert_eq!(rev.run_count_all_time, 1);
+    }
+
+    #[test]
+    fn a_launch_tuple_driver_wins_over_the_current_task_pin() {
+        use boss_protocol::DriverSource;
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "t", &product_id, "chore", None);
+        conn.execute("UPDATE tasks SET driver = 'codex' WHERE id = 't'", [])
+            .unwrap();
+        insert_run_with_driver(
+            &conn,
+            "run_launch",
+            "exec_launch",
+            "t",
+            "chore_implementation",
+            1_500,
+            Some("claude"),
+        );
+        drop(conn);
+
+        let records = db.usage_records_for_window(1_000, 2_000).unwrap();
+        assert_eq!(records.runs.len(), 1);
+        assert_eq!(records.runs[0].driver.as_deref(), Some("claude"));
+        assert_eq!(records.runs[0].driver_source, DriverSource::LaunchTuple);
+    }
+
+    #[test]
+    fn a_null_launch_tuple_resolves_from_the_task_pin() {
+        use boss_protocol::DriverSource;
+
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "t", &product_id, "chore", None);
+        conn.execute("UPDATE tasks SET driver = 'codex' WHERE id = 't'", [])
+            .unwrap();
+        insert_run_with_driver(
+            &conn,
+            "run_resolved",
+            "exec_resolved",
+            "t",
+            "chore_implementation",
+            1_500,
+            None,
+        );
+        conn.execute(
+            "INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, input_tokens, output_tokens)
+             VALUES ('run_resolved_2', 'exec_resolved', 'worker', 'completed', '1600', 5, 7)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let records = db.usage_records_for_window(1_000, 2_000).unwrap();
+        assert_eq!(records.runs.len(), 2);
+        for run in &records.runs {
+            assert_eq!(run.driver.as_deref(), Some("codex"));
+            assert_eq!(run.driver_source, DriverSource::Resolved);
+        }
+    }
+
+    #[test]
+    fn a_null_launch_tuple_that_cannot_resolve_stays_unknown() {
+        use boss_protocol::DriverSource;
+
+        let (_dir, db) = open_db();
+        let conn = db.connect().unwrap();
+        insert_run_with_driver(
+            &conn,
+            "run_unknown",
+            "exec_unknown",
+            "not_a_task",
+            "progression",
+            1_500,
+            None,
+        );
+        drop(conn);
+
+        let records = db.usage_records_for_window(1_000, 2_000).unwrap();
+        assert_eq!(records.runs.len(), 1);
+        assert_eq!(records.runs[0].driver, None);
+        assert_eq!(records.runs[0].driver_source, DriverSource::Unknown);
     }
 
     #[test]
@@ -789,7 +933,7 @@ mod tests {
             .expect("the seed fixture applies to a freshly migrated database");
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let records = db.usage_records_for_window(0, now + 86_400).unwrap();
-        assert_eq!(records.runs.len(), 19);
+        assert_eq!(records.runs.len(), 20);
 
         let query = |since: i64| {
             UsageRowsQuery::builder()
@@ -812,12 +956,12 @@ mod tests {
                 coverage.runs_zero,
                 coverage.runs_unmeasured
             ),
-            (19, 14, 2, 1, 2)
+            (20, 14, 2, 1, 3)
         );
         assert_eq!(
             report.taskless.len(),
-            3,
-            "answer agent, review guide and automation triage"
+            4,
+            "answer agent, review guide, automation triage and an unresolvable progression"
         );
         let drivers = report
             .dimension_values
@@ -845,7 +989,7 @@ mod tests {
             assert!(count(code) > 0, "the seed has no run with caveat {code}");
         }
         assert!(report.spans_capture_boundary);
-        assert!(report.overall.runs_unmeasured == 2 && report.overall.runs_zero == 1);
+        assert!(report.overall.runs_unmeasured == 3 && report.overall.runs_zero == 1);
 
         // Grok and Antigravity: measured but partial, and never priced even
         // though the Antigravity model name is one an API table could match.

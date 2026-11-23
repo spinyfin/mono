@@ -8,7 +8,7 @@ use boss_protocol::{
 use super::*;
 
 const CAPTURE_START: i64 = 1_785_144_180;
-const T0: i64 = 1_790_000_000;
+const BASE_EPOCH_S: i64 = 1_790_000_000;
 const DAY: i64 = 86_400;
 const RETENTION: i64 = 14 * DAY;
 
@@ -23,7 +23,7 @@ fn query(since: i64, until: i64) -> UsageRowsQuery {
 }
 
 fn window() -> UsageRowsQuery {
-    query(T0 - 100, T0 + 100_000)
+    query(BASE_EPOCH_S - 100, BASE_EPOCH_S + 100_000)
 }
 
 /// A completed Claude run with no recorded tokens, owned by `item`.
@@ -52,6 +52,12 @@ fn tokens(mut record: UsageRunRecord, input: i64, output: i64, cache_creation: i
 
 fn with_driver(mut record: UsageRunRecord, driver: Option<&str>) -> UsageRunRecord {
     record.driver = driver.map(str::to_owned);
+    record
+}
+
+fn with_resolved_driver(mut record: UsageRunRecord, driver: &str) -> UsageRunRecord {
+    record.driver = Some(driver.to_owned());
+    record.driver_source = DriverSource::Resolved;
     record
 }
 
@@ -117,8 +123,8 @@ fn an_unmeasured_run_is_excluded_from_every_sum_and_never_read_as_zero() {
         &window(),
         &records(
             vec![
-                tokens(run("r1", "e1", "t1", T0), 100, 50, 10, 5),
-                run("r2", "e1", "t1", T0 + 1),
+                tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 100, 50, 10, 5),
+                run("r2", "e1", "t1", BASE_EPOCH_S + 1),
             ],
             vec![task("t1", "t1", 2)],
         ),
@@ -149,7 +155,7 @@ fn an_unmeasured_run_is_excluded_from_every_sum_and_never_read_as_zero() {
 fn a_window_of_only_unmeasured_runs_reports_unknown_classes_not_zero() {
     let report = build(
         &window(),
-        &records(vec![run("r1", "e1", "t1", T0)], vec![task("t1", "t1", 1)]),
+        &records(vec![run("r1", "e1", "t1", BASE_EPOCH_S)], vec![task("t1", "t1", 1)]),
     );
     let overall = &report.overall;
     assert_eq!(overall.runs_measured, 0);
@@ -163,7 +169,7 @@ fn a_window_of_only_unmeasured_runs_reports_unknown_classes_not_zero() {
 fn a_missing_class_stays_unknown_and_makes_the_run_partial() {
     // Grok and Antigravity never report cache creation: the other classes are
     // present, that one is NULL.
-    let mut partial = run("r1", "e1", "t1", T0);
+    let mut partial = run("r1", "e1", "t1", BASE_EPOCH_S);
     partial.driver = Some("grok".into());
     partial.input_tokens = Some(2_486);
     partial.output_tokens = Some(115);
@@ -192,12 +198,12 @@ fn a_missing_class_stays_unknown_and_makes_the_run_partial() {
 
 #[test]
 fn per_class_nulls_never_collapse_into_zero_in_a_mixed_set() {
-    let mut output_only = run("r2", "e1", "t1", T0 + 1);
+    let mut output_only = run("r2", "e1", "t1", BASE_EPOCH_S + 1);
     output_only.output_tokens = Some(7);
     let report = build(
         &window(),
         &records(
-            vec![tokens(run("r1", "e1", "t1", T0), 10, 20, 30, 40), output_only],
+            vec![tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 10, 20, 30, 40), output_only],
             vec![task("t1", "t1", 2)],
         ),
     );
@@ -213,12 +219,12 @@ fn per_class_nulls_never_collapse_into_zero_in_a_mixed_set() {
 
 #[test]
 fn only_a_fully_recorded_zero_counts_as_zero() {
-    let mut input_zero_only = run("r2", "e1", "t1", T0 + 1);
+    let mut input_zero_only = run("r2", "e1", "t1", BASE_EPOCH_S + 1);
     input_zero_only.input_tokens = Some(0);
     let report = build(
         &window(),
         &records(
-            vec![tokens(run("r1", "e1", "t1", T0), 0, 0, 0, 0), input_zero_only],
+            vec![tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 0, 0, 0, 0), input_zero_only],
             vec![task("t1", "t1", 2)],
         ),
     );
@@ -236,16 +242,22 @@ fn only_a_fully_recorded_zero_counts_as_zero() {
 // ── Totals ────────────────────────────────────────────────────────────────
 
 fn mixed_records() -> UsageWindowRecords {
-    let mut codex = tokens(run("r3", "e3", "t2", T0 + 3), 500, 60, 0, 400);
+    let mut codex = tokens(run("r3", "e3", "t2", BASE_EPOCH_S + 3), 500, 60, 0, 400);
     codex.driver = Some("codex".into());
-    let mut review = tokens(run("r5", "e5", "comment_1", T0 + 5), 9, 9, 0, 0);
+    let mut review = tokens(run("r5", "e5", "comment_1", BASE_EPOCH_S + 5), 9, 9, 0, 0);
     review.execution_kind = "answer_agent".into();
     records(
         vec![
-            with_model(tokens(run("r1", "e1", "t1", T0), 100, 10, 5, 50), "claude-opus"),
-            with_model(tokens(run("r2", "e2", "rev1", T0 + 1), 40, 4, 2, 20), "claude-opus"),
+            with_model(
+                tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 100, 10, 5, 50),
+                "claude-opus",
+            ),
+            with_model(
+                tokens(run("r2", "e2", "rev1", BASE_EPOCH_S + 1), 40, 4, 2, 20),
+                "claude-opus",
+            ),
             codex,
-            run("r4", "e4", "rev2", T0 + 4),
+            run("r4", "e4", "rev2", BASE_EPOCH_S + 4),
             review,
         ],
         vec![
@@ -319,14 +331,14 @@ fn group_sums_equal_overall_at_each_level() {
 
 #[test]
 fn a_task_with_two_drivers_appears_under_both_groups_with_only_matching_executions() {
-    let mut codex = tokens(run("r2", "e2", "t1", T0 + 1), 5, 5, 0, 0);
+    let mut codex = tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 5, 5, 0, 0);
     codex.driver = Some("codex".into());
     let mut query = window();
     query.group_by = vec![UsageDimension::Driver];
     let report = build(
         &query,
         &records(
-            vec![tokens(run("r1", "e1", "t1", T0), 1, 1, 0, 0), codex],
+            vec![tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 1, 1, 0, 0), codex],
             vec![task("t1", "t1", 2)],
         ),
     );
@@ -370,7 +382,7 @@ fn a_root_with_no_runs_of_its_own_is_still_emitted_to_hold_its_revisions() {
     let report = build(
         &window(),
         &records(
-            vec![tokens(run("r1", "e1", "rev1", T0), 30, 3, 0, 0)],
+            vec![tokens(run("r1", "e1", "rev1", BASE_EPOCH_S), 30, 3, 0, 0)],
             vec![task("t1", "t1", 4), task("rev1", "t1", 1)],
         ),
     );
@@ -427,7 +439,7 @@ fn a_revision_whose_root_has_no_record_is_its_own_root() {
     let report = build(
         &window(),
         &records(
-            vec![tokens(run("r1", "e1", "rev1", T0), 1, 1, 0, 0)],
+            vec![tokens(run("r1", "e1", "rev1", BASE_EPOCH_S), 1, 1, 0, 0)],
             vec![task("rev1", "missing_root", 1)],
         ),
     );
@@ -441,7 +453,7 @@ fn runs_outside_window_counts_a_tasks_other_runs() {
     let report = build(
         &window(),
         &records(
-            vec![tokens(run("r1", "e1", "t1", T0), 1, 1, 0, 0)],
+            vec![tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 1, 1, 0, 0)],
             vec![task("t1", "t1", 6)],
         ),
     );
@@ -466,15 +478,15 @@ fn taskless_runs_are_listed_and_counted_in_overall() {
 
 #[test]
 fn the_window_is_half_open_on_run_created_at() {
-    let query = query(T0, T0 + 10);
+    let query = query(BASE_EPOCH_S, BASE_EPOCH_S + 10);
     let report = build(
         &query,
         &records(
             vec![
-                run("before", "e0", "t1", T0 - 1),
-                run("at_since", "e1", "t1", T0),
-                run("last", "e2", "t1", T0 + 9),
-                run("at_until", "e3", "t1", T0 + 10),
+                run("before", "e0", "t1", BASE_EPOCH_S - 1),
+                run("at_since", "e1", "t1", BASE_EPOCH_S),
+                run("last", "e2", "t1", BASE_EPOCH_S + 9),
+                run("at_until", "e3", "t1", BASE_EPOCH_S + 10),
             ],
             vec![task("t1", "t1", 4)],
         ),
@@ -493,7 +505,15 @@ fn truncation_keeps_the_most_recent_runs_and_says_so() {
     let mut query = window();
     query.run_cap = 3;
     let runs: Vec<_> = (0..5)
-        .map(|i| tokens(run(&format!("r{i}"), &format!("e{i}"), "t1", T0 + i), 1, 0, 0, 0))
+        .map(|i| {
+            tokens(
+                run(&format!("r{i}"), &format!("e{i}"), "t1", BASE_EPOCH_S + i),
+                1,
+                0,
+                0,
+                0,
+            )
+        })
         .collect();
     let report = build(&query, &records(runs, vec![task("t1", "t1", 5)]));
     assert!(report.truncated);
@@ -514,7 +534,7 @@ fn truncation_keeps_the_most_recent_runs_and_says_so() {
         &query,
         &records(
             (0..5)
-                .map(|i| run(&format!("r{i}"), &format!("e{i}"), "t1", T0 + i))
+                .map(|i| run(&format!("r{i}"), &format!("e{i}"), "t1", BASE_EPOCH_S + i))
                 .collect(),
             vec![task("t1", "t1", 5)],
         ),
@@ -525,9 +545,14 @@ fn truncation_keeps_the_most_recent_runs_and_says_so() {
 #[test]
 fn the_cap_applies_after_filters_so_a_narrow_filter_is_not_truncated_by_other_runs() {
     let mut codex_runs: Vec<_> = (0..4)
-        .map(|i| with_driver(run(&format!("c{i}"), &format!("ce{i}"), "t1", T0 + i), Some("codex")))
+        .map(|i| {
+            with_driver(
+                run(&format!("c{i}"), &format!("ce{i}"), "t1", BASE_EPOCH_S + i),
+                Some("codex"),
+            )
+        })
         .collect();
-    codex_runs.push(run("claude_run", "e_claude", "t1", T0 + 9));
+    codex_runs.push(run("claude_run", "e_claude", "t1", BASE_EPOCH_S + 9));
     let mut query = window();
     query.run_cap = 2;
     query.filters = vec![UsageFilter {
@@ -585,10 +610,13 @@ fn a_query_asking_for_three_levels_or_a_repeated_dimension_is_rejected() {
 fn two_driver_records() -> UsageWindowRecords {
     records(
         vec![
-            with_model(tokens(run("r1", "e1", "t1", T0), 1, 1, 0, 0), "claude-opus"),
-            with_model(tokens(run("r2", "e2", "t1", T0 + 1), 1, 1, 0, 0), "claude-sonnet"),
+            with_model(tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 1, 1, 0, 0), "claude-opus"),
+            with_model(
+                tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 1, 1, 0, 0),
+                "claude-sonnet",
+            ),
             with_driver(
-                with_model(tokens(run("r3", "e3", "t1", T0 + 2), 1, 1, 0, 0), "gpt"),
+                with_model(tokens(run("r3", "e3", "t1", BASE_EPOCH_S + 2), 1, 1, 0, 0), "gpt"),
                 Some("codex"),
             ),
         ],
@@ -627,6 +655,34 @@ fn filters_and_across_dimensions_and_or_within_one() {
 }
 
 #[test]
+fn repeated_filters_on_the_same_dimension_union_their_values() {
+    let mut query = window();
+    query.filters = vec![
+        filter(UsageDimension::Driver, &["claude"]),
+        filter(UsageDimension::Driver, &["codex"]),
+    ];
+    assert_eq!(
+        build(&query, &two_driver_records()).overall.runs_total,
+        3,
+        "two driver filters equal one comma-separated driver filter"
+    );
+
+    query.filters = vec![filter(UsageDimension::Driver, &["claude", "codex"])];
+    assert_eq!(build(&query, &two_driver_records()).overall.runs_total, 3);
+
+    query.filters = vec![
+        filter(UsageDimension::Driver, &["claude"]),
+        filter(UsageDimension::Driver, &["codex"]),
+        filter(UsageDimension::Model, &["gpt"]),
+    ];
+    assert_eq!(
+        build(&query, &two_driver_records()).overall.runs_total,
+        1,
+        "a different dimension still intersects"
+    );
+}
+
+#[test]
 fn dimension_values_count_what_each_value_would_add_ignoring_its_own_filter() {
     let mut query = window();
     query.filters = vec![filter(UsageDimension::Driver, &["claude"])];
@@ -657,7 +713,10 @@ fn dimension_values_carry_labels_and_name_an_absent_driver_not_recorded() {
     let report = build(
         &window(),
         &records(
-            vec![with_driver(tokens(run("r1", "e1", "t1", T0), 1, 1, 0, 0), None)],
+            vec![with_driver(
+                tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 1, 1, 0, 0),
+                None,
+            )],
             vec![task("t1", "t1", 1)],
         ),
     );
@@ -727,12 +786,12 @@ fn spend_class_follows_the_execution_kind_and_an_unknown_kind_is_unclassified() 
 
 #[test]
 fn a_tasks_spend_class_split_covers_its_direct_runs() {
-    let mut design = tokens(run("r2", "e2", "t1", T0 + 1), 7, 0, 0, 0);
+    let mut design = tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 7, 0, 0, 0);
     design.execution_kind = "project_design".into();
     let report = build(
         &window(),
         &records(
-            vec![tokens(run("r1", "e1", "t1", T0), 3, 0, 0, 0), design],
+            vec![tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 3, 0, 0, 0), design],
             vec![task("t1", "t1", 2)],
         ),
     );
@@ -750,8 +809,8 @@ fn the_driver_is_the_launch_tuple_or_unknown_never_assumed() {
         &window(),
         &records(
             vec![
-                tokens(run("r1", "e1", "t1", T0), 1, 1, 0, 0),
-                with_driver(tokens(run("r2", "e2", "t1", T0 + 1), 1, 1, 0, 0), None),
+                tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 1, 1, 0, 0),
+                with_driver(tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 1, 1, 0, 0), None),
             ],
             vec![task("t1", "t1", 2)],
         ),
@@ -765,6 +824,43 @@ fn the_driver_is_the_launch_tuple_or_unknown_never_assumed() {
         (executions[1].driver.as_deref(), executions[1].driver_source),
         (None, DriverSource::Unknown)
     );
+}
+
+#[test]
+fn a_resolved_driver_is_distinct_from_the_launch_tuple_and_from_unknown() {
+    let report = build(
+        &window(),
+        &records(
+            vec![
+                tokens(run("r1", "e1", "t1", BASE_EPOCH_S), 1, 1, 0, 0),
+                with_resolved_driver(tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 9, 1, 0, 4), "codex"),
+                with_driver(tokens(run("r3", "e3", "t1", BASE_EPOCH_S + 2), 1, 1, 0, 0), None),
+            ],
+            vec![task("t1", "t1", 3)],
+        ),
+    );
+    let executions = &report.tasks[0].executions;
+    assert_eq!(
+        (executions[0].driver.as_deref(), executions[0].driver_source),
+        (Some("claude"), DriverSource::LaunchTuple)
+    );
+    assert_eq!(
+        (executions[1].driver.as_deref(), executions[1].driver_source),
+        (Some("codex"), DriverSource::Resolved)
+    );
+    assert_eq!(
+        only_run_of(&executions[1]).input_convention,
+        InputConvention::Gross,
+        "classification uses the resolved slug"
+    );
+    assert_eq!(
+        (executions[2].driver.as_deref(), executions[2].driver_source),
+        (None, DriverSource::Unknown)
+    );
+}
+
+fn only_run_of(execution: &boss_protocol::ExecutionUsageNode) -> &boss_protocol::RunUsageRow {
+    &execution.runs[0]
 }
 
 // ── Caveats ───────────────────────────────────────────────────────────────
@@ -782,7 +878,10 @@ fn codes(codes: &[&str]) -> Vec<String> {
 fn caveat_codes_follow_each_case() {
     // A healthy Claude run still carries the standing subagent caveat.
     assert_eq!(
-        caveat_codes_of(with_model(tokens(run("r", "e", "t1", T0), 1, 1, 1, 1), "claude-opus")),
+        caveat_codes_of(with_model(
+            tokens(run("r", "e", "t1", BASE_EPOCH_S), 1, 1, 1, 1),
+            "claude-opus"
+        )),
         codes(&[caveat::SUBAGENTS_EXCLUDED])
     );
     // Created before capture existed, with no tokens and the stored reason.
@@ -801,16 +900,19 @@ fn caveat_codes_follow_each_case() {
     );
     // No driver recorded.
     assert_eq!(
-        caveat_codes_of(with_driver(run("r", "e", "t1", T0), None)),
+        caveat_codes_of(with_driver(run("r", "e", "t1", BASE_EPOCH_S), None)),
         codes(&[caveat::DRIVER_NOT_RECORDED])
     );
     // Codex input is gross.
     assert_eq!(
-        caveat_codes_of(with_driver(tokens(run("r", "e", "t1", T0), 9, 1, 0, 4), Some("codex"))),
+        caveat_codes_of(with_driver(
+            tokens(run("r", "e", "t1", BASE_EPOCH_S), 9, 1, 0, 4),
+            Some("codex")
+        )),
         codes(&[caveat::GROSS_INPUT])
     );
     // The literal synthetic marker, with the launched alias as detail.
-    let mut synthetic = with_model(tokens(run("r", "e", "t1", T0), 1, 1, 1, 1), "<synthetic>");
+    let mut synthetic = with_model(tokens(run("r", "e", "t1", BASE_EPOCH_S), 1, 1, 1, 1), "<synthetic>");
     synthetic.execution_model = Some("opus".into());
     let report = build(&window(), &records(vec![synthetic], vec![task("t1", "t1", 1)]));
     assert_eq!(
@@ -824,7 +926,7 @@ fn caveat_codes_follow_each_case() {
         "never replaced"
     );
     // No observed model: the launched alias stands in, marked.
-    let mut aliased = tokens(run("r", "e", "t1", T0), 1, 1, 1, 1);
+    let mut aliased = tokens(run("r", "e", "t1", BASE_EPOCH_S), 1, 1, 1, 1);
     aliased.execution_model = Some("opus".into());
     assert_eq!(
         caveat_codes_of(aliased),
@@ -836,7 +938,7 @@ fn caveat_codes_follow_each_case() {
 fn grok_and_antigravity_runs_carry_no_driver_no_capture_caveat() {
     // Both drivers now record tokens: a measured Grok run is partial, not unmeasured.
     for driver in ["grok", "agy"] {
-        let mut record = with_driver(run("r", "e", "t1", T0), Some(driver));
+        let mut record = with_driver(run("r", "e", "t1", BASE_EPOCH_S), Some(driver));
         record.input_tokens = Some(10);
         record.output_tokens = Some(2);
         record.cache_read_tokens = Some(5);
@@ -848,7 +950,7 @@ fn grok_and_antigravity_runs_carry_no_driver_no_capture_caveat() {
 
 #[test]
 fn a_partial_run_names_the_classes_it_does_not_report() {
-    let mut record = with_driver(run("r", "e", "t1", T0), Some("agy"));
+    let mut record = with_driver(run("r", "e", "t1", BASE_EPOCH_S), Some("agy"));
     record.input_tokens = Some(10);
     record.output_tokens = Some(2);
     record.cache_read_tokens = Some(5);
@@ -861,7 +963,7 @@ fn a_partial_run_names_the_classes_it_does_not_report() {
 
 #[test]
 fn a_reported_usage_unavailable_reason_becomes_a_caveat_and_stays_on_the_run() {
-    let mut record = run("r", "e", "t1", T0);
+    let mut record = run("r", "e", "t1", BASE_EPOCH_S);
     record.usage_unavailable =
         Some("One or more provider responses omit valid input, output, or cache-read usage".into());
     let report = build(&window(), &records(vec![record], vec![task("t1", "t1", 1)]));
@@ -916,9 +1018,12 @@ fn coverage_counts_each_caveat_once_per_run() {
 #[test]
 fn usd_is_excluded_by_driver_for_subscription_drivers_even_when_the_model_name_is_priced() {
     // The pricer would price anything: the exclusion must not rely on the model name.
-    let mut agy = with_model(tokens(run("a", "ea", "t1", T0), 1, 1, 1, 1), "gemini-4-neon");
+    let mut agy = with_model(tokens(run("a", "ea", "t1", BASE_EPOCH_S), 1, 1, 1, 1), "gemini-4-neon");
     agy.driver = Some("agy".into());
-    let mut grok = with_model(tokens(run("g", "eg", "t1", T0 + 1), 1, 1, 1, 1), "grok-4.5-build");
+    let mut grok = with_model(
+        tokens(run("g", "eg", "t1", BASE_EPOCH_S + 1), 1, 1, 1, 1),
+        "grok-4.5-build",
+    );
     grok.driver = Some("grok".into());
     let report = build_usage_rows_report(
         &window(),
@@ -940,19 +1045,25 @@ fn usd_is_excluded_by_driver_for_subscription_drivers_even_when_the_model_name_i
 
 #[test]
 fn usd_causes_follow_the_first_rule_that_applies() {
-    let mut codex = with_model(tokens(run("codex", "e1", "t1", T0), 9, 1, 0, 4), "gpt");
+    let mut codex = with_model(tokens(run("codex", "e1", "t1", BASE_EPOCH_S), 9, 1, 0, 4), "gpt");
     codex.driver = Some("codex".into());
     let no_driver = with_driver(
-        with_model(tokens(run("nodriver", "e2", "t1", T0 + 1), 1, 1, 1, 1), "claude-x"),
+        with_model(
+            tokens(run("nodriver", "e2", "t1", BASE_EPOCH_S + 1), 1, 1, 1, 1),
+            "claude-x",
+        ),
         None,
     );
-    let mut incomplete = with_model(run("incomplete", "e3", "t1", T0 + 2), "claude-x");
+    let mut incomplete = with_model(run("incomplete", "e3", "t1", BASE_EPOCH_S + 2), "claude-x");
     incomplete.input_tokens = Some(1);
-    let unknown = with_model(tokens(run("unknown", "e4", "t1", T0 + 3), 1, 1, 1, 1), "mystery");
-    let unmodelled = tokens(run("unmodelled", "e5", "t1", T0 + 4), 1, 1, 1, 1);
-    let unmeasured = run("unmeasured", "e6", "t1", T0 + 5);
+    let unknown = with_model(
+        tokens(run("unknown", "e4", "t1", BASE_EPOCH_S + 3), 1, 1, 1, 1),
+        "mystery",
+    );
+    let unmodelled = tokens(run("unmodelled", "e5", "t1", BASE_EPOCH_S + 4), 1, 1, 1, 1);
+    let unmeasured = run("unmeasured", "e6", "t1", BASE_EPOCH_S + 5);
     let priced = with_model(
-        tokens(run("priced", "e7", "t1", T0 + 6), 1_000, 100, 0, 0),
+        tokens(run("priced", "e7", "t1", BASE_EPOCH_S + 6), 1_000, 100, 0, 0),
         "claude-opus",
     );
     let report = build_usage_rows_report(
@@ -997,7 +1108,7 @@ fn usd_causes_follow_the_first_rule_that_applies() {
 
 #[test]
 fn every_usd_figure_carries_the_estimate_caveat_and_no_usd_is_made_unasked() {
-    let record = with_model(tokens(run("r", "e", "t1", T0), 1, 1, 1, 1), "claude-opus");
+    let record = with_model(tokens(run("r", "e", "t1", BASE_EPOCH_S), 1, 1, 1, 1), "claude-opus");
     let recs = records(vec![record], vec![task("t1", "t1", 1)]);
     let priced = build_usage_rows_report(&window(), &recs, Some(&priced_only_claude));
     assert!(

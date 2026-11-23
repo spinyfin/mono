@@ -14,7 +14,7 @@
 //! every sum, a class is unknown when any measured run lacks it, and nothing
 //! ever coalesces NULL to zero.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use boss_protocol::{
     CostBucket, CostMeasurement, ExecutionUsageNode, ModelUsage, RunCoverage, RunUsageRow, SpendClass, TaskUsageNode,
@@ -30,11 +30,12 @@ use crate::record::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 /// and the reply says so; nothing is dropped silently.
 ///
 /// Sized from a measurement on a synthetic database of production order
-/// (60,000 runs): the engine spends roughly 90 microseconds of CPU and sends
-/// roughly 1.6 KB of JSON per run in the reply, so 5,000 runs is about half a
-/// second of engine CPU and under 10 MB on the wire. The 20,000 first
-/// proposed in the design cost about two seconds and over 30 MB, which is not
-/// a table anyone can read or an app can decode comfortably.
+/// (60,000 runs, 90-day window of 45,004 runs, reply truncated to this cap):
+/// engine CPU p95 is about 870 ms over 20 calls and the compact JSON is about
+/// 12 MB. The 20,000 first proposed in the design was several seconds and
+/// tens of megabytes, which is not a table anyone can read or an app can
+/// decode comfortably. The 150 ms p95 budget is still missed; the next lever
+/// is classifying only the capped slice, not raising this cap.
 pub const DEFAULT_RUN_CAP: u32 = 5_000;
 
 /// Grouping depth the reply shape supports: the outer level and one subgroup level.
@@ -307,15 +308,34 @@ fn spend_class_buckets(want_usd: bool, runs: &[&RunFacts<'_>]) -> Vec<CostBucket
 // ── Filters, dimension values, coverage ───────────────────────────────────
 
 /// A filter with no values restricts nothing, so a client can send one chip
-/// row per dimension without special-casing an empty selection.
+/// row per dimension without special-casing an empty selection. Several
+/// filters on the same dimension union their values (OR within one
+/// dimension), matching the wire contract and a client that sends one chip
+/// row per value. Distinct dimensions still AND.
 fn passes_filters(facts: &RunFacts<'_>, filters: &[UsageFilter], skip: Option<UsageDimension>) -> bool {
-    filters
-        .iter()
-        .filter(|filter| Some(filter.dimension) != skip && !filter.values.is_empty())
-        .all(|filter| {
-            let (value, _) = dimension_value(facts, filter.dimension);
-            filter.values.contains(&value)
+    unioned_filter_values(filters, skip)
+        .into_iter()
+        .all(|(dimension, values)| {
+            let (value, _) = dimension_value(facts, dimension);
+            values.contains(value.as_str())
         })
+}
+
+fn unioned_filter_values(
+    filters: &[UsageFilter],
+    skip: Option<UsageDimension>,
+) -> BTreeMap<UsageDimension, HashSet<&str>> {
+    let mut by_dimension: BTreeMap<UsageDimension, HashSet<&str>> = BTreeMap::new();
+    for filter in filters {
+        if Some(filter.dimension) == skip || filter.values.is_empty() {
+            continue;
+        }
+        by_dimension
+            .entry(filter.dimension)
+            .or_default()
+            .extend(filter.values.iter().map(String::as_str));
+    }
+    by_dimension
 }
 
 fn dimension_values(in_window: &[RunFacts<'_>], filters: &[UsageFilter]) -> Vec<UsageDimensionValues> {
