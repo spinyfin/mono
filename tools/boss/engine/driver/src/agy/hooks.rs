@@ -6,6 +6,15 @@
 //! `deny`, or `deny_unless_prior_grant`. Native `SessionStart` is not a
 //! pre-prompt readiness signal; loaded hook counts are not authorization.
 //!
+//! An allowlist kind (AnswerAgent, ReviewGuide, Progression) is answered
+//! `deny_unless_prior_grant`, which leaves native file calls to the session's
+//! read grants. Its commands are decided here instead: the policy carries the
+//! kind's command prefixes as `command_grants`, and the adapter answers
+//! `auto_approve` for one simple command that a prefix covers, after the same
+//! structural checks and guards as every other call. The CLI's allow rules
+//! are not used for commands, because a rule whose program is a shell
+//! variable (`"$BOSS_BIN" propose`) grants only its exact text.
+//!
 //! The global-root progress map wires all six measured lifecycle events.
 //! Authorization replaces its single PreToolUse entry before atomic
 //! installation and content binding; the other five remain forwarders.
@@ -326,6 +335,10 @@ pub(super) fn expected_authorization_policy(
         .iter()
         .map(|(name, path)| (name.clone(), json!(path)))
         .collect();
+    // The kind's command allowlist. The adapter decides it, because the CLI's
+    // own allow rules cannot: see the permission renderer's module docs.
+    let command_grants = super::permissions::command_grants(worker_kind)
+        .with_context(|| format!("deriving agy command grants for {worker_kind:?}"))?;
     Ok(json!({
         "version": 1,
         "authorization_command": authorization_command(process_home, obs),
@@ -334,6 +347,9 @@ pub(super) fn expected_authorization_policy(
         "run_id": obs.run_id,
         "worker_kind": worker_kind_name(worker_kind),
         "approval": approval_for(worker_kind),
+        // Command prefixes answered `auto_approve` once the guards have passed.
+        // Only ever nonempty beside `deny_unless_prior_grant`.
+        "command_grants": command_grants,
         "workspace_path": obs.workspace_path.display().to_string(),
         "process_home": process_home.display().to_string(),
         "protected_paths": protected_paths(process_home, interception),
@@ -608,16 +624,28 @@ fn probe_authorization_with_timeout(
             }}
         })
     };
-    let positive = run(payload(if review_guide {
+    let positive_command = if review_guide {
         "cat boss-agy-auth-positive.txt"
     } else {
         "echo boss-agy-auth-positive"
-    }))?;
+    };
+    let positive = run(payload(positive_command))?;
     let denied = run(payload("sudo rm -rf /tmp/boss-agy-auth-denied-sentinel"))?;
     // Only the reused launch guard denies this command; structural policy allows
     // it. This checks deny liveness in addition to the adapter's own deny.
     let guard_denied = run(payload("open -a Boss"))?;
-    let expected = policy["approval"].as_str().context("approval")?;
+    // The harmless command gets the kind's own answer, unless the kind's
+    // allowlist grants its program outright: `cat` is a review-guide grant, and
+    // the adapter approves a granted command itself.
+    let program = positive_command.split(' ').next().unwrap_or_default();
+    let granted = policy["command_grants"]
+        .as_array()
+        .is_some_and(|grants| grants.iter().any(|grant| grant.as_str() == Some(program)));
+    let expected = if granted {
+        "auto_approve"
+    } else {
+        policy["approval"].as_str().context("approval")?
+    };
     if positive["decision"] != expected || denied["decision"] != "deny" || guard_denied["decision"] != "deny" {
         bail!(
             "pre-prompt authorization probe failed: positive={positive}, structural={denied}, reused_guard={guard_denied}"

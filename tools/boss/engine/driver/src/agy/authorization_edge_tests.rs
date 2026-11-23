@@ -201,6 +201,8 @@ fn engine_executable_variables_are_resolved_before_the_guards() {
             assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
         }
     }
+    // A progression run's grant names the program `BOSS_BIN` holds, so every
+    // spelling that resolves to it is the granted verb.
     let progression = Fixture::new("run-tool-vars-progression");
     progression.install(WorkerKind::Progression);
     for command in [
@@ -208,7 +210,7 @@ fn engine_executable_variables_are_resolved_before_the_guards() {
         "\"${BOSS_BIN}\" propose done --outcome delivered --summary ok",
     ] {
         let (body, stderr) = authorize_tools(&progression, command);
-        assert_eq!(decision(&body), "deny_unless_prior_grant", "{command}: {body} {stderr}");
+        assert_eq!(decision(&body), "auto_approve", "{command}: {body} {stderr}");
     }
 }
 
@@ -280,27 +282,28 @@ fn non_writing_kinds_deny_shell_mediated_writes_on_allowed_prefixes() {
             assert_eq!(decision(&body), "deny", "{kind:?} {command}: {body} {stderr}");
         }
     }
-    for kind in [
-        WorkerKind::AnswerAgent,
-        WorkerKind::ReviewGuide,
-        WorkerKind::Progression,
+    // The same commands without a write pass the structural checks. Whether
+    // one then runs is the kind's own command grants: a covered command is
+    // approved, and the rest keep the deny-by-default answer.
+    const GRANTED: &str = "auto_approve";
+    const UNGRANTED: &str = "deny_unless_prior_grant";
+    for (kind, gh, boss, sed) in [
+        (WorkerKind::AnswerAgent, UNGRANTED, UNGRANTED, UNGRANTED),
+        (WorkerKind::ReviewGuide, UNGRANTED, UNGRANTED, GRANTED),
+        (WorkerKind::Progression, GRANTED, GRANTED, UNGRANTED),
     ] {
         let fx = Fixture::new("run-nonwriting-reads");
         fx.install_with(kind, |c| {
             c.is_standard_worker = false;
         });
-        for command in [
-            "gh pr view 1 --repo spinyfin/mono 2>&1",
-            "gh pr view 1 > /dev/null",
-            "\"$BOSS_BIN\" pr status",
-            "sed -n '1,5p' f",
+        for (command, expected) in [
+            ("gh pr view 1 --repo spinyfin/mono 2>&1", gh),
+            ("gh pr view 1 > /dev/null", gh),
+            ("\"$BOSS_BIN\" pr status", boss),
+            ("sed -n '1,5p' f", sed),
         ] {
             let (body, stderr) = authorize_tools(&fx, command);
-            assert_eq!(
-                decision(&body),
-                "deny_unless_prior_grant",
-                "{kind:?} {command}: {body} {stderr}"
-            );
+            assert_eq!(decision(&body), expected, "{kind:?} {command}: {body} {stderr}");
         }
     }
 }
@@ -321,6 +324,10 @@ fn invalid_permission_posture_is_rejected_with_consistent_hashes() {
             Some(json!({"allow": [1], "deny": ["write_file(/tmp/fence)"]})),
         ),
         ("permissions", Some(json!({"allow": [], "deny": ["command(rm)"]}))),
+        (
+            "permissions",
+            Some(json!({"allow": ["command(gh pr view)"], "deny": ["write_file(/tmp/fence)"]})),
+        ),
         (
             "permissions",
             Some(json!({"allow": ["invalid"], "deny": ["write_file(/tmp/fence)"]})),

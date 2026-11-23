@@ -848,3 +848,6 @@ mod scratch_workspace_tests;
 
 #[path = "python_scratch_tests.rs"]
 mod python_scratch_tests;
+
+#[path = "command_grant_tests.rs"]
+mod command_grant_tests;

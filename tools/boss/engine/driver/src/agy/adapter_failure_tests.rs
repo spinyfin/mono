@@ -72,6 +72,11 @@ fn malformed_input_and_identity_fail_closed() {
         ("guards", json!([{"command":"true", "matcher":"unknown"}])),
         ("protected_paths", json!(false)),
         ("workspace_path", json!(12)),
+        ("command_grants", json!("gh pr view")),
+        ("command_grants", json!([1])),
+        ("command_grants", json!([" "])),
+        // A kind answered `auto_approve` has no allowlist to grant from.
+        ("command_grants", json!(["gh pr view"])),
     ] {
         let mut policy: Value = serde_json::from_slice(&policy_bytes).unwrap();
         policy[field] = value;

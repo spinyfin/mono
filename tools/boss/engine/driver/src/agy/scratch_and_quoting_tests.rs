@@ -143,16 +143,24 @@ fn own_conversation_reads_preserve_each_kinds_approval_posture() {
         let spill = conversation_dir(&fx).join(".system_generated/steps/3/output.txt");
         let payload = command_in(&fx, Some(CONVERSATION), &format!("cat {}", spill.display()));
         let (_, body, stderr) = authorize(&fx.process_home, &payload);
-        let expected = match kind {
+        let posture = match kind {
             WorkerKind::Standard | WorkerKind::Reviewer | WorkerKind::Triage => "auto_approve",
             WorkerKind::AnswerAgent | WorkerKind::ReviewGuide | WorkerKind::Progression => "deny_unless_prior_grant",
         };
-        assert_eq!(decision(&body), expected, "{kind:?}: {body} {stderr}");
+        // `cat` is a review-guide command grant; no other allowlist kind has it.
+        let cat = if kind == WorkerKind::ReviewGuide {
+            "auto_approve"
+        } else {
+            posture
+        };
+        assert_eq!(decision(&body), cat, "{kind:?}: {body} {stderr}");
+        // A native read is never a command grant: it stays with the session's
+        // read grants.
         let (read, detail) = verdict(
             &fx,
             &payload_for(Some(CONVERSATION), "read_file", json!({"Path": spill})),
         );
-        assert_eq!(read, expected, "{kind:?} read_file: {detail}");
+        assert_eq!(read, posture, "{kind:?} read_file: {detail}");
     }
 }
 

@@ -18,7 +18,7 @@ None of the three candidate expressions of a read-only Reviewer holds up. `toolP
 Express every worker kind's posture, Reviewer included, the same way:
 
 1. **Session settings** that pin the default agent mode and the review preset: `"agentMode": ""` and `"toolPermission": "request-review"`.
-2. **A `PreToolUse` hook that answers every tool call with a verdict.** `auto_approve` for what the kind may do, `deny` with a `reason` for what it may not. Kinds that run from an allowlist answer `deny_unless_prior_grant` and carry the allowlist in `permissions.allow`.
+2. **A `PreToolUse` hook that answers every tool call with a verdict.** `auto_approve` for what the kind may do, `deny` with a `reason` for what it may not. Kinds that run from an allowlist answer `deny_unless_prior_grant` and carry the allowlist in `permissions.allow`. (Amended 2026-11-23: only the native read grants go in `permissions.allow`. The hook decides the command grants too; see "An allow rule whose program is a shell variable" in section 5.)
 3. **`permissions.deny` only as a belt for the native file tools** (`write_file`, `edit_file`, `read_file`). Command denies belong in the hook's guard, not in rules.
 4. **None of** `--dangerously-skip-permissions`, `always-proceed`, `strict`, `--mode`, or `--sandbox` as the posture.
 
@@ -320,6 +320,34 @@ Under `deny_unless_prior_grant` with `command(cat)` allowed:
 | `cat $(touch x; echo inside.txt)` | **ran**, and the inner `touch` made `x` |
 
 An allow rule for a read-only command also allows that command with a redirect, and anything inside a command substitution. An allowlist of "safe" commands is not a write barrier.
+
+### An allow rule whose program is a shell variable grants only its exact text (added 2026-11-23, 1.5.14)
+
+Not from this study's sessions. This comes from progression runs dispatched on 1.5.14 on 2026-11-22 and 2026-11-23, read back from the CLI's own step records and from what the agents reported. Each run examined ended without declaring an outcome. The session allowlist was the progression table rendered as command rules, in two spellings of the Boss CLI, and the hook answered `deny_unless_prior_grant` for every call:
+
+| Allow rule in force                  | Command typed                            | Result                                                                 |
+| ------------------------------------ | ---------------------------------------- | ---------------------------------------------------------------------- |
+| `command(gh pr view)`                | `gh pr view 3338 --repo … --json …`      | ran                                                                    |
+| `command(gh pr checks)`              | `gh pr checks 3338 --repo …`             | ran                                                                    |
+| `command("$BOSS_BIN" task list)`     | `"$BOSS_BIN" task list`                  | ran                                                                    |
+|                                      | `"$BOSS_BIN" task list --product boss`   | **denied**                                                             |
+| `command("$BOSS_BIN" task show)`     | `"$BOSS_BIN" task show`                  | ran                                                                    |
+|                                      | `"$BOSS_BIN" task show <id>`             | **denied**                                                             |
+| `command("$BOSS_BIN" pr status)`     | `"$BOSS_BIN" pr status`                  | ran                                                                    |
+|                                      | `"$BOSS_BIN" pr status --json`           | **denied**                                                             |
+| `command("$BOSS_BIN" propose)`       | `"$BOSS_BIN" propose`                    | ran                                                                    |
+|                                      | `"$BOSS_BIN" propose --help`             | **denied**                                                             |
+|                                      | `"$BOSS_BIN" propose done --outcome … …` | **denied**                                                             |
+| `command(boss propose)` and the like | `boss task show <id>`                    | denied by the hook: the launch guard refuses a `PATH` lookup of `boss` |
+| none                                 | `gh pr list …`, `printenv BOSS_BIN`      | denied                                                                 |
+
+The denied steps carry `permission check failed for unsandboxed "<command>": Permission denied for unsandboxed(<command>)`, with the whole command as the resource.
+
+- **A rule of plain words is a word-by-word prefix. A rule whose program is a quoted shell variable matches the exact command text and nothing longer.** Why was not established: the rule's quoting, the `$`, or both.
+- **So an allowlist kind could run no Boss verb that takes an argument**, and the declaration that ends a progression run always takes several. The bare `boss` spelling is not a way round it while the launch guard is in the hook chain, and it always is.
+- **Command grants therefore belong to the hook as well.** The adapter answers `auto_approve` for a command the kind's allowlist covers, after its structural checks and guards, and `deny_unless_prior_grant` for everything else. `permissions.allow` carries only the native read grants. No command rule is rendered in either list.
+
+Not measured: whether a rule spelled some other way would match as a prefix (`command(regex:…)`, an `unsandboxed(…)` rule, an unquoted `$BOSS_BIN`), and whether a plain-word rule still matches a command that has a quoted argument. To measure what a progression run can execute on a signed-in host, run `bazel run //tools/boss/engine/driver:agy_progression_probe -- /tmp/agy-progression-evidence-$(uuidgen)`. It provisions the production progression posture, points `BOSS_BIN` at a stand-in that records its arguments, asks for two granted verbs and one ungranted verb, and passes only if exactly the granted ones reached the stand-in.
 
 ## 6. The sandbox
 

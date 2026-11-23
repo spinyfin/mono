@@ -193,6 +193,14 @@ rust_binary(
     deps = [":driver"] + all_crate_deps(normal = True),
 )
 
+rust_binary(
+    name = "agy_progression_probe",
+    srcs = ["bin/agy_progression_probe.rs"],
+    edition = "2024",
+    visibility = ["//visibility:private"],
+    deps = [":driver"] + all_crate_deps(normal = True),
+)
+
 filegroup(
     name = "agy_blocked_marker_capture",
     srcs = ["src/agy/testdata/blocked_marker_1.5.9.jsonl"],
