@@ -25,15 +25,34 @@ pub(crate) struct Guard {
 /// the Boss-launch guard is the only one that is always present, so this
 /// never returns empty as long as `config` reaches this function at all.
 pub(crate) fn guard_commands(config: &ToolUseInterceptionConfig) -> Vec<Guard> {
+    guard_commands_with_path_env(config, &[])
+}
+
+/// Same chain as [`guard_commands`], with extra `NAME=value` assignments on
+/// the path-guard command itself. Callers that need an additional trusted
+/// root (agy's conversation scratch) pass it here so it cannot land on a
+/// different guard if the chain grows.
+pub(crate) fn guard_commands_with_path_env(
+    config: &ToolUseInterceptionConfig,
+    path_env: &[(&str, &str)],
+) -> Vec<Guard> {
     let mut out = Vec::new();
 
     // 1. Path guard (data-dir sandbox). Matcher `*`: it inspects
     //    file_path/notebook_path/path on every tool, not just Bash.
     if let (Some(data_dir), Some(guard_script)) = (&config.data_dir, &config.path_guard_script) {
+        let mut assignments: Vec<String> = path_env
+            .iter()
+            .map(|(name, value)| format!("{name}={}", shell_quote(value)))
+            .collect();
+        assignments.push(format!(
+            "BOSS_DATA_DIR={dir}",
+            dir = shell_quote(&data_dir.display().to_string()),
+        ));
         out.push(Guard {
             command: format!(
-                "BOSS_DATA_DIR={dir} python3 {script}",
-                dir = shell_quote(&data_dir.display().to_string()),
+                "{env} python3 {script}",
+                env = assignments.join(" "),
                 script = shell_quote(&guard_script.display().to_string()),
             ),
             matcher: "*",

@@ -381,6 +381,8 @@ fn quoted_heredoc_and_single_quoted_python_bodies_are_data() {
     let fx = Fixture::new("run-quoted-python");
     fx.install(WorkerKind::Standard);
     seed_conversation(&fx);
+    fs::write(fx.workspace().join("script.py"), "print(1)\n").unwrap();
+    fs::write(fx.workspace().join("script<name.py"), "print(1)\n").unwrap();
     let scratch = conversation_dir(&fx).join("scratch");
     let scratch = scratch.display().to_string();
     let body = python_body(&scratch);
@@ -528,4 +530,292 @@ fn shell_bodies_are_still_inspected_and_python_bodies_are_not_run_as_shell() {
         assert_command_denied(&fx, command);
     }
     assert_command_allowed(&fx, "python3 -c 'print(`1`)  # not shell'");
+}
+
+fn relative_from(from_dir: &Path, to: &Path) -> PathBuf {
+    let from = fs::canonicalize(from_dir).unwrap();
+    let to = if to.exists() {
+        fs::canonicalize(to).unwrap()
+    } else {
+        to.to_path_buf()
+    };
+    let mut cursor = from.as_path();
+    let mut up = PathBuf::new();
+    loop {
+        if to.starts_with(cursor) {
+            return up.join(to.strip_prefix(cursor).unwrap());
+        }
+        match cursor.parent() {
+            Some(parent) => {
+                up.push("..");
+                cursor = parent;
+            }
+            None => return up.join(&to),
+        }
+    }
+}
+
+#[test]
+fn same_command_symlink_in_scratch_cannot_reach_protected_state() {
+    let fx = Fixture::new("run-scratch-ln-same");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let to_data = relative_from(&scratch, &data);
+    let to_hooks = relative_from(&scratch, &hooks);
+    std::os::unix::fs::symlink(&to_data, fx.workspace().join("prepared-up")).unwrap();
+    std::os::unix::fs::symlink(&to_data, fx.workspace().join("prepared-link")).unwrap();
+    fs::create_dir_all(scratch.join("d")).unwrap();
+    fs::write(scratch.join("d/state.db"), "decoy\n").unwrap();
+    fs::write(scratch.join("file"), "decoy\n").unwrap();
+    let home_scratch = format!("$HOME/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch");
+    for command in [
+        format!(
+            "ln -s {} {}/up && cat {}/up/state.db",
+            to_data.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "ln -s {} {}/hooks && cat {}/hooks",
+            to_hooks.display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "ln -s {} {home_scratch}/up && cat {home_scratch}/up/state.db",
+            to_data.display(),
+        ),
+        format!("ln -s {} {}/up", to_data.display(), scratch.display()),
+        format!("cp -s {} {}/up", to_data.display(), scratch.display()),
+        format!(
+            "python3 -c 'import os; os.symlink({:?}, {:?})' && cat {}/up/state.db",
+            to_data.to_string_lossy(),
+            scratch.join("up").to_string_lossy(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/up && cat {}/up/state.db",
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "cp -a {} {}/up && cat {}/up/state.db",
+            fx.workspace().join("prepared-link").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv {} {}/old-d && mv {} {}/d && cat {}/d/state.db",
+            scratch.join("d").display(),
+            fx.workspace().display(),
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "mv -f {} {}/file && cat {}/file",
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "cp -a {} {}/file && cat {}/file",
+            fx.workspace().join("prepared-link").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "ditto {} {}/planted && cat {}/planted/state.db",
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+        format!(
+            "bash -c 'mv {} {}/planted-bash' && cat {}/planted-bash/state.db",
+            fx.workspace().join("prepared-up").display(),
+            scratch.display(),
+            scratch.display()
+        ),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn two_command_bracket_glob_cannot_read_through_scratch_link() {
+    let fx = Fixture::new("run-scratch-ln-two");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    std::os::unix::fs::symlink(&data, scratch.join("up")).unwrap();
+    std::os::unix::fs::symlink(&hooks, scratch.join("hooks.json")).unwrap();
+    for command in [
+        format!("cat {}/[[:lower:]]p/state.db", scratch.display()),
+        format!("cat {}/[[=u=]]p/state.db", scratch.display()),
+        format!("cat {}/[[.u.]]p/state.db", scratch.display()),
+        format!("cat {}/[!x]p/state.db", scratch.display()),
+        format!("cat {}/[[:lower:]]ooks.json", scratch.display()),
+        format!("cat $HOME/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch/[[:lower:]]p/state.db"),
+        format!("cat ~/.gemini/antigravity-cli/brain/{CONVERSATION}/scratch/[[:lower:]]ooks.json"),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn python_bodies_cannot_open_settings_hooks_or_other_conversations() {
+    let fx = Fixture::new("run-python-body-scan");
+    fx.install(WorkerKind::Standard);
+    seed_conversation(&fx);
+    let settings = fx.process_home.join(".gemini/antigravity-cli/settings.json");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let other = brain(&fx).join("c2/scratch/x.py");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::write(&other, "print(1)\n").unwrap();
+    let scratch = conversation_dir(&fx).join("scratch");
+    fs::write(scratch.join("lib.rs"), "fn main() {}\n").unwrap();
+    fs::create_dir_all(scratch.join("work dir")).unwrap();
+    fs::write(scratch.join("work dir/file.rs"), "fn main() {}\n").unwrap();
+    for command in [
+        format!("python3 -c 'print(open(\"{}\").read())'", settings.display()),
+        format!("python3 -c 'print(open(\"{}\").read())'", hooks.display()),
+        format!("python3 -c 'print(open(\"{}\").read())'", other.display()),
+        format!("python3 - <<'PY'\nprint(open(\"{}\").read())\nPY", settings.display()),
+        format!("python3 - <<'PY'\nprint(open(\"{}\").read())\nPY", other.display()),
+        "python3 -c 'print(open(\"~/.gemini/antigravity-cli/settings.json\").read())'".to_owned(),
+        "python3 -c 'print(open(\"$HOME/.gemini/config/hooks.json\").read())'".to_owned(),
+        "python3 -c 'print(open(\"$HOME/.gemini/antigravity-cli/brain/c2/scratch/x.py\").read())'".to_owned(),
+        format!(
+            "python3 -c 'print(open(\"{}/work dir/../../.system_generated/logs/transcript_full.jsonl\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 - <<'PY'\nprint(open(\"{}/work dir/../../.system_generated/logs/transcript_full.jsonl\").read())\nPY",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'print(open(\"{}/\\x2e\\x2e/.system_generated/logs/transcript_full.jsonl\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'print(open(\"{}/\" \"../../../antigravity-cli/settings.json\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'import os; print(open(os.path.join(\"{}\", \"..\", \"..\", \"c2\", \"scratch\", \"x.py\")).read())'",
+            scratch.display()
+        ),
+        format!(
+            "python3 -c 'from pathlib import Path; print(open(Path(\"{}\") / \"..\" / \"..\" / \"c2\" / \"scratch\" / \"x.py\").read())'",
+            scratch.display()
+        ),
+        format!("echo 'print(open(\"{}\").read())' | python3", settings.display()),
+        format!(
+            "printf '%s' 'print(open(\"{}\").read())' | python3 -",
+            settings.display()
+        ),
+        format!(
+            "cat <<'PY' | python3 -\nprint(open(\"{}\").read())\nPY",
+            other.display()
+        ),
+        format!(
+            "uv run --python python3.12 python3 -c 'print(open(\"{}\").read())'",
+            settings.display()
+        ),
+        format!("python3.13t -c 'print(open(\"{}\").read())'", settings.display()),
+    ] {
+        let reason = assert_command_denied(&fx, &command);
+        assert!(
+            reason.contains("protected") || reason.contains("denied"),
+            "{command}: {reason}"
+        );
+    }
+    assert_command_allowed(
+        &fx,
+        &format!("python3 -c 'print(open(\"{}/lib.rs\").read())'", scratch.display()),
+    );
+    assert_command_allowed(
+        &fx,
+        &format!(
+            "python3 - <<'PY'\nprint(open(\"{}/lib.rs\").read())\nPY",
+            scratch.display()
+        ),
+    );
+    assert_command_allowed(
+        &fx,
+        &format!(
+            "python3 -c 'print(open(\"{}/work dir/file.rs\").read())'",
+            scratch.display()
+        ),
+    );
+    assert_command_allowed(
+        &fx,
+        &format!(
+            "python3 - <<'PY'\nprint(open(\"{}/work dir/file.rs\").read())\nPY",
+            scratch.display()
+        ),
+    );
+    for command in [
+        r#"python3 -c 'print(open(os.path.expanduser("~/\x2egemini/config/hooks.json")).read())'"#.to_owned(),
+        r#"python3 -c 'print(open(os.path.expanduser("~/\u002egemini/config/hooks.json")).read())'"#.to_owned(),
+        r#"python3 -c 'print(open(os.path.expanduser("~/\056gemini/config/hooks.json")).read())'"#.to_owned(),
+        "python3 - <<'PY'\nprint(open(os.path.expanduser(\"~/\\x2egemini/config/hooks.json\")).read())\nPY".to_owned(),
+        "python3 - <<'PY'\nprint(open(os.path.expanduser(\"~/\\u002egemini/config/hooks.json\")).read())\nPY"
+            .to_owned(),
+        "python3 - <<'PY'\nprint(open(os.path.expanduser(\"~/\\056gemini/config/hooks.json\")).read())\nPY".to_owned(),
+        format!(
+            "cd {} && python3 -c 'print(open(\"../.system_generated/logs/transcript_full.jsonl\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "cd {} && python3 - <<'PY'\nprint(open(\"../.system_generated/logs/transcript_full.jsonl\").read())\nPY",
+            scratch.display()
+        ),
+        format!(
+            "cd {} && python3 -c 'print(open(\"../../../../../../../state.db\").read())'",
+            scratch.display()
+        ),
+        format!(
+            "cd {} && python3 -c 'print(open(\"../../c2/scratch/x.py\").read())'",
+            scratch.display()
+        ),
+    ] {
+        let reason = assert_command_denied(&fx, &command);
+        assert!(
+            reason.contains("protected") || reason.contains("denied"),
+            "{command}: {reason}"
+        );
+    }
+    assert_command_allowed(&fx, "cat <<'EOF'\n~/.gemini/config/hooks.json\nsymlink\nEOF");
+    assert_command_allowed(&fx, "cat <<<'symlink ~/.gemini/config/hooks.json'");
+    assert_command_allowed(
+        &fx,
+        "python3 -c 'from pathlib import Path; print(Path(\"x\").is_symlink())'",
+    );
+    assert_command_allowed(&fx, "python3 -c 'import os; os.stat(\"x\", follow_symlinks=False)'");
+    assert_command_allowed(
+        &fx,
+        &format!("grep -rn symlink src && cat {}/lib.rs", scratch.display()),
+    );
+}
+
+#[test]
+fn unquoted_heredoc_apostrophe_does_not_hide_arithmetic() {
+    let fx = Fixture::new("run-unquoted-apostrophe");
+    fx.install(WorkerKind::Standard);
+    let reason = assert_command_denied(&fx, "cat <<EOF\ndon't\nEOF\nx='a''[$(id)]'\n(( x ))");
+    assert!(
+        reason.contains("cannot be inspected") || reason.contains("denied") || reason.contains("substitution"),
+        "{reason}"
+    );
 }

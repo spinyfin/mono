@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::home::{agy_homes_root, brain_link, process_home_for_run, session_settings_path_for_run};
-use crate::hook_guards::{Guard, guard_commands, write_executable};
+use crate::hook_guards::{Guard, guard_commands_with_path_env, write_executable};
 use crate::hook_settings::forwarder_command;
 use crate::{ProgressObservationConfig, ToolUseInterceptionConfig, WorkerKind};
 
@@ -238,8 +238,12 @@ fn collect_guard_artifact_paths(config: &ToolUseInterceptionConfig) -> Vec<(Stri
 
 /// Guard commands the execution requires: the shared Boss chain plus the
 /// adapter-only tool-surface and Reviewer/Triage publish guards.
-fn authorization_guards(worker_kind: WorkerKind, interception: &ToolUseInterceptionConfig) -> Vec<Guard> {
-    let mut guards = guard_commands(interception);
+fn authorization_guards(
+    worker_kind: WorkerKind,
+    interception: &ToolUseInterceptionConfig,
+    path_env: &[(&str, &str)],
+) -> Vec<Guard> {
+    let mut guards = guard_commands_with_path_env(interception, path_env);
     guards.push(Guard {
         command: format!(
             "python3 -c {}",
@@ -303,16 +307,16 @@ pub(super) fn expected_authorization_policy(
     obs: &ProgressObservationConfig,
     interception: &ToolUseInterceptionConfig,
 ) -> anyhow::Result<Value> {
-    let mut guards = authorization_guards(worker_kind, interception);
-    if interception.data_dir.is_some() && interception.path_guard_script.is_some() {
-        // Only agy supplies this trusted root; the shared guard validates the
-        // conversation id and permits only scratch and command-output steps/tasks.
-        guards[0].command = format!(
-            "BOSS_AGY_SCRATCH_ROOT={} {}",
-            shell_quote(&brain_link(process_home).display().to_string()),
-            guards[0].command
-        );
-    }
+    // Only agy supplies this trusted root; the shared guard validates the
+    // conversation id and permits only scratch and command-output steps/tasks.
+    // The assignment is attached at path-guard construction, not by index.
+    let scratch_root = brain_link(process_home).display().to_string();
+    let path_env: Vec<(&str, &str)> = if interception.data_dir.is_some() && interception.path_guard_script.is_some() {
+        vec![("BOSS_AGY_SCRATCH_ROOT", scratch_root.as_str())]
+    } else {
+        Vec::new()
+    };
+    let guards = authorization_guards(worker_kind, interception, &path_env);
     if guards.is_empty() {
         bail!("AgyDriver refuses to arm zero PreToolUse guards (ToolUseInterception declared)");
     }

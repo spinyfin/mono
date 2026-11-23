@@ -211,15 +211,22 @@ def has_inline_program(program, arguments):
     return False
 
 
-def stdin_comes_from_redirect(group, cwd):
+def stdin_comes_from_redirect(group, cwd, files_proven):
     """Accept one fixed fd-0 source, preserving quote provenance.
 
     Adjacent operators inside shlex words fail closed: they are shell syntax,
     while quoted angle brackets remain ordinary filename characters.
     """
     redirects = []
+    masks = getattr(group, 'literal_chars', None)
+    if masks is None:
+        # Lexer-fallback groups are plain lists with no quote provenance.
+        # A redirect cannot be proven, so STDIN_FLAGS / has_inline_program decide.
+        return False
     for index, token in enumerate(group):
-        literal = group.literal_chars[index]
+        if index >= len(masks) or len(masks[index]) != len(token):
+            return False
+        literal = masks[index]
         angles = [i for i, char in enumerate(token) if char in '<>' and not literal[i]]
         if not angles:
             continue
@@ -235,12 +242,27 @@ def stdin_comes_from_redirect(group, cwd):
         if operator not in ('<', '<<', '<<-', '<<<'):
             return False
         target = token[match.end():] or (group[index + 1] if index + 1 < len(group) else '')
-        redirects.append((operator, target))
+        target_index = index if token[match.end():] else (index + 1 if index + 1 < len(group) else index)
+        redirects.append((operator, target, target_index))
     if len(redirects) != 1:
         return False
-    operator, target = redirects[0]
+    operator, target, target_index = redirects[0]
     if operator != '<':
         return bool(target)
+    if not files_proven:
+        return False
+    # Command and process substitution in this group run before the redirect
+    # opens, so `python3 - < f "$(ln -sf /dev/tty f)"` can replace a proven
+    # regular file. Treat the redirect as unproven when this group contains
+    # that syntax, or a `$` / backtick in any token other than the target.
+    joined = ''.join(group)
+    if '$(' in joined or '`' in joined or '<(' in joined or '>(' in joined:
+        return False
+    for index, token in enumerate(group):
+        if index == target_index:
+            continue
+        if '$' in token or '`' in token:
+            return False
     # Expansions and preceding directory changes prevent proving which file
     # will be opened. Resolve symlinks before checking device roots and type.
     if not target or any(char in target for char in '$~*?[]`'):
@@ -257,13 +279,14 @@ def stdin_comes_from_redirect(group, cwd):
         try:
             return stat.S_ISREG(os.stat(resolved).st_mode)
         except FileNotFoundError:
-            # A missing file cannot supply live stdin; the shell fails open().
-            return True
+            # A missing file cannot be proven not to be created earlier in this
+            # command (`ln -s /dev/tty t && python3 - < t`, `mkfifo f; python3 - < f`).
+            return False
     except (OSError, ValueError):
         return False
 
 
-def stdin_channel_detail(group, cwd):
+def stdin_channel_detail(group, cwd, files_proven):
     """Why this argv opens a stdin-driven session, or None if it does not."""
     rest = strip_prefixes(group)
     if not rest:
@@ -281,7 +304,7 @@ def stdin_channel_detail(group, cwd):
     # `python3 - <<'PY'` and `sqlite3 db < script.sql` read a heredoc or file,
     # not a live session. A shell is excluded: the body it would read is a
     # script the other guards cannot attribute to a command of its own.
-    if program not in SHELLS and stdin_comes_from_redirect(group, cwd):
+    if program not in SHELLS and stdin_comes_from_redirect(group, cwd, files_proven):
         return None
 
     for argument in arguments:
@@ -335,16 +358,23 @@ def main():
     masked = review_guide_masked_command(command)
     if masked is not None:
         command = masked
-    cwd = payload.get("cwd", tool_input.get("cwd", tool_input.get("workdir", os.getcwd())))
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        cwd = tool_input.get("cwd", tool_input.get("workdir"))
     if not isinstance(cwd, str) or not os.path.isabs(cwd):
         cwd = None
+    # Unknown commands can change cwd or replace an existing regular file
+    # with a terminal link or FIFO. Only known neutral builtins preserve proof.
+    neutral_programs = {'true', 'false', ':', 'echo', 'printf', 'pwd'}
+    files_proven = True
     for group in command_groups(command):
-        rest = strip_prefixes(group)
-        if rest and os.path.basename(rest[0]) in ('cd', 'pushd', 'popd'):
-            cwd = None
-        detail = stdin_channel_detail(group, cwd)
+        detail = stdin_channel_detail(group, cwd, files_proven)
         if detail:
             emit("block", STDIN_CHANNEL_BLOCK.format(detail=detail))
+        if (not group or group[0] not in neutral_programs
+                or any(char in token for token in group for char in '<>$`')):
+            cwd = None
+            files_proven = False
 
     emit("approve")
 
@@ -548,6 +578,10 @@ mod tests {
 
     #[test]
     fn approves_interpreters_whose_stdin_is_a_heredoc_or_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("script.py"), "print(1)\n").unwrap();
+        std::fs::write(dir.path().join("script<name.py"), "print(1)\n").unwrap();
+        std::fs::write(dir.path().join("script.sql"), "select 1;\n").unwrap();
         for command in [
             "python3 - <<'PY'\nprint(1)\nPY",
             "python3 - <<PY\nprint(1)\nPY",
@@ -567,7 +601,11 @@ mod tests {
             "node - <<'JS'\nconsole.log(1)\nJS",
             "python3 - 2>/dev/null <<'PY'\nprint(1)\nPY",
         ] {
-            let (decision, reason) = bash(command);
+            let (decision, reason) = decide(serde_json::json!({
+                "tool_name": "Bash",
+                "cwd": dir.path(),
+                "tool_input": {"command": command},
+            }));
             assert_eq!(decision, "approve", "{command:?} reads a heredoc or file: {reason}");
         }
     }
@@ -641,6 +679,66 @@ mod tests {
             }));
             assert_eq!(decision, expected, "{target}: {reason}");
         }
+    }
+
+    #[test]
+    fn stdin_redirect_to_a_file_created_in_the_same_command_is_not_a_proven_file() {
+        for command in [
+            "ln -s /dev/tty t && python3 - < t",
+            "mkfifo f; python3 - < f",
+            "eval cd /dev; python3 - < tty",
+        ] {
+            let (decision, reason) = bash(command);
+            assert_eq!(decision, "block", "{command:?} still opens a stdin channel: {reason}");
+        }
+    }
+
+    #[test]
+    fn earlier_commands_invalidate_regular_file_redirect_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["f", "tty"] {
+            std::fs::write(dir.path().join(name), "print(1)\n").unwrap();
+        }
+        for command in [
+            "ln -sf /dev/tty f && python3 - < f".to_owned(),
+            "rm f; mkfifo f; python3 - < f".to_owned(),
+            "c=cd; $c /dev; python3 - < tty".to_owned(),
+            "echo replaced > f; python3 - < f".to_owned(),
+            format!("ln -sf /dev/tty {0}/f; python3 - < {0}/f", dir.path().display()),
+        ] {
+            let (decision, reason) = decide(serde_json::json!({
+                "tool_name": "Bash", "cwd": dir.path(),
+                "tool_input": {"command": command}
+            }));
+            assert_eq!(decision, "block", "{command}: {reason}");
+        }
+        for command in ["python3 - < f", "echo ok; python3 - < f"] {
+            let (decision, reason) = decide(serde_json::json!({
+                "tool_name": "Bash", "cwd": dir.path(),
+                "tool_input": {"command": command}
+            }));
+            assert_eq!(decision, "approve", "{command}: {reason}");
+        }
+        for command in [
+            r#"python3 - < f "$(ln -sf /dev/tty f)""#.to_owned(),
+            "python3 - < f `ln -sf /dev/tty f`".to_owned(),
+            "python3 - < f <(ln -sf /dev/tty f)".to_owned(),
+        ] {
+            let (decision, reason) = decide(serde_json::json!({
+                "tool_name": "Bash", "cwd": dir.path(),
+                "tool_input": {"command": command}
+            }));
+            assert_eq!(decision, "block", "{command} still opens a stdin channel: {reason}");
+        }
+    }
+
+    #[test]
+    fn lexer_fallback_groups_without_literal_chars_do_not_crash() {
+        // ANSI-C quotes with an escaped quote make shlex fail; command_groups
+        // then falls back to plain lists that have no literal_chars.
+        let (decision, reason) = bash(r#"python3 tools/x.py $'it\'s'"#);
+        assert_eq!(decision, "approve", "script argument must still be approved: {reason}");
+        assert!(reason.is_empty(), "{reason}");
     }
 
     #[test]

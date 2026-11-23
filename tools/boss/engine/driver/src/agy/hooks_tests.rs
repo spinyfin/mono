@@ -752,6 +752,40 @@ fn git_store_guard_refuses_store_writes_via_agy_payload() {
 }
 
 #[test]
+fn scratch_root_env_is_prefixed_onto_the_path_guard_command() {
+    let fx = Fixture::new("run-scratch-prefix");
+    let policy = expected_authorization_policy(
+        &fx.process_home,
+        WorkerKind::Standard,
+        &fx.obs(),
+        &fx.interception(|_| {}),
+    )
+    .unwrap();
+    let guards = policy["guards"].as_array().expect("guards");
+    let mut path_cmds = Vec::new();
+    for guard in guards {
+        let command = guard["command"].as_str().unwrap();
+        if command.contains("BOSS_DATA_DIR=") {
+            path_cmds.push(command);
+            assert!(
+                command.contains("BOSS_AGY_SCRATCH_ROOT="),
+                "path guard must carry the scratch root: {command}"
+            );
+            assert!(
+                command.find("BOSS_AGY_SCRATCH_ROOT=").unwrap() < command.find("BOSS_DATA_DIR=").unwrap(),
+                "{command}"
+            );
+        } else {
+            assert!(
+                !command.contains("BOSS_AGY_SCRATCH_ROOT="),
+                "scratch root must not land on a non-path guard: {command}"
+            );
+        }
+    }
+    assert_eq!(path_cmds.len(), 1, "{guards:?}");
+}
+
+#[test]
 fn guard_commands_always_includes_boss_launch_guard() {
     let config = ToolUseInterceptionConfig {
         data_dir: None,
@@ -765,7 +799,7 @@ fn guard_commands_always_includes_boss_launch_guard() {
         run_id: Some("run-1".into()),
         workspace_path: Some(PathBuf::from("/tmp/ws")),
     };
-    let guards = super::guard_commands(&config);
+    let guards = crate::hook_guards::guard_commands(&config);
     assert_eq!(guards.len(), 1, "{config:?}");
     assert_eq!(guards[0].command, crate::claude::BOSS_LAUNCH_GUARD_COMMAND);
     assert_eq!(guards[0].matcher, "Bash");
