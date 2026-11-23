@@ -169,45 +169,31 @@ fn retain_known_poll_value<'a>(prior: Option<&'a str>, incoming: &'a str) -> &'a
     incoming
 }
 
+#[derive(Debug, Default)]
+pub(super) enum CompletionHead<'a> {
+    Captured(&'a str),
+    #[default]
+    Unavailable,
+    Pending,
+}
+
 /// Optional trailing inputs for the inner worker PR-completion write,
 /// grouped so that method stays under clippy's `too_many_arguments` threshold.
 #[derive(Debug, Default, bon::Builder)]
 struct WorkerPrCompletionExtras<'a> {
-    pr_head_after: Option<&'a str>,
+    #[builder(default)]
+    head: CompletionHead<'a>,
     result_summary: Option<&'a str>,
     review_verdict: Option<ReviewVerdictInput>,
     superseded_by_pr: Option<&'a str>,
 }
-
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Record that a worker produced a PR for `execution_id`. In a single
-    /// transaction:
-    ///   - the linked task/chore moves to the column dictated by
-    ///     `target` (`in_review` for an open PR, `done` for a PR that
-    ///     was already merged at Stop time) and gets `pr_url`
-    ///     populated. If the task is already past the target column
-    ///     (`done`, `archived`), its status is left alone — the
-    ///     `pr_url` update still applies.
-    ///   - the execution transitions from `waiting_human` (or `running`)
-    ///     to `completed`, the cube workspace lease columns are
-    ///     cleared, `finished_at` is stamped,
-    ///   - the run summary is updated if a fresh summary is provided
-    ///     and the run hasn't already captured one.
-    ///
-    /// Returns `Ok(None)` if the execution has already been finalised
-    /// (terminal status), making this safe to call from a hook handler
-    /// that may fire repeatedly.
-    ///
-    /// `review_verdict`, when `Some`, is inserted into `pr_review_verdicts`
-    /// inside the SAME transaction as the writes below — see
-    /// [`crate::ReviewVerdictInput`]'s docs. Every non-`pr_review`
-    /// caller passes `None`.
-    pub fn record_worker_pr_completion(
+    pub(super) fn record_worker_pr_completion_with_head(
         &self,
         execution_id: &str,
         pr_url: &str,
-        pr_head_after: Option<&str>,
+        head: CompletionHead<'_>,
         result_summary: Option<&str>,
         target: WorkerPrCompletionTarget,
         review_verdict: Option<ReviewVerdictInput>,
@@ -217,7 +203,7 @@ impl WorkDb {
             pr_url,
             target,
             WorkerPrCompletionExtras::builder()
-                .maybe_pr_head_after(pr_head_after)
+                .head(head)
                 .maybe_result_summary(result_summary)
                 .maybe_review_verdict(review_verdict)
                 .build(),
@@ -252,11 +238,16 @@ impl WorkDb {
         extras: WorkerPrCompletionExtras<'_>,
     ) -> Result<Option<WorkerPrCompletion>> {
         let WorkerPrCompletionExtras {
-            pr_head_after,
+            head,
             result_summary,
             review_verdict,
             superseded_by_pr,
         } = extras;
+        let (pr_head_after, capture_state) = match head {
+            CompletionHead::Captured(sha) => (Some(sha), "recorded"),
+            CompletionHead::Unavailable => (None, "unavailable"),
+            CompletionHead::Pending => (None, "pending"),
+        };
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -341,6 +332,10 @@ impl WorkDb {
                  last_status_actor  = 'engine',
                  blocked_reason     = ?5,
                  blocked_attempt_id = NULL,
+                 review_required_state = CASE WHEN ?6 AND ?2 = 'active' THEN
+                     CASE WHEN review_required_state = 'automated_review' THEN review_required_state ELSE 'awaiting_admission' END
+                     WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL
+                     ELSE review_required_state END,
                  completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived') THEN ?4 END)
              WHERE id = ?1",
                 params![
@@ -348,7 +343,8 @@ impl WorkDb {
                     new_status.as_str(),
                     pr_url_for_task,
                     now,
-                    blocked_reason_for_task
+                    blocked_reason_for_task,
+                    matches!(target, WorkerPrCompletionTarget::PendingReview)
                 ],
             )?;
         }
@@ -385,9 +381,17 @@ impl WorkDb {
                  finished_at = ?2,
                  pr_url = ?3,
                  pr_head_after = ?4,
-                 superseded_by_pr = COALESCE(?5, superseded_by_pr)
+                 superseded_by_pr = COALESCE(?5, superseded_by_pr),
+                 pr_head_after_capture = CASE WHEN kind = 'pr_review' THEN NULL ELSE ?6 END
              WHERE id = ?1",
-            params![execution_id, now, pr_url, pr_head_after, superseded_by_pr],
+            params![
+                execution_id,
+                now,
+                pr_url,
+                pr_head_after,
+                superseded_by_pr,
+                capture_state
+            ],
         )?;
 
         // Update the most-recent run for this execution: if a summary is
@@ -1067,8 +1071,9 @@ impl WorkDb {
     /// cycle's terminal `pr_review` must not be treated as covering a new
     /// head.
     ///
-    /// A task qualifies immediately once an open
-    /// `pr_review_admission_deferred` attention item marks it as an actual
+    /// A task qualifies immediately when its review state is
+    /// `awaiting_admission`. Legacy rows also qualify when an open
+    /// `pr_review_admission_deferred` attention item marks an actual
     /// deferral (the deferral paths file exactly that marker). Absent that
     /// marker — e.g. an `AlreadyReviewed` hold, which files none — a task
     /// only qualifies once its `updated_at` is older than
@@ -1208,7 +1213,8 @@ impl WorkDb {
                        AND we.kind != 'pr_review'
                    )
                AND (
-                     EXISTS (
+                     t.review_required_state = 'awaiting_admission'
+                     OR EXISTS (
                        SELECT 1 FROM work_attention_items ai
                        WHERE ai.work_item_id = t.id
                          AND ai.kind = 'pr_review_admission_deferred'
@@ -1284,6 +1290,7 @@ impl WorkDb {
             "engine",
             "UPDATE tasks
              SET status            = 'in_review',
+                 review_required_state = CASE WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL ELSE review_required_state END,
                  updated_at        = ?2,
                  last_status_actor = 'engine'
              WHERE id = ?1
@@ -1341,6 +1348,7 @@ impl WorkDb {
             &format!(
                 "UPDATE tasks
              SET status            = 'in_review',
+                 review_required_state = CASE WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL ELSE review_required_state END,
                  updated_at        = ?2,
                  last_status_actor = 'engine'
              WHERE id = ?1
@@ -1392,6 +1400,7 @@ impl WorkDb {
             "engine",
             "UPDATE tasks
              SET status            = 'in_review',
+                 review_required_state = CASE WHEN review_required_state IN ('awaiting_admission', 'automated_review') THEN NULL ELSE review_required_state END,
                  pr_url            = ?2,
                  updated_at        = ?3,
                  last_status_actor = 'engine',

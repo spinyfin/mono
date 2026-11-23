@@ -669,6 +669,7 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         pr_head_after: row.get(29)?,
         last_error: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
         superseded_by_pr: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
+        pr_head_after_capture: row.get(32)?,
     })
 }
 
