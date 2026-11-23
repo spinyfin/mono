@@ -94,7 +94,6 @@ struct WorkNavigatorReview: View {
             ScrollView {
                 ReviewGuideViewerHeader(
                     chatModel: model, rootTaskId: root.id, generatedAt: content?.generatedAt,
-                    findingsInitiallyExpanded: false,
                     inlineGuide: InlineReviewGuideHeader(
                         versionID: reader?.versionID, comparisonID: content?.comparisonId,
                         artifact: artifact,

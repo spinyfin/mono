@@ -814,16 +814,26 @@ final class MarkdownDocumentChromeTests: XCTestCase {
             artifact: .reviewGuide(seriesID: "prgs_1", versionID: "prgv_1")
         )
 
-        func headerHeight(findings: ReviewGuideFindings?, expanded: Bool) -> CGFloat {
+        func headerHeight(findings: ReviewGuideFindings?, expanded: Bool?) -> CGFloat {
             model.reviewGuideFindingsBySeriesID["prgs_1"] = findings
             let probe = HeightProbe()
-            let view = VStack(spacing: 0) {
-                ReviewGuideViewerHeader(
+            let header: ReviewGuideViewerHeader
+            if let expanded {
+                header = ReviewGuideViewerHeader(
                     chatModel: model,
                     rootTaskId: task.id,
                     generatedAt: "2026-09-16T00:00:00Z",
                     findingsInitiallyExpanded: expanded
                 )
+            } else {
+                header = ReviewGuideViewerHeader(
+                    chatModel: model,
+                    rootTaskId: task.id,
+                    generatedAt: "2026-09-16T00:00:00Z"
+                )
+            }
+            let view = VStack(spacing: 0) {
+                header
                 .onGeometryChange(for: CGFloat.self, of: \.size.height) { probe.height = $0 }
                 Color.clear
             }
@@ -858,8 +868,13 @@ final class MarkdownDocumentChromeTests: XCTestCase {
         let bare = headerHeight(findings: nil, expanded: true)
         let twoExpanded = headerHeight(findings: two, expanded: true)
         let twoCollapsed = headerHeight(findings: two, expanded: false)
+        let twoDefault = headerHeight(findings: two, expanded: nil)
         let fifteenExpanded = headerHeight(findings: fifteen, expanded: true)
         XCTAssertGreaterThan(bare, 0)
+        XCTAssertEqual(
+            twoDefault, twoCollapsed, accuracy: 1,
+            "a guide with no saved expansion starts collapsed"
+        )
 
         // Status line + disclosure row + two one-line bullets: well under
         // the cap.

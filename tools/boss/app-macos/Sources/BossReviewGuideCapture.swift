@@ -10,7 +10,8 @@ import SwiftUI
 ///   update is pending with no tracked findings: a status line and an
 ///   empty addendum.
 /// - `--capture-findings-collapsed` — start with the addendum disclosure
-///   collapsed instead of expanded.
+///   collapsed (the live viewer default). Omit it to photograph the
+///   expanded list.
 /// - `--capture-attachments=<n>` and `--capture-attachment-image=<png>` —
 ///   seed registered evidence using a local screenshot (default: no evidence).
 ///
