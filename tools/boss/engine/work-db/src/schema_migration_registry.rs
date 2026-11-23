@@ -428,6 +428,20 @@ pub(super) fn all() -> Vec<Migration> {
             apply: merge_intent::migrate,
         },
         Migration {
+            id: "20261122_0400_merged_findings_disposition".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "pr_review_batches", "merged_findings_disposition")? {
+                    conn.execute_batch(
+                        "ALTER TABLE pr_review_batches ADD COLUMN merged_findings_disposition TEXT
+                         CHECK (merged_findings_disposition IS NULL
+                                OR merged_findings_disposition IN ('followup', 'below_gate', 'unreadable'))",
+                    )?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: "20261117_0212_no_op_completion_ready".into(),
             legacy_version: None,
             apply: |conn| {

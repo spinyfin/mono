@@ -135,6 +135,7 @@ pub async fn reconcile_batch(
     }
 
     let in_review = candidates_for_pr_urls(work_db.list_chores_pending_merge_check(), &wanted);
+    let reviewing = candidates_for_pr_urls(work_db.list_reviewing_chores_pending_merge_check(), &wanted);
     let blocked_conflict = candidates_for_pr_urls(work_db.list_chores_blocked_on_merge_conflict(), &wanted);
     let blocked_ci = candidates_for_pr_urls(work_db.list_chores_blocked_on_ci_failure(), &wanted);
     let blocked_other = candidates_for_pr_urls(work_db.list_chores_blocked_other_with_pr(), &wanted);
@@ -146,6 +147,7 @@ pub async fn reconcile_batch(
     let mut probe_seen = std::collections::HashSet::new();
     let probe_urls: Vec<String> = in_review
         .iter()
+        .chain(reviewing.iter())
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
@@ -167,6 +169,11 @@ pub async fn reconcile_batch(
     let mut seen = std::collections::HashSet::new();
     for candidate in in_review
         .iter()
+        .chain(
+            reviewing
+                .iter()
+                .filter(|candidate| super::pass::probed_merged(&probe_results, &candidate.pr_url)),
+        )
         .chain(blocked_conflict.iter())
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())

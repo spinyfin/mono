@@ -125,6 +125,31 @@ pub(crate) fn apply_pending_review_verdicts(
             }
         }
     }
+    // A merge can settle the root before recovery sees its dead supervisor.
+    // Reuse the reaper so this also converges when no open PR remains for the
+    // merge poller to visit. Accepted reports survive the reaper transaction.
+    // A reaper error must not skip preservation: the merge poller already
+    // warns and continues, and this sweep is the recovery path when no
+    // open PR remains for the poller to visit.
+    match db.reap_inert_review_batches(crate::work::REVIEW_BATCH_STALE_SECS) {
+        Ok(ids) => {
+            stats.reaped = ids.len();
+            if !ids.is_empty() {
+                tracing::info!(
+                    reaped = ids.len(),
+                    ?ids,
+                    "review-verdict apply sweep reaped inert review batches"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "review-verdict apply sweep: reap failed; continuing to preserve merged findings"
+            );
+        }
+    }
+    stats.created_work += db.preserve_merged_review_batch_findings()?;
     Ok(stats)
 }
 
@@ -135,7 +160,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 
 impl crate::sweep_loop::SweepOutcome for ReviewVerdictApplyStats {
     fn has_activity(&self) -> bool {
-        self.applied > 0 || self.failed > 0 || self.superseded > 0
+        self.applied > 0 || self.failed > 0 || self.superseded > 0 || self.created_work > 0 || self.reaped > 0
     }
 
     fn log(&self) {
@@ -144,6 +169,7 @@ impl crate::sweep_loop::SweepOutcome for ReviewVerdictApplyStats {
             failed = self.failed,
             created_work = self.created_work,
             superseded = self.superseded,
+            reaped = self.reaped,
             "review-verdict apply sweep: applied staged review_verdict proposals",
         );
     }
@@ -425,6 +451,137 @@ mod observation_tests {
         assert_eq!(
             db.worker_proposal(&proposal.id).unwrap().unwrap().state,
             ProposalState::Applied
+        );
+    }
+
+    #[test]
+    fn apply_pending_preserves_failed_merged_batch_findings() {
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let root = create_active_chore(&db, &product, "merged review findings");
+        let pr_url = "https://github.com/example/repo/pull/42";
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET pr_url = ?2, repo_remote_url = 'https://github.com/example/repo' WHERE id = ?1",
+                rusqlite::params![root, pr_url],
+            )
+            .unwrap();
+        let roles = [
+            ReviewBatchMemberRole::ClaudeReviewer,
+            ReviewBatchMemberRole::CodexReviewer,
+            ReviewBatchMemberRole::GrokReviewer,
+        ];
+        let executions: Vec<_> = roles
+            .iter()
+            .map(|_| {
+                db.create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(&root)
+                        .kind(ExecutionKind::PrReview)
+                        .status(ExecutionStatus::Running)
+                        .build(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let members: Vec<_> = roles
+            .iter()
+            .zip(&executions)
+            .map(|(role, exec)| {
+                ReviewBatchMemberCreateInput::builder()
+                    .attempt(1)
+                    .provider_effort("medium")
+                    .requested_driver("claude")
+                    .resolved_model("test-model")
+                    .role(*role)
+                    .status(ReviewBatchMemberStatus::Pending)
+                    .execution_id(exec.id.clone())
+                    .build()
+            })
+            .collect();
+        let classification = ReviewClassification::builder()
+            .changed_files(vec!["src/lib.rs".to_owned()])
+            .complexity_flags(vec![])
+            .has_production_code(true)
+            .metadata_missing(vec![])
+            .production_languages(vec![ReviewLanguageBucket::Rust])
+            .profile(ReviewProfile::Light)
+            .subsystem_buckets(vec!["engine".to_owned()])
+            .additions(1)
+            .deletions(1)
+            .build();
+        let (batch, _) = db
+            .create_review_batch(
+                ReviewBatchCreateInput::builder()
+                    .cycle_root_id(root.clone())
+                    .base_sha("base")
+                    .classification(classification)
+                    .phase(ReviewBatchPhase::PreMerge)
+                    .pr_number(42)
+                    .pr_url(pr_url)
+                    .target_sha("reviewed-head")
+                    .build(),
+                &members,
+            )
+            .unwrap();
+        for (role, exec) in roles.iter().zip(&executions) {
+            let payload = serde_json::json!({
+                "batch_id": batch.id, "target_sha": "reviewed-head",
+                "report": {
+                    "batch_id": batch.id, "pr_url": pr_url, "target_sha": "reviewed-head",
+                    "phase": "pre_merge", "summary": format!("Report from {role}"),
+                    "coverage": {"files_inspected": ["src/lib.rs"], "files_omitted": [], "limitations": []},
+                    "findings": [{"severity": "high", "category": "correctness", "confidence": "high",
+                        "file": "src/lib.rs", "title": format!("Finding from {role}"), "problem": "lost result",
+                        "impact": "lost work", "suggested_fix": "persist it", "static_evidence": "early return",
+                        "needs_runtime_verification": false}]
+                }
+            })
+            .to_string();
+            db.submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &exec.id,
+                work_item_id: &root,
+                kind: ProposalKind::ReviewReport,
+                payload_json: &payload,
+                idempotency_key: "report",
+            })
+            .unwrap()
+            .unwrap();
+            db.connect()
+                .unwrap()
+                .execute(
+                    "UPDATE work_executions SET status = 'completed', finished_at = '1' WHERE id = ?1",
+                    [&exec.id],
+                )
+                .unwrap();
+        }
+        db.observe_chore_pr_merged(&root, pr_url).unwrap();
+        let stats =
+            apply_pending_review_verdicts(&db, &FakePrStateChecker::always(PrOpenState::Merged), &|_| vec![]).unwrap();
+        assert_eq!(stats.created_work, 1);
+        assert_eq!(stats.reaped, 1);
+        assert_eq!(stats.applied, 0);
+        let followup = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM tasks WHERE created_via = ?1",
+                [format!("pr_review:unconsolidated:{}", batch.id)],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(!followup.is_empty());
+        let stale = db
+            .list_attention_items_for_work_item(&root)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.kind == crate::work::PR_REVIEW_BATCH_STALE_ATTENTION_KIND && item.status == "open")
+            .expect("reaped batch must keep an open stale attention");
+        assert!(
+            stale.body_markdown.contains(&followup),
+            "reaped attention must name the follow-up: {}",
+            stale.body_markdown
         );
     }
 }

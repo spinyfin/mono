@@ -1005,6 +1005,17 @@ mod floor_tests {
                 Box::new(|c| merge_intent::migrate(c).unwrap()),
             ),
             (
+                "20261122_0400_merged_findings_disposition",
+                Box::new(|c| {
+                    c.execute_batch(
+                        "ALTER TABLE pr_review_batches ADD COLUMN merged_findings_disposition TEXT
+                         CHECK (merged_findings_disposition IS NULL
+                                OR merged_findings_disposition IN ('followup', 'below_gate', 'unreadable'))",
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
                 "20261117_0212_no_op_completion_ready",
                 Box::new(|c| {
                     c.execute_batch(

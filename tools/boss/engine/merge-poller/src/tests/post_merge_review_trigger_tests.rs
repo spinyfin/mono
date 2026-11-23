@@ -73,6 +73,120 @@ fn merged_probe(pr_url: &str, merge_commit_oid: Option<&str>, head_ref_oid: Opti
         .build()
 }
 
+#[tokio::test]
+async fn merge_during_review_closes_backlog_and_doing_rows_without_a_verdict() {
+    assert_merge_during_review(false).await;
+}
+
+#[tokio::test]
+async fn adaptive_merge_during_review_closes_backlog_and_doing_rows_without_a_verdict() {
+    assert_merge_during_review(true).await;
+}
+
+async fn assert_merge_during_review(adaptive: bool) {
+    for status in ["todo", "active"] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/1";
+        let (_, root) = make_chore_in_review(&db, "review in flight", pr);
+        seed_pre_merge_batch(&db, &root, "head", ReviewProfile::Light);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                rusqlite::params![root, status],
+            )
+            .unwrap();
+        let probe = StubProbe::new();
+        let publisher = RecordingPublisher::default();
+        // Open PRs stay in their existing lane, with no merge or remediation.
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
+        let open = if adaptive {
+            reconcile_one(&db, probe.as_ref(), &publisher, None, None, None, pr)
+                .await
+                .0
+        } else {
+            run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await
+        };
+        assert_eq!(open.merged, 0);
+        let current: String = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [&root], |r| r.get(0))
+            .unwrap();
+        assert_eq!(current, status);
+        assert!(publisher.events.lock().await.is_empty());
+        // Only GitHub's merged observation permits completion.
+        probe.set(pr, PrLifecycleState::Merged);
+        let merged = if adaptive {
+            reconcile_one(&db, probe.as_ref(), &publisher, None, None, None, pr)
+                .await
+                .0
+        } else {
+            run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await
+        };
+        assert_eq!(merged.merged, 1);
+        let (current, completed): (String, Option<String>) = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT status, completed_at FROM tasks WHERE id = ?1", [&root], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(current, "done");
+        assert!(completed.is_some());
+        assert!(db.get_merge_evidence(&root).unwrap().is_some());
+        assert!(db.review_verdicts_for_work_item(&root).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn closed_unmerged_does_not_complete_a_review_held_row() {
+    assert_closed_unmerged_during_review(false).await;
+}
+
+#[tokio::test]
+async fn adaptive_closed_unmerged_does_not_complete_a_review_held_row() {
+    assert_closed_unmerged_during_review(true).await;
+}
+
+async fn assert_closed_unmerged_during_review(adaptive: bool) {
+    for status in ["todo", "active"] {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/1";
+        let (_, root) = make_chore_in_review(&db, "review in flight", pr);
+        seed_pre_merge_batch(&db, &root, "head", ReviewProfile::Light);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                rusqlite::params![root, status],
+            )
+            .unwrap();
+        let probe = StubProbe::new();
+        let publisher = RecordingPublisher::default();
+        probe.set(pr, PrLifecycleState::ClosedUnmerged);
+        let outcome = if adaptive {
+            reconcile_one(&db, probe.as_ref(), &publisher, None, None, None, pr)
+                .await
+                .0
+        } else {
+            run_one_pass(&db, probe.as_ref(), &publisher, None, None, None).await
+        };
+        assert_eq!(outcome.merged, 0);
+        assert_eq!(outcome.closed_unmerged, 0);
+        let current: String = db
+            .connect()
+            .unwrap()
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [&root], |r| r.get(0))
+            .unwrap();
+        assert_eq!(current, status);
+        assert!(db.get_merge_evidence(&root).unwrap().is_none());
+        assert!(publisher.events.lock().await.is_empty());
+    }
+}
+
 /// No pre-merge batch on record (batch-mode review disabled for this PR, or
 /// a manual/human-driven row) means there is nothing to gate eligibility on
 /// — the trigger must not guess, it must skip.

@@ -1237,6 +1237,7 @@ fn sweep_entry_point_applies_every_proposed_verdict_and_skips_already_applied_on
             failed: 0,
             created_work: 1,
             superseded: 0,
+            reaped: 0,
         }
     );
 
@@ -1687,6 +1688,7 @@ fn persistent_not_applying_bail_files_attention_once_and_is_not_counted_applied(
             failed: 0,
             created_work: 0,
             superseded: 0,
+            reaped: 0,
         }
     );
 }
@@ -1717,6 +1719,7 @@ fn sweep_does_not_list_an_already_superseded_proposal() {
             failed: 0,
             created_work: 0,
             superseded: 0,
+            reaped: 0,
         },
         "a proposal already superseded is not listed as proposed, so the superseded counter is not touched"
     );
@@ -1857,6 +1860,7 @@ fn sweep_counts_a_proposal_superseded_during_apply() {
             failed: 0,
             created_work: 0,
             superseded: 1,
+            reaped: 0,
         },
         "a proposal still proposed at list time that lands superseded in commit must increment superseded"
     );

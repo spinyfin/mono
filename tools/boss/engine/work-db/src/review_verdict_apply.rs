@@ -52,6 +52,8 @@ pub struct ReviewVerdictApplyStats {
     /// Proposals this pass observed as `superseded` (a later verdict for
     /// the same batch won). Distinct from `applied` and from `failed`.
     pub superseded: usize,
+    /// Inert review batches this pass reaped before merged-findings recovery.
+    pub reaped: usize,
 }
 
 /// Result of comparing a pre-merge batch's frozen target with the PR head.
@@ -462,7 +464,7 @@ impl WorkDb {
         }
     }
 
-    fn materialize_review_findings(
+    pub(super) fn materialize_review_findings(
         &self,
         origin_task: &Task,
         cycle_root_id: &str,
