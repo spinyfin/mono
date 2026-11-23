@@ -166,6 +166,48 @@ async fn merged_pr_cancels_live_review_guide_attempts() {
 }
 
 #[tokio::test]
+async fn repeated_merged_probe_on_human_driven_row_keeps_explicit_review_guide_alive() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/acme/widget/pull/11";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-human-merged", pr);
+    db.update_work_item(
+        &chore_id,
+        WorkItemPatch {
+            human_driven: Some(true),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::Merged);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let handler = RecordingCompletionHandler::default();
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+
+    let (series, comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
+    let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let attempt = db.dispatch_pr_review_guide_attempt(&attempt.id, &chore_id).unwrap();
+    let execution_id = attempt.execution_id.clone().expect("dispatch binds an execution");
+
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_ne!(
+        db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(handler.released.lock().unwrap().is_empty());
+    assert_eq!(db.live_pr_review_guide_attempts_for_series(&series).unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn closed_unmerged_pr_cancels_live_review_guide_attempts() {
     let dir = tempdir().unwrap();
     let db = WorkDb::open(dir.path().join("boss.db")).unwrap();

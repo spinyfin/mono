@@ -819,7 +819,8 @@ pub(crate) async fn sweep_one(
                 ),
             }
             end_conflict_deferral(work_db, candidate, crate::work::ConflictDeferralEnd::PrMerged);
-            if mark_merged(work_db, publisher, host, candidate, &probe_result).await {
+            let newly_merged = mark_merged(work_db, publisher, host, candidate, &probe_result).await;
+            if newly_merged {
                 outcome.merged += 1;
                 // Clean up any pending/running ci_remediations rows and emit
                 // CiFailureCleared so the macOS kanban clears the "ci failing"
@@ -835,14 +836,21 @@ pub(crate) async fn sweep_one(
             // terminal so the scheduler doesn't try to redispatch.
             stop_active_revision_executions(work_db, publisher, completion_handler, &candidate.work_item_id, outcome)
                 .await;
-            stop_live_review_guides(
-                work_db,
-                completion_handler,
-                &candidate.work_item_id,
-                &candidate.pr_url,
-                "parent PR merged",
-            )
-            .await;
+            // Only on the pass that records the terminal transition: rows
+            // that stay `in_review` after their PR merged (human-driven rows,
+            // merges into a non-default base) are re-probed every sweep, and
+            // an operator's explicit Generate/Retry for such a PR must not be
+            // cancelled again on each pass.
+            if newly_merged {
+                stop_live_review_guides(
+                    work_db,
+                    completion_handler,
+                    &candidate.work_item_id,
+                    &candidate.pr_url,
+                    "parent PR merged",
+                )
+                .await;
+            }
             // Deep-production eligibility + merge-SHA batch creation for the
             // landed-code post-merge review. Independent of `mark_merged`'s
             // own bookkeeping outcome (a human-driven row that stays in
@@ -1079,17 +1087,20 @@ pub(crate) async fn sweep_one(
             // Retire the row to `done` (the parallel path to `mark_merged`
             // above) — no redo execution is spawned; a human moves the row
             // back to `todo`/`active` manually if the work should be redone.
+            // Cancel live review guides only on the pass that records the
+            // transition; rows that stay `in_review` are re-probed every sweep
+            // and must not cancel an operator's explicit Generate/Retry.
             if mark_closed_unmerged(work_db, publisher, candidate).await {
                 outcome.closed_unmerged += 1;
+                stop_live_review_guides(
+                    work_db,
+                    completion_handler,
+                    &candidate.work_item_id,
+                    &candidate.pr_url,
+                    "PR closed unmerged",
+                )
+                .await;
             }
-            stop_live_review_guides(
-                work_db,
-                completion_handler,
-                &candidate.work_item_id,
-                &candidate.pr_url,
-                "PR closed unmerged",
-            )
-            .await;
         }
     }
     // For every open (or just-probed) PR, persist the CI + review poll
