@@ -77,6 +77,8 @@ pub fn init_all(registry: &Registry) {
     // Work DB lock-contention rollup: timing-event / busy-failure counters
     // and the longest-hold-per-minute gauge.
     boss_work_db::lock_stats::register_metrics(registry);
+    // Host-load sampler gauges (load average, CPU, memory, swap).
+    boss_engine_runtime::host_load::register_metrics(registry);
     // Background pass durations and item counts, plus loop-owned cadence
     // for the singleton envelope and terminal-work sweeps.
     boss_engine_runtime::sweep_metrics::register_metrics(registry);
@@ -277,6 +279,22 @@ mod tests {
                 "envelope_watch.tick_interval_ms",
                 "github_api.graphql.remaining",
                 "github_api.rest.remaining",
+                "host.cpu_busy_pct_x100",
+                "host.cpu_idle_pct_x100",
+                "host.cpu_system_pct_x100",
+                "host.cpu_user_pct_x100",
+                "host.load_avg_15m_x100",
+                "host.load_avg_1m_x100",
+                "host.load_avg_5m_x100",
+                "host.logical_cpus",
+                "host.mem_available_bytes",
+                "host.mem_compressor_bytes",
+                "host.mem_free_bytes",
+                "host.mem_pressure_level_pct",
+                "host.mem_total_bytes",
+                "host.mem_used_bytes",
+                "host.swap_total_bytes",
+                "host.swap_used_bytes",
                 "merge_poller.adaptive_tracked",
                 "merge_poller.items_per_pass",
                 "merge_poller.items_unfinished",

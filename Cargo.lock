@@ -972,6 +972,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-host-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "libc",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boss-engine-jsonl-append"
 version = "0.1.0"
 dependencies = [
@@ -1134,6 +1146,7 @@ dependencies = [
  "boss-engine-effort",
  "boss-engine-gh-invocation",
  "boss-engine-grok-home-retention",
+ "boss-engine-host-load",
  "boss-engine-live-status-redact",
  "boss-engine-live-worker-state",
  "boss-engine-merge-poller",
@@ -2090,6 +2103,7 @@ dependencies = [
  "boss-engine-board-gesture",
  "boss-engine-driver",
  "boss-engine-effort",
+ "boss-engine-host-load",
  "boss-engine-proposal-validation",
  "boss-engine-recovery",
  "boss-engine-storage-values",
