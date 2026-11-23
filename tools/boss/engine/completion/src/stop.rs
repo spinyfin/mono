@@ -157,9 +157,19 @@ impl WorkerCompletionHandler {
             let candidates = entry.candidates();
             return match self.resolve_bound_pr_url(execution) {
                 Some(bound_url) => {
-                    if candidates.contains(&bound_url) {
-                        self.staged_pr_urls.mark_branch_verified(execution_id, &bound_url);
-                        Some(bound_url)
+                    let mut matched = None;
+                    for staged_url in &candidates {
+                        match self.check_pr_url_deliverable(execution, staged_url, log_ctx).await {
+                            PrUrlDeliverable::Associated { .. } => {
+                                matched = Some(staged_url.clone());
+                                break;
+                            }
+                            PrUrlDeliverable::Unassociated | PrUrlDeliverable::Undecided => {}
+                        }
+                    }
+                    if let Some(url) = matched {
+                        self.staged_pr_urls.mark_branch_verified(execution_id, &url);
+                        Some(url)
                     } else {
                         tracing::warn!(
                             execution_id,
@@ -194,66 +204,34 @@ impl WorkerCompletionHandler {
             execution.worker_branch_prefix.as_deref(),
         );
         // A resumed execution's PR is on its predecessor's branch: accept any
-        // primary execution branch of the same work item.
-        let work_item_branches = self.work_item_branches(execution);
-        let slug = match parse_repo_slug(&execution.repo_remote_url) {
-            Ok(slug) => slug,
-            Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "{log_ctx}: cannot parse repo slug; dropping staged URLs for safety",
-                );
-                self.staged_pr_urls.forget(execution_id);
-                return None;
-            }
-        };
+        // primary execution branch of the same work item. The per-candidate
+        // check is shared with the `pr_created` proposal path.
         let mut own_candidate = None;
         let mut predecessor_candidate = None;
         let mut rejected_candidates = Vec::new();
         for staged_url in entry.candidates() {
-            let Some(pr_num) = pr_number_from_url(&staged_url) else {
-                tracing::warn!(
-                    execution_id,
-                    staged_pr_url = %staged_url,
-                    "{log_ctx}: cannot parse PR number from staged URL; dropping that candidate for safety",
-                );
-                rejected_candidates.push(staged_url);
-                continue;
-            };
-            match self.branch_verifier.fetch_pr_head_ref(&slug, pr_num).await {
-                Ok(ref head_ref) if head_identifies_any_branch(head_ref, &work_item_branches) => {
-                    if super::branches_identify_same_work_item(head_ref, &expected_branch) {
+            match self.check_pr_url_deliverable(execution, &staged_url, log_ctx).await {
+                PrUrlDeliverable::Associated { head_ref } => {
+                    let is_own = head_ref
+                        .as_deref()
+                        .is_some_and(|head| super::branches_identify_same_work_item(head, &expected_branch));
+                    if is_own {
                         own_candidate.get_or_insert(staged_url);
                     } else {
                         predecessor_candidate.get_or_insert(staged_url);
                     }
                 }
-                Ok(head_ref) => {
-                    tracing::warn!(
-                        execution_id,
-                        staged_pr_url = %staged_url,
-                        staged_pr_branch = %head_ref,
-                        %expected_branch,
-                        "pr_recheck_staged_branch_mismatch: staged PR's head branch is not a primary execution branch of this work item; dropping that candidate",
-                    );
+                PrUrlDeliverable::Unassociated => {
                     PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
                     rejected_candidates.push(staged_url);
                 }
-                Err(err) => {
+                PrUrlDeliverable::Undecided => {
                     // Transient API failure: cannot verify this candidate on
                     // this pass, but do NOT discard it. On the next pass the
                     // candidate is still staged and verification is retried —
                     // dropping here would strand the worker if the cold path
-                    // also fails. A definitive branch-name mismatch (the
-                    // Ok(head_ref) arm above) evicts after selection.
-                    tracing::warn!(
-                        execution_id,
-                        staged_pr_url = %staged_url,
-                        ?err,
-                        "{log_ctx}: branch verification failed transiently; \
-                         keeping staged URL for retry on next pass",
-                    );
+                    // also fails. A definitive mismatch (Unassociated) evicts
+                    // after selection.
                 }
             }
         }

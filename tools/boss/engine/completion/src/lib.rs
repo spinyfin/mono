@@ -173,6 +173,7 @@ pub use boss_observation_contracts::{
 };
 use conflict_delivery_gate::ConflictDeliveryDecision;
 use contribution_gate::{RevisionContributionReason, RevisionReviewGate};
+use pr_binding_guard::PrUrlDeliverable;
 pub(crate) use pr_transition::GhReviewBatchEnqueuer;
 pub use pr_transition::review_batch_input_from_metadata;
 

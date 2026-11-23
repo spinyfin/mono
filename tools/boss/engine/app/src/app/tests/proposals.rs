@@ -2794,7 +2794,7 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
         ProposalKind::ReviewGuide,
         &validated.canonical_json,
     );
-    let persisted = boss_engine_runtime::review_guide_validation::submit_worker_proposal(
+    let persisted = boss_engine_runtime::review_guide_validation::submit_worker_proposal_with_flags(
         db,
         boss_work_db::SubmitWorkerProposalInput {
             execution_id: &execution.id,
@@ -2803,6 +2803,7 @@ async fn review_guide_submission_publishes_for_its_attributed_codex_execution() 
             payload_json: &validated.canonical_json,
             idempotency_key: &key,
         },
+        false,
     )
     .unwrap()
     .unwrap();

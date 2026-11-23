@@ -72,7 +72,7 @@ impl WorkerCompletionHandler {
             // As with the staged-URL arm below, a merge-poller sweep must
             // not turn a revision's mid-turn push into implicit completion.
             if execution.kind == ExecutionKind::RevisionImplementation
-                && self.should_defer_staged_pr_recheck(execution_id)
+                && self.should_defer_proposal_pr_recheck(execution_id)
             {
                 tracing::info!(
                     execution_id,
@@ -508,6 +508,37 @@ impl WorkerCompletionHandler {
         };
         let horizon = std::time::Duration::from_secs(self.staged_pr_mid_turn_defer_secs.max(0) as u64);
         entry.staged_at.elapsed() < horizon
+    }
+
+    /// True when a merge-poller proposal-arm recheck must not finalize a
+    /// revision yet: the worker is observed mid-turn and the newest Applied
+    /// `pr_created` row is still inside the shared deferral horizon, measured
+    /// from the row's `created_at`. Unlike [`Self::should_defer_staged_pr_recheck`],
+    /// this does not consult the in-memory staging cache — an empty cache
+    /// after an engine restart is exactly the case the durable proposal arm
+    /// exists to recover, so deferral has to key on the durable row.
+    pub(super) fn should_defer_proposal_pr_recheck(&self, execution_id: &str) -> bool {
+        if !self.observed_mid_turn(execution_id) {
+            return false;
+        }
+        let horizon_secs = self.staged_pr_mid_turn_defer_secs.max(0);
+        if horizon_secs == 0 {
+            return false;
+        }
+        let Ok(proposals) = self
+            .work_db
+            .list_worker_proposals_for_execution(execution_id, ProposalKind::PrCreated)
+        else {
+            return false;
+        };
+        let Some(applied) = proposals.iter().find(|p| p.state == ProposalState::Applied) else {
+            return false;
+        };
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let Some(created_epoch) = boss_engine_utils::iso8601::parse_stored_timestamp(&applied.created_at) else {
+            return false;
+        };
+        now.saturating_sub(created_epoch) < horizon_secs
     }
 
     /// PR-detection recheck for a terminal execution (status

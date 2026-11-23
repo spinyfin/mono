@@ -218,6 +218,11 @@ pub struct StubBranchVerifier {
     /// Every PR number `fetch_pr_head_ref` was asked about, in call order.
     #[builder(default = std::sync::Mutex::new(Vec::new()))]
     pub head_ref_calls: std::sync::Mutex<Vec<u64>>,
+    /// Every PR number `fetch_pr_head_oid` was asked about, in call order.
+    /// Lets a test prove a path reached SHA-delta after another arm
+    /// already stamped the same PR's head.
+    #[builder(default = std::sync::Mutex::new(Vec::new()))]
+    pub head_oid_calls: std::sync::Mutex<Vec<u64>>,
 }
 
 impl StubBranchVerifier {
@@ -235,6 +240,14 @@ impl StubBranchVerifier {
         self.head_ref_calls
             .lock()
             .expect("head_ref_calls mutex poisoned")
+            .clone()
+    }
+
+    /// PR numbers `fetch_pr_head_oid` was called with, in order.
+    pub fn head_oid_calls_snapshot(&self) -> Vec<u64> {
+        self.head_oid_calls
+            .lock()
+            .expect("head_oid_calls mutex poisoned")
             .clone()
     }
 
@@ -332,7 +345,11 @@ impl BranchVerifier for StubBranchVerifier {
         }
     }
 
-    async fn fetch_pr_head_oid(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+    async fn fetch_pr_head_oid(&self, _repo_slug: &str, pr_number: u64) -> Result<String> {
+        self.head_oid_calls
+            .lock()
+            .expect("head_oid_calls mutex poisoned")
+            .push(pr_number);
         let guard = self.head_oid_result.lock().await;
         match &*guard {
             Ok(oid) => Ok(oid.clone()),

@@ -249,7 +249,7 @@ async fn accepted_review_guide_finalizes_before_proposal_recovery() {
         ProposalKind::ReviewGuide,
         &validated.canonical_json,
     );
-    let persisted = boss_engine_runtime::review_guide_validation::submit_worker_proposal(
+    let persisted = boss_engine_runtime::review_guide_validation::submit_worker_proposal_with_flags(
         db,
         boss_work_db::SubmitWorkerProposalInput {
             execution_id: &execution.id,
@@ -258,6 +258,7 @@ async fn accepted_review_guide_finalizes_before_proposal_recovery() {
             payload_json: &validated.canonical_json,
             idempotency_key: &key,
         },
+        false,
     )
     .unwrap()
     .unwrap();
