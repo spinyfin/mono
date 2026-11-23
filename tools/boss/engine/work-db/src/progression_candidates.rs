@@ -80,14 +80,15 @@
 //!    there is a refusal so the agent can ask); an item that arrives at the
 //!    sweep already over budget is not nominated again.
 //!
-//!    A run whose agent never started ([`launch_failed_sql`]) starts the
-//!    separate launch backoff: 2 minutes, doubling per consecutive failure up
-//!    to 30 minutes, reset when an agent starts. It does not start the calibrated
-//!    cooldown or count toward the infrastructure-failure cap. The
-//!    cap is the engine admitting it cannot unstick *this item*; a failed
-//!    launch says nothing about the item, and every item given the same
-//!    driver fails the same way while that driver's launch is broken. Such an
-//!    item is retried each time its launch backoff ends, and
+//!    A run whose agent never started ([`launch_failed_sql`]), or whose
+//!    recorded failure is a host-environment error ([`environment_failed_sql`]:
+//!    DNS / ENOTFOUND / connection-refused / "Can't reach the API server"),
+//!    starts the separate launch backoff: 2 minutes, doubling per consecutive
+//!    failure up to 30 minutes, reset when an agent starts. It does not start
+//!    the calibrated cooldown or count toward the infrastructure-failure cap.
+//!    The cap is the engine admitting it cannot unstick *this item*; a failed
+//!    launch or a laptop that slept and dropped DNS says nothing about the
+//!    item. Such an item is retried each time its launch backoff ends, and
 //!    [`WorkDb::progression_launch_backoff`] reports the wait so it is never
 //!    silent.
 //!
@@ -118,6 +119,7 @@ use boss_engine_storage_values::dispatch_wait::{
     DISPATCH_WAIT_REASON_AUTOMATION_PAUSED, DISPATCH_WAIT_REASON_DISPATCH_PAUSED, DISPATCH_WAIT_REASON_FOCUS_MODE,
     DISPATCH_WAIT_REASON_POOL_EXHAUSTED, WAITING_FOR_WORKSPACE_REASON,
 };
+use boss_engine_storage_values::environment_failure::{environment_unreachable_sql, is_environment_unreachable};
 use boss_engine_storage_values::progression::{
     CREATED_VIA_PROGRESSION_SWEEP, DEFAULT_COOLDOWN_SECS, DEFAULT_MAX_CREATES_PER_ITEM_WINDOW,
     DEFAULT_MAX_CREATES_WINDOW_SECS, DEFAULT_STUCK_AFTER_SECS, INFRASTRUCTURE_FAILURE_CAP, METADATA_KEY_COOLDOWN_SECS,
@@ -200,6 +202,41 @@ pub(crate) fn launch_failed_sql(x: &str) -> String {
         "({x}.status = 'failed' AND ({x}.launch_failed = 1
           OR {x}.pre_start_failure_count > 0 OR {x}.started_at IS NULL))"
     )
+}
+
+/// Recorded error text of execution `x`: `last_error`, else the latest run's
+/// `error_text`. The candidate view and the ladder read the same body.
+pub(crate) fn execution_error_sql(x: &str) -> String {
+    format!(
+        "COALESCE(NULLIF(TRIM({x}.last_error), ''),
+                 (SELECT r.error_text FROM work_runs r
+                  WHERE r.execution_id = {x}.id
+                  ORDER BY r.created_at DESC, r.id DESC LIMIT 1), '')"
+    )
+}
+
+/// Whether progression execution `x` died because the host could not reach
+/// the API (DNS / ENOTFOUND / connection-refused), not because of the item.
+/// Generated from [`is_environment_unreachable`].
+pub(crate) fn environment_failed_sql(x: &str) -> String {
+    let error = execution_error_sql(x);
+    format!(
+        "({x}.status IN {INFRASTRUCTURE_FAILED} AND ({}))",
+        environment_unreachable_sql(&error)
+    )
+}
+
+/// A run that is not evidence about the item: it never launched, or the host
+/// could not reach the network. Shares the launch backoff and is left out of
+/// the infrastructure-failure cap.
+pub(crate) fn environment_or_launch_failed_sql(x: &str) -> String {
+    format!("({} OR {})", launch_failed_sql(x), environment_failed_sql(x))
+}
+
+/// True when recorded failure text is a host-environment error. Same
+/// classifier the candidate view SQL uses.
+pub(crate) fn error_is_environment_failure(error: Option<&str>) -> bool {
+    error.is_some_and(is_environment_unreachable)
 }
 
 /// The progression runs of item `a` that count as attempts, as a `WHERE`
@@ -546,12 +583,12 @@ fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
     } else {
         "px.status <> 'cancelled' AND NOT (px.status = 'abandoned' AND px.started_at IS NULL)"
     };
-    let launch_failed = launch_failed_sql("px");
+    let non_item_failure = environment_or_launch_failed_sql("px");
     let ended_early = crate::progression_events::run_ended_early_sql("px", a);
     format!(
         "EXISTS (SELECT 1 FROM work_executions px
                  WHERE px.work_item_id = {a}.id AND px.kind = 'progression' AND {status_filter}
-                   AND NOT {launch_failed}
+                   AND NOT {non_item_failure}
                    AND COALESCE(CAST(px.finished_at AS INTEGER), CAST(px.created_at AS INTEGER))
                        + (CASE WHEN px.run_done_outcome = 'no_changes_needed'
                                THEN MIN(({cooldown}) * {NO_ACTION_COOLDOWN_MULTIPLIER},
@@ -565,16 +602,17 @@ fn in_cooldown_sql(a: &str, cooldown: &str, completed_only: bool) -> String {
 /// ended in infrastructure failure, so the sweep stops nominating it (and the
 /// engine asks the owner: `progression_ladder`). Runs from before the owner's
 /// last "keep trying" answer (`progression_ladder.reset_at`) do not count, and
-/// neither does a run that failed to launch ([`launch_failed_sql`]): its agent
-/// never looked at the item, so it is no evidence about the item.
+/// neither does a run that failed to launch ([`launch_failed_sql`]) or died
+/// from a host-environment error ([`environment_failed_sql`]): neither is
+/// evidence about the item.
 fn infrastructure_failing_sql(a: &str) -> String {
     let attempt = attempt_sql("fx", a);
-    let launch_failed = launch_failed_sql("fx");
+    let non_item_failure = environment_or_launch_failed_sql("fx");
     (0..INFRASTRUCTURE_FAILURE_CAP)
         .map(|offset| {
             format!(
                 "COALESCE((SELECT fx.status FROM work_executions fx
-                           WHERE {attempt} AND NOT {launch_failed}
+                           WHERE {attempt} AND NOT {non_item_failure}
                              AND (CAST(fx.created_at AS INTEGER) >
                                   COALESCE((SELECT l.reset_at FROM progression_ladder l
                                             WHERE l.work_item_id = {a}.id), 0)
@@ -602,9 +640,9 @@ fn launch_backoff_until_sql(a: &str) -> String {
          AND (({}) OR bx.started_at IS NOT NULL)",
         attempt_sql("bx", a)
     );
-    let launch_failed = launch_failed_sql("bx");
+    let launch_failed = environment_or_launch_failed_sql("bx");
     let history_attempt = attempt_sql("hx", a);
-    let history_failed = launch_failed_sql("hx");
+    let history_failed = environment_or_launch_failed_sql("hx");
     let streak = format!(
         "(SELECT COALESCE(MIN(CASE WHEN NOT failed THEN position - 1 END), COUNT(*))
           FROM (SELECT failed, ROW_NUMBER() OVER (ORDER BY created_at DESC, id DESC) AS position
@@ -902,7 +940,8 @@ impl WorkDb {
     /// when. `None` when no item is waiting on one.
     ///
     /// An item counts when its latest progression run failed to launch
-    /// ([`launch_failed_sql`]), the launch backoff from that run is still running,
+    /// ([`launch_failed_sql`]) or died from a host-environment error
+    /// ([`environment_failed_sql`]), the launch backoff from that run is still running,
     /// and every other clause that does not depend on time or on the run
     /// history holds, so the backoff is the one thing between the item and
     /// its next run. An item that stopped being stuck, was parked, or picked

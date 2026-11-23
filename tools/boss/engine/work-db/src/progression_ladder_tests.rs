@@ -757,6 +757,113 @@ fn a_failed_launch_between_two_runs_that_died_neither_counts_nor_hides_them() {
     assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
 }
 
+const ENOTFOUND_ERROR: &str = "api_error (auto-resume attempt 1/3): API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+
+impl Fx {
+    fn set_error(&self, run: &str, error: &str) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute("UPDATE work_executions SET last_error = ?1 WHERE id = ?2", [error, run])
+            .unwrap();
+    }
+
+    fn environment_run(&self, id: &str, ago: i64) -> String {
+        let run = self.past_run(id, "orphaned", None, ago, "fp", S5);
+        self.set_error(&run, ENOTFOUND_ERROR);
+        run
+    }
+}
+
+#[test]
+fn two_enotfound_failures_are_retried_and_never_file_the_question() {
+    let fx = fx();
+    let id = fx.conflicted("DNS dropped while it was looking");
+    fx.environment_run(&id, 30 * HOUR);
+    fx.environment_run(&id, 20 * HOUR);
+
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(!fx.db.progression_clauses(&id).unwrap().unwrap().infrastructure_failing);
+    assert!(fx.open_question(&id).is_none());
+}
+
+#[test]
+fn two_progression_timeouts_still_file_the_infrastructure_question() {
+    let fx = fx();
+    let id = fx.conflicted("Genuinely out of time twice");
+    for ago in [30 * HOUR, 20 * HOUR] {
+        let run = fx.past_run(&id, "failed", None, ago, "fp", S5);
+        fx.set_error(&run, "progression-run-timeout: elapsed 1800s (limit 1800s)");
+    }
+    let pass = fx.pass();
+    assert_eq!((pass.minted.len(), pass.asked.len()), (0, 1), "{pass:?}");
+    assert_eq!(pass.asked[0].reason, LadderReason::InfrastructureFailure);
+}
+
+#[test]
+fn a_question_filed_for_enotfound_runs_is_withdrawn_and_the_item_runs_again() {
+    let fx = fx();
+    let id = fx.conflicted("Asked about a DNS blip");
+    let first = fx.past_run(&id, "orphaned", None, 30 * HOUR, "fp", S5);
+    let second = fx.past_run(&id, "orphaned", None, 20 * HOUR, "fp", S5);
+    assert_eq!(fx.pass().asked.len(), 1);
+    fx.set_error(&first, ENOTFOUND_ERROR);
+    fx.set_error(&second, ENOTFOUND_ERROR);
+    let pass = fx.pass();
+    assert_eq!(pass.retracted, vec![id.clone()]);
+    assert_eq!((pass.minted.len(), pass.asked.len()), (1, 0), "{pass:?}");
+    assert!(fx.open_question(&id).is_none());
+}
+
+#[test]
+fn empty_or_whitespace_last_error_falls_back_to_work_runs_error_text_in_ladder() {
+    let fx = fx();
+    let id = fx.conflicted("Empty last_error with ENOTFOUND on work_runs");
+    let env_run = fx.past_run(&id, "orphaned", None, 30 * HOUR, "fp", S5);
+    let ws_env_run = fx.past_run(&id, "orphaned", None, 25 * HOUR, "fp", S5);
+    let real_1 = fx.past_run(&id, "failed", None, 20 * HOUR, "fp", S5);
+    let real_2 = fx.past_run(&id, "failed", None, 10 * HOUR, "fp", S5);
+    fx.set_error(&env_run, "");
+    fx.set_error(&ws_env_run, "   ");
+    fx.set_error(&real_1, "progression-run-timeout: elapsed 1800s (limit 1800s)");
+    fx.set_error(&real_2, "progression-run-timeout: elapsed 1800s (limit 1800s)");
+    {
+        let conn = fx.db.connect().unwrap();
+        for (run_id, exec_id) in [("run_empty_err", &env_run), ("run_ws_err", &ws_env_run)] {
+            conn.execute(
+                "INSERT INTO work_runs (id, execution_id, agent_id, status, error_text, created_at)
+                 VALUES (?1, ?2, 'progression-1', 'failed', ?3, ?4)",
+                params![run_id, exec_id, ENOTFOUND_ERROR, now().to_string()],
+            )
+            .unwrap();
+        }
+    }
+
+    let state = fx.db.progression_ladder_state(&id, S5).unwrap();
+    let by_id = |target: &str| {
+        state
+            .runs
+            .iter()
+            .find(|r| r.execution_id == target)
+            .expect("run present")
+    };
+    assert!(by_id(&env_run).environment_failed);
+    assert_eq!(by_id(&env_run).error.as_deref(), Some(ENOTFOUND_ERROR));
+    assert!(by_id(&ws_env_run).environment_failed);
+    assert_eq!(by_id(&ws_env_run).error.as_deref(), Some(ENOTFOUND_ERROR));
+    assert!(!by_id(&real_1).environment_failed);
+    assert!(!by_id(&real_2).environment_failed);
+
+    let pass = fx.pass();
+    assert_eq!(pass.asked.len(), 1);
+    let q = fx.open_question(&id).unwrap();
+    assert!(q.question.explanation.contains(&real_1));
+    assert!(q.question.explanation.contains(&real_2));
+    assert!(!q.question.explanation.contains(&env_run));
+    assert!(!q.question.explanation.contains(&ws_env_run));
+}
+
 /// An item already parked on a question that was filed for two failed
 /// launches, while those still counted. The next pass takes the question back
 /// and nominates the item again, with nothing asked of the owner.

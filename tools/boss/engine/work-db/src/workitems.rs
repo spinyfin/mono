@@ -1861,6 +1861,12 @@ impl WorkDb {
         Ok(())
     }
 
+    pub fn delete_metadata(&self, key: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM metadata WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     pub fn get_pane_summary(&self, work_item_id: &str) -> Result<Option<(String, String)>> {
         let conn = self.connect()?;
         let row = conn

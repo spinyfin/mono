@@ -109,11 +109,12 @@ pub struct ProgressionSettings {
     /// seconds. Placeholder 7 days.
     #[builder(default = DEFAULT_MAX_CREATES_WINDOW_SECS)]
     pub max_creates_window_secs: i64,
-    /// `progression.run_timeout`, in seconds. Placeholder 30 minutes. The
-    /// deadline sweep reaps a progression run older than this through the
-    /// ordinary pane teardown and records it `failed`, which the candidate view's
-    /// infrastructure-failure clause counts (two in a row stops nominations).
-    /// The engine publishes it as `progression.run_timeout_secs` metadata.
+    /// `progression.run_timeout`, in seconds of host-awake time. Placeholder
+    /// 30 minutes. The deadline sweep reaps a progression run older than this
+    /// through the ordinary pane teardown and records it `failed`, which the
+    /// candidate view's infrastructure-failure clause counts (two in a row
+    /// stops nominations). Suspend time does not consume the budget. The
+    /// engine publishes it as `progression.run_timeout_secs` metadata.
     #[builder(default = DEFAULT_RUN_TIMEOUT_SECS)]
     pub run_timeout_secs: u64,
     /// `progression.expected_questions_per_week`: an alarm threshold on the
