@@ -851,11 +851,6 @@ pub const AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS: &str = "reviewed_with_findings
 pub const AI_REVIEW_STATE_REVIEWED_ALL_CLEAR: &str = "reviewed_all_clear";
 pub const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_required";
 pub const AI_REVIEW_STATE_NOT_REVIEWED: &str = "not_reviewed";
-/// Automatic AI review will not run for this head: a no-op / pure-rebase skip,
-/// the review-cycle cap, a `gave_up` verdict, or a findings revision that
-/// delivered without moving the head. Distinct from [`AI_REVIEW_STATE_NOT_REVIEWED`],
-/// which means a review is still due.
-pub const AI_REVIEW_STATE_REVIEW_CLOSED: &str = "review_closed";
 pub const AI_REVIEW_STATE_REVIEWED_CLEAN_PENDING: &str = "reviewed_clean_pending";
 
 /// Statements and cardinality of one [`attach_ai_review_state_with`] pass,

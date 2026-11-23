@@ -36,13 +36,14 @@ use super::{
 /// 3. **AI Review** — an AI review is queued or running, a review is still
 ///    due for the current head (`not_reviewed`), or it reported findings that
 ///    no revision has started on yet (a started revision would have matched
-///    rule 2). `review_closed` (no-op skip, cycle cap, `gave_up`, or a
-///    findings revision that delivered without moving the head) is not AI
-///    Review: nothing automatic will review that head.
+///    rule 2). `review_not_required` (no-op skip, cycle cap, exhausted
+///    `gave_up`, no review scheduled, or a findings revision that delivered
+///    without moving the head) is not AI Review: nothing automatic will
+///    review that head.
 /// 4. **Ready** — `ready_for_review`, the engine-computed flag, once the
-///    higher-priority states are excluded. `review_not_required`,
-///    `review_closed`, and clean verdicts can be Ready; `not_reviewed`
-///    cannot, because a review is still due.
+///    higher-priority states are excluded. `review_not_required` and clean
+///    verdicts can be Ready; `not_reviewed` cannot, because a review is
+///    still due.
 /// 5. **Pending** — everything else: an open PR whose required CI is still
 ///    running or not yet polled, whose mergeability is unknown, or that has
 ///    no PR bound yet. Nothing is wrong and nobody needs to act; the card is
@@ -198,7 +199,7 @@ mod tests {
 
     #[test]
     fn ready_card_with_clean_ai_review_stays_ready() {
-        for state in ["reviewed_all_clear", "review_not_required", "review_closed"] {
+        for state in ["reviewed_all_clear", "review_not_required"] {
             assert_eq!(
                 classify_review_section(&with_ai_state(ready_card(), state)),
                 Some(ReviewSection::Ready),

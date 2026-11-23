@@ -190,8 +190,8 @@ mod tests {
     use super::*;
     use crate::work::{
         CiRemediationInsertInput, ConflictResolutionInsertInput, CreateExecutionInput, ExecutionStatus,
-        GithubMergeIntentInsertInput, PrPollStateInput, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, ReviewVerdictInput,
-        WorkItemPatch,
+        GithubMergeIntentInsertInput, PrPollStateInput, REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        REVIEW_GATE_OUTCOME_SKIPPED_NOOP, ReviewVerdictInput, WorkItemPatch,
     };
     use boss_execution_contracts::NoopExecutionPublisher;
     use boss_protocol::{ExecutionKind, MERGE_INTENT_ACTIVE, MERGE_INTENT_REASON_REMOVED_FROM_MERGE_QUEUE};
@@ -349,8 +349,8 @@ mod tests {
         fn probe(&self, head: &str, ci: &'static str) {
             self.observe(head, ci);
             // Ready requires a current-head AI state that is not still due.
-            // A green probe with no verdict lands in AI Review, and settle is
-            // a no-op. A no-op skip stamps last_reviewed_sha instead.
+            // A green probe with a review due lands in AI Review, and settle is
+            // a no-op. A no-op skip records a skip verdict instead.
             if ci == "success" {
                 self.mark_head_reviewed_clean(head);
             }
@@ -713,7 +713,24 @@ mod tests {
         f.db.mark_conflict_resolution_succeeded(&attempt.id, Some(FIXED))
             .unwrap();
         f.observe(FIXED, "success");
-        f.db.stamp_skipped_review_head(id, Some(FIXED)).unwrap();
+        let producer =
+            f.db.create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(id)
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        f.db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE work_executions SET status = 'completed' WHERE id = ?1",
+                [&producer.id],
+            )
+            .unwrap();
+        f.db.record_skip_review_verdict(&producer.id, id, Some(FIXED), REVIEW_GATE_OUTCOME_SKIPPED_NOOP)
+            .unwrap();
         f.settle().await;
         assert!(f.standing().is_none());
         let shown = f.on_card().unwrap();

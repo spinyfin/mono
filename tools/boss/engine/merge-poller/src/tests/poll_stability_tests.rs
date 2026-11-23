@@ -266,7 +266,7 @@ async fn refresh_preserves_known_values_but_accepts_conflicts_and_invalidates_ci
         )
         .unwrap()
     );
-    assert_eq!(section(&db, &candidate), Some(ReviewSection::AiReview));
+    assert_eq!(section(&db, &candidate), Some(ReviewSection::Pending));
     assert!(
         db.set_pr_status_observation(
             &candidate.work_item_id,

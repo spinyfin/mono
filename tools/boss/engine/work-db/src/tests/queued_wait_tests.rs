@@ -1226,8 +1226,7 @@ fn review_states_use_admission_and_current_head_evidence_on_every_surface() -> B
         ("admission", DISPATCH_WAIT_REASON_REVIEW_RESERVATION),
         ("parked", DISPATCH_WAIT_REASON_PARKED),
         ("human", DISPATCH_WAIT_REASON_HUMAN_DRIVEN),
-        ("fallback", DISPATCH_WAIT_REASON_REVIEW_RESERVATION),
-        ("skipped", DISPATCH_WAIT_REASON_AWAITING_MERGE),
+        ("fallback", DISPATCH_WAIT_REASON_AWAITING_MERGE),
         ("unexplained", DISPATCH_WAIT_REASON_UNCLASSIFIED),
     ] {
         let item = create_test_chore(&db, &product.id, name);
@@ -1309,9 +1308,6 @@ fn review_states_use_admission_and_current_head_evidence_on_every_surface() -> B
                         ],
                     )
                     .unwrap();
-            }
-            "skipped" => {
-                db.stamp_skipped_review_head(&item.id, Some("head")).unwrap();
             }
             "parked" => {
                 db.connect()

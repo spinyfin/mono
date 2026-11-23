@@ -846,7 +846,6 @@ fn pull_request(
                 Some("reviewed_with_findings") => nav::AiReview::Findings,
                 Some("reviewed_all_clear") => nav::AiReview::AllClear,
                 Some("reviewed_clean_pending") => nav::AiReview::CleanPending,
-                Some("review_closed" | "review_not_required") => nav::AiReview::NotRequired,
                 _ => nav::AiReview::NotRequired,
             },
             conflict,
