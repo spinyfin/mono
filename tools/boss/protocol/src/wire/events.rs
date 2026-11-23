@@ -1361,8 +1361,10 @@ pub enum FrontendEvent {
         clamped_from: Option<usize>,
     },
     /// Response to [`FrontendRequest::SetDriverTrafficSplit`] and
-    /// [`FrontendRequest::GetDriverTrafficSplit`]. `split` is the current
-    /// effective allocation; its four shares always sum to exactly 100.
+    /// [`FrontendRequest::GetDriverTrafficSplit`], and published on
+    /// `TOPIC_DRIVER_TRAFFIC_SPLIT` to subscribed sessions after a successful
+    /// set. `split` is the stored configured split; its four shares sum to
+    /// exactly 100 and a 0% share is off.
     #[worker(passthrough)]
     DriverTrafficSplitResult { split: DriverTrafficSplit },
     /// Response to [`FrontendRequest::GetDriverQuotaUsage`]. Carries one

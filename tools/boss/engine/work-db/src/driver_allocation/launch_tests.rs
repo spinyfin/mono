@@ -284,6 +284,8 @@ fn an_unallocatable_task_does_not_stop_its_products_other_executions() {
     let product = create_test_product(&db);
     db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100, 0))
         .unwrap();
+    // A model pin is an eligibility constraint, not a driver pin: "opus"
+    // belongs to claude, which holds no share, so this row cannot be placed.
     let pinned = create_test_chore(&db, &product.id, "pinned to an unfunded driver's model");
     db.update_work_item(
         &pinned.id,
@@ -311,6 +313,7 @@ fn an_unallocatable_task_does_not_stop_its_products_other_executions() {
         .unwrap();
     assert_eq!(other_decision.driver.as_deref(), Some("codex"));
 
+    // Claim revalidation refuses only the offending execution, with a typed error.
     let err = db.claim_execution_for_dispatch(&refused.id).unwrap_err();
     let refusal = err.downcast_ref::<DriverAllocationRefused>().expect("typed refusal");
     assert!(!refusal.to_string().is_empty());
@@ -323,6 +326,8 @@ fn attention_sweep_keeps_the_banner_of_a_pre_start_failure_until_a_real_run_star
     let chore = create_test_chore_manual(&db, &product.id, "refused at dispatch");
     let execution = create_ready_chore_execution(&db, &chore.id);
 
+    // A terminal pre-start failure writes a failed bookkeeping run stamped
+    // `started_at = now` in the same second as the bounce's banner stamp.
     db.record_pre_start_failure(&execution.id, "engine", None, "refused", &[])
         .unwrap();
     db.bounce_dispatch_failed_to_backlog(&chore.id, "driver_allocation_refused", "refused")
@@ -345,6 +350,7 @@ fn attention_sweep_keeps_the_banner_of_a_pre_start_failure_until_a_real_run_star
         "a failed bookkeeping run is not evidence that anything started"
     );
 
+    // A genuine later run start does clear it.
     db.connect()
         .unwrap()
         .execute(
