@@ -684,6 +684,10 @@ const NOT_UPKEEP: &[(&str, &str)] = &[
         "list_work_item_ids_in_merge_queue",
         "a set of ids the merge poller reads to choose how deeply to probe a PR; it nominates and mints nothing",
     ),
+    (
+        "list_chores_awaiting_operator_answer_with_active_ci_fix",
+        "observation-only for the merge poller's moot CI-fix retire; it never nominates or mints, and the question hold is not a parked row",
+    ),
 ];
 
 const LISTING_KEYWORDS: &[&str] = &[

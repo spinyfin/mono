@@ -815,7 +815,8 @@ fn progression_verbs_report_missing_malformed_and_unknown_fields() {
         for bad in ["", "   ", "not an id", "42", "T", "Tx1", "task_a b"] {
             assert!(!errs(kind, json!({"on": bad})).is_empty(), "{kind} accepted `{bad}`");
         }
-        for good in ["task_abc", "task_123", "T7"] {
+        let short = format!("T{}", 7);
+        for good in ["task_abc", "task_123", short.as_str()] {
             ok(kind, json!({"on": good}));
         }
     }
@@ -968,7 +969,11 @@ fn done_answer_actions_bind_a_change_to_an_answer_of_the_question() {
         json!({"outcome": "blocked", "summary": "Needs the owner", "question": question, "criterion": "2",
                "answer_actions": actions})
     };
-    let archive = |answer: &str| json!({"answer": answer, "action": {"kind": "archive_revision", "revision": "T12"}});
+    let revision = format!("T{}", 12);
+    let archive = {
+        let revision = revision.clone();
+        move |answer: &str| json!({"answer": answer, "action": {"kind": "archive_revision", "revision": revision.clone()}})
+    };
 
     // Stored beside the typed payload, with `Yes` folded to its canonical spelling.
     let canonical = ok(ProposalKind::RunDone, with(&yes_no, json!([archive("Yes")])));
@@ -981,13 +986,15 @@ fn done_answer_actions_bind_a_change_to_an_answer_of_the_question() {
     assert_eq!(stored[0].answer, "yes");
     assert_eq!(
         stored[0].action,
-        boss_protocol::OwnerAction::ArchiveRevision { revision: "T12".into() }
+        boss_protocol::OwnerAction::ArchiveRevision {
+            revision: revision.clone()
+        }
     );
     // The criterion and the typed payload are still readable.
     assert!(boss_protocol::run_done_question_criterion(&canonical).is_some());
     assert!(serde_json::from_str::<RunDoneProposalPayload>(&canonical).is_ok());
     // Binding a different change is a different submission; binding none adds no key.
-    let start = json!([{"answer": "yes", "action": {"kind": "start", "item": "T12"}}]);
+    let start = json!([{"answer": "yes", "action": {"kind": "start", "item": revision}}]);
     assert_ne!(ok(ProposalKind::RunDone, with(&yes_no, start)), canonical);
     assert!(!ok(ProposalKind::RunDone, with(&yes_no, json!([]))).contains("answer_actions"));
 
@@ -1003,7 +1010,7 @@ fn done_answer_actions_bind_a_change_to_an_answer_of_the_question() {
     )));
     assert!(refused(with(
         &yes_no,
-        json!([{"answer": "yes", "action": {"kind": "delete", "item": "T12"}}])
+        json!([{"answer": "yes", "action": {"kind": "delete", "item": format!("T{}", 12)}}])
     )));
     assert!(refused(
         json!({"outcome": "blocked", "summary": "stuck", "answer_actions": [archive("yes")]})

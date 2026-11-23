@@ -192,6 +192,24 @@ pub(super) async fn handle_operator_question(ctx: Dispatch, req: FrontendRequest
                 });
             }
             let product_id = item.product_id().to_string();
+            if !outcome.retired_ci_attempts.is_empty()
+                && let Some(pr_url) = match &item {
+                    WorkItem::Task(task) | WorkItem::Chore(task) => task.pr_url.clone(),
+                    _ => None,
+                }
+            {
+                let candidate = boss_work_db::PendingMergeCheck {
+                    work_item_id: work_item_id(&item),
+                    product_id: product_id.clone(),
+                    pr_url,
+                };
+                boss_engine_merge_poller::remediation_push::publish_ci_failure_cleared(
+                    work_db.as_ref(),
+                    server_state.publisher.as_ref(),
+                    &candidate,
+                )
+                .await;
+            }
             // A Yes on a prerequisite proposal also created (or linked) a
             // task; the board must refresh that card too.
             let mut changed = vec![work_item_id(&item)];

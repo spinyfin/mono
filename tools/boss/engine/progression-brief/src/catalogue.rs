@@ -56,7 +56,7 @@ pub fn render_question_criteria() -> &'static str {
      - `--on-answer '<option label>=undepend <dependent-id> <prerequisite-id>'` drops a dependency edge between two rows in your neighbourhood.\n\
      - The option labels `Park this item` and `Archive this item` need no binding: the engine carries them out.\n\
      \n\
-     Use `yes` or `no` for a yes-no question and the option label, verbatim, for a multiple-choice one; repeat `--on-answer` to bind more than one answer. A question under criterion 1 or 2 asks for an action, so at least one of its answers must be one the engine carries out (a bound change, or one of those two labels). Without one it is refused: no answer could change anything, and the next run would be refused exactly as you were. Changing priority, merging, stopping a worker and answering someone else's question cannot be bound, so do not ask the owner to do them: end the run and say what is needed in `--summary`. Criteria 3 and 4 are decisions: the answer reaches the next run, which acts on it with the verbs above.\n\
+     Use `yes` or `no` for a yes-no question and the option label, verbatim, for a multiple-choice one; repeat `--on-answer` to bind more than one answer. A question under criterion 1 or 2 asks for an action, so at least one of its answers must be one the engine carries out (a bound change, one of those two labels, or a create-prerequisite or link-prerequisite question). Without one it is refused: no answer could change anything, and the next run would be refused exactly as you were. Changing priority, merging a pull request, stopping a live worker, and answering someone else's question are not `--on-answer` changes, so do not ask the owner to do them: end the run and say what is needed in `--summary`. Criteria 3 and 4 are decisions: the answer reaches the next run, which acts on it with the verbs above.\n\
      \n\
      Do not ask to confirm an action you may take directly. Do not ask \"should I keep trying\" (the engine files that question after two attempts). Do not restate a worker's free-text blocker as a question without first classifying it. `no-changes-needed` is refused for a declared-blocker item: either redispatch with the evidence the blocker is stale, or ask a specific question.\n"
 }
@@ -101,6 +101,8 @@ mod tests {
             "undepend <dependent-id> <prerequisite-id>",
             "`Park this item` and `Archive this item`",
             "A question under criterion 1 or 2 asks for an action",
+            "create-prerequisite or link-prerequisite question",
+            "Changing priority, merging a pull request, stopping a live worker",
         ] {
             assert!(criteria.contains(taught), "the criteria must teach: {taught}");
         }

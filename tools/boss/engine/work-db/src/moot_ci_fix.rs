@@ -12,13 +12,13 @@
 //!   the PR's CI as failing even though every check on its head passes;
 //! - the board keeps showing the attempt's "ci failing" badge.
 //!
-//! The retire paths that already existed each need something this state never
-//! has. A clean head probe retires an active attempt only while the parent
-//! carries a CI signal and the PR is not conflicting, and never for a
-//! merge-queue failure. A conflict retires the attempt only once the conflict
-//! watcher takes the PR over, which a deferred conflict never does. A PR head
-//! advance retires a merge-queue attempt, but no revision can run to move the
-//! head while the dead one holds the chain.
+//! Other retire paths each need something this state never has. A clean head
+//! probe retires an active attempt only while the parent carries a CI signal
+//! and the PR is not conflicting, and never for a merge-queue failure. A
+//! conflict retires the attempt only once the conflict watcher takes the PR
+//! over, which a deferred conflict never does. A PR head advance retires a
+//! merge-queue attempt, but no revision can run to move the head while the
+//! dead one holds the chain.
 //!
 //! [`WorkDb::retire_moot_pending_ci_fixes`] is the reconciliation the merge
 //! poller runs on every open probe whose head CI is green. It is deliberately
@@ -29,11 +29,17 @@
 //!
 //! - the PR conflicts with its base, so it cannot re-enter the queue until the
 //!   conflict is resolved, which moves the head;
-//! - the fix was stopped and another writer on the same PR is queued behind
-//!   it. That writer moves the head, and a head advance supersedes a
-//!   merge-queue failure by the rule that already exists, so the stopped fix
-//!   holds back exactly the work that makes it moot;
+//! - the fix was stopped and a runnable revision of the same PR chain is
+//!   queued behind it. That writer moves the head, and a head advance
+//!   supersedes a merge-queue failure by the rule that already exists, so
+//!   the stopped fix holds back exactly the work that makes it moot. A
+//!   parked dependent, or a dependent on another PR, is not that writer;
 //! - its revision is already closed.
+//!
+//! A merge-queue failure is not a required check on the PR head. Head CI is
+//! green by construction for those, so a ready or autostart queue-side fix
+//! stays pending until one of the three reasons above. Closing it on green
+//! head CI alone would drop a real prerequisite.
 
 use super::*;
 use crate::task_status_audit::abandon_cause;
@@ -228,14 +234,30 @@ fn has_run_queued(conn: &Connection, work_item_id: &str) -> Result<bool> {
     )?)
 }
 
-/// Whether an open item waits on `revision_id`: the next writer on the PR.
+/// Whether a runnable revision of the same PR chain waits on `revision_id`.
+/// A parked dependent, or a dependent on another PR, is not the next writer.
 fn has_writer_queued_behind(conn: &Connection, revision_id: &str) -> Result<bool> {
+    let root = crate::chain_helpers::chain_root(conn, revision_id)?;
+    let parked = crate::parking::parked_task_sql("t");
+    let live = live_chain_writer_sql("t");
+    let walk = crate::chain_helpers::cycle_root_walk_cte(
+        "t.id IN (SELECT dependent_id FROM work_item_dependencies
+                  WHERE prerequisite_id = ?1 AND relation = ?2)",
+    );
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM work_item_dependencies d
-                       JOIN tasks t ON t.id = d.dependent_id
-                       WHERE d.prerequisite_id = ?1 AND d.relation = ?2
-                         AND t.deleted_at IS NULL AND t.status NOT IN ('done', 'archived'))",
-        params![revision_id, RELATION_BLOCKS],
+        &format!(
+            "{walk}
+             SELECT EXISTS(
+                 SELECT 1 FROM roots
+                 JOIN tasks t ON t.id = roots.task_id
+                 WHERE roots.cycle_root_id = ?3
+                   AND t.kind = 'revision'
+                   AND t.deleted_at IS NULL
+                   AND NOT {parked}
+                   AND {live}
+             )"
+        ),
+        params![revision_id, RELATION_BLOCKS, root],
         |row| row.get(0),
     )?)
 }
@@ -363,6 +385,26 @@ impl WorkDb {
         }
         commit_and_publish(tx, pending, self.event_bus())?;
         Ok(retired)
+    }
+
+    /// Items held for an owner question that still have an open PR and an
+    /// active CI-fix attempt. The merge poller probes these only to retire a
+    /// moot CI-fix; they are not admitted to automatic remediation or merge.
+    pub fn list_chores_awaiting_operator_answer_with_active_ci_fix(&self) -> Result<Vec<PendingMergeCheck>> {
+        self.query_pending_merge_checks(
+            "t.status = 'blocked'
+               AND t.blocked_reason = 'awaiting_operator_answer'
+               AND EXISTS (
+                   SELECT 1 FROM operator_questions q
+                    WHERE q.work_item_id = t.id AND q.status = 'open'
+               )
+               AND EXISTS (
+                   SELECT 1 FROM ci_remediations ci
+                    WHERE ci.work_item_id = t.id
+                      AND ci.status IN ('pending', 'running')
+                      AND ci.revision_task_id IS NOT NULL
+               )",
+        )
     }
 }
 
@@ -579,6 +621,41 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_dependent_is_not_the_next_writer_on_the_pr() {
+        let db = db();
+        let product = create_test_product(&db).id;
+        let item = pr_owner(&db, &product);
+        let (attempt_id, stopped) = ci_fix(&db, &product, &item, "mq:head-1", "merge_queue_rebounce", "todo");
+        execution(&db, &stopped, ExecutionStatus::Cancelled);
+        let behind = revision(&db, &item, "Resolve conflicts", "todo", "cli");
+        queue_behind(&db, &behind, &stopped);
+        db.connect()
+            .unwrap()
+            .execute("UPDATE tasks SET parked_at = '1' WHERE id = ?1", [&behind])
+            .unwrap();
+
+        assert!(db.retire_moot_pending_ci_fixes(&item, false).unwrap().is_empty());
+        assert_eq!(task(&db, &stopped).status, TaskStatus::Todo);
+        assert_eq!(attempt(&db, &attempt_id).status, "pending");
+    }
+
+    #[test]
+    fn a_dependent_on_another_pr_is_not_the_next_writer_on_this_one() {
+        let db = db();
+        let product = create_test_product(&db).id;
+        let item = pr_owner(&db, &product);
+        let (attempt_id, stopped) = ci_fix(&db, &product, &item, "mq:head-1", "merge_queue_rebounce", "todo");
+        execution(&db, &stopped, ExecutionStatus::Cancelled);
+        let other = pr_owner(&db, &product);
+        let foreign = revision(&db, &other, "Other pull request work", "todo", "cli");
+        queue_behind(&db, &foreign, &stopped);
+
+        assert!(db.retire_moot_pending_ci_fixes(&item, false).unwrap().is_empty());
+        assert_eq!(task(&db, &stopped).status, TaskStatus::Todo);
+        assert_eq!(attempt(&db, &attempt_id).status, "pending");
+    }
+
+    #[test]
     fn a_pending_head_failure_fix_is_closed_once_the_head_is_green() {
         let db = db();
         let product = create_test_product(&db).id;
@@ -710,5 +787,50 @@ mod tests {
         assert_eq!(ended.status, "abandoned");
         assert_eq!(ended.failure_reason.as_deref(), Some("revision_archived_by_owner"));
         assert!(db.active_blocked_signals(&item).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_item_held_for_an_owner_question_with_an_active_ci_fix_is_listed_for_observation() {
+        let db = db();
+        let product = create_test_product(&db).id;
+        let item = pr_owner(&db, &product);
+        let (_attempt, _revision) = ci_fix(&db, &product, &item, "head-1", "pr_branch_ci", "todo");
+        let asking = execution(&db, &item, ExecutionStatus::Running);
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_operator_answer' WHERE id = ?1",
+            [&item],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO operator_questions(id, work_item_id, execution_id, proposal_id, question_json, status, created_at)
+             VALUES ('oq-observe', ?1, ?2, 'prop', ?3, 'open', '1')",
+            params![
+                item,
+                asking,
+                r#"{"text":"Skip the build-fix?","answer_type":{"kind":"yes_no"},"explanation":"why"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let listed = db.list_chores_awaiting_operator_answer_with_active_ci_fix().unwrap();
+        assert!(
+            listed.iter().any(|row| row.work_item_id == item),
+            "the observation list must include the parent"
+        );
+        assert!(
+            db.list_chores_pending_merge_check()
+                .unwrap()
+                .iter()
+                .all(|row| row.work_item_id != item)
+        );
+        assert!(
+            db.list_chores_blocked_other_with_pr()
+                .unwrap()
+                .iter()
+                .all(|row| row.work_item_id != item),
+            "the question's hold must not admit the parent to automatic remediation"
+        );
     }
 }

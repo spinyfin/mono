@@ -200,6 +200,9 @@ fn the_owners_yes_closes_the_dead_revision_and_releases_what_waited_on_it() {
     for moved in [&stuck.ci_fix, &stuck.conflict_work] {
         assert!(outcome.touched_work_item_ids.contains(moved), "{moved}");
     }
+    assert_eq!(outcome.retired_ci_attempts.len(), 1);
+    assert_eq!(outcome.retired_ci_attempts[0].id, stuck.attempt);
+    assert_eq!(outcome.retired_ci_attempts[0].status, "abandoned");
     // Answering again is the idempotent repeat it always was.
     answer(&fx, &stuck.item, OperatorAnswer::YesNo { value: true }).expect("idempotent repeat");
 }
@@ -529,4 +532,111 @@ fn a_bound_change_must_be_in_reach_possible_and_still_needed() {
         .unwrap();
     let from_worker = rejection(&fx, &worker.id, skip_or_run(&stuck), "k5");
     assert!(from_worker.contains("only a progression run"), "{from_worker}");
+}
+
+#[test]
+fn a_coordinator_answer_does_not_make_the_bound_change() {
+    let fx = fx();
+    let stuck = stuck(&fx);
+    ask(&fx, &stuck, skip_or_run(&stuck));
+
+    let error = fx
+        .db
+        .answer_operator_question_from(
+            &stuck.item,
+            OperatorAnswer::YesNo { value: true },
+            &fx.checker,
+            boss_protocol::LAST_STATUS_ACTOR_BOSS,
+            None,
+            false,
+        )
+        .unwrap_err();
+    let Some(OperatorQuestionError::ValidationFailed { message }) = error.downcast_ref::<OperatorQuestionError>()
+    else {
+        panic!("expected a typed refusal, got {error:#}");
+    };
+    assert!(message.contains("only the owner"), "{message}");
+    assert_eq!(
+        fx.db.list_operator_questions(&stuck.item).unwrap()[0].status,
+        OperatorQuestionStatus::Open
+    );
+    assert_eq!(fx.task(&stuck.ci_fix).status, TaskStatus::Todo);
+    assert_eq!(attempt_row(&fx, &stuck.attempt).status, "pending");
+}
+
+#[test]
+fn a_multiple_choice_handoff_in_context_is_refused_even_when_another_option_is_bound() {
+    let fx = fx();
+    let stuck = stuck(&fx);
+    let run = fx.run(&stuck.item, FINGERPRINT, "S13_revision_chain");
+    let reason = rejection(
+        &fx,
+        &run,
+        json!({
+            "outcome": "blocked", "summary": "A cancelled build-fix blocks the conflict work", "criterion": "2",
+            "question": {
+                "text": "Skip that build-fix so we can resolve the conflicts with main?",
+                "answer_type": {"kind": "multiple_choice", "choices": ["Skip", "Keep"]},
+                "explanation": "Context:\nSkip: you delete the cancelled row on the board.\nKeep: the engine \
+                                archives it.\nRecommendation:\nKeep it."
+            },
+            "answer_actions": [{"answer": "Keep", "action": {
+                "kind": "archive_revision", "revision": stuck.ci_fix}}]
+        }),
+        "mc-context",
+    );
+    assert!(reason.contains("you delete"), "{reason}");
+    assert!(reason.contains("the explanation of what an answer does"), "{reason}");
+}
+
+#[test]
+fn a_prerequisite_question_is_an_executable_answer_under_criterion_2() {
+    let fx = fx();
+    let stuck = stuck(&fx);
+    ask(
+        &fx,
+        &stuck,
+        json!({
+            "outcome": "blocked", "summary": "Needs a precursor first", "criterion": "2",
+            "question": {
+                "text": "Create a prerequisite to land the fixture fix first?",
+                "answer_type": {"kind": "create_prerequisite_task", "name": "Fix the fixture race",
+                                "brief": "The fixture races retention cleanup."},
+                "explanation": "Context:\nThe next run cannot start until that work lands.\nYes:\nThat work is \
+                                created and this item waits on it.\nNo:\nThis item continues without it.\n\
+                                Recommendation:\nI recommend Yes because the next run cannot start until it lands."
+            }
+        }),
+    );
+    assert_eq!(
+        fx.db.list_operator_questions(&stuck.item).unwrap()[0].status,
+        OperatorQuestionStatus::Open
+    );
+}
+
+#[test]
+fn a_link_prerequisite_question_is_an_executable_answer_under_criterion_2() {
+    let fx = fx();
+    let stuck = stuck(&fx);
+    fx.keys.set(fx.keys.get() + 1);
+    let other = fx.pr_item("Land the wiring", "pass");
+    ask(
+        &fx,
+        &stuck,
+        json!({
+            "outcome": "blocked", "summary": "Wait for the open wiring PR", "criterion": "2",
+            "question": {
+                "text": "Wait for the wiring that already has a pull request?",
+                "answer_type": {"kind": "link_prerequisite_task", "existing_id": other,
+                                "name": "Land the wiring"},
+                "explanation": "Context:\nThat pull request is already open.\nYes:\nThis item waits for it.\nNo:\n\
+                                This item continues without it.\nRecommendation:\nI recommend Yes because that \
+                                work already exists."
+            }
+        }),
+    );
+    assert_eq!(
+        fx.db.list_operator_questions(&stuck.item).unwrap()[0].status,
+        OperatorQuestionStatus::Open
+    );
 }

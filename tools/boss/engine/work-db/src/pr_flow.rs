@@ -2867,8 +2867,9 @@ impl WorkDb {
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
         }
         // A board change bound to the chosen answer is made here, or the answer is refused.
-        let changed = crate::answer_actions::apply_bound_in_tx(&mut pending, &tx, &task, &question, &chosen, actor)?;
-        touched_work_item_ids.extend(changed);
+        let bound = crate::answer_actions::apply_bound_in_tx(&mut pending, &tx, &task, &question, &chosen, actor)?;
+        touched_work_item_ids.extend(bound.touched);
+        let retired_ci_attempts = bound.retired_attempts;
 
         if let Some(reason) = archive_reason {
             anyhow::ensure!(
@@ -2899,6 +2900,7 @@ impl WorkDb {
             .maybe_prerequisite_work_item_id(prerequisite_work_item_id)
             .touched_work_item_ids(touched_work_item_ids)
             .maybe_dispatch_work_item_id(dispatch_work_item_id)
+            .retired_ci_attempts(retired_ci_attempts)
             .build())
     }
 }

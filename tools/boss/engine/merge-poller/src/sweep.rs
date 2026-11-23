@@ -139,6 +139,10 @@ pub async fn reconcile_batch(
     let blocked_ci = candidates_for_pr_urls(work_db.list_chores_blocked_on_ci_failure(), &wanted);
     let blocked_other = candidates_for_pr_urls(work_db.list_chores_blocked_other_with_pr(), &wanted);
     let stranded_blocked = candidates_for_pr_urls(work_db.list_chores_stranded_blocked_remediation(), &wanted);
+    let awaiting_answer = candidates_for_pr_urls(
+        work_db.list_chores_awaiting_operator_answer_with_active_ci_fix(),
+        &wanted,
+    );
 
     // Probe only the requested URLs that still have a live candidate row.
     // A URL that has dropped off every list costs nothing here and is
@@ -150,6 +154,7 @@ pub async fn reconcile_batch(
         .chain(blocked_ci.iter())
         .chain(blocked_other.iter())
         .chain(stranded_blocked.iter())
+        .chain(awaiting_answer.iter())
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_seen.insert(url.clone()))
         .collect();
@@ -192,6 +197,10 @@ pub async fn reconcile_batch(
     }
     for candidate in &stranded_blocked {
         sweep_stranded_blocked_remediation(work_db, &probe_results, publisher, host, candidate, &mut outcome).await;
+    }
+    for candidate in &awaiting_answer {
+        observe_awaiting_answer_for_moot_ci_fix(work_db, publisher, host, candidate, &probe_results, "adaptive_batch")
+            .await;
     }
     // See the matching gate in `run_one_pass`: a `trunk_queue` product's
     // dequeue/eviction signal is owned by the Trunk queue poller, not
@@ -1530,11 +1539,34 @@ pub(crate) async fn dispatch_ci_axis(
 /// leave conflict revisions alone. Publishes a work-item invalidation when
 /// anything was archived, since neither retire path notifies the board.
 ///
+/// Probe an item held for an owner question only to retire a moot CI-fix.
+/// The question's hold stays; the item is not admitted to [`sweep_one`].
+pub(crate) async fn observe_awaiting_answer_for_moot_ci_fix(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    host: Option<&dyn SweepHost>,
+    candidate: &PendingMergeCheck,
+    probe_results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+    caller: &'static str,
+) {
+    let probe_result = match probe_results.get(&candidate.pr_url) {
+        Some(Ok(state)) => state,
+        _ => return,
+    };
+    let PrLifecycleState::Open(open) = &probe_result.state else {
+        return;
+    };
+    let known_queue = retire_moot_revisions(work_db, publisher, host, candidate, probe_result, open)
+        .await
+        .then_some(None);
+    update_pr_poll_state(work_db, publisher, candidate, probe_result, known_queue, caller).await;
+}
+
 /// A green head also retires CI-fix attempts that are still *active* but can
 /// no longer run (`ci_watch::retire_moot_pending_ci_fixes`). Returns whether
 /// any was, so the caller does not write the PR's poll state from a snapshot
 /// of an attempt that has just ended.
-async fn retire_moot_revisions(
+pub(crate) async fn retire_moot_revisions(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     host: Option<&dyn SweepHost>,

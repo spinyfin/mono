@@ -120,7 +120,7 @@ pub(crate) mod abandon_cause {
     );
     pub(crate) const OWNER_ANSWER_ARCHIVED_REVISION: AbandonCause<'static> = AbandonCause::engine(
         "owner_answer_archived_revision",
-        "apply_answer_action",
+        "apply_bound_in_tx",
         "the owner's answer archived the revision; its not-yet-live executions withdrawn before it was archived",
     );
 }

@@ -38,7 +38,7 @@ The declaration is refused, and the run can ask again properly, when:
 
 ### Applied when the owner answers
 
-The change is made in the transaction that records the answer, as whoever answered. Three things can happen:
+The change is made in the transaction that records the answer, and only when the owner answers. A coordinator or progression answerer records no bound change: the answer is refused with a typed failure, nothing is written, and the question stays open. Three things can happen:
 
 - **It is made.** The item's description gains a line saying what the engine did, so the next progression run neither repeats it nor asks for it again. The engine log has `operator answer: made the board change bound to the chosen answer`.
 - **Nothing was left to change** (the revision was closed in the meantime). The answer is recorded and the description says so.
@@ -48,7 +48,7 @@ An answer that binds no change behaves as before: it is recorded on the item's d
 
 ## What a question may not say
 
-A progression question is refused when its question text, an option label, or the part of the explanation that says what an answer does (everything but `Context:` and `Details:`) is worded so that the owner would make the change:
+A progression question is refused when its question text, an option label, or the part of the explanation that says what an answer does is worded so that the owner would make the change. For a yes/no question that is everything but `Context:` and `Details:`. For a multiple-choice question `Context:` is kept, because that is where each option's outcome is described:
 
 - "by hand", "manually", "yourself";
 - "you" or "please" governing a board verb: "you archive", "please delete", "you will need to start";
@@ -59,7 +59,11 @@ An option label in the first person ("I will delete the cancelled row now") is r
 
 A board verb on its own is fine. "Archive the cancelled build-fix" is what the engine does when `archive-revision` is bound to that answer.
 
-The same two functions (`owner_handoff_wording`, `owner_voiced_label` in `boss_protocol`) are run over every option set and question text the engine itself defines, in `answer_actions::tests`. An engine-defined question added later goes in that list.
+The same two functions (`owner_handoff_wording`, `owner_voiced_label` in `boss_protocol`) are run over every option set `engine_option_sets()` returns. Producers read their labels from that list, so a new engine-defined option is checked by the same test.
+
+### What is not a bound change
+
+`--on-answer` is the three board mutations above, plus the item-local Park / Archive labels and the built-in create-prerequisite and link-prerequisite questions. Changing priority, merging a pull request, stopping a live worker, and answering someone else's question stay human-only. Binding any of those would be a separate capability (the critical-priority gate, GitHub merge intents, live worker teardown). A progression run that needs one of them ends with `--summary` rather than a question the owner would have to carry out.
 
 ## Moot CI-fix attempts
 
@@ -69,7 +73,11 @@ A CI-fix revision is created by a `ci_remediations` attempt, and the two are mea
 - for a merge-queue failure, the PR's stored CI state reads `fail` although every check on its head passes;
 - the board keeps the attempt's "ci failing (n/m)" badge.
 
-On every open probe with green head CI, whatever the mergeability, the merge poller retires such an attempt, archives its revision and releases what waited on it. The reason is recorded as the attempt's `failure_reason`:
+On every open probe with green head CI, whatever the mergeability, the merge poller retires such an attempt, archives its revision and releases what waited on it. That includes an item held on `awaiting_operator_answer` with an open question and an active CI-fix: the poller probes it only for this retire, leaves the question's hold in place, and does not admit the row to automatic remediation or merge.
+
+A merge-queue failure is not a required check on the PR head. Head CI is green by construction for those, so a ready or autostart queue-side fix stays pending until one of the three reasons below. Closing it on green head CI alone would drop a real prerequisite. The next writer that can make a queue-side fix moot is a runnable revision of the same PR chain, not a parked dependent or a dependent on another PR.
+
+The reason is recorded as the attempt's `failure_reason`:
 
 | `failure_reason`                      | When                                                                                                                                                                                                                           |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -86,7 +94,7 @@ Left alone, always:
 - a merge-queue fix on a PR that still merges cleanly, unless it is both stopped and in another writer's way. Head CI is green by construction for a merge-queue failure, and a fix that is queued to run is doing its job;
 - a parked item.
 
-The retire emits `CiFailureCleared`, and the same pass writes the head's real CI state. To see it happen, read `ci_watch: retired a moot CI-fix attempt` in the engine log, or `boss engine ci list --work-item <id>`.
+The retire emits `CiFailureCleared`, and the same pass writes the head's real CI state. An owner answer that archives the revision publishes the same event after commit, so the card's "ci failing" badge is not left on a stale pending row. To see it happen, read `ci_watch: retired a moot CI-fix attempt` in the engine log, or `boss engine ci list --work-item <id>`.
 
 ## Where the code is
 

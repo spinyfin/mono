@@ -14,17 +14,16 @@ pub(crate) enum Disposition {
 /// "Archive" and "Park" on a question about something other than the item
 /// remain instructions for the worker.
 pub(crate) fn known_choice(choice: &str) -> Option<Disposition> {
-    match choice.trim().to_ascii_lowercase().as_str() {
-        "archive this item"
-        | "archive this chore"
-        | "archive this task"
-        | "archive this revision"
-        | "archive this followup" => Some(Disposition::Archive),
-        "park this item" | "park this chore" | "park this task" | "park this revision" | "park this followup" => {
-            Some(Disposition::Park)
+    let lower = choice.trim().to_ascii_lowercase();
+    for noun in boss_protocol::ITEM_DISPOSITION_NOUNS {
+        if lower == format!("archive this {noun}") {
+            return Some(Disposition::Archive);
         }
-        _ => None,
+        if lower == format!("park this {noun}") {
+            return Some(Disposition::Park);
+        }
     }
+    None
 }
 
 /// Park the item as the owner and settle the answered question.

@@ -16,18 +16,15 @@
 //!   made, the whole answer is refused with the reason and the question stays
 //!   open. An answer is never recorded with its change left undone.
 //!
-//! Before this, the answer to a progression question changed nothing by
-//! itself: it restored the item's stuck state and appended the answer to the
-//! item's description for the next progression run, whose verbs were then
-//! refused for exactly the reason the first run had asked. The owner was asked
-//! again, and finally asked to make the change by hand.
-//!
-//! The changes are made with the owner's authority, not the agent's. The
-//! agent's `archive-revision` needs proof that a revision is dead (its parent
-//! PR green, or the revision already delivered); the owner's answer is the
-//! decision that it is not wanted, so no such proof is asked for. What still
-//! refuses a change is a fact, not a permission: a worker is on the revision,
-//! or the engine's own start path declines.
+//! An answer that carries no bound change still restores the item's stuck
+//! state and appends the answer to the item's description for the next
+//! progression run. A bound change is made with the owner's authority, not
+//! the agent's. The agent's `archive-revision` needs proof that a revision
+//! is dead (its parent PR green, or the revision already delivered); the
+//! owner's answer is the decision that it is not wanted, so no such proof is
+//! asked for. What still refuses a change is a fact, not a permission: a
+//! worker is on the revision, or the engine's own start path declines. Only
+//! a human answerer may make a bound change.
 
 use super::*;
 use crate::moot_ci_fix::retire_attempts_of_closed_revision_in_tx;
@@ -35,8 +32,8 @@ use crate::progression_scope::check_progression_scope_on;
 use crate::progression_verbs::resolve_target;
 use crate::task_status_audit::abandon_cause;
 use boss_protocol::{
-    AnswerAction, OperatorAnswer, OperatorAnswerType, OperatorQuestion, OperatorQuestionError, OperatorQuestionRecord,
-    OwnerAction, ProgressionQuestionCriterion, RunDoneProposalPayload,
+    AnswerAction, LAST_STATUS_ACTOR_HUMAN, OperatorAnswer, OperatorAnswerType, OperatorQuestion, OperatorQuestionError,
+    OperatorQuestionRecord, OwnerAction, ProgressionQuestionCriterion, RunDoneProposalPayload,
 };
 
 /// `tasks.archived_by` for a revision the owner's answer closed.
@@ -50,7 +47,9 @@ const ATTEMPT_RETIRED_BY_OWNER_ANSWER: &str = "revision_archived_by_owner";
 const HOW_TO_ASK: &str = "The owner decides and the engine acts: word each answer as what happens when it is picked, \
      and bind a board change to an answer with `--on-answer '<answer>=<change>'`, where the change is \
      `archive-revision <id>`, `start <id>` or `undepend <dependent-id> <prerequisite-id>`. The options `Park this \
-     item` and `Archive this item` are also carried out by the engine.";
+     item` and `Archive this item` are also carried out by the engine. A create-prerequisite or link-prerequisite \
+     question is carried out without a binding. Changing priority, merging a pull request, stopping a live worker, \
+     and answering someone else's question are not bound changes.";
 
 /// A bound change resolved against the board: what making it would do.
 enum Plan {
@@ -172,8 +171,11 @@ fn handoff_wording(question: &OperatorQuestion) -> Option<String> {
             }
         }
     }
-    boss_protocol::owner_handoff_wording(&boss_protocol::explanation_decision_text(&question.explanation))
-        .map(|phrase| refusal("the explanation of what an answer does", phrase))
+    boss_protocol::owner_handoff_wording(&boss_protocol::explanation_decision_text(
+        &question.explanation,
+        &question.answer_type,
+    ))
+    .map(|phrase| refusal("the explanation of what an answer does", phrase))
 }
 
 /// Whether the question offers an option the engine carries out without a
@@ -181,6 +183,24 @@ fn handoff_wording(question: &OperatorQuestion) -> Option<String> {
 fn offers_item_disposition(question: &OperatorQuestion) -> bool {
     matches!(&question.answer_type, OperatorAnswerType::MultipleChoice { choices }
         if choices.iter().any(|choice| crate::operator_disposition::known_choice(choice).is_some()))
+}
+
+/// Whether any answer to `question` is one the engine carries out: a bound
+/// change, an item-local disposition, or a built-in prerequisite question.
+fn offers_executable_answer(question: &OperatorQuestion, actions: &[AnswerAction]) -> bool {
+    !actions.is_empty()
+        || offers_item_disposition(question)
+        || matches!(
+            question.answer_type,
+            OperatorAnswerType::CreatePrerequisiteTask { .. } | OperatorAnswerType::LinkPrerequisiteTask { .. }
+        )
+}
+
+/// What [`apply_bound_in_tx`] did, for the answer transaction.
+#[derive(Default)]
+pub(crate) struct BoundApplication {
+    pub touched: Vec<String>,
+    pub retired_attempts: Vec<CiRemediation>,
 }
 
 /// Why the question a `run_done` declaration carries may not be asked as it
@@ -246,7 +266,7 @@ pub(crate) fn refuse_question_shape(
         boss_protocol::run_done_question_criterion(payload_json),
         Some(ProgressionQuestionCriterion::HumanOnlyAction | ProgressionQuestionCriterion::VerbsExhausted)
     );
-    if asks_for_an_action && actions.is_empty() && !offers_item_disposition(question) {
+    if asks_for_an_action && !offers_executable_answer(question, &actions) {
         return Ok(Some(format!(
             "this question cites criterion 1 or 2, so it asks for an action, but none of its answers is carried \
              out by the engine: whatever the owner picks, nothing on the board changes and the next run is \
@@ -286,15 +306,17 @@ fn name_of(task: &Task) -> String {
 }
 
 /// Make the change bound to `answer`, if the question binds one to it, as
-/// `actor`. Returns the other items the change touched, for the board; empty
-/// when the answer carries no change. An `Err` carrying an
-/// [`OperatorQuestionError`] means the change could not be made; the caller's
-/// transaction is then dropped, so the answer is not recorded either.
+/// the owner. Returns the other items the change touched and any CI attempts
+/// it retired, for the board and the badge; empty when the answer carries no
+/// change. An `Err` carrying an [`OperatorQuestionError`] means the change
+/// could not be made; the caller's transaction is then dropped, so the answer
+/// is not recorded either.
 ///
 /// Must run after the answer has restored the item's own state, in the same
 /// transaction, so a change that starts the item itself sees it restored. The
 /// caller's board publication reconciles the product and wakes the scheduler,
-/// which is what dispatches work the change released or started.
+/// which is what dispatches work the change released or started. A bound
+/// change is refused unless `actor` is the owner.
 pub(crate) fn apply_bound_in_tx(
     pending: &mut PendingEvents,
     conn: &Connection,
@@ -302,7 +324,7 @@ pub(crate) fn apply_bound_in_tx(
     question: &OperatorQuestionRecord,
     answer: &OperatorAnswer,
     actor: &str,
-) -> Result<Vec<String>> {
+) -> Result<BoundApplication> {
     let payload: Option<String> = conn
         .query_row(
             "SELECT p.payload_json FROM operator_questions q
@@ -313,7 +335,7 @@ pub(crate) fn apply_bound_in_tx(
         )
         .optional()?;
     let Some(payload) = payload else {
-        return Ok(Vec::new());
+        return Ok(BoundApplication::default());
     };
     let actions: Vec<AnswerAction> = boss_protocol::run_done_answer_actions(&payload).map_err(|message| {
         anyhow::Error::from(OperatorQuestionError::ValidationFailed {
@@ -321,8 +343,16 @@ pub(crate) fn apply_bound_in_tx(
         })
     })?;
     let Some(bound) = actions.iter().find(|bound| bound.applies_to(answer)) else {
-        return Ok(Vec::new());
+        return Ok(BoundApplication::default());
     };
+    if actor != LAST_STATUS_ACTOR_HUMAN {
+        return Err(OperatorQuestionError::ValidationFailed {
+            message: "only the owner can make the board change this answer carries; nothing was changed and \
+                 the question is still open"
+                .into(),
+        }
+        .into());
+    }
     let action = &bound.action;
     // The scope was checked when the question was asked; the stored snapshot
     // is checked again so a change can never reach outside it.
@@ -336,7 +366,7 @@ pub(crate) fn apply_bound_in_tx(
         }
     }
     let now = now_string();
-    let mut touched = Vec::new();
+    let mut application = BoundApplication::default();
     let made = match plan(conn, task, action)?.map_err(|why| refused(action, &why))? {
         Plan::AlreadyDone(why) => format!("nothing was left to change: {why}"),
         Plan::ArchiveRevision(revision) => {
@@ -379,8 +409,9 @@ pub(crate) fn apply_bound_in_tx(
             if !retired.is_empty() {
                 made.push_str("; the CI attempt that created it was retired");
             }
-            touched.push(revision.id);
-            touched.extend(waiting);
+            application.touched.push(revision.id);
+            application.touched.extend(waiting);
+            application.retired_attempts = retired;
             made
         }
         Plan::Start(target) => {
@@ -399,7 +430,7 @@ pub(crate) fn apply_bound_in_tx(
             )?;
             stage_task_board_change(pending, conn, &target.id)?;
             let made = format!("started {}", name_of(&target));
-            touched.push(target.id);
+            application.touched.push(target.id);
             made
         }
         Plan::Undepend {
@@ -410,7 +441,7 @@ pub(crate) fn apply_bound_in_tx(
             crate::dep_helpers::maybe_engine_unblock_dependent_as_actor(pending, conn, &dependent, &now, actor)?;
             stage_task_board_change(pending, conn, &dependent)?;
             let made = format!("`{dependent}` no longer waits on `{prerequisite}`");
-            touched.push(dependent);
+            application.touched.push(dependent);
             made
         }
     };
@@ -437,43 +468,17 @@ pub(crate) fn apply_bound_in_tx(
         made = %made,
         "operator answer: made the board change bound to the chosen answer",
     );
-    Ok(touched)
+    Ok(application)
 }
 
 #[cfg(test)]
 mod tests {
     use boss_protocol::{
-        AnswerOptionLabels, CONFLICT_MISMATCH_CHOICE_FORCE_MERGE, CONFLICT_MISMATCH_CHOICE_REWRITE,
-        FileCountBypassSpec, OperatorAnswerType, owner_handoff_wording, owner_voiced_label,
+        FileCountBypassSpec, OperatorAnswerType, engine_option_sets, owner_handoff_wording, owner_voiced_label,
     };
 
     use crate::operator_disposition::known_choice;
-    use crate::progression_ladder::{ARCHIVE_IT, KEEP_TRYING, PARK_IT, QUESTION_TEXT};
-
-    /// Every option label the engine itself defines, by the question it
-    /// belongs to. A new engine-defined question adds its labels here.
-    fn engine_defined_option_labels() -> Vec<(&'static str, Vec<String>)> {
-        let labels = AnswerOptionLabels::split_or_bypass();
-        let dispositions = ["item", "chore", "task", "revision", "followup"]
-            .iter()
-            .flat_map(|noun| [format!("Archive this {noun}"), format!("Park this {noun}")])
-            .collect();
-        vec![
-            (
-                "out of attempts",
-                vec![PARK_IT.into(), ARCHIVE_IT.into(), KEEP_TRYING.into()],
-            ),
-            (
-                "architectural mismatch",
-                vec![
-                    CONFLICT_MISMATCH_CHOICE_REWRITE.into(),
-                    CONFLICT_MISMATCH_CHOICE_FORCE_MERGE.into(),
-                ],
-            ),
-            ("split or bypass", vec![labels.yes, labels.no]),
-            ("item dispositions", dispositions),
-        ]
-    }
+    use crate::progression_ladder::QUESTION_TEXT;
 
     /// Every question text the engine words itself.
     fn engine_worded_questions() -> Vec<String> {
@@ -495,7 +500,7 @@ mod tests {
     /// delete that row on the board", fails here.
     #[test]
     fn no_engine_defined_option_or_question_hands_a_board_change_to_the_owner() {
-        for (question, labels) in engine_defined_option_labels() {
+        for (question, labels) in engine_option_sets() {
             assert!(!labels.is_empty(), "{question}");
             for label in labels {
                 assert_eq!(owner_voiced_label(&label), None, "{question}: `{label}`");
@@ -523,7 +528,7 @@ mod tests {
     /// Every item-disposition label the guard lists is one the engine acts on.
     #[test]
     fn every_listed_item_disposition_is_carried_out_by_the_engine() {
-        let (_, dispositions) = engine_defined_option_labels()
+        let (_, dispositions) = engine_option_sets()
             .into_iter()
             .find(|(question, _)| *question == "item dispositions")
             .unwrap();

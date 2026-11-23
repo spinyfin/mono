@@ -419,3 +419,118 @@ async fn sweep_retires_a_cancelled_queue_fix_once_the_green_pr_conflicts() {
     assert_eq!(task(&db, &chore).ci_required_state.as_deref(), Some("success"));
     assert!(publisher.ci_failure_cleared_count(pr).await >= 1);
 }
+
+/// Whole pass: the parent is held on an owner question, head CI is green, and a
+/// cancelled CI-fix still gates a sibling. The pass retires the fix and leaves
+/// the question's hold in place.
+#[tokio::test]
+async fn sweep_retires_a_cancelled_fix_while_an_owner_question_is_open() {
+    use crate::tests::StubProbe;
+
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/713";
+    let (product, chore) = make_in_review(&db, "C-question-moot-fix", pr);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let (attempt_id, revision) = spawn_ci_fix(&db, &product, &chore, pr, "head-1").await;
+    executions_to(&db, &revision, "cancelled");
+
+    let asking = db
+        .create_execution(
+            crate::work::CreateExecutionInput::builder()
+                .work_item_id(chore.clone())
+                .kind(crate::work::ExecutionKind::TaskImplementation)
+                .status(crate::work::ExecutionStatus::Cancelled)
+                .build(),
+        )
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = 'awaiting_operator_answer' WHERE id = ?1",
+        [&chore],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO operator_questions(id, work_item_id, execution_id, proposal_id, question_json, status, created_at)
+         VALUES ('oq-c1', ?1, ?2, 'prop', ?3, 'open', '1')",
+        rusqlite::params![
+            chore,
+            asking.id,
+            r#"{"text":"Skip that build-fix so the conflicts can be resolved?","answer_type":{"kind":"yes_no"},"explanation":"why"}"#
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        task(&db, &chore).blocked_reason.as_deref(),
+        Some("awaiting_operator_answer")
+    );
+    assert!(
+        db.list_chores_pending_merge_check()
+            .unwrap()
+            .iter()
+            .all(|row| row.work_item_id != chore),
+        "the question's hold must keep the parent off the in-review list"
+    );
+    assert!(
+        db.list_chores_awaiting_operator_answer_with_active_ci_fix()
+            .unwrap()
+            .iter()
+            .any(|row| row.work_item_id == chore),
+        "the observation list must see the parent"
+    );
+
+    let sibling = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(chore.clone())
+                .description("Resolve the conflicts with the base branch")
+                .force_duplicate(true)
+                .build(),
+            &fix_checker(),
+        )
+        .unwrap();
+    assert_eq!(
+        db.gating_prereqs_for(&sibling.id).unwrap(),
+        vec![revision.clone()],
+        "precondition: the sibling waits on the cancelled CI-fix"
+    );
+
+    let probe = StubProbe::new();
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus {
+            mergeability: OpenPrMergeability::Clean,
+            ci: OpenPrCiStatus::Clean,
+        }),
+        "base-1",
+        "head-1",
+    );
+    crate::run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+
+    let ended = attempt(&db, &attempt_id);
+    assert_eq!(ended.status, "abandoned");
+    assert_eq!(ended.failure_reason.as_deref(), Some("moot_head_ci_green"));
+    assert_closed(&db, &revision);
+    assert!(
+        db.gating_prereqs_for(&sibling.id).unwrap().is_empty(),
+        "the sibling must no longer wait on the closed revision"
+    );
+    assert_eq!(
+        task(&db, &chore).blocked_reason.as_deref(),
+        Some("awaiting_operator_answer"),
+        "the question's hold must stay"
+    );
+    assert_eq!(
+        db.list_operator_questions(&chore).unwrap()[0].status,
+        boss_protocol::OperatorQuestionStatus::Open
+    );
+    assert!(
+        db.list_chores_pending_merge_check()
+            .unwrap()
+            .iter()
+            .all(|row| row.work_item_id != chore),
+        "the parent must not be admitted to automatic merge after the retire"
+    );
+    assert!(publisher.ci_failure_cleared_count(pr).await >= 1);
+}

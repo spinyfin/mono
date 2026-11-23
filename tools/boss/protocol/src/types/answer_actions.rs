@@ -101,7 +101,7 @@ pub struct AnswerAction {
 }
 
 impl AnswerAction {
-    /// Parse `<answer>=<change>`, for example `yes=archive-revision T12`. The
+    /// Parse `<answer>=<change>`, for example `yes=archive-revision <id>`. The
     /// split is at the last `=`, so an option label may contain one.
     pub fn parse(flag: &str) -> Result<Self, String> {
         let Some((answer, spec)) = flag.rsplit_once('=') else {
@@ -290,23 +290,68 @@ pub fn owner_voiced_label(label: &str) -> Option<String> {
         .map(|opening| opening.trim().to_owned())
 }
 
-/// The parts of a labelled explanation that say what an answer does: every
-/// section but `Context:` and `Details:`. Those two describe the situation and
-/// carry evidence; the rest is what the owner reads as "what happens if I pick
-/// this".
-pub fn explanation_decision_text(explanation: &str) -> String {
+/// The parts of a labelled explanation that say what an answer does.
+///
+/// `Details:` is always evidence and is dropped. For a Yes/No question,
+/// `Context:` describes the situation and is dropped too; `Yes:`, `No:` and
+/// `Recommendation:` are what the owner reads as "what happens if I pick
+/// this". A multiple-choice question has no `Yes:` / `No:` sections: it says
+/// in `Context:` what each option leads to, so that section is kept.
+pub fn explanation_decision_text(explanation: &str, answer_type: &OperatorAnswerType) -> String {
+    let keep_context = matches!(answer_type, OperatorAnswerType::MultipleChoice { .. });
     let mut kept = Vec::new();
     let mut in_context = false;
     for line in explanation.lines() {
         match line.trim() {
             "Details:" => break,
-            "Context:" => in_context = true,
-            "Yes:" | "No:" | "Recommendation:" => in_context = false,
+            "Context:" => in_context = !keep_context,
+            "Yes:" | "No:" | "Recommendation:" | "Split:" | "Bypass limit:" => in_context = false,
             body if !in_context && !body.is_empty() => kept.push(body),
             _ => {}
         }
     }
     kept.join("\n")
+}
+
+/// Labels of the question the engine files when progression runs out of attempts.
+pub const LADDER_PARK_IT: &str = "Park it";
+pub const LADDER_ARCHIVE_IT: &str = "Archive it";
+pub const LADDER_KEEP_TRYING: &str = "Keep trying";
+
+/// Nouns the engine puts on item-local Park / Archive options.
+pub const ITEM_DISPOSITION_NOUNS: &[&str] = &["item", "chore", "task", "revision", "followup"];
+
+/// Park / Archive labels the engine carries out without a bound change.
+pub fn item_disposition_labels() -> Vec<String> {
+    ITEM_DISPOSITION_NOUNS
+        .iter()
+        .flat_map(|noun| [format!("Archive this {noun}"), format!("Park this {noun}")])
+        .collect()
+}
+
+/// Every option set the engine itself puts on a question. Producers read
+/// their labels from here; the wording guard iterates the same list.
+pub fn engine_option_sets() -> Vec<(&'static str, Vec<String>)> {
+    let labels = super::answer_labels::AnswerOptionLabels::split_or_bypass();
+    vec![
+        (
+            "out of attempts",
+            vec![
+                LADDER_PARK_IT.to_owned(),
+                LADDER_ARCHIVE_IT.to_owned(),
+                LADDER_KEEP_TRYING.to_owned(),
+            ],
+        ),
+        (
+            "architectural mismatch",
+            vec![
+                super::conflict_mismatch::CONFLICT_MISMATCH_CHOICE_REWRITE.to_owned(),
+                super::conflict_mismatch::CONFLICT_MISMATCH_CHOICE_FORCE_MERGE.to_owned(),
+            ],
+        ),
+        ("split or bypass", vec![labels.yes, labels.no]),
+        ("item dispositions", item_disposition_labels()),
+    ]
 }
 
 #[cfg(test)]
@@ -321,16 +366,30 @@ mod tests {
         OperatorAnswer::MultipleChoice { value: value.into() }
     }
 
+    fn short_id(n: u32) -> String {
+        format!("T{n}")
+    }
+
     #[test]
     fn a_change_is_parsed_from_its_command_line_spelling_and_back() {
-        for spec in ["archive-revision T12", "start task_abc", "undepend T13 T12"] {
+        let revision = short_id(12);
+        let dependent = short_id(13);
+        let archive = format!("archive-revision {revision}");
+        let undepend = format!("undepend {dependent} {revision}");
+        for spec in [archive.as_str(), "start task_abc", undepend.as_str()] {
             assert_eq!(OwnerAction::parse(spec).unwrap().spelling(), spec);
         }
         assert_eq!(
-            OwnerAction::parse("undepend T13 T12").unwrap().targets(),
-            vec!["T13", "T12"]
+            OwnerAction::parse(&undepend).unwrap().targets(),
+            vec![dependent.as_str(), revision.as_str()]
         );
-        for bad in ["", "archive-revision", "delete T12", "start T1 T2", "undepend T13"] {
+        for bad in [
+            "",
+            "archive-revision",
+            &format!("delete {revision}"),
+            &format!("start {} {}", short_id(1), short_id(2)),
+            &format!("undepend {dependent}"),
+        ] {
             let error = OwnerAction::parse(bad).unwrap_err();
             assert!(error.contains("archive-revision <id>"), "{error}");
         }
@@ -338,26 +397,27 @@ mod tests {
 
     #[test]
     fn a_bound_action_splits_at_the_last_equals_and_matches_its_answer() {
-        let bound = AnswerAction::parse("yes=archive-revision T12").unwrap();
+        let revision = short_id(12);
+        let bound = AnswerAction::parse(&format!("yes=archive-revision {revision}")).unwrap();
         assert_eq!(bound.answer, "yes");
         assert!(bound.applies_to(&yes()));
         assert!(!bound.applies_to(&OperatorAnswer::YesNo { value: false }));
         assert!(!bound.applies_to(&choose("Yes, skip it")));
 
-        let labelled = AnswerAction::parse("Skip a=b build-fix=start T12").unwrap();
+        let labelled = AnswerAction::parse(&format!("Skip a=b build-fix=start {revision}")).unwrap();
         assert_eq!(labelled.answer, "Skip a=b build-fix");
         assert!(labelled.applies_to(&choose("Skip a=b build-fix")));
         assert!(!labelled.applies_to(&choose("skip a=b build-fix")));
 
-        assert!(AnswerAction::parse("archive-revision T12").is_err());
-        assert!(AnswerAction::parse("=start T12").is_err());
+        assert!(AnswerAction::parse(&format!("archive-revision {revision}")).is_err());
+        assert!(AnswerAction::parse(&format!("=start {revision}")).is_err());
     }
 
     #[test]
     fn bound_actions_must_name_an_answer_the_question_offers() {
         let archive = |answer: &str| AnswerAction {
             answer: answer.into(),
-            action: OwnerAction::ArchiveRevision { revision: "T12".into() },
+            action: OwnerAction::ArchiveRevision { revision: short_id(12) },
         };
         assert!(validate_answer_actions(&OperatorAnswerType::YesNo, &[archive("Yes"), archive("no")]).is_ok());
         assert!(validate_answer_actions(&OperatorAnswerType::YesNo, &[archive("maybe")]).is_err());
@@ -370,7 +430,7 @@ mod tests {
         assert!(validate_answer_actions(&choices, &[archive("yes")]).is_err());
 
         let prerequisite = OperatorAnswerType::LinkPrerequisiteTask {
-            existing_id: Some("T1".into()),
+            existing_id: Some("task_revision".into()),
             existing_pr: None,
             work_item_id: String::new(),
             name: String::new(),
@@ -382,12 +442,15 @@ mod tests {
 
     #[test]
     fn stored_actions_are_read_from_beside_the_typed_payload() {
-        let stored = r#"{"outcome":"blocked","summary":"s","answer_actions":[
-            {"answer":"yes","action":{"kind":"archive_revision","revision":"T12"}},
-            {"answer":"no","action":{"kind":"start","item":"T12"}}]}"#;
-        let actions = run_done_answer_actions(stored).unwrap();
+        let revision = short_id(12);
+        let stored = format!(
+            r#"{{"outcome":"blocked","summary":"s","answer_actions":[
+            {{"answer":"yes","action":{{"kind":"archive_revision","revision":"{revision}"}}}},
+            {{"answer":"no","action":{{"kind":"start","item":"{revision}"}}}}]}}"#
+        );
+        let actions = run_done_answer_actions(&stored).unwrap();
         assert_eq!(actions.len(), 2);
-        assert_eq!(actions[1].action, OwnerAction::Start { item: "T12".into() });
+        assert_eq!(actions[1].action, OwnerAction::Start { item: revision });
         assert_eq!(
             run_done_answer_actions(r#"{"outcome":"blocked","summary":"s"}"#).unwrap(),
             vec![]
@@ -420,7 +483,7 @@ mod tests {
             ),
             ("You will need to start the build-fix again.", "you start"),
             ("Remove the dependency by hand, then answer.", "by hand"),
-            ("Run `bossctl work start T12` to resume.", "bossctl"),
+            ("Run `bossctl work start task_revision` to resume.", "bossctl"),
             ("The row has to be closed manually.", "manually"),
         ] {
             assert_eq!(owner_handoff_wording(text).as_deref(), Some(phrase), "{text}");
@@ -467,12 +530,33 @@ mod tests {
         let explanation = "Context:\nPlease delete nothing here.\nYes:\nThe build-fix is skipped.\nNo:\nIt runs \
                            first.\nRecommendation:\nSkip it.\nDetails:\nbossctl output";
         assert_eq!(
-            explanation_decision_text(explanation),
+            explanation_decision_text(explanation, &OperatorAnswerType::YesNo),
             "The build-fix is skipped.\nIt runs first.\nSkip it."
         );
         assert_eq!(
-            explanation_decision_text("Context:\nc\nRecommendation:\nPick the first."),
+            explanation_decision_text(
+                "Context:\nc\nRecommendation:\nPick the first.",
+                &OperatorAnswerType::YesNo
+            ),
             "Pick the first."
+        );
+    }
+
+    #[test]
+    fn a_multiple_choice_context_that_hands_a_change_to_the_owner_is_in_the_decision_text() {
+        let explanation = "Context:\nSkip: you delete the cancelled row on the board.\nKeep: the engine archives \
+                           it.\nRecommendation:\nKeep it.";
+        let multiple = OperatorAnswerType::MultipleChoice {
+            choices: vec!["Skip".into(), "Keep".into()],
+        };
+        let decision = explanation_decision_text(explanation, &multiple);
+        assert!(
+            decision.contains("you delete the cancelled row on the board"),
+            "{decision}"
+        );
+        assert_eq!(
+            explanation_decision_text(explanation, &OperatorAnswerType::YesNo),
+            "Keep it."
         );
     }
 }

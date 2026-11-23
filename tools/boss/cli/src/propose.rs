@@ -2306,11 +2306,17 @@ mod tests {
                 serde_json::json!({"reason": "merge_conflict"})
             )
         );
+        let revision = format!("T{}", 9);
         assert_eq!(
-            shape(&["archive-revision", "T9", "--reason", "dead; parent is green"]),
+            shape(&[
+                "archive-revision",
+                revision.as_str(),
+                "--reason",
+                "dead; parent is green"
+            ]),
             (
                 ProposalKind::ArchiveRevision,
-                serde_json::json!({"revision": "T9", "reason": "dead; parent is green"})
+                serde_json::json!({"revision": revision, "reason": "dead; parent is green"})
             )
         );
         assert_eq!(shape(&["unblock"]), (ProposalKind::Unblock, serde_json::json!({})));
@@ -2318,12 +2324,13 @@ mod tests {
 
     #[test]
     fn progression_verbs_reject_malformed_invocations() {
+        let missing_reason = format!("T{}", 1);
         for args in [
             vec!["revise", "--brief", "a", "--brief-file", "b.md"],
             vec!["precursor", "--brief", "no name"],
             vec!["depend"],
             vec!["clear-signal", "--reason", "worker_failed"],
-            vec!["archive-revision", "T1"],
+            vec!["archive-revision", missing_reason.as_str()],
             vec!["redispatch", "--brief-addendum", "a", "--brief-addendum-file", "b.md"],
         ] {
             let mut full = vec!["boss", "propose"];
@@ -2532,8 +2539,11 @@ mod tests {
             "--explanation",
             "Context:\nc\nYes:\nIt is skipped.\nNo:\nIt runs first.\nRecommendation:\nI recommend Yes because CI is green.",
         ];
+        let revision = format!("T{}", 12);
+        let archive = format!("yes=archive-revision {revision}");
+        let start = format!("no=start {revision}");
         let mut args = base.to_vec();
-        args.extend(["--on-answer", "yes=archive-revision T12", "--on-answer", "no=start T12"]);
+        args.extend(["--on-answer", archive.as_str(), "--on-answer", start.as_str()]);
         let (kind, payload, _) = payload_for(command_for(&args)).unwrap();
         assert_eq!(kind, ProposalKind::RunDone);
         let bound = boss_protocol::run_done_answer_actions(&payload.to_string()).unwrap();
@@ -2541,21 +2551,25 @@ mod tests {
         assert_eq!(bound[0].answer, "yes");
         assert_eq!(
             bound[0].action,
-            boss_protocol::OwnerAction::ArchiveRevision { revision: "T12".into() }
+            boss_protocol::OwnerAction::ArchiveRevision {
+                revision: revision.clone()
+            }
         );
         assert_eq!(
             bound[1].action,
-            boss_protocol::OwnerAction::Start { item: "T12".into() }
+            boss_protocol::OwnerAction::Start { item: revision.clone() }
         );
         // Without the flag the payload carries no key.
         let (_, payload, _) = payload_for(command_for(&base)).unwrap();
         assert!(payload.get(boss_protocol::ANSWER_ACTIONS_KEY).is_none());
         // A change the engine cannot make is a usage error naming the ones it can.
         let mut unknown = base.to_vec();
-        unknown.extend(["--on-answer", "yes=delete T12"]);
+        let delete = format!("yes=delete {revision}");
+        unknown.extend(["--on-answer", delete.as_str()]);
         let error = payload_for(command_for(&unknown)).unwrap_err().to_string();
         assert!(error.contains("archive-revision <id>"), "{error}");
         // A change is bound to an answer, so it needs a question.
+        let start_only = format!("yes=start {revision}");
         assert!(
             Cli::try_parse_from([
                 "boss",
@@ -2566,7 +2580,7 @@ mod tests {
                 "--summary",
                 "s",
                 "--on-answer",
-                "yes=start T12"
+                start_only.as_str()
             ])
             .is_err()
         );
