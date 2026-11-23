@@ -2820,6 +2820,42 @@ pub(crate) enum CostCommand {
     /// The highest-token-cost runs recorded in a time window, ranked
     /// descending.
     Top(CostTopArgs),
+    /// Run-grain token usage in a time window as a task → execution → run
+    /// tree with the driver and model each execution and run used. Every
+    /// figure is computed by the engine; runs with no recorded tokens are
+    /// shown as unknown, never as zero. A task's revisions roll up under its
+    /// chain root: the root shows its own tokens and the chain's inclusive
+    /// total, and list totals count each run once.
+    Rows(CostRowsArgs),
+}
+
+/// How deep `boss cost rows` prints the tree in text mode (`--json` is always
+/// the whole reply).
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum UsageDepth {
+    Task,
+    Execution,
+    Run,
+}
+
+/// Parse `DIMENSION=VALUE[,VALUE…]` for `--filter`.
+pub(crate) fn parse_usage_filter(input: &str) -> Result<boss_protocol::UsageFilter, String> {
+    let (dimension, values) = input
+        .split_once('=')
+        .ok_or_else(|| format!("expected DIMENSION=VALUE[,VALUE…], got {input:?}"))?;
+    let values: Vec<String> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return Err(format!("--filter {dimension} needs at least one value"));
+    }
+    Ok(boss_protocol::UsageFilter {
+        dimension: dimension.trim().parse()?,
+        values,
+    })
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2892,6 +2928,56 @@ pub(crate) struct CostTopArgs {
 
     /// Include an estimated USD figure alongside the token totals. See
     /// `boss cost task --usd`'s help for the pricing-table caveat.
+    #[arg(long)]
+    pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CostRowsArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `2w`).
+    #[arg(long)]
+    pub(crate) since: String,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// Group runs by up to two dimensions, outermost first (e.g.
+    /// `driver,model`). Dimensions: product, project, task_kind,
+    /// execution_kind, spend_class, driver, model, effort, reasoning,
+    /// task_status, execution_status, coverage, host. Reasoning is the task's
+    /// current setting; the launch tuple does not record it.
+    #[arg(long, value_delimiter = ',', value_name = "DIMENSION")]
+    pub(crate) group_by: Vec<boss_protocol::UsageDimension>,
+
+    /// Keep runs whose value for DIMENSION is one of the listed values, e.g.
+    /// `--filter driver=claude,codex`. Repeat to filter on several
+    /// dimensions: filters AND across dimensions and OR within one.
+    /// Repeating the same dimension unions its values, so
+    /// `--filter driver=claude --filter driver=codex` equals
+    /// `--filter driver=claude,codex`.
+    #[arg(long = "filter", value_name = "DIMENSION=VALUE[,VALUE…]", value_parser = parse_usage_filter)]
+    pub(crate) filters: Vec<boss_protocol::UsageFilter>,
+
+    /// List revisions as top-level rows instead of nesting them under
+    /// their chain root.
+    #[arg(long)]
+    pub(crate) no_roll_up: bool,
+
+    /// How deep the text output goes. `--json` always carries every level.
+    #[arg(long, value_enum, default_value_t = UsageDepth::Execution)]
+    pub(crate) depth: UsageDepth,
+
+    /// Include an estimated USD figure alongside the token totals. See
+    /// `boss cost task --usd`'s help for the pricing-table caveat; Grok and
+    /// Antigravity are subscription-billed and never priced.
     #[arg(long)]
     pub(crate) usd: bool,
 

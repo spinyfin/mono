@@ -410,6 +410,28 @@ fn top_cost_report() -> crate::TopCostReport {
         .build()
 }
 
+fn token_usage_rows_report() -> crate::TokenUsageRowsReport {
+    crate::TokenUsageRowsReport::builder()
+        .capture_start_epoch_s(1_785_144_180)
+        .coverage(
+            crate::UsageCoverage::builder()
+                .runs_complete(0)
+                .runs_partial(0)
+                .runs_total(0)
+                .runs_unmeasured(0)
+                .runs_zero(0)
+                .build(),
+        )
+        .generated_at_epoch_s(1_747_000_000)
+        .overall(cost_measurement())
+        .run_cap(20_000)
+        .since_epoch_s(1_746_000_000)
+        .spans_capture_boundary(false)
+        .truncated(false)
+        .until_epoch_s(1_747_000_000)
+        .build()
+}
+
 /// Every `FrontendEvent` variant paired with the exact `"type"` tag it
 /// must serialize under. Ordered to match the declaration order in
 /// [`events.rs`](super::events) so a reviewer can diff the two side by
@@ -1488,6 +1510,13 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "top_cost_consumers",
         },
+        TagCase {
+            label: "TokenUsageRows",
+            event: FrontendEvent::TokenUsageRows {
+                report: token_usage_rows_report(),
+            },
+            expected_tag: "token_usage_rows",
+        },
         // --- Planner / project lifecycle ---
         TagCase {
             label: "PlannerRunsList",
@@ -2448,6 +2477,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemCostReport { .. }
         | FrontendEvent::CostWindowReport { .. }
         | FrontendEvent::TopCostConsumers { .. }
+        | FrontendEvent::TokenUsageRows { .. }
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }

@@ -650,6 +650,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: cost_report_db::USAGE_WINDOW_INDEX_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: cost_report_db::migrate_usage_window_index,
+        },
+        Migration {
             id: "20261104_1700_workspace_lease_boundary".into(),
             legacy_version: None,
             apply: preserved_work::migrate_lease_boundary,

@@ -676,6 +676,7 @@ dependencies = [
  "boss-transcript-markdown",
  "boss-trunk-auth",
  "boss-trunk-client",
+ "boss-usage-report",
  "boss-work-db",
  "boss-worker-processes",
  "chrono",
@@ -2065,6 +2066,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-usage-report"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "boss-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "boss-work-db"
 version = "0.1.0"
 dependencies = [
@@ -2095,6 +2105,7 @@ dependencies = [
  "boss-protocol-spoke",
  "boss-review-guide",
  "boss-task-scope",
+ "boss-usage-report",
  "boss-work-navigator",
  "boss-write-batch",
  "chrono",

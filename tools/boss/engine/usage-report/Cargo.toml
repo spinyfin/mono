@@ -1,0 +1,12 @@
+[package]
+name = "boss-usage-report"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }
+boss-protocol = { path = "../../protocol" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

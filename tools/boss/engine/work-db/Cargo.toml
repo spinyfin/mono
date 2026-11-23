@@ -36,6 +36,7 @@ prost = { workspace = true }
 boss-protocol = { path = "../../protocol" }
 boss-review-guide = { path = "../review-guide" }
 boss-task-scope = { path = "../task-scope" }
+boss-usage-report = { path = "../usage-report" }
 boss-work-navigator = { path = "../work-navigator" }
 chrono = { workspace = true }
 fastrand = { workspace = true }
