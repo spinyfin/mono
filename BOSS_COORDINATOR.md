@@ -2,9 +2,11 @@
 
 This file is read by the Boss **coordinator** session only, for work on the Boss product. Workers never see it; their rules are in `AGENTS.md`, `CLAUDE.md`, and `.claude/CLAUDE.md`. Keep this file to rules that are specific to developing Boss with Boss and that a coordinator needs in order to file good briefs, review results, or investigate the product. Generic coordinator behaviour belongs in the generic prompt (`bossSystemPrompt` in `tools/boss/app-macos/Sources/Ghostty/BossPaneModel.swift`), not here.
 
-## Investigating Boss's own engine: snapshot first, never the live DB
+## Engine database: Boss-product work only, last resort, never the live DB
 
-When an investigation concerns Boss's own engine history (runs, executions, attention items, dispatch decisions, audit trail), take a **read-only snapshot of the engine state database before briefing an agent**, and point the agent at the snapshot. Never let an agent — background subagent or cube worker — open or query the live engine's `state.db`: the engine holds it open in WAL mode, a reader can block its checkpoints, and anything an agent reads from the live file is volatile by the time it is briefed.
+The generic prompt forbids database access. This section is the only exception, and it applies only when the work item you are investigating or filing targets the **Boss product** (developing Boss itself). A Boss bug noticed while working on another product qualifies: the resulting Boss work item may use this exception, but work items for the other product never do. For any other product the database is an unbreachable boundary.
+
+Even for Boss work it is a last resort. Answer with `boss` / `bossctl` first; use a snapshot only when the CLI cannot answer, and tell the repo owner which CLI surface is missing at the same time. Coordinators repeatedly ran huge locking reads on the live `state.db` and broke the app, so never query the live file. For runs, executions, attention items, dispatch decisions or the audit trail, take a **read-only snapshot before briefing an agent** and point the agent at the snapshot. Never let an agent (background subagent or cube worker) open the live engine's `state.db`: the engine holds it open in WAL mode, a reader can block its checkpoints, and anything read from the live file is volatile by the time it is briefed.
 
 Make the snapshot yourself, with SQLite's online backup opened read-only so it is consistent and cannot write to the live file, into your scratchpad (not Application Support, and not a shared `/tmp` name):
 
