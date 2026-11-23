@@ -223,6 +223,24 @@ extension EngineClient {
         sendLine(["type": "metrics_list_live"], queueIfDisconnected: true)
     }
 
+    /// Run-grain token usage for a time window. The engine returns the
+    /// task → execution → run tree with every figure already computed.
+    @discardableResult
+    func sendGetTokenUsageRows(_ query: TokenUsageQuery) -> String? {
+        let filters: [[String: Any]] = query.filters.map { filter in
+            ["dimension": filter.dimension.rawValue, "values": filter.values]
+        }
+        return sendLine([
+            "type": "get_token_usage_rows",
+            "since_epoch_s": query.sinceEpochS,
+            "until_epoch_s": query.untilEpochS,
+            "filters": filters,
+            "group_by": query.groupBy.map(\.rawValue),
+            "roll_up_revisions": query.rollUpRevisions,
+            "estimate_usd": query.estimateUsd,
+        ], queueIfDisconnected: true)
+    }
+
     /// Signal the engine that the Boss app window just became active.
     /// The engine schedules an immediate pass of every PR-state reconciler
     /// so the kanban reflects upstream GitHub changes (merged PRs, new
