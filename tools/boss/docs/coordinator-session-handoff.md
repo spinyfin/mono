@@ -167,4 +167,4 @@ Inbox delivery also records `coordinator_inbox_delivery_stage` for registration 
 
 ### Manual verification targets
 
-`coordinator_inbox_live_test` and `coordinator_inbox_real_model_test` are `manual` targets, excluded from the wildcard suite and the pre-push affected-test gate; `hermetic_test_wrapper.sh` intentionally strips `ANTHROPIC_API_KEY`, so the real-model check is not run in worker gates.
+`coordinator_inbox_live_test` and `coordinator_inbox_real_model_test` are `manual` targets, excluded from the wildcard suite. `hermetic_test_wrapper.sh` intentionally strips `ANTHROPIC_API_KEY`, so `coordinator_inbox_real_model_test` is also tagged `requires-credentials` and excluded from worker pre-push affected-test gates, while the credential-free `coordinator_inbox_live_test` remains selectable when affected.

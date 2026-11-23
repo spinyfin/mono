@@ -698,7 +698,7 @@ fn bazel_conflict_revision_requires_affected_tests_with_lockfile_carve_out() {
     for needle in [
         "run the tests for the targets affected by the files that had conflicts",
         "rdeps(//..., set(<conflicted source files>))",
-        "except attr(tags, \"manual\", //...)",
+        "except attr(tags, \"requires-credentials\", //...)",
         "do NOT on their own select tests",
         "stop as blocked",
         "Do NOT run the full `bazel test //...` suite in this gate",
@@ -709,6 +709,10 @@ fn bazel_conflict_revision_requires_affected_tests_with_lockfile_carve_out() {
             "bazel conflict prompt missing `{needle}`:\n{prompt}"
         );
     }
+    assert!(
+        !prompt.contains("except attr(tags, \"manual\", //...)"),
+        "bazel conflict prompt must not blanket-exclude credential-free manual targets:\n{prompt}",
+    );
 }
 
 #[test]
@@ -726,5 +730,13 @@ fn non_conflict_bazel_prompt_has_no_affected_test_step() {
     assert!(
         !prompt.contains("targets affected by the files that had conflicts"),
         "non-conflict prompt must not carry the conflict affected-test step:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("except attr(tags, \"requires-credentials\", //...)"),
+        "ordinary Bazel pre-push gate must exclude credential-only live probes:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("except attr(tags, \"manual\", //...)"),
+        "ordinary Bazel pre-push gate must not blanket-exclude credential-free manual targets:\n{prompt}",
     );
 }

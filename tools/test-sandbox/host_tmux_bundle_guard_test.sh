@@ -17,20 +17,22 @@ if [[ ! -e "${tmux_entry}" ]]; then
   exit 1
 fi
 
-# Resolve the symlink to tmux.bin inside the @host_tmux runfiles directory.
-tmux_dir="$(cd "$(dirname "${tmux_entry}")" && pwd)"
-tmux_name="$(basename "${tmux_entry}")"
-if [[ -L "${tmux_entry}" ]]; then
-  link_target="$(readlink "${tmux_entry}")"
-  if [[ "${link_target}" == /* ]]; then
-    tmux_bin="${link_target}"
-  else
-    tmux_bin="$(cd "${tmux_dir}/$(dirname "${link_target}")" && pwd)/$(basename "${link_target}")"
-  fi
-else
-  tmux_bin="${tmux_dir}/${tmux_name}"
+# In the runfiles tree, tmux, tmux.bin, and lib/*.dylib are siblings.
+bundle_dir="$(cd "$(dirname "${tmux_entry}")" && pwd)"
+tmux_bin="${bundle_dir}/tmux.bin"
+if [[ ! -e "${tmux_bin}" ]]; then
+  printf 'FAIL: bundled binary %s does not exist beside %s\n' "${tmux_bin}" "${tmux_entry}" >&2
+  exit 1
 fi
-bundle_dir="$(dirname "${tmux_bin}")"
+
+otool_cmd=()
+if [[ -n "${DEVELOPER_DIR:-}" && -x "${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/bin/otool" ]]; then
+  otool_cmd=("${DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/bin/otool")
+elif [[ -n "${DEVELOPER_DIR:-}" && -x "${DEVELOPER_DIR}/usr/bin/otool" ]]; then
+  otool_cmd=("${DEVELOPER_DIR}/usr/bin/otool")
+else
+  otool_cmd=("/usr/bin/xcrun" "--no-cache" "otool")
+fi
 
 check_macho() {
   local macho="$1"
@@ -38,7 +40,15 @@ check_macho() {
   local macho_dir
   macho_dir="$(dirname "${macho}")"
 
+  local otool_file="${TEST_TMPDIR:?}/otool.out"
+  if ! "${otool_cmd[@]}" -L "${macho}" > "${otool_file}"; then
+    printf 'FAIL: %s -L failed for %s\n' "${otool_cmd[*]}" "${macho}" >&2
+    return 1
+  fi
+
   local line_num=0
+  local dep_count=0
+  local saw_libsystem=0
   while IFS= read -r line; do
     line_num=$((line_num + 1))
     # Line 1 is the Mach-O header ("<path>:").
@@ -54,6 +64,10 @@ check_macho() {
     if [[ -z "${dep}" ]]; then
       continue
     fi
+    dep_count=$((dep_count + 1))
+    if [[ "${dep}" == "/usr/lib/libSystem.B.dylib" ]]; then
+      saw_libsystem=1
+    fi
     case "${dep}" in
       /usr/lib/*|/System/*)
         ;;
@@ -61,16 +75,34 @@ check_macho() {
         local rel="${dep#@loader_path/}"
         if [[ ! -e "${macho_dir}/${rel}" ]]; then
           printf 'FAIL: %s references %s, but %s does not exist in runfiles\n' "${macho}" "${dep}" "${macho_dir}/${rel}" >&2
-          exit 1
+          return 1
         fi
         ;;
       *)
         printf 'FAIL: %s has non-self-contained dependency %s\n' "${macho}" "${dep}" >&2
-        exit 1
+        return 1
         ;;
     esac
-  done < <(/usr/bin/otool -L "${macho}")
+  done < "${otool_file}"
+
+  if [[ "${dep_count}" -eq 0 ]]; then
+    printf 'FAIL: no Mach-O load commands parsed for %s\n' "${macho}" >&2
+    return 1
+  fi
+  if [[ "${is_dylib}" -eq 0 && "${saw_libsystem}" -ne 1 ]]; then
+    printf 'FAIL: %s did not report /usr/lib/libSystem.B.dylib in otool -L output\n' "${macho}" >&2
+    return 1
+  fi
 }
+
+# Negative control: non-Mach-O input must fail inspection rather than passing
+# vacuously.
+non_macho="${TEST_TMPDIR:?}/not-a-macho"
+printf 'not a mach-o binary\n' > "${non_macho}"
+if check_macho "${non_macho}" 0 >/dev/null 2>&1; then
+  printf 'FAIL: check_macho unexpectedly passed on non-Mach-O input %s\n' "${non_macho}" >&2
+  exit 1
+fi
 
 check_macho "${tmux_bin}" 0
 dylib_count=0

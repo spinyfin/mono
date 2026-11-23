@@ -576,7 +576,10 @@ import time
 trace = open(os.environ["BOSS_RELAY_TRACE"], "w")
 faulthandler.dump_traceback_later(10, repeat=True, file=trace)
 root = Path(sys.argv[1])
-# Raw startup/composer captures from isolated, unprompted installed CLIs.
+# Raw startup/composer captures from isolated installed CLIs (unprompted except
+# `composer-manual (after /help dismissed)`, which submitted and dismissed
+# `/help` so the startup banner and `/effort` hint cleared out of the 12-line
+# tail, leaving `manual mode on` as the sole readiness marker).
 # Replay at byte boundaries to cover split CSI and UTF-8 sequences.
 spec = importlib.util.spec_from_file_location("initial_prompt", root / "initial-prompt.py")
 launcher = importlib.util.module_from_spec(spec)
@@ -642,7 +645,7 @@ for fixture in json.loads(r'''[
   {
     "driver": "claude",
     "version": "2.1.330",
-    "phase": "composer-manual",
+    "phase": "composer-manual (after /help dismissed)",
     "ready": true,
     "height": 18,
     "width": 220,

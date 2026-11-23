@@ -231,7 +231,10 @@ network_enabled_rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    tags = ["manual"],
+    tags = [
+        "manual",
+        "requires-credentials",
+    ],
     deps = TEST_DEPS + [
         "//tools/boss/engine/pane-summary",
         "//tools/boss/engine/prose-vocabulary",
@@ -243,6 +246,20 @@ network_enabled_rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+# @codex_probe_runtime//codex:login-shell must stay a declared symlink to the
+# host login shell so remote workers execute their own shell rather than a
+# shipped copy of the client's binary.
+sh_test(
+    name = "codex_login_shell_symlink_guard_test",
+    size = "small",
+    srcs = ["//tools/test-sandbox:host_tool_symlink_guard_test.sh"],
+    args = [
+        "$(rootpath @codex_probe_runtime//codex:login-shell)",
+        "--from-fingerprint",
+    ],
+    data = ["@codex_probe_runtime//codex:login-shell"],
 )
 
 # Public contracts live outside src/ so test edits do not invalidate engine_lib.
@@ -602,8 +619,9 @@ rust_test(
 )
 
 # Opt-in real-model behavior check. `hermetic_test_wrapper.sh` intentionally
-# strips `ANTHROPIC_API_KEY` (no passthrough), and `manual`-tagged targets are
-# excluded from wildcard `bazel test //...` and the pre-push affected-test gate.
+# strips `ANTHROPIC_API_KEY` (no passthrough); `manual` excludes it from
+# wildcard `bazel test //...` and `requires-credentials` excludes it from
+# worker pre-push affected-test gates.
 rust_test(
     name = "coordinator_inbox_real_model_test",
     size = "medium",
@@ -620,7 +638,10 @@ rust_test(
     ],
     edition = "2024",
     rustc_flags = ["--cfg=boss_real_model_test"],
-    tags = ["manual"],
+    tags = [
+        "manual",
+        "requires-credentials",
+    ],
     deps = [
         ":engine_lib",
         ":tmux_fixture",

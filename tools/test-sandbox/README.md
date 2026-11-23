@@ -312,16 +312,16 @@ Two limits of a remote run are worth knowing:
 
 ### Host tools a single test declares
 
-`@host_lsof//:lsof` and `@worker_zsh//:zsh` are system binaries that one or two tests declare in `data`, kept out of the shared runtime so no other test can run them. Both were `repository_ctx.symlink` links and failed remotely for the reason above, in two different ways:
+`@host_lsof//:lsof`, `@worker_zsh//:zsh`, and `@codex_probe_runtime//codex:login-shell` are system binaries that one or two tests declare in `data`, kept out of the shared runtime so no other test can run them. They used to be `repository_ctx.symlink` links and failed remotely for the reason above, in two different ways:
 
 - `//tools/cube:cube_lib_test` runs the runfile itself. The copy of `/usr/sbin/lsof` was killed at launch, and the test saw an exit status of `None`.
-- The worker shell tests run `/bin/zsh` by that path and declare `@worker_zsh//:zsh` only so the wrapper grants it. Locally the runfile resolved to `/bin/zsh`. On a worker it was a file inside the runfiles tree, nothing granted the real shell, and the tests failed with `/bin/sh: /bin/zsh: Operation not permitted`.
+- The worker shell tests run `/bin/zsh` by that path and declare `@worker_zsh//:zsh` only so the wrapper grants it. Locally the runfile resolved to `/bin/zsh`. On a worker it was a file inside the runfiles tree, nothing granted the real shell, and the tests failed with `/bin/sh: /bin/zsh: Operation not permitted`. `@codex_probe_runtime//codex:login-shell` works the same way for the host login shell that `codex_guard_live_test` executes.
 
-`host_tool_symlink` in `repositories.bzl` now generates both repositories. The label is a rule target that declares one symlink to the absolute host path, so it reaches a worker as a symlink that leaves the runfiles tree, and the wrapper grants its resolved target there as it does for the runtime's `bin/` links. Visibility is unchanged, and so is each repository's behaviour where the tool is absent: `host_lsof` still writes its stub script off macOS, and on a host without `/bin/zsh` `@worker_zsh//:zsh` is still a dangling link, which only macOS targets select.
+`host_tool_symlink` in `repositories.bzl` now generates all three repositories. The label is a rule target that declares one symlink to the absolute host path, so it reaches a worker as a symlink that leaves the runfiles tree, and the wrapper grants its resolved target there as it does for the runtime's `bin/` links. Visibility is unchanged, and so is each repository's behaviour where the tool is absent: `host_lsof` still writes its stub script off macOS, and on a host without `/bin/zsh` `@worker_zsh//:zsh` is still a dangling link, which only macOS targets select.
 
 Each repository also writes a `fingerprint` (OS build and sha256 of the tool) that travels in the target's runfiles, so a test's cache key still follows the binary's contents. It is not in the target's `files`, because consumers expand `$(rootpath ...)` on the label and that needs a single file.
 
-`host_tool_symlink_guard_test.sh` is the local check for both, run as `//tools/cube:host_lsof_symlink_guard_test` and `//tools/boss/engine/worker-bin:worker_zsh_symlink_guard_test`: the runfile must be a symlink straight to the host path.
+`host_tool_symlink_guard_test.sh` is the local check for all three, run as `//tools/cube:host_lsof_symlink_guard_test`, `//tools/boss/engine/worker-bin:worker_zsh_symlink_guard_test`, and `//tools/boss/engine/core:codex_login_shell_symlink_guard_test`: the runfile must be a symlink straight to the host path.
 
 ### The per-user temp directory
 
@@ -336,9 +336,9 @@ When the capability is set and `TMPDIR` is not an absolute path, the wrapper now
 
 ### Not yet remote-capable
 
-The audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, which the same rule generates), `host_lsof` and `worker_zsh` were converted. `host_tmux` in `repositories.bzl` is also remote-capable on macOS: it copies the client's Homebrew `tmux` binary along with its non-system dylibs into `lib/`, rewrites their load commands to `@loader_path/lib/...`, and re-signs the bundle with an ad-hoc `codesign` signature (it is still the client's Homebrew build rather than a pinned download). These repositories still hand a test a copy of a client binary without bundling:
+The audited runtime (`@test_runtime_tools`, and `@checkleft_node_test_tools`, which the same rule generates), `host_lsof`, `worker_zsh`, and `codex_probe_runtime`'s login shell were converted. `host_tmux` in `repositories.bzl` is also remote-capable on macOS: it copies the client's Homebrew `tmux` binary along with its non-system dylibs into `lib/`, rewrites their load commands to `@loader_path/lib/...`, and re-signs the bundle with an ad-hoc `codesign` signature (it is still the client's Homebrew build rather than a pinned download). These repositories still hand a test a copy of a client binary without bundling:
 
-- `host_claude` and `codex_probe_runtime` in `repositories.bzl`. A copy of a system binary (the Codex probe's login shell is usually `/bin/zsh`) will not launch on a worker. A copy of anything else is the client's build, not the worker's.
+- `host_claude` in `repositories.bzl`. A copy of a client binary is the client's build, not the worker's.
 - `jj_test_tools` and `cube_jj_newer` ship a pinned download rather than a host binary.
 
 A test tagged `exclusive` cannot be scheduled remotely at all, because the tag also forces local execution. `exclusive-if-local` keeps the serial run locally and lets the test go to a worker.
@@ -528,7 +528,7 @@ The guard could not have passed on any host, under any configuration. It had sim
 | `hermetic_test_wrapper.sh`                     | The `--run_under` wrapper. Builds the macOS Seatbelt profile, sets the audited `PATH`, unsets credentials, creates the short private temp root, captures stacks before `TEST_TIMEOUT` and on TERM, and cleans up the process group. |
 | `repositories.bzl`                             | `test_runtime_repository` — resolves the audited host tools (`bash`, `git`, `python3`, …) and declares them as symlinks, so the wrapper's `PATH` contains only declared inputs.                                                     |
 | `runtime_symlink_guard_test.sh`                | Asserts every `bin/<tool>` of the runtime is a symlink straight to its audited host path, so a change back to shipped copies is caught without a remote run.                                                                        |
-| `host_tool_symlink_guard_test.sh`              | The same assertion for one host tool that `host_tool_symlink` declares; the packages allowed to use `@host_lsof` and `@worker_zsh` run it.                                                                                          |
+| `host_tool_symlink_guard_test.sh`              | The same assertion for one host tool that `host_tool_symlink` declares; the packages allowed to use `@host_lsof`, `@worker_zsh`, and `@codex_probe_runtime` run it.                                                                 |
 | `hermeticity_guard_test.rs`                    | The guards. Every property in the table above is asserted here. Built twice: `hermeticity_guard_test` and `xcode_capability_guard_test` (the latter with `MONO_TEST_XCODE_TOOLCHAIN=1`).                                            |
 | `linux_policy_source_test.sh`                  | Pins the exact `.bazelrc` / wrapper / `defs.bzl` strings so the policy cannot be silently relaxed.                                                                                                                                  |
 | `linux_remote_action_sandbox.sh`               | The per-action sandbox a Linux remote worker runs every action in. The workers install a copy; this file is the one they must match.                                                                                                |

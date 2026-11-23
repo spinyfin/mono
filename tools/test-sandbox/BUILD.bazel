@@ -4,10 +4,7 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(":defs.bzl", "network_enabled_rust_test")
 load(":macos_direct_test_runner.bzl", "macos_direct_test_runner")
 
-exports_files([
-    "bundle_macos_tmux.py",
-    "macos_direct_test_runner.template.sh",
-])
+exports_files(["macos_direct_test_runner.template.sh"])
 
 sh_test(
     name = "host_tmux_bundle_guard_test",
@@ -15,6 +12,7 @@ sh_test(
     srcs = ["host_tmux_bundle_guard_test.sh"],
     args = ["$(rootpath @host_tmux//:tmux)"],
     data = ["@host_tmux//:tmux"],
+    env = {"MONO_TEST_XCODE_TOOLCHAIN": "1"},
     target_compatible_with = ["@platforms//os:macos"],
 )
 
@@ -23,6 +21,7 @@ sh_test(
 exports_files(
     ["host_tool_symlink_guard_test.sh"],
     visibility = [
+        "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/worker-bin:__pkg__",
         "//tools/cube:__pkg__",
     ],
