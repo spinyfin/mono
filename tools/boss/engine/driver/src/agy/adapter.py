@@ -515,25 +515,34 @@ def nested_shell_bodies(group):
 PYTHON_PROGRAM_RE = re.compile(r"(?:python|pypy|ipython)[0-9.]*[a-z]*")
 PYTHON_PATH_ESCAPE_RE = re.compile(r"\\(?:x|u|U|N|[0-7])")
 PYTHON_DOTDOT_TOKEN_RE = re.compile(r"(?:^|[/\\'\"\s])\.\.(?:[/\\'\"\s]|$)")
+# Link creation is matched by name, not by call syntax: `m = os.symlink; m(...)`
+# and `from os import symlink as s` name the primitive without calling it.
 PYTHON_LINK_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:os\s*\.\s*)?(?:symlink|link)\s*\(|(?:symlink_to|hardlink_to)\s*\("
+    r"(?<![A-Za-z0-9_])(?:symlink|symlink_to|hardlink_to|link_to)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])os\s*\.\s*link(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])import\b[^\n;]*(?<![A-Za-z0-9_])link(?![A-Za-z0-9_])"
 )
-# A body that names scratch must not also be able to move, copy or spawn
-# something: the scratch walk below sees links as they are before the body runs,
-# and a rename/move/copy (or a child process, or an indirection that reaches
-# one) can bring a prepared link in afterwards and read through it.
+# A body that names scratch must not also be able to move, copy, extract or
+# spawn something: the scratch walk below sees links as they are before the
+# body runs, and a rename/move/copy (or an archive extraction, a child process,
+# or an indirection that reaches one) can bring a prepared link in afterwards
+# and read through it. Every reference is denied by name -- not only a literal
+# `name(` call -- so an alias, `__dict__`/`vars` lookup or trailing-comma call
+# cannot hide the primitive. A body that needs none of these is unaffected.
 PYTHON_RELOCATE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:rename|renames|move|copy2|copyfile|copytree|copymode|copystat"
-    r"|system|popen\w*|spawn\w*|posix_spawn\w*|exec[lv]\w*|fork\w*|startfile|link_to)\s*\("
-    r"|(?<![A-Za-z0-9_])shutil\s*\.\s*copy\w*"
-    r"|(?<![A-Za-z0-9_.])copy\s*\("
-    r"|(?<![A-Za-z0-9_])os\s*\.\s*replace\s*\("
-    r"|(?<![A-Za-z0-9_.])replace\s*\("
-    r"|(?<![A-Za-z0-9_])(?:subprocess|ctypes|importlib|__import__|getattr|setattr|pty|runpy"
-    r"|pexpect|multiprocessing|asyncio)(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_.])(?:eval|exec|compile)\s*\("
+    r"(?<![A-Za-z0-9_])(?:rename|renames|replace|move|copy|copy2|copyfile|copyfileobj"
+    r"|copytree|copymode|copystat|link|system|popen\w*|spawn\w*|posix_spawn\w*"
+    r"|exec\w*|fork\w*|startfile|extract\w*|unpack_archive|tarfile|zipfile|shutil"
+    r"|subprocess|ctypes|importlib|pty|runpy|pexpect|multiprocessing|asyncio"
+    r"|eval|compile|getattr|setattr|vars|globals|locals|__dict__|__builtins__"
+    r"|__import__|__getattribute__|__loader__|builtins)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])import\s+\*"
+    r"|(?<![A-Za-z0-9_])from\s+\S+\s+import\b"
+    r"|(?<![A-Za-z0-9_])import\b[^\n;]*(?<![A-Za-z0-9_])as\b"
 )
-PYTHON_METHOD_REPLACE_RE = re.compile(r"\.\s*replace\s*\(")
+PYTHON_HOME_BUILDER_RE = re.compile(
+    r"HOME|expanduser|\.home\s*\(|getenv|environ|getpwuid|getpass|~"
+)
 PYTHON_JOIN_RE = re.compile(r"(?:os\s*\.\s*path\s*\.\s*join|pathlib\s*\.\s*Path|(?<![A-Za-z0-9_])Path)\s*\(")
 PYTHON_PATH_DIV_RE = re.compile(r"/\s*['\"]\.\.|\.\.['\"]\s*/")
 
@@ -644,42 +653,8 @@ def python_body_creates_link(body):
     return bool(PYTHON_LINK_RE.search(body))
 
 
-def python_call_has_top_level_comma(body, open_index):
-    # `open_index` is just past the call's `(`. True when the argument list has
-    # a comma outside nested brackets and string literals (`str.replace(a, b)`),
-    # False for a single argument (`Path.replace(target)`); an unterminated call
-    # reads as having one so the caller errs toward denying.
-    depth = 1
-    index, length = open_index, len(body)
-    while index < length:
-        char = body[index]
-        if char in "\"'":
-            delim = char * 3 if body.startswith(char * 3, index) else char
-            index += len(delim)
-            while index < length and not body.startswith(delim, index):
-                index += 2 if body[index] == chr(92) else 1
-            index += len(delim)
-            continue
-        if char in "([{":
-            depth += 1
-        elif char in ")]}":
-            depth -= 1
-            if depth == 0:
-                return False
-        elif char == "," and depth == 1:
-            return True
-        index += 1
-    return False
-
-
 def python_body_relocates_or_spawns(body):
-    if PYTHON_RELOCATE_RE.search(body):
-        return True
-    # `Path.replace(target)` moves a file; `str.replace(old, new)` does not.
-    for match in PYTHON_METHOD_REPLACE_RE.finditer(body):
-        if not python_call_has_top_level_comma(body, match.end()):
-            return True
-    return False
+    return bool(PYTHON_RELOCATE_RE.search(body))
 
 
 def allowed_scratch_spellings(policy):
@@ -841,6 +816,24 @@ def python_literal_leaves_scratch(content, policy, cwd):
 SCRATCH_WALK_LIMIT = 20000
 
 
+def scratch_link_is_dangerous(real, policy):
+    # A link that stays in scratch or reaches the workspace is no bypass; only
+    # one that resolves into protected state or leaves both is.
+    if within_conversation_scratch(real, policy):
+        return False
+    for root in policy.get("protected_paths", []):
+        for spelling in protected_spellings(root):
+            root_abs = spelling.rstrip(os.sep)
+            if root_abs and (real == root_abs or real.startswith(root_abs + os.sep)):
+                return True
+    workspace = policy.get("workspace_path")
+    if isinstance(workspace, str) and workspace:
+        root = os.path.realpath(workspace)
+        if real == root or real.startswith(root + os.sep):
+            return False
+    return True
+
+
 def scratch_tree_has_escape(policy):
     # A string-by-string realpath cannot see a path the body builds at run time
     # (adjacent literals, os.path.join, `+`, pathlib, a chdir then a relative
@@ -869,7 +862,7 @@ def scratch_tree_has_escape(policy):
                     if seen > SCRATCH_WALK_LIMIT:
                         return True
                     entry = os.path.join(dirpath, name)
-                    if os.path.islink(entry) and not within_conversation_scratch(os.path.realpath(entry), policy):
+                    if os.path.islink(entry) and scratch_link_is_dangerous(os.path.realpath(entry), policy):
                         return True
         except Exception:
             return True
@@ -934,7 +927,9 @@ def python_body_touches_protected(body, policy, cwd=None, trust_scratch=True):
     # Path.home() at run time names no scratch spelling, and the allowance is
     # only as good as what scratch holds. It is bounded and fails closed.
     if scratch_tree_has_escape(policy):
-        return True
+        fail_closed("Python is denied while this conversation's scratch holds a link that "
+                    "resolves outside scratch and the workspace (or is too large to check); "
+                    "remove that link, then retry.")
     haystacks = [text]
     haystacks.extend(mask_scratch(blob) for blob in decoded)
     if decoded:
@@ -942,7 +937,12 @@ def python_body_touches_protected(body, policy, cwd=None, trust_scratch=True):
     # The home-prefixed needles miss a path assembled from the home directory
     # at run time, so the agent-home directory name itself is a needle once the
     # allowed spellings are masked out.
-    needles.append(".gemini")
+    # `.gemini` matches as a whole path component, and only in a body that also
+    # builds a path from the home directory at run time (a literal home-prefixed
+    # spelling is already a needle above).
+    gemini_component = None
+    if PYTHON_HOME_BUILDER_RE.search(body):
+        gemini_component = re.compile(r"(?<![A-Za-z0-9_.\-])\.gemini(?![A-Za-z0-9_.\-])")
     conv = policy.get("conversation_id")
     brain_pat = re.compile(r"antigravity-cli/brain[/\\]([A-Za-z0-9][A-Za-z0-9_-]{0,127})")
     root_pats = []
@@ -956,6 +956,8 @@ def python_body_touches_protected(body, policy, cwd=None, trust_scratch=True):
         for needle in needles:
             if needle and needle in haystack:
                 return True
+        if gemini_component is not None and gemini_component.search(haystack):
+            return True
         for match in brain_pat.finditer(haystack):
             if not isinstance(conv, str) or match.group(1) != conv:
                 return True

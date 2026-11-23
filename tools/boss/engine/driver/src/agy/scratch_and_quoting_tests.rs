@@ -532,11 +532,11 @@ fn shell_bodies_are_still_inspected_and_python_bodies_are_not_run_as_shell() {
     assert_command_allowed(&fx, "python3 -c 'print(`1`)  # not shell'");
 }
 
-fn relative_from(from_dir: &Path, to: &Path) -> PathBuf {
+pub(super) fn relative_from(from_dir: &Path, to: &Path) -> PathBuf {
     crate::test_support::relative_from(from_dir, to)
 }
 
-fn run_approved(fx: &Fixture, command: &str) {
+pub(super) fn run_approved(fx: &Fixture, command: &str) {
     assert_command_allowed(fx, command);
     let status = Command::new("bash")
         .arg("-c")
@@ -547,7 +547,7 @@ fn run_approved(fx: &Fixture, command: &str) {
     assert!(status.success(), "{command}");
 }
 
-fn prepare_link_via_command(fx: &Fixture, name: &str, target: &Path) -> PathBuf {
+pub(super) fn prepare_link_via_command(fx: &Fixture, name: &str, target: &Path) -> PathBuf {
     let prepared = fx.tmp.path().join(name);
     run_approved(fx, &format!("ln -s {} {}", target.display(), prepared.display()));
     prepared

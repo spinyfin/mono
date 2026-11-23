@@ -92,6 +92,13 @@ RECOVERY = (
     "Do not work around this gate."
 )
 
+GLOB_LIMIT_REASON = (
+    "Blocked: this wildcard matches too many paths for the guard to verify that "
+    "none of them is inside the engine data directory. Narrow the pattern to "
+    "the directory you need (for example a specific subdirectory or file "
+    "extension) and retry."
+)
+
 # -- Broad-traversal boundary ------------------------------------------------
 #
 # Roots whose subtree spans the operator's whole machine. A recursive walk
@@ -436,46 +443,67 @@ def emit(decision, reason=None):
         crate::render_scratch_safe_programs!(),
         r#"
 # Heredoc bodies fed to these programs are data. Every other consumer (a
-# shell, an interpreter, `source`, anything unknown) executes or interprets
-# its stdin, so its body is inspected like command text.
+# shell, an interpreter, `source`, `xargs`, awk, sqlite3, a script, anything
+# unknown) may execute or interpret its stdin, so its body is inspected like
+# command text. The test is on the unstripped program: a wrapper such as
+# `xargs cat` is not `cat`.
 HEREDOC_DATA_CONSUMERS = {
     "cat", "tee", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "grep",
     "rg", "base64", "shasum", "md5", "md5sum", "sha256sum", "diff", "cmp",
 }
+# Programs that neither run nor interpret text they are handed, so a command
+# made only of these never executes a heredoc body that another heredoc wrote.
+NON_EXECUTING_PROGRAMS = HEREDOC_DATA_CONSUMERS | {
+    "cd", "ls", "echo", "printf", "pwd", "mkdir", "touch", "true", "false", ":",
+    "chmod", "rm", "mv", "cp", "stat", "file", "find", "sleep",
+}
 BODY_WORD_RE = re.compile(r"[^\s'\"()\[\],;=<>|&`{}]+")
+BODY_LITERAL_RE = re.compile(r"\"([^\"\n]+)\"|'([^'\n]+)'")
+ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def raw_program(group):
+    for token in without_redirections(list(group)):
+        if token in ("{", "(", "!", "time") or ASSIGNMENT_TOKEN_RE.match(token):
+            continue
+        return os.path.basename(token.lstrip("({"))
+    return ""
+
+
+def body_candidate_groups(body):
+    # A body that is run (or interpreted) is read three ways so no spelling
+    # hides in it: as whitespace-split words, as complete quoted string
+    # literals (a path containing a space survives only whole), and as shell
+    # command groups (which resolve quoting and backslash-escaped spaces).
+    groups = [BODY_WORD_RE.findall(body)]
+    for match in BODY_LITERAL_RE.finditer(body):
+        groups.append([match.group(1) or match.group(2)])
+    try:
+        groups.extend(list(group) for group in command_groups(body))
+    except Exception:
+        pass
+    return groups
 
 
 def heredoc_body_groups(group):
     body = getattr(group, "body", "")
-    if not body:
+    if not body or raw_program(group) in HEREDOC_DATA_CONSUMERS:
         return []
     rest = strip_prefixes(group)
-    program = os.path.basename(rest[0]) if rest else ""
-    if program in HEREDOC_DATA_CONSUMERS:
-        return []
-    return [(program, body)]
-
-
-INTERPRETER_PREFIXES = ("python", "node", "ruby", "perl", "php", "lua", "deno", "bun")
-
-
-def group_executes_text(group):
-    rest = strip_prefixes(group)
-    program = os.path.basename(rest[0]) if rest else ""
-    return (program in SHELL_PROGRAMS or program in ("source", ".", "eval")
-            or program.startswith(INTERPRETER_PREFIXES))
+    return [(os.path.basename(rest[0]) if rest else "", body)]
 
 
 def flatten_command_groups(command):
     # Nested shell bodies come from the shared extractor the adapter uses; a
     # shape that extractor cannot see into (`bash script.sh`) is ordinary
-    # worker activity here, so its reason is not a denial. Heredoc bodies of
-    # executing consumers are inspected: shell bodies as commands, anything
-    # else as the words an interpreter could open. A body piped into an
-    # executing consumer (`cat <<EOF | bash`) is that consumer's stdin, so it
-    # is inspected the same way. When the command runs a shell or interpreter
-    # at all, the other heredoc bodies it writes (`cat <<EOF > s.sh; bash
-    # s.sh`) are inspected as words too.
+    # worker activity here, so its reason is not a denial. The test for a
+    # heredoc body is fail-closed: it is data only when its consumer is in
+    # HEREDOC_DATA_CONSUMERS itself. Every other consumer's body, and a body
+    # piped into any other consumer (`cat <<EOF | xargs cat`, `| awk ...`,
+    # `| sqlite3`), is inspected: as commands for a shell, as words and whole
+    # quoted literals otherwise. When the command contains anything that is
+    # not known to be inert at all, the remaining heredoc bodies it writes
+    # (`cat <<EOF > s.sh; ./s.sh`) are inspected too.
     groups = []
     data_bodies = []
     state = {"executes": False}
@@ -483,7 +511,7 @@ def flatten_command_groups(command):
         if program in SHELL_PROGRAMS or program in ("", "source", ".", "eval"):
             walk(body)
         else:
-            groups.append(BODY_WORD_RE.findall(body))
+            groups.extend(body_candidate_groups(body))
     def walk(text):
         for group in command_groups(text):
             groups.append(group)
@@ -492,20 +520,22 @@ def flatten_command_groups(command):
                 walk(body)
             for program, body in heredoc_body_groups(group):
                 inspect(program, body)
-            if group_executes_text(group):
+            program = raw_program(group)
+            if program and program not in NON_EXECUTING_PROGRAMS:
                 state["executes"] = True
+            if program not in HEREDOC_DATA_CONSUMERS:
                 rest = strip_prefixes(group)
-                program = os.path.basename(rest[0]) if rest else ""
+                stripped = os.path.basename(rest[0]) if rest else ""
                 for source in getattr(group, "pipe_sources", None) or []:
                     body = getattr(source, "body", "") or ""
                     if body:
-                        inspect(program, body)
-            elif getattr(group, "body", ""):
+                        inspect(stripped, body)
+            if getattr(group, "body", ""):
                 data_bodies.append(group.body)
     walk(command)
     if state["executes"]:
         for body in data_bodies:
-            groups.append(BODY_WORD_RE.findall(body))
+            groups.extend(body_candidate_groups(body))
     return groups
 
 
@@ -642,7 +672,7 @@ def main():
             if not complete:
                 # A truncated expansion is not a superset of the shell's, so
                 # nothing it left out can be approved.
-                emit("block", RECOVERY)
+                emit("block", GLOB_LIMIT_REASON)
             for match in matches:
                 real = os.path.realpath(match)
                 if in_scratch and conversation_scratch_contains(real, scratch_base):

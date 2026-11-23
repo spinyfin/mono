@@ -512,6 +512,40 @@ fn heredocs_piped_into_executors_or_written_then_run_are_inspected() {
 }
 
 #[test]
+fn heredocs_for_unlisted_consumers_and_spaced_aliases_are_inspected() {
+    let (tmp, data, brain) = data_fixture();
+    let alias = tmp.path().join("boss-alias");
+    std::os::unix::fs::symlink(&data, &alias).unwrap();
+    let spaced = tmp.path().join("boss alias");
+    std::os::unix::fs::symlink(&data, &spaced).unwrap();
+    let t = alias.join("state.db");
+    let t = t.display();
+    let st = spaced.join("state.db");
+    let st = st.display();
+    for command in [
+        format!("xargs cat <<'EOF'\n{t}\nEOF"),
+        format!("cat <<'EOF' | xargs cat\n{t}\nEOF"),
+        format!("cat <<'EOF' | awk '{{system($0)}}'\ncat {t}\nEOF"),
+        format!("cat <<'EOF' | sqlite3\n.open {t}\nEOF"),
+        format!("cat <<'EOF' > s.sh\ncat {t}\nEOF\n./s.sh"),
+        format!("cat <<'EOF' | python3 -\nprint(open(\"{st}\").read())\nEOF"),
+        format!("cat <<'EOF' > s.sh\ncat '{st}'\nEOF\nbash s.sh"),
+        format!(
+            "cat <<'EOF' > s.sh\ncat {}\nEOF\nbash s.sh",
+            st.to_string().replace(' ', "\\ ")
+        ),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain, &command), "block", "{command}");
+    }
+    for command in [
+        format!("cat <<'EOF' > notes.txt\n{t}\nEOF"),
+        format!("cat <<'EOF' | grep x\n{st}\nEOF"),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain, &command), "approve", "{command}");
+    }
+}
+
+#[test]
 fn wildcards_keep_the_literal_check_and_native_paths_are_not_expanded() {
     let (tmp, data, brain) = data_fixture();
     let d = data.display();

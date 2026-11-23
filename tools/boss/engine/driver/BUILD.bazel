@@ -95,7 +95,7 @@ rust_test(
         # release the test binaries were fetched from.
         "CODEX_CLI_VERSION": CODEX_CLI_VERSION,
     },
-    shard_count = 12,
+    shard_count = 16,
     deps = [
         "//tools/boss/codex_auth",
         "//tools/boss/command-runner",
