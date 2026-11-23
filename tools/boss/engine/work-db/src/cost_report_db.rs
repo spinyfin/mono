@@ -14,8 +14,7 @@
 use super::*;
 
 use boss_engine_storage_values::CostRunRecord;
-use boss_protocol::DriverSource;
-use boss_usage_report::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
+use boss_usage_report::{RecordedDriver, UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 
 const COST_RECORD_COLUMNS: &str = "
     wr.id,
@@ -117,13 +116,10 @@ const USAGE_RUN_COLUMNS: &str = "
 ";
 
 fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
-    let driver: Option<String> = row.get(25)?;
-    let driver = driver.filter(|slug| !slug.is_empty());
-    let driver_source = if driver.is_some() {
-        DriverSource::LaunchTuple
-    } else {
-        DriverSource::Unknown
-    };
+    let driver = row
+        .get::<_, Option<String>>(25)?
+        .filter(|slug| !slug.is_empty())
+        .map_or(RecordedDriver::Unknown, RecordedDriver::LaunchTuple);
     Ok(UsageRunRecord {
         run_id: row.get(0)?,
         run_status: row.get(1)?,
@@ -151,7 +147,6 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
         execution_pr_url: row.get(23)?,
         execution_host_id: row.get(24)?,
         driver,
-        driver_source,
         execution_model: row.get(26)?,
         execution_effort: row.get(27)?,
     })
@@ -162,28 +157,33 @@ fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
 /// `driver_transcript::resolve_execution_driver_slug` uses; calling it here
 /// (after the snapshot is released) avoids a lookup per run and avoids
 /// holding the pooled connection while that chain re-enters `WorkDb`.
-fn fill_resolved_drivers(db: &WorkDb, runs: &mut [UsageRunRecord]) -> Result<()> {
+/// An error on one execution (for example an unrecognised `kind` written by
+/// another engine build) is logged and leaves that run's driver unknown so
+/// one bad row never makes the whole window unreadable.
+fn fill_resolved_drivers(db: &WorkDb, runs: &mut [UsageRunRecord]) {
     let mut resolved: HashMap<String, Option<String>> = HashMap::new();
     for run in runs {
-        if run.driver.as_deref().is_some_and(|slug| !slug.is_empty()) {
+        if run.driver.slug().is_some() {
             continue;
         }
-        if !resolved.contains_key(&run.execution_id) {
-            let slug = db.get_execution_driver_slug(&run.execution_id)?;
-            resolved.insert(run.execution_id.clone(), slug.filter(|s| !s.is_empty()));
-        }
-        match resolved.get(&run.execution_id).and_then(|slug| slug.as_deref()) {
-            Some(slug) => {
-                run.driver = Some(slug.to_owned());
-                run.driver_source = DriverSource::Resolved;
+        let slug = resolved.entry(run.execution_id.clone()).or_insert_with(|| {
+            match db.get_execution_driver_slug(&run.execution_id) {
+                Ok(slug) => slug.filter(|s| !s.is_empty()),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %run.execution_id,
+                        error = %format!("{err:#}"),
+                        "failed to resolve driver for usage report execution; leaving unknown"
+                    );
+                    None
+                }
             }
-            None => {
-                run.driver = None;
-                run.driver_source = DriverSource::Unknown;
-            }
-        }
+        });
+        run.driver = match slug.as_deref() {
+            Some(slug) => RecordedDriver::Resolved(slug.to_owned()),
+            None => RecordedDriver::Unknown,
+        };
     }
-    Ok(())
 }
 
 /// Task columns of [`UsageTaskRecord`] in field order of [`map_usage_task_record`],
@@ -368,7 +368,7 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             tx.commit()?;
         }
-        fill_resolved_drivers(self, &mut runs)?;
+        fill_resolved_drivers(self, &mut runs);
         Ok(UsageWindowRecords { runs, tasks })
     }
 
@@ -750,7 +750,7 @@ mod tests {
 
         let guide = records.runs.iter().find(|run| run.run_id == "run_guide").unwrap();
         assert_eq!(guide.work_item_id, "comparison_1");
-        assert_eq!(guide.driver.as_deref(), Some("claude"));
+        assert_eq!(guide.driver, RecordedDriver::LaunchTuple("claude".into()));
         assert_eq!(guide.input_tokens, Some(5));
         assert_eq!(guide.cache_creation_tokens, None, "an unset class stays NULL");
 
@@ -773,8 +773,6 @@ mod tests {
 
     #[test]
     fn a_launch_tuple_driver_wins_over_the_current_task_pin() {
-        use boss_protocol::DriverSource;
-
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let conn = db.connect().unwrap();
@@ -794,14 +792,11 @@ mod tests {
 
         let records = db.usage_records_for_window(1_000, 2_000).unwrap();
         assert_eq!(records.runs.len(), 1);
-        assert_eq!(records.runs[0].driver.as_deref(), Some("claude"));
-        assert_eq!(records.runs[0].driver_source, DriverSource::LaunchTuple);
+        assert_eq!(records.runs[0].driver, RecordedDriver::LaunchTuple("claude".into()));
     }
 
     #[test]
     fn a_null_launch_tuple_resolves_from_the_task_pin() {
-        use boss_protocol::DriverSource;
-
         let (_dir, db) = open_db();
         let product_id = create_product(&db);
         let conn = db.connect().unwrap();
@@ -828,15 +823,12 @@ mod tests {
         let records = db.usage_records_for_window(1_000, 2_000).unwrap();
         assert_eq!(records.runs.len(), 2);
         for run in &records.runs {
-            assert_eq!(run.driver.as_deref(), Some("codex"));
-            assert_eq!(run.driver_source, DriverSource::Resolved);
+            assert_eq!(run.driver, RecordedDriver::Resolved("codex".into()));
         }
     }
 
     #[test]
     fn a_null_launch_tuple_that_cannot_resolve_stays_unknown() {
-        use boss_protocol::DriverSource;
-
         let (_dir, db) = open_db();
         let conn = db.connect().unwrap();
         insert_run_with_driver(
@@ -852,8 +844,40 @@ mod tests {
 
         let records = db.usage_records_for_window(1_000, 2_000).unwrap();
         assert_eq!(records.runs.len(), 1);
-        assert_eq!(records.runs[0].driver, None);
-        assert_eq!(records.runs[0].driver_source, DriverSource::Unknown);
+        assert_eq!(records.runs[0].driver, RecordedDriver::Unknown);
+    }
+
+    #[test]
+    fn an_unrecognised_execution_kind_with_null_driver_does_not_fail_the_window() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "t", &product_id, "chore", None);
+        insert_run_with_driver(
+            &conn,
+            "run_task_unknown_kind",
+            "exec_task_unknown_kind",
+            "t",
+            "kind_from_another_build",
+            1_500,
+            None,
+        );
+        insert_run_with_driver(
+            &conn,
+            "run_taskless_unknown_kind",
+            "exec_taskless_unknown_kind",
+            "not_a_task",
+            "kind_from_another_build",
+            1_501,
+            None,
+        );
+        drop(conn);
+
+        let records = db.usage_records_for_window(1_000, 2_000).unwrap();
+        assert_eq!(records.runs.len(), 2);
+        for run in &records.runs {
+            assert_eq!(run.driver, RecordedDriver::Unknown);
+        }
     }
 
     #[test]

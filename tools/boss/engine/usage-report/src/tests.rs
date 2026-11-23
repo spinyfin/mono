@@ -38,7 +38,7 @@ fn run(id: &str, execution: &str, item: &str, created: i64) -> UsageRunRecord {
         .execution_kind("task_implementation")
         .execution_status("completed")
         .execution_created_at_epoch_s(created)
-        .driver("claude")
+        .driver(RecordedDriver::LaunchTuple("claude".into()))
         .build()
 }
 
@@ -51,13 +51,14 @@ fn tokens(mut record: UsageRunRecord, input: i64, output: i64, cache_creation: i
 }
 
 fn with_driver(mut record: UsageRunRecord, driver: Option<&str>) -> UsageRunRecord {
-    record.driver = driver.map(str::to_owned);
+    record.driver = driver.map_or(RecordedDriver::Unknown, |slug| {
+        RecordedDriver::LaunchTuple(slug.to_owned())
+    });
     record
 }
 
 fn with_resolved_driver(mut record: UsageRunRecord, driver: &str) -> UsageRunRecord {
-    record.driver = Some(driver.to_owned());
-    record.driver_source = DriverSource::Resolved;
+    record.driver = RecordedDriver::Resolved(driver.to_owned());
     record
 }
 
@@ -169,8 +170,7 @@ fn a_window_of_only_unmeasured_runs_reports_unknown_classes_not_zero() {
 fn a_missing_class_stays_unknown_and_makes_the_run_partial() {
     // Grok and Antigravity never report cache creation: the other classes are
     // present, that one is NULL.
-    let mut partial = run("r1", "e1", "t1", BASE_EPOCH_S);
-    partial.driver = Some("grok".into());
+    let mut partial = with_driver(run("r1", "e1", "t1", BASE_EPOCH_S), Some("grok"));
     partial.input_tokens = Some(2_486);
     partial.output_tokens = Some(115);
     partial.cache_read_tokens = Some(24_576);
@@ -242,8 +242,10 @@ fn only_a_fully_recorded_zero_counts_as_zero() {
 // ── Totals ────────────────────────────────────────────────────────────────
 
 fn mixed_records() -> UsageWindowRecords {
-    let mut codex = tokens(run("r3", "e3", "t2", BASE_EPOCH_S + 3), 500, 60, 0, 400);
-    codex.driver = Some("codex".into());
+    let codex = with_driver(
+        tokens(run("r3", "e3", "t2", BASE_EPOCH_S + 3), 500, 60, 0, 400),
+        Some("codex"),
+    );
     let mut review = tokens(run("r5", "e5", "comment_1", BASE_EPOCH_S + 5), 9, 9, 0, 0);
     review.execution_kind = "answer_agent".into();
     records(
@@ -331,8 +333,10 @@ fn group_sums_equal_overall_at_each_level() {
 
 #[test]
 fn a_task_with_two_drivers_appears_under_both_groups_with_only_matching_executions() {
-    let mut codex = tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 5, 5, 0, 0);
-    codex.driver = Some("codex".into());
+    let codex = with_driver(
+        tokens(run("r2", "e2", "t1", BASE_EPOCH_S + 1), 5, 5, 0, 0),
+        Some("codex"),
+    );
     let mut query = window();
     query.group_by = vec![UsageDimension::Driver];
     let report = build(
@@ -935,8 +939,8 @@ fn caveat_codes_follow_each_case() {
 }
 
 #[test]
-fn grok_and_antigravity_runs_carry_no_driver_no_capture_caveat() {
-    // Both drivers now record tokens: a measured Grok run is partial, not unmeasured.
+fn grok_and_antigravity_measured_runs_are_partial_with_only_the_tokens_partial_caveat() {
+    // Grok and Antigravity report every class except cache creation, so a measured run is partial.
     for driver in ["grok", "agy"] {
         let mut record = with_driver(run("r", "e", "t1", BASE_EPOCH_S), Some(driver));
         record.input_tokens = Some(10);
@@ -944,7 +948,6 @@ fn grok_and_antigravity_runs_carry_no_driver_no_capture_caveat() {
         record.cache_read_tokens = Some(5);
         let got = caveat_codes_of(record);
         assert_eq!(got, codes(&[caveat::TOKENS_PARTIAL]), "{driver}");
-        assert!(!got.iter().any(|c| c.contains("no_capture")));
     }
 }
 
@@ -1018,13 +1021,17 @@ fn coverage_counts_each_caveat_once_per_run() {
 #[test]
 fn usd_is_excluded_by_driver_for_subscription_drivers_even_when_the_model_name_is_priced() {
     // The pricer would price anything: the exclusion must not rely on the model name.
-    let mut agy = with_model(tokens(run("a", "ea", "t1", BASE_EPOCH_S), 1, 1, 1, 1), "gemini-4-neon");
-    agy.driver = Some("agy".into());
-    let mut grok = with_model(
-        tokens(run("g", "eg", "t1", BASE_EPOCH_S + 1), 1, 1, 1, 1),
-        "grok-4.5-build",
+    let agy = with_driver(
+        with_model(tokens(run("a", "ea", "t1", BASE_EPOCH_S), 1, 1, 1, 1), "gemini-4-neon"),
+        Some("agy"),
     );
-    grok.driver = Some("grok".into());
+    let grok = with_driver(
+        with_model(
+            tokens(run("g", "eg", "t1", BASE_EPOCH_S + 1), 1, 1, 1, 1),
+            "grok-4.5-build",
+        ),
+        Some("grok"),
+    );
     let report = build_usage_rows_report(
         &window(),
         &records(vec![agy, grok], vec![task("t1", "t1", 2)]),
@@ -1045,8 +1052,10 @@ fn usd_is_excluded_by_driver_for_subscription_drivers_even_when_the_model_name_i
 
 #[test]
 fn usd_causes_follow_the_first_rule_that_applies() {
-    let mut codex = with_model(tokens(run("codex", "e1", "t1", BASE_EPOCH_S), 9, 1, 0, 4), "gpt");
-    codex.driver = Some("codex".into());
+    let codex = with_driver(
+        with_model(tokens(run("codex", "e1", "t1", BASE_EPOCH_S), 9, 1, 0, 4), "gpt"),
+        Some("codex"),
+    );
     let no_driver = with_driver(
         with_model(
             tokens(run("nodriver", "e2", "t1", BASE_EPOCH_S + 1), 1, 1, 1, 1),

@@ -20,7 +20,7 @@ use boss_protocol::{
     UsageFilter, UsageGroup, UsageGroupKey, UsageNote,
 };
 
-use crate::classify::{ClassifyContext, RunFacts, UsdEstimator, classify, dimension_value, driver_source};
+use crate::classify::{ClassifyContext, RunFacts, UsdEstimator, classify, dimension_value, finalize_kept};
 use crate::classify::{known_total, model_label, token_classes};
 use crate::fold::{RunFold, UsdOutcome};
 use crate::record::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
@@ -28,13 +28,10 @@ use crate::record::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 /// The most runs one reply carries. Past it the most recent runs are kept
 /// and the reply says so; nothing is dropped silently.
 ///
-/// Sized from a measurement on a synthetic database of production order
-/// (60,000 runs, 90-day window of 45,004 runs, reply truncated to this cap):
-/// engine CPU p95 is about 870 ms over 20 calls and the compact JSON is about
-/// 12 MB. The 20,000 first proposed in the design was several seconds and
-/// tens of megabytes, which is not a table anyone can read or an app can
-/// decode comfortably. The 150 ms p95 budget is still missed; the next lever
-/// is classifying only the capped slice, not raising this cap.
+/// Sized so a full reply stays around 12 MB of compact JSON (about 2.5 KB per
+/// run); a larger cap costs seconds of engine CPU and a reply an app cannot
+/// decode comfortably. Latency is not addressed by raising this cap; see the
+/// design's Latency budget section.
 pub const DEFAULT_RUN_CAP: u32 = 5_000;
 
 /// Grouping depth the reply shape supports: the outer level and one subgroup level.
@@ -106,34 +103,44 @@ pub fn build_usage_rows_report(
     };
 
     // 1. The window is half-open on `work_runs.created_at`.
-    let in_window: Vec<RunFacts<'_>> = records
+    let mut in_window: Vec<RunFacts<'_>> = records
         .runs
         .iter()
         .filter(|run| {
             run.run_created_at_epoch_s >= query.since_epoch_s && run.run_created_at_epoch_s < query.until_epoch_s
         })
-        .map(|run| classify(run, tasks.get(run.work_item_id.as_str()).copied(), &classify_ctx))
+        .map(|run| classify(run, tasks.get(run.work_item_id.as_str()).copied()))
         .collect();
+
+    let mut in_window_per_task: HashMap<&str, u32> = HashMap::new();
+    for facts in &in_window {
+        *in_window_per_task.entry(facts.rec.work_item_id.as_str()).or_default() += 1;
+    }
 
     // 2. Filter chips count what each value would add, so a dimension's own
     //    filter is left out of its own counts.
-    let dimension_values = dimension_values(&in_window, &query.filters);
+    let compiled_filters = compile_filters(&query.filters);
+    let dimension_values = dimension_values(&in_window, &compiled_filters);
 
-    // 3. Filters, then the cap.
-    let mut kept: Vec<&RunFacts<'_>> = in_window
-        .iter()
-        .filter(|facts| passes_filters(facts, &query.filters, None))
+    // 3. Filters, then the cap, then pricing and caveats on the surviving runs.
+    let mut kept_mut: Vec<&mut RunFacts<'_>> = in_window
+        .iter_mut()
+        .filter(|facts| passes_filters(facts, &compiled_filters, None))
         .collect();
-    let truncated = kept.len() > query.run_cap as usize;
+    let truncated = kept_mut.len() > query.run_cap as usize;
     if truncated {
-        kept.sort_by(|a, b| {
+        kept_mut.sort_by(|a, b| {
             b.rec
                 .run_created_at_epoch_s
                 .cmp(&a.rec.run_created_at_epoch_s)
                 .then_with(|| b.rec.run_id.cmp(&a.rec.run_id))
         });
-        kept.truncate(query.run_cap as usize);
+        kept_mut.truncate(query.run_cap as usize);
     }
+    for facts in &mut kept_mut {
+        finalize_kept(facts, &classify_ctx);
+    }
+    let kept: Vec<&RunFacts<'_>> = kept_mut.into_iter().map(|facts| &*facts).collect();
 
     // 4. Totals, coverage, notes.
     let overall = measure(&kept);
@@ -141,10 +148,6 @@ pub fn build_usage_rows_report(
     let coverage = coverage(query, &kept, &gaps, want_usd);
 
     // 5. The tree.
-    let mut in_window_per_task: HashMap<&str, u32> = HashMap::new();
-    for facts in &in_window {
-        *in_window_per_task.entry(facts.rec.work_item_id.as_str()).or_default() += 1;
-    }
     let ctx = TreeCtx {
         tasks: &tasks,
         in_window_per_task: &in_window_per_task,
@@ -214,22 +217,10 @@ fn spend_class_buckets(runs: &[&RunFacts<'_>]) -> Vec<CostBucket> {
 /// filters on the same dimension union their values (OR within one
 /// dimension), matching the wire contract and a client that sends one chip
 /// row per value. Distinct dimensions still AND.
-fn passes_filters(facts: &RunFacts<'_>, filters: &[UsageFilter], skip: Option<UsageDimension>) -> bool {
-    unioned_filter_values(filters, skip)
-        .into_iter()
-        .all(|(dimension, values)| {
-            let (value, _) = dimension_value(facts, dimension);
-            values.contains(value.as_str())
-        })
-}
-
-fn unioned_filter_values(
-    filters: &[UsageFilter],
-    skip: Option<UsageDimension>,
-) -> BTreeMap<UsageDimension, HashSet<&str>> {
+fn compile_filters(filters: &[UsageFilter]) -> Vec<(UsageDimension, HashSet<&str>)> {
     let mut by_dimension: BTreeMap<UsageDimension, HashSet<&str>> = BTreeMap::new();
     for filter in filters {
-        if Some(filter.dimension) == skip || filter.values.is_empty() {
+        if filter.values.is_empty() {
             continue;
         }
         by_dimension
@@ -237,14 +228,31 @@ fn unioned_filter_values(
             .or_default()
             .extend(filter.values.iter().map(String::as_str));
     }
-    by_dimension
+    by_dimension.into_iter().collect()
 }
 
-fn dimension_values(in_window: &[RunFacts<'_>], filters: &[UsageFilter]) -> Vec<UsageDimensionValues> {
+fn passes_filters(
+    facts: &RunFacts<'_>,
+    filters: &[(UsageDimension, HashSet<&str>)],
+    skip: Option<UsageDimension>,
+) -> bool {
+    filters.iter().all(|(dimension, values)| {
+        if Some(*dimension) == skip {
+            return true;
+        }
+        let (value, _) = dimension_value(facts, *dimension);
+        values.contains(value)
+    })
+}
+
+fn dimension_values(
+    in_window: &[RunFacts<'_>],
+    filters: &[(UsageDimension, HashSet<&str>)],
+) -> Vec<UsageDimensionValues> {
     UsageDimension::ALL
         .into_iter()
         .map(|dimension| {
-            let mut counts: BTreeMap<String, (String, u32)> = BTreeMap::new();
+            let mut counts: HashMap<&str, (&str, u32)> = HashMap::new();
             for facts in in_window
                 .iter()
                 .filter(|facts| passes_filters(facts, filters, Some(dimension)))
@@ -254,7 +262,11 @@ fn dimension_values(in_window: &[RunFacts<'_>], filters: &[UsageFilter]) -> Vec<
             }
             let mut values: Vec<UsageDimensionValue> = counts
                 .into_iter()
-                .map(|(value, (label, runs))| UsageDimensionValue { value, label, runs })
+                .map(|(value, (label, runs))| UsageDimensionValue {
+                    value: value.to_owned(),
+                    label: label.to_owned(),
+                    runs,
+                })
                 .collect();
             values.sort_by(|a, b| b.runs.cmp(&a.runs).then_with(|| a.value.cmp(&b.value)));
             UsageDimensionValues { dimension, values }
@@ -358,7 +370,7 @@ fn build_groups(
     path: &[UsageGroupKey],
 ) -> Vec<UsageGroup> {
     let dimension = dims[0];
-    let mut parts: BTreeMap<String, (String, Vec<&RunFacts<'_>>)> = BTreeMap::new();
+    let mut parts: HashMap<&str, (&str, Vec<&RunFacts<'_>>)> = HashMap::new();
     for facts in runs {
         let (value, label) = dimension_value(facts, dimension);
         parts.entry(value).or_insert_with(|| (label, Vec::new())).1.push(facts);
@@ -369,8 +381,8 @@ fn build_groups(
             let mut key = path.to_vec();
             key.push(UsageGroupKey {
                 dimension,
-                value,
-                label,
+                value: value.to_owned(),
+                label: label.to_owned(),
             });
             let measurement = measure(&members);
             if dims.len() > 1 {
@@ -505,7 +517,7 @@ fn execution_nodes(runs: &[&RunFacts<'_>]) -> Vec<ExecutionUsageNode> {
                 .execution_id(&rec.execution_id)
                 .work_item_id(&rec.work_item_id)
                 .created_at_epoch_s(rec.execution_created_at_epoch_s)
-                .driver_source(driver_source(rec))
+                .driver_source(rec.driver.source())
                 .kind(&rec.execution_kind)
                 .measurement(measure(&members))
                 .spend_class(first.spend_class)

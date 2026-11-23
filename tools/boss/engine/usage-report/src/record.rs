@@ -8,6 +8,40 @@
 
 use boss_protocol::DriverSource;
 
+/// Effective driver of an execution and how it was obtained.
+///
+/// Carrying the slug and source as one enum makes an inconsistent pair (such as
+/// a driver slug paired with [`DriverSource::Unknown`]) unrepresentable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RecordedDriver {
+    /// `work_executions.driver` recorded at spawn.
+    LaunchTuple(String),
+    /// Resolved from current routing when `work_executions.driver` was NULL.
+    Resolved(String),
+    /// Neither a launch tuple nor current routing yielded a driver.
+    #[default]
+    Unknown,
+}
+
+impl RecordedDriver {
+    /// Non-empty driver slug, if known.
+    pub fn slug(&self) -> Option<&str> {
+        match self {
+            Self::LaunchTuple(slug) | Self::Resolved(slug) if !slug.is_empty() => Some(slug.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Wire source corresponding to this recorded driver.
+    pub fn source(&self) -> DriverSource {
+        match self {
+            Self::LaunchTuple(slug) if !slug.is_empty() => DriverSource::LaunchTuple,
+            Self::Resolved(slug) if !slug.is_empty() => DriverSource::Resolved,
+            _ => DriverSource::Unknown,
+        }
+    }
+}
+
 /// One `work_runs` row with its owning execution. Task context is looked up
 /// by [`Self::work_item_id`] in [`UsageWindowRecords::tasks`]; an execution
 /// whose work item has no task row (answer agent, review guide, automation
@@ -44,14 +78,9 @@ pub struct UsageRunRecord {
     pub execution_finished_at_epoch_s: Option<i64>,
     pub execution_pr_url: Option<String>,
     pub execution_host_id: Option<String>,
-    /// Effective driver: the launch tuple when present, otherwise the slug
-    /// resolved for a NULL launch tuple, otherwise `None`.
-    pub driver: Option<String>,
-    /// How [`Self::driver`] was obtained. Defaults to [`DriverSource::Unknown`]
-    /// so a test that only sets `driver` is still classified as a launch
-    /// tuple when the slug is present (see `classify::driver_source`).
-    #[builder(default = DriverSource::Unknown)]
-    pub driver_source: DriverSource,
+    /// Effective driver and how it was obtained.
+    #[builder(default)]
+    pub driver: RecordedDriver,
     /// `work_executions.model`: the model alias the execution launched with.
     pub execution_model: Option<String>,
     /// `work_executions.effort_level`: the effort the execution launched with.

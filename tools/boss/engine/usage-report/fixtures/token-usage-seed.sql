@@ -64,7 +64,9 @@ INSERT INTO tasks (id, product_id, project_id, kind, name, status, created_at, u
   ('task_seed_j_design',     'prod_seed_boss',  'proj_seed_usage', 'design',   'Design the usage window (seed)',     'done', '1784000000', '1784000000', (SELECT now - 36 * 3600 FROM seed_clock),  NULL,                                       'high',     'xhigh',  113, NULL);
 
 -- Executions. driver / model / effort_level are the launch tuple; the
--- pre-capture execution predates it, so those are NULL ("not recorded").
+-- pre-capture execution predates it, so those columns are NULL and its driver
+-- is resolved from current routing (`driver_source = resolved`). The
+-- "not recorded" case is `exec_seed_unresolved` below.
 -- Executions whose work_item_id is not a task (answer agent, review guide,
 -- automation triage) are deliberate: they have no tasks row.
 INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, started_at, finished_at, driver, model, effort_level, host_id, pr_url) VALUES
