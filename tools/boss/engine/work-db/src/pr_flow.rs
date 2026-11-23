@@ -2691,9 +2691,17 @@ impl WorkDb {
         let mut prerequisite_work_item_id = None;
         let mut touched_work_item_ids = Vec::new();
         let mut dispatch_work_item_id = None;
-        let mut archive_work_item_id = None;
+        let mut archive_reason = None;
         let ladder_question = crate::progression_ladder::is_ladder_question(&tx, &question.question.id)?;
         let mismatch_attempt = super::conflict_mismatch::attempt_for_question(&tx, &question.question.id)?;
+        // Only the owner's choice of an item-local disposition acts on the item;
+        // any other answerer's choice of the same label resumes the worker.
+        let disposition = match &answer {
+            OperatorAnswer::MultipleChoice { value } if actor == LAST_STATUS_ACTOR_HUMAN => {
+                crate::operator_disposition::known_choice(value)
+            }
+            _ => None,
+        };
         match (answer, &question.question.answer_type) {
             // The engine's own question when progression ran out of attempts.
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
@@ -2707,7 +2715,9 @@ impl WorkDb {
                     &now,
                     crate::task_status_audit::WriteAttribution { actor, provenance },
                 )?;
-                archive_work_item_id = effect.archive.then(|| task.id.clone());
+                archive_reason = effect
+                    .archive
+                    .then_some("progression could not unstick it; the owner chose to archive it");
             }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
                 if mismatch_attempt.is_some() =>
@@ -2775,6 +2785,26 @@ impl WorkDb {
                 minted_execution = restart.minted;
                 dispatch_work_item_id = restart.dispatch_work_item_id;
             }
+            (OperatorAnswer::MultipleChoice { .. }, OperatorAnswerType::MultipleChoice { .. })
+                if disposition == Some(crate::operator_disposition::Disposition::Archive) =>
+            {
+                archive_reason = Some("the owner chose to archive this item in an operator question");
+            }
+            (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. })
+                if disposition == Some(crate::operator_disposition::Disposition::Park) =>
+            {
+                let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                let block = choice_block(&question.question, &value, &timestamp);
+                touched_work_item_ids = crate::operator_disposition::park_answer_in_tx(
+                    &tx,
+                    &mut pending,
+                    &task,
+                    &question.question,
+                    &block,
+                    &now,
+                    crate::task_status_audit::WriteAttribution { actor, provenance },
+                )?;
+            }
             (OperatorAnswer::MultipleChoice { value }, OperatorAnswerType::MultipleChoice { .. }) => {
                 let timestamp = answered_at.format("%Y-%m-%d %H:%M UTC").to_string();
                 let block = choice_block(&question.question, &value, &timestamp);
@@ -2830,6 +2860,25 @@ impl WorkDb {
             (answer, answer_type) => anyhow::bail!("unhandled operator answer {answer:?} for {answer_type:?}"),
         }
 
+        if let Some(reason) = archive_reason {
+            anyhow::ensure!(
+                actor == LAST_STATUS_ACTOR_HUMAN,
+                "only the owner can choose to archive an item"
+            );
+            self.update_task_in_tx(
+                &tx,
+                &mut pending,
+                &task.id,
+                WorkItemPatch::builder()
+                    .status("archived")
+                    .archived_reason(reason)
+                    .build(),
+                crate::task_status_audit::WriteAttribution {
+                    actor,
+                    provenance: Some(provenance.unwrap_or("operator_question_archive")),
+                },
+            )?;
+        }
         crate::progression_events::waive_grace_after_answer(&tx, &task.id, &question.question.execution_id)?;
         let mut updated = query_task(&tx, &task.id).require("task", &task.id)?;
         project_for_work_item_updated(&tx, &mut updated, "answer_operator_question");
@@ -2840,7 +2889,6 @@ impl WorkDb {
             .maybe_prerequisite_work_item_id(prerequisite_work_item_id)
             .touched_work_item_ids(touched_work_item_ids)
             .maybe_dispatch_work_item_id(dispatch_work_item_id)
-            .maybe_archive_work_item_id(archive_work_item_id)
             .build())
     }
 }

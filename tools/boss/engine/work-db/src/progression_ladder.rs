@@ -70,8 +70,8 @@
 //! - **Park it** parks the item (its chain root for a revision) as the owner,
 //!   then restores its pre-question state. The owner's decision is a human
 //!   write, so the progression tier's refusal to park does not apply.
-//! - **Archive it** restores the state and asks the caller to archive the item
-//!   through the ordinary update path once this transaction has committed.
+//! - **Archive it** archives through the ordinary update path in the answer
+//!   transaction, so the answer and disposition succeed or roll back together.
 //! - **Keep trying** resets the ladder's counts (`reset_at`), restores the
 //!   pre-question state and waives the stuck-after grace once, so the item is
 //!   nominated again as soon as its cooldown allows. It starts no work itself:
@@ -914,8 +914,7 @@ pub(crate) fn items_with_open_ladder_question(conn: &Connection) -> Result<HashS
     Ok(stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
 }
 
-/// What an answer to the engine's question asks of the caller once the answer
-/// has committed.
+/// What the enclosing answer transaction still needs to apply.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct LadderAnswerEffect {
     /// Archive the item through the ordinary update path.

@@ -1031,7 +1031,7 @@ fn keep_trying_resets_the_attempts_and_renominates_the_item_in_the_state_it_was_
 
     let outcome = fx.answer(&question, KEEP_TRYING);
 
-    assert_eq!(outcome.archive_work_item_id, None);
+    assert_ne!(fx.task(&id).status, TaskStatus::Archived);
     assert!(
         !outcome.minted_execution,
         "keep trying starts no work: progression stays the actor"
@@ -1235,32 +1235,17 @@ fn park_it_on_a_revision_parks_the_parent_pr_it_follows() {
 }
 
 #[test]
-fn archive_it_restores_the_item_and_hands_the_archive_to_the_caller() {
+fn archive_it_archives_in_the_answer_transaction() {
     let fx = fx();
     let id = fx.conflicted("Owner says archive");
     let question = exhausted(&fx, &id, S5);
 
     let outcome = fx.answer(&question, ARCHIVE_IT);
 
-    assert_eq!(outcome.archive_work_item_id.as_deref(), Some(id.as_str()));
-    assert_eq!(
-        fx.task(&id).blocked_reason.as_deref(),
-        Some("merge_conflict"),
-        "not left waiting on an answer"
-    );
-    // The caller archives through the ordinary update path, as the owner.
-    let archived = fx
-        .db
-        .update_work_item(
-            &id,
-            boss_protocol::WorkItemPatch::builder()
-                .status("archived")
-                .archived_reason("progression could not unstick it; the owner chose to archive it")
-                .build(),
-        )
-        .unwrap();
+    assert!(!outcome.minted_execution);
     assert_eq!(fx.task(&id).status, TaskStatus::Archived);
-    drop(archived);
+    assert_eq!(fx.task(&id).last_status_actor, "human");
+    assert!(fx.task(&id).operator_question.is_none());
 }
 
 // ── the cross-fingerprint worker_failed episode ──────────────────────────────
