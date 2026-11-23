@@ -2388,58 +2388,7 @@ impl ServerState {
         PaneReleaseOutcome::Reaped
     }
 
-    /// Detach presentation for a worker whose tmux teardown was already verified.
-    ///
-    /// [`Self::hosted_pane_slot_for_run`] returns the slot this run was once
-    /// given, not necessarily the slot it holds now — a leaked pool claim can
-    /// have been reclaimed and reused by a different run in between. Every
-    /// slot-scoped effect below is therefore conditioned on both occupancy
-    /// oracles agreeing the slot is either unowned or owned by `run_id`: the
-    /// pool that owns `worker_id` (main, automation, or review) and
-    /// live-state. Acting unconditionally would tear down a newer occupant's
-    /// viewer, pool claim and live state out from under it.
-    async fn detach_untracked_worker_viewer(&self, run_id: &str) -> PaneReleaseOutcome {
-        self.live_worker_states.release_persona_for_run(run_id);
-        if let Some(slot_id) = self.hosted_pane_slot_for_run(run_id) {
-            let worker_id = boss_execution_contracts::worker_id_for_slot(slot_id);
-            let pool_holder = self.execution_coordinator.claim_holder(&worker_id).await;
-            let pool_held_by_other = pool_holder.as_deref().is_some_and(|holder| holder != run_id);
-            let live_held_by_other = self
-                .live_worker_states
-                .get(slot_id)
-                .is_some_and(|state| state.run_id != run_id);
-            if pool_held_by_other || live_held_by_other {
-                tracing::warn!(
-                    run_id,
-                    slot_id,
-                    pool_held_by_other,
-                    live_held_by_other,
-                    "detach_untracked_worker_viewer: the derived slot is occupied by a different \
-                     live execution; skipping teardown so its viewer, pool claim and live state \
-                     are left untouched",
-                );
-            } else {
-                let request = EngineToAppRequest::DetachWorkerPane(boss_protocol::DetachWorkerPaneInput {
-                    run_id: run_id.to_owned(),
-                    slot_id,
-                });
-                if let Err(err) = self.send_to_app(request, PANE_RELEASE_ACK_TIMEOUT).await {
-                    tracing::warn!(run_id, slot_id, ?err, "failed to detach untracked tmux viewer");
-                }
-                self.execution_coordinator
-                    .release_pool_claim_if_execution(&worker_id, run_id)
-                    .await;
-                self.live_worker_states.release_slot_for_run(run_id);
-                self.live_status_manager.stop_slot_for_run(slot_id, run_id);
-                self.broadcast_live_worker_states().await;
-            }
-        }
-        self.forget_run_caches(run_id);
-        self.forget_approval_watch(run_id);
-        PaneReleaseOutcome::Reaped
-    }
-
-    fn forget_run_caches(&self, run_id: &str) {
+    pub(super) fn forget_run_caches(&self, run_id: &str) {
         self.transcript_path_cache.forget(run_id);
         self.run_cost_capture.forget(run_id);
         self.agy_background_tasks.forget(run_id);

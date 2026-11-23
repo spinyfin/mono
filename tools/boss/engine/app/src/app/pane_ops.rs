@@ -1385,8 +1385,7 @@ impl ServerState {
                 self.broadcast_live_worker_states().await;
             }
         }
-        self.transcript_path_cache.forget(run_id);
-        self.run_cost_capture.forget(run_id);
+        self.forget_run_caches(run_id);
         self.forget_approval_watch(run_id);
         PaneReleaseOutcome::Reaped
     }
