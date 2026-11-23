@@ -20,6 +20,7 @@
 #   $7 — unstamped build_provenance_rs (stamp = -1, this test runs --nostamp)
 #   $8 — unstamped //tools/boss/build-info:version_probe
 #   $9 — always-stamped //tools/boss/build-info:version_probe_stamped
+#   $10 — //tools/boss/engine/core:engine_fixture_test (same main.rs as engine)
 set -euo pipefail
 
 unstamped_rs="$1"
@@ -31,6 +32,7 @@ bossctl_bin="$6"
 unstamped_provenance_rs="$7"
 unstamped_probe="$8"
 stamped_probe="$9"
+engine_bin="${10}"
 
 expect_line() {
   local file="$1" line="$2"
@@ -122,6 +124,12 @@ fi
 bossctl_version="$("$bossctl_bin" --version)"
 if [[ "$bossctl_version" != "bossctl 0.0.0-dev" ]]; then
   echo "ERROR: unstamped bossctl --version was '${bossctl_version}', expected 'bossctl 0.0.0-dev'" >&2
+  exit 1
+fi
+
+engine_version="$("$engine_bin" --version)"
+if [[ "$engine_version" != "boss-engine 0.0.0-dev" ]]; then
+  echo "ERROR: unstamped boss-engine --version was '${engine_version}', expected 'boss-engine 0.0.0-dev'" >&2
   exit 1
 fi
 

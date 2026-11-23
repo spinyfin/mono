@@ -109,7 +109,7 @@ stamp_flag(
 build_info_rs(
     name = "build_info_rs",
     out = "build_info_generated.rs",
-    visibility = ["//tools/boss:__subpackages__"],
+    visibility = ["//tools/boss/build-info:__pkg__"],
 )
 
 # Deterministic stable-status fixture for build_info_stamp_test so stamped
@@ -166,6 +166,7 @@ sh_test(
         "$(location :build_provenance_rs)",
         "$(location //tools/boss/build-info:version_probe)",
         "$(location //tools/boss/build-info:version_probe_stamped)",
+        "$(location //tools/boss/engine/core:engine_fixture_test)",
     ],
     data = [
         ":build_info_rs",
@@ -177,6 +178,7 @@ sh_test(
         "//tools/boss/build-info:version_probe",
         "//tools/boss/build-info:version_probe_stamped",
         "//tools/boss/cli:boss",
+        "//tools/boss/engine/core:engine_fixture_test",
     ],
 )
 

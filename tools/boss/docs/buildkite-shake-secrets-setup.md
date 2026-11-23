@@ -15,9 +15,12 @@ macro. A release binary built without these credentials will refuse to run
 The `boss-release` Buildkite step (`.buildkite/steps/boss-release.sh`) reads
 the credentials from Buildkite's secret store at the start of every run, exports
 them into the shell environment, and then invokes `bazel build -c opt`. The
-`.bazelrc` propagates them to the compiler via `--action_env`, so they are
-embedded into the binary and included in Bazel's cache key (keeping the
-credential-embedded release build distinct from the credential-free PR build).
+`.bazelrc` inherits those names via `--action_env` into every action's
+`default_shell_env`; `rules_rust` copies that map into every Rustc action, so
+the set values are part of every Rust compile's cache key, not only
+`//tools/boss/github`. The matching `--define` flags are a second, narrower
+split that `boss_github` compiles into `rustc_env`. Together they keep the
+credential-embedded release build distinct from a credential-free PR build.
 
 ---
 
