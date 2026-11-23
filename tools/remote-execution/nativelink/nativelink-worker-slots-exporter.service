@@ -1,0 +1,20 @@
+# systemd user unit for the per-worker slot and CAS eviction exporter
+# (worker-slots-exporter.py). Install as
+# ~/.config/systemd/user/nativelink-worker-slots-exporter.service; the
+# runbook (../README.md, "Hub metrics") has the steps.
+#
+# Restart=always restarts this exporter, not the hub. The exporter only
+# reads: it asks the admin API and watches the CAS directories.
+[Unit]
+Description=Per-worker slot figures from the NativeLink hub admin API, for Prometheus
+After=nativelink-macos-hub.service
+
+[Service]
+EnvironmentFile=%h/nativelink-macos-hub/hub.env
+ExecStart=/usr/bin/python3 %h/nativelink-macos-hub/worker-slots-exporter.py
+Restart=always
+RestartSec=5
+MemoryMax=100M
+
+[Install]
+WantedBy=default.target

@@ -19,6 +19,11 @@ hub_unit="${dir}/nativelink/nativelink-macos-hub.service"
 health_unit="${dir}/nativelink/nativelink-macos-hub-health.service"
 health_timer="${dir}/nativelink/nativelink-macos-hub-health.timer"
 health="${dir}/nativelink/hub-health.sh"
+textfile="${dir}/nativelink/hub-textfile-metrics.sh"
+textfile_unit="${dir}/nativelink/nativelink-hub-textfile.service"
+textfile_timer="${dir}/nativelink/nativelink-hub-textfile.timer"
+slots_exporter="${dir}/nativelink/worker-slots-exporter.py"
+slots_unit="${dir}/nativelink/nativelink-worker-slots-exporter.service"
 build="${dir}/nativelink/build-worker.sh"
 patches_dir="${dir}/nativelink/patches"
 readme="${dir}/README.md"
@@ -204,10 +209,72 @@ if grep -v -E '^[[:space:]]*#' "$health" |
   grep -q -E '(^|\|\||&&|;|\$\()[[:space:]]*(systemctl|launchctl|kill|pkill|killall)[[:space:]]'; then
   fail "hub-health.sh must only report: it must not restart, stop or signal anything"
 fi
-if cat "$health_unit" "$hub_unit" "$health_timer" | grep -v -E '^[[:space:]]*#' |
+if cat "$health_unit" "$hub_unit" "$health_timer" "$textfile_unit" "$textfile_timer" "$slots_unit" | grep -v -E '^[[:space:]]*#' |
   grep -q -E 'OnFailure|RuntimeMaxSec|WatchdogSec|OnCalendar'; then
   fail "no unit may restart the hub on a schedule or on a failed health check"
 fi
+
+# ---------------------------------------------------------------------------
+# Hub restart exporter (textfile) and slots/CAS exporter.
+# ---------------------------------------------------------------------------
+
+# CAS cap: 95% of the store filesystem, minus 5 GB for the action cache.
+# The live hub.env value is that formula; the number stays on the host.
+grep -q -E '^//   NL_HUB_CAS_MAX_BYTES   Size of the CAS in bytes. 95% of the filesystem' "$hub" ||
+  fail "hub.json5 must size NL_HUB_CAS_MAX_BYTES at 95% of the filesystem"
+grep -q -F 'minus 5 GB for the' "$hub" ||
+  fail "hub.json5 must subtract 5 GB from the CAS cap for the action cache"
+grep -q -F 'NL_HUB_CAS_MAX_BYTES=<95% of that filesystem, minus 5 GB, in bytes>' "$readme" ||
+  fail "README.md's hub.env example must size the CAS at 95% minus 5 GB"
+
+# Restart exporter: reads the user unit as root, writes node_exporter's textfile
+# directory atomically, never restarts the hub.
+grep -q -x 'OnUnitActiveSec=30s' "$textfile_timer" ||
+  fail "the hub restart exporter must run every 30 s"
+grep -q -x 'Type=oneshot' "$textfile_unit" ||
+  fail "nativelink-hub-textfile.service must be oneshot"
+grep -q -x 'ExecStart=/home/bduff/nativelink-macos-hub/hub-textfile-metrics.sh' "$textfile_unit" ||
+  fail "the restart exporter's system unit must run hub-textfile-metrics.sh"
+grep -q 'mktemp' "$textfile" && grep -q -F 'mv "$tmp" "$OUT"' "$textfile" ||
+  fail "hub-textfile-metrics.sh must write the textfile atomically (temp file, then mv)"
+if grep -v -E '^[[:space:]]*#' "$textfile" | grep -q -E 'systemctl.*(restart|stop|kill|disable)'; then
+  fail "hub-textfile-metrics.sh must only read the hub unit: it must not restart or stop it"
+fi
+
+# Slots/CAS exporter: loopback only, inotify insert/eviction counters, 15-minute
+# low-priority walk, cap from the running hub process.
+grep -q -x 'EnvironmentFile=%h/nativelink-macos-hub/hub.env' "$slots_unit" ||
+  fail "the slots exporter's unit must read hub.env, where the admin address is"
+grep -q -x 'ExecStart=/usr/bin/python3 %h/nativelink-macos-hub/worker-slots-exporter.py' "$slots_unit" ||
+  fail "the slots exporter's unit must start worker-slots-exporter.py"
+grep -q -F 'HTTPServer(("127.0.0.1", 9108), H)' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must listen on 127.0.0.1:9108"
+if grep -q -E 'HTTPServer\(\("0\.0\.0\.0"' "$slots_exporter"; then
+  fail "worker-slots-exporter.py must not bind non-loopback"
+fi
+grep -q -F '/admin/scheduler/MAIN_SCHEDULER/workers' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must ask the admin API about MAIN_SCHEDULER"
+grep -q -F 'IN_MOVED_TO into' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must keep its comments on inotify insert/eviction counters"
+grep -q -F 'A walk of cas-content/d2 every 15 min' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must keep its comments on the 15-minute low-priority walk"
+grep -q -F 'time.sleep(900)' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must walk the CAS every 15 minutes"
+grep -q -F 'os.setpriority(os.PRIO_PROCESS, tid, 19)' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must run the CAS walk at nice 19"
+grep -q -F 'NL_HUB_CAS_MAX_BYTES of the *running* hub' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must keep its comments on reading the cap from the running hub process"
+grep -q -F '/proc/{pid}/environ' "$slots_exporter" ||
+  fail "worker-slots-exporter.py must read NL_HUB_CAS_MAX_BYTES from the running hub process"
+if grep -v -E '^[[:space:]]*(#|")' "$slots_exporter" | grep -q -E 'systemctl.*restart|systemctl.*stop'; then
+  fail "worker-slots-exporter.py must only read: it must not restart or stop the hub"
+fi
+grep -q -x '## Hub metrics' "$readme" ||
+  fail "README.md must keep its \"Hub metrics\" section"
+grep -q -F 'copy_if_changed' "$readme" && grep -q -F 'cmp -s' "$readme" ||
+  fail "README.md install steps must copy a file only when content differs (identical content is a no-op)"
+grep -q -x '## Installing or updating hub files' "$readme" ||
+  fail "README.md must keep its \"Installing or updating hub files\" section"
 
 # ---------------------------------------------------------------------------
 # One NativeLink version: the build script, the patches and the runbook agree.
@@ -265,7 +332,11 @@ done
 # No address is written into the repository.
 # ---------------------------------------------------------------------------
 
-for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer" "$readme"; do
+if [[ -e "${dir}/nativelink/hub.env" ]]; then
+  fail "hub.env names listen addresses and must not be in the repository"
+fi
+
+for file in "$hub" "$worker" "$plist" "$hub_unit" "$health_unit" "$health_timer" "$textfile" "$textfile_unit" "$textfile_timer" "$slots_exporter" "$slots_unit" "$readme"; do
   # Loopback is the one address that is the same on every host.
   if grep -o -E '([0-9]{1,3}\.){3}[0-9]{1,3}' "$file" | grep -v -x -q '127\.0\.0\.1'; then
     fail "$(basename "$file") contains an IP address; addresses are host configuration"

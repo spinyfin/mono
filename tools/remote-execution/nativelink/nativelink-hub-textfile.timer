@@ -1,0 +1,14 @@
+# Runs the hub restart-state exporter every 30 s
+# (nativelink-hub-textfile.service). Install as
+# /etc/systemd/system/nativelink-hub-textfile.timer. The runbook
+# (../README.md, "Hub metrics") has the steps.
+[Unit]
+Description=Export NativeLink hub restart state every 30 s
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

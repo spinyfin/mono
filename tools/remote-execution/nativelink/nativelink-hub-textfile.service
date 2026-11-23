@@ -1,0 +1,20 @@
+# System unit: export the hub's restart state to node_exporter's textfile
+# collector (hub-textfile-metrics.sh). Install as
+# /etc/systemd/system/nativelink-hub-textfile.service; the timer
+# nativelink-hub-textfile.timer starts it every 30 s. The runbook
+# (../README.md, "Hub metrics") has the steps.
+#
+# This is a system unit, not a user one: the hub itself is a user unit, which
+# node_exporter's systemd collector cannot see, and the textfile directory
+# (/var/lib/prometheus/node-exporter) is root-owned. ExecStart is an absolute
+# path because a system unit's %h is root's home. After=user@1000.service is
+# the hub user's systemd instance on this host (uid 1000).
+#
+# It only reads. It never restarts the hub.
+[Unit]
+Description=Export NativeLink hub restart state to node_exporter textfile collector
+After=user@1000.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/bduff/nativelink-macos-hub/hub-textfile-metrics.sh
