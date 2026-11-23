@@ -1375,12 +1375,15 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
             parked_without_charge(&fx, &parked[0].id)
         })
         .await;
-        // The park arms a 100 ms retry kick. Expire it and kick so the
-        // second persist can start with the clock still held.
+        // The park arms a 100 ms retry kick. Expire that timer, then wait
+        // with the clock held so the second persist cannot be overtaken by
+        // the 5s command deadline. Kick on each poll: a one-shot kick can
+        // be consumed while HOST_SLOTS=1 is still held, and
+        // `timing::condition` never moves the clock.
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(100) + TICK).await;
-        env.coordinator.kick();
         timing::condition(|| {
+            env.coordinator.kick();
             assert_parked_never_failed(&fx, &parked);
             peer.commands().iter().filter(|c| is_lease(c)).count() >= 2
         })
@@ -1394,10 +1397,14 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         fx.add_spoke_host("other", 8);
         let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
         let third = triage(&fx, &env, "third");
-        env.coordinator.kick();
-        // Placement on the second host answers immediately. Pace anyway so a
-        // park-delay timer on the held clock still fires if kick needs it.
-        timing::advancing(|| {
+        // Placement on the second host answers immediately. Hold the clock
+        // across persist and delivery: advancing here would spend virtual
+        // time against the 300 ms Spawn deadline while real I/O is still
+        // in flight. The park-delay timers were expired above. Kick on
+        // each poll so a wake consumed while the first host's slot is
+        // still draining is retried.
+        timing::condition(|| {
+            env.coordinator.kick();
             assert_parked_never_failed(&fx, &parked);
             other
                 .commands()
