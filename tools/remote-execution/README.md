@@ -2,7 +2,7 @@
 
 This directory holds everything that is installed on the hosts that run mono's remote builds on macOS workers: the NativeLink configs, the units that start them, the patches the workers need, the hub's health check, and this runbook. Nothing here is built or read by a build. The files are copied to the hosts by hand, which is why they are in the repository: a change to how the scheduler behaves is a reviewed change, and `tests/config_test.sh` keeps the files consistent with each other.
 
-What decides whether a build executes remotely is elsewhere: [`.buildkite/README.md`](../../.buildkite/README.md) for CI steps and [`tools/test-sandbox/README.md`](../test-sandbox/README.md) for a developer's Mac. The Linux workers have a hub of their own, described in [`.buildkite/linux-agents-runbook.md`](../../.buildkite/linux-agents-runbook.md); see "Not covered here" at the end.
+What decides whether a build executes remotely is elsewhere: [`.buildkite/README.md`](../../.buildkite/README.md) for CI steps and [`tools/test-sandbox/README.md`](../test-sandbox/README.md) for a developer's Mac. The hub schedules the Linux workers too ("Routing" below). Their configs and units are not in this directory: [`.buildkite/linux-agents-runbook.md`](../../.buildkite/linux-agents-runbook.md), "Remote execution workers", describes them.
 
 ## What is here
 
@@ -33,7 +33,37 @@ The workers, as inspected on 2026-11-18:
 
 `zakalwe` (10 cores, 16 GB) was the hub and a ten-slot worker in one process, with its stores on an external disk. It stops being the hub at the cutover. If it stays in the pool it is a worker like the others, with `NL_WORKER_DATA` on its internal disk: stalls of the external disk were what the scheduler turned into the hang of 2026-11-18.
 
+The Linux workers are the hosts in [`.buildkite/linux-agents-runbook.md`](../../.buildkite/linux-agents-runbook.md), "Remote execution workers".
+
 The slot counts are the numbers the workers ran with before this change. They are sized by cores, and about four concurrent Rust compiles was the RAM-safe figure measured for a 16 GB host in September ([investigation](../../docs/investigations/nativelink-macos-remote-execution.md)), so expect memory pressure on a worker; the scheduler's `worker_timeout_s` is set with that in mind.
+
+## Routing
+
+One scheduler serves the macOS and the Linux workers, and one CAS and action cache serve both kinds of build. What keeps a macOS action off a Linux worker, and the reverse, is the `OSFamily` platform property:
+
+- **Every worker declares one.** `OSFamily: macos` in `worker-macos.json5`, `OSFamily: linux` in a Linux worker's `worker.json5`.
+- **The scheduler matches it exactly** (`OSFamily: "exact"` in `hub.json5`): an action is offered only to workers whose value equals the action's.
+- **Every action has one by the time it is scheduled.** Linux builds send `OSFamily=linux` (`ci-remote-linux` in `.ci.bazelrc`). macOS builds send none, and an action without the property would be offered to every worker. The `property_modifier` layer in `hub.json5` therefore gives each arriving action a value: the one its client sent, or `macos` if it sent none.
+
+| The client sends                       | The scheduler sees | Runs on                                                                 |
+| -------------------------------------- | ------------------ | ----------------------------------------------------------------------- |
+| no `OSFamily`                          | `OSFamily=macos`   | a macOS worker                                                          |
+| `OSFamily=macos`                       | `OSFamily=macos`   | a macOS worker                                                          |
+| `OSFamily=linux`                       | `OSFamily=linux`   | a Linux worker                                                          |
+| `OSFamily=linux`, `worker-host=<name>` | the same           | that Linux worker only                                                  |
+| any other `OSFamily`                   | the same           | nothing: it fails after `unsatisfiable_action_timeout_s` (five minutes) |
+
+The default is filled in on the hub, after the client has computed the action's digest. So it changes no cache key, a macOS build needs no flag, and a checkout older than this arrangement routes correctly. `macos` is the default, and not `linux`, because the Linux builds were already tagged and the macOS ones were not.
+
+Measured on 2026-11-22 against a hub with this `hub.json5` and three workers on loopback, one declaring `macos` and two `linux`, eight actions per row: the first four rows of the table ran where it says, and with the `macos` worker stopped an untagged action stayed queued (the hub's queue listing showed it as `OSFamily=macos`) while both `linux` workers sat idle.
+
+**Naming one worker.** Every worker also declares `worker-host` with its own name. A build that adds `--remote_default_exec_properties=worker-host=<name>` runs only on that worker. The hub does not list the key, and a key it does not list restricts only the workers that declare it, so every worker on either operating system must declare one. For a Linux worker the build must also carry `OSFamily=linux`: without it the action is a macOS action and no macOS worker has that name, so it waits and fails.
+
+**Adding a worker.** It must declare `OSFamily` with one of the two values, and `worker-host`. A worker that declares neither `macos` nor `linux` is never offered anything. A Linux worker must also run every action inside the sandbox the Linux runbook describes, because `ci-remote-linux` sends tests to whatever Linux worker is on this hub.
+
+**A target with its own `exec_properties`** does not receive `--remote_default_exec_properties`. On a Linux build such a target would lose `OSFamily=linux` and be scheduled as a macOS action, so it has to carry the property itself.
+
+**When one operating system's workers are all gone** and the other's are connected, that operating system's actions wait, and fail after `unsatisfiable_action_timeout_s`. With no worker connected at all they fail after `no_worker_action_timeout_s`.
 
 ## Version and patches
 
@@ -234,10 +264,10 @@ NL_HUB_CAS_MAX_BYTES=<at most 80% of that filesystem, less 5 GB, in bytes>
 NL_HUB_CLIENT_LISTEN=<address>:50051
 NL_HUB_WORKER_LISTEN=<address>:50061
 NL_HUB_ADMIN_LISTEN=127.0.0.1:50071
-NL_HEALTH_EXPECTED_WORKERS=<the number of Macs in the pool>
+NL_HEALTH_EXPECTED_WORKERS=<the number of workers, macOS and Linux>
 ```
 
-If the host also runs the Linux workers' hub, the two cannot share an address and port: give this one ports of its own, and use them in the workers' plists. Then:
+Then:
 
 ```sh
 loginctl enable-linger "$USER"
@@ -304,5 +334,5 @@ A checkout that built against the old hub may log `Lost inputs no longer availab
 
 ## Not covered here
 
-- **The Linux workers' hub** (`.buildkite/linux-agents-runbook.md`, "Remote execution workers") runs the 1.8.6 release, and its workers the Linux build from `build-worker.sh`, but its `hub.json5` is its own and sets no scheduler timeouts: it has the versions of this change and not yet the scheduler block. The CI probe and the step timeouts already apply to Linux steps; the probe needs a status page on that hub's client port to see more than a connection.
+- **The Linux workers' configs and units.** They register with this hub and run the Linux build from `build-worker.sh`, but `worker.json5`, the action sandbox and the systemd unit are installed per host and described in `.buildkite/linux-agents-runbook.md`, "Remote execution workers"; no copy is in this directory, so `tests/config_test.sh` does not cover them. The health check counts workers of both operating systems together: it reports a missing worker, and does not say which pool is short.
 - **A per-RPC deadline in the Bazel client** (`--remote_grpc_service_config` in Bazel 9.3 or later). That would fail the Execute call itself so a developer build could fall back instead of stopping. The status watchdog is the bound on Bazel 9.1.

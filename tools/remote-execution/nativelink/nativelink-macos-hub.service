@@ -1,15 +1,13 @@
-# systemd user unit for the hub that serves the macOS workers: scheduler, CAS
-# and action cache (hub.json5). Install as
+# systemd user unit for the hub: scheduler, CAS and action cache (hub.json5)
+# for the macOS and the Linux workers. Install as
 # ~/.config/systemd/user/nativelink-macos-hub.service; the runbook
 # (../README.md, "Cutover") has the steps.
 #
-# The name and the directory say "macos" because the Linux workers have a hub
-# of their own (nativelink-hub.service in ~/nativelink, see
-# .buildkite/linux-agents-runbook.md), and both can run on one host. They must
-# stay two processes: the macOS builds do not tag their actions, and a
-# scheduler offers an untagged action to every worker it has.
+# The name and the directory say "macos" because the Linux workers had a hub
+# of their own until 2026-11-22. One scheduler now serves both, and routes on
+# the OSFamily property (../README.md, "Routing").
 [Unit]
-Description=NativeLink hub for macOS remote execution (scheduler, CAS, action cache)
+Description=NativeLink hub for remote execution (scheduler, CAS, action cache)
 After=network-online.target
 
 [Service]

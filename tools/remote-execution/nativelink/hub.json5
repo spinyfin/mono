@@ -1,10 +1,11 @@
-// NativeLink hub for the macOS remote-execution workers: scheduler, CAS and
-// action cache. For NativeLink 1.8.6; an older binary rejects several of the
-// fields below.
+// NativeLink hub for remote execution: one scheduler, CAS and action cache
+// for the macOS and the Linux workers. For NativeLink 1.8.6; an older binary
+// rejects several of the fields below.
 //
-// Runs on a Linux host as nativelink-macos-hub.service. It runs no actions
-// itself: every worker is a separate process on a Mac (worker-macos.json5).
-// The runbook is ../README.md.
+// Runs on a Linux host as nativelink-macos-hub.service (the name is from when
+// it served the Macs only). It runs no actions itself: every worker is a
+// separate process, on a Mac (worker-macos.json5) or on a Linux host
+// (.buildkite/linux-agents-runbook.md). The runbook is ../README.md.
 //
 // Values that belong to the host come from the unit's EnvironmentFile
 // (hub.env), so this file is the same on any host and names no address. A
@@ -52,114 +53,147 @@
   schedulers: [
     {
       name: "MAIN_SCHEDULER",
-      simple: {
-        supported_platform_properties: {
-          cpu_count: "minimum",
-          OSFamily: "priority",
-          "container-image": "priority",
+      // One scheduler for both operating systems. What keeps a macOS action
+      // off a Linux worker, and the reverse, is the OSFamily property: each
+      // worker declares "macos" or "linux", and the scheduler below offers an
+      // action only to workers whose value equals the action's.
+      //
+      // Linux builds send OSFamily=linux with every action (ci-remote-linux
+      // in .ci.bazelrc). macOS builds send no OSFamily at all, and an action
+      // without one would be offered to every worker. So this layer gives
+      // every action a value before it is scheduled: the one the client
+      // sent, or "macos" when it sent none.
+      //
+      // The rewrite happens here, after the client has computed the action's
+      // digest, so it changes no cache key: macOS builds need no flag, and a
+      // checkout from before this change routes correctly.
+      //
+      // "add" overwrites, so the client's value is moved aside first and put
+      // back over the default afterwards. A "replace" whose property is
+      // absent does nothing.
+      property_modifier: {
+        modifications: [
+          { replace: { name: "OSFamily", new_name: "requested-OSFamily" } },
+          { add: { name: "OSFamily", value: "macos" } },
+          { replace: { name: "requested-OSFamily", new_name: "OSFamily" } },
+        ],
+        scheduler: {
+          simple: {
+            supported_platform_properties: {
+              cpu_count: "minimum",
+              // A worker is offered an action only if it declares the same
+              // OSFamily. Every action has one by the time it gets here: see
+              // modifications above.
+              OSFamily: "exact",
+              "container-image": "priority",
+            },
+
+            // Every timeout below is written out, including the ones that equal
+            // NativeLink's default, so that a change of default in a later
+            // release cannot change this scheduler, and so that each has its
+            // reason next to it. ../README.md, "Timeouts", has the same list as
+            // one table, with what a Bazel client sees when each one fires.
+            // ../tests/config_test.sh pins the values.
+
+            // A worker that has sent nothing for this long is evicted and its
+            // actions are queued again. A worker sends a keepalive every 2.5 s
+            // (half of worker_api_endpoint.timeout), and any message counts.
+            //
+            // 30 s is twelve keepalives in a row. The workers are 16 GB Macs
+            // running 10 to 12 compiles each, where a pause of several seconds is
+            // ordinary: on 2026-11-18, with NativeLink 1.6.6 and its 5 s window,
+            // 6 to 20 operations an hour were timed out on workers that were
+            // alive. The costs are not symmetric. Too long only delays the retry
+            // of what a dead worker held, by the difference. Too short evicts a
+            // live worker, which throws away everything it is running.
+            //
+            // It is also the grace the scheduler adds to an action's own timeout
+            // before ending it over the worker's head, and that clock starts at
+            // assignment, so fetching inputs and uploading outputs has to fit in
+            // it for a test that runs close to its limit.
+            worker_timeout_s: 30,
+
+            // Ends an action that has been executing this long with no change of
+            // state reported by its worker, whatever its keepalives say. It is
+            // the only bound on an action that carries no timeout (every build
+            // action; Bazel sets one on tests only) and that a live worker keeps
+            // reporting as running. Keepalives do not extend it.
+            //
+            // It has to exceed everything a healthy worker may spend on one
+            // action, or it ends work that would have finished: fetch (10 min),
+            // command (20 min) and upload (10 min), the three limits
+            // worker-macos.json5 sets. 45 min is that sum and five more, so the
+            // worker's own, more specific error arrives first.
+            max_action_executing_timeout_s: 2700,
+
+            // How often executing actions are checked against the limits above
+            // when no client is attached to do it, and how often the scheduler
+            // looks for an action whose worker no longer holds it (a result lost
+            // on the way). NativeLink's default. It only sets how late those are
+            // noticed, and half a minute is small next to every limit it serves.
+            executing_sweep_interval_s: 30,
+
+            // A worker told to kill an action, and silent about it for this
+            // long, is evicted. NativeLink's default. A kill is a signal, a grace
+            // period and the removal of the action's directory, for which the
+            // worker allows 30 s (max_cleanup_wait_s); this is twice that.
+            unacknowledged_kill_timeout_s: 60,
+
+            // An action handed to a worker that has kept talking for this long
+            // without acknowledging it is queued again, untried. Off by default.
+            // 20 s is eight keepalives sent past a dispatch the worker never
+            // took, which is a dispatch that was lost.
+            //
+            // Only workers from 1.7.3 acknowledge. Remove this line before
+            // connecting an older worker, or every action it is given is queued
+            // again and again.
+            dispatch_ack_timeout_s: 20,
+
+            // A queued action whose client has gone is dropped after this long.
+            // NativeLink's default. Bazel reattaches within seconds after a
+            // broken connection (five retries in about 3 s), so a minute never
+            // drops an action a build is still waiting for, and an interrupted
+            // build stops occupying the queue a minute later.
+            client_action_timeout_s: 60,
+
+            // Runs of one action that ended in an internal error or a scheduler
+            // timeout before the client is told. NativeLink's default: three
+            // retries, four runs. The error names the last failure.
+            max_job_retries: 3,
+
+            // Times an action may lose its worker (evicted, disconnected, timed
+            // out) before the client is told. NativeLink's default is 10, sized
+            // for pools where losing a worker is routine. No worker here is
+            // preemptible, and the larger pool (macOS) has six: an action that
+            // has lost a worker six times has lost as many as there are, and
+            // the pool is what is wrong. Each loss takes 30 to 60 s to detect,
+            // so a build caught in an eviction loop fails in about five minutes
+            // instead of ten.
+            max_worker_loss_retries: 6,
+
+            // A command that ran past its timeout on one worker is tried once on
+            // another before the timeout is final. NativeLink's default. A 16 GB
+            // host under memory pressure runs everything slowly; the second
+            // worker tells that apart from an action that is slow by itself.
+            max_timeout_retries: 1,
+
+            // A queued action fails once no worker at all has been connected for
+            // this long, instead of waiting for workers that may never come. Off
+            // by default. After a restart of this hub every worker reconnects
+            // with a backoff that tops out at 30 s; two minutes is four of those.
+            no_worker_action_timeout_s: 120,
+
+            // A queued action that no connected worker could run even when idle
+            // fails after this long. Off by default. It catches a mistake (a
+            // client that asks for more cpu_count than any worker has, or for an
+            // OSFamily no worker declares), and it is what a build sees when
+            // every worker of its operating system is gone while the other
+            // pool is still connected. Five minutes is longer than a restart of
+            // a whole pool, during which the workers that could run it are
+            // simply not back yet.
+            unsatisfiable_action_timeout_s: 300,
+          },
         },
-
-        // Every timeout below is written out, including the ones that equal
-        // NativeLink's default, so that a change of default in a later
-        // release cannot change this scheduler, and so that each has its
-        // reason next to it. ../README.md, "Timeouts", has the same list as
-        // one table, with what a Bazel client sees when each one fires.
-        // ../tests/config_test.sh pins the values.
-
-        // A worker that has sent nothing for this long is evicted and its
-        // actions are queued again. A worker sends a keepalive every 2.5 s
-        // (half of worker_api_endpoint.timeout), and any message counts.
-        //
-        // 30 s is twelve keepalives in a row. The workers are 16 GB Macs
-        // running 10 to 12 compiles each, where a pause of several seconds is
-        // ordinary: on 2026-11-18, with NativeLink 1.6.6 and its 5 s window,
-        // 6 to 20 operations an hour were timed out on workers that were
-        // alive. The costs are not symmetric. Too long only delays the retry
-        // of what a dead worker held, by the difference. Too short evicts a
-        // live worker, which throws away everything it is running.
-        //
-        // It is also the grace the scheduler adds to an action's own timeout
-        // before ending it over the worker's head, and that clock starts at
-        // assignment, so fetching inputs and uploading outputs has to fit in
-        // it for a test that runs close to its limit.
-        worker_timeout_s: 30,
-
-        // Ends an action that has been executing this long with no change of
-        // state reported by its worker, whatever its keepalives say. It is
-        // the only bound on an action that carries no timeout (every build
-        // action; Bazel sets one on tests only) and that a live worker keeps
-        // reporting as running. Keepalives do not extend it.
-        //
-        // It has to exceed everything a healthy worker may spend on one
-        // action, or it ends work that would have finished: fetch (10 min),
-        // command (20 min) and upload (10 min), the three limits
-        // worker-macos.json5 sets. 45 min is that sum and five more, so the
-        // worker's own, more specific error arrives first.
-        max_action_executing_timeout_s: 2700,
-
-        // How often executing actions are checked against the limits above
-        // when no client is attached to do it, and how often the scheduler
-        // looks for an action whose worker no longer holds it (a result lost
-        // on the way). NativeLink's default. It only sets how late those are
-        // noticed, and half a minute is small next to every limit it serves.
-        executing_sweep_interval_s: 30,
-
-        // A worker told to kill an action, and silent about it for this
-        // long, is evicted. NativeLink's default. A kill is a signal, a grace
-        // period and the removal of the action's directory, for which the
-        // worker allows 30 s (max_cleanup_wait_s); this is twice that.
-        unacknowledged_kill_timeout_s: 60,
-
-        // An action handed to a worker that has kept talking for this long
-        // without acknowledging it is queued again, untried. Off by default.
-        // 20 s is eight keepalives sent past a dispatch the worker never
-        // took, which is a dispatch that was lost.
-        //
-        // Only workers from 1.7.3 acknowledge. Remove this line before
-        // connecting an older worker, or every action it is given is queued
-        // again and again.
-        dispatch_ack_timeout_s: 20,
-
-        // A queued action whose client has gone is dropped after this long.
-        // NativeLink's default. Bazel reattaches within seconds after a
-        // broken connection (five retries in about 3 s), so a minute never
-        // drops an action a build is still waiting for, and an interrupted
-        // build stops occupying the queue a minute later.
-        client_action_timeout_s: 60,
-
-        // Runs of one action that ended in an internal error or a scheduler
-        // timeout before the client is told. NativeLink's default: three
-        // retries, four runs. The error names the last failure.
-        max_job_retries: 3,
-
-        // Times an action may lose its worker (evicted, disconnected, timed
-        // out) before the client is told. NativeLink's default is 10, sized
-        // for pools where losing a worker is routine. This pool has six
-        // workers and none is preemptible: an action that has lost a worker
-        // six times has lost as many as there are, and the pool is what is
-        // wrong. Each loss takes 30 to 60 s to detect, so a build caught in
-        // an eviction loop fails in about five minutes instead of ten.
-        max_worker_loss_retries: 6,
-
-        // A command that ran past its timeout on one worker is tried once on
-        // another before the timeout is final. NativeLink's default. A 16 GB
-        // host under memory pressure runs everything slowly; the second
-        // worker tells that apart from an action that is slow by itself.
-        max_timeout_retries: 1,
-
-        // A queued action fails once no worker at all has been connected for
-        // this long, instead of waiting for workers that may never come. Off
-        // by default. After a restart of this hub every worker reconnects
-        // with a backoff that tops out at 30 s; two minutes is four of those.
-        no_worker_action_timeout_s: 120,
-
-        // A queued action that no connected worker could run even when idle
-        // fails after this long. Off by default. Nothing a mono build asks
-        // for is unsatisfiable, so this only catches a mistake (a client that
-        // asks for more cpu_count than any worker has). Five minutes is
-        // longer than a restart of the whole pool, during which the workers
-        // that could run it are simply not back yet.
-        unsatisfiable_action_timeout_s: 300,
       },
     },
   ],
