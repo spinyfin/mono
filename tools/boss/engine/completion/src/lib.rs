@@ -161,6 +161,7 @@ mod queue_ci_audit;
 mod recheck;
 mod release;
 mod remediation;
+mod revision_review_hold;
 mod run_done_declaration;
 mod stop;
 mod teardown;

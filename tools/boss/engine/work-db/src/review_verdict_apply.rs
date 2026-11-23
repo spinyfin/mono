@@ -1079,5 +1079,6 @@ pub fn advance_held_revision_after_verdict_in_tx(
             super::resolve_attention_kind_in_tx(tx, &revision_id, super::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
         }
     }
+    super::review_batches::log_revisions_left_held_in(tx, cycle_root_id, target_sha, "verdict_applied")?;
     Ok(())
 }

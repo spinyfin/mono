@@ -1084,7 +1084,7 @@ pub use review_batches::{
     PR_REVIEW_BATCH_STALE_ATTENTION_KIND, PR_REVIEW_REPORTED_MEMBER_LIVE_ATTENTION_KIND,
     PRE_MERGE_BATCH_RESERVATION_UNITS, REVIEW_BATCH_REPORTED_MEMBER_GRACE_SECS, REVIEW_BATCH_STALE_SECS,
     RetryDeadReviewBatchMember, ReviewBatchCreateInput, ReviewBatchDispatch, ReviewBatchMemberCreateInput,
-    ReviewBatchQuorumOutcome,
+    ReviewBatchQuorumOutcome, ReviewHoldSettlement,
 };
 pub use review_findings_followup::ReviewFindingsFollowupInsert;
 pub use review_findings_followup::*;

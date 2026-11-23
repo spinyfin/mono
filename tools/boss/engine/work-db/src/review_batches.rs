@@ -78,7 +78,7 @@ pub enum ReviewBatchDispatch {
         batch: ReviewBatch,
         executions: Vec<WorkExecution>,
     },
-    LegacyExecution(WorkExecution),
+    LegacyExecution(Box<WorkExecution>),
     /// The review pool's weighted reservation accounting (see
     /// [`can_admit_review_batch_in_tx`]) has no room for a new batch of this
     /// target's phase right now, or dispatch focus / an all-spawns pause is
@@ -982,12 +982,14 @@ fn file_admission_deferred_attention_in_tx(tx: &Transaction<'_>, work_item_id: &
 /// A held revision is released by the batch that settles the head it pushed,
 /// matched on `work_executions.revision_stop_contributed_head` (see
 /// [`release_held_revision_after_terminal_batch_in_tx`] and
-/// `review_verdict_apply::advance_held_revision_after_verdict_in_tx`). A
-/// worker that reaches its Stop boundary stamps that column itself. One that
-/// ends its run by declaring delivery never reaches that boundary, and a
-/// deferred admission creates no batch to take the head from. Without this
-/// the column would stay empty, and no batch, however it was later started,
-/// could find the revision again.
+/// `review_verdict_apply::advance_held_revision_after_verdict_in_tx`). Both
+/// completion paths stamp that column with the head the run finished at: a
+/// worker's Stop boundary, and a declared delivery. That is the head at the
+/// end of the run, which is not always the head a review is admitted at: the
+/// pull request can move again before admission reads it, and a deferred
+/// admission creates no batch to take the head from. Without this the column
+/// would name a head no batch reviews, and no batch, however it was later
+/// started, could find the revision again.
 ///
 /// Admission knows both halves: the revision it is asked to review for and
 /// the head it was handed, which contains everything that revision pushed.
@@ -1277,6 +1279,7 @@ fn insufficient_quorum_attention(
 /// machine (insufficient leaf reports, exhausted supervisor, moved head)
 /// so they stay on one kind and one write path.
 fn fail_review_batch_with_attention(
+    pending: &mut PendingEvents,
     tx: &Transaction<'_>,
     batch: &ReviewBatch,
     now: &str,
@@ -1300,16 +1303,31 @@ fn fail_review_batch_with_attention(
     // revision held `active` for exactly this immutable target. A revision
     // that admission later re-pointed at a newer head (see
     // `record_awaited_review_head_in_tx`) is not matched and stays held.
-    release_held_revision_after_terminal_batch_in_tx(tx, &batch.cycle_root_id, &batch.target_sha, now)?;
+    //
+    // The revisions queued behind a released one are cascaded in the same
+    // transaction. Their board events are staged on `pending`; a caller that
+    // owns the commit publishes them with `commit_and_publish`. Nested
+    // callers (proposal apply) pass the same `pending` through to that
+    // commit so the board learns the dependent is no longer gated.
+    for released_id in
+        release_held_revision_after_terminal_batch_in_tx(tx, &batch.cycle_root_id, &batch.target_sha, now)?
+    {
+        super::cascade_dependents_after_prereq_status_change(pending, tx, &released_id, "in_review", now)?;
+    }
     Ok(())
 }
 
+/// Release every revision of `cycle_root_id` held for `target_sha`, once the
+/// pre-merge batch for that head has reached a terminal decision, and return
+/// the ones that moved to `in_review`. The caller decides whether to cascade
+/// to their dependents in the same transaction; the dependency-unblock sweep
+/// catches those it does not.
 fn release_held_revision_after_terminal_batch_in_tx(
     tx: &Transaction<'_>,
     cycle_root_id: &str,
     target_sha: &str,
     now: &str,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let mut revision_ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
     revision_ids.push(cycle_root_id.to_owned());
     let placeholders = revision_ids
@@ -1343,13 +1361,105 @@ fn release_held_revision_after_terminal_batch_in_tx(
             .query_map(values.as_slice(), |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
+    let mut released = Vec::new();
     for revision_id in held {
         if WorkDb::advance_held_pending_review_task_to_in_review_in_tx(tx, &revision_id, now)? {
             // The review this revision was held for has reached its decision.
             super::resolve_attention_kind_in_tx(tx, &revision_id, PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
+            released.push(revision_id);
         }
     }
+    log_revisions_left_held_in(tx, cycle_root_id, target_sha, "batch_terminal")?;
+    Ok(released)
+}
+
+/// Log each revision of `cycle_root_id` that a terminal review decision for
+/// `target_sha` left held `active`.
+///
+/// A held revision is released by the decision for the head recorded on its
+/// latest finished run (see [`record_awaited_review_head_in_tx`]). One that
+/// stays held after a decision for another head is waiting for its own
+/// batch, which is ordinary. One that stays held with no recorded head, or
+/// for a head no batch will review, is not released by any decision, and
+/// nothing else recorded which of the two it was. This line records the head
+/// each such revision awaits beside the head that was just decided, so the
+/// two cases can be told apart afterwards.
+pub(crate) fn log_revisions_left_held_in(
+    conn: &Connection,
+    cycle_root_id: &str,
+    target_sha: &str,
+    decision: &str,
+) -> Result<()> {
+    let revision_ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(conn, cycle_root_id)?;
+    if revision_ids.is_empty() {
+        return Ok(());
+    }
+    let mut statement = conn.prepare(
+        "SELECT t.id, we.id, we.revision_stop_contributed_head, we.pr_head_after
+         FROM tasks t
+         LEFT JOIN work_executions we ON we.id = (
+             SELECT latest.id FROM work_executions latest
+             WHERE latest.work_item_id = t.id
+               AND latest.kind = 'revision_implementation'
+               AND latest.status = 'completed'
+             ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+         )
+         WHERE t.id IN (SELECT value FROM json_each(?1))
+           AND t.kind = 'revision' AND t.status = 'active' AND t.deleted_at IS NULL
+           AND t.pr_url IS NOT NULL AND t.pr_url != ''
+           AND NOT EXISTS (
+               SELECT 1 FROM work_executions pending
+               WHERE pending.work_item_id = t.id AND pending.kind != 'pr_review'
+                 AND pending.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+           )
+         ORDER BY t.id",
+    )?;
+    let held = statement.query_map(params![super::id_array(&revision_ids)], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in held {
+        let (revision_id, execution_id, awaited_head, pr_head_after) = row?;
+        tracing::info!(
+            cycle_root_id,
+            decided_head = target_sha,
+            decision,
+            revision_id,
+            execution_id = execution_id.as_deref().unwrap_or("(no finished run)"),
+            awaited_review_head = awaited_head.as_deref().unwrap_or("(none recorded)"),
+            pr_head_after = pr_head_after.as_deref().unwrap_or("(none recorded)"),
+            "review decision left a revision of this pull request held: the head it awaits is not \
+             the head that was decided",
+        );
+    }
     Ok(())
+}
+
+/// What settling a revision's review hold against a pull-request head found.
+/// See [`WorkDb::settle_revision_review_hold`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewHoldSettlement {
+    /// The pre-merge batch for the head has not reached its decision. That
+    /// decision releases the revision.
+    AwaitingBatch { batch_id: String },
+    /// The review of the head had already reached its decision, so the
+    /// revision moved to `in_review` in this call.
+    Released {
+        batch_id: String,
+        batch_status: ReviewBatchStatus,
+    },
+    /// No pre-merge batch exists for the head. Admission has to create one,
+    /// or record why it cannot.
+    NoBatch,
+    /// The item is not a revision held for review at the head: it is not a
+    /// revision, it is not `active` with a bound pull request, a writer run
+    /// of it has not finished, or it has no finished run to record the head
+    /// on.
+    NotHeld,
 }
 
 /// File one durable, work-item-scoped alarm for every batch that has an
@@ -1473,10 +1583,13 @@ fn file_reported_live_review_batch_member_attentions(conn: &mut Connection) -> R
 ///
 /// Must be called inside an already-open transaction — see
 /// [`WorkDb::try_advance_review_batch_quorum`] for the standalone wrapper.
+/// Board events from a cascade on failure are staged on `pending`; the
+/// caller publishes them with its commit.
 pub(crate) fn try_advance_review_batch_quorum_in_tx(
     tx: &Transaction<'_>,
     batch_id: &str,
     registry: &boss_engine_driver::DriverRegistry,
+    pending: &mut PendingEvents,
 ) -> Result<ReviewBatchQuorumOutcome> {
     let Some(batch) = review_batch_by_id_in(tx, batch_id)? else {
         return Ok(ReviewBatchQuorumOutcome::NoOp);
@@ -1507,6 +1620,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 }
                 Some(member) if member_attempt_is_settled(member) => {
                     fail_review_batch_with_attention(
+                        pending,
                         tx,
                         &batch,
                         &now,
@@ -1568,7 +1682,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
                 Ok(ReviewBatchQuorumOutcome::SupervisorDispatched)
             } else {
                 let (title, body) = insufficient_quorum_attention(tx, &batch, &members)?;
-                fail_review_batch_with_attention(tx, &batch, &now, &title, body)?;
+                fail_review_batch_with_attention(pending, tx, &batch, &now, &title, body)?;
                 Ok(ReviewBatchQuorumOutcome::InsufficientQuorum)
             }
         }
@@ -1588,6 +1702,7 @@ pub(crate) fn try_advance_review_batch_quorum_in_tx(
             }
             Some(member) if member_attempt_is_settled(member) => {
                 fail_review_batch_with_attention(
+                    pending,
                     tx,
                     &batch,
                     &now,
@@ -1713,6 +1828,94 @@ impl WorkDb {
             title,
             &body,
         )
+    }
+
+    /// Settle the review hold of `revision_id` against the pull-request head
+    /// `target_sha`: record that head as the one the revision is held for
+    /// and, when the pre-merge batch for it has already reached a terminal
+    /// decision, release the revision now.
+    ///
+    /// A held revision is otherwise released only at the moment a batch
+    /// reaches its decision, by the head recorded on the revision then (see
+    /// [`record_awaited_review_head_in_tx`]). That is an edge, and a
+    /// revision can come to be held for a head after the edge has passed:
+    /// its run finishes after another row's batch for the same head was
+    /// admitted and decided, or the batch decides between a completion's
+    /// admission call and its completion write. Nothing pending would then
+    /// release it. Every path that takes or keeps the hold for a head it
+    /// knows calls this, so the hold is decided by the batch's state and
+    /// not by the order the two writes happened in.
+    ///
+    /// Both decisions release: a verdict, and a failure (see
+    /// [`fail_review_batch_with_attention`]). Dependents of a released
+    /// revision are cascaded in the same transaction.
+    pub fn settle_revision_review_hold(&self, revision_id: &str, target_sha: &str) -> Result<ReviewHoldSettlement> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cycle_root_id = super::chain_helpers::chain_root(&tx, revision_id)?;
+        if cycle_root_id == revision_id {
+            return Ok(ReviewHoldSettlement::NotHeld);
+        }
+        record_awaited_review_head_in_tx(&tx, revision_id, target_sha)?;
+        let Some(batch) = review_batch_for_target_in(&tx, &cycle_root_id, ReviewBatchPhase::PreMerge, target_sha)?
+        else {
+            tx.commit()?;
+            return Ok(ReviewHoldSettlement::NoBatch);
+        };
+        if !matches!(batch.status, ReviewBatchStatus::Completed | ReviewBatchStatus::Failed) {
+            tx.commit()?;
+            return Ok(ReviewHoldSettlement::AwaitingBatch { batch_id: batch.id });
+        }
+        let now = now_string();
+        let mut pending = PendingEvents::new();
+        let released = release_held_revision_after_terminal_batch_in_tx(&tx, &cycle_root_id, target_sha, &now)?;
+        for released_id in &released {
+            super::cascade_dependents_after_prereq_status_change(&mut pending, &tx, released_id, "in_review", &now)?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(if released.iter().any(|id| id == revision_id) {
+            ReviewHoldSettlement::Released {
+                batch_id: batch.id,
+                batch_status: batch.status,
+            }
+        } else {
+            ReviewHoldSettlement::NotHeld
+        })
+    }
+
+    /// Release the review hold on `work_item_id` and cascade to the items
+    /// waiting on it, in one transaction.
+    ///
+    /// With `verdict_source_id` the release requires that item's newest
+    /// reviewer run to have recorded a review result (see
+    /// [`Self::advance_pending_review_task_to_in_review_with_verdict_source`]);
+    /// without it the decision not to review is itself the justification
+    /// (see [`Self::advance_held_pending_review_task_to_in_review`]). Returns
+    /// whether the item moved to `in_review`.
+    ///
+    /// Those two move the row only; this also cascades to the revisions
+    /// queued behind the released one in the same transaction, so the next
+    /// revision is dispatchable immediately. Paths that release a hold outside
+    /// a batch's own decision use this.
+    pub fn release_review_hold(&self, work_item_id: &str, verdict_source_id: Option<&str>) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_string();
+        let released = match verdict_source_id {
+            Some(source) => Self::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
+                &tx,
+                work_item_id,
+                source,
+                &now,
+            )?,
+            None => Self::advance_held_pending_review_task_to_in_review_in_tx(&tx, work_item_id, &now)?,
+        };
+        let mut pending = PendingEvents::new();
+        if released {
+            super::cascade_dependents_after_prereq_status_change(&mut pending, &tx, work_item_id, "in_review", &now)?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(released)
     }
 
     /// Currently reserved review-pool units `(pre_merge, post_merge)` for
@@ -1890,7 +2093,7 @@ impl WorkDb {
                     );
                 }
                 tx.commit()?;
-                return Ok(ReviewBatchDispatch::LegacyExecution(execution));
+                return Ok(ReviewBatchDispatch::LegacyExecution(Box::new(execution)));
             }
         }
         // Checked here — after ExistingBatch/LegacyExecution, before the
@@ -2124,8 +2327,9 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let registry = boss_engine_driver::DriverRegistry::default();
-        let outcome = try_advance_review_batch_quorum_in_tx(&tx, batch_id, &registry)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let outcome = try_advance_review_batch_quorum_in_tx(&tx, batch_id, &registry, &mut pending)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(outcome)
     }
 
@@ -2391,8 +2595,9 @@ impl WorkDb {
             // batch can change, so check it before committing rather than
             // waiting for some other hook to notice.
             let registry = boss_engine_driver::DriverRegistry::default();
-            let outcome = try_advance_review_batch_quorum_in_tx(&tx, &member.batch_id, &registry)?;
-            tx.commit()?;
+            let mut pending = PendingEvents::new();
+            let outcome = try_advance_review_batch_quorum_in_tx(&tx, &member.batch_id, &registry, &mut pending)?;
+            commit_and_publish(tx, pending, &self.event_bus)?;
             return Ok(match outcome {
                 ReviewBatchQuorumOutcome::InsufficientQuorum => RetryDeadReviewBatchMember::BatchFailed,
                 _ => RetryDeadReviewBatchMember::NotRetried,
@@ -2465,7 +2670,9 @@ impl WorkDb {
              WHERE id = ?2 AND status IN ('pending', 'running')",
             params![now, member.id],
         )?;
+        let mut pending = PendingEvents::new();
         fail_review_batch_with_attention(
+            &mut pending,
             &tx,
             &batch,
             &now,
@@ -2479,7 +2686,7 @@ impl WorkDb {
                 batch.pr_url, batch.id, batch.target_sha,
             ),
         )?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(true)
     }
 
@@ -2512,7 +2719,9 @@ impl WorkDb {
              WHERE id = ?2 AND status IN ('pending', 'running')",
             params![now, member.id],
         )?;
+        let mut pending = PendingEvents::new();
         fail_review_batch_with_attention(
+            &mut pending,
             &tx,
             &batch,
             &now,
@@ -2524,7 +2733,7 @@ impl WorkDb {
                 batch.pr_url, batch.id,
             ),
         )?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(true)
     }
 
@@ -2603,6 +2812,15 @@ impl WorkDb {
         for (batch_id, cycle_root_id, pr_url, deleted_at) in rows {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut pending = PendingEvents::new();
+            // Read before the write below so the release that follows knows
+            // which head this batch was the review of.
+            let reaped_target: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT phase, target_sha FROM pr_review_batches WHERE id = ?1",
+                    params![batch_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             let changed = tx.execute(
                 "UPDATE pr_review_batches
                  SET status = 'failed', completed_at = ?2, updated_at = ?2
@@ -2612,6 +2830,28 @@ impl WorkDb {
             if changed == 0 {
                 tx.commit()?;
                 continue;
+            }
+            // Reaping is a terminal decision for the batch's head like any
+            // other failure, so it releases the revisions held for that head
+            // as [`fail_review_batch_with_attention`] does. Without this a
+            // revision whose batch was reaped stayed held until a replacement
+            // generation decided the same head, and for good once the
+            // generation cap left no replacement to come.
+            if let Some((phase, target_sha)) = reaped_target
+                && phase == ReviewBatchPhase::PreMerge.as_str()
+                && deleted_at.is_none()
+            {
+                for released_id in
+                    release_held_revision_after_terminal_batch_in_tx(&tx, &cycle_root_id, &target_sha, &now)?
+                {
+                    super::cascade_dependents_after_prereq_status_change(
+                        &mut pending,
+                        &tx,
+                        &released_id,
+                        "in_review",
+                        &now,
+                    )?;
+                }
             }
             // The dead-root branch (`deleted_at IS NOT NULL`, or `status IN
             // (done, archived)` for a non-post-merge batch) bypasses the
