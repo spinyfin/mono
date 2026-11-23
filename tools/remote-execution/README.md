@@ -328,7 +328,7 @@ Swap on `headcrash` is two files, both in `/etc/fstab` with the default priority
 add_swap() {
   local file=$1 size=$2
   if sudo test -e "$file"; then
-    if [[ "$(sudo blkid -p -o value -s TYPE "$file" 2>/dev/null)" != "swap" ]]; then
+    if [ "$(sudo blkid -p -o value -s TYPE "$file" 2>/dev/null)" != swap ]; then
       echo "error: $file exists but is not a valid swap file; inspect and remove it (sudo rm -- '$file') before re-running" >&2
       return 1
     fi
