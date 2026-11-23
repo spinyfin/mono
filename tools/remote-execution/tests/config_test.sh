@@ -228,6 +228,9 @@ grep -q -x -F '        max_inflight_tasks: 12,' "${hw}/worker.json5" ||
   fail "headcrash's worker.json5 must run 12 slots"
 grep -q -F 'cpu_count: { values: ["12"] }' "${hw}/worker.json5" ||
   fail "headcrash's cpu_count must equal its slots"
+if grep -q 'empiricist' "${hw}/nativelink-worker.service"; then
+  fail "headcrash's nativelink-worker.service must not name empiricist as the hub"
+fi
 grep -q -F '/swap2.img' "$readme" ||
   fail "README.md must document the host's swap files"
 
@@ -269,16 +272,24 @@ grep -q -F 'minus 5 GB for the' "$hub" ||
 grep -q -F 'NL_HUB_CAS_MAX_BYTES=<95% of that filesystem, minus 5 GB, in bytes>' "$readme" ||
   fail "README.md's hub.env example must size the CAS at 95% minus 5 GB"
 
-# Restart exporter: reads the user unit as root, writes node_exporter's textfile
-# directory atomically, never restarts the hub.
+# Restart exporter: reads the system unit as root, writes node_exporter's
+# textfile directory atomically, never restarts the hub.
 grep -q -x 'OnUnitActiveSec=30s' "$textfile_timer" ||
   fail "the hub restart exporter must run every 30 s"
 grep -q -x 'Type=oneshot' "$textfile_unit" ||
   fail "nativelink-hub-textfile.service must be oneshot"
+grep -q -x 'After=nativelink-macos-hub.service' "$textfile_unit" ||
+  fail "nativelink-hub-textfile.service must be ordered after nativelink-macos-hub.service"
+if grep -q 'user@1000\.service' "$textfile_unit"; then
+  fail "nativelink-hub-textfile.service must not reference user@1000.service"
+fi
 grep -q -x 'ExecStart=/home/bduff/nativelink-macos-hub/hub-textfile-metrics.sh' "$textfile_unit" ||
   fail "the restart exporter's system unit must run hub-textfile-metrics.sh"
 grep -q 'mktemp' "$textfile" && grep -q -F 'mv "$tmp" "$OUT"' "$textfile" ||
   fail "hub-textfile-metrics.sh must write the textfile atomically (temp file, then mv)"
+if grep -q 'HUB_USER' "$textfile"; then
+  fail "hub-textfile-metrics.sh must not define dead HUB_USER / NL_HUB_USER"
+fi
 if grep -v -E '^[[:space:]]*#' "$textfile" | grep -q -E 'systemctl.*(restart|stop|kill|disable)'; then
   fail "hub-textfile-metrics.sh must only read the hub unit: it must not restart or stop it"
 fi

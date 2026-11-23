@@ -174,6 +174,8 @@ systemctl --user is-failed nativelink-macos-hub-health.service   # "failed" whil
 journalctl --user --unit nativelink-macos-hub-health.service --since -1h --output cat
 ```
 
+Because `nativelink-macos-hub-health.service` runs as a `bduff` user unit while reading the system hub unit's journal with `journalctl --quiet --unit nativelink-macos-hub.service`, `journald` must keep its default `SplitMode=uid` (so entries from `User=bduff` land in a journal `bduff` can read) or `bduff` must be in the `systemd-journal` group; otherwise `--quiet` hides permission errors as an idle window.
+
 What makes it unhealthy, and why each limit is where it is:
 
 | Condition                                                                     | Limit           | Reason                                                                                                                                                     |
@@ -320,17 +322,26 @@ copy_if_changed "$W/nativelink-worker.service.d/memory.conf" ~/.config/systemd/u
 systemctl --user daemon-reload
 ```
 
-Swap on `headcrash` is two files, both in `/etc/fstab` with the default priority: `/swap.img` (8G) and `/swap2.img` (24G), root-owned, mode 0600, 32G in all. The hub never uses it (`MemorySwapMax=0`); it is there for the worker's actions and the rest of the host. The repository provisions no host settings, so this is the record. To recreate it on a new host (idempotent: each file is made only when missing, and `swapon` and the `fstab` line are skipped when already in place):
+Swap on `headcrash` is two files, both in `/etc/fstab` with the default priority: `/swap.img` (8G) and `/swap2.img` (24G), root-owned, mode 0600, 32G in all. The hub never uses it (`MemorySwapMax=0`); it is there for the worker's actions and the rest of the host. The repository provisions no host settings, so this is the record. To recreate it on a new host (idempotent: each file is made only when missing, an existing non-swap file fails with a repair instruction rather than being registered, and `/etc/fstab` is updated only after `swapon` succeeds):
 
 ```sh
 add_swap() {
-  file=$1 size=$2
-  sudo test -e "$file" || { sudo fallocate -l "$size" "$file" && sudo chmod 600 "$file" && sudo mkswap "$file"; }
-  grep -q "^$file[[:space:]]" /etc/fstab || echo "$file none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null
-  swapon --show=NAME --noheadings | grep -qx "$file" || sudo swapon "$file"
+  local file=$1 size=$2
+  if sudo test -e "$file"; then
+    if [[ "$(sudo blkid -p -o value -s TYPE "$file" 2>/dev/null)" != "swap" ]]; then
+      echo "error: $file exists but is not a valid swap file; inspect and remove it (sudo rm -- '$file') before re-running" >&2
+      return 1
+    fi
+  else
+    sudo fallocate -l "$size" "$file" || return 1
+    sudo chmod 600 "$file" || return 1
+    sudo mkswap "$file" || return 1
+  fi
+  swapon --show=NAME --noheadings | grep -qxF "$file" || sudo swapon "$file" || return 1
+  awk -v f="$file" '$1 == f { found = 1 } END { exit !found }' /etc/fstab ||
+    echo "$file none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null || return 1
 }
-add_swap /swap.img 8G
-add_swap /swap2.img 24G
+add_swap /swap.img 8G && add_swap /swap2.img 24G
 ```
 
 ## Cutover

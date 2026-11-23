@@ -1,5 +1,5 @@
 [Unit]
-Description=NativeLink worker for Linux remote execution (hub on empiricist)
+Description=NativeLink worker for Linux remote execution (hub on this host)
 After=network-online.target
 
 [Service]

@@ -6,14 +6,13 @@
 #
 # This is a system unit because the textfile directory
 # (/var/lib/prometheus/node-exporter) is root-owned. The hub is a system unit
-# too (nativelink-macos-hub.service), so `systemctl show` needs no --user. ExecStart is an absolute
-# path because a system unit's %h is root's home. After=user@1000.service is
-# the hub user's systemd instance on this host (uid 1000).
+# too (nativelink-macos-hub.service), so `systemctl show` needs no --user.
+# ExecStart is an absolute path because a system unit's %h is root's home.
 #
 # It only reads. It never restarts the hub.
 [Unit]
 Description=Export NativeLink hub restart state to node_exporter textfile collector
-After=user@1000.service
+After=nativelink-macos-hub.service
 
 [Service]
 Type=oneshot
