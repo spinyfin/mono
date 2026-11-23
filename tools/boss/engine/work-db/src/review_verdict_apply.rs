@@ -1010,55 +1010,9 @@ pub fn advance_held_revision_after_verdict_in_tx(
     now: &str,
     require_gate_passing_verdict: bool,
 ) -> Result<()> {
-    // Candidate revision rows are sourced from the full review-cycle chain
-    // under `cycle_root_id`, not just its direct children: residual
-    // pre-flatten-migration rows can still nest a revision under another
-    // revision (see `get_chain_root_task` / `review_cycle_root_id`), and a
-    // direct `parent_task_id = cycle_root_id` predicate would exclude such a
-    // nested row before its contributed head could even be checked, leaving
-    // it stranded `active` even once its exact reviewed push lands. The
-    // `collect_chain_revision_ids_including_deleted` owns this downward walk:
-    // it intentionally traverses tombstoned intermediate revisions so a live
-    // descendant is still found, and shares the chain helper's 64-hop bound.
-    let mut revision_ids = super::chain_helpers::collect_chain_revision_ids_including_deleted(tx, cycle_root_id)?;
-    revision_ids.push(cycle_root_id.to_owned());
-    let placeholders = revision_ids
-        .iter()
-        .enumerate()
-        .map(|(index, _)| format!("?{}", index + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
     // Every revision held for this head: admission can point more than one
     // at it (see `review_batches::record_awaited_review_head_in_tx`).
-    let sql = format!(
-        "SELECT t.id
-         FROM tasks t
-         JOIN work_executions we ON we.id = (
-             SELECT latest.id FROM work_executions latest
-             WHERE latest.work_item_id = t.id
-               AND latest.kind = 'revision_implementation'
-               AND latest.status = 'completed'
-             ORDER BY latest.created_at DESC, latest.id DESC
-             LIMIT 1
-         )
-         WHERE t.id IN ({placeholders})
-           AND t.kind = 'revision'
-           AND t.status = 'active'
-           AND t.deleted_at IS NULL
-           AND we.kind = 'revision_implementation'
-           AND we.status = 'completed'
-           AND we.revision_stop_contributed_head = ?{}
-         ORDER BY t.id",
-        revision_ids.len() + 1,
-    );
-    let mut values: Vec<&dyn rusqlite::ToSql> = revision_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-    values.push(&target_sha);
-    let held: Vec<String> = {
-        let mut statement = tx.prepare(&sql)?;
-        statement
-            .query_map(values.as_slice(), |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    };
+    let held = super::held_revision_release::held_revision_ids_for_head_in_tx(tx, cycle_root_id, target_sha)?;
     for revision_id in held {
         let advanced = if require_gate_passing_verdict {
             WorkDb::advance_pending_review_task_to_in_review_with_verdict_source_in_tx(
@@ -1077,7 +1031,15 @@ pub fn advance_held_revision_after_verdict_in_tx(
             // Cleared with the release, in the same transaction, rather than
             // on a later pass of the deferred-admission sweep.
             super::resolve_attention_kind_in_tx(tx, &revision_id, super::PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND)?;
+            super::held_revision_release::resolve_unplaceable_attention_in_tx(tx, &revision_id)?;
         }
     }
-    Ok(())
+    // A revision no head was ever recorded for is not matched above, and
+    // would otherwise sit `active` with nothing saying why.
+    super::held_revision_release::report_unplaceable_held_revisions_in_tx(
+        tx,
+        cycle_root_id,
+        target_sha,
+        "review verdict applied",
+    )
 }

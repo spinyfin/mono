@@ -462,6 +462,15 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          `applying`, and resolves it itself on the pass that actually lands the verdict.",
     ),
     entry(
+        PR_REVIEW_HELD_REVISION_UNPLACEABLE_ATTENTION_KIND,
+        ClearedBy::ProducerReconciles,
+        "Review decisions are both the producer and the only thing that can release the revision: they \
+         file this when a verdict or failed batch settles a PR while a revision is still held `active` \
+         with no recorded contributed head, and resolve it themselves when the revision is released or \
+         review admission records the head it awaits. A later unrelated run start proves nothing about \
+         whether a review can find this revision.",
+    ),
+    entry(
         PR_REVIEW_ADMISSION_DEFERRED_ATTENTION_KIND,
         ClearedBy::ProducerReconciles,
         "Review admission resolves this item itself, for the cycle root and every revision held on \
