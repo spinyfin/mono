@@ -190,6 +190,23 @@ fn assert_never_failed(fx: &Fixture, execution_id: &str) {
     assert_eq!(fx.db.list_executions(None).unwrap().len(), 1, "no second execution");
 }
 
+fn assert_parked_never_failed(fx: &Fixture, parked: &[WorkExecution]) {
+    for execution in parked {
+        let row = fx.db.get_execution(&execution.id).unwrap();
+        assert!(!row.status.is_terminal(), "{row:?}");
+        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+    }
+}
+
+fn parked_without_charge(fx: &Fixture, execution_id: &str) -> bool {
+    fx.db
+        .get_execution(execution_id)
+        .unwrap()
+        .last_error
+        .as_deref()
+        .is_some_and(|err| err.contains("spoke lease unresolved"))
+}
+
 fn command_waiting(fx: &Fixture) -> bool {
     fx.provider.command_waits() >= 1
 }
@@ -1349,24 +1366,27 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         env.coordinator.kick();
         // Observe the first stored lease before any virtual time passes.
         // HOST_SLOTS is 1: the first attempt must park before the second
-        // persist can start. advancing paces virtual time so SQLite and
-        // gRPC still complete.
+        // persist can start. Advance only until that stored command parks,
+        // then hold the clock while the second persist runs so the 5s
+        // command deadline cannot overtake it.
         timing::condition(|| peer.commands().iter().any(is_lease)).await;
         timing::advancing(|| {
-            for execution in &parked {
-                let row = fx.db.get_execution(&execution.id).unwrap();
-                assert!(!row.status.is_terminal(), "{row:?}");
-                assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
-            }
+            assert_parked_never_failed(&fx, &parked);
+            parked_without_charge(&fx, &parked[0].id)
+        })
+        .await;
+        // The park arms a 100 ms retry kick. Expire it and kick so the
+        // second persist can start with the clock still held.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100) + TICK).await;
+        env.coordinator.kick();
+        timing::condition(|| {
+            assert_parked_never_failed(&fx, &parked);
             peer.commands().iter().filter(|c| is_lease(c)).count() >= 2
         })
         .await;
         timing::advancing(|| {
-            for execution in &parked {
-                let row = fx.db.get_execution(&execution.id).unwrap();
-                assert!(!row.status.is_terminal(), "{row:?}");
-                assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
-            }
+            assert_parked_never_failed(&fx, &parked);
             parked.iter().all(|e| attention_open(&fx, &e.id))
         })
         .await;
@@ -1375,7 +1395,10 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
         let third = triage(&fx, &env, "third");
         env.coordinator.kick();
-        timing::condition(|| {
+        // Placement on the second host answers immediately. Pace anyway so a
+        // park-delay timer on the held clock still fires if kick needs it.
+        timing::advancing(|| {
+            assert_parked_never_failed(&fx, &parked);
             other
                 .commands()
                 .iter()
@@ -1389,11 +1412,7 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
                 .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id),
             "the third execution must not spawn on the host whose leases are in doubt"
         );
-        for execution in &parked {
-            let row = fx.db.get_execution(&execution.id).unwrap();
-            assert!(!row.status.is_terminal(), "{row:?}");
-            assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
-        }
+        assert_parked_never_failed(&fx, &parked);
     })
     .await;
 }
