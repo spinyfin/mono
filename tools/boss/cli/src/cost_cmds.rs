@@ -91,6 +91,33 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
                 print_window_cost_report(&report, &tz)
             })
         }
+        CostCommand::Rows(args) => {
+            let (since_epoch_s, until_epoch_s) = resolve_window(&args.since, args.until.as_deref())?;
+            let response = client
+                .send_request(&FrontendRequest::GetTokenUsageRows(
+                    boss_protocol::TokenUsageRowsRequest {
+                        since_epoch_s,
+                        until_epoch_s,
+                        filters: args.filters.clone(),
+                        group_by: args.group_by.clone(),
+                        roll_up_revisions: !args.no_roll_up,
+                        estimate_usd: args.usd,
+                    },
+                ))
+                .await
+                .map_err(CliError::internal)?;
+            let report = match response {
+                FrontendEvent::TokenUsageRows { report } => report,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("cost rows", &other)),
+            };
+            let tz = resolve_display_tz(args.utc);
+            print_entity(ctx, &serde_json::json!({ "report": report }), || {
+                print_usage_rows_report(&report, args.depth, args.usd, &tz)
+            })
+        }
         CostCommand::Top(args) => {
             let (since_epoch_s, until_epoch_s) = resolve_window(&args.since, args.until.as_deref())?;
             let response = client
@@ -394,6 +421,278 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
     }
 }
 
+// ── `boss cost rows` ──────────────────────────────────────────────────
+
+fn print_usage_rows_report(report: &boss_protocol::TokenUsageRowsReport, depth: UsageDepth, usd: bool, tz: &DisplayTz) {
+    println!(
+        "Token usage from {} to {} ({})",
+        format_epoch(report.since_epoch_s, tz),
+        format_epoch(report.until_epoch_s, tz),
+        tz.label,
+    );
+    if report.spans_capture_boundary {
+        println!();
+        println!(
+            "  WARNING: this window starts before per-run token capture began ({}). Runs before that \
+             instant have no recorded tokens and are excluded from every total below — these figures \
+             are a FLOOR on the window's real spend, not a complete total.",
+            format_epoch(report.capture_start_epoch_s, tz),
+        );
+    } else if report.overall.runs_unmeasured > 0 {
+        println!();
+        println!(
+            "  WARNING: {} run(s) in this window have no recorded tokens and are excluded from every \
+             total below — these figures are a FLOOR on the window's real spend, not a complete total.",
+            report.overall.runs_unmeasured,
+        );
+    }
+    if report.truncated {
+        println!();
+        println!(
+            "  WARNING: more than {} runs matched; only the most recent {} are shown. Narrow --since or add --filter to see the rest.",
+            report.run_cap, report.run_cap,
+        );
+    }
+    println!();
+    print_measurement_summary(&report.overall);
+    print_usage_coverage(&report.coverage);
+    print_pricing_gaps(&report.pricing_gaps);
+
+    if report.group_by.is_empty() {
+        println!();
+        print_usage_tree(&report.tasks, &report.taskless, depth, usd);
+    } else {
+        let levels: Vec<String> = report.group_by.iter().map(|dimension| dimension.to_string()).collect();
+        println!();
+        println!("Grouped by {}.", levels.join(" › "));
+        print_usage_groups(&report.groups, depth, usd, 0);
+    }
+    if usd {
+        println!();
+        println!("  USD figures: (ESTIMATE, not billing truth)");
+    }
+}
+
+fn print_usage_coverage(coverage: &boss_protocol::UsageCoverage) {
+    println!(
+        "  Coverage: {} complete, {} partial (some token classes unreported), {} recorded zero, {} unmeasured (unknown, not counted as zero)",
+        coverage.runs_complete, coverage.runs_partial, coverage.runs_zero, coverage.runs_unmeasured,
+    );
+    if let Some(priceable) = coverage.runs_priceable {
+        println!("  USD estimate covers {priceable} of {} run(s)", coverage.runs_total);
+    }
+    if !coverage.by_caveat.is_empty() {
+        let counted: Vec<String> = coverage
+            .by_caveat
+            .iter()
+            .map(|caveat| format!("{} ×{}", caveat.code, caveat.runs))
+            .collect();
+        println!("  Caveats: {}", counted.join(", "));
+    }
+    for note in &coverage.notes {
+        println!("  NOTE ({}): {}", note.code, note.detail);
+    }
+}
+
+fn print_usage_groups(groups: &[boss_protocol::UsageGroup], depth: UsageDepth, usd: bool, level: usize) {
+    for group in groups {
+        let Some(key) = group.key.last() else { continue };
+        println!();
+        println!(
+            "{}{}: {} — {}, {}/{} runs measured",
+            "  ".repeat(level),
+            key.dimension,
+            key.label,
+            format_measurement_tokens(&group.measurement),
+            group.measurement.runs_measured,
+            group.measurement.runs_total,
+        );
+        if group.subgroups.is_empty() {
+            print_usage_tree(&group.tasks, &group.taskless, depth, usd);
+        } else {
+            print_usage_groups(&group.subgroups, depth, usd, level + 1);
+        }
+    }
+}
+
+fn print_usage_tree(
+    tasks: &[boss_protocol::TaskUsageNode],
+    taskless: &[boss_protocol::ExecutionUsageNode],
+    depth: UsageDepth,
+    usd: bool,
+) {
+    let rows = usage_tree_rows(tasks, taskless, depth, usd);
+    if rows.is_empty() {
+        println!("  (no runs)");
+        return;
+    }
+    let mut headers = vec!["NAME", "KIND", "DRIVER", "MODEL", "STATUS", "TOKENS", "RUNS", "CAVEATS"];
+    if usd {
+        headers.push("USD (EST)");
+    }
+    let mut table = new_dynamic_table(headers);
+    for row in rows {
+        table.add_row(row);
+    }
+    print_table(table);
+}
+
+const NOT_RECORDED: &str = "not recorded";
+
+/// A priced run that costs under half a cent must not print as `$0.00`, which
+/// reads as "free"; only an unpriceable run prints a dash.
+fn format_usd_estimate(usd: f64) -> String {
+    if usd > 0.0 && usd < 0.005 {
+        "<$0.01".to_owned()
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// One printable line per node, down to `depth`. A task shows its own
+/// (direct) tokens and, on a chain root with revisions, the chain's inclusive
+/// total beside it; list-level totals elsewhere count direct only.
+fn usage_tree_rows(
+    tasks: &[boss_protocol::TaskUsageNode],
+    taskless: &[boss_protocol::ExecutionUsageNode],
+    depth: UsageDepth,
+    usd: bool,
+) -> Vec<Vec<String>> {
+    fn usd_cell(value: Option<f64>, partial: bool) -> String {
+        match value {
+            Some(usd) if partial => format!("{} (partial)", format_usd_estimate(usd)),
+            Some(usd) => format_usd_estimate(usd),
+            None => "—".to_owned(),
+        }
+    }
+
+    fn push_task(
+        rows: &mut Vec<Vec<String>>,
+        task: &boss_protocol::TaskUsageNode,
+        nested: bool,
+        depth: UsageDepth,
+        usd: bool,
+    ) {
+        let label = boss_protocol::short_id_label(task.short_id).unwrap_or_else(|| task.task_id.clone());
+        let name = format!("{}{label}: {}", if nested { "  ↳ " } else { "" }, task.name);
+        // A chain root that owns no run in this slice has nothing of its own
+        // to count: a dash, not a zero.
+        let mut tokens = if task.direct.runs_total == 0 {
+            "—".to_owned()
+        } else {
+            format_measurement_tokens(&task.direct)
+        };
+        if let Some(inclusive) = task.inclusive.as_ref().filter(|_| !task.revisions.is_empty()) {
+            tokens = format!("{tokens} ({} incl. revisions)", format_measurement_tokens(inclusive));
+        }
+        let mut runs = format!("{}/{}", task.direct.runs_measured, task.direct.runs_total);
+        if task.runs_outside_window > 0 {
+            runs.push_str(&format!(" (+{} outside window)", task.runs_outside_window));
+        }
+        let mut row = vec![
+            name,
+            task.kind.clone(),
+            String::new(),
+            String::new(),
+            task.status.clone(),
+            tokens,
+            runs,
+            String::new(),
+        ];
+        if usd {
+            row.push(usd_cell(task.direct.estimated_usd, task.direct.estimated_usd_partial));
+        }
+        rows.push(row);
+        if depth != UsageDepth::Task {
+            for execution in &task.executions {
+                push_execution(rows, execution, "    ", depth, usd);
+            }
+        }
+        for revision in &task.revisions {
+            push_task(rows, revision, true, depth, usd);
+        }
+    }
+
+    fn push_execution(
+        rows: &mut Vec<Vec<String>>,
+        execution: &boss_protocol::ExecutionUsageNode,
+        indent: &str,
+        depth: UsageDepth,
+        usd: bool,
+    ) {
+        let mut row = vec![
+            format!("{indent}{} ({})", execution.kind, execution.spend_class.as_str()),
+            String::new(),
+            execution.driver.clone().unwrap_or_else(|| NOT_RECORDED.to_owned()),
+            execution.model_launched.clone().unwrap_or_else(|| "—".to_owned()),
+            execution.status.clone(),
+            format_measurement_tokens(&execution.measurement),
+            format!(
+                "{}/{}",
+                execution.measurement.runs_measured, execution.measurement.runs_total
+            ),
+            String::new(),
+        ];
+        if usd {
+            row.push(usd_cell(
+                execution.measurement.estimated_usd,
+                execution.measurement.estimated_usd_partial,
+            ));
+        }
+        rows.push(row);
+        if depth == UsageDepth::Run {
+            for run in &execution.runs {
+                let tokens = match run.total_tokens {
+                    Some(total) => format_token_total(total, run.coverage == boss_protocol::RunCoverage::Partial),
+                    None => "unknown".to_owned(),
+                };
+                let caveats: Vec<&str> = run.caveats.iter().map(|caveat| caveat.code.as_str()).collect();
+                let mut row = vec![
+                    format!("{indent}  run {}", run.run_id),
+                    String::new(),
+                    String::new(),
+                    run.model_observed.clone().unwrap_or_else(|| "—".to_owned()),
+                    run.status.clone(),
+                    tokens,
+                    run.coverage.as_str().to_owned(),
+                    caveats.join(","),
+                ];
+                if usd {
+                    row.push(match (run.estimated_usd, run.unpriceable_cause.as_deref()) {
+                        (Some(value), _) => format_usd_estimate(value),
+                        (None, Some(cause)) => format!("— ({cause})"),
+                        (None, None) => "—".to_owned(),
+                    });
+                }
+                rows.push(row);
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    for task in tasks {
+        push_task(&mut rows, task, false, depth, usd);
+    }
+    for execution in taskless {
+        let mut row = vec![
+            format!("(no task) {}", execution.work_item_id),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
+        if usd {
+            row.push(String::new());
+        }
+        rows.push(row);
+        push_execution(&mut rows, execution, "  ", depth, usd);
+    }
+    rows
+}
+
 fn format_optional_tokens(value: Option<i64>) -> String {
     value.map(format_tokens).unwrap_or_else(|| "unknown".into())
 }
@@ -444,6 +743,199 @@ mod tests {
     fn resolve_window_rejects_empty_or_reversed_ranges() {
         let err = resolve_window("0h", Some("0h")).unwrap_err();
         assert!(err.to_string().contains("--until must be after --since"));
+    }
+
+    #[test]
+    fn parse_usage_filter_accepts_dimension_and_values() {
+        let filter = parse_usage_filter("driver=claude, codex").unwrap();
+        assert_eq!(filter.dimension, boss_protocol::UsageDimension::Driver);
+        assert_eq!(filter.values, ["claude", "codex"]);
+        assert!(parse_usage_filter("driver").unwrap_err().contains("DIMENSION=VALUE"));
+        assert!(
+            parse_usage_filter("driver=")
+                .unwrap_err()
+                .contains("at least one value")
+        );
+        assert!(
+            parse_usage_filter("flavour=x")
+                .unwrap_err()
+                .contains("unknown usage dimension")
+        );
+    }
+
+    fn measurement(runs_total: u32, runs_measured: u32, total_tokens: i64) -> CostMeasurement {
+        CostMeasurement::builder()
+            .agent_active_ms(0)
+            .estimated_usd_partial(false)
+            .runs_measured(runs_measured)
+            .runs_total(runs_total)
+            .runs_unmeasured(runs_total - runs_measured)
+            .runs_zero(0)
+            .total_tokens(total_tokens)
+            .maybe_input_tokens((runs_measured > 0).then_some(total_tokens))
+            .build()
+    }
+
+    fn usage_run(
+        id: &str,
+        coverage: boss_protocol::RunCoverage,
+        total: Option<i64>,
+        caveat: &str,
+    ) -> boss_protocol::RunUsageRow {
+        boss_protocol::RunUsageRow::builder()
+            .run_id(id)
+            .coverage(coverage)
+            .created_at_epoch_s(1)
+            .host_id("local")
+            .input_convention(boss_protocol::InputConvention::Net)
+            .status("completed")
+            .caveats(vec![boss_protocol::UsageCaveat {
+                code: caveat.to_owned(),
+                detail: None,
+            }])
+            .maybe_total_tokens(total)
+            .build()
+    }
+
+    fn usage_execution(
+        runs: Vec<boss_protocol::RunUsageRow>,
+        driver: Option<&str>,
+    ) -> boss_protocol::ExecutionUsageNode {
+        boss_protocol::ExecutionUsageNode::builder()
+            .execution_id("exec_1")
+            .work_item_id("task_1")
+            .created_at_epoch_s(1)
+            .driver_source(boss_protocol::DriverSource::LaunchTuple)
+            .kind("chore_implementation")
+            .measurement(measurement(runs.len() as u32, 1, 40))
+            .spend_class(boss_protocol::SpendClass::Implementation)
+            .status("completed")
+            .runs(runs)
+            .maybe_driver(driver.map(str::to_owned))
+            .build()
+    }
+
+    fn usage_task(
+        id: &str,
+        short_id: i64,
+        revisions: Vec<boss_protocol::TaskUsageNode>,
+    ) -> boss_protocol::TaskUsageNode {
+        let chain = !revisions.is_empty();
+        boss_protocol::TaskUsageNode::builder()
+            .task_id(id)
+            .chain_root_id(id)
+            .direct(measurement(2, 1, 40))
+            .is_chain_root(true)
+            .kind("chore")
+            .name("Fix cursor flicker")
+            .product_id("prod_1")
+            .runs_outside_window(3)
+            .status("done")
+            .executions(vec![usage_execution(
+                vec![
+                    usage_run(
+                        "run_known",
+                        boss_protocol::RunCoverage::Partial,
+                        Some(40),
+                        "tokens_partial",
+                    ),
+                    usage_run(
+                        "run_unknown",
+                        boss_protocol::RunCoverage::Unmeasured,
+                        None,
+                        "pre_capture",
+                    ),
+                ],
+                None,
+            )])
+            .revisions(revisions)
+            .maybe_inclusive(chain.then(|| measurement(3, 2, 70)))
+            .short_id(short_id)
+            .build()
+    }
+
+    #[test]
+    fn usage_rows_show_unknown_never_zero_and_the_chain_total_beside_direct() {
+        let revision = usage_task("task_rev", 8, Vec::new());
+        let root = usage_task("task_root", 7, vec![revision]);
+        let rows = usage_tree_rows(&[root], &[], UsageDepth::Run, false);
+        let cells: Vec<String> = rows.iter().map(|row| row.join(" | ")).collect();
+
+        // Task row: direct tokens, the chain's inclusive total, and the runs outside the window.
+        assert!(
+            cells[0].contains("40") && cells[0].contains("(70 incl. revisions)"),
+            "{}",
+            cells[0]
+        );
+        assert!(cells[0].contains("1/2 (+3 outside window)"), "{}", cells[0]);
+        // The execution has no recorded driver: it says so rather than guessing.
+        assert!(cells[1].contains("not recorded"), "{}", cells[1]);
+        // A partial run's total is a floor; an unmeasured run is unknown and never 0.
+        assert!(
+            cells[2].contains("40 (partial)") && cells[2].contains("tokens_partial"),
+            "{}",
+            cells[2]
+        );
+        assert!(
+            cells[3].contains("unknown") && cells[3].contains("pre_capture"),
+            "{}",
+            cells[3]
+        );
+        assert!(!cells[3].contains("| 0 |"), "{}", cells[3]);
+        // The revision nests under its root.
+        assert!(cells[4].contains("↳") && cells[4].contains("T8"), "{}", cells[4]);
+    }
+
+    #[test]
+    fn a_chain_root_with_no_runs_of_its_own_prints_a_dash_not_zero() {
+        let mut root = usage_task("task_root", 7, vec![usage_task("task_rev", 8, Vec::new())]);
+        root.direct = measurement(0, 0, 0);
+        root.executions.clear();
+        let rows = usage_tree_rows(&[root], &[], UsageDepth::Task, false);
+        assert!(
+            rows[0][5].starts_with("—") && rows[0][5].contains("incl. revisions"),
+            "{:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn usage_rows_stop_at_the_requested_depth_and_label_taskless_executions() {
+        let taskless = usage_execution(
+            vec![usage_run(
+                "run_guide",
+                boss_protocol::RunCoverage::Measured,
+                Some(5),
+                "gross_input",
+            )],
+            Some("codex"),
+        );
+        let at_task = usage_tree_rows(&[usage_task("task_a", 1, Vec::new())], &[], UsageDepth::Task, false);
+        assert_eq!(at_task.len(), 1);
+        let at_execution = usage_tree_rows(
+            &[usage_task("task_a", 1, Vec::new())],
+            std::slice::from_ref(&taskless),
+            UsageDepth::Execution,
+            false,
+        );
+        assert_eq!(
+            at_execution.len(),
+            4,
+            "task, its execution, the no-task header, that execution"
+        );
+        assert!(
+            at_execution[2][0].starts_with("(no task) task_1"),
+            "{:?}",
+            at_execution[2]
+        );
+        assert!(!at_execution.iter().any(|row| row[0].contains("run ")));
+    }
+
+    #[test]
+    fn a_tiny_priced_run_never_prints_as_zero_dollars() {
+        assert_eq!(format_usd_estimate(0.0018), "<$0.01");
+        assert_eq!(format_usd_estimate(0.0), "$0.00", "only a priced zero prints as zero");
+        assert_eq!(format_usd_estimate(15.54366), "$15.54");
     }
 
     #[test]

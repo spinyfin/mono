@@ -46,6 +46,7 @@ rust_library(
         "//tools/boss/engine/review-guide",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/usage-report",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/work-navigator",
         "//tools/boss/engine/write-batch",
@@ -100,6 +101,7 @@ rust_library(
         "//tools/boss/engine/review-guide",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/usage-report",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/work-navigator",
         "//tools/boss/engine/write-batch",
@@ -120,10 +122,14 @@ rust_test(
     # the 300s moderate budget on loaded CI agents.
     timeout = "long",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = ["//tools/boss/app-macos:work_board_banners_swift"],
+    compile_data = [
+        "//tools/boss/app-macos:work_board_banners_swift",
+        "//tools/boss/engine/usage-report:token_usage_seed_sql",
+    ],
     crate_root = "src/lib.rs",
     data = [
         "//tools/boss/app-macos:work_board_banners_swift",
+        "//tools/boss/engine/usage-report:token_usage_seed_sql",
         "@jj_test_tools//:jj",
     ] + glob(["src/**/*.rs"]),
     edition = "2024",
@@ -135,7 +141,10 @@ rust_test(
         proc_macro = True,
         proc_macro_dev = True,
     ),
-    rustc_env = {"BOSS_WORK_BOARD_BANNERS_SWIFT": "$(execpath //tools/boss/app-macos:work_board_banners_swift)"},
+    rustc_env = {
+        "BOSS_WORK_BOARD_BANNERS_SWIFT": "$(execpath //tools/boss/app-macos:work_board_banners_swift)",
+        "BOSS_USAGE_SEED_SQL": "$(execpath //tools/boss/engine/usage-report:token_usage_seed_sql)",
+    },
     deps = [
         "//lib/rust/git_utils",
         "//tools/boss/comment_anchor",
@@ -157,6 +166,7 @@ rust_test(
         "//tools/boss/engine/review-guide",
         "//tools/boss/engine/storage-values",
         "//tools/boss/engine/task-scope",
+        "//tools/boss/engine/usage-report",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/work-navigator",
         "//tools/boss/engine/write-batch",

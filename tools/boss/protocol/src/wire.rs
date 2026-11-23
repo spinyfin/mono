@@ -1032,6 +1032,12 @@ pub enum FrontendRequest {
         work_item_id: String,
     },
 
+    /// Run-grain token usage for a time window as a task → execution → run tree
+    /// with every figure computed by the engine. Read-only; backs `boss cost
+    /// rows` and the Token Usage window. The fields sit flat beside `type`; see
+    /// [`crate::TokenUsageRowsRequest`]. Replies with [`FrontendEvent::TokenUsageRows`].
+    GetTokenUsageRows(crate::TokenUsageRowsRequest),
+
     /// The highest-token-cost runs recorded in `[since_epoch_s,
     /// until_epoch_s)`, ranked descending by total tokens. Read-only;
     /// backs `boss cost top`. Replies with

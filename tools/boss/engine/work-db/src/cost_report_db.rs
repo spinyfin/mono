@@ -2,10 +2,17 @@
 //! against their owning execution and task) into [`boss_engine_storage_values::CostRunRecord`].
 //! All grouping, ranking, and pricing stays in `boss_engine::cost_report`;
 //! this file's only job is the flat row fetch.
+//!
+//! [`WorkDb::usage_records_for_window`] is the same fetch widened for the
+//! usage rows request: every execution is kept (a left join to `tasks`, so the
+//! kinds that have no task row are not silently dropped), plus the launch
+//! tuple, timestamps and chain roots that request groups by. The builders
+//! live in `boss_usage_report`; this file still only fetches.
 
 use super::*;
 
 use boss_engine_storage_values::CostRunRecord;
+use boss_usage_report::{UsageRunRecord, UsageTaskRecord, UsageWindowRecords};
 
 const COST_RECORD_COLUMNS: &str = "
     wr.id,
@@ -52,6 +59,134 @@ fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
         started_at_epoch_s: row.get(17)?,
         driver: row.get(18)?,
         usage_unavailable: row.get(19)?,
+    })
+}
+
+/// Migration id for [`USAGE_WINDOW_INDEX_SQL`].
+pub(super) const USAGE_WINDOW_INDEX_MIGRATION_ID: &str = "20261123_1830_work_runs_created_at_epoch_idx";
+
+/// Lets the window predicate below seek `work_runs` by creation time. Nothing
+/// else indexes `work_runs.created_at`, so a window of a week would otherwise
+/// read the whole table. The index is on the expression the predicate uses
+/// (`created_at` is stored as epoch-second text) so SQLite can match them;
+/// `IF NOT EXISTS` makes the migration a no-op when another change has
+/// already added an equivalent index under this name.
+pub(super) const USAGE_WINDOW_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS work_runs_created_at_epoch_idx ON work_runs(CAST(created_at AS INTEGER))";
+
+pub(super) fn migrate_usage_window_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch(USAGE_WINDOW_INDEX_SQL)?;
+    Ok(())
+}
+
+/// Run, execution and launch-tuple columns of [`UsageRunRecord`], in field
+/// order of [`map_usage_run_record`]. Timestamps are cast in the projection
+/// only, so the `WHERE` below matches the index expression.
+const USAGE_RUN_COLUMNS: &str = "
+    wr.id,
+    wr.status,
+    CAST(wr.created_at AS INTEGER),
+    wr.host_id,
+    we.id,
+    we.work_item_id,
+    we.kind,
+    we.status,
+    CAST(we.created_at AS INTEGER),
+    CAST(wr.started_at AS INTEGER),
+    CAST(wr.finished_at AS INTEGER),
+    wr.rounds,
+    wr.agent_active_ms,
+    wr.model,
+    wr.input_tokens,
+    wr.output_tokens,
+    wr.cache_creation_tokens,
+    wr.cache_creation_5m_tokens,
+    wr.cache_creation_1h_tokens,
+    wr.cache_read_tokens,
+    wr.usage_unavailable,
+    CAST(we.started_at AS INTEGER),
+    CAST(we.finished_at AS INTEGER),
+    we.pr_url,
+    we.host_id,
+    we.driver,
+    we.model,
+    we.effort_level
+";
+
+fn map_usage_run_record(row: &Row) -> rusqlite::Result<UsageRunRecord> {
+    Ok(UsageRunRecord {
+        run_id: row.get(0)?,
+        run_status: row.get(1)?,
+        run_created_at_epoch_s: row.get(2)?,
+        run_host_id: row.get(3)?,
+        execution_id: row.get(4)?,
+        work_item_id: row.get(5)?,
+        execution_kind: row.get(6)?,
+        execution_status: row.get(7)?,
+        execution_created_at_epoch_s: row.get(8)?,
+        run_started_at_epoch_s: row.get(9)?,
+        run_finished_at_epoch_s: row.get(10)?,
+        rounds: row.get(11)?,
+        agent_active_ms: row.get(12)?,
+        run_model: row.get(13)?,
+        input_tokens: row.get(14)?,
+        output_tokens: row.get(15)?,
+        cache_creation_tokens: row.get(16)?,
+        cache_creation_5m_tokens: row.get(17)?,
+        cache_creation_1h_tokens: row.get(18)?,
+        cache_read_tokens: row.get(19)?,
+        usage_unavailable: row.get(20)?,
+        execution_started_at_epoch_s: row.get(21)?,
+        execution_finished_at_epoch_s: row.get(22)?,
+        execution_pr_url: row.get(23)?,
+        execution_host_id: row.get(24)?,
+        driver: row.get(25)?,
+        execution_model: row.get(26)?,
+        execution_effort: row.get(27)?,
+    })
+}
+
+/// Task columns of [`UsageTaskRecord`] in field order of [`map_usage_task_record`],
+/// ending with the task's all-time run count.
+const USAGE_TASK_COLUMNS: &str = "
+    t.id,
+    t.name,
+    t.kind,
+    t.status,
+    t.product_id,
+    t.short_id,
+    p.name,
+    t.project_id,
+    pr.name,
+    t.pr_url,
+    CAST(t.completed_at AS INTEGER),
+    t.reasoning,
+    t.effort_level,
+    (SELECT COUNT(*)
+       FROM work_executions we
+       JOIN work_runs wr ON wr.execution_id = we.id
+      WHERE we.work_item_id = t.id)
+";
+
+fn map_usage_task_record(row: &Row, roots: &HashMap<String, String>) -> rusqlite::Result<UsageTaskRecord> {
+    let task_id: String = row.get(0)?;
+    let chain_root_id = roots.get(&task_id).cloned().unwrap_or_else(|| task_id.clone());
+    Ok(UsageTaskRecord {
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        status: row.get(3)?,
+        product_id: row.get(4)?,
+        chain_root_id,
+        run_count_all_time: row.get(13)?,
+        short_id: row.get(5)?,
+        product_name: row.get(6)?,
+        project_id: row.get(7)?,
+        project_name: row.get(8)?,
+        pr_url: row.get(9)?,
+        completed_at_epoch_s: row.get(10)?,
+        reasoning: row.get(11)?,
+        effort_level: row.get(12)?,
+        task_id,
     })
 }
 
@@ -138,6 +273,56 @@ impl WorkDb {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Every `work_runs` row created in `[since_epoch_s, until_epoch_s)`
+    /// with its execution, launch tuple and task context, for the usage rows
+    /// request. Executions whose work item has no `tasks` row (answer agent,
+    /// review guide, automation triage) are kept; the task list simply has no
+    /// entry for them. The task list carries each referenced task plus its
+    /// chain root, so a root with no run of its own in the window is available
+    /// to nest its revisions under. Chain roots come from the same walk the
+    /// rest of the engine uses. All of it is read in one snapshot.
+    pub fn usage_records_for_window(&self, since_epoch_s: i64, until_epoch_s: i64) -> Result<UsageWindowRecords> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let sql = format!(
+            "SELECT {USAGE_RUN_COLUMNS}
+             FROM work_runs wr
+             JOIN work_executions we ON we.id = wr.execution_id
+             WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
+             ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+        );
+        let runs = tx
+            .prepare(&sql)?
+            .query_map(params![since_epoch_s, until_epoch_s], map_usage_run_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut work_item_ids: Vec<&str> = runs.iter().map(|run| run.work_item_id.as_str()).collect();
+        work_item_ids.sort_unstable();
+        work_item_ids.dedup();
+        let roots = chain_helpers::chain_roots(&tx, &work_item_ids)?;
+        let mut task_ids: Vec<&str> = work_item_ids.clone();
+        task_ids.extend(roots.values().map(String::as_str));
+        task_ids.sort_unstable();
+        task_ids.dedup();
+
+        let sql = format!(
+            "SELECT {USAGE_TASK_COLUMNS}
+             FROM tasks t
+             LEFT JOIN products p ON p.id = t.product_id
+             LEFT JOIN projects pr ON pr.id = t.project_id
+             WHERE t.id IN (SELECT value FROM json_each(?1))
+             ORDER BY t.id"
+        );
+        let tasks = tx
+            .prepare(&sql)?
+            .query_map([query_ensure::id_array(&task_ids)], |row| {
+                map_usage_task_record(row, &roots)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(UsageWindowRecords { runs, tasks })
     }
 
     /// Every `work_runs` row created in `[since_epoch_s, until_epoch_s)`,
@@ -438,5 +623,260 @@ mod tests {
             .cost_records_for_window(created_at + 1, created_at + 100)
             .expect("query succeeds");
         assert!(outside.is_empty());
+    }
+    // ── usage rows projection ─────────────────────────────────────────────
+
+    fn insert_task(conn: &Connection, id: &str, product_id: &str, kind: &str, parent: Option<&str>) {
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, kind, name, status, created_at, updated_at, parent_task_id)
+             VALUES (?1, ?2, ?3, ?1, 'done', '1', '1', ?4)",
+            params![id, product_id, kind, parent],
+        )
+        .unwrap();
+    }
+
+    fn insert_run(conn: &Connection, run_id: &str, execution_id: &str, work_item_id: &str, kind: &str, created: i64) {
+        conn.execute(
+            "INSERT INTO work_executions (id, work_item_id, kind, status, repo_remote_url, created_at, driver)
+             VALUES (?1, ?2, ?3, 'completed', 'https://example.test/repo', ?4, 'claude')",
+            params![execution_id, work_item_id, kind, created.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, input_tokens, output_tokens)
+             VALUES (?1, ?2, 'worker', 'completed', ?3, 5, 7)",
+            params![run_id, execution_id, created.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn usage_records_keep_taskless_executions_and_carry_every_chain_root() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "root", &product_id, "chore", None);
+        insert_task(&conn, "rev_a", &product_id, "revision", Some("root"));
+        // Legacy nesting: a revision parented to a revision still resolves to the root.
+        insert_task(&conn, "rev_b", &product_id, "revision", Some("rev_a"));
+        insert_run(
+            &conn,
+            "run_root_old",
+            "exec_root_old",
+            "root",
+            "chore_implementation",
+            100,
+        );
+        insert_run(
+            &conn,
+            "run_rev_b",
+            "exec_rev_b",
+            "rev_b",
+            "revision_implementation",
+            2_000,
+        );
+        insert_run(
+            &conn,
+            "run_guide",
+            "exec_guide",
+            "comparison_1",
+            "pr_review_guide",
+            2_001,
+        );
+        drop(conn);
+
+        let records = db.usage_records_for_window(1_000, 3_000).unwrap();
+        let run_ids: Vec<&str> = records.runs.iter().map(|run| run.run_id.as_str()).collect();
+        assert_eq!(run_ids, ["run_rev_b", "run_guide"], "the old run is outside the window");
+
+        let guide = records.runs.iter().find(|run| run.run_id == "run_guide").unwrap();
+        assert_eq!(guide.work_item_id, "comparison_1");
+        assert_eq!(guide.driver.as_deref(), Some("claude"));
+        assert_eq!(guide.input_tokens, Some(5));
+        assert_eq!(guide.cache_creation_tokens, None, "an unset class stays NULL");
+
+        let task_ids: Vec<&str> = records.tasks.iter().map(|task| task.task_id.as_str()).collect();
+        assert_eq!(
+            task_ids,
+            ["rev_b", "root"],
+            "the revision's task and its chain root, and nothing for the taskless execution"
+        );
+        let rev = records.tasks.iter().find(|task| task.task_id == "rev_b").unwrap();
+        assert_eq!(rev.chain_root_id, "root");
+        let root = records.tasks.iter().find(|task| task.task_id == "root").unwrap();
+        assert_eq!(root.chain_root_id, "root");
+        assert_eq!(
+            root.run_count_all_time, 1,
+            "the root's run is outside the window but counted"
+        );
+        assert_eq!(rev.run_count_all_time, 1);
+    }
+
+    #[test]
+    fn usage_window_is_half_open_on_run_creation() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let conn = db.connect().unwrap();
+        insert_task(&conn, "t", &product_id, "chore", None);
+        insert_run(&conn, "at_since", "e1", "t", "chore_implementation", 1_000);
+        insert_run(&conn, "at_until", "e2", "t", "chore_implementation", 2_000);
+        drop(conn);
+        let records = db.usage_records_for_window(1_000, 2_000).unwrap();
+        assert_eq!(records.runs.len(), 1);
+        assert_eq!(records.runs[0].run_id, "at_since");
+    }
+
+    #[test]
+    fn the_window_predicate_seeks_the_created_at_index() {
+        let (_dir, db) = open_db();
+        let conn = db.connect().unwrap();
+        let plan: String = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT {USAGE_RUN_COLUMNS}
+                 FROM work_runs wr JOIN work_executions we ON we.id = wr.execution_id
+                 WHERE CAST(wr.created_at AS INTEGER) >= 1 AND CAST(wr.created_at AS INTEGER) < 2"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("work_runs_created_at_epoch_idx"),
+            "the window read must use the expression index, plan was:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn a_database_without_the_created_at_index_gains_it_on_open() {
+        let (dir, db) = open_db();
+        let path = db.path().to_path_buf();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute_batch(&format!(
+                "DROP INDEX work_runs_created_at_epoch_idx;
+                 DELETE FROM schema_migrations WHERE id = '{USAGE_WINDOW_INDEX_MIGRATION_ID}';"
+            ))
+            .unwrap();
+        }
+        drop(db);
+        let upgraded = crate::WorkDb::open(path).unwrap();
+        let conn = upgraded.connect().unwrap();
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'work_runs_created_at_epoch_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "opening an older database must add the index");
+        drop(dir);
+    }
+
+    /// The seed fixture is the only way an isolated engine gets usage to show,
+    /// so it must keep applying to the current schema and keep covering every
+    /// case the usage rows request has to render.
+    #[test]
+    fn the_seed_fixture_applies_and_covers_every_driver_and_coverage_state() {
+        use boss_protocol::{RunCoverage, UsageDimension};
+        use boss_usage_report::{UsageRowsQuery, build_usage_rows_report, cause, caveat};
+
+        let (_dir, db) = open_db();
+        db.connect()
+            .unwrap()
+            .execute_batch(include_str!(env!("BOSS_USAGE_SEED_SQL")))
+            .expect("the seed fixture applies to a freshly migrated database");
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let records = db.usage_records_for_window(0, now + 86_400).unwrap();
+        assert_eq!(records.runs.len(), 19);
+
+        let query = |since: i64| {
+            UsageRowsQuery::builder()
+                .since_epoch_s(since)
+                .until_epoch_s(now + 86_400)
+                .generated_at_epoch_s(now)
+                .capture_start_epoch_s(1_785_144_180)
+                .retention_max_age_secs(14 * 86_400)
+                .build()
+        };
+        let priced = |model: &str, _tokens: boss_usage_report::PricedTokens| model.contains("claude").then_some(1.0);
+        let report = build_usage_rows_report(&query(0), &records, Some(&priced));
+
+        let coverage = &report.coverage;
+        assert_eq!(
+            (
+                coverage.runs_total,
+                coverage.runs_complete,
+                coverage.runs_partial,
+                coverage.runs_zero,
+                coverage.runs_unmeasured
+            ),
+            (19, 14, 2, 1, 2)
+        );
+        assert_eq!(
+            report.taskless.len(),
+            3,
+            "answer agent, review guide and automation triage"
+        );
+        let drivers = report
+            .dimension_values
+            .iter()
+            .find(|d| d.dimension == UsageDimension::Driver)
+            .unwrap();
+        let driver_values: Vec<&str> = drivers.values.iter().map(|v| v.value.as_str()).collect();
+        for expected in ["claude", "codex", "grok", "agy", "(none)"] {
+            assert!(
+                driver_values.contains(&expected),
+                "{expected} missing from {driver_values:?}"
+            );
+        }
+        let count = |code: &str| coverage.by_caveat.iter().find(|c| c.code == code).map_or(0, |c| c.runs);
+        for code in [
+            caveat::PRE_CAPTURE,
+            caveat::DRIVER_NOT_RECORDED,
+            caveat::GROSS_INPUT,
+            caveat::SUBAGENTS_EXCLUDED,
+            caveat::SYNTHETIC_MODEL,
+            caveat::MODEL_FROM_LAUNCH_TUPLE,
+            caveat::TOKENS_PARTIAL,
+            caveat::USAGE_UNAVAILABLE,
+        ] {
+            assert!(count(code) > 0, "the seed has no run with caveat {code}");
+        }
+        assert!(report.spans_capture_boundary);
+        assert!(report.overall.runs_unmeasured == 2 && report.overall.runs_zero == 1);
+
+        // Grok and Antigravity: measured but partial, and never priced even
+        // though the Antigravity model name is one an API table could match.
+        let all_runs: Vec<_> = report
+            .tasks
+            .iter()
+            .flat_map(|t| std::iter::once(t).chain(t.revisions.iter()))
+            .flat_map(|t| t.executions.iter())
+            .flat_map(|e| e.runs.iter().map(move |r| (e.driver.as_deref(), r)))
+            .collect();
+        for driver in ["grok", "agy"] {
+            let (_, run) = all_runs
+                .iter()
+                .find(|(d, r)| *d == Some(driver) && r.coverage == RunCoverage::Partial)
+                .unwrap_or_else(|| panic!("a partial {driver} run"));
+            assert_eq!(run.tokens.as_ref().unwrap().cache_creation, None);
+            assert_eq!(run.agent_active_ms, None);
+            assert_eq!(run.unpriceable_cause.as_deref(), Some(cause::SUBSCRIPTION_UNPRICED));
+        }
+
+        // A recent window: the chain root whose own run is 40 days old is
+        // still emitted to hold its recent revision.
+        let recent = build_usage_rows_report(&query(now - 7 * 86_400), &records, None);
+        let ghost = recent
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task_seed_c_ghost_root")
+            .unwrap();
+        assert_eq!(ghost.direct.runs_total, 0);
+        assert_eq!(ghost.runs_outside_window, 1);
+        assert_eq!(ghost.revisions.len(), 1);
+        assert!(ghost.inclusive.as_ref().unwrap().total_tokens > 0);
     }
 }

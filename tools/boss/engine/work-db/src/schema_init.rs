@@ -1180,6 +1180,12 @@ mod floor_tests {
             }),
         ));
         steps.push((
+            super::super::cost_report_db::USAGE_WINDOW_INDEX_MIGRATION_ID,
+            Box::new(|c| {
+                super::super::cost_report_db::migrate_usage_window_index(c).unwrap();
+            }),
+        ));
+        steps.push((
             "20261120_1630_run_usage_unavailable",
             Box::new(|c| {
                 c.execute_batch("ALTER TABLE work_runs ADD COLUMN usage_unavailable TEXT DEFAULT 'No provider token usage observed'")

@@ -56,6 +56,7 @@ mod review_guide;
 mod review_section;
 mod stuck_report;
 mod task;
+mod usage_report;
 mod work_item;
 mod worker_tier;
 
@@ -96,5 +97,6 @@ pub use review_guide::*;
 pub use review_section::*;
 pub use stuck_report::*;
 pub use task::*;
+pub use usage_report::*;
 pub use work_item::*;
 pub use worker_tier::*;

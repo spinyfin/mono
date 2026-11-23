@@ -12,6 +12,7 @@ boss-execution-contracts = { path = "../execution-contracts" }
 boss-engine-storage-values = { path = "../storage-values" }
 boss-work-db = { path = "../work-db" }
 boss-task-scope = { path = "../task-scope" }
+boss-usage-report = { path = "../usage-report" }
 anyhow = { workspace = true }
 boss-comment-anchor = { path = "../../comment_anchor" }
 boss-engine-comment-classifier = { path = "../comment-classifier" }
