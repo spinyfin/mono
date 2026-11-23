@@ -96,9 +96,9 @@ pub fn seed_published_guide_comment(db: &WorkDb, pr_number: u32, body: &str) -> 
 
 pub use boss_engine_test_process::{ProcessGroupChild, spawn_setsid_sleeper};
 
-/// Keep each completion fixture in its own cwd so a sibling run-process
-/// reap cannot claim it. The shared session fixture retains the owning guard
-/// and the stdin lifeline that cleans up after a killed test process.
+/// Give each completion fixture its own cwd so a sibling run-process reap
+/// of its recorded workspace cannot claim it. The shared session fixture
+/// retains the owning guard and stdin lifeline for a killed test process.
 pub fn spawn_group_leader_sleeper() -> ProcessGroupChild {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let cwd = std::env::temp_dir().join(format!(

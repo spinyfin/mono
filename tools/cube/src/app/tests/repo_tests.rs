@@ -1267,3 +1267,196 @@ fn repo_remove_refuses_leased_without_force() {
     assert_eq!(result.payload["removed"], true);
     assert_eq!(result.payload["forced"], true);
 }
+
+mod purge_verification {
+    use workspace_procs::WorkspaceProcessTable;
+    use workspace_procs_testing::{StaticProcessTable, UnreadableTable, fake_process};
+
+    use crate::app::repo::purge_workspace_trees;
+
+    #[test]
+    fn partial_purge_keeps_registration_and_can_be_retried() {
+        use super::super::support::{FakeRunner, seed_mono_repo, with_database_path};
+        use crate::{
+            cli::{Cli, Command},
+            store::Store,
+        };
+        use clap::Parser;
+        let (tempdir, database_path) = with_database_path();
+        let root = std::fs::canonicalize(tempdir.path()).unwrap().join("workspaces");
+        let path = root.join("mono-agent-001");
+        std::fs::create_dir_all(&path).unwrap();
+        seed_mono_repo(&root, &database_path);
+        let runner = FakeRunner::new(vec![]);
+        let quiet = StaticProcessTable::new(vec![], 900);
+        for (table, removed) in [(&UnreadableTable as &dyn WorkspaceProcessTable, false), (&quiet, true)] {
+            let Command::Repo { command } =
+                Cli::parse_from(["cube", "repo", "remove", "mono", "--purge-workspaces"]).command
+            else {
+                panic!("repo command")
+            };
+            let result = crate::app::repo::run_repo_with_process_table(
+                command,
+                Some(&database_path),
+                &runner,
+                None,
+                None,
+                table,
+            )
+            .unwrap();
+            assert_eq!(result.payload["removed"], removed);
+            let store = Store::open_at(&database_path).unwrap();
+            assert_eq!(store.get_repo("mono").unwrap().is_none(), removed);
+            assert_eq!(path.exists(), !removed);
+            if !removed {
+                assert!(result.message.contains("could not be verified"));
+                assert_eq!(result.payload["refused_dirs"][0]["error"], "process list unavailable");
+            }
+        }
+    }
+
+    #[test]
+    fn purge_unlinks_workspace_symlinks_without_sweeping_targets() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let target = std::fs::canonicalize(tempdir.path()).unwrap().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = tempdir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(target.to_str().unwrap()))], 900);
+        let outcome = purge_workspace_trees(&table, None, "mono", std::slice::from_ref(&link)).unwrap();
+        assert!(outcome.refused.is_empty());
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(target.is_dir());
+        assert!(table.signals().is_empty());
+        std::os::unix::fs::symlink(target.join("missing"), &link).unwrap();
+        purge_workspace_trees(&UnreadableTable, None, "mono", std::slice::from_ref(&link)).unwrap();
+        assert!(std::fs::symlink_metadata(link).is_err());
+    }
+
+    #[test]
+    fn purge_retains_directories_with_immortal_occupants_and_removes_the_rest() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let busy = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
+        let quiet = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-002");
+        std::fs::create_dir_all(&busy).unwrap();
+        std::fs::create_dir_all(&quiet).unwrap();
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(busy.to_str().unwrap()))], 900);
+        table.immortal(40);
+
+        let outcome = purge_workspace_trees(&table, None, "mono", &[busy.clone(), quiet.clone()]).unwrap();
+
+        assert!(busy.exists(), "refused directory is retained");
+        assert!(!quiet.exists());
+        assert_eq!(outcome.purged, vec![quiet.display().to_string()]);
+        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(outcome.refused[0]["path"], busy.display().to_string());
+        assert_eq!(outcome.refused[0]["survivor_pids"], serde_json::json!([40]));
+    }
+
+    #[test]
+    fn purge_kills_killable_occupants_before_removing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
+        std::fs::create_dir_all(&ws).unwrap();
+        let table = StaticProcessTable::new(vec![fake_process(40, 1, "tool", Some(ws.to_str().unwrap()))], 900);
+        let outcome = purge_workspace_trees(&table, None, "mono", std::slice::from_ref(&ws)).unwrap();
+        assert!(!ws.exists());
+        assert!(outcome.refused.is_empty());
+        assert!(!table.is_alive(40));
+    }
+
+    #[test]
+    fn purge_retains_directories_when_the_process_table_is_unreadable() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(tempdir.path()).unwrap().join("mono-agent-001");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outcome = purge_workspace_trees(&UnreadableTable, None, "mono", std::slice::from_ref(&ws)).unwrap();
+        assert!(ws.exists());
+        assert!(outcome.purged.is_empty());
+        assert_eq!(outcome.refused[0]["error"], "process list unavailable");
+    }
+
+    #[test]
+    fn lease_allocates_a_distinct_id_and_preserves_an_unverified_husk() {
+        use super::super::support::{ExpectedCommand, FakeRunner, seed_mono_repo, with_database_path};
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        for unreadable in [false, true] {
+            for nonempty in [false, true] {
+                let (tempdir, database_path) = with_database_path();
+                let workspace_root = std::fs::canonicalize(tempdir.path()).unwrap().join("workspaces");
+                let husk_path = workspace_root.join("mono-agent-004");
+                // Intentionally no .jj/ or .git/ — this is the broken-empty state.
+                std::fs::create_dir_all(&husk_path).expect("workspace dir");
+
+                if nonempty {
+                    std::fs::create_dir_all(husk_path.join("leftover")).unwrap();
+                }
+                seed_mono_repo(&workspace_root, &database_path);
+
+                let new_path = workspace_root.join("mono-agent-005");
+                let staging = workspace_root.join(".incoming-mono-agent-005");
+                let runner = FakeRunner::new(vec![
+                    ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
+                    ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+                    ExpectedCommand::ok(
+                        new_path.clone(),
+                        "jj",
+                        &["git", "remote", "list"],
+                        "origin\tgit@github.com:spinyfin/mono.git\n",
+                    ),
+                    ExpectedCommand::ok(
+                        new_path.clone(),
+                        "jj",
+                        &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                        "",
+                    ),
+                    ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main@origin"], ""),
+                    ExpectedCommand::ok(
+                        new_path.clone(),
+                        "jj",
+                        &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                        "abc1234",
+                    ),
+                ]);
+
+                let table = StaticProcessTable::new(
+                    vec![fake_process(40, 1, "tool", Some(husk_path.to_str().unwrap()))],
+                    900,
+                );
+                table.immortal(40);
+                let process_table: &dyn WorkspaceProcessTable = if unreadable { &UnreadableTable } else { &table };
+                let crate::cli::Command::Workspace { command } =
+                    Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "retained husk"]).command
+                else {
+                    panic!("workspace command")
+                };
+                let result = crate::app::workspace::run_workspace_with_process_table(
+                    command,
+                    Some(&database_path),
+                    &runner,
+                    process_table,
+                )
+                .expect("lease should self-heal the husk and auto-create a fresh workspace");
+                runner.assert_exhausted();
+
+                assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
+                assert_eq!(result.payload["workspace"]["state"], "leased");
+
+                // Both the retained husk and the newly leased workspace remain registered.
+                assert!(husk_path.exists(), "unverified husk must remain");
+                assert_eq!(husk_path.join("leftover").exists(), nonempty);
+                use crate::store::{Store, WorkspaceListFilter};
+                let store = Store::open_at(&database_path).unwrap();
+                let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
+                let ids: Vec<_> = rows.iter().map(|r| r.workspace_id.as_str()).collect();
+                assert!(ids.contains(&"mono-agent-004"), "husk row must remain; saw {ids:?}");
+                assert!(
+                    ids.contains(&"mono-agent-005"),
+                    "fresh workspace should exist; saw {ids:?}"
+                );
+            }
+        }
+    }
+}

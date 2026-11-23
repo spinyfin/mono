@@ -10,6 +10,8 @@ use git_utils::repo_slug::{
 };
 use serde_json::json;
 
+use workspace_procs::{ReapReport, SystemWorkspaceProcessTable, WorkspaceProcessTable};
+
 use crate::cli::RepoCommand;
 use crate::command_runner::{CommandInvocation, CommandRunner};
 use crate::lock::RepoLock;
@@ -22,6 +24,7 @@ use crate::app::errors::{
     CubeError, JJ_NO_REMOTE_BOOKMARK_SIGNATURE, JJ_REVISION_DOESNT_EXIST_SIGNATURE, Result, RunResult,
 };
 use crate::app::jj::network_cmd_timeout;
+use crate::app::process_guard::{SweepPhase, ensure_no_live_processes, sweep_is_noteworthy, sweep_json};
 use crate::app::store_gc::store_gc_lock_path;
 use crate::app::util::repo_lock_path;
 
@@ -37,6 +40,24 @@ pub(super) fn run_repo(
     runner: &dyn CommandRunner,
     repo_ensure_defaults: Option<&RepoEnsureDefaults>,
     cube_config: Option<config::CubeConfig>,
+) -> Result<RunResult> {
+    run_repo_with_process_table(
+        command,
+        database_path,
+        runner,
+        repo_ensure_defaults,
+        cube_config,
+        &SystemWorkspaceProcessTable,
+    )
+}
+
+pub(super) fn run_repo_with_process_table(
+    command: RepoCommand,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    repo_ensure_defaults: Option<&RepoEnsureDefaults>,
+    cube_config: Option<config::CubeConfig>,
+    process_table: &dyn WorkspaceProcessTable,
 ) -> Result<RunResult> {
     let store = if let Some(path) = database_path {
         Store::open_at(path)?
@@ -237,6 +258,7 @@ pub(super) fn run_repo(
 
             // Preserve the registration on cleanup failure so a retry can finish.
             let mut purged_dirs: Vec<String> = Vec::new();
+            let mut refused_dirs: Vec<serde_json::Value> = Vec::new();
             if purge_workspaces {
                 let mut paths = workspace_paths;
                 for candidate in super::provision::discover_workspaces(&record)? {
@@ -244,23 +266,31 @@ pub(super) fn run_repo(
                         paths.push(candidate.workspace_path);
                     }
                 }
-                for path in &paths {
-                    super::fs_util::remove_workspace_tree(path)?;
-                    purged_dirs.push(path.display().to_string());
-                }
+                let outcome = purge_workspace_trees(process_table, database_path, &repo, &paths)?;
+                purged_dirs = outcome.purged;
+                refused_dirs = outcome.refused;
             }
-            store.delete_repo(&repo)?;
+            let removed = refused_dirs.is_empty();
+            if removed {
+                store.delete_repo(&repo)?;
+            }
 
             audit!(
                 database_path,
-                "repo.removed",
+                if removed { "repo.removed" } else { "repo.purge_partial" },
                 repo = record.repo,
                 workspace_count = workspace_count,
                 forced = force,
                 purged_workspaces = purge_workspaces,
             );
 
-            let message = if purge_workspaces {
+            let message = if !removed {
+                format!(
+                    "Kept repo `{repo}` registered for retry; purged {} directory(ies), and {} directory(ies) were kept because they could not be verified free of running processes; see refused_dirs.",
+                    purged_dirs.len(),
+                    refused_dirs.len()
+                )
+            } else if purge_workspaces {
                 format!(
                     "Removed repo `{repo}` ({workspace_count} workspace(s)) from the registry and deleted on-disk directories."
                 )
@@ -274,14 +304,77 @@ pub(super) fn run_repo(
                 json!({
                     "repo": record,
                     "workspace_count": workspace_count,
-                    "removed": true,
+                    "removed": removed,
                     "forced": force,
                     "purged_workspaces": purge_workspaces,
                     "purged_dirs": purged_dirs,
+                    "refused_dirs": refused_dirs,
                 }),
             )
         }
     }
+}
+
+/// What a purge did: directories removed, and directories kept because
+/// something is still running in them (or the process table could not be read).
+pub(super) struct PurgeOutcome {
+    pub(super) purged: Vec<String>,
+    pub(super) refused: Vec<serde_json::Value>,
+}
+
+/// Remove each workspace tree after verifying nothing still runs inside it.
+/// A refused directory is retained, warned about, and reported with its
+/// survivors or scan error; it does not stop the other directories.
+pub(super) fn purge_workspace_trees(
+    table: &dyn WorkspaceProcessTable,
+    database_path: Option<&Path>,
+    repo: &str,
+    paths: &[PathBuf],
+) -> Result<PurgeOutcome> {
+    let mut outcome = PurgeOutcome {
+        purged: Vec::new(),
+        refused: Vec::new(),
+    };
+    for path in paths {
+        let workspace_id = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let verification = if super::fs_util::is_recursive_removal(path)? {
+            ensure_no_live_processes(table, &workspace_id, path)
+        } else {
+            Ok(ReapReport::default())
+        };
+        let removal_allowed = verification.is_ok();
+        let sweep = verification.unwrap_or_else(|refusal| refusal.report);
+        if sweep_is_noteworthy(&sweep, SweepPhase::Remove) {
+            audit!(
+                database_path,
+                "workspace.processes_reaped",
+                repo = repo,
+                workspace_id = workspace_id,
+                phase = "remove",
+                processes = sweep_json(&sweep),
+            );
+        }
+        if !removal_allowed {
+            let detail = sweep.error.clone().unwrap_or_else(|| sweep.survivor_summary());
+            eprintln!(
+                "warning: cube repo remove: keeping {} because it could not be verified free of running processes ({detail})",
+                path.display(),
+            );
+            outcome.refused.push(json!({
+                "path": path.display().to_string(),
+                "error": sweep.error,
+                "survivors": sweep_json(&sweep)["survivors"],
+                "survivor_pids": sweep.survivors.iter().map(|s| s.process.pid).collect::<Vec<_>>(),
+            }));
+            continue;
+        }
+        super::fs_util::remove_workspace_tree(path)?;
+        outcome.purged.push(path.display().to_string());
+    }
+    Ok(outcome)
 }
 
 /// Resolve a bare `<reponame>` and ensure the repo, walking the resolution

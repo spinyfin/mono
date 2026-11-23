@@ -24,12 +24,9 @@ fn incident_table() -> StaticProcessTable {
         "--output_base=/cache/_bazel_me/abc".into(),
         format!("--workspace_directory={WS}"),
     ];
-    let mut human = ws_process(700, 1, "zsh");
-    human.has_controlling_terminal = true;
-    let mut pane = ws_process(100, 50, "zsh");
-    pane.has_controlling_terminal = true;
-    let mut agent = ws_process(200, 100, "claude");
-    agent.has_controlling_terminal = true;
+    let human = ws_process(700, 1, "zsh");
+    let pane = ws_process(100, 50, "zsh");
+    let agent = ws_process(200, 100, "claude");
     let processes = vec![
         pane,
         agent,
@@ -296,4 +293,31 @@ fn final_verification_reports_new_occupants_without_signalling_them() {
     assert_eq!(pids(&report.survivors), vec![12]);
     assert!(!report.is_clean());
     assert!(table.0.is_alive(12));
+}
+
+#[test]
+fn linux_identity_recognizes_exit_before_zombie_state() {
+    use crate::process_table::parse_linux_identity;
+    // Fields after comm: state, ppid, pgrp, session, tty, tpgid, flags,
+    // then fields 10 through 21, followed by starttime (field 22).
+    let stat = |state, flags| format!("42 (tool ) name) {state} 7 0 0 0 0 {flags} {} 123", "0 ".repeat(12));
+    for state in ["R", "S", "D"] {
+        // The real exit race reports flags 0x40000c and state R.
+        let exited = parse_linux_identity(42, &stat(state, "4194316")).err().unwrap();
+        assert_eq!(exited.kind(), std::io::ErrorKind::NotFound);
+        let live = parse_linux_identity(42, &stat(state, "4194304")).unwrap();
+        assert_eq!(live.ppid, 7);
+        assert_eq!(live.start_ticks, 123);
+        assert_eq!(live.command, "tool ) name");
+    }
+    for state in ["Z", "X", "x"] {
+        assert_eq!(
+            parse_linux_identity(42, &stat(state, "0")).err().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+    assert_eq!(
+        parse_linux_identity(42, &stat("R", "unreadable")).err().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
 }

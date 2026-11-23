@@ -694,7 +694,6 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
- "workspace-procs",
 ]
 
 [[package]]
@@ -824,6 +823,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "workspace-procs",
 ]
 
 [[package]]
@@ -1499,6 +1499,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "workspace-procs",
 ]
 
 [[package]]

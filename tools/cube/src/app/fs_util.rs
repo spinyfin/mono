@@ -46,3 +46,15 @@ pub(super) fn remove_workspace_tree(path: &Path) -> super::errors::Result<()> {
         source,
     })
 }
+
+/// Whether removal will recurse into this path, without following a top-level link.
+pub(super) fn is_recursive_removal(path: &Path) -> super::errors::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(super::errors::CubeError::WorkspaceDirRemove {
+            path: path.into(),
+            source,
+        }),
+    }
+}

@@ -36,7 +36,8 @@ use crate::app::lease_reclaim::{
     report_provisioning,
 };
 use crate::app::process_guard::{
-    SweepPhase, ensure_no_live_processes_in, sweep_is_noteworthy, sweep_json, sweep_live_workspace_processes,
+    SweepPhase, ensure_no_live_processes_in, inspect_live_workspace_processes, sweep_is_noteworthy, sweep_json,
+    sweep_live_workspace_processes,
 };
 use crate::app::provision::{
     auto_create_workspace, discover_workspaces, find_workspace_record, format_lease_message, format_setup_message,
@@ -232,6 +233,20 @@ pub(super) fn run_workspace(
     database_path: Option<&Path>,
     runner: &dyn CommandRunner,
 ) -> Result<RunResult> {
+    run_workspace_with_process_table(
+        command,
+        database_path,
+        runner,
+        &workspace_procs::SystemWorkspaceProcessTable,
+    )
+}
+
+pub(super) fn run_workspace_with_process_table(
+    command: WorkspaceCommand,
+    database_path: Option<&Path>,
+    runner: &dyn CommandRunner,
+    process_table: &dyn workspace_procs::WorkspaceProcessTable,
+) -> Result<RunResult> {
     let status_phase = match &command {
         WorkspaceCommand::Status { workspace } => Some(super::workspace_status::StatusPhase::start(
             "registry_open",
@@ -253,7 +268,7 @@ pub(super) fn run_workspace(
             task,
             prefer,
             allow_dirty,
-            exclude,
+            mut exclude,
             release_on_setup_failure,
         } => {
             let repo_record = store
@@ -274,30 +289,7 @@ pub(super) fn run_workspace(
             // holder/task — when a worker's `@` is observed to move
             // mid-flight, this is the first thing to grep.
             let expired = store.expire_stale_leases(&repo, leased_at_epoch_s)?;
-            let mut sweep_failure = None;
             for swept in &expired {
-                if let Some(workspace) = candidates.iter().find(|w| w.workspace_id == swept.workspace_id) {
-                    let report = sweep_live_workspace_processes(
-                        &workspace.workspace_id,
-                        &workspace.workspace_path,
-                        SweepPhase::Expire,
-                    );
-                    audit!(
-                        database_path,
-                        "workspace.processes_reaped",
-                        repo = repo,
-                        workspace_id = workspace.workspace_id,
-                        phase = "expire",
-                        processes = sweep_json(&report)
-                    );
-                    if !report.is_clean() {
-                        sweep_failure = Some(CubeError::WorkspaceBusy {
-                            path: workspace.workspace_path.clone(),
-                            processes: report.error.clone().unwrap_or_else(|| report.survivor_summary()),
-                        });
-                    }
-                }
-
                 audit!(
                     database_path,
                     "lease.expired_reclaimed",
@@ -310,8 +302,37 @@ pub(super) fn run_workspace(
                     prior_lease_expires_at_epoch_s = swept.lease_expires_at_epoch_s,
                 );
             }
-            if let Some(error) = sweep_failure {
-                return Err(error);
+            // A free row, including one whose TTL just expired, can still
+            // have a live holder. Never signal it or reset its working copy.
+            let free = store.list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some(&repo),
+                ..Default::default()
+            })?;
+            for workspace in free.into_iter().filter(|w| w.state == WorkspaceState::Free) {
+                let phase = if expired.iter().any(|e| e.workspace_id == workspace.workspace_id) {
+                    SweepPhase::Expire
+                } else {
+                    SweepPhase::Lease
+                };
+                let report = inspect_live_workspace_processes(&workspace.workspace_path);
+                if !report.is_clean() {
+                    store.update_workspace_health(&repo, &workspace.workspace_id, WorkspaceHealth::Quarantined)?;
+                    exclude.push(workspace.workspace_id.clone());
+                    audit!(
+                        database_path,
+                        "workspace.processes_quarantined",
+                        repo = repo,
+                        workspace_id = workspace.workspace_id,
+                        phase = phase.as_str(),
+                        processes = sweep_json(&report)
+                    );
+                    eprintln!(
+                        "cube {}: {}: quarantined: {}",
+                        phase.as_str(),
+                        workspace.workspace_id,
+                        report.error.clone().unwrap_or_else(|| report.survivor_summary())
+                    );
+                }
             }
             super::registration::quarantine_obsolete(
                 &store,
@@ -382,6 +403,14 @@ pub(super) fn run_workspace(
                     .into_iter()
                     .next()
                     .ok_or_else(|| CubeError::WorkspaceNotFound(pref.to_string()))?;
+
+                let occupancy = inspect_live_workspace_processes(&target.workspace_path);
+                if !occupancy.is_clean() {
+                    return Err(CubeError::WorkspaceBusy {
+                        path: target.workspace_path.clone(),
+                        processes: occupancy.error.clone().unwrap_or_else(|| occupancy.survivor_summary()),
+                    });
+                }
 
                 if target.state == WorkspaceState::Leased {
                     // Held by a live worker (or an unexpired lease). We must
@@ -1101,8 +1130,9 @@ pub(super) fn run_workspace(
                 // surfacing it to the caller. A husk must never be a reason to
                 // deny a lease for a reachable repo (issue #845 part 2b).
                 for (ws_id, ws_path) in &broken_empty {
-                    gc_broken_empty_workspace(&mut store, database_path, &repo, ws_id, ws_path)?;
-                    candidates.retain(|c| &c.workspace_id != ws_id);
+                    if gc_broken_empty_workspace(process_table, &mut store, database_path, &repo, ws_id, ws_path)? {
+                        candidates.retain(|c| &c.workspace_id != ws_id);
+                    }
                 }
 
                 // Pool is empty, fully leased, only had broken-empty husks
@@ -1194,10 +1224,16 @@ pub(super) fn run_workspace(
             // workspace wedge every other lease/release for the repo.
             drop(_lock);
 
-            // Verify before reset or setup can rewrite a prior holder's files.
-            if let Err(error) = ensure_no_live_processes_in(&workspace.workspace_id, &workspace.workspace_path) {
-                store.quarantine_workspace(&lease_id, "process cleanup could not verify an empty workspace")?;
-                return Err(error);
+            // Recheck after claiming, before any reset or setup mutation.
+            let occupancy = inspect_live_workspace_processes(&workspace.workspace_path);
+            if sweep_is_noteworthy(&occupancy, SweepPhase::Lease) {
+                audit!(
+                    database_path,
+                    "workspace.processes_inspected",
+                    workspace_id = workspace.workspace_id,
+                    phase = "lease",
+                    processes = sweep_json(&occupancy)
+                );
             }
 
             // If the workspace we just claimed was reclaimed-from-expired
@@ -1216,36 +1252,51 @@ pub(super) fn run_workspace(
             } else {
                 expired_by_workspace_id.get(workspace.workspace_id.as_str()).copied()
             };
-            if let Err(error) = reset_workspace_guarded(
-                runner,
-                database_path,
-                &workspace.workspace_path,
-                &repo_record.main_branch,
-                prior_expired,
-            ) {
-                let CubeError::LeaseExpiredWorkspaceDirty {
-                    prior_lease_id: refused_prior_lease_id,
-                    prior_holder: refused_prior_holder,
-                    ..
-                } = error
-                else {
-                    let report = sweep_live_workspace_processes(
-                        &workspace.workspace_id,
-                        &workspace.workspace_path,
-                        SweepPhase::Release,
-                    );
-                    audit!(
-                        database_path,
-                        "workspace.processes_reaped",
-                        workspace_id = workspace.workspace_id,
-                        phase = "setup_failed",
-                        processes = sweep_json(&report)
-                    );
-                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
-                    if let Some(undo) = &lease_reclaim_undo {
-                        undo.roll_back(&store, database_path, "reset_failed");
+            let reset_result = if occupancy.is_clean() {
+                reset_workspace_guarded(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repo_record.main_branch,
+                    prior_expired,
+                )
+            } else {
+                Err(CubeError::WorkspaceBusy {
+                    path: workspace.workspace_path.clone(),
+                    processes: occupancy.error.clone().unwrap_or_else(|| occupancy.survivor_summary()),
+                })
+            };
+            if let Err(error) = reset_result {
+                let (refused_prior_lease_id, refused_prior_holder, quarantine_reason) = match error {
+                    CubeError::LeaseExpiredWorkspaceDirty {
+                        prior_lease_id,
+                        prior_holder,
+                        ..
+                    } => (prior_lease_id, prior_holder, DIRTY_RECLAIM_QUARANTINE_REASON.to_owned()),
+                    CubeError::WorkspaceBusy { processes, .. } => (
+                        String::new(),
+                        String::new(),
+                        format!("live or uninspectable processes: {processes}"),
+                    ),
+                    error => {
+                        let report = sweep_live_workspace_processes(
+                            &workspace.workspace_id,
+                            &workspace.workspace_path,
+                            SweepPhase::SetupFailed,
+                        );
+                        audit!(
+                            database_path,
+                            "workspace.processes_reaped",
+                            workspace_id = workspace.workspace_id,
+                            phase = "setup_failed",
+                            processes = sweep_json(&report)
+                        );
+                        let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                        if let Some(undo) = &lease_reclaim_undo {
+                            undo.roll_back(&store, database_path, "reset_failed");
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 };
 
                 // The health check a few hundred lines up only tests for
@@ -1267,19 +1318,22 @@ pub(super) fn run_workspace(
                 // this guard (a brand new `jj workspace add` has no prior
                 // holder's work to protect, so `prior_expired` is always
                 // `None` for it below — this cannot recurse).
-                if let Err(store_err) = store.quarantine_workspace(&lease_id, DIRTY_RECLAIM_QUARANTINE_REASON) {
-                    eprintln!(
-                        "warning: cube failed to persist dirty-reclaim quarantine for `{}/{}`: {store_err}",
-                        workspace.repo, workspace.workspace_id,
-                    );
-                }
+                store.quarantine_workspace(&lease_id, &quarantine_reason)?;
+                let quarantine_event = if occupancy.is_clean() {
+                    "workspace.dirty_reclaim_quarantined"
+                } else {
+                    "workspace.processes_quarantined"
+                };
                 audit!(
                     database_path,
-                    "workspace.dirty_reclaim_quarantined",
+                    quarantine_event,
                     repo = workspace.repo,
                     workspace_id = workspace.workspace_id,
                     prior_lease_id = refused_prior_lease_id,
                     prior_holder = refused_prior_holder,
+                    reason = quarantine_reason,
+                    phase = "lease",
+                    processes = sweep_json(&occupancy),
                 );
 
                 report_provisioning(
@@ -1349,7 +1403,7 @@ pub(super) fn run_workspace(
                     let report = sweep_live_workspace_processes(
                         &workspace.workspace_id,
                         &workspace.workspace_path,
-                        SweepPhase::Release,
+                        SweepPhase::SetupFailed,
                     );
                     audit!(
                         database_path,
@@ -1416,7 +1470,7 @@ pub(super) fn run_workspace(
                     let report = sweep_live_workspace_processes(
                         &workspace.workspace_id,
                         &workspace.workspace_path,
-                        SweepPhase::Release,
+                        SweepPhase::SetupFailed,
                     );
                     audit!(
                         database_path,
@@ -1518,7 +1572,7 @@ pub(super) fn run_workspace(
             // never blocks the release: survivors are logged and audited.
             let process_sweep =
                 sweep_live_workspace_processes(&workspace.workspace_id, &workspace.workspace_path, SweepPhase::Release);
-            if sweep_is_noteworthy(&process_sweep) {
+            if sweep_is_noteworthy(&process_sweep, SweepPhase::Release) {
                 audit!(
                     database_path,
                     "workspace.processes_reaped",
@@ -1768,7 +1822,7 @@ pub(super) fn run_workspace(
                 } else {
                     Default::default()
                 };
-                if sweep_is_noteworthy(&process_sweep) {
+                if sweep_is_noteworthy(&process_sweep, SweepPhase::Release) {
                     audit!(
                         database_path,
                         "workspace.processes_reaped",
@@ -2016,7 +2070,7 @@ pub(super) fn run_workspace(
             } else {
                 Default::default()
             };
-            if sweep_is_noteworthy(&process_sweep) {
+            if sweep_is_noteworthy(&process_sweep, SweepPhase::Remove) {
                 audit!(
                     database_path,
                     "workspace.processes_reaped",

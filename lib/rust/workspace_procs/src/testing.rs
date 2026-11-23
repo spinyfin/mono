@@ -113,11 +113,32 @@ pub fn fake_process(pid: i32, ppid: i32, command: &str, cwd: Option<&str>) -> Li
     LiveProcess {
         pid,
         ppid,
-        pgid: pid,
         start_micros: 999_000_000_000_000,
         command: command.to_owned(),
         argv: vec![command.to_owned()],
         cwd: cwd.map(PathBuf::from),
-        has_controlling_terminal: false,
     }
+}
+
+/// A process table whose listing always fails.
+pub struct UnreadableTable;
+impl WorkspaceProcessTable for UnreadableTable {
+    fn list(&self) -> io::Result<Vec<LiveProcess>> {
+        Err(io::Error::other("process list unavailable"))
+    }
+    fn snapshot(&self, _pid: i32) -> io::Result<LiveProcess> {
+        Err(io::Error::other("process list unavailable"))
+    }
+    fn signal(&self, _pid: i32, _signal: Signal) -> io::Result<()> {
+        Ok(())
+    }
+    fn own_pid(&self) -> i32 {
+        900
+    }
+}
+
+#[test]
+fn unreadable_table_refuses_inspection() {
+    assert!(UnreadableTable.list().is_err());
+    assert!(UnreadableTable.snapshot(40).is_err());
 }

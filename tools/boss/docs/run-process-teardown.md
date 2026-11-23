@@ -19,7 +19,7 @@ Observed on a live worker (pids from one session):
 | the agent's tool shell (`zsh -c …`)                              | 35428 (its own) | none            |
 | `( sleep 30 ) &` from that tool shell                            | 35428           | none            |
 
-The agent's tool runner spawns each tool shell detached into its own process group and session, so signalling the pane shell's group (`kill(-30509, …)`) reaches neither the agent nor any tool shell. A backgrounded subshell inherits the tool shell's group, and when the tool shell exits it re-parents to launchd. Walking down from the pane finds nothing; signalling the pane's group finds nothing. Process groups are therefore kept as a first pass but cannot be the ownership rule.
+The agent's tool runner spawns each tool shell detached into its own process group and session, so signalling the pane shell's group (`kill(-30509, …)`) reaches neither the agent nor any tool shell. A backgrounded subshell inherits the tool shell's group, and when the tool shell exits it re-parents to launchd. Walking down from the pane finds nothing; signalling the pane's group finds nothing. Cleanup therefore follows verified process identities rather than numeric process groups.
 
 ## Ownership
 
@@ -34,7 +34,7 @@ Only the workspace's Bazel server is spared and reported. It is recognised by th
 
 ## Killing and logging
 
-The ladder sends `SIGTERM` to owned processes and retains their (pid, start-time) identities through the grace period. Escalation scans those identities and descendants of targets still alive with the same start time; it never discovers new targets by workspace path. This keeps re-parented TERM-resistant tools in scope without touching a later lease's occupants or a recycled root pid. The KILL pass uses that identity fence. Final verification also reports new directory occupants without signalling them, so a newly orphaned process blocks removal. Process-list failures retain the partial signal report and make verification inconclusive.
+The ladder sends `SIGTERM` to owned processes and retains their (pid, start-time) identities through the grace period. Escalation scans those identities and descendants of targets still alive with the same start time; it never discovers new targets by workspace path. This keeps re-parented TERM-resistant tools in scope without touching a later lease's occupants or a recycled root pid. The KILL pass uses that identity fence. Final verification also reports new directory occupants without signalling them, so a newly orphaned process blocks removal. Process-list and individual process inspection failures retain the partial signal report and make verification inconclusive.
 
 Every process killed is logged with pid, command, age, which signal, why it was owned and its argument vector:
 
@@ -43,12 +43,13 @@ Every process killed is logged with pid, command, age, which signal, why it was 
 
 ## Where it runs
 
-- **Pane release** (`tmux_teardown.rs`): the pane pid and start time supply the ancestry root; the execution's recorded workspace supplies the path. The pane's mutable cwd is never trusted. The full ladder runs on a blocking thread and is awaited before lease release. Broad path roots (root, home, ancestors of the default cube workspace pool) are rejected.
-- **Lease release** (`finish_worker_teardown` and `force_release`): `run_process_reap::reap_workspace` with the workspace path captured before the terminalizing write nulled it, immediately before `cube workspace release`.
+- **Pane release** (`tmux_teardown.rs`): tmux verifies the spawn token and awaits cleanup of registered and token-inheriting process identities before destroying the session. It never adopts the recorded numeric pane pid at teardown; retained dead panes cannot confer ownership on a replacement process.
+- **Engine completion** (`finish_worker_teardown`): releases through Cube, which verifies that the lease still exists before its workspace sweep. A stale completion with only a recorded workspace path does not sweep that path.
 - **cube `workspace release` and `force-release`**: sweep and kill before the reset; the release proceeds whatever happened, with survivors in the message, stderr and audit log. Every engine termination path releases its lease through this command, so it is the net under the engine-side passes.
 - **cube removal** (`workspace remove --expunge`, pool trim): sweep and kill before the directory is staged, again under the staged `.removing-<id>` name before it is unlinked, and before a leftover staged directory is cleared. A survivor or inconclusive process scan fails the removal with `refusing to remove workspace directory …: processes are still running inside it after SIGTERM and SIGKILL: <pid (command)>`; the directory is left in place for a later pass.
 
-- **Expired leases and setup failures**: cube sweeps and audits these transitions too, and verifies the selected workspace before setup. Expiry sweeps use the `expire` phase. A failed verification refuses reuse.
+- **Expired leases and claims**: read-only scans quarantine occupied or uninspectable workspaces without signals or resets, with an audit listing the processes or inspection error. Selection continues to another workspace or provisions a new one.
+- **Setup failures**: Cube sweeps before release, logging and auditing the `setup_failed` phase.
 - **Removal audit**: a spared Bazel server is noteworthy even when no signals were sent; its pid remains in the removal audit.
 
 ## Verifying
