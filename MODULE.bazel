@@ -412,6 +412,19 @@ swift_deps.from_package(
     resolved = "//tools/boss/app-macos:Package.resolved",
     swift = "//tools/boss/app-macos:Package.swift",
 )
+
+# Fix the compiler warnings that the pinned SwiftPM dependencies emit so the
+# whole app build is warning-free.
+swift_deps.configure_package(
+    name = "swiftui-math",
+    patch_args = ["-p1"],
+    patches = ["//third_party/patches:swiftpkg_swiftui_math-0.1.0-register-fonts-for-url.patch"],
+)
+swift_deps.configure_package(
+    name = "textual",
+    patch_args = ["-p1"],
+    patches = ["//third_party/patches:swiftpkg_textual-0.3.1-main-actor-with-attachments.patch"],
+)
 use_repo(
     swift_deps,
     "swift_package",
