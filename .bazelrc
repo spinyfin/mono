@@ -185,6 +185,16 @@ build:dev-remote --disk_cache=~/.cache/bazelcache-remote
 build:dev-remote --grpc_keepalive_time=30s
 build:dev-remote --grpc_keepalive_timeout=20s
 build:dev-remote --workspace_status_command=tools/remote-execution/dev-remote-workspace-status.sh
+# Ride out transient post-wake DNS/network blips (~60s measured after Mac wake)
+# before falling back to local execution. Bazel 9.3.3's defaults (5 retries,
+# 5s max delay, 100ms initial, 2x backoff) only retry for ~3.1s. Once the
+# command-start GetCapabilities check exhausts those retries,
+# GoogleChannelConnectionFactory latches RemoteExecutionCapabilitiesException
+# for the whole command and --remote_local_fallback runs every action locally.
+# 20 retries with a 15s cap gives 185s-226s (205.5s nominal, >= 3m even at -10%
+# jitter) with zero overhead on healthy builds and a ~3.8m bound when offline.
+build:dev-remote --remote_retries=20
+build:dev-remote --remote_retry_max_delay=15s
 build:dev-remote --remote_local_fallback
 # Results of actions this machine ran itself (after a fallback, or because the
 # action cannot run remotely) stay on this machine and are not uploaded. The
