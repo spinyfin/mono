@@ -186,21 +186,188 @@ async fn repeated_merged_probe_on_human_driven_row_keeps_explicit_review_guide_a
             [&chore_id],
         )
         .unwrap();
+    let (series, comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
+    let initial = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let initial = db.dispatch_pr_review_guide_attempt(&initial.id, &chore_id).unwrap();
+    let initial_execution_id = initial.execution_id.clone().expect("dispatch binds an execution");
+
     let probe = StubProbe::new();
     probe.set(pr, PrLifecycleState::Merged);
     let publisher = Arc::new(RecordingPublisher::default());
     let handler = RecordingCompletionHandler::default();
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    let first_pass = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(first_pass.merged, 0, "human-driven row must stay in_review");
+    assert_eq!(probe.call_count(pr), 1);
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_eq!(
+        db.get_execution(&initial_execution_id).unwrap().status,
+        ExecutionStatus::Cancelled,
+        "first merged observation on a human-driven row must cancel live guides"
+    );
+    assert_eq!(handler.released.lock().unwrap().clone(), vec![initial_execution_id]);
+    assert!(db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty());
 
+    handler.released.lock().unwrap().clear();
+    let explicit = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let explicit = db.dispatch_pr_review_guide_attempt(&explicit.id, &chore_id).unwrap();
+    let explicit_execution_id = explicit.execution_id.clone().expect("dispatch binds an execution");
+
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(
+        probe.call_count(pr),
+        2,
+        "second pass must re-probe the human-driven row"
+    );
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_ne!(
+        db.get_execution(&explicit_execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(handler.released.lock().unwrap().is_empty());
+    assert_eq!(db.live_pr_review_guide_attempts_for_series(&series).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn repeated_closed_unmerged_probe_on_human_driven_row_keeps_explicit_review_guide_alive() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/acme/widget/pull/12";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-human-closed", pr);
+    db.update_work_item(
+        &chore_id,
+        WorkItemPatch {
+            human_driven: Some(true),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
     let (series, comparison) =
         crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
-    let attempt = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
-    let attempt = db.dispatch_pr_review_guide_attempt(&attempt.id, &chore_id).unwrap();
-    let execution_id = attempt.execution_id.clone().expect("dispatch binds an execution");
+    let initial = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let initial = db.dispatch_pr_review_guide_attempt(&initial.id, &chore_id).unwrap();
+    let initial_execution_id = initial.execution_id.clone().expect("dispatch binds an execution");
+
+    let probe = StubProbe::new();
+    probe.set(pr, PrLifecycleState::ClosedUnmerged);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let handler = RecordingCompletionHandler::default();
+    let first_pass = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(first_pass.closed_unmerged, 0, "human-driven row must stay in_review");
+    assert_eq!(probe.call_count(pr), 1);
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_eq!(
+        db.get_execution(&initial_execution_id).unwrap().status,
+        ExecutionStatus::Cancelled,
+        "first closed-unmerged observation on a human-driven row must cancel live guides"
+    );
+    assert_eq!(handler.released.lock().unwrap().clone(), vec![initial_execution_id]);
+    assert!(db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty());
+
+    handler.released.lock().unwrap().clear();
+    let explicit = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let explicit = db.dispatch_pr_review_guide_attempt(&explicit.id, &chore_id).unwrap();
+    let explicit_execution_id = explicit.execution_id.clone().expect("dispatch binds an execution");
 
     run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(
+        probe.call_count(pr),
+        2,
+        "second pass must re-probe the human-driven row"
+    );
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, TaskStatus::InReview);
     assert_ne!(
-        db.get_execution(&execution_id).unwrap().status,
+        db.get_execution(&explicit_execution_id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(handler.released.lock().unwrap().is_empty());
+    assert_eq!(db.live_pr_review_guide_attempts_for_series(&series).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn repeated_merged_probe_on_non_default_base_keeps_explicit_review_guide_alive() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/acme/widget/pull/13";
+    let (_product_id, chore_id) = make_chore_in_review(&db, "guide-non-default-base", pr);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET repo_remote_url = 'https://github.com/acme/widget.git' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+    let (series, comparison) =
+        crate::work::test_support::seed_review_guide_series_for_pr(&db, &chore_id, pr, "base", "head");
+    let initial = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let initial = db.dispatch_pr_review_guide_attempt(&initial.id, &chore_id).unwrap();
+    let initial_execution_id = initial.execution_id.clone().expect("dispatch binds an execution");
+
+    let probe = StubProbe::new();
+    probe.set_probe(
+        pr,
+        PrLifecycleProbe::builder()
+            .url(pr.to_owned())
+            .state(PrLifecycleState::Merged)
+            .base_ref_name("release")
+            .base_branch_error("PR targets `release`, not default branch `main`")
+            .labels(Vec::new())
+            .review(PrReviewState::Unknown)
+            .build(),
+    );
+    let publisher = Arc::new(RecordingPublisher::default());
+    let handler = RecordingCompletionHandler::default();
+    let first_pass = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(first_pass.merged, 0, "non-default-base merge must stay in_review");
+    assert_eq!(probe.call_count(pr), 1);
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_eq!(
+        db.get_execution(&initial_execution_id).unwrap().status,
+        ExecutionStatus::Cancelled,
+        "first merged observation into a non-default base must cancel live guides"
+    );
+    assert_eq!(handler.released.lock().unwrap().clone(), vec![initial_execution_id]);
+    assert!(db.live_pr_review_guide_attempts_for_series(&series).unwrap().is_empty());
+
+    handler.released.lock().unwrap().clear();
+    let explicit = db.create_pr_review_guide_attempt(&series, &comparison, "test").unwrap();
+    let explicit = db.dispatch_pr_review_guide_attempt(&explicit.id, &chore_id).unwrap();
+    let explicit_execution_id = explicit.execution_id.clone().expect("dispatch binds an execution");
+
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, Some(&handler), None).await;
+    assert_eq!(
+        probe.call_count(pr),
+        2,
+        "second pass must re-probe the non-default-base row"
+    );
+    let WorkItem::Chore(task) = db.get_work_item(&chore_id).unwrap() else {
+        panic!("expected chore")
+    };
+    assert_eq!(task.status, TaskStatus::InReview);
+    assert_ne!(
+        db.get_execution(&explicit_execution_id).unwrap().status,
         ExecutionStatus::Cancelled
     );
     assert!(handler.released.lock().unwrap().is_empty());

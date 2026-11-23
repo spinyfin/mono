@@ -18,6 +18,27 @@ use sha2::{Digest, Sha256};
 use super::query_ensure::RequireRow;
 use super::*;
 
+pub(crate) const TERMINAL_OBSERVATIONS_MIGRATION_ID: &str = "20261123_1622_review_guide_terminal_observations";
+
+pub(crate) fn migrate_terminal_observations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pr_review_guide_terminal_observations (
+            root_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            canonical_pr_url TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (root_task_id, canonical_pr_url)
+         );",
+    )?;
+    if table_exists(conn, "pr_merge_evidence")? {
+        conn.execute(
+            "INSERT OR IGNORE INTO pr_review_guide_terminal_observations (root_task_id, canonical_pr_url, observed_at)
+             SELECT root_task_id, canonical_pr_url, observed_at FROM pr_merge_evidence",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Lifecycle of one `pr_review_guide_attempts` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrReviewGuideAttemptStatus {
@@ -607,6 +628,64 @@ impl WorkDb {
             }
         }
         Ok(cancelled_executions)
+    }
+
+    /// Record the first terminal (`Merged` or `ClosedUnmerged`) observation for
+    /// `(chain_root, canonical_pr_url)` and cancel live review-guide attempts
+    /// only on that first observation.
+    ///
+    /// Rows that stay `in_review` after their PR reaches a terminal state
+    /// (human-driven rows, merges into a non-default base) are re-probed on
+    /// every sweep; recording the first observation durably ensures live
+    /// attempts created while the PR was open are cancelled once, while
+    /// explicit Generate/Retry attempts created afterward stay live on later
+    /// passes.
+    pub fn cancel_live_pr_review_guides_on_first_terminal_observation(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        reason: &str,
+    ) -> Result<Vec<String>> {
+        let first_observation = {
+            let conn = self.connect()?;
+            let root = chain_root(&conn, work_item_id)?;
+            let canonical = boss_github::pr_url::canonical_pr_url(pr_url).unwrap_or_else(|| pr_url.to_owned());
+            let now = now_string();
+            conn.execute(
+                "INSERT INTO pr_review_guide_terminal_observations (root_task_id, canonical_pr_url, observed_at)
+                 VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+                params![root, canonical, now],
+            )? > 0
+        };
+        if !first_observation {
+            return Ok(Vec::new());
+        }
+        self.cancel_live_pr_review_guides_for_root(work_item_id, pr_url, reason)
+    }
+
+    /// Clear any recorded terminal observation for `(chain_root, canonical_pr_url)`
+    /// when the PR is observed open again (for example, a closed-unmerged PR that
+    /// was reopened). Avoids any write when no prior terminal observation exists.
+    pub fn clear_pr_review_guide_terminal_observation(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let root = chain_root(&conn, work_item_id)?;
+        let canonical = boss_github::pr_url::canonical_pr_url(pr_url).unwrap_or_else(|| pr_url.to_owned());
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM pr_review_guide_terminal_observations
+                 WHERE root_task_id = ?1 AND canonical_pr_url = ?2",
+                params![&root, &canonical],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        Ok(conn.execute(
+            "DELETE FROM pr_review_guide_terminal_observations
+             WHERE root_task_id = ?1 AND canonical_pr_url = ?2",
+            params![root, canonical],
+        )? > 0)
     }
 
     fn terminate_pr_review_guide_attempt(

@@ -551,6 +551,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: review_guide_sources::migrate_retention_indexes,
         },
         Migration {
+            id: review_guide_jobs::TERMINAL_OBSERVATIONS_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: review_guide_jobs::migrate_terminal_observations,
+        },
+        Migration {
             id: "20261120_1630_run_usage_unavailable".into(),
             legacy_version: None,
             apply: |conn| {
