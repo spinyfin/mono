@@ -203,25 +203,25 @@ boss_short_version_plist(
 # stability); stamped counterparts must (positive control).
 stamp_inputs_analysis_test(
     name = "build_info_rs_unstamped_no_status_input_test",
-    expect_stable_status = False,
+    expect_input = False,
     target_under_test = ":build_info_rs",
 )
 
 stamp_inputs_analysis_test(
     name = "version_plist_unstamped_no_status_input_test",
-    expect_stable_status = False,
+    expect_input = False,
     target_under_test = ":version_plist_unstamped",
 )
 
 stamp_inputs_analysis_test(
     name = "build_info_rs_stamped_has_status_input_test",
-    expect_stable_status = True,
+    expect_input = True,
     target_under_test = ":build_info_rs_stamped_default_status",
 )
 
 stamp_inputs_analysis_test(
     name = "version_plist_stamped_has_status_input_test",
-    expect_stable_status = True,
+    expect_input = True,
     target_under_test = ":version_plist_stamped_default_status",
 )
 
@@ -251,14 +251,14 @@ build_provenance_rs(
 # could match. A stamped (release) build embeds the time.
 stamp_inputs_analysis_test(
     name = "build_provenance_rs_unstamped_no_build_time_input_test",
-    expect_stable_status = False,
+    expect_input = False,
     status_file = "volatile-status.txt",
     target_under_test = ":build_provenance_rs",
 )
 
 stamp_inputs_analysis_test(
     name = "build_provenance_rs_stamped_has_build_time_input_test",
-    expect_stable_status = True,
+    expect_input = True,
     status_file = "volatile-status.txt",
     target_under_test = ":build_provenance_rs_stamped",
 )

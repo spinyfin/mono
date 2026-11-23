@@ -77,7 +77,7 @@ def attrs_with_stamp(attrs):
 def _stamp_inputs_analysis_test_impl(ctx):
     target = ctx.attr.target_under_test
     status_file = ctx.attr.status_file
-    expected = ctx.attr.expect_stable_status
+    expected = ctx.attr.expect_input
     found = False
     for action in target.actions:
         for f in action.inputs.to_list():
@@ -99,7 +99,7 @@ stamp_inputs_analysis_test = rule(
     analysis_test = True,
     attrs = {
         "target_under_test": attr.label(mandatory = True),
-        "expect_stable_status": attr.bool(
+        "expect_input": attr.bool(
             mandatory = True,
             doc = "Whether an action of the target must take `status_file` as an input.",
         ),
