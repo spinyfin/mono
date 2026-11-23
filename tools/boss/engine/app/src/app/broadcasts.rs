@@ -414,6 +414,88 @@ impl ServerState {
         })
     }
 
+    /// Rebuild the in-memory dispatch outage record from the dispatch event
+    /// stream, so an outage in progress when the engine stopped keeps its
+    /// start time and counters until a new dispatch claims a host. Called once
+    /// at startup, before anything that can refuse or claim a launch; the
+    /// tracker merges the restore into a refusal that got there first and
+    /// drops it if a claim did.
+    pub(crate) async fn restore_dispatch_outage(&self) {
+        let root = self.dispatch_event_root.clone();
+        let events =
+            tokio::task::spawn_blocking(move || boss_dispatch_reader::read_current(&root).map(|read| read.events))
+                .await;
+        match events {
+            Ok(Ok(events)) => {
+                if let Some(started_epoch_s) = self
+                    .execution_coordinator
+                    .dispatch_outage()
+                    .restore_from_events(&events)
+                {
+                    tracing::warn!(
+                        started_epoch_s,
+                        "dispatch outage was in progress when the engine stopped; restored it",
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(error = %format!("{err:#}"), "could not read the dispatch event stream to restore an in-progress dispatch outage");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "dispatch outage restore task failed");
+            }
+        }
+    }
+    /// Push a fresh engine-health snapshot when a global dispatch outage
+    /// starts, ends or changes its host exclusions, and every minute while
+    /// one lasts so the banner's duration and refusal counts stay current.
+    /// Built like [`Self::spawn_spawn_streak_health_broadcaster`], for the
+    /// same reason: the banner is worth nothing if it only appears on a poll.
+    pub fn spawn_dispatch_outage_health_broadcaster(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        const REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+        let weak_state = Arc::downgrade(self);
+        boss_event_bus::spawn_supervised("engine_dispatch_outage_health", move || {
+            let weak_state = weak_state.clone();
+            async move {
+                let Some(state) = weak_state.upgrade() else {
+                    return;
+                };
+                let mut changes = state.execution_coordinator.dispatch_outage().subscribe();
+                state.broadcast_engine_health().await;
+                drop(state);
+                loop {
+                    let active = weak_state
+                        .upgrade()
+                        .is_some_and(|state| state.execution_coordinator.dispatch_outage().active().is_some());
+                    // Idle until the next change; while an outage lasts, also
+                    // wake each minute to refresh its relative times.
+                    let changed = if active {
+                        tokio::select! {
+                            changed = changes.changed() => changed.is_ok(),
+                            () = tokio::time::sleep(REFRESH) => true,
+                        }
+                    } else {
+                        changes.changed().await.is_ok()
+                    };
+                    if !changed {
+                        tracing::warn!(
+                            "dispatch outage broadcaster: notifier closed, subscription ended; outage \
+                             changes will no longer push engine health",
+                        );
+                        return;
+                    }
+                    let Some(state) = weak_state.upgrade() else {
+                        return;
+                    };
+                    tracing::debug!(
+                        outage_active = state.execution_coordinator.dispatch_outage().active().is_some(),
+                        "dispatch outage changed or refreshing — broadcasting engine health to subscribed frontends",
+                    );
+                    state.broadcast_engine_health().await;
+                }
+            }
+        })
+    }
     /// Push a fresh engine-health snapshot whenever the progression sweep
     /// starts, changes or ends its launch backoff notice, and every minute
     /// while it remains active so relative times stay current. Built like

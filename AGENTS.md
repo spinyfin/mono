@@ -106,6 +106,10 @@ root-cause rule as the section below.
   dispatch to chosen projects/products; scope rules, precedence against the
   pause and force-launch, the `focus_mode` hold reason):
   [`tools/boss/docs/dispatch-focus-mode.md`](tools/boss/docs/dispatch-focus-mode.md)
+- Global dispatch outage (every host excluded for every item: what raises
+  it, the app banner, `bossctl dispatch state`/`diagnose` fields, and why a
+  successful launch, not a cleared flag, ends it):
+  [`tools/boss/docs/dispatch-outage.md`](tools/boss/docs/dispatch-outage.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

@@ -8,6 +8,7 @@ mod blocked_workspace;
 mod claimed_dispatch;
 mod conflict_workspace;
 mod dispatch;
+mod dispatch_outage;
 mod engine_rebase_hold;
 mod execution_bookmarks;
 mod execution_contracts;

@@ -136,12 +136,25 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
     let dispatch_paused = server_state.execution_coordinator.is_dispatch_paused();
     let mut issues: Vec<EngineHealthIssue> = Vec::new();
 
+    // A global dispatch outage (every host excluded for every item) is the
+    // headline: nothing new can start at all, which outranks every other
+    // issue the banner can carry. Rendered by the engine, shown verbatim,
+    // and not an attention item — it stays until a new launch claims a host.
+    let dispatch_outage = server_state.execution_coordinator.dispatch_outage().active();
+    if let Some(outage) = dispatch_outage.as_ref() {
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        issues.push(boss_execution_contracts::dispatch_outage_health_issue(
+            outage,
+            &boss_engine_dispatch::coordinator::outage_elapsed_phrase(outage.started_epoch_s, now),
+        ));
+    }
+
     // Pre-start spawn-failure streaks: a (driver, worker kind) combination
     // whose spawns keep failing before a pane exists, with no success in
-    // between. Listed first because the banner's headline is the first
-    // issue, and "a whole class of worker cannot start" is the one entry
-    // here that is actively losing work while it sits unread. The engine
-    // renders the text; the app shows it verbatim. See
+    // between. They follow the dispatch outage above, which must stay first:
+    // the banner headline is the first issue. "A whole class of worker cannot
+    // start" is the one entry here that is actively losing work while it sits
+    // unread. The engine renders the text; the app shows it verbatim. See
     // [`boss_engine_runtime::pre_start_streak`].
     let spawn_failure_streaks = server_state.execution_coordinator.pre_start_streaks().active_alerts();
     let streak_now = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -433,6 +446,7 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         review_guide_reenqueue: server_state.review_guide_reenqueue_summary(),
         issues,
         spawn_failure_streaks,
+        dispatch_outage,
     }
 }
 

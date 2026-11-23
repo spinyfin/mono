@@ -16,9 +16,14 @@ pub(super) struct PreStartFailureReported;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
-struct HostSelectionFailure {
+pub(super) struct HostSelectionFailure {
     report: Vec<Eligibility>,
     message: String,
+    /// Why each registered host is excluded, when every one is excluded for
+    /// a reason that does not depend on the work item — a global dispatch
+    /// outage rather than an item that does not fit. `None` for an ordinary
+    /// per-item refusal.
+    pub(super) global_exclusions: Option<Vec<DispatchOutageHostExclusion>>,
 }
 
 /// Where `cube workspace goto` should position the working copy: a PR
@@ -243,9 +248,21 @@ impl ExecutionCoordinator {
             required_capabilities.insert(driver_capability(driver));
         }
 
-        self.work_db.ensure_work_item_not_quarantined(work_item.primary_id())?;
+        if let Err(err) = self.work_db.ensure_work_item_not_quarantined(work_item.primary_id()) {
+            // A failed startup worker scan holds every work item, so this
+            // refusal is a global outage rather than one item's quarantine.
+            return Err(match self.scan_error_hold_exclusions() {
+                Some(global_exclusions) => anyhow!(HostSelectionFailure {
+                    report: Vec::new(),
+                    message: format!("{err:#}"),
+                    global_exclusions: Some(global_exclusions),
+                }),
+                None => err,
+            });
+        }
         let quarantine_reason = self.work_db.local_dispatch_quarantine_reason()?;
         let mut hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
+        let registry = hosts.clone();
         if quarantine_reason.is_some() {
             hosts.retain(|host| host.id != "local");
         }
@@ -300,6 +317,7 @@ impl ExecutionCoordinator {
                 .ok_or_else(|| anyhow!("selected host '{host_id}' is missing from the registry")),
             None => Err(anyhow!(HostSelectionFailure {
                 report: report.clone(),
+                global_exclusions: self.global_host_exclusions(&registry, quarantine_reason.as_deref()),
                 message: format!(
                     "no eligible host for work item {}: {}{}",
                     work_item.primary_id(),
@@ -1123,15 +1141,26 @@ impl ExecutionCoordinator {
                 // watchdog reaped it as a `worker_claimed` stall. Emit a
                 // terminal `host_selected:error` so the blocker is named in
                 // dispatch.jsonl before recording the start failure.
+                // A global refusal carries the host exclusions it saw so a
+                // reader of the stream (`bossctl dispatch diagnose`, the
+                // engine's restart replay) follows the live record exactly.
+                let global_refusal = self.fold_dispatch_refusal(execution, &err);
+                let refusal_details = match &global_refusal {
+                    Some(refusal) => refusal.refusal_details(),
+                    None => serde_json::json!({ "reason": "no_eligible_host" }),
+                };
                 self.dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
                             .with_work_item(&execution.work_item_id)
                             .with_worker(worker_id)
                             .with_error(&err)
-                            .with_details(serde_json::json!({ "reason": "no_eligible_host" })),
+                            .with_details(refusal_details),
                     )
                     .await;
+                if let Some(refusal) = &global_refusal {
+                    self.announce_dispatch_outage(refusal).await;
+                }
                 if had_requested_host {
                     return Err(err);
                 }
@@ -1202,9 +1231,18 @@ impl ExecutionCoordinator {
                 DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Ok, &execution.id)
                     .with_work_item(&execution.work_item_id)
                     .with_worker(worker_id)
-                    .with_details(serde_json::json!({ "host_id": selected_host.id.clone() })),
+                    .with_details(serde_json::json!({
+                        "host_id": selected_host.id.clone(),
+                        "existing_assignment": held_spoke_host.is_some(),
+                    })),
             )
             .await;
+        // A host handed back by an existing spoke assignment was not chosen by
+        // selection (no enabled/quarantine check ran), so it cannot prove a new
+        // launch can claim a host.
+        if held_spoke_host.is_none() {
+            self.record_dispatch_claim(execution, &selected_host.id).await;
+        }
         tracing::info!(
             execution_id = %execution.id,
             work_item_id = %execution.work_item_id,

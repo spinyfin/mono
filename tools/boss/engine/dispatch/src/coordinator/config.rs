@@ -93,6 +93,7 @@ impl ExecutionCoordinator {
             max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
             pause_state_changed: tokio::sync::watch::channel(0).0,
             pre_start_streaks: Arc::default(),
+            dispatch_outage: Arc::default(),
             repo_lease_limiter: super::lease_limiter::RepoLeaseLimiter::new(MAX_CONCURRENT_LEASE_ATTEMPTS_PER_REPO),
             cube_lease_timeout: CUBE_LEASE_TIMEOUT,
             driving_runs: std::sync::Mutex::new(DrivingRuns::default()),
@@ -1202,6 +1203,22 @@ impl ExecutionCoordinator {
     /// its changes. See `boss_engine::pre_start_streak`.
     pub fn pre_start_streaks(&self) -> &Arc<PreStartStreakTracker> {
         &self.pre_start_streaks
+    }
+
+    /// A failed startup worker scan holds every work item, and most launch
+    /// paths are refused by it silently, so report the active work it is
+    /// keeping from dispatching as a global dispatch outage. Run after startup
+    /// reconcile and then periodically by [`Self::spawn_scan_error_hold_watch`].
+    /// No-op without a scan error, and counts each held item once.
+    pub fn sweep_scan_error_hold(&self) {
+        self.note_scan_error_hold_blocking_active_work();
+    }
+
+    /// The global dispatch outage record. The engine health report reads the
+    /// active outage and `ServerState::spawn_dispatch_outage_health_broadcaster`
+    /// subscribes to its changes.
+    pub fn dispatch_outage(&self) -> &Arc<DispatchOutageTracker> {
+        &self.dispatch_outage
     }
 
     /// The (driver, worker kind) combination a spawn of `execution` on

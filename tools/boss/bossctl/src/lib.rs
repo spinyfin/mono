@@ -26,6 +26,7 @@ mod agents;
 mod command_types;
 mod comments;
 mod dispatch_concurrency;
+mod dispatch_outage;
 mod dispatch_stats;
 mod doctor;
 mod doctor_spawn;

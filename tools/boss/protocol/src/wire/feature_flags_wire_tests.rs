@@ -5,7 +5,9 @@
 //! `wire`, so every item these tests reach is unchanged.
 
 use super::*;
-use crate::health_wire::{EngineHealthIssue, EngineHealthReport, SpawnFailureStreak};
+use crate::health_wire::{
+    DispatchOutage, DispatchOutageHostExclusion, EngineHealthIssue, EngineHealthReport, SpawnFailureStreak,
+};
 use crate::metrics_wire::MetricLiveEntry;
 
 #[test]
@@ -294,6 +296,7 @@ fn engine_health_result_event_round_trips_healthy() {
             review_guide_reenqueue: None,
             issues: Vec::new(),
             spawn_failure_streaks: Vec::new(),
+            dispatch_outage: None,
         },
     };
     let json = serde_json::to_string(&original).unwrap();
@@ -334,6 +337,7 @@ fn engine_health_result_event_round_trips_with_issue() {
             review_guide_reenqueue: None,
             issues: vec![issue.clone()],
             spawn_failure_streaks: Vec::new(),
+            dispatch_outage: None,
         },
     };
     let json = serde_json::to_string(&original).unwrap();
@@ -370,6 +374,7 @@ fn engine_health_result_event_round_trips_spawn_failure_streaks() {
             automation_paused: false,
             issues: Vec::new(),
             spawn_failure_streaks: vec![streak.clone()],
+            dispatch_outage: None,
             review_guide_reenqueue: None,
             engine_version: "1.0.4-dev-abc123".into(),
             engine_git_sha: "abc123".into(),
@@ -392,4 +397,60 @@ fn engine_health_report_without_streak_field_still_deserializes() {
     // (as "no active streaks") rather than failing the whole health read.
     let report: EngineHealthReport = serde_json::from_str(r#"{"anthropic_api_key_present":true,"issues":[]}"#).unwrap();
     assert!(report.spawn_failure_streaks.is_empty());
+}
+
+#[test]
+fn engine_health_result_event_round_trips_dispatch_outage() {
+    // The CLI reads the structured outage; every field, including the
+    // verbatim per-host refusal text, must survive the wire.
+    let outage = DispatchOutage::builder()
+        .started_epoch_s(1_790_494_560)
+        .host_exclusions(vec![
+            DispatchOutageHostExclusion {
+                host_id: "local".into(),
+                kind: "local_quarantine".into(),
+                cause: "held by the startup quarantine".into(),
+                reason: "local dispatch quarantined: historical workers lack tmux identity".into(),
+                recovery_action: Some("clear the hold".into()),
+            },
+            DispatchOutageHostExclusion {
+                host_id: "anaplian".into(),
+                kind: "host_disabled".into(),
+                cause: "disabled".into(),
+                reason: "disabled".into(),
+                recovery_action: None,
+            },
+        ])
+        .refused_attempts(9)
+        .refused_work_items(3)
+        .latest_refusal_epoch_s(1_790_495_000)
+        .latest_work_item_id("task_1")
+        .latest_execution_id("exec_1")
+        .build();
+    let original = FrontendEvent::EngineHealthResult {
+        report: EngineHealthReport::builder()
+            .anthropic_api_key_present(true)
+            .dispatch_paused(false)
+            .automation_paused(false)
+            .issues(Vec::new())
+            .dispatch_outage(outage.clone())
+            .build(),
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
+    match parsed {
+        FrontendEvent::EngineHealthResult { report } => assert_eq!(report.dispatch_outage, Some(outage)),
+        other => panic!("unexpected variant: {other:?}"),
+    }
+}
+
+#[test]
+fn engine_health_report_without_outage_field_still_deserializes() {
+    let report: EngineHealthReport = serde_json::from_str(r#"{"anthropic_api_key_present":true,"issues":[]}"#).unwrap();
+    assert_eq!(report.dispatch_outage, None);
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(
+        !json.contains("dispatch_outage"),
+        "absent outage stays off the wire: {json}"
+    );
 }

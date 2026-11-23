@@ -576,9 +576,19 @@ impl ExecutionCoordinator {
             self.validate_requested_host(&input.work_item_id, &host_id)?;
         }
         let requested_host_id = input.requested_host_id.clone();
+        let work_item_id = input.work_item_id.clone();
         // The store asks about one run at most: the started run that governs
         // this work item. Answering "no worker" is what makes it stale.
         let mut judged_stale = None;
+        // The store refuses a held item before it looks at anything else, so
+        // ask the same question first and decide from what it returned. A
+        // failed startup worker scan holds every item, so a refusal by that
+        // hold is a global outage, not one item's problem; a refusal with no
+        // scan error behind it (one item's own historical worker) is not.
+        if let Err(err) = self.work_db.ensure_work_item_not_quarantined(&work_item_id) {
+            self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+            return Err(err);
+        }
         let execution = self.work_db.request_execution_with_live_check(input, |id| {
             let live = has_worker(id);
             if !live {

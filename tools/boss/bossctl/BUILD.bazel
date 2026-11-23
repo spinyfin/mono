@@ -9,6 +9,7 @@ rust_library(
         "src/command_types.rs",
         "src/comments.rs",
         "src/dispatch_concurrency.rs",
+        "src/dispatch_outage.rs",
         "src/dispatch_stats.rs",
         "src/doctor.rs",
         "src/doctor_spawn.rs",

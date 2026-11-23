@@ -1332,6 +1332,7 @@ dependencies = [
  "boss-engine-structured-output",
  "boss-host-execution",
  "boss-protocol",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
