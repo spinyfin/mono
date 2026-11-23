@@ -94,52 +94,24 @@ pub mod raw {
         pub observed_size: u64,
     }
 
+    /// Async wrapper over [`read_contained_sync`]: the blocking implementation
+    /// is the only one, so truncate-and-regrow detection has a single home.
     pub async fn read_contained(
         path: &Path,
         root: Option<&Path>,
         cursor: &Cursor,
         max_bytes: usize,
     ) -> Result<Chunk, TailError> {
-        let containment = check_root_containment(path, root, cursor.root_identity)?;
-        let mut file = open_no_follow(path).await?;
-        let metadata = file.metadata().await?;
-        if let Some(containment) = &containment {
-            verify_opened_containment(path, containment, &metadata).await?;
-        }
-        let named = fs::symlink_metadata(path).await?;
-        if !metadata.is_file() || !same_file_identity(&metadata, &named) {
-            return Err(TailError::Containment(
-                "transcript must be a single-link regular file".into(),
-            ));
-        }
-        let identity = file_identity(&metadata);
-        let checkpoint_ok = match &cursor.checkpoint {
-            Some(checkpoint) => checkpoint_matches(&mut file, checkpoint).await?,
-            None => cursor.offset == 0,
-        };
-        let (mut next, offset, replaced) = prepare_next_cursor(cursor, &metadata, identity, checkpoint_ok);
-        file.seek(SeekFrom::Start(offset)).await?;
-        let count = metadata.len().saturating_sub(offset).min(max_bytes as u64);
-        let mut data = Vec::with_capacity(count as usize);
-        (&mut file).take(count).read_to_end(&mut data).await?;
-        next.offset += data.len() as u64;
-        next.identity = Some(identity);
-        next.root_identity = containment.map(|c| c.root_identity);
-        next.observed_size = metadata.len();
-        next.checkpoint = read_checkpoint(&mut file, next.offset).await?;
-        Ok(Chunk {
-            eof: next.offset == metadata.len(),
-            cursor: next,
-            offset,
-            data,
-            replaced,
-            previous_size: cursor.observed_size,
-            observed_size: metadata.len(),
-        })
+        let path = path.to_path_buf();
+        let root = root.map(Path::to_path_buf);
+        let cursor = cursor.clone();
+        tokio::task::spawn_blocking(move || read_contained_sync(&path, root.as_deref(), &cursor, max_bytes))
+            .await
+            .map_err(|error| TailError::Io(io::Error::other(error)))?
     }
 
-    /// Synchronous counterpart to [`read_contained`] for callers on non-async
-    /// threads (such as periodic worker-liveness sweeps).
+    /// Blocking implementation behind [`read_contained`]; also usable directly
+    /// from threads that are already off the async runtime.
     pub fn read_contained_sync(
         path: &Path,
         root: Option<&Path>,
@@ -423,29 +395,11 @@ impl TranscriptTail {
 }
 
 async fn checkpoint_matches(file: &mut fs::File, checkpoint: &FileCheckpoint) -> io::Result<bool> {
-    file.seek(SeekFrom::Start(0)).await?;
-    let mut current_prefix = vec![0; checkpoint.prefix.len()];
-    if let Err(error) = file.read_exact(&mut current_prefix).await {
-        return if error.kind() == io::ErrorKind::UnexpectedEof {
-            Ok(false)
-        } else {
-            Err(error)
-        };
-    }
-    if current_prefix != checkpoint.prefix {
-        return Ok(false);
-    }
-    if checkpoint.suffix_start == 0 {
-        return Ok(true);
-    }
-
-    file.seek(SeekFrom::Start(checkpoint.suffix_start)).await?;
-    let mut current_suffix = vec![0; checkpoint.suffix.len()];
-    match file.read_exact(&mut current_suffix).await {
-        Ok(_) => Ok(current_suffix == checkpoint.suffix),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(error),
-    }
+    let mut std_file = file.try_clone().await?.into_std().await;
+    let checkpoint = checkpoint.clone();
+    tokio::task::spawn_blocking(move || checkpoint_matches_sync(&mut std_file, &checkpoint))
+        .await
+        .map_err(io::Error::other)?
 }
 
 fn checkpoint_matches_sync(file: &mut std::fs::File, checkpoint: &FileCheckpoint) -> io::Result<bool> {
@@ -477,28 +431,10 @@ fn checkpoint_matches_sync(file: &mut std::fs::File, checkpoint: &FileCheckpoint
 }
 
 async fn read_checkpoint(file: &mut fs::File, offset: u64) -> io::Result<Option<FileCheckpoint>> {
-    if offset == 0 {
-        return Ok(None);
-    }
-    let length = offset.min(CHECKPOINT_BYTES);
-    file.seek(SeekFrom::Start(0)).await?;
-    let mut prefix = vec![0; length as usize];
-    file.read_exact(&mut prefix).await?;
-
-    let suffix_start = offset - length;
-    let suffix = if suffix_start == 0 {
-        prefix.clone()
-    } else {
-        file.seek(SeekFrom::Start(suffix_start)).await?;
-        let mut suffix = vec![0; length as usize];
-        file.read_exact(&mut suffix).await?;
-        suffix
-    };
-    Ok(Some(FileCheckpoint {
-        prefix,
-        suffix_start,
-        suffix,
-    }))
+    let mut std_file = file.try_clone().await?.into_std().await;
+    tokio::task::spawn_blocking(move || read_checkpoint_sync(&mut std_file, offset))
+        .await
+        .map_err(io::Error::other)?
 }
 
 fn read_checkpoint_sync(file: &mut std::fs::File, offset: u64) -> io::Result<Option<FileCheckpoint>> {

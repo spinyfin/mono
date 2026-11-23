@@ -5,9 +5,9 @@
 //! crate's descriptor-verified containment, partial-line framing, and
 //! same-inode truncate-and-regrow detection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use boss_engine_driver::agy::BackgroundTaskCorrelation;
 use boss_transcript_tail::raw;
@@ -18,14 +18,17 @@ use crate::build_wait_tracker::DEFAULT_BUILD_WAIT_HORIZON_SECS;
 /// poll continue from the updated cursor until EOF.
 const MAX_TRANSCRIPT_SCAN_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
-/// Whether the worker or background-task process is currently alive.
+/// Whether the `agy` worker process is still alive.
+///
+/// Silence from a background task (an unwritten log, buffered output) is not
+/// evidence that it exited, so only a positive signal produces `Exited`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundTaskLiveness {
-    /// The worker or active background task appears to be running.
+    /// The worker process is confirmed alive.
     Alive,
-    /// The worker or active background task has exited or gone stale.
+    /// The worker process is confirmed dead.
     Exited,
-    /// No pid or task log was recorded; fall back to the unmatched-`RUNNING` horizon.
+    /// No pid was recorded; the per-task horizon alone bounds suppression.
     Unknown,
 }
 
@@ -50,7 +53,17 @@ impl BackgroundTaskScan {
 /// whole transcript on every call.
 #[derive(Debug, Default)]
 pub struct BackgroundTaskScanCache {
-    scans: Mutex<HashMap<String, BackgroundTaskScan>>,
+    /// One lock per execution, so one execution's first full transcript scan
+    /// does not block every other execution's snapshot.
+    scans: Mutex<HashMap<String, Arc<Mutex<BackgroundTaskScan>>>>,
+    /// Verdicts the periodic hang sweep publishes for probe-free readers.
+    verdicts: Mutex<Verdicts>,
+}
+
+#[derive(Debug, Default)]
+struct Verdicts {
+    live: HashSet<String>,
+    warned: HashSet<String>,
 }
 
 impl BackgroundTaskScanCache {
@@ -67,12 +80,18 @@ impl BackgroundTaskScanCache {
         probe: F,
     ) -> bool
     where
-        F: FnOnce(&[&Path]) -> BackgroundTaskLiveness,
+        F: FnOnce() -> BackgroundTaskLiveness,
     {
-        let mut scans = self.scans.lock().expect("agy background-task scan cache poisoned");
-        let scan = scans.entry(execution_id.to_owned()).or_default();
+        let scan = Arc::clone(
+            self.scans
+                .lock()
+                .expect("agy background-task scan cache poisoned")
+                .entry(execution_id.to_owned())
+                .or_default(),
+        );
+        let mut scan = scan.lock().expect("agy background-task scan poisoned");
         poll_scan(
-            scan,
+            &mut scan,
             path,
             containment_root,
             now_epoch,
@@ -81,11 +100,33 @@ impl BackgroundTaskScanCache {
         )
     }
 
+    /// Executions the last sweep found covered by a live background task.
+    pub fn live_runs(&self) -> HashSet<String> {
+        self.verdicts.lock().expect("agy verdicts poisoned").live.clone()
+    }
+
+    pub fn replace_live_runs(&self, live: HashSet<String>) {
+        self.verdicts.lock().expect("agy verdicts poisoned").live = live;
+    }
+
+    /// True the first time `execution_id` is reported, so a persistent
+    /// failure logs once instead of on every sweep.
+    pub fn first_warning(&self, execution_id: &str) -> bool {
+        self.verdicts
+            .lock()
+            .expect("agy verdicts poisoned")
+            .warned
+            .insert(execution_id.to_owned())
+    }
+
     pub fn forget(&self, execution_id: &str) {
         self.scans
             .lock()
             .expect("agy background-task scan cache poisoned")
             .remove(execution_id);
+        let mut verdicts = self.verdicts.lock().expect("agy verdicts poisoned");
+        verdicts.live.remove(execution_id);
+        verdicts.warned.remove(execution_id);
     }
 }
 
@@ -98,22 +139,19 @@ fn poll_scan<F>(
     probe: F,
 ) -> bool
 where
-    F: FnOnce(&[&Path]) -> BackgroundTaskLiveness,
+    F: FnOnce() -> BackgroundTaskLiveness,
 {
     if !ingest_transcript(scan, path, containment_root, max_batch_bytes, now_epoch) {
         return false;
     }
-    if !scan.correlation.has_unmatched_running() {
+    // Each task is aged out on its own: an orphaned old task (a daemon, or a
+    // completion in a shape the parser does not know) neither extends nor
+    // revokes the suppression owed to a task launched since.
+    let cutoff = now_epoch.saturating_sub(DEFAULT_BUILD_WAIT_HORIZON_SECS);
+    if !scan.correlation.has_blocking_task_since(cutoff) {
         return false;
     }
-    let Some(oldest_epoch) = scan.correlation.oldest_active_epoch() else {
-        return false;
-    };
-    if now_epoch.saturating_sub(oldest_epoch) >= DEFAULT_BUILD_WAIT_HORIZON_SECS {
-        return false;
-    }
-    let log_paths: Vec<&Path> = scan.correlation.active_log_paths().collect();
-    match probe(&log_paths) {
+    match probe() {
         BackgroundTaskLiveness::Exited => false,
         BackgroundTaskLiveness::Alive | BackgroundTaskLiveness::Unknown => true,
     }
@@ -194,7 +232,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
         let mut exited_scan = BackgroundTaskScan::default();
         assert!(!poll_scan(
@@ -203,7 +241,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Exited,
+            || BackgroundTaskLiveness::Exited,
         ));
     }
 
@@ -227,7 +265,7 @@ mod tests {
             None,
             start,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
         assert!(!poll_scan(
             &mut scan,
@@ -235,7 +273,7 @@ mod tests {
             None,
             start + DEFAULT_BUILD_WAIT_HORIZON_SECS,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
     }
 
@@ -257,13 +295,13 @@ mod tests {
         std::fs::write(&path, format!("{running}{padding}")).unwrap();
         let mut scan = BackgroundTaskScan::default();
         let now = 1_700_000_000;
-        assert!(poll_scan(&mut scan, &path, None, now, batch, |_| {
+        assert!(poll_scan(&mut scan, &path, None, now, batch, || {
             BackgroundTaskLiveness::Alive
         }));
         let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(completion.as_bytes()).unwrap();
         drop(file);
-        assert!(!poll_scan(&mut scan, &path, None, now, batch, |_| {
+        assert!(!poll_scan(&mut scan, &path, None, now, batch, || {
             BackgroundTaskLiveness::Alive
         }));
     }
@@ -281,7 +319,7 @@ mod tests {
         assert!(padding.len() > batch);
         std::fs::write(&path, format!("{padding}{running}")).unwrap();
         let mut scan = BackgroundTaskScan::default();
-        assert!(poll_scan(&mut scan, &path, None, 1_700_000_000, batch, |_| {
+        assert!(poll_scan(&mut scan, &path, None, 1_700_000_000, batch, || {
             BackgroundTaskLiveness::Alive
         },));
     }
@@ -302,14 +340,14 @@ mod tests {
         .unwrap();
         let cache = BackgroundTaskScanCache::new();
         assert!(
-            !cache.poll_with_probe("exec-out", &outside, Some(&root), 1_700_000_000, |_| {
+            !cache.poll_with_probe("exec-out", &outside, Some(&root), 1_700_000_000, || {
                 BackgroundTaskLiveness::Alive
             })
         );
         let inside = root.join("inside.jsonl");
         std::fs::copy(&outside, &inside).unwrap();
         assert!(
-            cache.poll_with_probe("exec-in", &inside, Some(&root), 1_700_000_000, |_| {
+            cache.poll_with_probe("exec-in", &inside, Some(&root), 1_700_000_000, || {
                 BackgroundTaskLiveness::Alive
             })
         );
@@ -332,7 +370,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
 
         // Rewrite in place (same inode) to a larger file with no RUNNING row.
@@ -351,7 +389,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
     }
 
@@ -374,7 +412,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
 
         let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -387,7 +425,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
     }
 
@@ -414,7 +452,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
 
         let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -427,7 +465,7 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
     }
 
@@ -461,12 +499,12 @@ mod tests {
             None,
             now,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
     }
 
     #[test]
-    fn overlapping_tasks_anchor_horizon_on_oldest_remaining_active_task() {
+    fn overlapping_tasks_age_out_individually() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("transcript.jsonl");
         let t0 = "2024-01-01T00:00:00Z";
@@ -494,7 +532,7 @@ mod tests {
             None,
             still_within_second,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
         ));
         assert!(!poll_scan(
             &mut scan,
@@ -502,7 +540,60 @@ mod tests {
             None,
             t_second_epoch + DEFAULT_BUILD_WAIT_HORIZON_SECS,
             MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
-            |_| BackgroundTaskLiveness::Alive,
+            || BackgroundTaskLiveness::Alive,
+        ));
+    }
+
+    #[test]
+    fn orphaned_old_task_does_not_disable_suppression_for_a_fresh_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // task-old never completes; task-new is launched hours later.
+        let transcript = format!(
+            "{}\n{}\n",
+            r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","created_at":"2024-01-01T00:00:00Z","content":"Tool is running as a background task with task id: conv/task-old\n"}"#,
+            r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","created_at":"2024-01-01T03:00:00Z","content":"Tool is running as a background task with task id: conv/task-new\n"}"#,
+        );
+        std::fs::write(&path, transcript).unwrap();
+        let fresh = boss_engine_utils::iso8601::parse_iso8601_to_epoch("2024-01-01T03:00:00Z").unwrap();
+        let mut scan = BackgroundTaskScan::default();
+        assert!(poll_scan(
+            &mut scan,
+            &path,
+            None,
+            fresh + 60,
+            MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
+            || BackgroundTaskLiveness::Alive,
+        ));
+        // Once the fresh task also ages out, nothing is suppressed.
+        assert!(!poll_scan(
+            &mut scan,
+            &path,
+            None,
+            fresh + DEFAULT_BUILD_WAIT_HORIZON_SECS,
+            MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
+            || BackgroundTaskLiveness::Alive,
+        ));
+    }
+
+    #[test]
+    fn daemon_running_row_does_not_hide_a_silent_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let transcript = format!(
+            "{}\n{}\n",
+            r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"engine","IsDaemon":true}}]}"#,
+            r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","content":"Tool is running as a background task with task id: conv/task-1\nTask logs are available at: file:///tmp/daemon.log\n"}"#,
+        );
+        std::fs::write(&path, transcript).unwrap();
+        let mut scan = BackgroundTaskScan::default();
+        assert!(!poll_scan(
+            &mut scan,
+            &path,
+            None,
+            1_700_000_000,
+            MAX_TRANSCRIPT_SCAN_BATCH_BYTES,
+            || BackgroundTaskLiveness::Alive,
         ));
     }
 }
