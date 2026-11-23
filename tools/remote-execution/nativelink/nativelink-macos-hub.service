@@ -1,32 +1,41 @@
-# systemd user unit for the hub: scheduler, CAS and action cache (hub.json5)
-# for the macOS and the Linux workers. Install as
-# ~/.config/systemd/user/nativelink-macos-hub.service; the runbook
-# (../README.md, "Cutover") has the steps.
+# System unit for the NativeLink hub: scheduler, CAS and action cache
+# (hub.json5) for the macOS and the Linux workers.
 #
-# The name and the directory say "macos" because the Linux workers had a hub
-# of their own until 2026-11-22. One scheduler now serves both, and routes on
-# the OSFamily property (../README.md, "Routing").
+# Moved from bduff's user unit (~/.config/systemd/user/nativelink-macos-hub.service,
+# left in place, disabled, for rollback) on 2026-11-22, because under the user
+# manager the hub ran with oom_score_adj 200 and the kernel OOM killer picked
+# it first whenever the Linux worker's compiles and links filled RAM. Here it
+# runs at OOMScoreAdjust=-900 with MemoryLow protection and no swap.
+#
+# Rollback: sudo systemctl disable --now nativelink-macos-hub.service, then as
+# bduff: systemctl --user enable --now nativelink-macos-hub.service
 [Unit]
 Description=NativeLink hub for remote execution (scheduler, CAS, action cache)
+Wants=network-online.target
 After=network-online.target
+RequiresMountsFor=/mnt/cache
 
 [Service]
+User=bduff
+Group=bduff
 # Host values hub.json5 expands: listen addresses, data directory, store
-# sizes. hub.json5 lists them. A variable that is missing fails the start with
-# an error naming it; nothing falls back to a default.
-EnvironmentFile=%h/nativelink-macos-hub/hub.env
-ExecStart=%h/nativelink-macos-hub/nativelink %h/nativelink-macos-hub/hub.json5
-WorkingDirectory=%h/nativelink-macos-hub
-# Restart after a crash. This is not a recovery mechanism for a scheduler that
-# is running but not scheduling: that state does not exit, so nothing here
-# would restart it, and nothing should. nativelink-macos-hub-health.timer
-# reports it, and the runbook says what to look at before restarting by hand.
+# sizes. A variable that is missing fails the start with an error naming it.
+EnvironmentFile=/home/bduff/nativelink-macos-hub/hub.env
+ExecStart=/home/bduff/nativelink-macos-hub/nativelink /home/bduff/nativelink-macos-hub/hub.json5
+WorkingDirectory=/home/bduff/nativelink-macos-hub
+# Restart after a crash; not a recovery mechanism for a scheduler that is
+# running but not scheduling (nativelink-macos-hub-health.timer reports that).
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
-# One JSON event per line in the journal. hub-health.sh reads it, and
-# refuses any other format instead of reading it as a quiet scheduler.
+# One JSON event per line in the journal; hub-health.sh reads it.
 Environment=NL_LOG=json
+# Keep the hub alive under memory pressure: the OOM killer takes compiles
+# first, the hub's working set (anon ~0.3-1.3G plus hot CAS page cache) is
+# protected from reclaim up to 4G, and none of it goes to swap.
+OOMScoreAdjust=-900
+MemoryLow=4G
+MemorySwapMax=0
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

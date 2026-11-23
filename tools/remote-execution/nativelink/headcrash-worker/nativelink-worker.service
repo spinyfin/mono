@@ -1,0 +1,18 @@
+[Unit]
+Description=NativeLink worker for Linux remote execution (hub on empiricist)
+After=network-online.target
+
+[Service]
+ExecStart=%h/nativelink/nativelink %h/nativelink/worker.json5
+WorkingDirectory=%h/nativelink
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+# Build actions yield to the macOS hub on this host, and cannot take its
+# memory: if actions outgrow the limit they are killed, not the hub.
+Nice=5
+MemoryHigh=24G
+MemoryMax=26G
+
+[Install]
+WantedBy=default.target

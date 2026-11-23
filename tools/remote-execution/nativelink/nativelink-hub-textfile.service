@@ -4,9 +4,9 @@
 # nativelink-hub-textfile.timer starts it every 30 s. The runbook
 # (../README.md, "Hub metrics") has the steps.
 #
-# This is a system unit, not a user one: the hub itself is a user unit, which
-# node_exporter's systemd collector cannot see, and the textfile directory
-# (/var/lib/prometheus/node-exporter) is root-owned. ExecStart is an absolute
+# This is a system unit because the textfile directory
+# (/var/lib/prometheus/node-exporter) is root-owned. The hub is a system unit
+# too (nativelink-macos-hub.service), so `systemctl show` needs no --user. ExecStart is an absolute
 # path because a system unit's %h is root's home. After=user@1000.service is
 # the hub user's systemd instance on this host (uid 1000).
 #

@@ -142,7 +142,7 @@ for name in $(variables "$hub"); do
     fail "README.md's hub.env example does not set ${name}"
   fi
 done
-grep -q -x 'EnvironmentFile=%h/nativelink-macos-hub/hub.env' "$hub_unit" ||
+grep -q -x 'EnvironmentFile=/home/bduff/nativelink-macos-hub/hub.env' "$hub_unit" ||
   fail "the hub's unit must read hub.env"
 grep -q -x 'EnvironmentFile=%h/nativelink-macos-hub/hub.env' "$health_unit" ||
   fail "the health check's unit must read hub.env, where the admin address is"
@@ -187,8 +187,50 @@ grep -q -x 'Environment=NL_LOG=json' "$hub_unit" ||
 # The journal of the unit the hub runs as.
 grep -q -x 'ExecStart=%h/nativelink-macos-hub/hub-health.sh --journal-unit nativelink-macos-hub.service' "$health_unit" ||
   fail "the health check must read the journal of nativelink-macos-hub.service"
-grep -q 'journalctl --user --quiet --unit' "$health" ||
+grep -q 'journalctl --quiet --unit' "$health" ||
   fail "hub-health.sh must pass --quiet to journalctl so an empty window is not '-- No entries --'"
+if grep -q -E 'journalctl .*--user' "$health"; then
+  fail "hub-health.sh reads the hub's journal, a system unit: journalctl must not pass --user"
+fi
+# The hub is a system unit (bduff's user manager ran it at oom_score_adj 200
+# and the OOM killer took it first); the health timer and slots exporter stay
+# user units.
+for line in 'User=bduff' 'Group=bduff' 'Restart=always' 'RestartSec=5' 'LimitNOFILE=65536' \
+  'RequiresMountsFor=/mnt/cache' 'OOMScoreAdjust=-900' 'MemoryLow=4G' 'MemorySwapMax=0' \
+  'Wants=network-online.target' 'After=network-online.target' 'WantedBy=multi-user.target' \
+  'ExecStart=/home/bduff/nativelink-macos-hub/nativelink /home/bduff/nativelink-macos-hub/hub.json5'; do
+  grep -q -x -F "$line" "$hub_unit" || fail "the hub's system unit must contain: ${line}"
+done
+if grep -q -x 'WantedBy=default.target' "$hub_unit"; then
+  fail "the hub's unit is a system unit: it must be WantedBy=multi-user.target, not default.target"
+fi
+for f in "$textfile" "$slots_exporter"; do
+  if grep -v -E '^[[:space:]]*(#|""")' "$f" | grep -q -E '"?systemctl"?.*--user'; then
+    fail "$(basename "$f") reads the hub, a system unit: systemctl must not pass --user"
+  fi
+done
+grep -q -F 'sudo_copy_if_changed "$REPO/nativelink-macos-hub.service" /etc/systemd/system/nativelink-macos-hub.service 644' "$readme" ||
+  fail "README.md must install the hub's unit under /etc/systemd/system with sudo_copy_if_changed"
+if grep -q -E 'systemctl --user [a-z-]+ (--now )?nativelink-macos-hub\.service|journalctl --user --unit nativelink-macos-hub\.service|\.config/systemd/user/nativelink-macos-hub\.service 644' "$readme"; then
+  fail "README.md must not install or drive the hub as a user unit"
+fi
+
+# The Linux worker on the hub's host: its limits keep a compile burst inside
+# the worker's cgroup.
+hw="${dir}/nativelink/headcrash-worker"
+for line in 'MemoryHigh=16G' 'MemoryMax=18G' 'OOMScoreAdjust=300'; do
+  grep -q -x -F "$line" "${hw}/nativelink-worker.service.d/memory.conf" ||
+    fail "headcrash's memory.conf must contain: ${line}"
+done
+grep -q -F 'nativelink-1.8.6+stale-entry' "${hw}/nativelink-worker.service.d/60-v1.8.conf" ||
+  fail "headcrash's 60-v1.8.conf must start the pinned worker binary"
+grep -q -x -F '        max_inflight_tasks: 12,' "${hw}/worker.json5" ||
+  fail "headcrash's worker.json5 must run 12 slots"
+grep -q -F 'cpu_count: { values: ["12"] }' "${hw}/worker.json5" ||
+  fail "headcrash's cpu_count must equal its slots"
+grep -q -F '/swap2.img' "$readme" ||
+  fail "README.md must document the host's swap files"
+
 grep -q -x 'OnUnitActiveSec=1min' "$health_timer" ||
   fail "the health check must run every minute"
 # The scheduler by the name the admin API knows it under.

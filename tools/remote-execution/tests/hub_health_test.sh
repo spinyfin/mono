@@ -332,6 +332,10 @@ expect "idle journal" 0 "healthy: 6/6 workers"
 if ! grep -q -- '--quiet' "${hub}/journalctl-args"; then
   fail "idle journal: journalctl was not passed --quiet: $(cat "${hub}/journalctl-args")"
 fi
+# The hub is a system unit: its journal is read without --user.
+if grep -q -- '--user' "${hub}/journalctl-args"; then
+  fail "idle journal: journalctl was passed --user, but the hub is a system unit: $(cat "${hub}/journalctl-args")"
+fi
 cp "$log" "${hub}/journal.log"
 check_journal
 expect "journal with JSON" 0 "healthy: 6/6 workers" "1 log lines"

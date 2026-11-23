@@ -1,0 +1,74 @@
+// NativeLink worker for Linux remote execution on headcrash.
+//
+// Started by systemd (user unit nativelink-worker.service). The scheduler and
+// the shared cache are the hub that also serves the macOS workers (one
+// scheduler for both since 2026-11-22; it routes on OSFamily, which this
+// worker declares as "linux"). This process only runs actions: it fetches
+// inputs from the shared cache, keeps a local copy of them, and uploads
+// results back.
+//
+// The local store and the work directory must stay on the same filesystem:
+// the worker hardlinks inputs from the store into action roots.
+{
+  stores: [
+    {
+      name: "SHARED_CAS",
+      grpc: {
+        instance_name: "",
+        endpoints: [{ address: "grpc://127.0.0.1:50051" }],
+        store_type: "cas",
+        experimental_remote_cache_compression: false,
+      },
+    },
+    {
+      name: "SHARED_AC",
+      grpc: {
+        instance_name: "",
+        endpoints: [{ address: "grpc://127.0.0.1:50051" }],
+        store_type: "ac",
+      },
+    },
+    {
+      name: "WORKER_FAST_SLOW_STORE",
+      fast_slow: {
+        fast: {
+          filesystem: {
+            content_path: "/mnt/ssd/nativelink-linux-worker/v1.8/content",
+            temp_path: "/mnt/ssd/nativelink-linux-worker/v1.8/tmp",
+            eviction_policy: { max_bytes: 150000000000 },
+          },
+        },
+        fast_direction: "get",
+        slow: { ref_store: { name: "SHARED_CAS" } },
+      },
+    },
+  ],
+  workers: [
+    {
+      local: {
+        // Prefixes the worker id, so the hub\'s worker listing and its log say
+        // which host a line is about.
+        name: "headcrash-",
+        worker_api_endpoint: { uri: "grpc://127.0.0.1:50061" },
+        cas_fast_slow_store: "WORKER_FAST_SLOW_STORE",
+        upload_action_result: { ac_store: "SHARED_AC" },
+        work_directory: "/mnt/ssd/nativelink-linux-worker/v1.8/work",
+        // Every action runs inside the bubblewrap sandbox; the script is a
+        // byte-identical copy of the one on the other Linux workers.
+        entrypoint: "/home/bduff/nativelink/action-sandbox.sh",
+        additional_environment: { NL_ACTION_DIRECTORY: "action_directory" },
+        // Slots, sized by RAM (30 GB here, shared with the macOS hub), not by
+        // the 24 threads (12 since 2026-11-22: the 18G MemoryMax drop-in caps the
+        // worker; about 1.5 GB per slot). Keep the two numbers equal.
+        max_inflight_tasks: 12,
+        platform_properties: {
+          cpu_count: { values: ["12"] },
+          OSFamily: { values: ["linux"] },
+          "worker-host": { values: ["headcrash"] },
+        },
+      },
+    },
+  ],
+  servers: [],
+  global: { max_open_files: 24576 },
+}
