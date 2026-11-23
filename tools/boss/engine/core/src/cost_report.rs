@@ -608,21 +608,27 @@ pub fn build_top_cost_report(
         .build()
 }
 
+/// Echoed filters and window for [`build_runs_list_report`].
+#[derive(Debug, Clone, Default, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct RunsListQuery {
+    pub driver_filter: Option<String>,
+    pub kind_filter: Option<String>,
+    pub limit: Option<u32>,
+    pub since_epoch_s: Option<i64>,
+    pub status_filter: Option<String>,
+    pub until_epoch_s: Option<i64>,
+    pub work_item_filter: Option<String>,
+}
+
 /// Build the `boss runs list` report from pre-filtered `records` (preserving
 /// their query order). Every run is included regardless of token state:
 /// unmeasured runs have `tokens_measured = false` and `None` token fields,
 /// while recorded zero-token runs have `tokens_measured = true` and
 /// `total_tokens = Some(0)`.
-#[allow(clippy::too_many_arguments)]
 pub fn build_runs_list_report(
     records: &[CostRunRecord],
-    since_epoch_s: Option<i64>,
-    until_epoch_s: Option<i64>,
-    driver_filter: Option<String>,
-    kind_filter: Option<String>,
-    status_filter: Option<String>,
-    work_item_filter: Option<String>,
-    limit: Option<u32>,
+    query: &RunsListQuery,
     truncated: bool,
     generated_at_epoch_s: i64,
 ) -> RunsListReport {
@@ -671,13 +677,13 @@ pub fn build_runs_list_report(
         .rows(rows)
         .generated_at_epoch_s(generated_at_epoch_s)
         .truncated(truncated)
-        .maybe_driver_filter(driver_filter)
-        .maybe_kind_filter(kind_filter)
-        .maybe_limit(limit)
-        .maybe_since_epoch_s(since_epoch_s)
-        .maybe_status_filter(status_filter)
-        .maybe_until_epoch_s(until_epoch_s)
-        .maybe_work_item_filter(work_item_filter)
+        .maybe_driver_filter(query.driver_filter.clone())
+        .maybe_kind_filter(query.kind_filter.clone())
+        .maybe_limit(query.limit)
+        .maybe_since_epoch_s(query.since_epoch_s)
+        .maybe_status_filter(query.status_filter.clone())
+        .maybe_until_epoch_s(query.until_epoch_s)
+        .maybe_work_item_filter(query.work_item_filter.clone())
         .build()
 }
 
@@ -987,13 +993,7 @@ mod tests {
 
         let report = build_runs_list_report(
             &[unmeasured, zero, partial],
-            Some(50),
-            Some(200),
-            None,
-            None,
-            None,
-            None,
-            None,
+            &RunsListQuery::builder().since_epoch_s(50).until_epoch_s(200).build(),
             false,
             200,
         );

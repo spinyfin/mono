@@ -171,7 +171,7 @@ pub struct CostTopRow {
     pub output_tokens: Option<i64>,
     pub status: String,
     pub total_tokens: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub driver: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
@@ -229,7 +229,7 @@ pub struct RunHistoryRow {
     pub tokens_partial: bool,
     pub cache_creation_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub driver: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
@@ -301,4 +301,51 @@ pub struct SolArmReport {
 pub struct SolComparisonReport {
     pub arms: Vec<SolArmReport>,
     pub notes: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn sample_run_history_row() -> RunHistoryRow {
+        RunHistoryRow::builder()
+            .execution_id("exec_1")
+            .run_id("run_1")
+            .work_item_id("task_1")
+            .created_at_epoch_s(100)
+            .execution_status("completed")
+            .kind("chore_implementation")
+            .name("Fix cursor flicker")
+            .status("failed")
+            .build()
+    }
+
+    fn sample_top_row() -> CostTopRow {
+        CostTopRow::builder()
+            .execution_id("exec_1")
+            .run_id("run_1")
+            .work_item_id("task_1")
+            .kind("chore_implementation")
+            .name("Fix cursor flicker")
+            .status("completed")
+            .total_tokens(10)
+            .build()
+    }
+
+    #[test]
+    fn run_history_row_emits_driver_null_when_unrecorded() {
+        let encoded = serde_json::to_value(sample_run_history_row()).unwrap();
+        assert_eq!(encoded["driver"], Value::Null);
+        let decoded: RunHistoryRow = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.driver, None);
+    }
+
+    #[test]
+    fn cost_top_row_emits_driver_null_when_unrecorded() {
+        let encoded = serde_json::to_value(sample_top_row()).unwrap();
+        assert_eq!(encoded["driver"], Value::Null);
+        let decoded: CostTopRow = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.driver, None);
+    }
 }

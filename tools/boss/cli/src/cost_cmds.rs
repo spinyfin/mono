@@ -125,12 +125,41 @@ async fn resolve_leaf_work_item_id(
     Ok(task.id.clone())
 }
 
+/// How `boss runs list --work-item` treats a selector: friendly short ids
+/// still resolve through the engine, while canonical owner ids (task,
+/// comment, automation, comparison, product, project) pass through as
+/// `work_executions.work_item_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunsListOwnerSelector {
+    Friendly,
+    Canonical(String),
+}
+
+fn classify_runs_list_owner(raw: &str) -> RunsListOwnerSelector {
+    match parse_work_item_selector(raw) {
+        WorkItemSelector::ShortId(_) | WorkItemSelector::ProductShortId { .. } => RunsListOwnerSelector::Friendly,
+        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => RunsListOwnerSelector::Canonical(id),
+    }
+}
+
+async fn resolve_runs_list_owner_id(
+    client: &mut WorkerClient,
+    ctx: &RunContext,
+    raw_selector: &str,
+    product: Option<String>,
+) -> Result<String, CliError> {
+    match classify_runs_list_owner(raw_selector) {
+        RunsListOwnerSelector::Friendly => resolve_leaf_work_item_id(client, ctx, raw_selector, product).await,
+        RunsListOwnerSelector::Canonical(id) => Ok(id),
+    }
+}
+
 pub(crate) async fn run_runs_command(command: RunsCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
         RunsCommand::List(args) => {
             let work_item_id = match args.work_item.as_deref() {
-                Some(raw) => Some(resolve_leaf_work_item_id(&mut client, ctx, raw, args.product).await?),
+                Some(raw) => Some(resolve_runs_list_owner_id(&mut client, ctx, raw, args.product).await?),
                 None => None,
             };
             let (since_epoch_s, until_epoch_s) =
@@ -193,7 +222,7 @@ fn resolve_window(since: &str, until: Option<&str>) -> Result<(i64, i64), CliErr
     Ok((since_epoch_s, until_epoch_s))
 }
 
-fn resolve_optional_window(
+pub(crate) fn resolve_optional_window(
     since: Option<&str>,
     until: Option<&str>,
     has_work_item: bool,
@@ -588,6 +617,92 @@ mod tests {
         assert_eq!(format_optional_tokens(None), "unknown");
         assert_eq!(format_optional_tokens(Some(0)), "0");
         assert_eq!(format_token_total(12, true), "12 (partial)");
+    }
+
+    #[test]
+    fn classify_runs_list_owner_passes_canonical_non_task_ids() {
+        assert_eq!(classify_runs_list_owner("42"), RunsListOwnerSelector::Friendly);
+        assert_eq!(classify_runs_list_owner("t12"), RunsListOwnerSelector::Friendly);
+        assert_eq!(classify_runs_list_owner("acme/7"), RunsListOwnerSelector::Friendly);
+        assert_eq!(
+            classify_runs_list_owner("task_abc"),
+            RunsListOwnerSelector::Canonical("task_abc".into())
+        );
+        assert_eq!(
+            classify_runs_list_owner("comment_owner_1"),
+            RunsListOwnerSelector::Canonical("comment_owner_1".into())
+        );
+        assert_eq!(
+            classify_runs_list_owner("auto_owner_1"),
+            RunsListOwnerSelector::Canonical("auto_owner_1".into())
+        );
+        assert_eq!(
+            classify_runs_list_owner("cmp_owner_1"),
+            RunsListOwnerSelector::Canonical("cmp_owner_1".into())
+        );
+    }
+
+    #[test]
+    fn resolve_optional_window_defaults_to_24h_when_unscoped() {
+        let (since, until) = resolve_optional_window(None, None, false).unwrap();
+        assert_eq!(until.unwrap() - since.unwrap(), 86_400);
+    }
+
+    #[test]
+    fn resolve_optional_window_keeps_explicit_since() {
+        let (since, until) = resolve_optional_window(Some("7d"), None, false).unwrap();
+        assert_eq!(until.unwrap() - since.unwrap(), 7 * 86_400);
+    }
+
+    #[test]
+    fn resolve_optional_window_with_work_item_and_no_since_is_unbounded() {
+        let (since, until) = resolve_optional_window(None, None, true).unwrap();
+        assert_eq!((since, until), (None, None));
+    }
+
+    #[test]
+    fn resolve_optional_window_until_only_with_work_item() {
+        let (since, until) = resolve_optional_window(None, Some("2026-07-01T00:00:00Z"), true).unwrap();
+        assert_eq!(since, None);
+        assert_eq!(until, Some(1_782_864_000));
+    }
+
+    #[test]
+    fn resolve_optional_window_until_only_without_work_item_still_starts_24h_ago() {
+        let (since, until) = resolve_optional_window(None, Some("1h"), false).unwrap();
+        assert_eq!(until.unwrap() - since.unwrap(), 23 * 3_600);
+    }
+
+    #[test]
+    fn runs_list_cli_rejects_limit_zero() {
+        let err = Cli::try_parse_from(["boss", "runs", "list", "--limit", "0"]).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("must be at least 1"),
+            "expected --limit 0 to be rejected, got: {text}"
+        );
+    }
+
+    #[test]
+    fn runs_list_cli_parses_canonical_non_task_work_item() {
+        let cli = Cli::try_parse_from([
+            "boss",
+            "runs",
+            "list",
+            "--work-item",
+            "comment_owner_1",
+            "--kind",
+            "answer_agent",
+        ])
+        .expect("canonical owner id is accepted");
+        let Commands::Runs {
+            command: RunsCommand::List(args),
+        } = cli.command
+        else {
+            panic!("expected RunsCommand::List");
+        };
+        assert_eq!(args.work_item.as_deref(), Some("comment_owner_1"));
+        assert_eq!(args.kind.as_deref(), Some("answer_agent"));
     }
 
     #[test]

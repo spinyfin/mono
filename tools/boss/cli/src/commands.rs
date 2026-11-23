@@ -2945,8 +2945,10 @@ pub(crate) struct RunsListArgs {
     #[arg(long)]
     pub(crate) status: Option<String>,
 
-    /// Filter to runs for one work item. Accepts: primary id (`task_…`),
-    /// friendly short id (`42`, `#42`, `t42`), or `product/42`.
+    /// Filter to runs for one owner. Accepts a work-item selector
+    /// (primary id, friendly short id, `product/42`) or a canonical
+    /// non-task owner id stored on the execution (comment, automation,
+    /// or review-guide comparison).
     #[arg(long = "work-item", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
     pub(crate) work_item: Option<String>,
 
@@ -2955,11 +2957,20 @@ pub(crate) struct RunsListArgs {
     #[arg(long)]
     pub(crate) product: Option<String>,
 
-    /// Maximum number of runs to return, newest first.
-    #[arg(long)]
+    /// Maximum number of runs to return, newest first. Must be at least 1.
+    #[arg(long, value_parser = parse_positive_u32)]
     pub(crate) limit: Option<u32>,
 
     /// Print report timestamps in UTC instead of this host's local time.
     #[arg(long)]
     pub(crate) utc: bool,
+}
+
+fn parse_positive_u32(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|_| format!("invalid integer {s:?}"))?;
+    if n == 0 {
+        Err("must be at least 1".into())
+    } else {
+        Ok(n)
+    }
 }

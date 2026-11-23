@@ -56,15 +56,16 @@ The app's work-tree requests do not trigger these reads. They run on separate re
 
 Migration `20261121_1800_recurring_read_indexes` (`tools/boss/engine/work-db/src/recurring_read_indexes.rs`) adds seven indexes. Five are partial, so they hold only live rows and stay a few pages however much history accumulates; `tasks_status_idx` and `work_executions_finished_at_idx` cover every row.
 
-| Index                                | Serves                                                          |
-| ------------------------------------ | --------------------------------------------------------------- |
-| `tasks_status_idx`                   | every `status = '...'` task read                                |
-| `tasks_open_idx`                     | reads written as `status NOT IN ('done', 'archived')`           |
-| `tasks_dispatch_failed_idx`          | clearing stale dispatch-failure banners                         |
-| `work_executions_terminal_lease_idx` | finished executions still holding a workspace lease             |
-| `work_executions_finished_at_idx`    | finished-time windows written as `CAST(finished_at AS INTEGER)` |
-| `worker_proposals_undecided_idx`     | undecided proposals by kind, oldest first                       |
-| `work_runs_local_shell_ended_idx`    | local runs with a shell pid, by end time                        |
+| Index                                | Serves                                                                                                        |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `tasks_status_idx`                   | every `status = '...'` task read                                                                              |
+| `tasks_open_idx`                     | reads written as `status NOT IN ('done', 'archived')`                                                         |
+| `tasks_dispatch_failed_idx`          | clearing stale dispatch-failure banners                                                                       |
+| `work_executions_terminal_lease_idx` | finished executions still holding a workspace lease                                                           |
+| `work_executions_finished_at_idx`    | finished-time windows written as `CAST(finished_at AS INTEGER)`                                               |
+| `worker_proposals_undecided_idx`     | undecided proposals by kind, oldest first                                                                     |
+| `work_runs_local_shell_ended_idx`    | local runs with a shell pid, by end time                                                                      |
+| `work_runs_created_at_idx`           | run-history and cost window reads by `CAST(created_at AS INTEGER)` (`20261123_1415_work_runs_created_at_idx`) |
 
 Several statements were rewritten or pinned so the plan does not depend on planner statistics:
 
@@ -77,10 +78,11 @@ Several statements were rewritten or pinned so the plan does not depend on plann
 
 The migration analyzes only the indexes it creates. Building them reads each of the four tables once, on the first start after the upgrade.
 
-Two follow-up migrations cover the periodic and retention sweeps:
+Follow-up migrations cover later periodic, retention, and run-history reads:
 
 - `20261122_0515_review_guide_retention_indexes` (`tools/boss/engine/work-db/src/review_guide_source_retention.rs`) adds `pr_review_guide_versions_attempt_idx`, `pr_review_guide_versions_comparison_idx`, and `pr_review_guide_updates_previous_version_idx` so the `NOT EXISTS` checks in `prune_pr_review_guide_sources` seek by index (`139` pages in `sweep_read_budget_tests` over 500 seeded guide series/versions).
 - `20261122_0630_work_db_periodic_sweep_indexes` (`tools/boss/engine/work-db/src/recurring_read_indexes.rs`) adds nine partial indexes (`tasks_positioning_refused_idx`, `tasks_open_pr_idx`, `tasks_pr_url_live_non_revision_idx`, `tasks_origin_pr_url_idx`, `work_executions_preserved_commit_idx`, `work_executions_never_started_prunable_idx`, `execution_bookmarks_recovered_from_idx`, `execution_bookmarks_archive_cleanup_idx`, and `work_runs_ephemeral_transcript_idx`). On the fixture, preserved-work cleanup reads `1` page per pass, positioning-hold recheck reads `43` pages, PR binding repair reads `509` pages, steady-state execution retention reads `63` pages, and durable transcript-path backfill reads `1` page.
+- `20261123_1415_work_runs_created_at_idx` (`tools/boss/engine/work-db/src/recurring_read_indexes.rs`) adds `work_runs_created_at_idx` so run-history and cost window reads seek by `CAST(created_at AS INTEGER)` (ordered with `id`).
 
 ### Result on the fixture
 
