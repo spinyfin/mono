@@ -1,0 +1,33 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Accept the recommendation to begin a NativeLink shared-cache and remote-execution pilot while durable telemetry and local cache-cap cleanup land in parallel?",
+    "anchor": "verdict"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which Linux-first integration should the prototype prioritize after direct RBE works?",
+    "choices": [
+      "Development proxy host with workspace synchronization",
+      "Remote Boss engine presented through tmux",
+      "Prototype both and choose from measurements"
+    ],
+    "anchor": "linux-first-build-and-test-execution"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Does NativeLink's license permit the intended single-operator, multi-machine production deployment?",
+    "anchor": "software-choice"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should the first additional Mac be used during the measured rollout?",
+    "choices": [
+      "Darwin RBE worker",
+      "Whole-agent host",
+      "Expose both roles and let measured capacity decide",
+      "Use an existing Mac before purchasing"
+    ],
+    "anchor": "interaction-with-distributed-agent-execution"
+  }
+]
