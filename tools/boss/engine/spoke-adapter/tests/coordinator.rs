@@ -1,10 +1,9 @@
 //! The real dispatch coordinator against the authenticated scripted spoke.
-use super::{short, support::*, timing, workspace_slack};
+use super::{short, support::*, workspace_slack};
 
 pub(crate) use super::support::{
-    FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, drive_resumed_deadline_pass, elapse,
-    fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_async, until_elapsed,
-    until_ready_after_stored,
+    FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, elapse, freeze_clock, thaw_clock, until,
+    until_async, until_elapsed, until_ready_after_stored,
 };
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
@@ -67,8 +66,6 @@ const IN_DOUBT: &str = "spoke_assignment_in_doubt";
 /// Pre-start retry budget is 3 delays. One extra pass proves a spent budget
 /// would have failed the execution.
 const MORE_THAN_PRE_START_BUDGET: usize = 4;
-/// Host `pool_size` in [`env`]: attempts on that host share one slot.
-const HOST_SLOTS: usize = 1;
 
 fn quick() -> SpokeInDoubtTiming {
     SpokeInDoubtTiming {
@@ -87,7 +84,7 @@ struct Env {
 }
 
 async fn env(fx: &Fixture, slots: usize) -> Env {
-    fx.db.add_host(HOST, "worker@host", HOST_SLOTS as i64, &[]).unwrap();
+    fx.db.add_host(HOST, "worker@host", 1, &[]).unwrap();
     fx.db
         .connect()
         .unwrap()
@@ -335,7 +332,7 @@ async fn a_settled_indeterminate_spawn_parks_then_an_adopt_that_finds_it_alive_r
     let alive = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&alive);
     let _clock = FrozenClock::new();
-    let peer = timing::guarded(fx.spoke(
+    let peer = guarded(fx.spoke(
         Box::new(move |command| match &command.body {
             Some(command::Body::Spawn(_)) => Some(refused(command, ResultCode::OutcomeUncertain, "interrupted launch")),
             Some(command::Body::Adopt(_)) if flag.load(Ordering::SeqCst) => {
@@ -553,7 +550,7 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
     // hide that path. The clock is held so only the explicit advances
     // below expire the unanswered leases.
     freeze_clock();
-    let (fx, env, executions, peer) = timing::guarded(async {
+    let (fx, env, executions, peer) = guarded(async {
         let fx = Fixture::with_frozen_liveness(short(300)).await;
         let env = env(&fx, 2).await;
         let executions = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
@@ -573,14 +570,14 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
         (fx, env, executions, peer)
     })
     .await;
-    timing::guarded(until_elapsed("both leases to be parked with attention", || {
+    guarded(until_elapsed("both leases to be parked with attention", || {
         executions.iter().all(|e| attention_open(&fx, &e.id))
     }))
     .await;
 
     // Several dispatch passes later (more than the pre-start retry budget),
     // nothing has failed and nothing holds capacity.
-    timing::guarded(async {
+    guarded(async {
         let lease_ids: std::collections::BTreeSet<_> = peer
             .commands()
             .iter()
@@ -641,6 +638,11 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
             .map(|c| c.command_id.clone())
             .collect();
         assert_eq!(later_ids, lease_ids, "each pass reuses the stored lease command");
+        assert_eq!(
+            peer.commands().iter().filter(|c| is_lease(c)).count(),
+            2,
+            "no pass re-delivers a stored lease frame"
+        );
 
         // The hosts answer late: both executions proceed to spawn.
         for (n, lease) in peer.commands().into_iter().filter(is_lease).enumerate() {
@@ -652,7 +654,7 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
             peer.answer_late(&lease, answer_as(&lease, granted).unwrap()).await;
         }
         env.coordinator.kick();
-        timing::condition(|| {
+        until("both parked executions to spawn after the late grants", || {
             peer.commands()
                 .iter()
                 .filter(|c| matches!(c.body, Some(command::Body::Spawn(_))))
@@ -660,7 +662,10 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
                 == 2
         })
         .await;
-        timing::condition(|| executions.iter().all(|e| !attention_open(&fx, &e.id))).await;
+        until("the late grants to clear attention", || {
+            executions.iter().all(|e| !attention_open(&fx, &e.id))
+        })
+        .await;
     })
     .await;
 }
@@ -669,8 +674,8 @@ async fn unanswered_spoke_leases_park_without_holding_capacity_or_spending_the_r
 /// dispatch passes than the pre-start retry budget allows, and optionally a
 /// second host that every later pass would rank higher.
 async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: bool) {
-    timing::hold();
-    let (fx, env, execution, peer, events) = timing::guarded(async {
+    freeze_clock();
+    let (fx, env, execution, peer, events) = guarded(async {
         let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
         let mut env = env(&fx, 1).await;
         let events = Arc::new(boss_engine_runtime::dispatch_events::RecordingDispatchEventSink::new());
@@ -699,22 +704,23 @@ async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: 
             )
             .await;
         env.coordinator.kick();
-        timing::condition(|| peer.commands().iter().any(is_lease)).await;
+        until("the unanswered lease to be stored", || {
+            peer.commands().iter().any(is_lease)
+        })
+        .await;
         (fx, env, execution, peer, events)
     })
     .await;
     // The clock stays held: only the intentionally unanswered lease's command
-    // deadline is advanced, and stream liveness timers cannot fire. The
-    // invariant is checked on every step, not only at the end: a charged
-    // attempt waits out a wall-clock backoff and its retry is kicked from a
-    // timer on the held clock, so no later pass would ever open the item and
-    // the charge would surface as this wait hanging.
-    timing::guarded(timing::advancing(|| {
+    // deadline is advanced, and stream liveness timers cannot fire. Check
+    // the invariant on every step so a charged attempt fails immediately
+    // instead of hanging while its retry waits for a wall-clock backoff.
+    until_elapsed("the unanswered command to park with attention", || {
         assert_never_failed(&fx, &execution.id);
         attention_open(&fx, &execution.id)
-    }))
+    })
     .await;
-    timing::guarded(async {
+    guarded(async {
         let seen = peer.commands();
         let cursor = Cursor {
             journal_id: peer.journal.clone(),
@@ -759,7 +765,7 @@ async fn a_disconnected_host_is_never_charged_for_an_admitted_lease(other_host: 
         let peer = fx.spoke(Box::new(answer), Some(cursor), last_record).await;
         peer.answer_late(&lease, answer(&lease).unwrap()).await;
         env.coordinator.kick();
-        timing::condition(|| {
+        until("the disconnected host's lease to be answered late and spawn", || {
             peer.commands()
                 .iter()
                 .any(|c| matches!(c.body, Some(command::Body::Spawn(_))))
@@ -788,8 +794,8 @@ async fn a_better_ranked_host_never_takes_over_an_admitted_lease() {
 /// the host, never a failed start.
 #[tokio::test]
 async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spending_the_retry_budget() {
-    timing::hold();
-    timing::guarded(async {
+    freeze_clock();
+    guarded(async {
         let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
         let mut env = env(&fx, 1).await;
         // Shorter than the adapter's five-second command deadline, so the
@@ -810,9 +816,15 @@ async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spendi
         env.coordinator.kick();
         // The lease is stored and on the wire; the attempt now waits on timers
         // alone, so the one advance below cannot overtake work in flight.
-        timing::condition(|| peer.commands().iter().any(is_lease)).await;
+        until("the backstop lease to be stored", || {
+            peer.commands().iter().any(is_lease)
+        })
+        .await;
         tokio::time::advance(Duration::from_secs(2)).await;
-        timing::condition(|| fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Ready).await;
+        until("the lease backstop to park the execution", || {
+            fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Ready
+        })
+        .await;
 
         let row = fx.db.get_execution(&execution.id).unwrap();
         assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
@@ -839,7 +851,7 @@ async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spendi
                     .await
             }
         });
-        timing::advancing(|| forced.is_finished()).await;
+        until_elapsed("the forced lease backstop to finish", || forced.is_finished()).await;
         let forced_err = forced.await.unwrap().unwrap_err();
         assert!(
             forced_err
@@ -1192,6 +1204,14 @@ async fn a_spawn_that_resolved_alive_is_not_driven_again_by_the_sweep() {
     restarted.reconcile_ended_in_doubt_spokes().await;
     assert!(!fx.db.spoke_execution_in_doubt(&execution.id).unwrap());
     assert!(!attention_open(&fx, &execution.id));
+    // The sweep resumes a live execution's driver asynchronously, so being
+    // idle at this instant proves nothing. A driver that was started would
+    // show as driving or as a counted dispatch pass.
+    assert!(
+        !restarted.is_driving_execution(&execution.id),
+        "the sweep must not drive a worker that resolved alive"
+    );
+    assert_eq!(restarted.spoke_pass_starts(&execution.id), 0);
     until("the healthy-worker sweep finished asking the host", || {
         command_idle(&fx)
     })
@@ -1278,7 +1298,7 @@ async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released(
     let show_lease = Arc::new(AtomicBool::new(false));
     let script_show = Arc::clone(&show_lease);
     let mut clock = FrozenClock::new();
-    let peer = timing::guarded(fx.spoke(
+    let peer = guarded(fx.spoke(
         Box::new(move |command| {
             if is_lease(command) {
                 return None;
@@ -1351,8 +1371,8 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
     // only the explicit advances below expire a command. Firing the 5s lease
     // deadline on the default 2s pulse would close the stream; the 90s lease
     // backstop would also fire if virtual time ran ahead of persist.
-    timing::hold();
-    timing::guarded(async {
+    freeze_clock();
+    guarded(async {
         let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
         let env = env(&fx, 3).await;
         let parked = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
@@ -1369,8 +1389,11 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         // persist can start. Advance only until that stored command parks,
         // then hold the clock while the second persist runs so the 5s
         // command deadline cannot overtake it.
-        timing::condition(|| peer.commands().iter().any(is_lease)).await;
-        timing::advancing(|| {
+        until("the first unanswered lease to be stored", || {
+            peer.commands().iter().any(is_lease)
+        })
+        .await;
+        until_elapsed("the first unanswered lease to park", || {
             assert_parked_never_failed(&fx, &parked);
             parked_without_charge(&fx, &parked[0].id)
         })
@@ -1378,17 +1401,17 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         // The park arms a 100 ms retry kick. Expire that timer, then wait
         // with the clock held so the second persist cannot be overtaken by
         // the 5s command deadline. Kick on each poll: a one-shot kick can
-        // be consumed while HOST_SLOTS=1 is still held, and
-        // `timing::condition` never moves the clock.
+        // be consumed while HOST_SLOTS=1 is still held, and `until` never
+        // moves the clock.
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(100) + TICK).await;
-        timing::condition(|| {
+        until("the second unanswered lease to be stored", || {
             env.coordinator.kick();
             assert_parked_never_failed(&fx, &parked);
             peer.commands().iter().filter(|c| is_lease(c)).count() >= 2
         })
         .await;
-        timing::advancing(|| {
+        until_elapsed("both unanswered leases to be parked", || {
             assert_parked_never_failed(&fx, &parked);
             parked.iter().all(|e| attention_open(&fx, &e.id))
         })
@@ -1403,7 +1426,7 @@ async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_seco
         // in flight. The park-delay timers were expired above. Kick on
         // each poll so a wake consumed while the first host's slot is
         // still draining is retried.
-        timing::condition(|| {
+        until("the third execution to lease and spawn on the other host", || {
             env.coordinator.kick();
             assert_parked_never_failed(&fx, &parked);
             other
@@ -1431,7 +1454,7 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
     let first = triage(&fx, &env, "hung adopt");
     let first_id = first.id.clone();
     let _clock = FrozenClock::new();
-    let peer = timing::guarded(fx.spoke(
+    let peer = guarded(fx.spoke(
         Box::new(move |command| match &command.body {
             Some(command::Body::Spawn(_)) if run_of(command) == first_id => {
                 Some(refused(command, ResultCode::OutcomeUncertain, "interrupted launch"))
@@ -1489,7 +1512,7 @@ async fn a_hung_in_doubt_adopt_does_not_stall_the_scheduler_heartbeat() {
         "heartbeat reconcile must still see the cancelled in-doubt assignment"
     );
     fx.add_spoke_host("other", 8);
-    let other = timing::guarded(fx.spoke_as("other", Box::new(answer), None, 0)).await;
+    let other = guarded(fx.spoke_as("other", Box::new(answer), None, 0)).await;
     let second = triage(&fx, &env, "stranded ready");
     let spawned = || {
         other

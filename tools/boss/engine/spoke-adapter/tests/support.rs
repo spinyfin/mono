@@ -43,15 +43,15 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server,
 pub const STEP: Duration = Duration::from_secs(10);
 pub const HOST: &str = "host";
 
-/// Real TCP / gRPC connect. A paused clock auto-advances `timeout` when no
-/// task is runnable, so frozen tests keep a yield loop instead of a virtual
-/// STEP bound.
+/// Real TCP / gRPC connect. Under a paused clock a virtual `timeout(STEP)` would
+/// never fire (or fire early on auto-advance), so frozen tests bound the connect
+/// on wall time with [`guarded`] instead.
 async fn connect_within_step<T, E>(op: impl std::future::Future<Output = Result<T, E>>) -> T
 where
     E: std::fmt::Debug,
 {
     if clock_frozen() {
-        crate::timing::guarded(op).await.expect("spoke connect")
+        guarded(op).await.expect("spoke connect")
     } else {
         tokio::time::timeout(STEP, op)
             .await
@@ -118,21 +118,50 @@ impl Drop for FrozenClock {
 
 /// Park on wall time so gRPC can run while tokio's clock is paused.
 ///
-/// `tokio::time::sleep` would freeze. A `spawn_blocking` sleep alone is also
-/// wrong: with a paused `test-util` clock, tokio auto-advances to the next
-/// timer when no async task is runnable, so command deadlines fire during
-/// persist. Keep a yield loop runnable for the duration of the park.
+/// `tokio::time::sleep` would freeze. A `spawn_blocking` task inhibits tokio's
+/// paused-clock auto-advance for as long as it runs, so awaiting one keeps
+/// virtual time still without keeping the runtime thread busy.
 async fn wall_park(dur: Duration) {
-    let sleep = tokio::task::spawn_blocking(move || std::thread::sleep(dur));
-    tokio::select! {
-        result = sleep => {
-            result.expect("wall-clock park");
-        }
-        () = async {
-            loop {
-                tokio::task::yield_now().await;
+    tokio::task::spawn_blocking(move || std::thread::sleep(dur))
+        .await
+        .expect("wall-clock park");
+}
+
+/// A wall-clock hang guard that is independent of the manually controlled
+/// tokio clock. Polls `operation` while parking on wall time, so a paused clock
+/// cannot auto-advance and expire a command deadline while real I/O is in
+/// flight; only explicit advances in the test can.
+#[track_caller]
+pub(crate) fn guarded<T>(operation: impl std::future::Future<Output = T>) -> impl std::future::Future<Output = T> {
+    guarded_at(std::panic::Location::caller(), operation)
+}
+
+async fn guarded_at<T>(
+    armed_at: &'static std::panic::Location<'static>,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    const HANG: Duration = Duration::from_secs(120);
+    let started = std::time::Instant::now();
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            () = wall_park(TICK) => {
+                assert!(started.elapsed() < HANG, "test made no completion within two minutes (hang guard armed at {armed_at})");
             }
-        } => unreachable!("yield loop holds the paused clock still"),
+        }
+    }
+}
+
+/// Run `operation` with the tokio clock paused, thawing it afterwards.
+#[track_caller]
+pub(crate) fn while_frozen<T>(operation: impl std::future::Future<Output = T>) -> impl std::future::Future<Output = T> {
+    let armed_at = std::panic::Location::caller();
+    async move {
+        freeze_clock();
+        let result = guarded_at(armed_at, operation).await;
+        thaw_clock();
+        result
     }
 }
 
@@ -224,35 +253,6 @@ pub(crate) async fn until_elapsed(what: &str, mut ready: impl FnMut() -> bool) {
             return;
         }
         tokio::time::advance(TICK).await;
-    }
-}
-
-/// Wait for I/O-driven `ready` under a paused clock.
-///
-/// Advances virtual time by at most `max_virtual` so timers that must fire
-/// can run, then parks on wall time only. Callers that need a timer to fire
-/// first should `until_elapsed` for that signal, then `until` for `send_command`.
-pub(crate) async fn until_io(what: &str, mut ready: impl FnMut() -> bool, max_virtual: Duration) {
-    debug_assert!(clock_frozen());
-    let deadline = std::time::Instant::now() + WAIT;
-    let mut advanced = Duration::ZERO;
-    loop {
-        if ready() {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::task::yield_now().await;
-        if ready() {
-            return;
-        }
-        wall_park(TICK).await;
-        if ready() {
-            return;
-        }
-        if advanced + TICK <= max_virtual {
-            tokio::time::advance(TICK).await;
-            advanced += TICK;
-        }
     }
 }
 
@@ -414,35 +414,6 @@ pub(crate) async fn drive_poll_deadline_passes(
         })
         .await;
         seen += 1;
-    }
-}
-
-/// After a restart sweep resumes a live execution, wait until that driver
-/// has started and completed one pass. Fires any armed command deadline
-/// under a frozen clock, and ticks virtual time so prompt-confirmation
-/// timers can fire too. An idle command layer is not evidence of a pass.
-pub(crate) async fn drive_resumed_deadline_pass(
-    mut started: impl FnMut() -> u64,
-    mut completed: impl FnMut() -> u64,
-    mut waiting: impl FnMut() -> bool,
-    deadline: Duration,
-    starts_before: u64,
-    completions_before: u64,
-) {
-    let _clock = (!clock_frozen()).then(FrozenClock::new);
-    until("a resumed pass started", || started() > starts_before).await;
-    let watchdog = std::time::Instant::now();
-    while completed() <= completions_before {
-        assert!(
-            watchdog.elapsed() < WAIT,
-            "timed out waiting for the resumed pass completed parking or a local failure"
-        );
-        if waiting() {
-            elapse(deadline + TICK).await;
-        } else {
-            pace_io().await;
-            elapse(TICK).await;
-        }
     }
 }
 
@@ -1139,6 +1110,8 @@ impl Fixture {
             .liveness(liveness)
             .build();
         if self.frozen_liveness {
+            // Settling advances virtual time, so the clock must be paused.
+            let _clock = (!clock_frozen()).then(FrozenClock::new);
             peer.settle_initial_pulse().await;
         }
         peer

@@ -5,7 +5,6 @@ mod coordinator;
 mod regressions;
 mod routing;
 mod support;
-mod timing;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -76,7 +75,7 @@ pub(crate) fn workspace_slack(spawn_deadline_ms: u64) -> SpokeAdapterConfig {
 /// `command_deadline` must fire. `spawn_deadline` is load-tolerant so a slow
 /// Spawn reply cannot be an unsettled timeout before Stop is even sent.
 /// `workspace_slack` would raise the Stop deadline to 5s. The unanswered Stop
-/// is expired with virtual time so the retry assertion stays a few hundred
+/// is expired with virtual time, so the short deadline costs a few hundred
 /// milliseconds of tokio time, independent of sibling-test contention.
 pub(crate) fn answered_spawn_short_stop(command_deadline_ms: u64) -> SpokeAdapterConfig {
     SpokeAdapterConfig::builder()
@@ -234,31 +233,6 @@ async fn frozen_until_does_not_auto_advance_virtual_time() {
     assert!(
         tokio::time::Instant::now() - virtual_start < Duration::from_millis(100),
         "paused-clock waits must not auto-advance to the next timer"
-    );
-    assert!(!sleeper.is_finished(), "the 5s timer must still be pending");
-    sleeper.abort();
-    thaw_clock();
-}
-
-/// `until_io` may advance timers that must fire, then parks on wall time so a
-/// sweep or command deadline cannot expire while gRPC is still entering send.
-#[tokio::test]
-async fn frozen_until_io_caps_virtual_time() {
-    freeze_clock();
-    let virtual_start = tokio::time::Instant::now();
-    let ready = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&ready);
-    let sleeper = tokio::spawn(async {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    });
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(80));
-        flag.store(true, Ordering::SeqCst);
-    });
-    until_io("late wall-time flag", || ready.load(Ordering::SeqCst), TICK).await;
-    assert!(
-        tokio::time::Instant::now() - virtual_start <= TICK,
-        "I/O waits must not keep advancing after the virtual budget"
     );
     assert!(!sleeper.is_finished(), "the 5s timer must still be pending");
     sleeper.abort();
@@ -456,7 +430,7 @@ async fn runs_keep_their_transport_and_a_spoke_lease_is_never_sent_over_ssh() {
 
 #[tokio::test]
 async fn control_requests_name_the_run_and_keep_receipt_delivery_and_uncertainty_apart() {
-    timing::frozen(async {
+    while_frozen(async {
         let fx = Fixture::with(short(600)).await;
         fx.ready(HOST);
         let adapter = fx.adapter(HOST, "exec_1").await.unwrap();
@@ -521,7 +495,7 @@ async fn control_requests_name_the_run_and_keep_receipt_delivery_and_uncertainty
                     .await
             })
         };
-        timing::condition(|| {
+        until("the unanswered probe to be stored", || {
             peer.commands()
                 .iter()
                 .any(|c| matches!(&c.body, Some(command::Body::Deliver(d)) if d.kind == DeliveryKind::Probe as i32))

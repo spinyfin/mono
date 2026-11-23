@@ -25,6 +25,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 
+[features]
+# Test-only observation hooks (per-op command counters).
+test-support = []
+
 [dev-dependencies]
 boss-engine-runtime = { path = "../core/runtime", features = ["test-support"] }
 boss-host-enrollment = { path = "../host-enrollment" }
