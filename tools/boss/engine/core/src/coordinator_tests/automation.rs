@@ -178,12 +178,13 @@ async fn automation_dispatch_worker_id_maps_to_automation_pool_slot() {
         "automation-pool execution must receive an auto-worker-N worker_id, got {worker_id:?}"
     );
 
-    // Decoded slot must be in the automation-pool range (> MAX_WORKER_POOL_SIZE).
+    // Decoded slot must be in the automation-pool range (17..=24, directly
+    // above the lower main range 1..=16).
     let slot =
         slot_id_from_worker_id(worker_id).unwrap_or_else(|| panic!("slot_id_from_worker_id failed for {worker_id:?}"));
     assert!(
-        slot as usize > MAX_WORKER_POOL_SIZE,
-        "automation slot_id {slot} must be > {MAX_WORKER_POOL_SIZE} (the regular-pool ceiling); \
+        (17..=24).contains(&slot),
+        "automation slot_id {slot} must be in 17..=24 (above the lower main range); \
              got slot {slot} — automation pane would land on a regular-pool pane (slot-decoding regression)"
     );
 }

@@ -27,16 +27,43 @@ fn every_legacy_slot_round_trips_and_classifies() {
 }
 
 #[test]
+fn upper_main_slots_decode_to_main_indexes_17_through_32() {
+    let main = WorkerSlotPool::Local(DispatchPool::Main);
+    for slot in 45u8..=60 {
+        let identity = WorkerSlotIdentity::from_legacy_slot(slot).unwrap();
+        assert_eq!(identity.pool, main);
+        assert_eq!(identity.index.get(), u32::from(slot) - 28);
+        assert_eq!(identity.to_legacy_slot(), Some(slot));
+        let id = format!("worker-{}", identity.index);
+        assert_eq!(identity.to_legacy_worker_id(), Some(id.clone()));
+        assert_eq!(WorkerSlotIdentity::from_legacy_worker_id(&id), Some(identity));
+    }
+    // The ranges between and around the main halves keep their other pools.
+    for (slot, pool) in [
+        (16, main),
+        (17, WorkerSlotPool::Local(DispatchPool::Automation)),
+        (24, WorkerSlotPool::Local(DispatchPool::Automation)),
+        (25, WorkerSlotPool::Local(DispatchPool::Review)),
+        (40, WorkerSlotPool::Local(DispatchPool::Review)),
+        (41, WorkerSlotPool::Local(DispatchPool::Progression)),
+        (44, WorkerSlotPool::Local(DispatchPool::Progression)),
+        (45, main),
+    ] {
+        assert_eq!(WorkerSlotIdentity::from_legacy_slot(slot).unwrap().pool, pool, "{slot}");
+    }
+    // Main index 33 has no legacy slot; it must not alias another range.
+    assert_eq!(WorkerSlotIdentity::new(main, 33).unwrap().to_legacy_slot(), None);
+}
+
+#[test]
 fn invalid_and_overlapping_legacy_values_are_rejected() {
-    for slot in std::iter::once(0).chain(45..200) {
+    for slot in std::iter::once(0).chain(61..200) {
         assert_eq!(WorkerSlotIdentity::from_legacy_slot(slot), None);
     }
     for id in [
         "",
         "worker-0",
-        "worker-17",
-        "worker-25",
-        "worker-32",
+        "worker-33",
         "worker-64",
         "worker-199",
         "worker-256",
@@ -70,7 +97,7 @@ fn canonical_indexes_are_positive_and_independent_of_legacy_capacity() {
     ];
     for pool in pools {
         assert_eq!(WorkerSlotIdentity::new(pool, 0), None);
-        for index in [32, 64, 256, 1024, u32::MAX] {
+        for index in [33, 64, 256, 1024, u32::MAX] {
             let identity = WorkerSlotIdentity::new(pool, index).unwrap();
             let json = serde_json::to_string(&identity).unwrap();
             assert_eq!(serde_json::from_str::<WorkerSlotIdentity>(&json).unwrap(), identity);

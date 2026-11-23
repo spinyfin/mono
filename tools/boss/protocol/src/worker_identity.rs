@@ -6,6 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DispatchPool, REMOTE_SLOT_BASE};
 
+/// First legacy slot of the upper main range (main indexes 17..=32).
+const MAIN_UPPER_SLOT_FIRST: u8 = 45;
+/// Last legacy slot of the upper main range.
+const MAIN_UPPER_SLOT_LAST: u8 = 60;
+/// `legacy slot - offset` is the main index for the upper main range.
+const MAIN_UPPER_SLOT_OFFSET: u8 = 28;
+
 /// Remote virtual slots are not a dispatch pool: their execution can be of any kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,9 +37,21 @@ impl WorkerSlotIdentity {
         })
     }
 
-    /// Decode only the frozen legacy allocation ranges (main 1..=16,
-    /// automation 17..=24, review 25..=40, progression 41..=44, remote
-    /// `REMOTE_SLOT_BASE..=u8::MAX`). Gaps are invalid.
+    /// Decode only the frozen legacy allocation ranges. Gaps are invalid.
+    ///
+    /// | legacy slots | identity |
+    /// |---|---|
+    /// | 1..=16 | main 1..=16 |
+    /// | 17..=24 | automation 1..=8 |
+    /// | 25..=40 | review 1..=16 |
+    /// | 41..=44 | progression 1..=4 |
+    /// | 45..=60 | main 17..=32 |
+    /// | 61..=199 | unallocated |
+    /// | `REMOTE_SLOT_BASE..=u8::MAX` | remote |
+    ///
+    /// Main indexes 17..=32 sit above the progression range rather than
+    /// shifting the automation, review and progression ranges, so no existing
+    /// slot number moves.
     ///
     /// Keep these constants in sync with `execution-contracts` pool-size
     /// constants (verified by `legacy_codec_boundaries_match_pool_size_constants`
@@ -40,6 +59,9 @@ impl WorkerSlotIdentity {
     pub fn from_legacy_slot(slot: u8) -> Option<Self> {
         let (pool, offset) = match slot {
             1..=16 => (WorkerSlotPool::Local(DispatchPool::Main), 0),
+            MAIN_UPPER_SLOT_FIRST..=MAIN_UPPER_SLOT_LAST => {
+                (WorkerSlotPool::Local(DispatchPool::Main), MAIN_UPPER_SLOT_OFFSET)
+            }
             17..=24 => (WorkerSlotPool::Local(DispatchPool::Automation), 16),
             25..=40 => (WorkerSlotPool::Local(DispatchPool::Review), 24),
             41..=44 => (WorkerSlotPool::Local(DispatchPool::Progression), 40),
@@ -52,7 +74,14 @@ impl WorkerSlotIdentity {
     /// Larger canonical identities cannot be squeezed into another pool's range.
     pub fn to_legacy_slot(self) -> Option<u8> {
         let (offset, count) = match self.pool {
-            WorkerSlotPool::Local(DispatchPool::Main) => (0, 16),
+            WorkerSlotPool::Local(DispatchPool::Main) => {
+                let index = self.index.get();
+                return match index {
+                    1..=16 => Some(index as u8),
+                    17..=32 => Some((index + u32::from(MAIN_UPPER_SLOT_OFFSET)) as u8),
+                    _ => None,
+                };
+            }
             WorkerSlotPool::Local(DispatchPool::Automation) => (16, 8),
             WorkerSlotPool::Local(DispatchPool::Review) => (24, 16),
             WorkerSlotPool::Local(DispatchPool::Progression) => (40, 4),

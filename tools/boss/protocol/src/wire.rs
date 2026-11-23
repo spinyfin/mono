@@ -2417,7 +2417,7 @@ pub enum FrontendRequest {
 
     /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency
     /// cap that `drain_ready_queue` enforces separately from the underlying
-    /// 16-slot main worker pool (see `MAX_CONCURRENT_INTERACTIVE_WORKERS`).
+    /// 32-slot main worker pool (see `MAX_CONCURRENT_INTERACTIVE_WORKERS`).
     /// `limit` must be at least 1 — `0` is rejected with
     /// [`FrontendEvent::WorkError`], since it would wedge all mainline
     /// dispatch with no error surface; values above `MAX_WORKER_POOL_SIZE`

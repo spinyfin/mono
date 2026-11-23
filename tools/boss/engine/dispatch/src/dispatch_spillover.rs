@@ -10,15 +10,16 @@
 //! # The priority order
 //!
 //! There are three dispatch pools (see [`crate::coordinator`]): the
-//! interactive/main pool (slots 1..=16, paged into "Bridge Crew" 1..=8 and
-//! "Lower Decks" 9..=16), the automation pool (`auto-worker-N`, slots
-//! 17..=24), and the review pool (`review-N`, slots 25..=40). Automation
+//! interactive/main pool (main indexes 1..=32, paged into "Bridge Crew" 1..=8,
+//! "Lower Decks" 9..=16 and two further decks; legacy slots 1..=16 and
+//! 45..=60), the automation pool (`auto-worker-N`, slots 17..=24), and the
+//! review pool (`review-N`, slots 25..=40). Automation
 //! work routinely exceeds its 8 slots while interactive slots sit idle.
 //!
 //! This module implements two interlocking rules:
 //!
 //! 1. **Spillover.** When the automation pool is full, an automation
-//!    execution may claim a free *Lower Decks* slot — but strictly below
+//!    execution may claim a free slot on any page after Bridge Crew — but strictly below
 //!    ALL mainline work. Any ready mainline item beats any ready
 //!    automation item for a non-automation slot regardless of arrival
 //!    order. Automation only ever takes interactive capacity that no
@@ -33,15 +34,15 @@
 //! The resulting order is: **mainline > review > spilled automation**,
 //! with preemption as a last resort available to mainline alone.
 //!
-//! # Why spillover targets Lower Decks only
+//! # Why spillover never targets Bridge Crew
 //!
-//! Restricting spill to page 1 keeps all 8 Bridge Crew slots permanently
+//! Restricting spill to pages after the first keeps all 8 Bridge Crew slots permanently
 //! available to mainline. Without that restriction a burst of automation
 //! could occupy low-numbered slots between drain passes, and the next
 //! mainline arrival would have to preempt to run at all. Confining spill
-//! to Lower Decks means preemption stays genuinely rare: it fires only
+//! to the later pages means preemption stays genuinely rare: it fires only
 //! once mainline itself has filled all of Bridge Crew *and* whatever part
-//! of Lower Decks automation left alone.
+//! of the later pages automation left alone.
 
 pub(crate) use boss_execution_contracts::SlotView;
 
