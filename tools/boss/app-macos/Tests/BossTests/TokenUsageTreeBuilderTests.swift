@@ -230,6 +230,207 @@ final class TokenUsageTreeBuilderTests: XCTestCase {
         XCTAssertTrue(TokenUsageTree.mixesInputConventions(nodes))
     }
 
+    func testCodexOnlyNodesSetContainsGrossWithoutMixingAndMixedNodesSetBoth() throws {
+        let codex = sampleCodexTask()
+        let codexGroup = sampleGroup(dimension: .driver, value: "codex", label: "Codex", tasks: [codex])
+        let groupedNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [codexGroup]))
+        let group = try XCTUnwrap(groupedNodes.first)
+        let task = try XCTUnwrap(group.children?.first)
+        let execution = try XCTUnwrap(task.children?.first)
+        let run = try XCTUnwrap(execution.children?.first)
+
+        XCTAssertTrue(run.containsGross)
+        XCTAssertFalse(run.mixesGross)
+        XCTAssertTrue(execution.containsGross)
+        XCTAssertFalse(execution.mixesGross)
+        XCTAssertTrue(task.containsGross)
+        XCTAssertFalse(task.mixesGross)
+        XCTAssertTrue(group.containsGross)
+        XCTAssertFalse(group.mixesGross)
+        XCTAssertFalse(TokenUsageTree.mixesInputConventions(groupedNodes))
+
+        let claude = sampleGrokLikeTask(id: "t_claude", driver: "claude", total: 10)
+        let mixedGroup = sampleGroup(dimension: .project, value: "proj", label: "Proj", tasks: [claude, codex])
+        let mixedNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [mixedGroup]))
+        let mixed = try XCTUnwrap(mixedNodes.first)
+        XCTAssertTrue(mixed.containsGross)
+        XCTAssertTrue(mixed.mixesGross)
+        XCTAssertTrue(TokenUsageTree.mixesInputConventions(mixedNodes))
+    }
+
+    func testSubscriptionUnpricedPropagatesAboveRunLevelAndNotWhenMixed() throws {
+        var grokTask = sampleGrokLikeTask(id: "t_grok", driver: "grok", name: "Grok work", total: 20)
+        grokTask.executions[0].runs[0].unpriceableCause = "subscription_unpriced"
+        let grokGroup = sampleGroup(dimension: .driver, value: "grok", label: "Grok", tasks: [grokTask])
+        let grokNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [grokGroup]))
+        let group = try XCTUnwrap(grokNodes.first)
+        let task = try XCTUnwrap(group.children?.first)
+        let execution = try XCTUnwrap(task.children?.first)
+
+        XCTAssertEqual(execution.unpriceableCause, "subscription_unpriced")
+        XCTAssertEqual(task.unpriceableCause, "subscription_unpriced")
+        XCTAssertEqual(group.unpriceableCause, "subscription_unpriced")
+        let formatted = TokenUsageFormatter.usd(
+            estimated: group.estimatedUsd,
+            partial: group.estimatedUsdPartial,
+            unpriceableCause: group.unpriceableCause
+        )
+        XCTAssertEqual(formatted?.display, "— unpriced (subscription)")
+
+        let claudeTask = sampleGrokLikeTask(id: "t_claude", driver: "claude", name: "Claude work", total: 30)
+        let mixedGroup = sampleGroup(dimension: .project, value: "proj", label: "Proj", tasks: [claudeTask, grokTask])
+        let mixedNodes = TokenUsageTree.build(sampleReport(tasks: [], groups: [mixedGroup]))
+        let mixed = try XCTUnwrap(mixedNodes.first)
+        XCTAssertNil(mixed.unpriceableCause)
+    }
+
+    func testAllPreCaptureAggregateSetsDominantCaveat() throws {
+        var unmeasured = CostMeasurement.empty
+        unmeasured.runsTotal = 1
+        unmeasured.runsUnmeasured = 1
+        let preRun = RunUsageRow(
+            runId: "run-pre",
+            coverage: .unmeasured,
+            createdAtEpochS: 10,
+            hostId: "local",
+            inputConvention: .unknown,
+            status: "completed",
+            caveats: [
+                UsageCaveat(code: "driver_not_recorded", detail: nil),
+                UsageCaveat(code: "pre_capture", detail: nil),
+            ],
+            models: [],
+            tokens: nil,
+            agentActiveMs: nil,
+            finishedAtEpochS: 11,
+            modelObserved: nil,
+            rounds: nil,
+            startedAtEpochS: 10,
+            totalTokens: nil,
+            usageUnavailable: nil,
+            estimatedUsd: nil,
+            unpriceableCause: nil
+        )
+        let exec = ExecutionUsageNode(
+            executionId: "exec-pre",
+            workItemId: "task-pre",
+            createdAtEpochS: 10,
+            driverSource: .unknown,
+            kind: "chore_implementation",
+            measurement: unmeasured,
+            spendClass: .implementation,
+            status: "completed",
+            runs: [preRun],
+            driver: nil,
+            effortLaunched: nil,
+            finishedAtEpochS: 11,
+            hostId: "local",
+            modelLaunched: nil,
+            prUrl: nil,
+            startedAtEpochS: 10
+        )
+        let task = TaskUsageNode(
+            taskId: "task-pre",
+            chainRootId: "task-pre",
+            direct: unmeasured,
+            isChainRoot: true,
+            kind: "chore",
+            name: "Pre-capture task",
+            productId: "prod",
+            runsOutsideWindow: 0,
+            status: "done",
+            bySpendClass: [],
+            executions: [exec],
+            revisions: [],
+            completedAtEpochS: 11,
+            effortCurrent: nil,
+            inclusive: nil,
+            prUrl: nil,
+            projectId: nil,
+            reasoningCurrent: nil,
+            shortId: 4
+        )
+        let nodes = TokenUsageTree.build(sampleReport(tasks: [task]))
+        let taskNode = try XCTUnwrap(nodes.first)
+        let execNode = try XCTUnwrap(taskNode.children?.first)
+        XCTAssertEqual(execNode.dominantCaveat, "pre_capture")
+        XCTAssertEqual(taskNode.dominantCaveat, "pre_capture")
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementTotal(unmeasured, dominantCaveat: taskNode.dominantCaveat).display,
+            "— not instrumented"
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.measurementClass(nil, measurement: unmeasured, dominantCaveat: taskNode.dominantCaveat).display,
+            "— not instrumented"
+        )
+    }
+
+    func testSessionStateRejectsUntaggedErrorsAndClearsPendingOnTimeout() {
+        var state = TokenUsageSessionState()
+        let gen = state.beginRequest(requestId: "req-1")
+        XCTAssertEqual(gen, 1)
+        XCTAssertTrue(state.loading)
+        XCTAssertEqual(state.pendingRequestId, "req-1")
+
+        // Untagged app error must not be claimed by Token Usage.
+        XCTAssertFalse(state.receiveError(message: "unrelated decode error", requestId: nil))
+        XCTAssertTrue(state.loading)
+        XCTAssertNil(state.error)
+        XCTAssertEqual(state.pendingRequestId, "req-1")
+
+        // Error tagged for a different request must not be claimed either.
+        XCTAssertFalse(state.receiveError(message: "other rpc error", requestId: "req-other"))
+        XCTAssertEqual(state.pendingRequestId, "req-1")
+
+        // Timeout clears both loading and pendingRequestId.
+        XCTAssertTrue(state.failOnTimeout(generation: 1))
+        XCTAssertFalse(state.loading)
+        XCTAssertNil(state.pendingRequestId)
+        XCTAssertEqual(state.error, "The engine did not answer in time.")
+
+        // Encode failure (nil requestId) surfaces inline without leaving a pending id.
+        XCTAssertNil(state.beginRequest(requestId: nil))
+        XCTAssertFalse(state.loading)
+        XCTAssertNil(state.pendingRequestId)
+        XCTAssertNil(state.expectedRequestId)
+        XCTAssertNotNil(state.error)
+    }
+
+    func testSessionStateRejectsSupersededAndMissingIdReplies() {
+        var state = TokenUsageSessionState()
+        let reportA = sampleReport(tasks: [sampleGrokLikeTask(id: "a", driver: "claude", name: "A", total: 10)])
+        let reportB = sampleReport(tasks: [sampleGrokLikeTask(id: "b", driver: "claude", name: "B", total: 20)])
+
+        _ = state.beginRequest(requestId: "req-A")
+        _ = state.beginRequest(requestId: "req-B")
+
+        // Missing requestId is rejected.
+        XCTAssertFalse(state.receiveRows(reportA, requestId: nil))
+        XCTAssertNil(state.report)
+
+        // Newer reply B settles normally.
+        XCTAssertTrue(state.receiveRows(reportB, requestId: "req-B"))
+        XCTAssertEqual(state.report, reportB)
+        XCTAssertNil(state.pendingRequestId)
+        XCTAssertEqual(state.expectedRequestId, "req-B")
+
+        // Late reply A arriving after B settled is still rejected.
+        XCTAssertFalse(state.receiveRows(reportA, requestId: "req-A"))
+        XCTAssertEqual(state.report, reportB)
+
+        // Late reply A arriving after a newer request errored cannot clear the error.
+        _ = state.beginRequest(requestId: "req-C")
+        XCTAssertTrue(state.receiveError(message: "engine busy", requestId: "req-C"))
+        XCTAssertEqual(state.error, "engine busy")
+        XCTAssertFalse(state.receiveRows(reportA, requestId: "req-A"))
+        XCTAssertEqual(state.error, "engine busy")
+
+        // In-flight reply arriving during debounce after invalidatePending() is rejected.
+        _ = state.beginRequest(requestId: "req-D")
+        state.invalidatePending()
+        XCTAssertFalse(state.receiveRows(reportA, requestId: "req-D"))
+    }
+
     // MARK: - Fixtures
 
     private func sampleReport(

@@ -263,7 +263,7 @@ When the performance-metrics design's `GetMetricSeries` lands, `TokenUsageSeries
 
 ### 6. The Token Usage window
 
-**Registration.** `Window("Token Usage", id: "token-usage")` in `BossMacApp.swift` next to Metrics, with a `TokenUsageCommand` in the `CommandGroup(after: .windowList)` block holding `@AppStorage("boss.tokenUsage.visible")` and a shortcut that is free (Cmd+Shift+L, M, T and U are taken by Logs, Metrics, Terminal Loop and UI Stalls). Default size 1180×720, minimum 900×520.
+**Registration.** `Window("Token Usage", id: "token-usage")` in `BossMacApp.swift` next to Metrics, with a `TokenUsageCommand` in the `CommandGroup(after: .windowList)` block holding `@AppStorage("boss.tokenUsage.visible")` and `Cmd+Shift+O` (Cmd+Shift+K, L, M, T and U are taken by CommentLayer, Logs, Metrics, Terminal Loop and UI Stalls). Default size 1180×720, minimum 900×520.
 
 **Layout.** A toolbar row, a hierarchical table, an inspector on the right, and a footer.
 

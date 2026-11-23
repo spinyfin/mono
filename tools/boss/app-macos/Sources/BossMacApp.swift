@@ -321,7 +321,7 @@ private struct TokenUsageCommand: View {
                 openWindow(id: "token-usage")
             }
         }
-        .keyboardShortcut("k", modifiers: [.command, .shift])
+        .keyboardShortcut("o", modifiers: [.command, .shift])
     }
 }
 

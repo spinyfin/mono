@@ -418,13 +418,22 @@ struct TokenUsageWindow: View {
         if node.kind == .tasklessHeader || node.kind == .tasklessKind {
             EmptyView()
         } else if let coverage = node.coverage {
-            let figure = TokenUsageFormatter.tokenClass(value, coverage: coverage)
+            let figure = TokenUsageFormatter.tokenClass(
+                value,
+                coverage: coverage,
+                spansCaptureBoundary: spansCaptureBoundary
+            )
             Text(figure.display)
                 .foregroundStyle(figure.isUnknown ? .secondary : .primary)
                 .monospacedDigit()
                 .help(figure.annotation ?? "")
         } else if let measurement = node.measurement {
-            let figure = TokenUsageFormatter.measurementClass(value, measurement: measurement)
+            let figure = TokenUsageFormatter.measurementClass(
+                value,
+                measurement: measurement,
+                spansCaptureBoundary: spansCaptureBoundary,
+                dominantCaveat: node.dominantCaveat
+            )
             Text(figure.display)
                 .foregroundStyle(figure.isUnknown ? .secondary : .primary)
                 .monospacedDigit()
@@ -442,17 +451,17 @@ struct TokenUsageWindow: View {
                 tokens: node.totalTokens,
                 coverage: coverage,
                 caveats: node.caveats,
-                inputConvention: node.inputConvention ?? .unknown
+                inputConvention: node.inputConvention ?? .unknown,
+                spansCaptureBoundary: spansCaptureBoundary
             ).display)
             .monospacedDigit()
         } else if let measurement = node.measurement {
             Text(TokenUsageFormatter.measurementTotal(
                 measurement,
                 spansCaptureBoundary: spansCaptureBoundary,
-                mixesGross: node.mixesGross,
-                dominantCaveat: node.usageUnavailable
+                containsGross: node.containsGross,
+                dominantCaveat: node.dominantCaveat
             ).display)
-            .font(node.kind == .task && node.inclusive != nil ? .body.weight(.regular) : .body)
             .monospacedDigit()
         } else {
             Text("")
@@ -483,9 +492,12 @@ struct TokenUsageWindow: View {
             )
         }
         if let measurement = node.measurement {
+            let reason = measurement.runsUnmeasured == measurement.runsTotal && measurement.runsTotal > 0
+                ? TokenUsageFormatter.noMeasuredReason(measurement, dominantCaveat: node.dominantCaveat)
+                : node.usageUnavailable
             return TokenUsageFormatter.coverageBadge(
                 measurement: measurement,
-                reason: node.usageUnavailable
+                reason: reason
             )
         }
         return ""
@@ -526,7 +538,8 @@ struct TokenUsageWindow: View {
             if let report = chatModel.tokenUsage.report {
                 let overall = TokenUsageFormatter.measurementTotal(
                     report.overall,
-                    spansCaptureBoundary: report.spansCaptureBoundary
+                    spansCaptureBoundary: report.spansCaptureBoundary,
+                    containsGross: roots.contains(where: \.containsGross)
                 )
                 HStack(spacing: 12) {
                     Text("Overall (direct): \(overall.display)")
@@ -543,7 +556,8 @@ struct TokenUsageWindow: View {
                     Spacer()
                 }
                 if report.spansCaptureBoundary {
-                    Text("Totals are a floor: runs before 2026-07-27 have no token data.")
+                    let floorDate = TokenUsageFormatter.utcDateString(epochS: report.captureStartEpochS)
+                    Text("Totals are a floor: runs before \(floorDate) have no token data.")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -621,6 +635,7 @@ struct TokenUsageWindow: View {
     }
 
     private func debounceRefresh() {
+        chatModel.invalidatePendingTokenUsage()
         debounceTask?.cancel()
         debounceTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 150_000_000)
@@ -822,7 +837,11 @@ private struct TokenUsageInspector: View {
     }
 
     private func classRow(_ title: String, _ value: Int64?, _ coverage: RunCoverage) -> some View {
-        let figure = TokenUsageFormatter.tokenClass(value, coverage: coverage)
+        let figure = TokenUsageFormatter.tokenClass(
+            value,
+            coverage: coverage,
+            spansCaptureBoundary: spansCaptureBoundary
+        )
         return HStack {
             Text(title)
             Spacer()
@@ -837,7 +856,12 @@ private struct TokenUsageInspector: View {
             Text(title)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            Text(TokenUsageFormatter.measurementTotal(measurement, spansCaptureBoundary: spansCaptureBoundary).display)
+            Text(TokenUsageFormatter.measurementTotal(
+                measurement,
+                spansCaptureBoundary: spansCaptureBoundary,
+                containsGross: node.containsGross,
+                dominantCaveat: node.dominantCaveat
+            ).display)
                 .font(emphasize ? .title3.weight(.semibold) : .body)
                 .monospacedDigit()
             Text(TokenUsageFormatter.runsRatio(measured: measurement.runsMeasured, total: measurement.runsTotal))
@@ -882,17 +906,7 @@ private struct TokenUsageOutlineExpander: NSViewRepresentable {
                 window = NSApp.windows.first { $0.title.contains("Token Usage") }
             }
             guard let content = window?.contentView else { return }
-            expandOutline(in: content)
-        }
-    }
-
-    private func expandOutline(in view: NSView) {
-        if let outline = view as? NSOutlineView {
-            outline.expandItem(nil, expandChildren: true)
-            return
-        }
-        for sub in view.subviews {
-            expandOutline(in: sub)
+            TokenUsageCapture.expandOutlines(in: content)
         }
     }
 }

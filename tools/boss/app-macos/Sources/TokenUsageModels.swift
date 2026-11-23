@@ -310,6 +310,88 @@ struct TokenUsageSessionState: Equatable, Sendable {
     var error: String?
     var loading: Bool = false
     var receivedAt: Date?
+    /// Request id of the currently in-flight request; cleared on reply, error,
+    /// timeout, or disconnect.
     var pendingRequestId: String?
+    /// Request id of the latest issued request, kept independent of settlement
+    /// so late replies from superseded requests are always rejected.
+    var expectedRequestId: String?
     var generation: UInt64 = 0
+
+    /// Start a new usage request. Returns the generation token to watch for
+    /// timeout, or `nil` if the request could not be sent.
+    @discardableResult
+    mutating func beginRequest(requestId: String?) -> UInt64? {
+        generation += 1
+        error = nil
+        guard let requestId, !requestId.isEmpty else {
+            loading = false
+            pendingRequestId = nil
+            expectedRequestId = nil
+            error = "Could not send token usage request."
+            return nil
+        }
+        loading = true
+        pendingRequestId = requestId
+        expectedRequestId = requestId
+        return generation
+    }
+
+    /// Supersede any in-flight request before a debounced query is sent so
+    /// replies for the previous toolbar state cannot overwrite the window.
+    mutating func invalidatePending() {
+        generation += 1
+        pendingRequestId = nil
+        expectedRequestId = nil
+    }
+
+    /// Accept a rows reply only when it matches the latest expected in-flight
+    /// request id. Missing or mismatched ids are rejected.
+    @discardableResult
+    mutating func receiveRows(_ report: TokenUsageRowsReport, requestId: String?, now: Date = Date()) -> Bool {
+        guard let requestId,
+              let expected = expectedRequestId,
+              requestId == expected,
+              pendingRequestId == expected
+        else {
+            return false
+        }
+        self.report = report
+        loading = false
+        error = nil
+        receivedAt = now
+        pendingRequestId = nil
+        return true
+    }
+
+    /// Claim an error only when its request id matches the in-flight usage
+    /// request. Untagged errors (`requestId == nil`) are never claimed here.
+    @discardableResult
+    mutating func receiveError(message: String, requestId: String?) -> Bool {
+        guard let requestId, let pending = pendingRequestId, requestId == pending else {
+            return false
+        }
+        loading = false
+        error = message
+        pendingRequestId = nil
+        return true
+    }
+
+    @discardableResult
+    mutating func failOnTimeout(generation: UInt64) -> Bool {
+        guard self.generation == generation, pendingRequestId != nil else {
+            return false
+        }
+        loading = false
+        error = "The engine did not answer in time."
+        pendingRequestId = nil
+        return true
+    }
+
+    mutating func failOnDisconnect() {
+        guard pendingRequestId != nil || loading else { return }
+        loading = false
+        error = "Connection lost while loading token usage."
+        pendingRequestId = nil
+    }
 }

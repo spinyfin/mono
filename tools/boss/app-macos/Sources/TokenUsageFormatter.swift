@@ -32,7 +32,11 @@ enum TokenUsageFormatter {
     /// One token class on a run. A missing class on a measured or partial
     /// run is "unknown" in that cell only — not a zero, and not the same
     /// as the whole run being unmeasured.
-    static func tokenClass(_ value: Int64?, coverage: RunCoverage) -> Figure {
+    static func tokenClass(
+        _ value: Int64?,
+        coverage: RunCoverage,
+        spansCaptureBoundary: Bool = false
+    ) -> Figure {
         switch coverage {
         case .unmeasured:
             return .unknown("not recorded")
@@ -40,23 +44,30 @@ enum TokenUsageFormatter {
             guard let value else {
                 return .unknown("unknown")
             }
-            return .known(grouped(value))
+            return .known(grouped(value), annotation: spansCaptureBoundary ? "floor" : nil)
         }
     }
 
     /// Unmeasured run total: never `0`. Pre-capture vs post-capture NULL
     /// is distinguished by caveat, not by rendering zero.
-    static func runTotal(tokens: Int64?, coverage: RunCoverage, caveats: [UsageCaveat], inputConvention: InputConvention) -> Figure {
+    static func runTotal(
+        tokens: Int64?,
+        coverage: RunCoverage,
+        caveats: [UsageCaveat],
+        inputConvention: InputConvention,
+        spansCaptureBoundary: Bool = false
+    ) -> Figure {
         switch coverage {
         case .unmeasured:
             return .unknown(unmeasuredReason(caveats: caveats))
         case .zero:
-            return .known("0")
+            return .known("0", annotation: spansCaptureBoundary ? "floor" : nil)
         case .measured, .partial:
             guard let tokens else {
                 return .unknown(unmeasuredReason(caveats: caveats))
             }
-            var figure = Figure.known(grouped(tokens), annotation: coverage == .partial ? "floor" : nil)
+            let isFloor = coverage == .partial || spansCaptureBoundary
+            var figure = Figure.known(grouped(tokens), annotation: isFloor ? "floor" : nil)
             if inputConvention == .gross {
                 figure.annotation = append(figure.annotation, "gross")
             }
@@ -66,30 +77,36 @@ enum TokenUsageFormatter {
 
     // MARK: - Aggregates (task / execution / group / overall)
 
-    static func measurementClass(_ value: Int64?, measurement: CostMeasurement, dominantCaveat: String? = nil) -> Figure {
+    static func measurementClass(
+        _ value: Int64?,
+        measurement: CostMeasurement,
+        spansCaptureBoundary: Bool = false,
+        dominantCaveat: String? = nil
+    ) -> Figure {
         if measurement.runsMeasured == 0 {
             return .unknown(noMeasuredReason(measurement, dominantCaveat: dominantCaveat))
         }
         guard let value else {
             return .unknown("unknown")
         }
-        return .known(grouped(value))
+        return .known(grouped(value), annotation: spansCaptureBoundary ? "floor" : nil)
     }
 
     static func measurementTotal(
         _ measurement: CostMeasurement,
         spansCaptureBoundary: Bool = false,
-        mixesGross: Bool = false,
+        containsGross: Bool = false,
         dominantCaveat: String? = nil
     ) -> Figure {
         if measurement.runsMeasured == 0 {
             return .unknown(noMeasuredReason(measurement, dominantCaveat: dominantCaveat))
         }
         var annotation: String?
-        if measurement.tokensPartial || spansCaptureBoundary {
+        let hasUnmeasured = measurement.runsUnmeasured > 0 || measurement.runsMeasured < measurement.runsTotal
+        if measurement.tokensPartial || hasUnmeasured || spansCaptureBoundary {
             annotation = "floor"
         }
-        if mixesGross {
+        if containsGross {
             annotation = append(annotation, "gross")
         }
         return .known(grouped(measurement.totalTokens), annotation: annotation)
@@ -101,6 +118,11 @@ enum TokenUsageFormatter {
     /// `$0.00` and never a pricing-gap warning. Other unpriceable causes
     /// hide the figure. A priced run under half a cent is `<$0.01` so it
     /// cannot read as free.
+    ///
+    /// Limitation: for mixed aggregates containing both priced runs and
+    /// `subscription_unpriced` runs, the engine currently sets
+    /// `estimated_usd_partial = true`, so the formatter renders `(partial)`
+    /// until the engine excludes `subscription_unpriced` from `usd_partial`.
     static func usd(
         estimated: Double?,
         partial: Bool,
@@ -140,6 +162,11 @@ enum TokenUsageFormatter {
 
     static func noMeasuredReason(_ measurement: CostMeasurement, dominantCaveat: String?) -> String {
         if let dominantCaveat, !dominantCaveat.isEmpty {
+            if dominantCaveat == "usage_unavailable",
+               let first = measurement.usageUnavailable.first, !first.isEmpty
+            {
+                return first
+            }
             return caveatLabel(code: dominantCaveat, detail: nil)
         }
         if let first = measurement.usageUnavailable.first, !first.isEmpty {
@@ -184,10 +211,7 @@ enum TokenUsageFormatter {
         if unmeasured == total {
             return reason.map { "none (\($0))" } ?? "none"
         }
-        if complete == total {
-            return "complete"
-        }
-        if zero == total {
+        if partial == 0 && unmeasured == 0 && complete + zero == total {
             return "complete"
         }
         let measured = complete + partial + zero
@@ -300,6 +324,16 @@ enum TokenUsageFormatter {
         formatter.usesGroupingSeparator = true
         formatter.maximumFractionDigits = 0
         return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    /// Format a UTC epoch second as `YYYY-MM-DD` for the capture-boundary banner.
+    static func utcDateString(epochS: Int64) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(epochS)))
     }
 
     private static func append(_ existing: String?, _ extra: String) -> String {

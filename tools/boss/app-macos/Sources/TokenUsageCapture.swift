@@ -84,7 +84,7 @@ enum TokenUsageCapture {
         }
     }
 
-    private static func expandOutlines(in view: NSView?) {
+    static func expandOutlines(in view: NSView?) {
         guard let view else { return }
         if let outline = view as? NSOutlineView {
             outline.expandItem(nil, expandChildren: true)

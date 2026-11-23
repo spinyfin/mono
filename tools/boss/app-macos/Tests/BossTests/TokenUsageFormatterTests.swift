@@ -148,10 +148,132 @@ final class TokenUsageFormatterTests: XCTestCase {
     func testCaptureBoundaryLabelsEveryFigureAFloor() {
         var measurement = CostMeasurement.empty
         measurement.runsMeasured = 1
-        measurement.runsTotal = 2
+        measurement.runsTotal = 1
         measurement.totalTokens = 1_200
-        let figure = TokenUsageFormatter.measurementTotal(measurement, spansCaptureBoundary: true)
+        measurement.inputTokens = 900
+        let total = TokenUsageFormatter.measurementTotal(measurement, spansCaptureBoundary: true)
+        XCTAssertEqual(total.text, "1,200")
+        XCTAssertEqual(total.annotation, "floor")
+
+        let aggClass = TokenUsageFormatter.measurementClass(900, measurement: measurement, spansCaptureBoundary: true)
+        XCTAssertEqual(aggClass.text, "900")
+        XCTAssertEqual(aggClass.annotation, "floor")
+
+        let aggUnknownClass = TokenUsageFormatter.measurementClass(nil, measurement: measurement, spansCaptureBoundary: true)
+        XCTAssertTrue(aggUnknownClass.isUnknown)
+        XCTAssertEqual(aggUnknownClass.annotation, "unknown")
+
+        var unmeasuredMeasurement = CostMeasurement.empty
+        unmeasuredMeasurement.runsTotal = 1
+        unmeasuredMeasurement.runsUnmeasured = 1
+        let unmeasuredTotal = TokenUsageFormatter.measurementTotal(
+            unmeasuredMeasurement,
+            spansCaptureBoundary: true,
+            dominantCaveat: "pre_capture"
+        )
+        XCTAssertTrue(unmeasuredTotal.isUnknown)
+        XCTAssertEqual(unmeasuredTotal.annotation, "not instrumented")
+
+        let runMeasured = TokenUsageFormatter.runTotal(
+            tokens: 4_500,
+            coverage: .measured,
+            caveats: [],
+            inputConvention: .net,
+            spansCaptureBoundary: true
+        )
+        XCTAssertEqual(runMeasured.text, "4,500")
+        XCTAssertEqual(runMeasured.annotation, "floor")
+
+        let runGross = TokenUsageFormatter.runTotal(
+            tokens: 4_500,
+            coverage: .measured,
+            caveats: [],
+            inputConvention: .gross,
+            spansCaptureBoundary: true
+        )
+        XCTAssertEqual(runGross.annotation, "floor gross")
+
+        let runZero = TokenUsageFormatter.runTotal(
+            tokens: 0,
+            coverage: .zero,
+            caveats: [],
+            inputConvention: .net,
+            spansCaptureBoundary: true
+        )
+        XCTAssertEqual(runZero.text, "0")
+        XCTAssertTrue(runZero.isZero)
+        XCTAssertEqual(runZero.annotation, "floor")
+
+        let runUnmeasured = TokenUsageFormatter.runTotal(
+            tokens: nil,
+            coverage: .unmeasured,
+            caveats: [UsageCaveat(code: "pre_capture", detail: nil)],
+            inputConvention: .unknown,
+            spansCaptureBoundary: true
+        )
+        XCTAssertTrue(runUnmeasured.isUnknown)
+        XCTAssertEqual(runUnmeasured.annotation, "not instrumented")
+
+        let classMeasured = TokenUsageFormatter.tokenClass(320, coverage: .measured, spansCaptureBoundary: true)
+        XCTAssertEqual(classMeasured.text, "320")
+        XCTAssertEqual(classMeasured.annotation, "floor")
+
+        let classZero = TokenUsageFormatter.tokenClass(0, coverage: .zero, spansCaptureBoundary: true)
+        XCTAssertEqual(classZero.text, "0")
+        XCTAssertTrue(classZero.isZero)
+        XCTAssertEqual(classZero.annotation, "floor")
+
+        let classUnknown = TokenUsageFormatter.tokenClass(nil, coverage: .partial, spansCaptureBoundary: true)
+        XCTAssertTrue(classUnknown.isUnknown)
+        XCTAssertEqual(classUnknown.annotation, "unknown")
+
+        let classUnmeasured = TokenUsageFormatter.tokenClass(nil, coverage: .unmeasured, spansCaptureBoundary: true)
+        XCTAssertTrue(classUnmeasured.isUnknown)
+        XCTAssertEqual(classUnmeasured.annotation, "not recorded")
+    }
+
+    func testMeasurementTotalWithUnmeasuredRunsIsFloor() {
+        var measurement = CostMeasurement.empty
+        measurement.runsMeasured = 2
+        measurement.runsTotal = 3
+        measurement.runsUnmeasured = 1
+        measurement.tokensPartial = false
+        measurement.totalTokens = 18_400
+        let figure = TokenUsageFormatter.measurementTotal(measurement, spansCaptureBoundary: false)
+        XCTAssertEqual(figure.text, "18,400")
         XCTAssertEqual(figure.annotation, "floor")
+    }
+
+    func testMeasurementTotalContainsGrossAddsGrossMarker() {
+        var measurement = CostMeasurement.empty
+        measurement.runsMeasured = 2
+        measurement.runsTotal = 2
+        measurement.totalTokens = 95_000
+        let figure = TokenUsageFormatter.measurementTotal(measurement, containsGross: true)
+        XCTAssertEqual(figure.annotation, "gross")
+    }
+
+    func testNoMeasuredAggregateUsesDominantCaveat() {
+        var preCapture = CostMeasurement.empty
+        preCapture.runsTotal = 2
+        preCapture.runsUnmeasured = 2
+        let total = TokenUsageFormatter.measurementTotal(preCapture, dominantCaveat: "pre_capture")
+        XCTAssertEqual(total.text, "—")
+        XCTAssertEqual(total.annotation, "not instrumented")
+        let cell = TokenUsageFormatter.measurementClass(nil, measurement: preCapture, dominantCaveat: "pre_capture")
+        XCTAssertEqual(cell.text, "—")
+        XCTAssertEqual(cell.annotation, "not instrumented")
+
+        var unavailable = CostMeasurement.empty
+        unavailable.runsTotal = 1
+        unavailable.runsUnmeasured = 1
+        unavailable.usageUnavailable = ["No provider token usage observed"]
+        let unavailableTotal = TokenUsageFormatter.measurementTotal(unavailable, dominantCaveat: "usage_unavailable")
+        XCTAssertEqual(unavailableTotal.annotation, "No provider token usage observed")
+    }
+
+    func testUtcDateStringFormatsCaptureStartEpoch() {
+        XCTAssertEqual(TokenUsageFormatter.utcDateString(epochS: 1_785_144_180), "2026-07-27")
     }
 
     func testUsageUnavailableCaveatIsTheReasonNotAGrokSpecificMessage() {
@@ -238,6 +360,10 @@ final class TokenUsageFormatterTests: XCTestCase {
     func testCoverageBadgeCompletePartialNone() {
         XCTAssertEqual(
             TokenUsageFormatter.coverageBadge(complete: 4, partial: 0, zero: 0, unmeasured: 0, total: 4),
+            "complete"
+        )
+        XCTAssertEqual(
+            TokenUsageFormatter.coverageBadge(complete: 1, partial: 0, zero: 1, unmeasured: 0, total: 2),
             "complete"
         )
         XCTAssertEqual(
