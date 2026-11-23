@@ -1,0 +1,10 @@
+--- a/Sources/Textual/Internal/Attachment/WithAttachments.swift
++++ b/Sources/Textual/Internal/Attachment/WithAttachments.swift
+@@ -12,6 +12,7 @@
+ // writes the resolved attachments back into the attributed string as `Textual.Attachment`
+ // attributes. The rest of the rendering pipeline treats attachment runs like any other span.
+ 
++@MainActor
+ struct WithAttachments<Content: View>: View {
+   @Environment(\.imageAttachmentLoader) private var imageAttachmentLoader
+   @Environment(\.emojiAttachmentLoader) private var emojiAttachmentLoader

@@ -1,4 +1,5 @@
 import Charts
+import Combine
 import SwiftUI
 
 /// Debug pane that lists every engine counter and gauge and shows

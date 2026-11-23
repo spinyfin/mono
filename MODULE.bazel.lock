@@ -8573,7 +8573,7 @@
     "@@rules_swift_package_manager+//:extensions.bzl%swift_deps": {
       "general": {
         "bzlTransitiveDigest": "D0Ag7pIyJxeT1lCoYzWXDibKbzZGt0FT+aGaZMgn4Kc=",
-        "usagesDigest": "9aGGg0VnvzGufT6B7isS8jsW8XS1wMHm3m1/zfSOMf0=",
+        "usagesDigest": "gzomkN3q1wDy9FdJkblH7mYgHXdKSFzhfwWWS1Rp4ao=",
         "recordedInputs": [
           "REPO_MAPPING:rules_swift_package_manager+,bazel_skylib bazel_skylib+",
           "REPO_MAPPING:rules_swift_package_manager+,bazel_tools bazel_tools",
@@ -8598,6 +8598,18 @@
               "env": {},
               "env_inherit": [],
               "cached_json_directory": "",
+              "init_submodules": false,
+              "recursive_init_submodules": true,
+              "patch_args": [
+                "-p1"
+              ],
+              "patch_cmds": [],
+              "patch_cmds_win": [],
+              "patch_tool": "",
+              "patches": [
+                "@@//third_party/patches:swiftpkg_textual-0.3.1-main-actor-with-attachments.patch"
+              ],
+              "publicly_expose_all_targets": false,
               "replace_scm_with_registry": false
             }
           },
@@ -8624,6 +8636,18 @@
               "env": {},
               "env_inherit": [],
               "cached_json_directory": "",
+              "init_submodules": false,
+              "recursive_init_submodules": true,
+              "patch_args": [
+                "-p1"
+              ],
+              "patch_cmds": [],
+              "patch_cmds_win": [],
+              "patch_tool": "",
+              "patches": [
+                "@@//third_party/patches:swiftpkg_swiftui_math-0.1.0-register-fonts-for-url.patch"
+              ],
+              "publicly_expose_all_targets": false,
               "replace_scm_with_registry": false
             }
           }

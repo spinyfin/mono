@@ -140,6 +140,12 @@ final class HostDisplaySnapshotTests: XCTestCase {
     /// Upstream precondition for ghostty#13639: CoreVideo rejects a display
     /// link over an empty display set. GhosttyKit now treats that failure as
     /// optional; this test only documents the CoreVideo side of that contract.
+    ///
+    /// GhosttyKit still calls `CVDisplayLinkCreateWithCGDisplays`, which macOS 15
+    /// deprecated, so the contract being documented is that exact entry point
+    /// and there is no replacement API to migrate this test to. The test is
+    /// itself marked deprecated so its use of the deprecated call is explicit.
+    @available(macOS, deprecated: 15.0, message: "Documents the deprecated CVDisplayLink entry point GhosttyKit still calls")
     func testCVDisplayLinkCreateWithZeroDisplaysFails() {
         var link: CVDisplayLink?
         // Count 0: CoreVideo must not create a link. A non-null buffer is

@@ -31,6 +31,12 @@ Supported rule kinds:
   - `message` (optional string)
   - `severity` (optional `error|warning|info`)
   - `remediation` (optional string)
+- `required_package_feature`
+  - `when_calling` (required array of rule/macro callee names that trigger the requirement)
+  - `feature` (required string literal that must appear in `package(features = [...])`)
+  - `message` (optional string)
+  - `severity` (optional `error|warning|info`)
+  - `remediation` (optional string)
 
 Example:
 
@@ -55,7 +61,7 @@ checks:
 Notes:
 
 - `forbidden_rule_call` is AST-backed and matches direct call syntax, not macro expansion.
-- `forbidden_package_default_visibility` only applies to build files.
+- `forbidden_package_default_visibility` and `required_package_feature` only apply to build files.
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
 

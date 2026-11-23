@@ -1,0 +1,30 @@
+--- a/Sources/SwiftUIMath/Internal/Font/FontRegistry.swift
++++ b/Sources/SwiftUIMath/Internal/Font/FontRegistry.swift
+@@ -72,7 +72,9 @@
+         return nil
+       }
+ 
+-      guard CTFontManagerRegisterGraphicsFont(graphicsFont, nil) else {
++      guard let fontURL = CGFont.url(named: name),
++        CTFontManagerRegisterFontsForURL(fontURL as CFURL, .process, nil)
++      else {
+         return nil
+       }
+ 
+@@ -85,6 +87,16 @@
+ }
+ 
+ extension CGFont {
++  fileprivate static func url(named name: Math.Font.Name) -> URL? {
++    guard
++      let bundleURL = Bundle.module.url(forResource: "mathFonts", withExtension: "bundle"),
++      let url = Bundle(url: bundleURL)?.url(forResource: name.rawValue, withExtension: "otf")
++    else {
++      return nil
++    }
++    return url
++  }
++
+   fileprivate static func named(_ name: Math.Font.Name) -> CGFont? {
+     guard
+       let bundleURL = Bundle.module.url(forResource: "mathFonts", withExtension: "bundle"),

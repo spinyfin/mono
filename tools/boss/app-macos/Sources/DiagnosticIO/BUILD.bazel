@@ -1,5 +1,10 @@
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 
+# Warnings are errors; see //tools/boss/app-macos/BUILD.bazel.
+package(
+    features = ["swift.treat_warnings_as_errors"],
+)
+
 swift_library(
     name = "DiagnosticIO",
     srcs = ["DiagnosticWrite.swift"],

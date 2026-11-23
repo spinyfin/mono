@@ -18,7 +18,7 @@ final class DecisionNotificationTests: XCTestCase {
 
     func testCreationThenExactlyOneReminderEachIntervalWithoutCatchUpBurst() {
         var schedule = DecisionReminderSchedule()
-        schedule.reconcile([question()])
+        _ = schedule.reconcile([question()])
         XCTAssertEqual(schedule.due(at: start, interval: 3600), [question()])
         schedule.lastSent["question"] = start.timeIntervalSince1970
         XCTAssertTrue(schedule.due(at: start.addingTimeInterval(3599), interval: 3600).isEmpty)
@@ -32,20 +32,20 @@ final class DecisionNotificationTests: XCTestCase {
 
     func testRepeatedSnapshotAndRestartPreserveDeadline() {
         var schedule = DecisionReminderSchedule(lastSent: ["question": start.timeIntervalSince1970])
-        schedule.reconcile([question()])
-        schedule.reconcile([question()])
+        _ = schedule.reconcile([question()])
+        _ = schedule.reconcile([question()])
         XCTAssertTrue(schedule.due(at: start, interval: 3600).isEmpty)
         XCTAssertEqual(schedule.nextDate(interval: 3600), start.addingTimeInterval(3600))
     }
 
     func testAnswerOrWithdrawalCancelsReminderAndNewQuestionGetsItsOwnAlert() {
         var schedule = DecisionReminderSchedule(lastSent: ["question": start.timeIntervalSince1970])
-        schedule.reconcile([question()])
+        _ = schedule.reconcile([question()])
         XCTAssertEqual(schedule.reconcile([]), ["question"])
         XCTAssertNil(schedule.nextDate(interval: 3600))
         XCTAssertTrue(schedule.due(at: start.addingTimeInterval(7200), interval: 3600).isEmpty)
         XCTAssertTrue(schedule.lastSent.isEmpty)
-        schedule.reconcile([question("replacement")])
+        _ = schedule.reconcile([question("replacement")])
         XCTAssertEqual(schedule.due(at: start, interval: 3600), [question("replacement")])
     }
 
@@ -85,7 +85,7 @@ final class DecisionNotificationTests: XCTestCase {
     func testFailedSubmissionRetriesWithoutConsumingReminderAndClosureCancelsRetry() async {
         let notifier = ReviewNotificationCenter()
         notifier.decisionSchedule = DecisionReminderSchedule()
-        notifier.decisionSchedule.reconcile([question()])
+        _ = notifier.decisionSchedule.reconcile([question()])
         var attempts = 0
         var persisted: [String: TimeInterval] = [:]
         let send: () async throws -> Void = {
@@ -107,7 +107,7 @@ final class DecisionNotificationTests: XCTestCase {
         XCTAssertEqual(notifier.decisionSchedule.nextDate(interval: 3600), retry.addingTimeInterval(3600))
         await notifier.submitDecision(question(), send: { throw NSError(domain: "test", code: 2) },
                                       remove: {}, now: { retry }, persist: { persisted = $0 })
-        notifier.decisionSchedule.reconcile([])
+        _ = notifier.decisionSchedule.reconcile([])
         XCTAssertTrue(notifier.decisionSchedule.retryAfter.isEmpty)
         XCTAssertNil(notifier.decisionSchedule.nextDate(interval: 3600))
     }
@@ -115,14 +115,14 @@ final class DecisionNotificationTests: XCTestCase {
     func testSuccessPersistsDuringDisconnectButClosureRemovesDelivery() async {
         let notifier = ReviewNotificationCenter()
         notifier.decisionSchedule = DecisionReminderSchedule()
-        notifier.decisionSchedule.reconcile([question()])
+        _ = notifier.decisionSchedule.reconcile([question()])
         var persisted: [String: TimeInterval] = [:]
         await notifier.submitDecision(question(), send: { notifier.suspendDecisionReminders() },
                                       remove: { XCTFail("Still open") }, now: { self.start },
                                       persist: { persisted = $0 })
         XCTAssertEqual(persisted["question"], start.timeIntervalSince1970)
         var removed = false
-        await notifier.submitDecision(question(), send: { notifier.decisionSchedule.reconcile([]) },
+        await notifier.submitDecision(question(), send: { _ = notifier.decisionSchedule.reconcile([]) },
                                       remove: { removed = true },
                                       persist: { _ in XCTFail("Closed question must not be persisted") })
         XCTAssertTrue(removed)

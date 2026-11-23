@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// In-app surface for the embedded-terminal event-loop diagnostics — the
