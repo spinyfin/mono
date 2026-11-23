@@ -65,6 +65,23 @@ common --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 
+# Opt-in experiment: `--config=cranelift` compiles host Rust code with the
+# Cranelift codegen backend instead of LLVM. Nothing selects it by default.
+#
+# The backend only ships with nightly compilers, so the config switches the
+# Rust toolchain channel. MODULE.bazel registers one nightly toolchain for
+# that channel (macOS on Apple silicon only) whose target-configuration flags
+# carry -Zcodegen-backend=cranelift. Proc macros and build scripts are built
+# by the same nightly, with LLVM. The musl and wasm transitions under
+# tools/checkleft pin the channel back to stable, so those artifacts are built
+# exactly as without this config.
+#
+# Do not combine it with `-c opt` or `--config=release`, and do not add it to
+# a CI or release config. See
+# docs/investigations/cranelift-non-release-rust-builds.md for what works,
+# what does not, and the measurements.
+build:cranelift --@rules_rust//rust/toolchain/channel=nightly
+
 # boss shake credentials: propagate the three env vars that embed the
 # GitHub App into the binary at compile time. Values must be set in your
 # shell (or via direnv) before running bazel build //tools/boss/cli:boss.

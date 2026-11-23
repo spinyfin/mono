@@ -154,3 +154,13 @@ sh_test(
         "//:.ci.bazelrc",
     ],
 )
+
+sh_test(
+    name = "cranelift_config_source_test",
+    size = "small",
+    srcs = ["cranelift_config_source_test.sh"],
+    data = [
+        "//:.bazelrc",
+        "//:.ci.bazelrc",
+    ],
+)

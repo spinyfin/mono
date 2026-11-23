@@ -39,10 +39,19 @@ WasmComponentInfo = provider(
 # changesets. repobin already passes `-c opt`, so this matters for any other
 # route to a checkleft binary (a plain `bazel build`/`run`, or a
 # REPOBIN_BAZEL_FLAGS override to fastbuild).
+#
+# Guests are likewise always built with the pinned stable Rust toolchain. A
+# component's sha256 is pinned in CHECKS manifests, so it must not depend on
+# the compiler the invoking build selected (`--config=cranelift` switches the
+# host build to a nightly). Only the stable channel registers a wasm32-wasip2
+# toolchain.
+_RUST_CHANNEL = "@rules_rust//rust/toolchain/channel"
+
 def _wasip2_transition_impl(_settings, _attr):
     return {
         "//command_line_option:compilation_mode": "opt",
         "//command_line_option:platforms": str(Label("//platforms:wasm32_wasip2")),
+        _RUST_CHANNEL: "stable",
     }
 
 _wasip2_transition = transition(
@@ -51,6 +60,7 @@ _wasip2_transition = transition(
     outputs = [
         "//command_line_option:compilation_mode",
         "//command_line_option:platforms",
+        _RUST_CHANNEL,
     ],
 )
 

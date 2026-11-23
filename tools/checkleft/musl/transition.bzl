@@ -1,12 +1,24 @@
 """Starlark platform transition for building checkleft for musl targets."""
 
+# The musl toolchains are registered for the stable channel only (see ext.bzl),
+# and this binary is a release artifact. Pinning the channel keeps it on the
+# pinned stable compiler when the invoking build selects another one, as
+# `--config=cranelift` does.
+_RUST_CHANNEL = "@rules_rust//rust/toolchain/channel"
+
 def _musl_x86_64_transition_impl(_settings, _attr):
-    return {"//command_line_option:platforms": str(Label("//platforms:linux_x86_64_musl"))}
+    return {
+        "//command_line_option:platforms": str(Label("//platforms:linux_x86_64_musl")),
+        _RUST_CHANNEL: "stable",
+    }
 
 musl_x86_64_transition = transition(
     implementation = _musl_x86_64_transition_impl,
     inputs = [],
-    outputs = ["//command_line_option:platforms"],
+    outputs = [
+        "//command_line_option:platforms",
+        _RUST_CHANNEL,
+    ],
 )
 
 def _musl_binary_impl(ctx):

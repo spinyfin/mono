@@ -308,7 +308,7 @@
     },
     "//tools/checkleft/musl:ext.bzl%musl_rust_toolchain": {
       "general": {
-        "bzlTransitiveDigest": "rYe9GmA7ZeCRVeYl9QXdtJepdJaty+P5gY0bh2G6G5U=",
+        "bzlTransitiveDigest": "K7W0ql9pdjT1AwdIhQWcy+Jtz+kZaaLzNDSlavmQc/Y=",
         "usagesDigest": "N3rcLiecjqeLHp+Wzf/rS9xSSnwbhd3n8qoMmTFz3LY=",
         "recordedInputs": [
           "REPO_MAPPING:,rules_rust rules_rust+",
