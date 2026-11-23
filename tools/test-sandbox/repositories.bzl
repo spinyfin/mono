@@ -438,10 +438,10 @@ host_tmux = rule(
 )
 """
 
-# Appended to the BUILD file of a layout that has a host tmux. The bundle guard
-# test takes `:macos_bundle` rather than `:tmux`: here they are the same
-# target, so the guard inspects what the tmux tests run and fails if it is not
-# a self-contained bundle.
+# Appended to the BUILD file of a layout that built a macOS tmux bundle. The
+# bundle guard test takes `:macos_bundle` rather than `:tmux`: here they are
+# the same target, so the guard inspects what the tmux tests run and fails if
+# it is not a self-contained bundle.
 _HOST_TMUX_BUNDLE_ALIAS = """
 alias(
     name = "macos_bundle",
@@ -450,8 +450,8 @@ alias(
 )
 """
 
-# Appended to the BUILD file of the layout for a host with no tmux, where
-# `tmux` is the exit-127 stub and nothing was bundled.
+# Appended to the BUILD file of a layout with no macOS bundle (non-macOS hosts
+# that symlink a bare tmux, or hosts with no tmux that get the exit-127 stub).
 _HOST_TMUX_NO_BUNDLE = """
 filegroup(
     name = "macos_bundle",
@@ -476,11 +476,11 @@ def _host_tmux_repository_impl(repository_ctx):
     self-contained.
 
     Every layout also defines `:macos_bundle`, the label the bundle guard
-    test inspects. It is `:tmux` wherever a host tmux was found, and
-    incompatible with every platform on a host that has none: such a host
-    gets the exit-127 stub, there is no `tmux.bin` beside it, and the guard
-    is reported as skipped instead of failing on a bundle that was never
-    built.
+    test inspects. It is `:tmux` on macOS hosts where a bundle was built,
+    and incompatible with every platform on any layout with no macOS bundle
+    (non-macOS hosts, or hosts with no tmux that get the exit-127 stub), so
+    the guard is reported as skipped instead of failing on a bundle that was
+    never built.
     """
     visibility = [
         "@@//tools/boss/engine/core:__pkg__",
@@ -530,7 +530,7 @@ host_tmux(
             repository_ctx.file(
                 "BUILD.bazel",
                 content = "exports_files([\"tmux\"], visibility = {})\n".format(repr(visibility)) +
-                          _HOST_TMUX_BUNDLE_ALIAS,
+                          _HOST_TMUX_NO_BUNDLE,
             )
             return
 
