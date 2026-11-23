@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use workspace_procs::{
-    Ownership, Scope, Signal, SpareReason, SystemWorkspaceProcessTable, WorkspaceProcessTable, reap, scan,
+    Ownership, Scope, Signal, SpareReason, SystemWorkspaceProcessTable, WorkspaceProcessTable,
+    claude_scratchpad_roots_in, reap, scan,
 };
 
 fn fresh_dir(name: &str) -> PathBuf {
@@ -39,6 +40,32 @@ fn leave_a_loop_behind(cwd: &Path) -> i32 {
         .trim()
         .parse()
         .expect("loop pid")
+}
+
+/// `nohup sleep 300 &`. The test runtime's `PATH` holds only audited tools,
+/// so `nohup` is taken from its standard location, and where there is none
+/// the shell does what `nohup` does: ignore `SIGHUP`, then exec the job.
+const NOHUP_SLEEPER: &str = "if [ -x /usr/bin/nohup ]; then /usr/bin/nohup sleep 300 >/dev/null 2>&1 </dev/null & \
+     else ( trap '' HUP; exec sleep 300 >/dev/null 2>&1 </dev/null ) & fi; echo $!";
+
+/// Run a shell in `cwd` that starts `nohup sleep` in the background and
+/// exits: the sleeper is re-parented and, being a platform binary, exposes no
+/// environment on macOS, so its working directory is the only thing left that
+/// ties it to a run.
+fn leave_a_nohup_sleeper_behind(cwd: &Path) -> i32 {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(NOHUP_SLEEPER)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("spawn sh");
+    assert!(output.status.success(), "sh exited {:?}", output.status);
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("sleeper pid")
 }
 
 fn alive(pid: i32) -> bool {
@@ -172,4 +199,49 @@ fn descendant_of_a_root_is_owned_even_outside_the_paths() {
     assert!(!seen.owned.iter().any(|o| o.process.pid == me));
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+#[test]
+fn nohup_job_in_the_workspace_scratch_tree_is_killed_and_a_neighbours_is_not() {
+    let workspace = fresh_dir("reap-scratch-ws");
+    let tmp = fresh_dir("reap-scratch-tmp");
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let roots = claude_scratchpad_roots_in(&tmp, uid, &workspace);
+    assert!(!roots.is_empty());
+    // Where a session keeps a study it runs from its scratchpad.
+    let study = roots.last().unwrap().join("session-1/scratchpad/study");
+    std::fs::create_dir_all(&study).unwrap();
+    let neighbour_ws = PathBuf::from(format!("{}-2", workspace.display()));
+    let neighbour = claude_scratchpad_roots_in(&tmp, uid, &neighbour_ws)[0].join("session-9/scratchpad");
+    std::fs::create_dir_all(&neighbour).unwrap();
+
+    let escaped = leave_a_nohup_sleeper_behind(&study);
+    let bystander = leave_a_nohup_sleeper_behind(&neighbour);
+    let table = SystemWorkspaceProcessTable;
+    assert!(
+        wait_until(Duration::from_secs(5), || table
+            .snapshot(escaped)
+            .is_ok_and(|p| p.ppid == 1 && p.command == "sleep")),
+        "the sleeper should have re-parented to pid 1: {:?}",
+        table.snapshot(escaped)
+    );
+
+    let workspace_only = scan(&table, &Scope::for_workspace(&workspace)).unwrap();
+    assert!(
+        !workspace_only.owned.iter().any(|o| o.process.pid == escaped),
+        "nothing ties the sleeper to the workspace directory itself"
+    );
+
+    let scope = roots
+        .iter()
+        .fold(Scope::for_workspace(&workspace), |scope, root| scope.with_path(root));
+    let report = reap(&table, &scope, Duration::from_secs(5)).unwrap();
+    let bystander_alive = alive(bystander);
+    // SAFETY: a sleeper this test started; killed even if assertions fail.
+    unsafe { libc::kill(bystander, libc::SIGKILL) };
+    assert_eq!(report.killed_pids(), vec![escaped], "{report:?}");
+    assert!(report.is_clean(), "survivors: {}", report.survivor_summary());
+    assert!(wait_until(Duration::from_secs(5), || !alive(escaped)));
+    assert!(bystander_alive, "another workspace's scratch tree must be left alone");
 }

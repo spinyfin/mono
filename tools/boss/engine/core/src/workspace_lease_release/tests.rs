@@ -4,6 +4,7 @@ use boss_engine_recovery::execution_bookmark::ExecutionBookmark;
 use boss_protocol::{CreateExecutionInput, ExecutionKind, ExecutionStatus};
 use std::sync::Mutex;
 
+mod leaseless;
 mod preservation_retry;
 mod unowned;
 

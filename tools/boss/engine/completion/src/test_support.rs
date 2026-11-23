@@ -94,7 +94,7 @@ pub fn seed_published_guide_comment(db: &WorkDb, pr_number: u32, body: &str) -> 
     (root, series, comment)
 }
 
-pub use boss_engine_test_process::{ProcessGroupChild, spawn_setsid_sleeper};
+pub use boss_engine_test_process::{Escape, EscapedProcess, ProcessGroupChild, spawn_escaped, spawn_setsid_sleeper};
 
 /// Give each completion fixture its own cwd so a sibling run-process reap
 /// of its recorded workspace cannot claim it. The shared session fixture

@@ -321,3 +321,47 @@ fn linux_identity_recognizes_exit_before_zombie_state() {
         std::io::ErrorKind::InvalidData
     );
 }
+
+#[test]
+fn scratchpad_occupants_are_owned_only_for_the_swept_workspace() {
+    let scratch = claude_scratchpad_roots(std::path::Path::new(WS)).remove(0);
+    let neighbour = claude_scratchpad_roots(std::path::Path::new("/ws/mono-agent-0010")).remove(0);
+    let inside = scratch.join("session-a/scratchpad/study");
+    let table = StaticProcessTable::new(
+        vec![
+            // A private tmux server and the `nohup` job it hosts, both
+            // re-parented, neither with a working directory in the workspace.
+            fake_process(40, 1, "tmux", inside.to_str()),
+            fake_process(41, 40, "python3", inside.to_str()),
+            fake_process(42, 1, "python3", scratch.to_str()),
+            fake_process(50, 1, "python3", neighbour.join("session-b").to_str()),
+            fake_process(51, 1, "python3", scratch.parent().unwrap().to_str()),
+        ],
+        900,
+    );
+    let workspace_only = scan(&table, &Scope::for_workspace(WS)).unwrap();
+    assert!(workspace_only.is_clean(), "{workspace_only:?}");
+
+    let scope = Scope::for_workspace(WS).with_claude_scratchpads();
+    assert_eq!(
+        scope.clone().with_claude_scratchpads(),
+        scope,
+        "adding twice changes nothing"
+    );
+    let seen = scan(&table, &scope).unwrap();
+    assert_eq!(pids(&seen.owned), vec![40, 41, 42]);
+    assert_eq!(
+        seen.owned[0].ownership,
+        Ownership::WorkingDirectory {
+            inside: scratch.clone()
+        }
+    );
+    let report = reap(&table, &scope, Duration::from_millis(10)).unwrap();
+    assert_eq!(report.killed_pids(), vec![40, 41, 42]);
+    assert!(report.is_clean());
+    assert!(table.is_alive(50), "another workspace's scratch tree is not in scope");
+    assert!(
+        table.is_alive(51),
+        "the user's whole Claude temp directory is not in scope"
+    );
+}

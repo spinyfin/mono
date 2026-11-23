@@ -510,6 +510,10 @@ pub async fn reconcile_if_pane_dead(
                 )
                 .await;
             }
+        } else if !live_states.is_some_and(|live| live.is_run_live(&execution.id)) {
+            // No lease means no release gate to stop the run's detached
+            // processes at; stop them here, under the same registry gate.
+            crate::workspace_lease_release::reap_leaseless_run_processes(work_db, execution).await;
         }
     }
 

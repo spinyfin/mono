@@ -1,5 +1,6 @@
 //! Sweep occupants before release and removal; refuse removal when verification fails.
-//! Working-directory ownership catches detached tools after re-parenting.
+//! Working-directory ownership catches detached tools after re-parenting, in
+//! the workspace and in the Claude Code scratch tree that belongs to it.
 
 use std::path::Path;
 use std::time::Duration;
@@ -45,7 +46,11 @@ pub(super) fn sweep_workspace_processes(
     workspace_path: &Path,
     phase: SweepPhase,
 ) -> ReapReport {
-    let report = match reap(table, &Scope::for_workspace(workspace_path), TEARDOWN_GRACE) {
+    // The holder is finished, so whatever it left in the workspace's Claude
+    // Code scratch tree is leftover too. Read-only occupancy checks do not
+    // look there: a process in it is not writing the checkout.
+    let scope = Scope::for_workspace(workspace_path).with_claude_scratchpads();
+    let report = match reap(table, &scope, TEARDOWN_GRACE) {
         Ok(report) => report,
         Err(err) => {
             eprintln!(
@@ -237,6 +242,32 @@ mod tests {
         assert_eq!(json["killed"][0]["signal"], "SIGTERM");
         assert_eq!(json["spared"][0]["pid"], 60);
         assert!(json["survivors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn release_sweep_reaches_the_workspace_scratch_tree_and_inspection_does_not() {
+        let scratch = workspace_procs::claude_scratchpad_roots(Path::new(WS)).remove(0);
+        let study = scratch.join("session-1/scratchpad/study");
+        let neighbour = workspace_procs::claude_scratchpad_roots(Path::new("/pool/mono-agent-0070")).remove(0);
+        let table = StaticProcessTable::new(
+            vec![
+                fake_process(70, 1, "tmux", study.to_str()),
+                fake_process(71, 70, "python3", study.to_str()),
+                fake_process(72, 1, "python3", neighbour.to_str()),
+            ],
+            900,
+        );
+        let inspected = inspect_workspace_processes(&table, Path::new(WS));
+        assert!(inspected.is_clean(), "{inspected:?}");
+
+        let report = sweep_workspace_processes(&table, "mono-agent-007", Path::new(WS), SweepPhase::Release);
+        assert_eq!(report.killed_pids(), vec![70, 71]);
+        assert!(report.is_clean());
+        assert!(table.is_alive(72), "another workspace's scratch tree is not swept");
+        assert_eq!(
+            sweep_json(&report)["killed"][0]["owned_by"],
+            format!("working directory inside {}", scratch.display())
+        );
     }
 
     #[test]

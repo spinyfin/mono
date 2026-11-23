@@ -713,6 +713,10 @@ async fn reap_dead_execution(
             ),
         )
         .await;
+    } else {
+        // No lease means no release gate to stop the run's detached
+        // processes at; stop them here.
+        crate::workspace_lease_release::reap_leaseless_run_processes(work_db, execution).await;
     }
 
     // Drop the live-state entry BEFORE releasing the pool slot. The pool
@@ -889,6 +893,20 @@ mod tests {
             },
         );
     }
+
+    /// Records every `force_release_lease` call; every other [`CubeClient`]
+    /// method is unreachable from the reap.
+    #[derive(Default)]
+    struct RecordingCube {
+        force_releases: std::sync::Mutex<Vec<String>>,
+    }
+
+    crate::stub_cube_client! { RecordingCube {
+        async fn force_release_lease(&self, lease_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+            self.force_releases.lock().unwrap().push(lease_id.to_owned());
+            Ok(())
+        }
+    } }
 
     /// The parsed `started_at` epoch for an execution (panics if unset).
     fn started_epoch_of(db: &WorkDb, execution_id: &str) -> i64 {
@@ -1175,6 +1193,115 @@ mod tests {
     }
 
     // ─── reap_driver_exit_at_pane_input ───────────────────────────────────────────
+
+    /// The shapes that outlived a run whose pane was found absent: jobs
+    /// started with `nohup` and in a new session from a directory outside the
+    /// workspace, re-parented once their shell exited. Nothing but the run
+    /// identity they inherited ties them to the run, and the reap must stop
+    /// them before it returns the lease, without touching a job that carries
+    /// another run's identity or none.
+    #[tokio::test]
+    async fn observed_death_stops_nohup_and_new_session_jobs_outside_the_workspace() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "escaped jobs");
+        let db = Arc::new(db);
+        let workspace = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let execution_id = create_old_execution(&db, &work_item_id);
+        db.start_execution_run(
+            &execution_id,
+            "worker-1",
+            "repo-1",
+            "lease-escaped",
+            "ws-escaped",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+
+        let nohup = spawn_escaped(Escape::Nohup, elsewhere.path(), Some(&execution_id));
+        let new_session = spawn_escaped(Escape::Setsid, elsewhere.path(), Some(&execution_id));
+        let other_run = spawn_escaped(Escape::Nohup, elsewhere.path(), Some("exec_another_run"));
+        let no_identity = spawn_escaped(Escape::Setsid, elsewhere.path(), None);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let sink = RecordingDispatchEventSink::new();
+        let cube = RecordingCube::default();
+
+        let reaped = reap_observed_worker_death(
+            db.as_ref(),
+            &live_states,
+            coordinator,
+            &sink,
+            &cube,
+            &execution_id,
+            "pane-absent: tmux session gone and the recorded shell pid is dead",
+        )
+        .await;
+
+        assert!(reaped);
+        let grace = std::time::Duration::from_secs(5);
+        assert!(nohup.exited_within(grace), "the nohup job outlived the reap");
+        assert!(
+            new_session.exited_within(grace),
+            "the new-session job outlived the reap"
+        );
+        assert!(other_run.is_alive(), "another run's job must not be signalled");
+        assert!(
+            no_identity.is_alive(),
+            "a job with no run identity must not be signalled"
+        );
+        assert_eq!(*cube.force_releases.lock().unwrap(), ["lease-escaped"]);
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Orphaned);
+        assert_eq!(
+            execution.cube_lease_id, None,
+            "the lease is returned once the jobs are gone"
+        );
+    }
+
+    /// A run that holds no lease has no release gate to stop its jobs at; the
+    /// reap stops them itself.
+    #[tokio::test]
+    async fn observed_death_of_a_run_without_a_lease_stops_its_escaped_jobs() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "leaseless escaped jobs");
+        let db = Arc::new(db);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let execution_id = create_old_execution(&db, &work_item_id);
+        assert!(db.get_execution(&execution_id).unwrap().cube_lease_id.is_none());
+        let job = spawn_escaped(Escape::Nohup, elsewhere.path(), Some(&execution_id));
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+        let sink = RecordingDispatchEventSink::new();
+
+        let reaped = reap_observed_worker_death(
+            db.as_ref(),
+            &live_states,
+            coordinator,
+            &sink,
+            &NoopCube,
+            &execution_id,
+            "pane-absent: tmux session gone and the recorded shell pid is dead",
+        )
+        .await;
+
+        assert!(reaped);
+        assert!(
+            job.exited_within(std::time::Duration::from_secs(5)),
+            "the job outlived the reap"
+        );
+        assert!(db.list_attention_items(&execution_id).unwrap().iter().all(
+            |item| item.kind != boss_engine_storage_values::attention_kinds::RUN_PROCESSES_SURVIVED_ATTENTION_KIND
+        ));
+    }
 
     /// The core invariant: a driver exit observed at the pane-input boundary
     /// reaps the execution immediately, even though `started_at` is fresh

@@ -182,6 +182,143 @@ async fn reap_removes_a_reparented_background_shell_before_returning() -> Result
     Ok(())
 }
 
+/// A worker's tool shell starts its own tmux server from a directory outside
+/// the workspace and leaves a job running in one of its panes. The server
+/// daemonizes, so neither it nor the job is a descendant of the worker's
+/// pane, and neither has a working directory in the workspace. When the
+/// worker's pane is then found absent, the reap must stop both before it
+/// returns the lease.
+#[tokio::test]
+async fn observed_death_stops_a_worker_started_tmux_server_and_its_pane_job() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace)?;
+    let scratch = temp.path().join("scratch");
+    std::fs::create_dir(&scratch)?;
+    // The other tests in this binary point the process-wide `SHELL` at their
+    // own fixtures; tmux starts a pane's command with it.
+    let _home = boss_engine::driver::test_support::home_override(temp.path());
+    let _shell = boss_engine::driver::test_support::shell_override(Path::new("/bin/bash"));
+
+    let work_db = Arc::new(WorkDb::open(temp.path().join("state.db"))?);
+    let product = work_db.create_product(
+        CreateProductInput::builder()
+            .name("escaped tmux fixture")
+            .repo_remote_url("https://example.invalid/escaped-tmux.git")
+            .build(),
+    )?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id)
+            .name("leave a tmux server behind")
+            .autostart(true)
+            .build(),
+    )?;
+    let execution =
+        work_db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())?;
+    work_db.start_execution_run_on_host_with_tmux_hosting(
+        &execution.id,
+        "worker-1",
+        "fixture-repo",
+        "fixture-lease",
+        "fixture-workspace",
+        workspace.to_str().expect("temporary workspace is UTF-8"),
+        "local",
+        true,
+    )?;
+
+    // What the tool shell ran: `tmux -S s new-session -d <job>`, inheriting
+    // the run identity every worker process carries.
+    let tmux_binary = declared_tmux_binary()?;
+    let socket = scratch.join("s");
+    let _server_guard = TmuxServerGuard::new(tmux_binary.clone(), socket.clone());
+    let pid_file = scratch.join("job.pid");
+    let job = format!(
+        "echo $$ > {}; exec python3 -c 'import time; time.sleep(120)'",
+        boss_tmux::quote_for_shell(&pid_file.to_string_lossy())
+    );
+    let started = std::process::Command::new(&tmux_binary)
+        .arg("-S")
+        .arg(&socket)
+        .args(["new-session", "-d", "-c"])
+        .arg(&scratch)
+        .arg(&job)
+        .current_dir(&scratch)
+        .env_remove("TMUX")
+        .env_remove("BOSS_SPAWN_TOKEN")
+        .env("BOSS_RUN_ID", &execution.id)
+        .output()?;
+    if !started.status.success() {
+        bail!(
+            "worker-started tmux server did not start: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| !pid.trim().is_empty())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if !pid_file.exists() {
+        bail!("the job in the worker-started tmux server did not start");
+    }
+    let job_pid: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+    let server = std::process::Command::new(&tmux_binary)
+        .arg("-S")
+        .arg(&socket)
+        .args(["display-message", "-p", "#{pid}"])
+        .output()?;
+    let server_pid: i32 = String::from_utf8(server.stdout)?.trim().parse()?;
+    let dead = |pid| {
+        matches!(
+            boss_engine::dead_pid_sweep::probe_pid(pid),
+            boss_engine::dead_pid_sweep::PidStatus::Dead
+        )
+    };
+    assert!(
+        !dead(job_pid) && !dead(server_pid),
+        "fixture precondition: both are running"
+    );
+
+    // The worker's own pane is gone: its recorded shell pid no longer exists.
+    let mut exited = std::process::Command::new("true").spawn()?;
+    let worker_shell_pid = exited.id() as i32;
+    exited.wait()?;
+    let live_states = LiveWorkerStateRegistry::new();
+    live_states.register_spawn(1, &execution.id, "claude-opus-4-7", worker_shell_pid, None);
+    let cube = Arc::new(FixtureCube::default());
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        work_db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FixtureRunner),
+    ));
+    let events = RecordingDispatchEventSink::new();
+
+    let reaped = boss_engine::dead_pid_sweep::reap_observed_worker_death(
+        work_db.as_ref(),
+        &live_states,
+        coordinator,
+        &events,
+        cube.as_ref(),
+        &execution.id,
+        "pane-absent: tmux session gone and the recorded shell pid is dead",
+    )
+    .await;
+
+    assert!(reaped);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !(dead(job_pid) && dead(server_pid)) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(dead(server_pid), "the worker-started tmux server outlived the reap");
+    assert!(dead(job_pid), "the job in its pane outlived the reap");
+    assert_eq!(cube.released_leases.lock().unwrap().as_slice(), ["fixture-lease"]);
+    assert_eq!(work_db.get_execution(&execution.id)?.cube_lease_id, None);
+    Ok(())
+}
+
 /// App facade for the production spawn path: it validates that the engine
 /// attached a viewer to the tmux-owned worker and acknowledges that attach.
 #[derive(Default)]
