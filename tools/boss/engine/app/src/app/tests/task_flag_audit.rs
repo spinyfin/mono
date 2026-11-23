@@ -200,7 +200,10 @@ async fn list_task_field_audit_replies_with_the_flag_rows() {
 
     work_items::handle_list_task_field_audit(
         dispatch(&state, &sink, "req-list"),
-        FrontendRequest::ListTaskFieldAudit { id: chore.id.clone() },
+        FrontendRequest::ListTaskFieldAudit {
+            id: chore.id.clone(),
+            include_status: false,
+        },
     )
     .await;
 
@@ -963,5 +966,50 @@ async fn actioning_a_question_group_records_the_socket_caller_on_the_seeded_desi
             "human".into(),
             format!("insert_seeded_design_task_in_tx {basis}")
         )]
+    );
+}
+
+#[tokio::test]
+async fn request_execution_and_board_drop_stamp_created_via() {
+    let (state, _dir) = test_server_state();
+    let product = create_test_product_with_repo(&state.work_db, "Provenance RPC", Some("git@example.com:prov.git"));
+    let rpc_chore = create_test_chore_manual(&state.work_db, product.id.clone(), "RPC start");
+    let drop_chore = create_test_chore_manual(&state.work_db, product.id.clone(), "Board drop start");
+    let sink = make_session_sink();
+
+    executions::handle_request_execution(
+        dispatch(&state, &sink, "req-exec-start"),
+        FrontendRequest::RequestExecution {
+            input: RequestExecutionInput::builder()
+                .work_item_id(rpc_chore.id.clone())
+                .created_via("orphan_sweep")
+                .build(),
+        },
+    )
+    .await;
+    work_items::handle_move_work_item_on_board(
+        dispatch(&state, &sink, "req-board-drop"),
+        FrontendRequest::MoveWorkItemOnBoard {
+            id: drop_chore.id.clone(),
+            target: BoardDropTarget {
+                column: BoardColumn::Doing,
+                group: None,
+            },
+            explicit_status: None,
+            bypass_dispatch_pause: false,
+            observed_pause_since_epoch_s: None,
+        },
+    )
+    .await;
+
+    let rpc_execs = state.work_db.list_executions(Some(&rpc_chore.id)).unwrap();
+    assert_eq!(rpc_execs.len(), 1);
+    assert_eq!(rpc_execs[0].created_via.as_deref(), Some("frontend:request_execution"));
+
+    let drop_execs = state.work_db.list_executions(Some(&drop_chore.id)).unwrap();
+    assert_eq!(drop_execs.len(), 1);
+    assert_eq!(
+        drop_execs[0].created_via.as_deref(),
+        Some("board_drop:request_execution")
     );
 }

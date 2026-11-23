@@ -17,6 +17,7 @@ fn orphaned(db: &WorkDb, workspace: &Path, lease: &str) -> WorkExecution {
     let chore = create_test_chore(db, product.id.clone(), "unowned");
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Orphaned)

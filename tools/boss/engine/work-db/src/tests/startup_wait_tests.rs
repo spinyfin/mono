@@ -147,6 +147,7 @@ fn unexplained_wait_is_logged_on_read_without_waiting_for_a_heartbeat() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Queued)
@@ -193,6 +194,7 @@ fn unexplained_wait_is_logged_once_per_distinct_anomaly() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Queued)
@@ -217,6 +219,7 @@ fn unexplained_wait_age_follows_the_execution_transition_not_the_task_status() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Queued)
@@ -278,6 +281,7 @@ fn unexplained_wait_log_uses_the_given_execution_never_the_newest_row() {
     let selected = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Queued)
@@ -287,6 +291,7 @@ fn unexplained_wait_log_uses_the_given_execution_never_the_newest_row() {
     let progression = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task.id)
                 .kind(ExecutionKind::Progression)
                 .status(ExecutionStatus::Queued)
@@ -342,6 +347,7 @@ fn heartbeat_and_card_log_the_same_non_abandoned_execution() {
         ids.push(
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&task.id)
                     .kind(kind)
                     .status(status)

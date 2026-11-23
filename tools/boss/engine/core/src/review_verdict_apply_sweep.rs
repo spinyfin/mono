@@ -237,6 +237,7 @@ mod observation_tests {
         let supervisor = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(root.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Ready)

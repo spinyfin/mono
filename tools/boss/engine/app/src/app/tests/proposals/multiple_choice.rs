@@ -221,6 +221,7 @@ async fn archive_it_archives_the_item_progression_could_not_unstick() {
             .work_db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&chore)
                     .kind(boss_protocol::ExecutionKind::Progression)
                     .status(boss_protocol::ExecutionStatus::Completed)

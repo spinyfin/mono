@@ -32,6 +32,7 @@ async fn launch_rechecks_shares_changed_after_claim_for_implementations_revision
             let execution = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(&chore.id)
                         .kind(kind.clone())
                         .status(ExecutionStatus::Ready)
@@ -97,6 +98,7 @@ async fn launch_surfaces_allocation_errors_instead_of_using_engine_default() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -173,6 +175,7 @@ async fn tier_row_with_grok_product_default_spawns_on_the_allocated_driver() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&chore.id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)

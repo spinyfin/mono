@@ -26,6 +26,7 @@ fn ready_execution(db: &WorkDb, task_id: &str, created_at: &str) -> String {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -344,6 +345,7 @@ async fn direct_mutation_invalidation_refreshes_the_queued_order() {
             .work_db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&task.id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)
@@ -419,6 +421,7 @@ fn execution_in(db: &WorkDb, task_id: &str, kind: ExecutionKind, status: Executi
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task_id)
                 .kind(kind)
                 .status(status)

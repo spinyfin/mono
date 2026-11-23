@@ -294,6 +294,7 @@ fn park_behind(
                     .work_item_id(&prerequisite.id)
                     .audit_actor(actor)
                     .maybe_audit_basis(attribution.provenance.map(str::to_owned))
+                    .created_via("prerequisite_question:approval")
                     .build(),
                 |_| false,
             )?;
@@ -513,6 +514,7 @@ pub(super) fn continue_after_answer(
                 .explicit_start(true)
                 .audit_actor(actor)
                 .maybe_audit_basis(attribution.provenance.map(str::to_owned))
+                .created_via("operator_answer:request_execution")
                 .build(),
             // Match request_execution's conservative behavior when
             // no live-worker oracle is supplied.
@@ -633,6 +635,7 @@ fn queue_continuation_execution(
     insert_execution(
         conn,
         CreateExecutionInput::builder()
+            .created_via("prerequisite_question_restart")
             .work_item_id(&task.id)
             .kind(kind)
             .status(status)

@@ -21,6 +21,7 @@ async fn revision_with_pr_url_positions_via_goto_not_create_change() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -95,6 +96,7 @@ async fn revision_without_pr_url_falls_back_to_chain_root_for_goto() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_no_pr_url")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -163,6 +165,7 @@ async fn revision_lease_failure_records_start_failure() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -221,6 +224,7 @@ async fn revision_clean_lease_positions_via_goto() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore_id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -392,6 +396,7 @@ async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
     let root_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -403,6 +408,7 @@ async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_serialize")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -513,6 +519,7 @@ async fn schedule_execution_bypasses_live_review_sibling_for_merge_conflict_revi
     let _root_review_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -524,6 +531,7 @@ async fn schedule_execution_bypasses_live_review_sibling_for_merge_conflict_revi
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_conflict_bypass")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -607,6 +615,7 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
     let _root_review_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -619,6 +628,7 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
     let _descendant_writer_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_conflict_writer".to_owned())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Running)
@@ -631,6 +641,7 @@ async fn schedule_execution_blocks_conflict_revision_when_review_masks_live_desc
     let revision_exec_b = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_conflict_zsecond".to_owned())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -709,6 +720,7 @@ async fn schedule_execution_bypasses_live_review_sibling_for_non_conflict_revisi
     let _root_review_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -719,6 +731,7 @@ async fn schedule_execution_bypasses_live_review_sibling_for_non_conflict_revisi
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_no_bypass")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -787,6 +800,7 @@ async fn schedule_execution_defers_non_conflict_revision_behind_live_writer_desp
     let _root_review_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -796,6 +810,7 @@ async fn schedule_execution_defers_non_conflict_revision_behind_live_writer_desp
     let _writer_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_plain_writer".to_owned())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Running)
@@ -806,6 +821,7 @@ async fn schedule_execution_defers_non_conflict_revision_behind_live_writer_desp
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_plain_second".to_owned())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -877,6 +893,7 @@ async fn drain_admits_revision_despite_live_review_without_wait_reason() {
     let _root_review_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)
@@ -887,6 +904,7 @@ async fn drain_admits_revision_despite_live_review_without_wait_reason() {
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_wait_reason")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -961,6 +979,7 @@ async fn drain_records_writer_held_wait_reason_names_blocking_task_and_pr() {
     let root_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -975,6 +994,7 @@ async fn drain_records_writer_held_wait_reason_names_blocking_task_and_pr() {
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_writer_held")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1046,6 +1066,7 @@ async fn redundant_spawn_guard_emits_terminal_host_selected_error() {
     let _live_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1265,6 +1286,7 @@ async fn chain_serialized_backstop_emits_terminal_host_selected_error() {
     let _root_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1276,6 +1298,7 @@ async fn chain_serialized_backstop_emits_terminal_host_selected_error() {
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_backstop")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1424,6 +1447,7 @@ async fn chain_serialized_pre_claim_reconciles_lost_workspace_zombie_and_dispatc
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_t251")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1506,6 +1530,7 @@ async fn chain_serialized_stall_raises_durable_attention_after_threshold() {
     let _root_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -1516,6 +1541,7 @@ async fn chain_serialized_stall_raises_durable_attention_after_threshold() {
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_stall")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1737,6 +1763,7 @@ async fn merge_conflict_already_resolved_guard_short_circuits_dispatch() {
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

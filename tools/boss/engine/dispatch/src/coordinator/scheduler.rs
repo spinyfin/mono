@@ -2506,6 +2506,7 @@ impl ExecutionCoordinator {
             boss_protocol::RequestExecutionInput::builder()
                 .work_item_id(victim_execution.work_item_id.clone())
                 .audit_basis("preemption_requeue")
+                .created_via("scheduler:preemption_requeue")
                 .build(),
         ) {
             Ok(fresh) => {
@@ -2535,8 +2536,7 @@ impl ExecutionCoordinator {
     /// A spoke lease the host has not answered is a retry of the stored
     /// command, so it proceeds without a permit (`Some(None)`) and does
     /// not pin the bound while the host is silent. `miss_reason` overrides
-    /// the recorded wait text when another constraint (the interactive
-    /// cap) is also holding the row.
+    /// the recorded wait text when another constraint (interactive cap) holds the row.
     async fn begin_repo_lease_or_wait(
         self: &Arc<Self>,
         execution: &WorkExecution,

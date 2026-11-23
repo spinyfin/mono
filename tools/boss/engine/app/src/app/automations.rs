@@ -514,6 +514,7 @@ pub(super) async fn handle_create_automation_task(ctx: Dispatch, req: FrontendRe
                 let live_states = server_state.live_worker_states.clone();
                 let dispatch_input = RequestExecutionInput::builder()
                     .work_item_id(work_item_id_for_dispatch.clone())
+                    .created_via("automation:create_and_dispatch")
                     .build();
                 match work_db
                     .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))

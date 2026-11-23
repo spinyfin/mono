@@ -110,6 +110,7 @@ async fn drain_chain_hold_leaves_row_ready_not_claimed() {
     let _root_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root_id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -120,6 +121,7 @@ async fn drain_chain_hold_leaves_row_ready_not_claimed() {
     let revision_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_claim_hold")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -189,6 +191,7 @@ async fn drain_stagger_stamps_dispatch_not_before_and_returns_to_ready() {
     let later_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(later.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -377,6 +380,7 @@ async fn claim_lost_cleanup_does_not_release_a_replacement_claim() {
     let replacement = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(replacement_chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -427,6 +431,7 @@ async fn schedule_error_cleanup_does_not_release_a_replacement_claim() {
     let replacement = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(replacement_chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -436,6 +441,7 @@ async fn schedule_error_cleanup_does_not_release_a_replacement_claim() {
     let ready = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(ready_chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

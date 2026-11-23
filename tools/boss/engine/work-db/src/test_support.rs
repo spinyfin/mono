@@ -189,6 +189,7 @@ mod db_helpers {
     pub fn create_ready_chore_execution(db: &WorkDb, work_item_id: impl Into<String>) -> WorkExecution {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

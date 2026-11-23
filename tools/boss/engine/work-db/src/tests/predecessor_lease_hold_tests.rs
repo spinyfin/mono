@@ -81,6 +81,7 @@ fn a_predecessor_that_is_still_live_is_not_waited_for() {
     let next = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -100,6 +101,7 @@ fn a_successor_with_no_predecessor_does_not_wait() {
     let first = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -126,6 +128,7 @@ fn a_resume_row_names_no_workspace() {
     assert_eq!(resumed.transient_failure_count, 2);
     assert_eq!(resumed.preferred_workspace_id, None);
     assert!(!resumed.allow_dirty);
+    assert_eq!(resumed.created_via.as_deref(), Some("resume_execution"));
     assert_eq!(db.get_execution(&id).unwrap().status, ExecutionStatus::Orphaned);
     // The stalled run keeps its lease until the caller preserves and releases
     // it, and that is what the successor waits for.
@@ -171,6 +174,7 @@ fn resume_does_not_reuse_a_terminal_later_execution() {
     let next = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(prior.work_item_id.clone())
                 .kind(prior.kind)
                 .status(ExecutionStatus::Abandoned)
@@ -193,6 +197,7 @@ fn resume_does_not_adopt_a_sibling_of_a_read_only_kind() {
     let make = |status| {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(task.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(status)

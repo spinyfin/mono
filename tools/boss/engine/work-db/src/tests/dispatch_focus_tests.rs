@@ -81,6 +81,7 @@ fn followup_of(db: &WorkDb, product_id: &str, origin: &Task, created_via: &str) 
 fn ready_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id)
             .kind(kind)
             .status(ExecutionStatus::Ready)

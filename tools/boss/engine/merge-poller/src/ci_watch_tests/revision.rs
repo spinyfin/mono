@@ -250,6 +250,17 @@ async fn retrigger_creates_bespoke_execution_and_no_revision() {
         )
         .unwrap();
     assert_eq!(exec_count, 1, "retrigger must park a ci_remediation execution");
+    let created_via: Option<String> = conn
+        .query_row(
+            "SELECT created_via FROM work_executions WHERE work_item_id = ?1 AND kind = 'ci_remediation'",
+            rusqlite::params![&chore],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        created_via.as_deref(),
+        Some(crate::ci_watch::CREATED_VIA_CI_WATCH_RETRIGGER)
+    );
     let revisions: i64 = conn
         .query_row("SELECT COUNT(*) FROM tasks WHERE kind = 'revision'", [], |r| r.get(0))
         .unwrap();

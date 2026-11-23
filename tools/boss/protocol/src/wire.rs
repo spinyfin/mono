@@ -1621,6 +1621,12 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::TaskFieldAuditList`].
     ListTaskFieldAudit {
         id: String,
+        /// When `true`, also include all `property = 'status'` rows from
+        /// `task_status_audit` (not only those correlated with a flag or
+        /// abandonment operation) so `boss task show` and
+        /// `boss task executions` surface every status-change reason.
+        #[serde(default)]
+        include_status: bool,
     },
 
     ListTasks {

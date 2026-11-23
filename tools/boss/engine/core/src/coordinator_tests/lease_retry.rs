@@ -28,6 +28,7 @@ fn pr_review_execution(db: &WorkDb) -> WorkExecution {
     let (_, chore_id) = make_pr_review_fixture(db, Some("https://github.com/spinyfin/mono/pull/7"));
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore_id)
             .kind(ExecutionKind::PrReview)
             .status(ExecutionStatus::Ready)
@@ -105,6 +106,7 @@ async fn post_lease_chain_sibling_refusal_releases_lease_and_redispatch_succeeds
     let revision = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id("task_rev_late")
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -123,6 +125,7 @@ async fn post_lease_chain_sibling_refusal_releases_lease_and_redispatch_succeeds
                 let live = hook_db
                     .create_execution(
                         CreateExecutionInput::builder()
+                            .created_via("test")
                             .work_item_id(root_id.clone())
                             .kind(ExecutionKind::ChoreImplementation)
                             .status(ExecutionStatus::Running)

@@ -129,9 +129,9 @@ pub(super) const GRACE_COLUMN_MIGRATION_ID: &str = "20261106_1200_progression_gr
 pub(super) const EXECUTION_PROVENANCE_MIGRATION_ID: &str = "20261106_1205_execution_created_via";
 pub(super) const VIEWS_MIGRATION_ID: &str = "20261106_1210_progression_candidate_views";
 
-/// Add `work_executions.created_via`: which producer minted the execution. Only
-/// the `progression_sweep` sets it today; a NULL value means an execution minted
-/// by the ordinary reconcile and request paths.
+/// Add `work_executions.created_via`: which producer minted the execution. Every
+/// execution-creation path populates it; a NULL value marks only a row created
+/// before this column existed.
 pub(super) fn migrate_execution_provenance(conn: &Connection) -> Result<()> {
     if !crate::schema_init::table_has_column(conn, "work_executions", "created_via")? {
         conn.execute_batch("ALTER TABLE work_executions ADD COLUMN created_via TEXT")?;
@@ -1104,14 +1104,11 @@ fn insert_progression_execution(conn: &Connection, work_item_id: &str) -> Result
     let execution = insert_execution(
         conn,
         CreateExecutionInput::builder()
+            .created_via(CREATED_VIA_PROGRESSION_SWEEP)
             .work_item_id(work_item_id)
             .kind(ExecutionKind::Progression)
             .status(ExecutionStatus::Ready)
             .build(),
-    )?;
-    conn.execute(
-        "UPDATE work_executions SET created_via = ?2 WHERE id = ?1",
-        params![execution.id, CREATED_VIA_PROGRESSION_SWEEP],
     )?;
     conn.execute(
         "UPDATE tasks SET progression_grace_waived_at = NULL WHERE id = ?1",

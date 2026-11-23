@@ -53,6 +53,7 @@ fn hold_revision(db: &WorkDb, root_id: &str, launched: bool) -> String {
     } else {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

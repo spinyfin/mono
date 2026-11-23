@@ -453,6 +453,7 @@ mod tests {
         attach_revision(&db, &running_attempt.id, &with_exec);
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&with_exec)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Running)

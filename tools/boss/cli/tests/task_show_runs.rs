@@ -4,7 +4,7 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
-use boss_protocol::{CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus};
+use boss_protocol::{CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus, WorkItemPatch};
 use serde_json::Value;
 
 use common::{run_boss, run_boss_human};
@@ -19,6 +19,7 @@ async fn dismiss_question_cli_records_history_and_rejects_late_answers() -> Resu
     let db = engine.db()?;
     let execution = db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(&chore.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -112,6 +113,7 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
 
     let running = db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -119,6 +121,7 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
     )?;
     let completed = db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Completed)
@@ -148,6 +151,15 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
             .build(),
     )?;
 
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+    assert!(db.demote_active_work_item_to_todo(&chore.id)?);
+
     let show = run_boss(engine.socket_str(), &["task", "show", &chore.id])?;
     assert_run_surfaced(execution_json(&show, &running.id)?, &running_run.id, running_transcript)?;
     assert_run_surfaced(
@@ -155,6 +167,17 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
         &completed_run.id,
         completed_transcript,
     )?;
+
+    assert_eq!(execution_json(&show, &running.id)?["created_via"], "test");
+    let show_audit = show["field_audit"].as_array().expect("field_audit on task show");
+    let last_status = show_audit
+        .iter()
+        .rfind(|row| row["property"] == "status")
+        .expect("engine status transition in field_audit");
+    assert_eq!(last_status["old_value"], "active");
+    assert_eq!(last_status["new_value"], "todo");
+    assert_eq!(last_status["actor"], "engine");
+    assert_eq!(last_status["basis"], "demote_active_work_item_to_todo");
 
     let ledger = run_boss(engine.socket_str(), &["task", "executions", &chore.id])?;
     assert_run_surfaced(
@@ -167,6 +190,21 @@ async fn task_show_and_executions_surface_runs_for_running_and_completed_parents
         &completed_run.id,
         completed_transcript,
     )?;
+
+    assert_eq!(execution_json(&ledger, &completed.id)?["created_via"], "test");
+    let ledger_audit = ledger["field_audit"]
+        .as_array()
+        .expect("field_audit on task executions");
+    assert!(
+        ledger_audit.iter().any(|row| {
+            row["property"] == "status"
+                && row["old_value"] == "active"
+                && row["new_value"] == "todo"
+                && row["actor"] == "engine"
+                && row["basis"] == "demote_active_work_item_to_todo"
+        }),
+        "task executions --json must surface status transitions in field_audit"
+    );
 
     let human = run_boss_human(engine.socket_str(), &["task", "show", &chore.id])?;
     assert!(

@@ -403,6 +403,7 @@ async fn chore_show_json_includes_run_result_summary() -> Result<()> {
     let db = engine.db()?;
     let execution = db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Completed)

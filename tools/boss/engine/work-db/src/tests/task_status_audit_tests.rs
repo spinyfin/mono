@@ -347,6 +347,7 @@ fn legacy_backfill_does_not_reuse_an_older_execution_refusal() {
     let later = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -1040,6 +1041,7 @@ fn the_abandonment(db: &WorkDb, work_item_id: &str, code: &str) -> AbandonRow {
 fn execution_with_status(db: &WorkDb, work_item_id: &str, status: ExecutionStatus) -> WorkExecution {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(status)

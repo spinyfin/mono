@@ -146,6 +146,7 @@ fn admissible_concurrent_review_batch_pair_spans_batches_of_one_cycle_root_only(
     let bare_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(cycle_root.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

@@ -12,6 +12,7 @@ fn quorum_fails_the_batch_when_fewer_than_two_leaves_report() {
         .map(|_| {
             db.create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(cycle_root.id.clone())
                     .kind(ExecutionKind::PrReview)
                     .status(ExecutionStatus::Failed)

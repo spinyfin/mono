@@ -14,6 +14,7 @@ async fn fixture(db: &WorkDb, workspace: &Path) -> WorkExecution {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)
@@ -250,6 +251,7 @@ async fn leftover_sweep_uses_original_heartbeat_after_intervening_holders() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)
@@ -368,6 +370,7 @@ async fn reaped_worker_preserves_exactly_one_bookmark_only_for_unpushed_work() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)
@@ -437,6 +440,7 @@ async fn remote_rows_never_reach_local_release_or_occupancy() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -491,6 +495,7 @@ async fn sweep_requires_both_durable_pane_death_and_empty_cwds() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -582,6 +587,7 @@ async fn sweep_retries_a_cancelled_row_after_a_transient_cube_failure() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -688,6 +694,7 @@ async fn sweep_retries_a_never_started_row_without_a_bookmark() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Failed)
@@ -730,6 +737,7 @@ async fn only_an_unstarted_unrecorded_execution_is_never_positioned() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -863,6 +871,7 @@ async fn orphaned_worker(db: &WorkDb, repo: &boss_engine_test_git::jj::JjRepo) -
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -1150,6 +1159,7 @@ async fn leftover_sweep_lists_cube_workspaces_once_per_pass() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Failed)

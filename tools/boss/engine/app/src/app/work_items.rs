@@ -62,9 +62,10 @@ pub(super) fn refuse_agent_parking(server_state: &ServerState, peer_pid: Option<
     Ok(())
 }
 
-/// Reply with the recorded `deferred` / `autostart` changes of one task.
+/// Reply with the recorded `deferred` / `autostart` / abandonment changes of one task,
+/// and optionally its `status` transitions when `include_status` is set.
 pub(super) async fn handle_list_task_field_audit(ctx: Dispatch, req: FrontendRequest) {
-    let FrontendRequest::ListTaskFieldAudit { id } = req else {
+    let FrontendRequest::ListTaskFieldAudit { id, include_status } = req else {
         unreachable!()
     };
     let id = match ctx.server_state.resolve_work_item_id(&id).await {
@@ -74,7 +75,7 @@ pub(super) async fn handle_list_task_field_audit(ctx: Dispatch, req: FrontendReq
             return;
         }
     };
-    match ctx.work_db.list_task_field_audit(&id) {
+    match ctx.work_db.list_task_field_audit_with_status(&id, include_status) {
         Ok(rows) => send_response(
             &ctx.sink,
             &ctx.request_id,
@@ -1254,6 +1255,7 @@ pub(super) async fn apply_work_item_patch_from(
                             .maybe_observed_pause_since_epoch_s(bypass.observed_pause_since_epoch_s)
                             .audit_actor(actor)
                             .audit_basis(start_basis.clone())
+                            .created_via("board_drop:request_execution")
                             .build();
                         match coordinator
                             .dispatch_with_pause_bypass(dispatch_input, live_states)
@@ -1289,6 +1291,7 @@ pub(super) async fn apply_work_item_patch_from(
                             .explicit_start(true)
                             .audit_actor(actor)
                             .audit_basis(start_basis.clone())
+                            .created_via("board_drop:request_execution")
                             .build();
                         // Through the coordinator rather than the store, so
                         // this start shares the liveness test of every other
@@ -1340,10 +1343,11 @@ pub(super) async fn apply_work_item_patch_from(
                                 .maybe_blocked_reason(blocked_reason)
                                 .maybe_blocked_detail(blocked_detail)
                                 .build();
-                            match work_db.update_work_item_as_actor(
+                            match work_db.update_work_item_with_basis(
                                 &work_item_id_for_event,
                                 revert_patch,
                                 boss_protocol::LAST_STATUS_ACTOR_ENGINE,
+                                "dispatch_refused:status_reverted",
                             ) {
                                 Ok(reverted) => item = reverted,
                                 Err(err) => tracing::warn!(work_item_id = %work_item_id_for_event, ?err,

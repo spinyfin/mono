@@ -193,6 +193,7 @@ fn has_in_flight_ci_fix_revision_false_for_dead_halt_without_live_execution() {
 
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(revision.clone())
             .kind(ExecutionKind::RevisionImplementation)
             .status(ExecutionStatus::Ready)

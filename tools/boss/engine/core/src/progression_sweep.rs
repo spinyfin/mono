@@ -473,6 +473,7 @@ mod tests {
         let run = db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&id)
                     .kind(ExecutionKind::Progression)
                     .status(ExecutionStatus::Failed)
@@ -602,6 +603,7 @@ mod tests {
             let run = db
                 .create_execution(
                     boss_protocol::CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(&spent)
                         .kind(ExecutionKind::Progression)
                         .status(ExecutionStatus::Completed)

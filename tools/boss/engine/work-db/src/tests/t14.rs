@@ -32,6 +32,7 @@ fn pr_review_execution(db: &WorkDb, work_item_id: &str, status: ExecutionStatus,
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id.to_owned())
                 .kind(ExecutionKind::PrReview)
                 .status(status)

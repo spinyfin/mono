@@ -9,6 +9,7 @@ fn review_verdict_apply_records_cycle_root_advance() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&root.id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -130,6 +131,7 @@ fn review_verdict_apply_records_deletion_signoff_hold() {
     let supervisor = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&root.id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

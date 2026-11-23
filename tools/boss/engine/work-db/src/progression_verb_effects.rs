@@ -424,7 +424,15 @@ pub(super) fn redispatch(
         // sweep and `bossctl review start` use, and release the churn-guard
         // attention that parked it, as an explicit start does.
         resolve_attention_kind_in_tx(conn, &item.id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
-        via_engine_path(verb, request_pr_review_in_tx(conn, &item.id, pr_checker))?
+        let prior_id = crate::dispatch_helpers::query_latest_execution_for_work_item(conn, &item.id)?.map(|e| e.id);
+        let exec = via_engine_path(verb, request_pr_review_in_tx(conn, &item.id, pr_checker))?;
+        if prior_id.as_deref() != Some(exec.id.as_str()) {
+            conn.execute(
+                "UPDATE work_executions SET created_via = ?2 WHERE id = ?1",
+                params![exec.id, ctx.created_via],
+            )?;
+        }
+        exec
     } else if item.status == TaskStatus::Blocked && crate::dispatch_admission::primary_pr_awaits_review(conn, &item.id)?
     {
         // Revision dispatch positions the worker on the bound PR and requires
@@ -465,8 +473,13 @@ pub(super) fn redispatch(
         )?;
         stamp_progression_actor(conn, &revision.id)?;
         stage_task_board_change(pending, conn, &revision.id)?;
-        crate::dispatch_helpers::query_latest_execution_for_work_item(conn, &revision.id)?
-            .context("redispatch revision has no execution")?
+        let exec = crate::dispatch_helpers::query_latest_execution_for_work_item(conn, &revision.id)?
+            .context("redispatch revision has no execution")?;
+        conn.execute(
+            "UPDATE work_executions SET created_via = ?2 WHERE id = ?1",
+            params![exec.id, ctx.created_via],
+        )?;
+        exec
     } else {
         // An explicit start: it clears `churn_guard`, resolves a `deliberate_park`
         // attention, and lifts a non-refusal `worker_failed` block, all in this
@@ -479,6 +492,7 @@ pub(super) fn redispatch(
                 RequestExecutionInput::builder()
                     .work_item_id(item.id.clone())
                     .explicit_start(true)
+                    .created_via(ctx.created_via.clone())
                     .build(),
                 |_| true,
                 PROGRESSION,
@@ -490,12 +504,6 @@ pub(super) fn redispatch(
         )?;
         execution
     };
-    // The churn guard's window and the brief's redispatch allowance count by this
-    // stamp; a reused row keeps its own provenance.
-    conn.execute(
-        "UPDATE work_executions SET created_via = ?2 WHERE id = ?1 AND created_via IS NULL",
-        params![execution.id, ctx.created_via],
-    )?;
     stage_task_board_change(pending, conn, &item.id)?;
     Ok(Applied {
         subject: String::new(),

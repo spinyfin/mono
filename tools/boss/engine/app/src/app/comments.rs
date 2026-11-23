@@ -1848,6 +1848,7 @@ mod tests {
         let other_execution = work_db
             .create_execution(
                 boss_work_db::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(boss_work_db::ExecutionStatus::Ready)
@@ -1899,6 +1900,7 @@ mod tests {
         let execution = work_db
             .create_execution(
                 boss_work_db::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(boss_work_db::ExecutionStatus::Ready)
@@ -2579,6 +2581,7 @@ mod tests {
         let execution = work_db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(task_id)
                     .kind(ExecutionKind::RevisionImplementation)
                     .status(ExecutionStatus::Running)

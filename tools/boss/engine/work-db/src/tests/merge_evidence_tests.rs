@@ -239,6 +239,7 @@ async fn worker_merge_observation_records_root_even_after_execution_is_terminal(
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -274,6 +275,7 @@ fn worker_observing_merge_on_a_revision_records_the_bound_root() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Running)
@@ -312,6 +314,7 @@ fn worker_closed_unmerged_completion_does_not_record_a_merge() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -339,6 +342,7 @@ fn stale_worker_merge_cannot_replace_a_new_pr_binding() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(root.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)
@@ -370,6 +374,7 @@ fn blank_pr_url_is_unbound_for_a_worker_merge() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(root.clone())
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Running)

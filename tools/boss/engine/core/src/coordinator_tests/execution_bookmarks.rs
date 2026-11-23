@@ -16,6 +16,7 @@ async fn fresh_dispatch_preserves_and_reports_work_without_legacy_bookmark_failu
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id)
                     .kind(ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)
@@ -217,6 +218,7 @@ async fn bound_pr_fixture(revision: bool) -> BoundPrFixture {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item)
                 .kind(kind)
                 .status(ExecutionStatus::Ready)
@@ -518,6 +520,7 @@ async fn sweep_reports_real_unpushed_revisions_independent_of_original_workspace
             let prior = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(chore.id)
                         .kind(ExecutionKind::RevisionImplementation)
                         .status(ExecutionStatus::Ready)
@@ -613,6 +616,7 @@ async fn an_execution_without_a_preserved_tip_is_not_reported_or_failed_by_the_s
     let prior = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -697,6 +701,7 @@ mod preserved_cleanup_sweep {
                 .db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(work_item_id)
                         .kind(ExecutionKind::ChoreImplementation)
                         .status(ExecutionStatus::Ready)

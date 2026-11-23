@@ -25,6 +25,7 @@ async fn deterministic_positioning_refusal_holds_once_and_manual_launch_recovers
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -157,6 +158,7 @@ async fn transient_positioning_failure_keeps_pre_start_backoff() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -216,6 +218,7 @@ fn refused_chore_implementation(db: &WorkDb, item: &str, pr_url: &str) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.to_owned())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Claimed)
@@ -272,6 +275,7 @@ fn refused_revision_fixture(db: &Arc<WorkDb>) -> (String, WorkExecution) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Claimed)
@@ -405,6 +409,7 @@ async fn review_phase_refusal_keeps_in_review_and_rejects_automatic_starts() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Claimed)
@@ -465,6 +470,7 @@ async fn review_phase_hold_label_ignores_an_earlier_ci_diagnostic() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Claimed)
@@ -518,6 +524,7 @@ async fn review_hold_probe_uses_the_task_pr_when_the_execution_has_none() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Claimed)
@@ -578,6 +585,7 @@ async fn recheck_sweep_does_not_reopen_a_retired_spawning_attempt() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Claimed)
@@ -626,6 +634,7 @@ async fn recheck_sweep_lowers_a_hold_on_a_done_item_without_probing() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Claimed)
@@ -746,6 +755,7 @@ fn refusal_without_a_pr_says_the_item_must_be_launched_manually() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(item.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Claimed)

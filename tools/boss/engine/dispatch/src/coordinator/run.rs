@@ -1032,6 +1032,7 @@ impl ExecutionCoordinator {
                         boss_protocol::RequestExecutionInput::builder()
                             .work_item_id(execution.work_item_id.clone())
                             .audit_basis("slot_busy_replacement")
+                            .created_via("coordinator:slot_busy_requeue")
                             .build(),
                     )
                 {

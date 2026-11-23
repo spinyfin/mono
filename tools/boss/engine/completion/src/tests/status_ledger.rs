@@ -406,6 +406,7 @@ fn explicit_start_clears_record_exact_bases_on_all_five_paths() {
     let ci_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&ci_parent.id)
                 .kind(ExecutionKind::CiRemediation)
                 .status(ExecutionStatus::Ready)
@@ -712,6 +713,7 @@ fn dispatch_and_execution_producers_record_exact_bases() {
     let ready = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&revision.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)
@@ -822,6 +824,7 @@ fn pr_flow_and_binding_producers_record_exact_bases() {
     let rebound_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&rebound.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)
@@ -848,6 +851,7 @@ fn pr_flow_and_binding_producers_record_exact_bases() {
     let unresolved_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&unresolved.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Completed)
@@ -886,6 +890,7 @@ fn pr_flow_and_binding_producers_record_exact_bases() {
     let review_exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&root.id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)

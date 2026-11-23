@@ -6,6 +6,7 @@ fn store_question(db: &WorkDb, asking: &Task, q: &OperatorQuestion) {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&asking.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .repo_remote_url(crate::test_support::TEST_REPO_REMOTE_URL)

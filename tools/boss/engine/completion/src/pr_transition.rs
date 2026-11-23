@@ -404,6 +404,7 @@ impl WorkerCompletionHandler {
                                         true
                                     }
                                     Ok(crate::work::ReviewBatchDispatch::LegacyExecution(review_exec)) => {
+                                        let review_exec = *review_exec;
                                         tracing::info!(
                                             execution_id,
                                             review_execution_id = %review_exec.id,
@@ -1383,6 +1384,7 @@ mod already_reviewed_at_head_tests {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(work_item_id.to_owned())
                     .kind(ExecutionKind::PrReview)
                     .build(),

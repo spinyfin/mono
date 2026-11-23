@@ -21,6 +21,7 @@ fn classification(db: &WorkDb, id: &str) -> Option<String> {
 fn plant_gated_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) {
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(work_item_id)
             .kind(kind)
             .status(ExecutionStatus::WaitingDependency)
@@ -65,6 +66,7 @@ fn related_live_executions_and_chain_waits_are_not_engine_defects() {
             let execution = db
                 .create_execution(
                     CreateExecutionInput::builder()
+                        .created_via("test")
                         .work_item_id(&owner)
                         .kind(ExecutionKind::RevisionImplementation)
                         .status(status.parse().unwrap())
@@ -99,6 +101,7 @@ fn related_live_executions_and_chain_waits_are_not_engine_defects() {
     let blocker = create_test_chore_manual(&db, &product.id, "Current writer");
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(&blocker.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -131,6 +134,7 @@ fn waiting_human_row_is_kept_when_a_sibling_revision_is_queued() {
             .unwrap();
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&waiting.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::WaitingHuman)
@@ -139,6 +143,7 @@ fn waiting_human_row_is_kept_when_a_sibling_revision_is_queued() {
         .unwrap();
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&sibling.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(sibling_status.parse().unwrap())
@@ -311,6 +316,7 @@ fn behind_does_not_outrank_a_dead_review() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&task.id)
                     .kind(ExecutionKind::PrReview)
                     .status(status.parse().unwrap())
@@ -388,6 +394,7 @@ fn productive_ai_review_waits_for_human_review_but_dead_review_is_stuck() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task.id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Completed)

@@ -248,6 +248,7 @@ fn a_launched_revisions_push_is_reviewed_while_its_root_stays_out_of_focus() {
     let stray = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&cycle.root_id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)
@@ -445,6 +446,7 @@ fn admission_does_not_record_a_head_while_the_revisions_newest_run_is_live() {
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&cycle.revision_id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Ready)

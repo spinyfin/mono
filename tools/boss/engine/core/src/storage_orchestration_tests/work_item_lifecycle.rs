@@ -147,6 +147,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)
@@ -228,6 +229,7 @@ fn unrecoverable_revision_raises_attention_on_the_pr_owner() {
     let next_execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(next.clone())
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::WaitingDependency)

@@ -77,6 +77,7 @@ fn project_prerequisite_is_progressing_until_terminal_or_missing() {
     .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(&task.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::WaitingDependency)
@@ -97,6 +98,7 @@ fn project_prerequisite_is_progressing_until_terminal_or_missing() {
         .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(&member.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Running)
@@ -269,6 +271,7 @@ fn waiting_human_age_tracks_execution_transition_and_live_work_is_excluded() {
     let abandoned = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Abandoned)
@@ -493,6 +496,7 @@ fn unfinished_prerequisites_keep_dependents_waiting_even_at_human_gates() {
         .unwrap();
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&dependent.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::WaitingDependency)
@@ -759,6 +763,7 @@ fn non_task_waits_never_enter_task_history() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(id)
                     .kind(kind)
                     .repo_remote_url("https://github.com/example/design.git")

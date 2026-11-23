@@ -359,6 +359,7 @@ fn stuck_item_with_started_progression(dir: &Path) -> (Arc<WorkDb>, String, crat
     let execution = db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(boss_protocol::ExecutionKind::Progression)
                 .status(ExecutionStatus::Ready)

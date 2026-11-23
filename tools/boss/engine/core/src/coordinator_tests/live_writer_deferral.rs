@@ -104,6 +104,7 @@ async fn fixture() -> Fixture {
     db.mark_chore_blocked_merge_conflict(&chore.id, &pr_url).unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(&chore.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Completed)
@@ -124,6 +125,7 @@ async fn fixture() -> Fixture {
     let live = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(revision.id)
                 .kind(ExecutionKind::RevisionImplementation)
                 .status(ExecutionStatus::Running)
@@ -330,6 +332,7 @@ async fn a_live_review_does_not_defer_the_ladder() {
     fx.db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&fx.candidate.work_item_id)
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Running)

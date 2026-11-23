@@ -53,6 +53,7 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
     // This RPC is the human-facing start verb (kanban drag, `bossctl work
     // start`); automatic recovery calls the DB layer directly.
     input.explicit_start = true;
+    input.created_via = Some("frontend:request_execution".to_owned());
     input.audit_actor = Some(resolve_status_actor(&server_state, peer_pid).to_owned());
     input.audit_basis = Some(
         resolve_write_basis(

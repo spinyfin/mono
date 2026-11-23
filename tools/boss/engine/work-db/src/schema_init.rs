@@ -666,6 +666,32 @@ pub fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Install the compatibility-floor schema plus integer migrations through
+/// v038, with `metadata.schema_version = 38` and no `schema_migrations`
+/// ledger, so [`WorkDb::open`] bootstraps and replays v039 onward.
+#[cfg(test)]
+pub(crate) fn seed_integer_schema_through_v038(conn: &Connection) {
+    conn.execute_batch(baseline::SQL).unwrap();
+    project_postmortem::migrate_project_postmortem_signals(conn).unwrap();
+    pr_flow::migrate_operator_questions(conn).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE execution_restore_reports (
+            execution_id TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE,
+            report TEXT NOT NULL
+        )",
+    )
+    .unwrap();
+    pr_flow::migrate_operator_questions(conn).unwrap();
+    personas::migrate(conn).unwrap();
+    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN dispatch_wait_blocker_id TEXT")
+        .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '38')",
+        [],
+    )
+    .unwrap();
+}
+
 #[cfg(test)]
 pub(crate) fn assert_all_migrations_applied(conn: &Connection) {
     let expected = registry::all().into_iter().map(|m| m.id).collect();

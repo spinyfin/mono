@@ -915,6 +915,7 @@ async fn a_reviewer_still_running_at_un_park_is_recorded_as_in_flight() {
     let execution =
         f.db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.clone())
                 .kind(boss_protocol::ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

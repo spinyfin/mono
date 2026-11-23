@@ -66,6 +66,7 @@ fn operator_answer_and_repeat_project_current_section() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(&task.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Running)

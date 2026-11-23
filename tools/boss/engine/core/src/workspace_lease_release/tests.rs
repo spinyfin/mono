@@ -105,6 +105,7 @@ fn seed_terminal(db: &WorkDb, status: ExecutionStatus, lease: &str) -> WorkExecu
     let chore = create_test_chore(db, product.id.clone(), "lease-release");
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id)
             .kind(ExecutionKind::ChoreImplementation)
             .status(status)
@@ -483,6 +484,7 @@ async fn sweep_keeps_orphaned_row_when_occupancy_is_occupied() {
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id)
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Orphaned)

@@ -1703,6 +1703,7 @@ async fn assert_progression_spawn(driver_name: &str) {
     let execution = db
         .create_execution(
             boss_protocol::CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(boss_protocol::ExecutionKind::Progression)
                 .status(boss_protocol::ExecutionStatus::Ready)

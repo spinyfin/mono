@@ -226,6 +226,7 @@ mod tests {
     fn ready_execution_for(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> String {
         db.create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(work_item_id)
                 .kind(kind)
                 .status(ExecutionStatus::Ready)

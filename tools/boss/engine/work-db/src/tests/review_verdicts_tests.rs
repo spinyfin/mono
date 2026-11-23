@@ -12,6 +12,7 @@ fn seed_pr_review_execution(db: &WorkDb, product_id: &str, label: &str) -> (Task
     let execution = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::PrReview)
                 .status(ExecutionStatus::Ready)

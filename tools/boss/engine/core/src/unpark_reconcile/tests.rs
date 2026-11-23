@@ -285,6 +285,7 @@ impl Fixture {
             .db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                     .status(ExecutionStatus::Ready)

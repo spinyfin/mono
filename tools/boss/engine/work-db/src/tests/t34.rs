@@ -738,6 +738,7 @@ fn answering_a_gated_revision_records_the_answer_and_waits_for_its_gate() {
         let execution = db
             .create_execution(
                 CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(&asking)
                     .kind(ExecutionKind::RevisionImplementation)
                     .repo_remote_url(crate::test_support::TEST_REPO_REMOTE_URL)

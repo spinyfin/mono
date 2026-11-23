@@ -485,6 +485,7 @@ mod tests {
         let created = db
             .create_execution(
                 boss_protocol::CreateExecutionInput::builder()
+                    .created_via("test")
                     .work_item_id(chore.id.clone())
                     .kind(boss_protocol::ExecutionKind::Progression)
                     .status(ExecutionStatus::Ready)

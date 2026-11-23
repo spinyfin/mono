@@ -599,6 +599,7 @@ fn waiting_human_execution(db: &WorkDb, product_id: &str, label: &str) -> String
     let exec = db
         .create_execution(
             CreateExecutionInput::builder()
+                .created_via("test")
                 .work_item_id(chore.id.clone())
                 .kind(ExecutionKind::ChoreImplementation)
                 .status(ExecutionStatus::Ready)

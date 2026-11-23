@@ -292,6 +292,7 @@ fn abandon_stranded_executions_on_closed_work_items_sweep() {
     // predates this fix shipping.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(chore.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)
@@ -379,6 +380,7 @@ fn abandon_stranded_executions_on_closed_work_items_exempts_post_merge_review_me
     // the exemption is scoped to the batch member, not the whole task.
     db.create_execution(
         CreateExecutionInput::builder()
+            .created_via("test")
             .work_item_id(cycle_root.id.clone())
             .kind(ExecutionKind::ChoreImplementation)
             .status(ExecutionStatus::Ready)

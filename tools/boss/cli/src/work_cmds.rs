@@ -1545,7 +1545,10 @@ pub(crate) async fn run_show_leaf(
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
     let field_audit = field_audit_from_reply(
         client
-            .send_request(&FrontendRequest::ListTaskFieldAudit { id: item.id.clone() })
+            .send_request(&FrontendRequest::ListTaskFieldAudit {
+                id: item.id.clone(),
+                include_status: true,
+            })
             .await,
     );
     let mut task_json = task_json_with_runtime(&item, &runtime)?;
@@ -1631,7 +1634,7 @@ pub(crate) fn print_field_audit_section(rows: &[boss_protocol::TaskFieldAuditRow
         return;
     }
     println!();
-    println!("Flag and abandonment history ({}):", rows.len());
+    println!("Status, flag, and abandonment history ({}):", rows.len());
     for row in rows {
         let old = row.old_value.as_deref().unwrap_or("-");
         let new = row.new_value.as_deref().unwrap_or("-");
