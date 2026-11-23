@@ -95,6 +95,8 @@
 //!   hold/ask sequence ends in a visible failure for those attempts.
 
 use super::*;
+use boss_github::pr_url::same_pr;
+use boss_protocol::{OperatorAnswer, OperatorAnswerType, OperatorQuestionStatus};
 
 /// Upper bound on each GitHub call the `delivered` resolver makes inline
 /// (the staged-candidate branch check and the branch-keyed detector). On
@@ -247,7 +249,11 @@ impl WorkerCompletionHandler {
     /// — both network-capable and both honouring the stamped declaration —
     /// finalize it. That keeps the module's rule that a GitHub hang can never
     /// hold a slot indefinitely, without binding anything unverified.
-    async fn resolve_declared_pr_url(&self, execution: &crate::work::WorkExecution) -> DeclaredPrResolution {
+    async fn resolve_declared_pr_url(
+        &self,
+        execution: &crate::work::WorkExecution,
+        allow_detector_closed_unmerged: bool,
+    ) -> DeclaredPrResolution {
         let mut transient_detail: Option<String> = None;
         let stored_url = self.resolve_bound_pr_url(execution);
         if let Some(url) = stored_url.clone() {
@@ -327,6 +333,12 @@ impl WorkerCompletionHandler {
         match detected {
             Ok(Ok(PrStatus::Fresh { url })) => self.resolve_declared_pr_base(execution, url, false).await,
             Ok(Ok(PrStatus::Merged { url })) => self.resolve_declared_pr_base(execution, url, true).await,
+            Ok(Ok(PrStatus::Closed { url })) if allow_detector_closed_unmerged => {
+                if let Some(detail) = transient_detail {
+                    return DeclaredPrResolution::Transient { detail };
+                }
+                DeclaredPrResolution::ClosedUnmerged { pr_url: url }
+            }
             Ok(Ok(
                 status @ (PrStatus::None
                 | PrStatus::Closed { .. }
@@ -431,16 +443,81 @@ impl WorkerCompletionHandler {
     /// time either task runs, so a slow or failing `gh` call can delay those
     /// side effects, never a slot release.
     pub(super) async fn finalize_declared_delivery(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
-        let resolution = self.resolve_declared_pr_url(execution).await;
+        let declared_superseded_by = match self.work_db.execution_run_done_superseded_by(&execution.id) {
+            Ok(superseded_by) => superseded_by,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "run_done finalize (delivered): failed to read superseded_by from declaration",
+                );
+                None
+            }
+        };
+        let resolution = self
+            .resolve_declared_pr_url(execution, declared_superseded_by.is_some())
+            .await;
+        let mut superseding_pr: Option<String> = None;
         let (pr_url, mut merged, mut closed_unmerged) = match resolution {
-            DeclaredPrResolution::Bound { pr_url, merged } => (pr_url, merged, false),
+            DeclaredPrResolution::Bound { pr_url, merged } => {
+                if !merged && declared_superseded_by.is_some() {
+                    return self
+                        .finalize_declared_delivery_without_pr(
+                            execution,
+                            &format!("PR {pr_url} is still open; close it before declaring it superseded"),
+                        )
+                        .await;
+                }
+                (pr_url, merged, false)
+            }
             DeclaredPrResolution::BaseRefused { pr_url, reason } => {
                 self.record_pr_base_refusal(execution, &pr_url, &reason).await;
                 let detail = format!("{pr_url}: {reason}. Retarget the PR before completing delivery.");
                 return StopOutcome::PrBaseRefused { pr_url, detail };
             }
             DeclaredPrResolution::ClosedUnmerged { pr_url } => {
-                if self.is_merge_conflict_revision(execution) {
+                if let Some(raw) = declared_superseded_by.as_deref() {
+                    match resolve_superseding_pr_url(raw, &execution.repo_remote_url, &pr_url) {
+                        Ok(resolved) => {
+                            match supersede_close_approval(&self.work_db, &execution.work_item_id, &pr_url, &resolved) {
+                                SupersedeCloseApproval::Approved => {
+                                    superseding_pr = Some(resolved);
+                                    (pr_url, false, true)
+                                }
+                                SupersedeCloseApproval::Declined => {
+                                    return self
+                                    .finalize_declared_delivery_without_pr(
+                                        execution,
+                                        &format!(
+                                            "PR {pr_url} is closed without merging and the owner declined treating it \
+                                             as superseded by {resolved}"
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                SupersedeCloseApproval::Missing => {
+                                    return self
+                                        .finalize_declared_delivery_without_pr(
+                                            execution,
+                                            &format!(
+                                                "PR {pr_url} is closed without merging and there is no recorded owner \
+                                             approval to treat it as superseded by {resolved}"
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(reason) => {
+                            return self
+                                .finalize_declared_delivery_without_pr(
+                                    execution,
+                                    &format!("PR {pr_url} is closed without merging; {reason}"),
+                                )
+                                .await;
+                        }
+                    }
+                } else if self.is_merge_conflict_revision(execution) {
                     (pr_url, false, true)
                 } else {
                     return self
@@ -510,22 +587,25 @@ impl WorkerCompletionHandler {
         } else {
             WorkerPrCompletionTarget::InReview
         };
-        let completion =
-            match self
-                .work_db
+        let completion_result = if closed_unmerged && let Some(superseding) = superseding_pr.as_deref() {
+            self.work_db
+                .record_worker_superseded_pr_completion(&execution.id, &pr_url, superseding, None)
+        } else {
+            self.work_db
                 .record_worker_pr_completion(&execution.id, &pr_url, None, None, target, None)
-            {
-                Ok(Some(completion)) => completion,
-                Ok(None) => return StopOutcome::AlreadyTerminal,
-                Err(err) => {
-                    tracing::error!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "run_done finalize (delivered): failed to record PR completion",
-                    );
-                    return StopOutcome::DbError;
-                }
-            };
+        };
+        let completion = match completion_result {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "run_done finalize (delivered): failed to record PR completion",
+                );
+                return StopOutcome::DbError;
+            }
+        };
         self.reconcile_review_guide_source_for_execution(
             &execution.id,
             &pr_url,
@@ -576,7 +656,9 @@ impl WorkerCompletionHandler {
             merged = false;
         }
 
-        self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
+        if !(closed_unmerged && superseding_pr.is_some()) {
+            self.spawn_declared_delivery_audit(execution, &work_item_id, &pr_url);
+        }
         if merged {
             return StopOutcome::PrMerged { pr_url };
         }
@@ -794,6 +876,71 @@ impl WorkerCompletionHandler {
             .await;
         });
     }
+}
+
+enum SupersedeCloseApproval {
+    Approved,
+    Declined,
+    Missing,
+}
+
+/// Recorded owner approval to close `closed_pr` as superseded by `superseding_pr`.
+///
+/// Looks at answered Yes/No questions on this work item (any execution in the
+/// chain) that carry a structured `supersede_close` authorization matching
+/// both PRs in their respective roles. The latest matching answer wins.
+fn supersede_close_approval(
+    work_db: &crate::work::WorkDb,
+    work_item_id: &str,
+    closed_pr: &str,
+    superseding_pr: &str,
+) -> SupersedeCloseApproval {
+    let questions = match work_db.list_operator_questions(work_item_id) {
+        Ok(questions) => questions,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                ?err,
+                "run_done finalize (delivered): failed to read operator questions for supersede approval"
+            );
+            return SupersedeCloseApproval::Missing;
+        }
+    };
+    let mut matching: Vec<_> = questions
+        .into_iter()
+        .filter(|record| {
+            record.status == OperatorQuestionStatus::Answered
+                && matches!(record.question.answer_type, OperatorAnswerType::YesNo)
+                && matches!(record.answer, Some(OperatorAnswer::YesNo { .. }))
+                && record.supersede_close.as_ref().is_some_and(|auth| {
+                    same_pr(&auth.closed_pr, closed_pr) && same_pr(&auth.superseding_pr, superseding_pr)
+                })
+        })
+        .collect();
+    matching.sort_by(|left, right| {
+        left.answered_at
+            .cmp(&right.answered_at)
+            .then(left.question.id.cmp(&right.question.id))
+    });
+    match matching.last().and_then(|record| record.answer.as_ref()) {
+        Some(OperatorAnswer::YesNo { value: true }) => SupersedeCloseApproval::Approved,
+        Some(OperatorAnswer::YesNo { value: false }) => SupersedeCloseApproval::Declined,
+        _ => SupersedeCloseApproval::Missing,
+    }
+}
+
+/// Resolve a worker-supplied `superseded_by` reference to a canonical PR URL
+/// in `repo_remote_url`, rejecting the closed PR itself and other repos.
+fn resolve_superseding_pr_url(reference: &str, repo_remote_url: &str, closed_pr: &str) -> Result<String, String> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return Err("superseded_by is empty".to_owned());
+    }
+    let resolved = boss_github::pr_url::resolve_pr_reference(trimmed, repo_remote_url)?;
+    if same_pr(&resolved, closed_pr) {
+        return Err(format!("superseding PR {resolved} is the same as the closed PR"));
+    }
+    Ok(resolved)
 }
 
 /// The body of [`WorkerCompletionHandler::spawn_declared_delivery_audit`]'s
@@ -1345,5 +1492,44 @@ async fn run_declared_delivery_doc_link_detection(
                 )
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod supersede_reference_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_short_forms_in_the_execution_repo() {
+        let remote = "https://github.com/spinyfin/mono.git";
+        let closed = "https://github.com/spinyfin/mono/pull/2927";
+        assert_eq!(
+            resolve_superseding_pr_url("#2977", remote, closed).as_deref(),
+            Ok("https://github.com/spinyfin/mono/pull/2977")
+        );
+        assert_eq!(
+            resolve_superseding_pr_url("2977", remote, closed).as_deref(),
+            Ok("https://github.com/spinyfin/mono/pull/2977")
+        );
+        assert_eq!(
+            resolve_superseding_pr_url("spinyfin/mono#2977", remote, closed).as_deref(),
+            Ok("https://github.com/spinyfin/mono/pull/2977")
+        );
+    }
+
+    #[test]
+    fn rejects_the_closed_pr_and_a_foreign_repo() {
+        let remote = "https://github.com/spinyfin/mono.git";
+        let closed = "https://github.com/spinyfin/mono/pull/2927";
+        assert!(
+            resolve_superseding_pr_url(closed, remote, closed)
+                .unwrap_err()
+                .contains("same as the closed PR")
+        );
+        assert!(
+            resolve_superseding_pr_url("https://github.com/other/repo/pull/1", remote, closed)
+                .unwrap_err()
+                .contains("does not match")
+        );
     }
 }

@@ -844,6 +844,7 @@ fn question_classification_uses_pre_transaction_liveness_and_rechecks_eligibilit
             summary: "Needs a decision".into(),
             question: Some(question()),
             queue_ci_evidence: None,
+            superseded_by: None,
         })
         .unwrap();
         let probes = Cell::new(0);

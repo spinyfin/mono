@@ -543,6 +543,13 @@ pub(crate) struct RunDoneArgs {
     /// JSON evidence required to finish a merge-queue CI-fix revision.
     #[arg(long)]
     queue_ci_evidence_file: Option<PathBuf>,
+
+    /// Superseding PR reference (URL, `owner/repo#N`, `#N`, or number) when
+    /// asking to close the bound PR as superseded (`--outcome blocked
+    /// --answer-type yes-no`) or when declaring `--outcome delivered` after
+    /// closing it with approval.
+    #[arg(long)]
+    superseded_by: Option<String>,
     /// How the run ended. `delivered` = the deliverable exists;
     /// `no-changes-needed` = you verified there was nothing to produce;
     /// `blocked` = you are stopping without delivering. Explain the
@@ -1019,6 +1026,7 @@ fn payload_for(command: ProposeCommand) -> Result<(ProposalKind, serde_json::Val
                 outcome: RunDoneOutcome::from(args.outcome),
                 summary: args.summary,
                 question,
+                superseded_by: args.superseded_by,
             })
             .map_err(CliError::internal)?;
             // The criterion rides beside the typed payload; see

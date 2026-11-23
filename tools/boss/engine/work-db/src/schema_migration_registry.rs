@@ -358,6 +358,16 @@ pub(super) fn all() -> Vec<Migration> {
             apply: wait_diagnostics::migrate,
         },
         Migration {
+            id: "20261122_0615_execution_superseded_by_pr".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "work_executions", "superseded_by_pr")? {
+                    conn.execute_batch("ALTER TABLE work_executions ADD COLUMN superseded_by_pr TEXT")?;
+                }
+                Ok(())
+            },
+        },
+        Migration {
             id: execution_wait_history::MIGRATION_ID.into(),
             legacy_version: None,
             apply: execution_wait_history::migrate,
@@ -441,6 +451,16 @@ pub(super) fn all() -> Vec<Migration> {
             id: pr_flow::OPERATOR_QUESTION_STUCK_CLASSIFICATION_MIGRATION_ID.into(),
             legacy_version: None,
             apply: pr_flow::migrate_operator_question_stuck_classification,
+        },
+        Migration {
+            id: "20261122_0745_operator_question_supersede_close".into(),
+            legacy_version: None,
+            apply: |conn| {
+                if !table_has_column(conn, "operator_questions", "supersede_close_json")? {
+                    conn.execute_batch("ALTER TABLE operator_questions ADD COLUMN supersede_close_json TEXT")?;
+                }
+                Ok(())
+            },
         },
         Migration {
             id: "20261108_2100_parking_cancel_provenance".into(),

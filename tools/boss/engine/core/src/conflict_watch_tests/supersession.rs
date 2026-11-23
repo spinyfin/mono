@@ -685,6 +685,7 @@ fn raise_and_dismiss_mismatch(db: &WorkDb, attempt_id: &str, revision_id: &str) 
         summary: "Architectural mismatch".into(),
         question: None,
         queue_ci_evidence: None,
+        superseded_by: None,
     })
     .unwrap();
     db.submit_worker_proposal(crate::work::SubmitWorkerProposalInput {

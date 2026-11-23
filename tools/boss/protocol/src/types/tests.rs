@@ -2041,11 +2041,28 @@ fn run_done_payload_roundtrips() {
         outcome: RunDoneOutcome::Delivered,
         summary: "opened https://github.com/foo/bar/pull/1 with the md5 crate swap".into(),
         question: None,
+        superseded_by: None,
     };
     let raw = serde_json::to_value(&payload).unwrap();
     assert_eq!(raw.get("outcome").and_then(|v| v.as_str()), Some("delivered"));
+    assert!(raw.get("superseded_by").is_none());
     let back: RunDoneProposalPayload = serde_json::from_value(raw).unwrap();
     assert_eq!(payload, back);
+
+    let superseded = RunDoneProposalPayload {
+        queue_ci_evidence: None,
+        outcome: RunDoneOutcome::Delivered,
+        summary: "closed #2927 as superseded by #2977".into(),
+        question: None,
+        superseded_by: Some("https://github.com/foo/bar/pull/2977".into()),
+    };
+    let raw_superseded = serde_json::to_value(&superseded).unwrap();
+    assert_eq!(
+        raw_superseded.get("superseded_by").and_then(|v| v.as_str()),
+        Some("https://github.com/foo/bar/pull/2977")
+    );
+    let back_superseded: RunDoneProposalPayload = serde_json::from_value(raw_superseded).unwrap();
+    assert_eq!(superseded, back_superseded);
 }
 
 #[test]

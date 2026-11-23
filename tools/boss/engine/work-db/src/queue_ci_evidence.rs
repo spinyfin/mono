@@ -637,6 +637,7 @@ mod tests {
             summary: "PR branch passes; infra".into(),
             question: None,
             queue_ci_evidence: None,
+            superseded_by: None,
         };
         for key in ["first", "second", "third"] {
             let rejected = submit(key, &payload);
@@ -820,6 +821,7 @@ mod tests {
             summary: "Verified and requeued".into(),
             question: None,
             queue_ci_evidence: Some(proof),
+            superseded_by: None,
         };
         let submit = |key: &str, payload: &RunDoneProposalPayload| {
             db.submit_worker_proposal(SubmitWorkerProposalInput {
@@ -1009,6 +1011,7 @@ mod tests {
             summary: String::new(),
             question: None,
             queue_ci_evidence: None,
+            superseded_by: None,
         };
         assert_eq!(submit("blocked-empty", &payload), ProposalState::Rejected);
         payload.summary = "flaky infra".into();

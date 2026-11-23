@@ -111,6 +111,138 @@ pub fn same_pr(left: &str, right: &str) -> bool {
     left == right || canonical_pr_url(left).is_some_and(|url| Some(url) == canonical_pr_url(right))
 }
 
+/// Parse a positive PR number from `#N` or `N`, ignoring surrounding whitespace.
+pub fn parse_pr_number_only(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    let digits = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if digits.is_empty() || digits == "0" || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Parse `owner/repo#N` into `("owner/repo", N)`.
+pub fn parse_slug_pr(raw: &str) -> Option<(&str, u64)> {
+    let (slug, rest) = raw.split_once('#')?;
+    let digits = rest.trim();
+    if digits.is_empty() || digits == "0" || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number: u64 = digits.parse().ok()?;
+    let slug = slug.trim();
+    let (owner, repo) = slug.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((slug, number))
+}
+
+/// Canonicalize `owner/repo` + `number` into `https://github.com/owner/repo/pull/N`.
+pub fn canonical_slug_pr(slug: &str, number: u64) -> Option<String> {
+    if number == 0 {
+        return None;
+    }
+    let (owner, repo) = slug.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    canonical_pr_url(&format!("https://github.com/{owner}/{repo}/pull/{number}"))
+}
+
+/// Scan `text` for GitHub PR URLs and `owner/repo#N` references, appending
+/// canonicalized URLs to `out`. Unqualified `#N` references are ignored.
+pub fn scan_pr_refs(text: &str, out: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(start) = rest.find("https://github.com/") {
+        let candidate = &rest[start..];
+        let end = candidate
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | '"' | '\'' | ']'))
+            .unwrap_or(candidate.len());
+        let url = candidate[..end].trim_end_matches(['.', ';', ':']);
+        if let Some(canonical) = canonical_pr_url(url) {
+            out.push(canonical);
+        }
+        rest = &candidate[end.max(1)..];
+    }
+    let mut rest = text;
+    while let Some(hash) = rest.find('#') {
+        if let Some((slug, number)) = slug_pr_at(rest, hash)
+            && let Some(canonical) = canonical_slug_pr(slug, number)
+        {
+            out.push(canonical);
+        }
+        rest = &rest[hash + 1..];
+    }
+}
+
+fn slug_pr_at(text: &str, hash: usize) -> Option<(&str, u64)> {
+    let after = text.get(hash + 1..)?;
+    let digits_end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let digits = &after[..digits_end];
+    if digits == "0" {
+        return None;
+    }
+    let number: u64 = digits.parse().ok()?;
+    let before = text.get(..hash)?;
+    // One space between the slug and '#' ("owner/repo #12") is a common
+    // written form; more whitespace still fails so "#12" on its own is not
+    // pulled into an earlier word.
+    let before = before.strip_suffix(' ').unwrap_or(before);
+    let slug_start = before
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let slug = before.get(slug_start..)?.trim();
+    if slug.contains('/') && !slug.starts_with('/') && !slug.ends_with('/') {
+        Some((slug, number))
+    } else {
+        None
+    }
+}
+
+/// Shape check for a PR reference: a GitHub PR URL, `owner/repo#N`, `#N`, or a
+/// bare non-zero PR number, with no whitespace.
+pub fn is_pr_reference(text: &str) -> bool {
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    parse_pr_url_parts(text).is_some() || parse_slug_pr(text).is_some() || parse_pr_number_only(text).is_some()
+}
+
+/// Resolve a PR reference (`URL | owner/repo#N | #N | N`) to a canonical PR URL
+/// in `repo_remote_url`, rejecting references from other repos.
+pub fn resolve_pr_reference(reference: &str, repo_remote_url: &str) -> Result<String, String> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return Err("PR reference is empty".to_owned());
+    }
+    if let Some(url) = canonical_pr_url(trimmed) {
+        validate_pr_url(&url, repo_remote_url)?;
+        return Ok(url);
+    }
+    if let Some((slug, number)) = parse_slug_pr(trimmed) {
+        let product = parse_product_slug(repo_remote_url)
+            .ok_or_else(|| format!("could not parse product repo slug from `{repo_remote_url}`"))?;
+        if slug.to_ascii_lowercase() != product {
+            return Err(format!("PR repo `{slug}` does not match product repo `{product}`"));
+        }
+        return Ok(format!("https://github.com/{product}/pull/{number}"));
+    }
+    if let Some(number) = parse_pr_number_only(trimmed) {
+        let product = parse_product_slug(repo_remote_url)
+            .ok_or_else(|| format!("could not parse product repo slug from `{repo_remote_url}`"))?;
+        return Ok(format!("https://github.com/{product}/pull/{number}"));
+    }
+    Err(format!(
+        "`{trimmed}` is not a PR reference; expected a GitHub PR URL, owner/repo#N, #N, or PR number"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +549,62 @@ mod product_gate_tests {
             "git@github.com:spinyfin/mono.git",
         );
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn scan_pr_refs_preserves_repo_and_number_boundaries() {
+        let mut refs = Vec::new();
+        scan_pr_refs(
+            "See https://github.com/spinyfin/mono/pull/29270, spinyfin/mono#29270, and other/repo#2927.",
+            &mut refs,
+        );
+        assert_eq!(
+            refs,
+            vec![
+                "https://github.com/spinyfin/mono/pull/29270",
+                "https://github.com/spinyfin/mono/pull/29270",
+                "https://github.com/other/repo/pull/2927",
+            ]
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|r| same_pr(r, "https://github.com/spinyfin/mono/pull/2927"))
+        );
+    }
+
+    #[test]
+    fn resolve_pr_reference_accepts_short_forms_and_rejects_foreign_repos() {
+        let remote = "git@github.com:spinyfin/mono.git";
+        assert_eq!(
+            resolve_pr_reference("#2977", remote).as_deref(),
+            Ok("https://github.com/spinyfin/mono/pull/2977")
+        );
+        assert_eq!(
+            resolve_pr_reference("2977", remote).as_deref(),
+            Ok("https://github.com/spinyfin/mono/pull/2977")
+        );
+        assert_eq!(
+            resolve_pr_reference("spinyfin/mono#2977", remote).as_deref(),
+            Ok("https://github.com/spinyfin/mono/pull/2977")
+        );
+        assert!(resolve_pr_reference("other/repo#2977", remote).is_err());
+        assert!(resolve_pr_reference("https://github.com/other/repo/pull/2977", remote).is_err());
+        assert!(resolve_pr_reference("0", remote).is_err());
+        assert!(resolve_pr_reference("##2977", remote).is_err());
+    }
+
+    #[test]
+    fn is_pr_reference_validates_all_supported_shapes() {
+        assert!(is_pr_reference("https://github.com/spinyfin/mono/pull/1"));
+        assert!(is_pr_reference("spinyfin/mono#1"));
+        assert!(is_pr_reference("#1"));
+        assert!(is_pr_reference("1"));
+        assert!(!is_pr_reference(""));
+        assert!(!is_pr_reference("0"));
+        assert!(!is_pr_reference("#0"));
+        assert!(!is_pr_reference("##1"));
+        assert!(!is_pr_reference("spinyfin/mono #1"));
+        assert!(!is_pr_reference("not a pr"));
     }
 }

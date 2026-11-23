@@ -169,6 +169,16 @@ fn retain_known_poll_value<'a>(prior: Option<&'a str>, incoming: &'a str) -> &'a
     incoming
 }
 
+/// Optional trailing inputs for the inner worker PR-completion write,
+/// grouped so that method stays under clippy's `too_many_arguments` threshold.
+#[derive(Debug, Default, bon::Builder)]
+struct WorkerPrCompletionExtras<'a> {
+    pr_head_after: Option<&'a str>,
+    result_summary: Option<&'a str>,
+    review_verdict: Option<ReviewVerdictInput>,
+    superseded_by_pr: Option<&'a str>,
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
     /// Record that a worker produced a PR for `execution_id`. In a single
@@ -202,6 +212,51 @@ impl WorkDb {
         target: WorkerPrCompletionTarget,
         review_verdict: Option<ReviewVerdictInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_inner(
+            execution_id,
+            pr_url,
+            target,
+            WorkerPrCompletionExtras::builder()
+                .maybe_pr_head_after(pr_head_after)
+                .maybe_result_summary(result_summary)
+                .maybe_review_verdict(review_verdict)
+                .build(),
+        )
+    }
+
+    /// Record a successful non-merged completion for an execution that closed
+    /// its bound PR as superseded by `superseded_by_pr`.
+    pub fn record_worker_superseded_pr_completion(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        superseded_by_pr: &str,
+        result_summary: Option<&str>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        self.record_worker_pr_completion_inner(
+            execution_id,
+            pr_url,
+            WorkerPrCompletionTarget::DoneUnmerged,
+            WorkerPrCompletionExtras::builder()
+                .maybe_result_summary(result_summary)
+                .superseded_by_pr(superseded_by_pr)
+                .build(),
+        )
+    }
+
+    fn record_worker_pr_completion_inner(
+        &self,
+        execution_id: &str,
+        pr_url: &str,
+        target: WorkerPrCompletionTarget,
+        extras: WorkerPrCompletionExtras<'_>,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        let WorkerPrCompletionExtras {
+            pr_head_after,
+            result_summary,
+            review_verdict,
+            superseded_by_pr,
+        } = extras;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -329,9 +384,10 @@ impl WorkDb {
              SET status = 'completed',
                  finished_at = ?2,
                  pr_url = ?3,
-                 pr_head_after = ?4
+                 pr_head_after = ?4,
+                 superseded_by_pr = COALESCE(?5, superseded_by_pr)
              WHERE id = ?1",
-            params![execution_id, now, pr_url, pr_head_after],
+            params![execution_id, now, pr_url, pr_head_after, superseded_by_pr],
         )?;
 
         // Update the most-recent run for this execution: if a summary is
@@ -2482,57 +2538,7 @@ pub(super) fn insert_question_with_liveness(
     Ok(())
 }
 
-pub(super) fn map_question(row: &Row<'_>) -> rusqlite::Result<OperatorQuestionRecord> {
-    let json: String = row.get("question_json")?;
-    let question: OperatorQuestion = serde_json::from_str(&json)
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err)))?;
-    let answer: Option<String> = row.get("answer_json")?;
-    let answer = answer
-        .map(|json| serde_json::from_str(&json))
-        .transpose()
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(err)))?;
-    let status: String = row.get("status")?;
-    let dismissal = row
-        .get::<_, Option<String>>("dismissal_json")?
-        .map(|json| serde_json::from_str::<boss_protocol::OperatorQuestionDismissal>(&json))
-        .transpose()
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err)))?;
-    Ok(OperatorQuestionRecord::builder()
-        .question(
-            OperatorQuestionView::builder()
-                .id(row.get::<_, String>("id")?)
-                .text(question.text)
-                .answer_type(question.answer_type)
-                .explanation(question.explanation)
-                .asked_at(row.get::<_, String>("created_at")?)
-                .execution_id(row.get::<_, String>("execution_id")?)
-                .maybe_run_summary(row.get::<_, Option<String>>("run_summary")?)
-                .build(),
-        )
-        .work_item_id(row.get::<_, String>("work_item_id")?)
-        .status(match status.as_str() {
-            _ if dismissal.is_some() => OperatorQuestionStatus::Dismissed,
-            "open" => OperatorQuestionStatus::Open,
-            "answered" => OperatorQuestionStatus::Answered,
-            _ => OperatorQuestionStatus::Withdrawn,
-        })
-        .maybe_answer(answer)
-        .maybe_answered_by(row.get::<_, Option<String>>("answered_by")?)
-        .maybe_answered_at(row.get::<_, Option<String>>("answered_at")?)
-        .maybe_withdrawn_reason(if dismissal.is_some() {
-            None
-        } else {
-            row.get::<_, Option<String>>("withdrawn_reason")?
-        })
-        .maybe_dismissal(dismissal)
-        .build())
-}
-
-/// The one select `map_question` reads: every `operator_questions` column
-/// plus the declaring run's summary. Append a `WHERE` clause.
-pub(super) const OPERATOR_QUESTION_RECORD_SELECT: &str = "SELECT *, (SELECT json_extract(payload_json, '$.summary') \
-     FROM worker_proposals WHERE worker_proposals.id = operator_questions.proposal_id) AS run_summary \
-     FROM operator_questions";
+pub(super) use crate::mappers::{OPERATOR_QUESTION_RECORD_SELECT, map_question};
 
 #[work_db_boundary::instrument]
 impl WorkDb {
@@ -2894,92 +2900,9 @@ impl WorkDb {
 }
 
 pub use crate::operator_answer_outcome::OperatorAnswerOutcome;
-
-/// No on a plain yes-no or ordinary prerequisite question: record the
-/// declined path and grant nothing, matching [`choice_block`].
-fn declined_block(question: &OperatorQuestionView, timestamp: &str) -> String {
-    let no_label = question.answer_type.option_labels().map(|labels| labels.no.as_str());
-    let mut lines = format!(
-        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
-- **Question the previous worker asked:** {}\n\
-- **Answer:** {}\n",
-        question.text,
-        no_label.unwrap_or("No")
-    );
-    let no_heading = format!("{}:", no_label.unwrap_or("No"));
-    if let Some(no_path) = boss_protocol::explanation_section(&question.explanation, &no_heading) {
-        lines.push_str(&format!(
-            "- **The worker's {} path:** {no_path}\n",
-            no_label.unwrap_or("No")
-        ));
-    }
-    lines.push_str(&format!(
-        "- **The worker's explanation:** {}\n\
-- **Asked by run:** `{}`\n\n\
-The repo owner recorded this decline on the kanban. Proceed with the declined path named above. It grants no authorization: it does not authorize bypassing any check or exceeding any limit.\n",
-        question.explanation, question.execution_id
-    ));
-    lines
-}
-
-/// The brief addendum for a multiple-choice answer: the chosen option,
-/// verbatim. Unlike [`authorization_block`] it grants nothing beyond
-/// the decision itself.
-fn choice_block(question: &OperatorQuestionView, choice: &str, timestamp: &str) -> String {
-    format!(
-        "\n\n---\n\n## Recorded answer ({timestamp})\n\n\
-- **Question the previous worker asked:** {}\n\
-- **Options offered:** {}\n\
-- **Operator chose:** {choice}\n\
-- **The worker's explanation:** {}\n\
-- **Asked by run:** `{}`\n\n\
-The operator recorded this choice on the kanban. Proceed with the chosen option. It decides exactly the question above and nothing broader: it does not authorize bypassing any check or exceeding any limit.\n",
-        question.text,
-        match &question.answer_type {
-            OperatorAnswerType::MultipleChoice { choices } => choices.join(" / "),
-            _ => String::new(),
-        },
-        question.explanation,
-        question.execution_id
-    )
-}
-
-fn authorization_block(question: &OperatorQuestionView, timestamp: &str) -> String {
-    format!(
-        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
-- **Question the previous worker asked:** {}\n\
-- **Answer:** Yes\n\
-- **The worker's explanation:** {}\n\
-- **Asked by run:** `{}`\n\n\
-The repo owner recorded this answer. It is explicit, human-granted approval for exactly what the question asks and nothing broader. Treat it as the authorization the worker rules require before relaxing a check or exceeding a limit for this task; state in the PR body that this was approved by the repo owner on the date above. It does not authorize bypassing any other check, and it does not change what the repository's checks enforce.\n",
-        question.text, question.explanation, question.execution_id
-    )
-}
-
-/// The bypass answer to a split-vs-file-count-bypass question: keep this change
-/// in one PR, recording the approved file count separately from the free-form
-/// bypass reason.
-pub(super) fn file_count_bypass_authorization_block(
-    question: &OperatorQuestionView,
-    spec: boss_protocol::FileCountBypassSpec,
-    timestamp: &str,
-) -> String {
-    // A question asked before options were named records the plain "No".
-    let answer = question
-        .answer_type
-        .option_labels()
-        .map_or("No", |labels| labels.no.as_str());
-    format!(
-        "\n\n---\n\n## Repo owner approval ({timestamp})\n\n\
-- **Question the previous worker asked:** {}\n\
-- **Answer:** {answer} — keep this change in one PR\n\
-- **Authorized exception:** change/file-count for this PR only, up to {} files (repository limit {})\n\
-- **The worker's explanation:** {}\n\
-- **Asked by run:** `{}`\n\n\
-The repo owner recorded this answer. It is explicit, human-granted approval to finish this change as a single PR by declaring `BYPASS_CHANGE_FILE_COUNT=Split-vs-bypass question answered {answer} by the repo owner on {timestamp}; one-PR exception for this PR only` in the commit description. Checkleft does not enforce the approved count. Before pushing, compare the non-deleted file count from `jj diff --stat` against the PR base with the approved bound above and ask again if it is over. It does not authorize bypassing any other check, raising any other limit, or using the exception on a different PR. State in the PR body that this file-count exception was approved by the repo owner on the date above.\n",
-        question.text, spec.files, spec.limit, question.explanation, question.execution_id
-    )
-}
+pub(super) use crate::proposals::{
+    authorization_block, choice_block, declined_block, file_count_bypass_authorization_block,
+};
 
 #[cfg(test)]
 #[path = "pr_flow_tests.rs"]

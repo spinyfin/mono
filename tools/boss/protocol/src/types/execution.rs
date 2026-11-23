@@ -936,6 +936,11 @@ pub struct WorkExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 
+    /// Superseding PR reference recorded when this execution closed its bound
+    /// PR as superseded with approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_pr: Option<String>,
+
     /// When `true`, the cube workspace preference (`preferred_workspace_id`)
     /// is treated as a warmth hint only: if the preferred workspace is
     /// unavailable or busy, the coordinator falls back silently to any free

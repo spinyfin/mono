@@ -892,3 +892,70 @@ fn done_criterion_accompanies_only_a_question_and_is_canonicalized() {
     // A different criterion is a different submission.
     assert_ne!(ok(ProposalKind::RunDone, with(json!("2"))), canonical);
 }
+
+#[test]
+fn run_done_superseded_by_accepts_pr_references_only_on_delivered() {
+    for pr_ref in [
+        "https://github.com/spinyfin/mono/pull/2977",
+        "spinyfin/mono#2977",
+        "#2977",
+        "2977",
+    ] {
+        let canonical = ok(
+            ProposalKind::RunDone,
+            json!({
+                "outcome": "delivered",
+                "summary": "closed #2927 as superseded",
+                "superseded_by": pr_ref,
+            }),
+        );
+        let parsed: RunDoneProposalPayload = serde_json::from_str(&canonical).unwrap();
+        assert_eq!(parsed.superseded_by.as_deref(), Some(pr_ref));
+    }
+
+    for invalid_outcome in ["blocked", "no_changes_needed"] {
+        let errors = errs(
+            ProposalKind::RunDone,
+            json!({
+                "outcome": invalid_outcome,
+                "summary": "superseded",
+                "superseded_by": "#2977",
+            }),
+        );
+        assert!(
+            errors.iter().any(|e| e.field == "superseded_by"),
+            "expected superseded_by error for outcome={invalid_outcome}, got {errors:?}"
+        );
+    }
+
+    for invalid_ref in ["", "   ", "#0", "0", "not a pr", "foo/bar/baz#1", "https://example.com"] {
+        let errors = errs(
+            ProposalKind::RunDone,
+            json!({
+                "outcome": "delivered",
+                "summary": "closed",
+                "superseded_by": invalid_ref,
+            }),
+        );
+        assert!(
+            errors.iter().any(|e| e.field == "superseded_by"),
+            "expected superseded_by error for ref={invalid_ref:?}, got {errors:?}"
+        );
+    }
+
+    let blocked_canonical = ok(
+        ProposalKind::RunDone,
+        json!({
+            "outcome": "blocked",
+            "summary": "asking to close PR #2927 as superseded by #2977",
+            "superseded_by": "#2977",
+            "question": {
+                "text": "Close PR #2927 as superseded by #2977?",
+                "answer_type": {"kind": "yes_no"},
+                "explanation": "Context:\nPR #2977 supersedes #2927.\nYes:\nClose #2927.\nNo:\nKeep #2927.\nRecommendation:\nYes."
+            }
+        }),
+    );
+    let parsed: RunDoneProposalPayload = serde_json::from_str(&blocked_canonical).unwrap();
+    assert_eq!(parsed.superseded_by.as_deref(), Some("#2977"));
+}

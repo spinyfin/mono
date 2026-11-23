@@ -224,6 +224,7 @@ fn parked_mismatch() -> Parked {
         summary: "Architectural mismatch".into(),
         question: None,
         queue_ci_evidence: None,
+        superseded_by: None,
     })
     .unwrap();
     db.submit_worker_proposal(SubmitWorkerProposalInput {

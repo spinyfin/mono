@@ -297,12 +297,33 @@ pub fn validate_payload(kind: ProposalKind, payload: &Value) -> Result<Validated
                     }
                 }
             });
+            let superseded_by = reader.optional_text("superseded_by", MAX_SHORT_FIELD_CHARS);
+            if let Some(ref pr) = superseded_by {
+                let is_blocked_yes_no = outcome == Some(RunDoneOutcome::Blocked)
+                    && question
+                        .as_ref()
+                        .is_some_and(|q| matches!(q.answer_type, boss_protocol::OperatorAnswerType::YesNo));
+                if outcome != Some(RunDoneOutcome::Delivered) && !is_blocked_yes_no {
+                    reader.error(
+                        "superseded_by",
+                        "superseded_by is only meaningful on a delivered declaration or a blocked yes-no approval question",
+                    );
+                } else if pr.contains(['\n', '\r']) || !boss_github::pr_url::is_pr_reference(pr) {
+                    reader.error(
+                        "superseded_by",
+                        format!(
+                            "`{pr}` is not a PR reference; expected a GitHub PR URL, owner/repo#N, #N, or PR number"
+                        ),
+                    );
+                }
+            }
             reader.finish()?;
             let canonical = to_json(&RunDoneProposalPayload {
                 outcome: outcome.unwrap_or(RunDoneOutcome::Blocked),
                 summary: summary.unwrap_or_default(),
                 question,
                 queue_ci_evidence,
+                superseded_by,
             });
             with_criterion(canonical, criterion)
         }

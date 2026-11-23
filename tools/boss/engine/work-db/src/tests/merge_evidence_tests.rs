@@ -333,6 +333,29 @@ fn worker_closed_unmerged_completion_does_not_record_a_merge() {
 }
 
 #[test]
+fn worker_superseded_pr_completion_records_completed_without_merge_evidence() {
+    let db = WorkDb::open(temp_db_path("superseded-worker")).unwrap();
+    let root = fixture(&db);
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    db.record_worker_superseded_pr_completion(&execution.id, PR, OTHER_PR, Some("Closed #2927 as superseded by #2977"))
+        .unwrap()
+        .unwrap();
+    let updated = db.get_execution(&execution.id).unwrap();
+    assert_eq!(updated.status, ExecutionStatus::Completed);
+    assert_eq!(updated.superseded_by_pr.as_deref(), Some(OTHER_PR));
+    assert_eq!(task_status(&db, &root), "done");
+    assert!(db.get_merge_evidence(&root).unwrap().is_none());
+}
+
+#[test]
 fn stale_worker_merge_cannot_replace_a_new_pr_binding() {
     let db = WorkDb::open(temp_db_path("stale-worker-merge")).unwrap();
     let root = fixture(&db);
