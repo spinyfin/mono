@@ -580,23 +580,22 @@ impl ExecutionCoordinator {
         // The store asks about one run at most: the started run that governs
         // this work item. Answering "no worker" is what makes it stale.
         let mut judged_stale = None;
-        let execution = self
-            .work_db
-            .request_execution_with_live_check(input, |id| {
-                let live = has_worker(id);
-                if !live {
-                    judged_stale = Some(id.to_owned());
-                }
-                live
-            })
-            .inspect_err(|_| {
-                // A failed startup worker scan holds every item, so a refusal
-                // by the hold is a global outage, not one item's problem. Any
-                // other error (an unresolvable repo, say) is not the hold.
-                if self.work_db.ensure_work_item_not_quarantined(&work_item_id).is_err() {
-                    self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
-                }
-            })?;
+        // The store refuses a held item before it looks at anything else, so
+        // ask the same question first and decide from what it returned. A
+        // failed startup worker scan holds every item, so a refusal by that
+        // hold is a global outage, not one item's problem; a refusal with no
+        // scan error behind it (one item's own historical worker) is not.
+        if let Err(err) = self.work_db.ensure_work_item_not_quarantined(&work_item_id) {
+            self.note_scan_error_hold_refusals(std::slice::from_ref(&work_item_id));
+            return Err(err);
+        }
+        let execution = self.work_db.request_execution_with_live_check(input, |id| {
+            let live = has_worker(id);
+            if !live {
+                judged_stale = Some(id.to_owned());
+            }
+            live
+        })?;
         if let Some(stale) = judged_stale {
             self.release_abandoned_run(&stale);
         }

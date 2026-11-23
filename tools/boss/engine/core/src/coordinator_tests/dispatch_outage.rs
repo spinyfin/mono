@@ -471,14 +471,22 @@ async fn a_launch_the_scan_hold_refuses_outside_the_coordinator_is_reported_by_t
 
 #[tokio::test]
 async fn an_admission_error_that_is_not_the_scan_hold_does_not_raise_the_outage() {
-    // Nothing is held, so a refused request is just that item's problem.
+    // One item is quarantined for its own historical worker; there is no scan
+    // error, so the refusal is that item's problem and not a global hold.
     let fixture = fixture(1);
+    fixture
+        .db
+        .write_local_worker_quarantine(&LocalWorkerQuarantine {
+            executions: [("exec_old".to_owned(), "task_quarantined".to_owned())].into(),
+            scan_error: None,
+        })
+        .unwrap();
 
     fixture
         .coordinator
         .request_execution_via_db(
             RequestExecutionInput::builder()
-                .work_item_id("task_does_not_exist".to_owned())
+                .work_item_id("task_quarantined".to_owned())
                 .build(),
             Arc::new(crate::live_worker_state::LiveWorkerStateRegistry::new()),
         )
