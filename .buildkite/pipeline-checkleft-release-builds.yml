@@ -18,6 +18,8 @@ steps:
   - label: ":rust: checkleft-release (linux)"
     key: "checkleft-release-linux"
     command: ".buildkite/steps/checkleft-release.sh linux"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux
@@ -27,6 +29,8 @@ steps:
   - label: ":linux: checkleft-release (musl)"
     key: "checkleft-release-musl"
     command: ".buildkite/steps/checkleft-release.sh musl"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux
@@ -36,6 +40,8 @@ steps:
   - label: ":apple: checkleft-release (darwin)"
     key: "checkleft-release-darwin"
     command: ".buildkite/steps/checkleft-release.sh darwin"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: darwin
@@ -45,6 +51,8 @@ steps:
   - label: ":white_check_mark: checkleft-release (publish)"
     key: "checkleft-release-publish"
     command: ".buildkite/steps/checkleft-release.sh publish"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "checkleft-release-linux"
       - "checkleft-release-musl"

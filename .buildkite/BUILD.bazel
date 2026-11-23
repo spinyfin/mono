@@ -1,0 +1,7 @@
+# Pipeline YAML is consumed by Buildkite from the checkout. Grouped so
+# execlog_config_test sees every pipeline*.yml, including ones added later.
+filegroup(
+    name = "pipeline_ymls",
+    srcs = glob(["pipeline*.yml"]),
+    visibility = ["//.buildkite/steps/tests:__pkg__"],
+)

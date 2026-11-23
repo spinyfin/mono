@@ -18,6 +18,8 @@ steps:
   - label: ":rust: changelog-release (linux)"
     key: "changelog-release-linux"
     command: ".buildkite/steps/changelog-release.sh linux"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux
@@ -27,6 +29,8 @@ steps:
   - label: ":apple: changelog-release (darwin)"
     key: "changelog-release-darwin"
     command: ".buildkite/steps/changelog-release.sh darwin"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: darwin
@@ -36,6 +40,8 @@ steps:
   - label: ":white_check_mark: changelog-release (publish)"
     key: "changelog-release-publish"
     command: ".buildkite/steps/changelog-release.sh publish"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "changelog-release-linux"
       - "changelog-release-darwin"

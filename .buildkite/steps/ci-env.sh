@@ -197,8 +197,54 @@ if [[ "$CI_REMOTE_EXECUTION" == "on" ]]; then
   }
   ci_remote_watchdog_loop_tree "$$" "$CI_REMOTE_WATCHDOG_REASON_FILE" "${CI_BAZEL_REMOTE_EXECUTOR}" &
   CI_REMOTE_STEP_WATCHDOG_PID=$!
-  trap '_ci_remote_cleanup_step_watchdog' EXIT
 fi
+
+_CI_STEP_EXIT_TRAP="${_CI_STEP_EXIT_TRAP:-}"
+
+_ci_capture_preexisting_exit_trap() {
+  local existing
+  existing="$(trap -p EXIT)"
+  [[ -n "$existing" ]] || return 0
+  eval "set -- $existing"
+  if [[ "${3:-}" != "_ci_on_exit" ]]; then
+    _CI_STEP_EXIT_TRAP="${3:-}"
+  fi
+}
+
+# Register or clear a step-level EXIT handler without clobbering CI's own
+# _ci_on_exit finalizer (which cleans up the watchdog and prints the execlog
+# byte summary).
+ci_set_exit_trap() {
+  _CI_STEP_EXIT_TRAP="$1"
+  trap '_ci_on_exit' EXIT
+}
+
+ci_clear_exit_trap() {
+  _CI_STEP_EXIT_TRAP=""
+  trap '_ci_on_exit' EXIT
+}
+
+_ci_on_exit() {
+  local rc=$?
+  set +e
+  if [[ -n "${_CI_ON_EXIT_RAN:-}" ]]; then
+    return "$rc"
+  fi
+  _CI_ON_EXIT_RAN=1
+  if [[ -n "${_CI_STEP_EXIT_TRAP:-}" ]]; then
+    (exit "$rc")
+    eval "$_CI_STEP_EXIT_TRAP"
+  fi
+  _ci_remote_cleanup_step_watchdog
+  _ci_execlog_print_summary
+  return "$rc"
+}
+
+if [[ -z "${_CI_EXIT_TRAP_INSTALLED:-}" ]]; then
+  _ci_capture_preexisting_exit_trap
+  _CI_EXIT_TRAP_INSTALLED=1
+fi
+trap '_ci_on_exit' EXIT
 
 _ci_remote_on_term() {
   local msg probed
@@ -215,7 +261,8 @@ _ci_remote_on_term() {
     buildkite-agent annotate --style error --context "ci-remote-execution-timeout-${BUILDKITE_JOB_ID:-step}" \
       "${BUILDKITE_LABEL:-A step} was killed (SIGTERM) while remote execution was on: ${probed}. \`tools/remote-execution/README.md\`, \"What bounds a stuck action\"." || true
   fi
-  _ci_remote_cleanup_step_watchdog
+  # exit 143 triggers _ci_on_exit, which runs any step EXIT trap, cleans up
+  # the watchdog, and prints the execlog byte summary.
   exit 143
 }
 
@@ -226,8 +273,15 @@ _ci_remote_on_term() {
 _ci_run_bazel() {
   local tmplog="$1" subcommand="$2"
   shift 2
+  # Absolute interpreter captured by _ci_execlog_setup so this hop does not
+  # re-enter the PATH bazel shim (the shim covers Command::new("bazel") and
+  # other subprocesses that never call this function).
+  local bazel_bin="${CI_REAL_BAZEL:-}"
+  if [[ -z "$bazel_bin" ]]; then
+    bazel_bin="$(command -v bazel)"
+  fi
   if [[ "$CI_REMOTE_EXECUTION" != "on" ]]; then
-    command bazel \
+    "$bazel_bin" \
       $BAZEL_STARTUP_FLAGS \
       "$subcommand" \
       $CI_BAZEL_FLAGS \
@@ -241,7 +295,7 @@ _ci_run_bazel() {
   mkfifo "$fifo"
   tee "$tmplog" <"$fifo" &
   tee_pid=$!
-  command bazel \
+  "$bazel_bin" \
     $BAZEL_STARTUP_FLAGS \
     "$subcommand" \
     $CI_BAZEL_FLAGS \
@@ -259,6 +313,12 @@ _ci_run_bazel() {
   return "$rc"
 }
 
+# Per-job compact execution logs. Shared with PATH-wrapper subprocesses via
+# ci-execlog.sh (unique filenames, sibling-job cleanup, no wipe on re-source).
+# shellcheck source=ci-execlog.sh
+source "$(dirname "${BASH_SOURCE[0]}")/ci-execlog.sh"
+_ci_execlog_setup "$(dirname "${BASH_SOURCE[0]}")/ci-execlog.sh"
+
 # Wrap bazel and pass in ci configuration (CI_BAZEL_FLAGS, above).
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
 # cache after an Xcode upgrade) and recovers by running `bazel clean --expunge`
@@ -267,20 +327,38 @@ bazel() {
   local subcommand="$1"
   shift
 
-  local tmplog
-  tmplog=$(mktemp)
+  local execlog_flag=() flag
+  flag="$(_ci_execlog_flag_for "$subcommand" "$@")"
+  if [[ -n "$flag" ]]; then
+    execlog_flag=("$flag")
+  fi
 
-  if _ci_run_bazel "$tmplog" "$subcommand" "$@"; then
+  local tmplog
+  tmplog=$(mktemp "${TMPDIR:-/tmp}/ci-bazel-log.XXXXXX")
+
+  if _ci_run_bazel "$tmplog" "$subcommand" ${execlog_flag[@]+"${execlog_flag[@]}"} "$@"; then
     rm -f "$tmplog" "$tmplog.watchdog"
     return 0
   fi
 
-  # Check for Xcode version mismatch (stale disk cache after Xcode upgrade).
+  # Check for Xcode version mismatch (stale disk cache after an Xcode upgrade).
   if grep -qE "xcode-locator.*failed|Xcode version.*is not available" "$tmplog" 2>/dev/null; then
     echo "--- Xcode version mismatch detected in disk cache; running bazel clean --expunge and retrying"
-    command bazel $BAZEL_STARTUP_FLAGS clean --expunge
+    local bazel_bin="${CI_REAL_BAZEL:-}"
+    if [[ -z "$bazel_bin" ]]; then
+      bazel_bin="$(command -v bazel)"
+    fi
+    "$bazel_bin" $BAZEL_STARTUP_FLAGS clean --expunge
     rm -f "$tmplog" "$tmplog.watchdog"
-    _ci_run_bazel "$tmplog" "$subcommand" "$@"
+    # Allocate a new path: the first attempt already wrote (or began writing)
+    # its log, and each Bazel invocation gets its own file, so the retry must
+    # not reuse it.
+    execlog_flag=()
+    flag="$(_ci_execlog_flag_for "$subcommand" "$@")"
+    if [[ -n "$flag" ]]; then
+      execlog_flag=("$flag")
+    fi
+    _ci_run_bazel "$tmplog" "$subcommand" ${execlog_flag[@]+"${execlog_flag[@]}"} "$@"
     return $?
   fi
 

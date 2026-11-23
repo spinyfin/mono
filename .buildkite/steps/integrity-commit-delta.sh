@@ -22,6 +22,7 @@ steps:
     agents:
       queue: "macos-arm64"
     artifact_paths:
+      - "bazel-execlogs/**/*"
       - "bazel-out/**/extra_action_outputs/**/*"
       - "bazel-testlogs/**/test.log"
       - "bazel-testlogs/**/test.xml"
@@ -30,6 +31,8 @@ steps:
     key: "integrity-checkleft"
     command: ".buildkite/steps/integrity-checkleft.sh"
     timeout_in_minutes: 60
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: "bazel-any"
 PIPELINE

@@ -8,6 +8,8 @@ steps:
   - label: ":package: release (prepare)"
     key: "release-prepare"
     command: ".buildkite/steps/release-release.sh prepare"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux

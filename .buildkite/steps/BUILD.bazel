@@ -1,5 +1,7 @@
 # The step libraries are exported only to their own tests; the step scripts
 # themselves are run by Buildkite straight from the checkout, not by bazel.
+# Named files keep existing tests working; the globbed filegroup lets
+# execlog_config_test see every script that might source ci-env.sh.
 exports_files(
     [
         "bazel-build-test.sh",
@@ -7,10 +9,17 @@ exports_files(
         "boss-head-release-tag.sh",
         "boss-release.sh",
         "ci-env.sh",
+        "ci-execlog.sh",
         "disk-cache-gc-cap.sh",
         "fetch-boss-tags.sh",
         "remote-execution.sh",
         "report-flaky-tests.py",
     ],
+    visibility = ["//.buildkite/steps/tests:__pkg__"],
+)
+
+filegroup(
+    name = "step_scripts",
+    srcs = glob(["*.sh"]),
     visibility = ["//.buildkite/steps/tests:__pkg__"],
 )

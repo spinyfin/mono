@@ -627,7 +627,7 @@ phase_publish() {
 
 main() {
   local phase="${1:-}"
-  trap cleanup EXIT
+  ci_set_exit_trap cleanup
   case "${phase}" in
     prepare) phase_prepare ;;
     linux)   phase_linux ;;

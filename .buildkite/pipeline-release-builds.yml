@@ -6,6 +6,8 @@ steps:
   - label: ":rust: release (linux)"
     key: "release-linux"
     command: ".buildkite/steps/release-release.sh linux"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux
@@ -15,6 +17,8 @@ steps:
   - label: ":apple: release (darwin)"
     key: "release-darwin"
     command: ".buildkite/steps/release-release.sh darwin"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: darwin
@@ -24,6 +28,8 @@ steps:
   - label: ":white_check_mark: release (publish)"
     key: "release-publish"
     command: ".buildkite/steps/release-release.sh publish"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     depends_on:
       - "release-linux"
       - "release-darwin"

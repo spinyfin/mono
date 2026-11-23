@@ -71,7 +71,7 @@ phase_build() {
   # Expand the path now: EXIT runs after this function returns, when a
   # function-local `work` is unset. Under `set -u` a delayed expansion would
   # fail and leave the signing key on the agent.
-  trap "rm -rf -- $(printf '%q' "${work}")" EXIT
+  ci_set_exit_trap "rm -rf -- $(printf '%q' "${work}")"
   out="${work}/out"
   (umask 077 && printf '%s\n' "${key}" > "${work}/release.key")
 
@@ -98,7 +98,7 @@ phase_build() {
     --asset "boss-spoke-package-${platform}.sig=${out}/boss-spoke-package-${platform}.sig"
 
   rm -rf -- "${work}"
-  trap - EXIT
+  ci_clear_exit_trap
 }
 
 phase_publish() {

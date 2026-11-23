@@ -46,6 +46,8 @@ steps:
   - label: ":mag: checkleft-release (prepare)"
     key: "checkleft-release-prepare"
     command: ".buildkite/steps/checkleft-release.sh prepare"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux

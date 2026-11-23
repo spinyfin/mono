@@ -11,6 +11,8 @@ steps:
   - label: ":package: repobin-release (prepare)"
     key: "repobin-release-prepare"
     command: ".buildkite/steps/repobin-release.sh prepare"
+    artifact_paths:
+      - "bazel-execlogs/**/*"
     agents:
       queue: bazel-any
       os: linux
