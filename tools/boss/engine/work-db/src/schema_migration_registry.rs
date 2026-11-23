@@ -650,6 +650,11 @@ pub(super) fn all() -> Vec<Migration> {
             },
         },
         Migration {
+            id: "20261123_1415_work_runs_created_at_idx".into(),
+            legacy_version: None,
+            apply: recurring_read_indexes::migrate_work_runs_created_at_index,
+        },
+        Migration {
             id: "20261104_1700_workspace_lease_boundary".into(),
             legacy_version: None,
             apply: preserved_work::migrate_lease_boundary,

@@ -39,6 +39,15 @@ pub(super) fn migrate_merge_queue_index(conn: &Connection) -> Result<()> {
     apply_with_stat1_guard(conn, MERGE_QUEUE_INDEX_SQL, "ANALYZE tasks_merge_queue_live_idx;")
 }
 
+pub(super) fn migrate_work_runs_created_at_index(conn: &Connection) -> Result<()> {
+    apply_with_stat1_guard(
+        conn,
+        "CREATE INDEX IF NOT EXISTS work_runs_created_at_idx
+             ON work_runs(CAST(created_at AS INTEGER), id);",
+        "ANALYZE work_runs_created_at_idx;",
+    )
+}
+
 fn execution_statuses_sql(terminal: bool) -> String {
     boss_protocol::ExecutionStatus::ALL
         .iter()

@@ -433,6 +433,7 @@ pub fn request_contract(request: &FrontendRequest) -> RequestContract {
         | R::GetSolComparisonReport
         | R::GetStuckReport { .. }
         | R::GetTopCostConsumers { .. }
+        | R::GetRunHistory { .. }
         | R::GetWorkItemCostReport { .. }
         | R::GitHubAuthStatus
         | R::ListAttentionMerges { .. }

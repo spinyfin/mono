@@ -18,17 +18,6 @@ use type_imports::*;
 mod topics;
 pub use topics::*;
 
-/// Optional task-list predicates evaluated before transferring rows to clients.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TaskListQuery {
-    /// Canonical task id or decimal short id, scoped by the request's product.
-    pub selector: Option<String>,
-    pub match_term: Option<String>,
-    #[serde(default)]
-    pub kinds: Vec<crate::TaskKind>,
-    pub created_since: Option<i64>,
-}
-
 fn default_pool_size() -> i64 {
     1
 }
@@ -41,15 +30,6 @@ fn default_pool_size() -> i64 {
 /// lost probes, so an unspecified request must not opt into it by accident.
 fn default_probe_interrupt() -> bool {
     true
-}
-
-/// One task preserved (not deleted) by [`FrontendRequest::UnpopulateProject`]
-/// because it already had an execution — i.e. it was released and
-/// dispatched, so undoing the populate would destroy in-flight work.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnpopulatePreservedTask {
-    pub id: String,
-    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -988,6 +968,26 @@ pub enum FrontendRequest {
 
     GetRun {
         id: String,
+    },
+
+    /// Every `work_runs` row matching the requested window and/or
+    /// filters, newest first. Read-only; backs `boss runs list`. Replies
+    /// with [`FrontendEvent::RunHistory`].
+    GetRunHistory {
+        #[serde(default)]
+        since_epoch_s: Option<i64>,
+        #[serde(default)]
+        until_epoch_s: Option<i64>,
+        #[serde(default)]
+        driver: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        work_item_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
     },
 
     /// Which product the Boss UI's product chooser is currently set to,
@@ -2967,8 +2967,8 @@ pub use invalidation::{InvalidationClass, MAX_RUNTIME_PATCH_ITEMS, WorkRuntimePa
 // Snapshot / pool-summary DTOs: split out to keep this file under the size limit.
 mod snapshot_wire;
 pub use snapshot_wire::{
-    FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, TrunkQueueCheckDto,
-    WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
+    FeatureFlagSnapshot, OffsiteBackupSettings, OperatorDecisionNotification, SettingSnapshot, TaskListQuery,
+    TrunkQueueCheckDto, UnpopulatePreservedTask, WorkerPoolClaimEntry, WorkerPoolEntry, WorkspacePoolEntry,
 };
 
 mod topic_event_payload;

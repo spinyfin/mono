@@ -397,6 +397,16 @@ fn window_cost_report() -> crate::WindowCostReport {
         .build()
 }
 
+fn runs_list_report() -> crate::RunsListReport {
+    crate::RunsListReport::builder()
+        .rows(vec![])
+        .generated_at_epoch_s(1_747_000_000)
+        .truncated(false)
+        .since_epoch_s(1_746_000_000)
+        .until_epoch_s(1_747_000_000)
+        .build()
+}
+
 fn top_cost_report() -> crate::TopCostReport {
     crate::TopCostReport::builder()
         .rows(vec![])
@@ -1488,6 +1498,13 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "top_cost_consumers",
         },
+        TagCase {
+            label: "RunHistory",
+            event: FrontendEvent::RunHistory {
+                report: runs_list_report(),
+            },
+            expected_tag: "run_history",
+        },
         // --- Planner / project lifecycle ---
         TagCase {
             label: "PlannerRunsList",
@@ -2448,6 +2465,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::WorkItemCostReport { .. }
         | FrontendEvent::CostWindowReport { .. }
         | FrontendEvent::TopCostConsumers { .. }
+        | FrontendEvent::RunHistory { .. }
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }

@@ -75,7 +75,6 @@ pub(crate) use boss_protocol::SetTaskDocPointerInput;
 pub(crate) use boss_protocol::Task;
 pub(crate) use boss_protocol::TaskCostReport;
 pub(crate) use boss_protocol::TaskRuntime;
-pub(crate) use boss_protocol::TopCostReport;
 pub(crate) use boss_protocol::UnpopulatePreservedTask;
 pub(crate) use boss_protocol::WindowCostReport;
 pub(crate) use boss_protocol::WorkAttentionItem;
@@ -86,6 +85,7 @@ pub(crate) use boss_protocol::WorkItemDependency;
 pub(crate) use boss_protocol::WorkItemDependencyDetail;
 pub(crate) use boss_protocol::WorkItemDependencyView;
 pub(crate) use boss_protocol::WorkItemPatch;
+pub(crate) use boss_protocol::{RunsListReport, TopCostReport};
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};
 pub(crate) use serde::Serialize;
@@ -407,6 +407,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Cost { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             cost_cmds::run_cost_command(command, &ctx).await
+        }
+        Commands::Runs { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            cost_cmds::run_runs_command(command, &ctx).await
         }
     }
 }

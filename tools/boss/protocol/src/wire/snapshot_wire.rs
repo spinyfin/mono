@@ -15,6 +15,26 @@ pub struct TrunkQueueCheckDto {
     pub detail: String,
 }
 
+/// Optional task-list predicates evaluated before transferring rows to clients.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskListQuery {
+    /// Canonical task id or decimal short id, scoped by the request's product.
+    pub selector: Option<String>,
+    pub match_term: Option<String>,
+    #[serde(default)]
+    pub kinds: Vec<crate::TaskKind>,
+    pub created_since: Option<i64>,
+}
+
+/// One task preserved (not deleted) by `FrontendRequest::UnpopulateProject`
+/// because it already had an execution — i.e. it was released and
+/// dispatched, so undoing the populate would destroy in-flight work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnpopulatePreservedTask {
+    pub id: String,
+    pub name: String,
+}
+
 /// An open operator decision, independent of the selected product or board filters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]

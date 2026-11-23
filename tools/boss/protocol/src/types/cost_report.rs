@@ -172,6 +172,8 @@ pub struct CostTopRow {
     pub status: String,
     pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_usd: Option<f64>,
@@ -203,6 +205,71 @@ pub struct TopCostReport {
     /// allowed — `rows` is the top slice, not the full set.
     pub truncated: bool,
     pub until_epoch_s: i64,
+}
+
+/// One row of `boss runs list` — a single `work_runs` row regardless of
+/// whether token counts were recorded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct RunHistoryRow {
+    pub execution_id: String,
+    pub run_id: String,
+    pub work_item_id: String,
+    pub short_id: Option<i64>,
+    pub created_at_epoch_s: i64,
+    pub execution_status: String,
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_measured: bool,
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_partial: bool,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_epoch_s: Option<i64>,
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_epoch_s: Option<i64>,
+    pub total_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_unavailable: Option<String>,
+}
+
+/// Output shape for `boss runs list` — every run matching the requested
+/// window and filters, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct RunsListReport {
+    pub rows: Vec<RunHistoryRow>,
+    pub generated_at_epoch_s: i64,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_epoch_s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_epoch_s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_filter: Option<String>,
 }
 
 /// Eligible Codex outcomes grouped by the original PR-family assignment.

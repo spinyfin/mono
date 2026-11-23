@@ -15,8 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use boss_protocol::{
-    CostBucket, CostMeasurement, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow, TaskCostReport,
-    TopCostReport, WindowCostReport,
+    CostBucket, CostMeasurement, CostTopRow, DRIVER_SLUG_AGY, DRIVER_SLUG_GROK, ExecutionCostRow, RunHistoryRow,
+    RunsListReport, TaskCostReport, TopCostReport, WindowCostReport,
 };
 
 use crate::cost_pricing;
@@ -578,6 +578,7 @@ pub fn build_top_cost_report(
                     .iter()
                     .any(Option::is_none),
                 )
+                .maybe_driver(record.driver.clone())
                 .maybe_effort_level(record.effort_level.clone())
                 .maybe_estimated_usd(estimated_usd)
                 .maybe_model(record.model.clone())
@@ -604,6 +605,79 @@ pub fn build_top_cost_report(
         .since_epoch_s(since_epoch_s)
         .truncated(truncated)
         .until_epoch_s(until_epoch_s)
+        .build()
+}
+
+/// Build the `boss runs list` report from pre-filtered `records` (preserving
+/// their query order). Every run is included regardless of token state:
+/// unmeasured runs have `tokens_measured = false` and `None` token fields,
+/// while recorded zero-token runs have `tokens_measured = true` and
+/// `total_tokens = Some(0)`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_runs_list_report(
+    records: &[CostRunRecord],
+    since_epoch_s: Option<i64>,
+    until_epoch_s: Option<i64>,
+    driver_filter: Option<String>,
+    kind_filter: Option<String>,
+    status_filter: Option<String>,
+    work_item_filter: Option<String>,
+    limit: Option<u32>,
+    truncated: bool,
+    generated_at_epoch_s: i64,
+) -> RunsListReport {
+    let rows = records
+        .iter()
+        .map(|record| {
+            let measured = run_is_measured(record);
+            let partial = measured
+                && [
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cache_creation_tokens,
+                    record.cache_read_tokens,
+                ]
+                .iter()
+                .any(Option::is_none);
+            RunHistoryRow::builder()
+                .execution_id(record.execution_id.clone())
+                .run_id(record.run_id.clone())
+                .work_item_id(record.work_item_id.clone())
+                .maybe_short_id(record.work_item_short_id)
+                .created_at_epoch_s(record.created_at_epoch_s)
+                .execution_status(record.execution_status.clone())
+                .kind(record.execution_kind.clone())
+                .name(record.work_item_name.clone())
+                .status(record.run_status.clone())
+                .tokens_measured(measured)
+                .tokens_partial(partial)
+                .maybe_cache_creation_tokens(record.cache_creation_tokens)
+                .maybe_cache_read_tokens(record.cache_read_tokens)
+                .maybe_driver(record.driver.clone())
+                .maybe_effort_level(record.effort_level.clone())
+                .maybe_finished_at_epoch_s(record.finished_at_epoch_s)
+                .maybe_input_tokens(record.input_tokens)
+                .maybe_model(record.model.clone())
+                .maybe_output_tokens(record.output_tokens)
+                .maybe_reasoning(record.reasoning.clone())
+                .maybe_started_at_epoch_s(record.started_at_epoch_s)
+                .maybe_total_tokens(measured.then(|| known_tokens(record)))
+                .maybe_usage_unavailable(record.usage_unavailable.clone())
+                .build()
+        })
+        .collect();
+
+    RunsListReport::builder()
+        .rows(rows)
+        .generated_at_epoch_s(generated_at_epoch_s)
+        .truncated(truncated)
+        .maybe_driver_filter(driver_filter)
+        .maybe_kind_filter(kind_filter)
+        .maybe_limit(limit)
+        .maybe_since_epoch_s(since_epoch_s)
+        .maybe_status_filter(status_filter)
+        .maybe_until_epoch_s(until_epoch_s)
+        .maybe_work_item_filter(work_item_filter)
         .build()
 }
 
@@ -884,5 +958,63 @@ mod tests {
             assert!(report.overall.estimated_usd.is_none());
             assert!(report.overall.estimated_usd_partial);
         }
+    }
+
+    #[test]
+    fn top_report_carries_recorded_driver() {
+        let mut r = measured(record("run_1", "exec_1"), 100, 50, 0, 0);
+        r.driver = Some("agy".to_owned());
+        r.model = Some("<synthetic>".to_owned());
+        let report = build_top_cost_report(0, i64::MAX, 10, &[r], false, 0);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].driver.as_deref(), Some("agy"));
+        assert_eq!(report.rows[0].model.as_deref(), Some("<synthetic>"));
+    }
+
+    #[test]
+    fn runs_list_report_includes_unmeasured_and_zero_token_runs() {
+        let mut unmeasured = record("run_unmeasured", "exec_1");
+        unmeasured.driver = Some("agy".to_owned());
+        unmeasured.run_status = "failed".to_owned();
+        unmeasured.started_at_epoch_s = Some(100);
+        unmeasured.finished_at_epoch_s = Some(102);
+
+        let mut zero = measured(record("run_zero", "exec_2"), 0, 0, 0, 0);
+        zero.driver = Some("codex".to_owned());
+
+        let mut partial = output_and_cache_read_only(record("run_partial", "exec_3"), 50, 20);
+        partial.driver = Some("claude".to_owned());
+
+        let report = build_runs_list_report(
+            &[unmeasured, zero, partial],
+            Some(50),
+            Some(200),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            200,
+        );
+        assert_eq!(report.rows.len(), 3);
+
+        assert!(!report.rows[0].tokens_measured);
+        assert!(!report.rows[0].tokens_partial);
+        assert_eq!(report.rows[0].total_tokens, None);
+        assert_eq!(report.rows[0].input_tokens, None);
+        assert_eq!(report.rows[0].driver.as_deref(), Some("agy"));
+        assert_eq!(report.rows[0].status, "failed");
+        assert_eq!(report.rows[0].started_at_epoch_s, Some(100));
+        assert_eq!(report.rows[0].finished_at_epoch_s, Some(102));
+
+        assert!(report.rows[1].tokens_measured);
+        assert!(!report.rows[1].tokens_partial);
+        assert_eq!(report.rows[1].total_tokens, Some(0));
+        assert_eq!(report.rows[1].input_tokens, Some(0));
+
+        assert!(report.rows[2].tokens_measured);
+        assert!(report.rows[2].tokens_partial);
+        assert_eq!(report.rows[2].total_tokens, Some(70));
     }
 }

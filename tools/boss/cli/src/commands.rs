@@ -317,9 +317,17 @@ pub(crate) enum Commands {
     /// / `cache_read_tokens`). Token counts are the measured figures the
     /// system recorded; `--usd` adds an optional, clearly-labelled estimate
     /// against a human-maintained pricing table — never billing truth.
+    /// For full run history (including zero-token/unmeasured runs), see
+    /// `boss runs list`.
     Cost {
         #[command(subcommand)]
         command: CostCommand,
+    },
+    /// Inspect worker run history across time windows, drivers, kinds,
+    /// and statuses (including unmeasured and zero-token runs).
+    Runs {
+        #[command(subcommand)]
+        command: RunsCommand,
     },
 }
 
@@ -2818,7 +2826,9 @@ pub(crate) enum CostCommand {
     /// that answer "where did the budget go."
     Window(CostWindowArgs),
     /// The highest-token-cost runs recorded in a time window, ranked
-    /// descending.
+    /// descending. Excludes runs with no recorded tokens; for a full
+    /// run-history listing (including unmeasured/zero-token runs and
+    /// driver/status/kind filters), use `boss runs list`.
     Top(CostTopArgs),
 }
 
@@ -2894,6 +2904,60 @@ pub(crate) struct CostTopArgs {
     /// `boss cost task --usd`'s help for the pricing-table caveat.
     #[arg(long)]
     pub(crate) usd: bool,
+
+    /// Print report timestamps in UTC instead of this host's local time.
+    #[arg(long)]
+    pub(crate) utc: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RunsCommand {
+    /// List worker runs in a time window (or for a work item), including
+    /// runs with no recorded token data.
+    List(RunsListArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RunsListArgs {
+    /// Start of the window: an RFC3339 timestamp (e.g.
+    /// `2026-07-01T00:00:00Z`) or a relative duration ago (`24h`, `7d`,
+    /// `2w`). Defaults to `24h` when `--work-item` is omitted.
+    #[arg(long)]
+    pub(crate) since: Option<String>,
+
+    /// End of the window, same accepted formats as `--since`. Defaults
+    /// to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+
+    /// Filter by execution driver (e.g. `claude`, `codex`, `agy`,
+    /// `grok`).
+    #[arg(long)]
+    pub(crate) driver: Option<String>,
+
+    /// Filter by execution kind (e.g. `task_implementation`,
+    /// `chore_implementation`, `review_supervisor`).
+    #[arg(long)]
+    pub(crate) kind: Option<String>,
+
+    /// Filter by run status (e.g. `completed`, `failed`, `orphaned`,
+    /// `running`).
+    #[arg(long)]
+    pub(crate) status: Option<String>,
+
+    /// Filter to runs for one work item. Accepts: primary id (`task_…`),
+    /// friendly short id (`42`, `#42`, `t42`), or `product/42`.
+    #[arg(long = "work-item", value_name = boss_protocol::WORK_ITEM_ID_VALUE_NAME)]
+    pub(crate) work_item: Option<String>,
+
+    /// Resolve a friendly short id in `--work-item` against this product
+    /// (slug or id). Optional when the short id is globally unique.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+
+    /// Maximum number of runs to return, newest first.
+    #[arg(long)]
+    pub(crate) limit: Option<u32>,
 
     /// Print report timestamps in UTC instead of this host's local time.
     #[arg(long)]

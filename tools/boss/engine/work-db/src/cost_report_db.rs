@@ -27,7 +27,8 @@ const COST_RECORD_COLUMNS: &str = "
     wr.agent_active_ms,
     CAST(wr.started_at AS INTEGER),
     we.driver,
-    wr.usage_unavailable
+    wr.usage_unavailable,
+    CAST(wr.finished_at AS INTEGER)
 ";
 
 fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
@@ -52,6 +53,7 @@ fn map_cost_run_record(row: &Row) -> rusqlite::Result<CostRunRecord> {
         started_at_epoch_s: row.get(17)?,
         driver: row.get(18)?,
         usage_unavailable: row.get(19)?,
+        finished_at_epoch_s: row.get(20)?,
     })
 }
 
@@ -63,7 +65,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .query_row(
             "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
                     'completed', 'orphaned', 100, 42, 'model-a', 'high', 'medium',
-                    0, 11, 12, 13, 14, 99, 'grok', NULL",
+                    0, 11, 12, 13, 14, 99, 'grok', NULL, 120",
             [],
             map_cost_run_record,
         )
@@ -90,6 +92,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .agent_active_ms(14)
         .started_at_epoch_s(99)
         .driver("grok")
+        .finished_at_epoch_s(120)
         .build();
     assert_eq!(record, expected);
 
@@ -97,7 +100,7 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
         .query_row(
             "SELECT 'run-a', 'exec-a', 'task-a', 'Work name', 'task_implementation',
                     'completed', 'orphaned', 100, NULL, NULL, NULL, NULL,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL",
             [],
             map_cost_run_record,
         )
@@ -117,22 +120,82 @@ fn cost_row_mapping_preserves_every_owned_field_and_null() {
     );
 }
 
+/// Filter and ordering options for [`WorkDb::run_records`].
+#[derive(Debug, Clone, Default, bon::Builder)]
+pub struct RunQueryFilter<'a> {
+    pub since_epoch_s: Option<i64>,
+    pub until_epoch_s: Option<i64>,
+    pub driver: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub work_item_id: Option<&'a str>,
+    pub limit: Option<u32>,
+    #[builder(default)]
+    pub newest_first: bool,
+}
+
 #[work_db_boundary::instrument]
 impl WorkDb {
-    /// Every `work_runs` row for `work_item_id`'s executions, oldest
-    /// first. Backs `boss cost task <id>`.
-    pub fn cost_records_for_work_item(&self, work_item_id: &str) -> Result<Vec<CostRunRecord>> {
+    /// Shared query over `work_runs` joined with `work_executions` and `tasks`.
+    /// Backs `boss cost task`, `boss cost window`, `boss cost top`, and `boss runs list`.
+    pub fn run_records(&self, filter: &RunQueryFilter<'_>) -> Result<Vec<CostRunRecord>> {
         let conn = self.connect()?;
+        let mut clauses: Vec<String> = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(since) = filter.since_epoch_s {
+            values.push(since.into());
+            clauses.push(format!("CAST(wr.created_at AS INTEGER) >= ?{}", values.len()));
+        }
+        if let Some(until) = filter.until_epoch_s {
+            values.push(until.into());
+            clauses.push(format!("CAST(wr.created_at AS INTEGER) < ?{}", values.len()));
+        }
+        if let Some(driver) = filter.driver {
+            values.push(driver.to_owned().into());
+            clauses.push(format!("we.driver = ?{}", values.len()));
+        }
+        if let Some(kind) = filter.kind {
+            values.push(kind.to_owned().into());
+            clauses.push(format!("we.kind = ?{}", values.len()));
+        }
+        if let Some(status) = filter.status {
+            values.push(status.to_owned().into());
+            clauses.push(format!("wr.status = ?{}", values.len()));
+        }
+        if let Some(work_item_id) = filter.work_item_id {
+            values.push(work_item_id.to_owned().into());
+            clauses.push(format!("we.work_item_id = ?{}", values.len()));
+        }
+
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        let order_sql = if filter.newest_first {
+            "ORDER BY CAST(wr.created_at AS INTEGER) DESC, wr.id DESC"
+        } else {
+            "ORDER BY CAST(wr.created_at AS INTEGER) ASC, wr.id ASC"
+        };
+        let limit_sql = if let Some(limit) = filter.limit {
+            values.push(i64::from(limit).into());
+            format!("LIMIT ?{}", values.len())
+        } else {
+            String::new()
+        };
+
         let sql = format!(
             "SELECT {COST_RECORD_COLUMNS}
              FROM work_runs wr
              JOIN work_executions we ON we.id = wr.execution_id
              JOIN tasks t ON t.id = we.work_item_id
-             WHERE we.work_item_id = ?1
-             ORDER BY wr.created_at ASC, wr.id ASC"
+             {where_sql}
+             {order_sql}
+             {limit_sql}"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![work_item_id], map_cost_run_record)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), map_cost_run_record)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -140,26 +203,24 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// Every `work_runs` row for `work_item_id`'s executions, oldest
+    /// first. Backs `boss cost task <id>`.
+    pub fn cost_records_for_work_item(&self, work_item_id: &str) -> Result<Vec<CostRunRecord>> {
+        self.run_records(&RunQueryFilter {
+            work_item_id: Some(work_item_id),
+            ..Default::default()
+        })
+    }
+
     /// Every `work_runs` row created in `[since_epoch_s, until_epoch_s)`,
     /// oldest first. Backs both `boss cost window` (aggregated further by
     /// the caller) and `boss cost top` (ranked further by the caller).
     pub fn cost_records_for_window(&self, since_epoch_s: i64, until_epoch_s: i64) -> Result<Vec<CostRunRecord>> {
-        let conn = self.connect()?;
-        let sql = format!(
-            "SELECT {COST_RECORD_COLUMNS}
-             FROM work_runs wr
-             JOIN work_executions we ON we.id = wr.execution_id
-             JOIN tasks t ON t.id = we.work_item_id
-             WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
-             ORDER BY wr.created_at ASC, wr.id ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![since_epoch_s, until_epoch_s], map_cost_run_record)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        self.run_records(&RunQueryFilter {
+            since_epoch_s: Some(since_epoch_s),
+            until_epoch_s: Some(until_epoch_s),
+            ..Default::default()
+        })
     }
 }
 
@@ -438,5 +499,143 @@ mod tests {
             .cost_records_for_window(created_at + 1, created_at + 100)
             .expect("query succeeds");
         assert!(outside.is_empty());
+    }
+
+    #[test]
+    fn run_records_filters_by_driver_kind_status_and_orders_newest_first() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let task = create_test_chore(&db, &product_id, "Investigate driver failures");
+        let exec_claude = create_ready_chore_execution(&db, &task.id);
+        let exec_agy = create_ready_chore_execution(&db, &task.id);
+        db.record_execution_launch_config(&exec_claude.id, "claude", "claude-sonnet-5", None)
+            .unwrap();
+        db.record_execution_launch_config(&exec_agy.id, "agy", "gemini-4-hydrogen-medium", None)
+            .unwrap();
+
+        let run_1 = create_run(&db, &exec_claude.id, "failed");
+        let run_2 = create_run(&db, &exec_agy.id, "failed");
+        let run_3 = create_run(&db, &exec_agy.id, "completed");
+        set_tokens(&db, &run_3, 42, 8);
+        db.connect()
+            .unwrap()
+            .execute_batch(&format!(
+                "UPDATE work_runs SET created_at = '100', started_at = '101', finished_at = '105' WHERE id = '{run_1}';
+                 UPDATE work_runs SET created_at = '200', started_at = '201', finished_at = '202' WHERE id = '{run_2}';
+                 UPDATE work_runs SET created_at = '300', started_at = '301', finished_at = '310' WHERE id = '{run_3}';"
+            ))
+            .unwrap();
+
+        let agy_failed = db
+            .run_records(&RunQueryFilter {
+                since_epoch_s: Some(100),
+                until_epoch_s: Some(400),
+                driver: Some("agy"),
+                kind: Some("chore_implementation"),
+                status: Some("failed"),
+                newest_first: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(agy_failed.len(), 1);
+        assert_eq!(agy_failed[0].run_id, run_2);
+        assert_eq!(agy_failed[0].driver.as_deref(), Some("agy"));
+        assert_eq!(agy_failed[0].started_at_epoch_s, Some(201));
+        assert_eq!(agy_failed[0].finished_at_epoch_s, Some(202));
+        assert_eq!(agy_failed[0].input_tokens, None);
+
+        let newest = db
+            .run_records(&RunQueryFilter {
+                since_epoch_s: Some(100),
+                until_epoch_s: Some(400),
+                limit: Some(2),
+                newest_first: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            newest.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            vec![run_3.as_str(), run_2.as_str()]
+        );
+    }
+
+    #[test]
+    fn window_query_uses_work_runs_created_at_index_and_stays_fast_for_6000_runs() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let task = create_test_chore(&db, &product_id, "Synthetic load test");
+        let exec = create_ready_chore_execution(&db, &task.id);
+        db.record_execution_launch_config(&exec.id, "codex", "gpt-5-codex", None)
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO work_runs (id, execution_id, agent_id, status, created_at, started_at, finished_at)
+                     VALUES (?1, ?2, 'worker-1', 'completed', ?3, ?3, ?4)",
+                )
+                .unwrap();
+            let base_ts: i64 = 1_790_000_000;
+            // Seed 12,000 runs across 28 days (~6,000 in the recent 14-day window).
+            for i in 0..12_000i64 {
+                let ts = base_ts + i * 200;
+                let id = format!("run_perf_{i:05}");
+                stmt.execute(params![id, exec.id, ts.to_string(), (ts + 15).to_string()])
+                    .unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT; ANALYZE;").unwrap();
+
+        let window_end = 1_790_000_000 + 12_000 * 200;
+        let window_start = window_end - 14 * 86_400;
+
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN
+                 SELECT {COST_RECORD_COLUMNS}
+                 FROM work_runs wr
+                 JOIN work_executions we ON we.id = wr.execution_id
+                 JOIN tasks t ON t.id = we.work_item_id
+                 WHERE CAST(wr.created_at AS INTEGER) >= ?1 AND CAST(wr.created_at AS INTEGER) < ?2
+                 ORDER BY CAST(wr.created_at AS INTEGER) DESC, wr.id DESC"
+            ))
+            .unwrap()
+            .query_map(params![window_start, window_end], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("work_runs_created_at_idx"),
+            "expected window query to use work_runs_created_at_idx, got: {plan_text}"
+        );
+        assert!(
+            !plan_text.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "expected index order to avoid temp B-tree sort, got: {plan_text}"
+        );
+        drop(conn);
+
+        let t0 = std::time::Instant::now();
+        let rows = db
+            .run_records(&RunQueryFilter {
+                since_epoch_s: Some(window_start),
+                until_epoch_s: Some(window_end),
+                newest_first: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "work_runs 14-day window query: {} rows in {:.2}ms (plan: {plan_text})",
+            rows.len(),
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert!(rows.len() >= 6_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "14-day window query took too long: {elapsed:?}"
+        );
     }
 }

@@ -140,3 +140,80 @@ pub(super) async fn handle_get_top_cost_consumers(ctx: Dispatch, req: FrontendRe
         send_response(&sink, &request_id, FrontendEvent::TopCostConsumers { report });
     }
 }
+
+pub(super) async fn handle_get_run_history(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetRunHistory {
+        since_epoch_s,
+        until_epoch_s,
+        driver,
+        kind,
+        status,
+        work_item_id,
+        limit,
+    } = req
+    else {
+        unreachable!()
+    };
+
+    let resolved_work_item_id = match work_item_id {
+        Some(raw) => match server_state.resolve_work_item_id(&raw).await {
+            Ok(id) => Some(id),
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        },
+        None => None,
+    };
+
+    let now = boss_engine_utils::epoch_time::now_epoch_secs();
+    // Bound windowless queries when not scoped to a single work item.
+    let (since_epoch_s, until_epoch_s) = if since_epoch_s.is_none() && resolved_work_item_id.is_none() {
+        (Some(now - 86_400), until_epoch_s.or(Some(now)))
+    } else {
+        (since_epoch_s, until_epoch_s)
+    };
+
+    let query_limit = limit.map(|n| n.saturating_add(1));
+    let mut records = match work_db.run_records(
+        &boss_work_db::RunQueryFilter::builder()
+            .maybe_since_epoch_s(since_epoch_s)
+            .maybe_until_epoch_s(until_epoch_s)
+            .maybe_driver(driver.as_deref())
+            .maybe_kind(kind.as_deref())
+            .maybe_status(status.as_deref())
+            .maybe_work_item_id(resolved_work_item_id.as_deref())
+            .maybe_limit(query_limit)
+            .newest_first(true)
+            .build(),
+    ) {
+        Ok(records) => records,
+        Err(err) => return send_work_error(&sink, &request_id, &err),
+    };
+
+    let truncated = limit.is_some_and(|n| records.len() > n as usize);
+    if let Some(n) = limit {
+        records.truncate(n as usize);
+    }
+
+    let report = boss_engine_runtime::cost_report::build_runs_list_report(
+        &records,
+        since_epoch_s,
+        until_epoch_s,
+        driver,
+        kind,
+        status,
+        resolved_work_item_id,
+        limit,
+        truncated,
+        now,
+    );
+    send_response(&sink, &request_id, FrontendEvent::RunHistory { report });
+}
