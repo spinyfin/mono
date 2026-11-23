@@ -875,6 +875,7 @@ mod coordinator_guidance_cache;
 mod coordinator_handoff_store;
 mod coordinator_tmux;
 mod cost_report_db;
+pub use cost_report_db::RunQueryFilter;
 mod create_entities;
 mod critical_priority;
 mod critical_requests;

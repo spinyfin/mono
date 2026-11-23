@@ -40,19 +40,10 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
             })
         }
         CostCommand::Task(args) => {
-            let work_item = match parse_work_item_selector(&args.id) {
-                WorkItemSelector::ShortId(n) => resolve_short_id_item(&mut client, ctx, args.product, n).await?,
-                WorkItemSelector::ProductShortId { product_slug, n } => {
-                    resolve_short_id_item(&mut client, ctx, Some(product_slug), n).await?
-                }
-                WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => {
-                    get_work_item(&mut client, &id).await?
-                }
-            };
-            let (task, _label) = expect_leaf_work_item(work_item)?;
+            let task_id = resolve_leaf_work_item_id(&mut client, ctx, &args.id, args.product).await?;
             let response = client
                 .send_request(&FrontendRequest::GetWorkItemCostReport {
-                    work_item_id: task.id.clone(),
+                    work_item_id: task_id,
                     estimate_usd: args.usd,
                 })
                 .await
@@ -117,6 +108,89 @@ pub(crate) async fn run_cost_command(command: CostCommand, ctx: &RunContext) -> 
     }
 }
 
+async fn resolve_leaf_work_item_id(
+    client: &mut WorkerClient,
+    ctx: &RunContext,
+    raw_selector: &str,
+    product: Option<String>,
+) -> Result<String, CliError> {
+    let work_item = match parse_work_item_selector(raw_selector) {
+        WorkItemSelector::ShortId(n) => resolve_short_id_item(client, ctx, product, n).await?,
+        WorkItemSelector::ProductShortId { product_slug, n } => {
+            resolve_short_id_item(client, ctx, Some(product_slug), n).await?
+        }
+        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => get_work_item(client, &id).await?,
+    };
+    let (task, _label) = expect_leaf_work_item(work_item)?;
+    Ok(task.id.clone())
+}
+
+/// How `boss runs list --work-item` treats a selector: friendly short ids
+/// still resolve through the engine, while canonical owner ids (task,
+/// comment, automation, comparison, product, project) pass through as
+/// `work_executions.work_item_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunsListOwnerSelector {
+    Friendly,
+    Canonical(String),
+}
+
+fn classify_runs_list_owner(raw: &str) -> RunsListOwnerSelector {
+    match parse_work_item_selector(raw) {
+        WorkItemSelector::ShortId(_) | WorkItemSelector::ProductShortId { .. } => RunsListOwnerSelector::Friendly,
+        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => RunsListOwnerSelector::Canonical(id),
+    }
+}
+
+async fn resolve_runs_list_owner_id(
+    client: &mut WorkerClient,
+    ctx: &RunContext,
+    raw_selector: &str,
+    product: Option<String>,
+) -> Result<String, CliError> {
+    match classify_runs_list_owner(raw_selector) {
+        RunsListOwnerSelector::Friendly => resolve_leaf_work_item_id(client, ctx, raw_selector, product).await,
+        RunsListOwnerSelector::Canonical(id) => Ok(id),
+    }
+}
+
+pub(crate) async fn run_runs_command(command: RunsCommand, ctx: &RunContext) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    match command {
+        RunsCommand::List(args) => {
+            let work_item_id = match args.work_item.as_deref() {
+                Some(raw) => Some(resolve_runs_list_owner_id(&mut client, ctx, raw, args.product).await?),
+                None => None,
+            };
+            let (since_epoch_s, until_epoch_s) =
+                resolve_optional_window(args.since.as_deref(), args.until.as_deref(), work_item_id.is_some())?;
+            let response = client
+                .send_request(&FrontendRequest::GetRunHistory {
+                    since_epoch_s,
+                    until_epoch_s,
+                    driver: args.driver,
+                    kind: args.kind,
+                    status: args.status,
+                    work_item_id,
+                    limit: args.limit,
+                })
+                .await
+                .map_err(CliError::internal)?;
+            let report = match response {
+                FrontendEvent::RunHistory { report } => report,
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    return Err(CliError::application(message));
+                }
+                other => return Err(unexpected_event("runs list", &other)),
+            };
+            let tz = resolve_display_tz(args.utc);
+            print_entity(ctx, &serde_json::json!({ "report": report }), || {
+                print_runs_list_report(&report, &tz)
+            })
+        }
+    }
+}
+
 // ── Time-window parsing ──────────────────────────────────────────────
 
 /// Parse a `--since`/`--until` bound: an RFC3339 timestamp, or a
@@ -146,6 +220,28 @@ fn resolve_window(since: &str, until: Option<&str>) -> Result<(i64, i64), CliErr
         return Err(CliError::usage("--until must be after --since"));
     }
     Ok((since_epoch_s, until_epoch_s))
+}
+
+pub(crate) fn resolve_optional_window(
+    since: Option<&str>,
+    until: Option<&str>,
+    has_work_item: bool,
+) -> Result<(Option<i64>, Option<i64>), CliError> {
+    match (since, until) {
+        (Some(s), u) => {
+            let (since_s, until_s) = resolve_window(s, u)?;
+            Ok((Some(since_s), Some(until_s)))
+        }
+        (None, u) if !has_work_item => {
+            let (since_s, until_s) = resolve_window("24h", u)?;
+            Ok((Some(since_s), Some(until_s)))
+        }
+        (None, Some(u)) => {
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
+            Ok((None, Some(parse_epoch_bound(u, now)?)))
+        }
+        (None, None) => Ok((None, None)),
+    }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────
@@ -352,7 +448,7 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
     }
     println!();
     let include_usd = report.rows.iter().any(|row| row.estimated_usd.is_some());
-    let mut headers = vec!["WORK ITEM", "KIND", "MODEL", "TOKENS", "STARTED", "STATUS"];
+    let mut headers = vec!["WORK ITEM", "KIND", "DRIVER", "MODEL", "TOKENS", "STARTED", "STATUS"];
     if include_usd {
         headers.push("USD (EST)");
     }
@@ -367,6 +463,7 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
         let mut cells = vec![
             identity,
             row.kind.clone(),
+            row.driver.clone().unwrap_or_else(|| "—".to_owned()),
             row.model.clone().unwrap_or_else(|| "—".to_owned()),
             format_token_total(row.total_tokens, row.tokens_partial),
             started,
@@ -391,6 +488,72 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             "  (truncated to the top {} — more measured runs exist in this window)",
             report.limit
         );
+    }
+}
+
+fn print_runs_list_report(report: &RunsListReport, tz: &DisplayTz) {
+    match (report.since_epoch_s, report.until_epoch_s) {
+        (Some(since), Some(until)) => println!(
+            "Runs from {} to {} ({})",
+            format_epoch(since, tz),
+            format_epoch(until, tz),
+            tz.label,
+        ),
+        _ => println!(
+            "Runs (generated {} {})",
+            format_epoch(report.generated_at_epoch_s, tz),
+            tz.label,
+        ),
+    }
+    if report.rows.is_empty() {
+        println!();
+        println!("  No matching runs.");
+        return;
+    }
+    println!();
+    let mut table = new_dynamic_table(vec![
+        "WORK ITEM",
+        "KIND",
+        "DRIVER",
+        "MODEL",
+        "STATUS",
+        "STARTED",
+        "FINISHED",
+        "TOKENS",
+    ]);
+    for row in &report.rows {
+        let label = boss_protocol::short_id_label(row.short_id).unwrap_or_else(|| row.work_item_id.clone());
+        let identity = format!("{label}: {}", row.name);
+        let started = row
+            .started_at_epoch_s
+            .map(|e| format_epoch(e, tz))
+            .unwrap_or_else(|| "—".to_owned());
+        let finished = row
+            .finished_at_epoch_s
+            .map(|e| format_epoch(e, tz))
+            .unwrap_or_else(|| "—".to_owned());
+        let tokens = if !row.tokens_measured {
+            "unmeasured".to_owned()
+        } else {
+            format_token_total(row.total_tokens.unwrap_or(0), row.tokens_partial)
+        };
+        table.add_row(vec![
+            identity,
+            row.kind.clone(),
+            row.driver.clone().unwrap_or_else(|| "—".to_owned()),
+            row.model.clone().unwrap_or_else(|| "—".to_owned()),
+            row.status.clone(),
+            started,
+            finished,
+            tokens,
+        ]);
+    }
+    print_table(table);
+    if report.truncated
+        && let Some(limit) = report.limit
+    {
+        println!();
+        println!("  (truncated to {limit} — more matching runs exist)");
     }
 }
 
@@ -454,5 +617,146 @@ mod tests {
         assert_eq!(format_optional_tokens(None), "unknown");
         assert_eq!(format_optional_tokens(Some(0)), "0");
         assert_eq!(format_token_total(12, true), "12 (partial)");
+    }
+
+    #[test]
+    fn classify_runs_list_owner_passes_canonical_non_task_ids() {
+        assert_eq!(classify_runs_list_owner("42"), RunsListOwnerSelector::Friendly);
+        assert_eq!(classify_runs_list_owner("t12"), RunsListOwnerSelector::Friendly);
+        assert_eq!(classify_runs_list_owner("acme/7"), RunsListOwnerSelector::Friendly);
+        assert_eq!(
+            classify_runs_list_owner("task_abc"),
+            RunsListOwnerSelector::Canonical("task_abc".into())
+        );
+        assert_eq!(
+            classify_runs_list_owner("comment_owner_1"),
+            RunsListOwnerSelector::Canonical("comment_owner_1".into())
+        );
+        assert_eq!(
+            classify_runs_list_owner("auto_owner_1"),
+            RunsListOwnerSelector::Canonical("auto_owner_1".into())
+        );
+        assert_eq!(
+            classify_runs_list_owner("cmp_owner_1"),
+            RunsListOwnerSelector::Canonical("cmp_owner_1".into())
+        );
+    }
+
+    #[test]
+    fn resolve_optional_window_defaults_to_24h_when_unscoped() {
+        let (since, until) = resolve_optional_window(None, None, false).unwrap();
+        assert_eq!(until.unwrap() - since.unwrap(), 86_400);
+    }
+
+    #[test]
+    fn resolve_optional_window_keeps_explicit_since() {
+        let (since, until) = resolve_optional_window(Some("7d"), None, false).unwrap();
+        assert_eq!(until.unwrap() - since.unwrap(), 7 * 86_400);
+    }
+
+    #[test]
+    fn resolve_optional_window_with_work_item_and_no_since_is_unbounded() {
+        let (since, until) = resolve_optional_window(None, None, true).unwrap();
+        assert_eq!((since, until), (None, None));
+    }
+
+    #[test]
+    fn resolve_optional_window_until_only_with_work_item() {
+        let (since, until) = resolve_optional_window(None, Some("2026-07-01T00:00:00Z"), true).unwrap();
+        assert_eq!(since, None);
+        assert_eq!(until, Some(1_782_864_000));
+    }
+
+    #[test]
+    fn resolve_optional_window_until_only_without_work_item_still_starts_24h_ago() {
+        let (since, until) = resolve_optional_window(None, Some("1h"), false).unwrap();
+        assert_eq!(until.unwrap() - since.unwrap(), 23 * 3_600);
+    }
+
+    #[test]
+    fn runs_list_cli_rejects_limit_zero() {
+        let err = Cli::try_parse_from(["boss", "runs", "list", "--limit", "0"]).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("must be at least 1"),
+            "expected --limit 0 to be rejected, got: {text}"
+        );
+    }
+
+    #[test]
+    fn runs_list_cli_parses_canonical_non_task_work_item() {
+        let cli = Cli::try_parse_from([
+            "boss",
+            "runs",
+            "list",
+            "--work-item",
+            "comment_owner_1",
+            "--kind",
+            "answer_agent",
+        ])
+        .expect("canonical owner id is accepted");
+        let Commands::Runs {
+            command: RunsCommand::List(args),
+        } = cli.command
+        else {
+            panic!("expected RunsCommand::List");
+        };
+        assert_eq!(args.work_item.as_deref(), Some("comment_owner_1"));
+        assert_eq!(args.kind.as_deref(), Some("answer_agent"));
+    }
+
+    #[test]
+    fn runs_list_cli_parses_filters_and_help_cross_references() {
+        use clap::CommandFactory;
+        let cli = Cli::try_parse_from([
+            "boss",
+            "runs",
+            "list",
+            "--since",
+            "14d",
+            "--until",
+            "1d",
+            "--driver",
+            "agy",
+            "--kind",
+            "task_implementation",
+            "--status",
+            "failed",
+            "--work-item",
+            "42",
+            "--limit",
+            "100",
+            "--json",
+        ])
+        .expect("boss runs list parses");
+        assert!(cli.global.json);
+        let Commands::Runs {
+            command: RunsCommand::List(args),
+        } = cli.command
+        else {
+            panic!("expected RunsCommand::List");
+        };
+        assert_eq!(args.since.as_deref(), Some("14d"));
+        assert_eq!(args.until.as_deref(), Some("1d"));
+        assert_eq!(args.driver.as_deref(), Some("agy"));
+        assert_eq!(args.kind.as_deref(), Some("task_implementation"));
+        assert_eq!(args.status.as_deref(), Some("failed"));
+        assert_eq!(args.work_item.as_deref(), Some("42"));
+        assert_eq!(args.limit, Some(100));
+
+        let mut root_cmd = Cli::command();
+        let root_help = root_cmd.render_help().to_string();
+        assert!(
+            root_help.contains("runs"),
+            "boss --help should mention runs: {root_help}"
+        );
+
+        let cost_cmd = root_cmd.find_subcommand_mut("cost").expect("cost subcommand");
+        let top_cmd = cost_cmd.find_subcommand_mut("top").expect("cost top subcommand");
+        let top_help = top_cmd.render_help().to_string();
+        assert!(
+            top_help.contains("boss runs list"),
+            "boss cost top --help should cross-reference boss runs list: {top_help}"
+        );
     }
 }

@@ -171,6 +171,8 @@ pub struct CostTopRow {
     pub output_tokens: Option<i64>,
     pub status: String,
     pub total_tokens: i64,
+    #[serde(default)]
+    pub driver: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,6 +207,71 @@ pub struct TopCostReport {
     pub until_epoch_s: i64,
 }
 
+/// One row of `boss runs list` — a single `work_runs` row regardless of
+/// whether token counts were recorded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct RunHistoryRow {
+    pub execution_id: String,
+    pub run_id: String,
+    pub work_item_id: String,
+    pub short_id: Option<i64>,
+    pub created_at_epoch_s: i64,
+    pub execution_status: String,
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_measured: bool,
+    #[serde(default)]
+    #[builder(default)]
+    pub tokens_partial: bool,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_epoch_s: Option<i64>,
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_epoch_s: Option<i64>,
+    pub total_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_unavailable: Option<String>,
+}
+
+/// Output shape for `boss runs list` — every run matching the requested
+/// window and filters, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+pub struct RunsListReport {
+    pub rows: Vec<RunHistoryRow>,
+    pub generated_at_epoch_s: i64,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_epoch_s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_epoch_s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_filter: Option<String>,
+}
+
 /// Eligible Codex outcomes grouped by the original PR-family assignment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
@@ -234,4 +301,51 @@ pub struct SolArmReport {
 pub struct SolComparisonReport {
     pub arms: Vec<SolArmReport>,
     pub notes: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn sample_run_history_row() -> RunHistoryRow {
+        RunHistoryRow::builder()
+            .execution_id("exec_1")
+            .run_id("run_1")
+            .work_item_id("task_1")
+            .created_at_epoch_s(100)
+            .execution_status("completed")
+            .kind("chore_implementation")
+            .name("Fix cursor flicker")
+            .status("failed")
+            .build()
+    }
+
+    fn sample_top_row() -> CostTopRow {
+        CostTopRow::builder()
+            .execution_id("exec_1")
+            .run_id("run_1")
+            .work_item_id("task_1")
+            .kind("chore_implementation")
+            .name("Fix cursor flicker")
+            .status("completed")
+            .total_tokens(10)
+            .build()
+    }
+
+    #[test]
+    fn run_history_row_emits_driver_null_when_unrecorded() {
+        let encoded = serde_json::to_value(sample_run_history_row()).unwrap();
+        assert_eq!(encoded["driver"], Value::Null);
+        let decoded: RunHistoryRow = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.driver, None);
+    }
+
+    #[test]
+    fn cost_top_row_emits_driver_null_when_unrecorded() {
+        let encoded = serde_json::to_value(sample_top_row()).unwrap();
+        assert_eq!(encoded["driver"], Value::Null);
+        let decoded: CostTopRow = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.driver, None);
+    }
 }

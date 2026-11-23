@@ -1045,6 +1045,9 @@ pub enum FrontendEvent {
     /// Response to [`FrontendRequest::GetTopCostConsumers`].
     #[worker(passthrough)]
     TopCostConsumers { report: crate::TopCostReport },
+    /// Response to [`FrontendRequest::GetRunHistory`].
+    #[worker(passthrough)]
+    RunHistory { report: crate::RunsListReport },
     /// Response to [`FrontendRequest::ListPlannerRuns`]: every
     /// `planner_runs` audit row for the project, newest first.
     #[worker(passthrough)]

@@ -78,6 +78,7 @@ pub struct CostRunRecord {
     pub cache_read_tokens: Option<i64>,
     pub agent_active_ms: Option<i64>,
     pub started_at_epoch_s: Option<i64>,
+    pub finished_at_epoch_s: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]

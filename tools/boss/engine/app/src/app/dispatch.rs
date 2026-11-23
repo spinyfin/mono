@@ -181,6 +181,7 @@ async fn dispatch_attributed(mut ctx: Dispatch, request: FrontendRequest, bulk_r
         r @ FrontendRequest::GetSettings => Box::pin(engine_meta::handle_get_settings(ctx, r)),
         r @ FrontendRequest::GetTaskRuntime { .. } => Box::pin(executions::handle_get_task_runtime(ctx, r)),
         r @ FrontendRequest::GetTopCostConsumers { .. } => Box::pin(cost::handle_get_top_cost_consumers(ctx, r)),
+        r @ FrontendRequest::GetRunHistory { .. } => Box::pin(cost::handle_get_run_history(ctx, r)),
         r @ FrontendRequest::GetWorkerContext { .. } => Box::pin(context::handle_get_worker_context(ctx, r)),
         r @ FrontendRequest::GetWorkItem { .. } => Box::pin(work_items::handle_get_work_item(ctx, r)),
         r @ FrontendRequest::GetWorkItemByShortId { .. } => {

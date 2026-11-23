@@ -1200,6 +1200,12 @@ mod floor_tests {
                     .unwrap();
             }),
         ));
+        steps.push((
+            "20261123_1415_work_runs_created_at_idx",
+            Box::new(|c| {
+                super::super::recurring_read_indexes::migrate_work_runs_created_at_index(c).unwrap();
+            }),
+        ));
         steps.sort_by_key(|(id, _)| *id);
         for (_, apply) in steps {
             apply(&expected);
