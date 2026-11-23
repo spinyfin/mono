@@ -274,11 +274,206 @@ pub fn script_issues_command(source: &str) -> bool {
 /// Whether `source` is a cell that only polls an existing shell session.
 ///
 /// A wrapper that starts a command and then polls it with `write_stdin` is
-/// command-bearing, not this. A plain argv/string `exec` input (`echo hi`)
-/// is also not this: it never mentions `write_stdin` and still issues a
-/// command.
+/// command-bearing, not this — including when the command is reached through
+/// computed `tools[...]` access, an unknown `tools.*` member, or a `tools`
+/// alias, which [`script_issues_command`] does not see. A plain argv/string
+/// `exec` input (`echo hi`) is also not this: it never mentions `write_stdin`
+/// and still issues a command.
 pub fn script_is_continuation_only(source: &str) -> bool {
-    find_js_call(source, "write_stdin").is_some() && !script_issues_command(source)
+    find_js_call(source, "write_stdin").is_some() && !script_mentions_command_tool(source)
+}
+
+/// Cell builtins that compute, print or stash data without running a command.
+const CELL_BUILTIN_CALLS: &[&str] = &["text", "load", "store", "notify"];
+
+/// `tools.*` helpers that cannot start a shell command. This list is the
+/// contract for compute-only classification: a `tools.<name>` access is
+/// command-free only when `name` is listed here. Extend it when Codex grows
+/// another non-shell helper; unknown names, computed `tools[...]`, and a
+/// bare `tools` identifier (aliasing) stay command-capable.
+const NON_COMMAND_CELL_TOOLS: &[&str] = &["write_stdin", "apply_patch", "view_image", "update_plan"];
+
+/// Whether `source` is positively a cell script that runs no command: it
+/// calls a cell builtin (`text`, `load`, `store`, `notify`) or a known
+/// non-shell `tools.*` helper, or it is unambiguous JavaScript cell syntax
+/// (`await`, a `const`/`let` declaration, or `=>`) with no `write_stdin`
+/// poll, and it never reaches a command-bearing tool (`exec_command`,
+/// `shell`, computed `tools[...]`, an unknown `tools.*` name, or a `tools`
+/// alias).
+///
+/// Such a cell is ordinary code-mode work, not a shell command, so it must not
+/// be announced or drained as one with its JavaScript as the "command". A
+/// string that does not look like a cell (`echo hi`, `sleep 5; echo done`)
+/// is not this.
+pub fn script_is_compute_only(source: &str) -> bool {
+    if script_mentions_command_tool(source) {
+        return false;
+    }
+    if CELL_BUILTIN_CALLS
+        .iter()
+        .any(|name| find_js_call(source, name).is_some())
+        || NON_COMMAND_CELL_TOOLS
+            .iter()
+            .any(|name| *name != "write_stdin" && find_js_call(source, name).is_some())
+    {
+        return true;
+    }
+    find_js_call(source, "write_stdin").is_none() && script_has_unambiguous_js_cell_syntax(source)
+}
+
+/// Unambiguous JavaScript cell syntax that is not a shell one-liner: a
+/// statement/expression-positioned `await <expr>`, a `const <ident> =` or
+/// `const`/`let` destructuring declaration, or an arrow `=>`.
+/// String, comment and regex bodies are skipped so `echo await; sleep 999`,
+/// `grep -rn await src`, and bash `let n=1; sleep 999` stay shell.
+fn script_has_unambiguous_js_cell_syntax(source: &str) -> bool {
+    let mut lexer = JsLexer::new(source);
+    loop {
+        let prev = lexer.last;
+        let Some((at, ch)) = lexer.next_code() else {
+            break;
+        };
+        if ch == '='
+            && matches!(prev, LastJsToken::Operand | LastJsToken::Word { .. })
+            && source.get(at + 1..).is_some_and(|rest| rest.starts_with('>'))
+        {
+            return true;
+        }
+        if !js_ident_part(ch) || ch.is_ascii_digit() {
+            continue;
+        }
+        let rest = &source[at..];
+        let ident_len = rest.find(|c: char| !js_ident_part(c)).unwrap_or(rest.len());
+        let ident = &rest[..ident_len];
+        if ident == "await" && prev_allows_await(source, prev) {
+            let after = rest[ident_len..].trim_start();
+            if after.starts_with('"')
+                || after.starts_with('\'')
+                || after.starts_with('`')
+                || (after.starts_with('/') && !after.starts_with("//") && !after.starts_with("/*"))
+            {
+                return true;
+            }
+            if let Some((_, next)) = lexer.next_code()
+                && (js_ident_part(next) || matches!(next, '(' | '[' | '{' | '+' | '-' | '!' | '~'))
+            {
+                return true;
+            }
+            continue;
+        }
+        if ident == "const" && prev_allows_js_decl(source, prev) {
+            if let Some((_, next)) = lexer.next_code() {
+                if matches!(next, '{' | '[') {
+                    return true;
+                }
+                if js_ident_part(next)
+                    && !next.is_ascii_digit()
+                    && let Some((eq_at, '=')) = lexer.next_code()
+                    && !source
+                        .get(eq_at + 1..)
+                        .is_some_and(|tail| tail.starts_with('=') || tail.starts_with('>'))
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+        if ident == "let"
+            && prev_allows_js_decl(source, prev)
+            && let Some((_, next)) = lexer.next_code()
+            && matches!(next, '{' | '[')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn prev_allows_await(source: &str, prev: LastJsToken) -> bool {
+    match prev {
+        LastJsToken::Start => true,
+        LastJsToken::Punct(ch) => matches!(
+            ch,
+            ';' | '{'
+                | '}'
+                | '='
+                | '('
+                | '['
+                | ','
+                | ':'
+                | '?'
+                | '!'
+                | '~'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '&'
+                | '|'
+                | '^'
+                | '<'
+                | '>'
+        ),
+        LastJsToken::Word { start, end } => matches!(
+            source.get(start..end),
+            Some(
+                "return"
+                    | "yield"
+                    | "throw"
+                    | "case"
+                    | "else"
+                    | "do"
+                    | "await"
+                    | "typeof"
+                    | "void"
+                    | "delete"
+                    | "in"
+                    | "of"
+            )
+        ),
+        LastJsToken::Operand => false,
+    }
+}
+
+fn prev_allows_js_decl(source: &str, prev: LastJsToken) -> bool {
+    match prev {
+        LastJsToken::Start => true,
+        LastJsToken::Punct(ch) => matches!(ch, ';' | '{' | '}' | '('),
+        LastJsToken::Word { start, end } => matches!(source.get(start..end), Some("else")),
+        LastJsToken::Operand => false,
+    }
+}
+
+/// Whether `source` names a command-bearing helper anywhere in code (not only
+/// as a call), or reaches `tools` in a way that could dispatch a shell:
+/// computed property access, an unknown member, or a bare identifier that
+/// could be aliased. `tools.<known non-command tool>` is not this.
+fn script_mentions_command_tool(source: &str) -> bool {
+    let mut lexer = JsLexer::new(source);
+    while let Some((at, ch)) = lexer.next_code() {
+        if !js_ident_part(ch) {
+            continue;
+        }
+        let rest = &source[at..];
+        let ident_len = rest.find(|c: char| !js_ident_part(c)).unwrap_or(rest.len());
+        let ident = &rest[..ident_len];
+        if COMMAND_BEARING_CELL_CALLS.contains(&ident) {
+            return true;
+        }
+        if ident == "tools" {
+            let after = rest[ident_len..].trim_start();
+            if let Some(member_src) = after.strip_prefix('.') {
+                let member_len = member_src.find(|c: char| !js_ident_part(c)).unwrap_or(member_src.len());
+                let member = &member_src[..member_len];
+                if !member.is_empty() && NON_COMMAND_CELL_TOOLS.contains(&member) {
+                    continue;
+                }
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// The shell command(s) a cell script issues, in source order.
@@ -298,16 +493,18 @@ pub fn script_is_continuation_only(source: &str) -> bool {
 /// callers must not read an empty vec as "the cell ran no command".
 pub fn commands_from_cell_script(source: &str) -> Vec<String> {
     let mut commands = Vec::new();
-    let mut rest = source;
-    while let Some((at, needle_len)) = next_command_bearing_call(rest) {
-        let after = &rest[at + needle_len..];
+    // One lexer over the original source so template / brace state is
+    // retained between matches. Re-slicing after a call found inside
+    // `${...}` would restart with empty template_depths and treat the
+    // template's closing backtick as an opener, swallowing later commands.
+    for (at, needle_len) in js_call_sites(source, COMMAND_BEARING_CELL_CALLS) {
+        let after = source.get(at + needle_len..).unwrap_or("");
         if let Some(object) = balanced_object_literal(after)
             && let Some(parsed) = cell_object::parse_literal_object(object)
             && let Some(command) = parsed.get("cmd").or_else(|| parsed.get("command"))
         {
             commands.push(coerce_command_to_string(command));
         }
-        rest = after;
     }
     commands
 }
@@ -317,15 +514,13 @@ pub fn commands_from_cell_script(source: &str) -> Vec<String> {
 /// started the session even when the cell's output dropped `session_id`
 /// (`text(p.output)`).
 pub fn write_stdin_session_id_from_script(source: &str) -> Option<String> {
-    let mut rest = source;
-    while let Some(at) = find_js_call(rest, "write_stdin") {
-        let after = &rest[at + "write_stdin(".len()..];
+    for (at, needle_len) in js_call_sites(source, &["write_stdin"]) {
+        let after = source.get(at + needle_len..).unwrap_or("");
         if let Some(object) = balanced_object_literal(after)
             && let Some(session_id) = object_literal_string_field(object, "session_id")
         {
             return Some(session_id);
         }
-        rest = after;
     }
     None
 }
@@ -363,10 +558,23 @@ pub fn cell_script_command(source: &str) -> Option<String> {
 /// ignores matches inside string literals, so `spawnshell(` and `"shell("`
 /// in a string are not command-bearing.
 fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
-    COMMAND_BEARING_CELL_CALLS
-        .iter()
-        .filter_map(|name| find_js_call(source, name).map(|at| (at, name.len() + 1)))
-        .min_by_key(|(at, _)| *at)
+    js_call_sites(source, COMMAND_BEARING_CELL_CALLS).into_iter().next()
+}
+
+/// Every `name(` call site in `source`, in source order, from one lexer
+/// pass so template and brace state is retained between matches.
+fn js_call_sites(source: &str, names: &[&str]) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    let mut lexer = JsLexer::new(source);
+    while let Some((at, _)) = lexer.next_code() {
+        for name in names {
+            if js_call_at(source, at, name) {
+                sites.push((at, name.len() + 1));
+                break;
+            }
+        }
+    }
+    sites
 }
 
 /// Byte offset of `name(` at an identifier boundary, skipping string
@@ -374,26 +582,10 @@ fn next_command_bearing_call(source: &str) -> Option<(usize, usize)> {
 /// matches; `spawnshell(`, a quoted `"shell("`, and a commented-out
 /// `shell(` do not.
 fn find_js_call(source: &str, name: &str) -> Option<usize> {
-    let mut chars = source.char_indices().peekable();
-    while let Some((at, ch)) = chars.next() {
-        match ch {
-            '/' => match chars.peek().map(|&(_, next)| next) {
-                Some('/') => {
-                    chars.next();
-                    skip_js_line_comment(&mut chars);
-                }
-                Some('*') => {
-                    chars.next();
-                    skip_js_block_comment(&mut chars);
-                }
-                _ if js_regex_allowed_before(source, at) => skip_js_regex_literal(&mut chars),
-                _ if js_call_at(source, at, name) => return Some(at),
-                _ => {}
-            },
-            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
-            '`' => skip_js_quoted_string(&mut chars, ch, true),
-            _ if js_call_at(source, at, name) => return Some(at),
-            _ => {}
+    let mut lexer = JsLexer::new(source);
+    while let Some((at, _)) = lexer.next_code() {
+        if js_call_at(source, at, name) {
+            return Some(at);
         }
     }
     None
@@ -415,99 +607,248 @@ fn js_ident_boundary_at(source: &str, at: usize) -> bool {
     !preceding.is_ascii_alphanumeric() && preceding != '_' && preceding != '$'
 }
 
-/// Whether a `/` at byte offset `at` begins a regular-expression literal
-/// rather than a division, judged from the previous significant token
-/// after comments, strings, and whitespace are skipped. A regex can follow
-/// the start of input, an operator or opening punctuation, or a keyword
-/// such as `return`; it cannot follow an identifier, number, string or
-/// closing bracket. When the previous token is unclear, treat the slash as
-/// division so a later command stays visible.
-fn js_regex_allowed_before(source: &str, at: usize) -> bool {
-    let Some(prefix) = source.get(..at) else {
-        return false;
-    };
-    match last_js_token(prefix) {
-        LastJsToken::Start | LastJsToken::RegexPunct => true,
-        LastJsToken::Word { start, end } => matches!(
-            prefix.get(start..end),
-            Some(
-                "return"
-                    | "typeof"
-                    | "case"
-                    | "do"
-                    | "else"
-                    | "in"
-                    | "of"
-                    | "void"
-                    | "delete"
-                    | "throw"
-                    | "new"
-                    | "yield"
-                    | "await"
-            )
-        ),
-        LastJsToken::Operand => false,
-    }
-}
-
-/// Last significant token in `prefix` after skipping comments, strings, and
-/// whitespace. Used only to tell a regex literal from division.
+/// Last significant token seen by [`JsLexer`], used only to tell a regex
+/// literal from division, and a `{` from an object literal vs a statement
+/// block.
+#[derive(Clone, Copy)]
 enum LastJsToken {
     Start,
     Word { start: usize, end: usize },
     Operand,
-    RegexPunct,
+    Punct(char),
 }
 
-fn last_js_token(prefix: &str) -> LastJsToken {
-    let mut chars = prefix.char_indices().peekable();
-    let mut last = LastJsToken::Start;
-    while let Some((at, ch)) = chars.next() {
-        match ch {
-            '/' => match chars.peek().map(|&(_, next)| next) {
-                Some('/') => {
-                    chars.next();
-                    skip_js_line_comment(&mut chars);
-                }
-                Some('*') => {
-                    chars.next();
-                    skip_js_block_comment(&mut chars);
-                }
-                _ => last = LastJsToken::RegexPunct,
-            },
-            '"' | '\'' => {
-                skip_js_quoted_string(&mut chars, ch, false);
-                last = LastJsToken::Operand;
-            }
-            '`' => {
-                skip_js_quoted_string(&mut chars, ch, true);
-                last = LastJsToken::Operand;
-            }
-            ch if ch.is_whitespace() => {}
-            ')' | ']' => last = LastJsToken::Operand,
-            ch if js_ident_part(ch) => {
-                let mut end = at + ch.len_utf8();
-                while let Some(&(next_at, next)) = chars.peek() {
-                    if js_ident_part(next) {
-                        end = next_at + next.len_utf8();
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                last = if ch.is_ascii_digit() {
-                    LastJsToken::Operand
-                } else {
-                    LastJsToken::Word { start: at, end }
-                };
-            }
-            ch if ch.is_ascii() => last = LastJsToken::RegexPunct,
-            // Non-ASCII punctuation is not a reliable regex opener; fail
-            // toward division so a later command stays visible.
-            _ => last = LastJsToken::Operand,
+/// An unmatched `{` still open in [`JsLexer`]: a template `${` substitution,
+/// an object literal, or a statement block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenFrame {
+    Template,
+    Object,
+    Block,
+}
+
+/// A single forward pass over JavaScript cell source that yields only *code*:
+/// string, template-text, comment and regex-literal bodies are skipped, while
+/// template `${…}` substitutions are scanned as code (tracking brace depth).
+/// The previous significant token is tracked as the scan advances, so a `/`
+/// is classified as a regex opener or division from state the scanner already
+/// holds rather than by re-lexing the prefix.
+///
+/// Each item is the byte offset and first character of an identifier/number
+/// token (consumed whole) or of a single punctuation character; whitespace is
+/// not reported. When the previous token is unclear a slash is treated as
+/// division, so a later command stays visible.
+struct JsLexer<'a> {
+    source: &'a str,
+    chars: Peekable<std::str::CharIndices<'a>>,
+    last: LastJsToken,
+    /// Unmatched `{` frames, innermost last. A template `${` is closed by
+    /// returning to template text; an object literal's `}` is an operand so
+    /// `/` after `{a:1}` is division; a statement block's `}` leaves
+    /// regex-allowed state so a `/` starting the next statement is a regex.
+    frames: Vec<OpenFrame>,
+}
+
+impl<'a> JsLexer<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            chars: source.char_indices().peekable(),
+            last: LastJsToken::Start,
+            frames: Vec::new(),
         }
     }
-    last
+
+    /// Whether a `/` here begins a regex literal rather than a division. A
+    /// regex can follow the start of input, an operator or opening
+    /// punctuation, or a keyword such as `return`; it cannot follow an
+    /// identifier, number, string or closing bracket.
+    fn regex_allowed(&self) -> bool {
+        match self.last {
+            LastJsToken::Start | LastJsToken::Punct(_) => true,
+            LastJsToken::Word { start, end } => matches!(
+                self.source.get(start..end),
+                Some(
+                    "return"
+                        | "typeof"
+                        | "case"
+                        | "do"
+                        | "else"
+                        | "in"
+                        | "of"
+                        | "void"
+                        | "delete"
+                        | "throw"
+                        | "new"
+                        | "yield"
+                        | "await"
+                )
+            ),
+            LastJsToken::Operand => false,
+        }
+    }
+
+    /// Whether `{` here opens an object literal (expression context such as
+    /// `=`, `(`, `[`, `,`, `:`, `?`, `!`, `&`, `|`, `.`, `return`, `typeof`,
+    /// `void`, etc.) rather than a statement block (start, `;`, `{`, `}`,
+    /// `)`, `=>`, `else`/`do`/`try`/`finally`).
+    fn opens_object_literal(&self) -> bool {
+        match self.last {
+            LastJsToken::Word { start, end } => matches!(
+                self.source.get(start..end),
+                Some(
+                    "return"
+                        | "typeof"
+                        | "void"
+                        | "delete"
+                        | "throw"
+                        | "new"
+                        | "yield"
+                        | "await"
+                        | "in"
+                        | "of"
+                        | "case"
+                )
+            ),
+            LastJsToken::Punct(ch) => matches!(
+                ch,
+                '=' | '('
+                    | '['
+                    | ','
+                    | ':'
+                    | '?'
+                    | '!'
+                    | '~'
+                    | '+'
+                    | '-'
+                    | '*'
+                    | '/'
+                    | '%'
+                    | '&'
+                    | '|'
+                    | '^'
+                    | '<'
+                    | '.'
+            ),
+            _ => false,
+        }
+    }
+
+    /// Skip template-literal text up to the closing backtick, or up to and
+    /// including a `${` that opens a code substitution.
+    fn skip_template_text(&mut self) {
+        let mut escaped = false;
+        while let Some((_, ch)) = self.chars.next() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '`' => {
+                    self.last = LastJsToken::Operand;
+                    return;
+                }
+                '$' if self.chars.peek().map(|&(_, next)| next) == Some('{') => {
+                    self.chars.next();
+                    self.frames.push(OpenFrame::Template);
+                    self.last = LastJsToken::Punct('{');
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn next_code(&mut self) -> Option<(usize, char)> {
+        while let Some((at, ch)) = self.chars.next() {
+            match ch {
+                '/' => match self.chars.peek().map(|&(_, next)| next) {
+                    Some('/') => {
+                        self.chars.next();
+                        skip_js_line_comment(&mut self.chars);
+                    }
+                    Some('*') => {
+                        self.chars.next();
+                        skip_js_block_comment(&mut self.chars);
+                    }
+                    _ if self.regex_allowed() => {
+                        skip_js_regex_literal(&mut self.chars);
+                        self.last = LastJsToken::Operand;
+                    }
+                    _ => {
+                        self.last = LastJsToken::Punct('/');
+                        return Some((at, ch));
+                    }
+                },
+                '"' | '\'' => {
+                    skip_js_quoted_string(&mut self.chars, ch, false);
+                    self.last = LastJsToken::Operand;
+                }
+                '`' => self.skip_template_text(),
+                ch if ch.is_whitespace() => {}
+                '{' => {
+                    self.frames.push(if self.opens_object_literal() {
+                        OpenFrame::Object
+                    } else {
+                        OpenFrame::Block
+                    });
+                    self.last = LastJsToken::Punct('{');
+                    return Some((at, ch));
+                }
+                '}' => {
+                    match self.frames.pop() {
+                        Some(OpenFrame::Template) => self.skip_template_text(),
+                        kind => {
+                            // An object literal's `}` is an operand, so `/`
+                            // after `{a:1}` is division. A statement block's
+                            // `}` is regex-allowed, so a `/` starting the next
+                            // statement is a regex (and its body is skipped)
+                            // rather than code that can open a comment or
+                            // template.
+                            self.last = if kind == Some(OpenFrame::Object) {
+                                LastJsToken::Operand
+                            } else {
+                                LastJsToken::Punct('}')
+                            };
+                            return Some((at, ch));
+                        }
+                    }
+                }
+                ')' | ']' => {
+                    self.last = LastJsToken::Operand;
+                    return Some((at, ch));
+                }
+                ch if js_ident_part(ch) => {
+                    let mut end = at + ch.len_utf8();
+                    while let Some(&(next_at, next)) = self.chars.peek() {
+                        if !js_ident_part(next) {
+                            break;
+                        }
+                        end = next_at + next.len_utf8();
+                        self.chars.next();
+                    }
+                    self.last = if ch.is_ascii_digit() {
+                        LastJsToken::Operand
+                    } else {
+                        LastJsToken::Word { start: at, end }
+                    };
+                    return Some((at, ch));
+                }
+                ch if ch.is_ascii() => {
+                    self.last = LastJsToken::Punct(ch);
+                    return Some((at, ch));
+                }
+                // Non-ASCII punctuation is not a reliable regex opener; fail
+                // toward division so a later command stays visible.
+                _ => {
+                    self.last = LastJsToken::Operand;
+                    return Some((at, ch));
+                }
+            }
+        }
+        None
+    }
 }
 
 fn js_ident_part(ch: char) -> bool {
@@ -597,26 +938,12 @@ fn balanced_object_literal(source: &str) -> Option<&str> {
         return None;
     }
     let mut depth = 0usize;
-    let mut chars = trimmed.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
+    let mut lexer = JsLexer::new(trimmed);
+    while let Some((index, ch)) = lexer.next_code() {
         match ch {
-            '/' => match chars.peek().map(|&(_, next)| next) {
-                Some('/') => {
-                    chars.next();
-                    skip_js_line_comment(&mut chars);
-                }
-                Some('*') => {
-                    chars.next();
-                    skip_js_block_comment(&mut chars);
-                }
-                _ if js_regex_allowed_before(trimmed, index) => skip_js_regex_literal(&mut chars),
-                _ => {}
-            },
-            '"' | '\'' => skip_js_quoted_string(&mut chars, ch, false),
-            '`' => skip_js_quoted_string(&mut chars, ch, true),
             '{' => depth += 1,
             '}' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let end = offset + index + ch.len_utf8();
                     return Some(&source[offset..end]);
@@ -1040,6 +1367,29 @@ mod tests {
     }
 
     #[test]
+    fn division_after_a_regex_with_a_comment_lookalike_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\nconst r = s.replace(/\\/*/g, \"\");\n",
+            r#"const half = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn division_after_a_regex_with_escaped_slashes_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const u = url.replace(/\/\//g, "/"); const n = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
     fn division_after_a_block_comment_does_not_hide_a_later_exec_command() {
         let source = concat!(
             r#"await tools.write_stdin({session_id:8467,chars:""});"#,
@@ -1068,6 +1418,136 @@ mod tests {
         );
         assert!(script_issues_command(pi));
         assert_eq!(cell_script_command(pi).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_command_inside_a_template_does_not_drop_a_later_command() {
+        let source = concat!(
+            r#"text(`${await tools.exec_command({cmd:"echo hi"})}`);"#,
+            r#" await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert_eq!(commands_from_cell_script(source), vec!["echo hi", "sleep 999"]);
+        assert_eq!(cell_script_command(source).as_deref(), Some("echo hi\nsleep 999"));
+    }
+
+    #[test]
+    fn nested_object_in_a_template_substitution_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " text(`${ {a:1} }`); ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn division_after_a_closing_brace_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = {a:1} / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_regex_after_a_block_with_a_comment_lookalike_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" if (x) {} /\/*/.test(s); "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_regex_after_a_block_with_a_backtick_does_not_hide_a_later_exec_command() {
+        let source = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " for (const n of xs) { n++; }\n",
+            "/`/.test(out) && text(\"x\"); ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        );
+        assert!(script_issues_command(source));
+        assert!(!script_is_continuation_only(source));
+        assert_eq!(cell_script_command(source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn a_non_shell_tools_cell_without_a_builtin_is_compute_only() {
+        let source = r#"await tools.view_image({path:"/tmp/image.png"});"#;
+        assert!(script_is_compute_only(source));
+        assert!(!script_issues_command(source));
+        assert_eq!(cell_script_command(source), None);
+        assert!(!script_is_compute_only("echo hi"));
+        assert!(!script_is_compute_only(
+            r#"await tools.exec_command({cmd:"sleep 999"});"#
+        ));
+    }
+
+    #[test]
+    fn a_tools_alias_is_treated_as_command_capable() {
+        assert!(!script_is_compute_only("const t = tools; text(t);"));
+        assert!(!script_is_compute_only(
+            r#"text(await tools["view_image"]({path:"x"}));"#
+        ));
+        assert!(!script_is_compute_only(r#"text(await tools.unknown_helper({}));"#));
+        assert!(script_is_compute_only(r#"text(load("r").output);"#));
+        assert!(script_is_compute_only(
+            r#"await tools.apply_patch("*** Begin Patch\n*** End Patch");"#
+        ));
+    }
+
+    #[test]
+    fn helper_free_javascript_cells_are_compute_only() {
+        assert!(script_is_compute_only("await new Promise(r => setTimeout(r, 5000));"));
+        assert!(script_is_compute_only("const values = [1, 2, 3].map(n => n * 2);"));
+        assert!(!script_is_compute_only("echo hi"));
+        assert!(!script_is_compute_only("sleep 5; echo done"));
+        assert!(!script_is_compute_only("echo await; sleep 999"));
+        assert!(!script_is_compute_only("grep -rn await src"));
+        assert!(!script_is_compute_only("let n=1; sleep 999"));
+        let poll = r#"const p = await tools.write_stdin({session_id:8467,chars:""});"#;
+        assert!(!script_is_compute_only(poll));
+        assert!(script_is_continuation_only(poll));
+    }
+
+    #[test]
+    fn object_literal_in_array_or_expression_before_division_keeps_later_command_visible() {
+        let array_source = r#"const values = [{} / 2]; await tools.exec_command({cmd:"sleep 999"});"#;
+        assert!(script_issues_command(array_source));
+        assert!(!script_is_compute_only(array_source));
+        assert_eq!(cell_script_command(array_source).as_deref(), Some("sleep 999"));
+
+        let ternary_source = r#"const v = ok ? {a:1} / 2 : 0; await tools.exec_command({cmd:"sleep 999"});"#;
+        assert!(script_issues_command(ternary_source));
+        assert_eq!(cell_script_command(ternary_source).as_deref(), Some("sleep 999"));
+    }
+
+    #[test]
+    fn write_stdin_with_computed_or_aliased_tools_access_is_not_a_continuation() {
+        let computed = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" await tools["exec_command"]({cmd:"sleep 999"});"#,
+        );
+        assert!(!script_is_continuation_only(computed));
+        let alias = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const t = tools; await t[n]();",
+        );
+        assert!(!script_is_continuation_only(alias));
+        let unknown = concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" await tools.unknown_helper({});"#,
+        );
+        assert!(!script_is_continuation_only(unknown));
     }
 
     #[test]

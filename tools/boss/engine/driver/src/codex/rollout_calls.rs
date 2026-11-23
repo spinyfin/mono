@@ -44,9 +44,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use boss_engine_codex_rollout::cell::{
-    CellOutcome, CellOutput, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk,
-    payload_is_truncated_output, payload_reports_exit_code, payload_session_id, value_is_running_chunk,
-    value_reports_exit_code, wait_target_cell_id, write_stdin_session_id,
+    CellOutcome, CellOutput, is_cell_wait_tool, is_write_stdin_tool, parse_cell_output, payload_is_running_chunk,
+    payload_is_truncated_output, payload_reports_exit_code, payload_session_id, script_is_continuation_only,
+    value_is_running_chunk, value_reports_exit_code, wait_target_cell_id, write_stdin_session_id,
 };
 use boss_engine_codex_rollout::{CanonicalRolloutToolOutput, canonical_rollout_tool_output, flatten_tool_output_text};
 use serde_json::Value;
@@ -101,6 +101,20 @@ pub(super) struct RolloutToolCall {
     /// eligibility for calls that never asserted otherwise.
     #[serde(default = "default_issues_command")]
     pub(super) issues_command: bool,
+    /// When [`RolloutCallTracker::observe_output`] leaves a write_stdin poll
+    /// open, the session id observed on the chunk (or [`OpenPoll::Unresolved`]
+    /// when the poll used a dynamic session expression and the chunk named
+    /// none). Drain reads this instead of re-parsing `tool_input`, which
+    /// cannot recover a `load()`/`store()` session id.
+    #[serde(default)]
+    pub(super) open_poll: Option<OpenPoll>,
+}
+
+/// A write_stdin poll that stayed open at a turn boundary.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) enum OpenPoll {
+    Session(String),
+    Unresolved,
 }
 
 fn default_issues_command() -> bool {
@@ -117,6 +131,38 @@ pub(super) fn rollout_call_command_display(call: &RolloutToolCall) -> String {
         Some(command) => command.to_owned(),
         None => format!("{} {}", call.tool_name, call.tool_input),
     }
+}
+
+/// The unobserved-command display for a call still open at a turn boundary,
+/// or `None` when the call should not be flagged.
+///
+/// A call that issued a shell command is flagged by its command. A `write_stdin`
+/// poll that never resolved to a tracked origin (the session was started in an
+/// earlier turn, so the tracker had no binding) and is still open is itself the
+/// only observation of that command, so it is flagged too — by the session it
+/// polled when one is known, otherwise as an unresolved poll. The suffix is
+/// "no terminal result observed" because the tracker cannot tell a still-running
+/// chunk from an unconfirmed projection. Compute-only cells and non-shell
+/// tools carry neither and are dropped.
+pub(super) fn abandoned_call_display(call: &RolloutToolCall) -> Option<String> {
+    if call.issues_command {
+        return call
+            .tool_input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|_| rollout_call_command_display(call));
+    }
+    const NO_TERMINAL: &str = "no terminal result observed";
+    let session_id = match &call.open_poll {
+        Some(OpenPoll::Session(id)) => Some(id.as_str()),
+        _ => None,
+    }
+    .map(str::to_owned)
+    .or_else(|| write_stdin_session_id(&call.tool_input));
+    if let Some(session_id) = session_id {
+        return Some(format!("write_stdin session {session_id} ({NO_TERMINAL})"));
+    }
+    matches!(call.open_poll, Some(OpenPoll::Unresolved)).then(|| format!("write_stdin poll ({NO_TERMINAL})"))
 }
 
 /// What a consumer should do with a tool-call record.
@@ -251,6 +297,10 @@ impl<V> BoundedMap<V> {
 
     fn get(&self, key: &str) -> Option<&V> {
         self.entries.get(key)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.entries.get_mut(key)
     }
 
     fn is_empty(&self) -> bool {
@@ -457,7 +507,11 @@ impl RolloutCallTracker {
                 outcome: CellOutcome::Yielded { cell_id },
                 ..
             }) => {
-                self.cells.insert(cell_id.clone(), origin);
+                self.cells.insert(cell_id.clone(), origin.clone());
+                self.remember_open_poll(&origin, call_id, session_id.as_deref().or(call_session_id.as_deref()));
+                if origin != call_id {
+                    self.calls.remove(call_id);
+                }
                 return Ok(OutputDisposition::StillRunning { cell_id: Some(cell_id) });
             }
             // The cell finished but the command did not. Re-arm the cell
@@ -476,6 +530,11 @@ impl RolloutCallTracker {
                 if let Some(cell_id) = cell_id.clone() {
                     self.cells.insert(cell_id, origin.clone());
                 }
+                self.remember_open_poll(
+                    &origin,
+                    call_id,
+                    payload_session_id(&payload).as_deref().or(call_session_id.as_deref()),
+                );
                 if origin != call_id {
                     self.calls.remove(call_id);
                 }
@@ -497,6 +556,7 @@ impl RolloutCallTracker {
                     .get(&origin)
                     .expect("origin call presence was just checked")
                     .clone();
+                self.remember_open_poll(&origin, call_id, session_id.as_deref().or(call_session_id.as_deref()));
                 if origin != call_id {
                     self.calls.remove(call_id);
                 }
@@ -507,16 +567,40 @@ impl RolloutCallTracker {
                 // session id even when this output is not a cell envelope.
                 // Completing that origin requires positive terminal evidence;
                 // a bare running chunk, unified-exec "still running" prose,
-                // or a poll error must leave it open.
-                if origin != call_id {
+                // or a poll error must leave it open. The same check applies
+                // when a non-command write_stdin poll resolves to itself
+                // (sessions were drained at an earlier turn boundary):
+                // "Process running" is not a terminal result.
+                let self_resolved_write_stdin = origin == call_id
+                    && self
+                        .calls
+                        .get(call_id)
+                        .is_some_and(|call| !call.issues_command && is_write_stdin_poll(call));
+                if origin != call_id || self_resolved_write_stdin {
                     match command_output_kind(output) {
                         CommandOutputKind::Terminal => {}
                         CommandOutputKind::Running => {
-                            self.calls.remove(call_id);
+                            if origin != call_id {
+                                self.calls.remove(call_id);
+                            } else {
+                                self.remember_open_poll(
+                                    &origin,
+                                    call_id,
+                                    session_id.as_deref().or(call_session_id.as_deref()),
+                                );
+                            }
                             return Ok(OutputDisposition::StillRunning { cell_id: None });
                         }
                         CommandOutputKind::Unconfirmed => {
-                            self.calls.remove(call_id);
+                            if origin != call_id {
+                                self.calls.remove(call_id);
+                            } else {
+                                self.remember_open_poll(
+                                    &origin,
+                                    call_id,
+                                    session_id.as_deref().or(call_session_id.as_deref()),
+                                );
+                            }
                             let call = self
                                 .calls
                                 .get(&origin)
@@ -540,6 +624,29 @@ impl RolloutCallTracker {
             self.calls.remove(call_id);
         }
         Ok(OutputDisposition::Completed(call))
+    }
+
+    /// Persist the observed session (or an unresolved-poll marker) on a
+    /// self-resolved write_stdin continuation left open, and bind the session
+    /// to that open poll so a subsequent poll of the same session closes it.
+    fn remember_open_poll(&mut self, origin: &str, call_id: &str, session_id: Option<&str>) {
+        if origin != call_id {
+            return;
+        }
+        let Some(call) = self.calls.get_mut(origin) else {
+            return;
+        };
+        if call.issues_command || !is_write_stdin_poll(call) {
+            return;
+        }
+        let open_poll = match session_id {
+            Some(id) if !id.is_empty() => {
+                self.sessions.insert(id.to_owned(), origin.to_owned());
+                OpenPoll::Session(id.to_owned())
+            }
+            _ => OpenPoll::Unresolved,
+        };
+        call.open_poll = Some(open_poll);
     }
 
     /// Whether any call is still open.
@@ -624,6 +731,16 @@ fn command_output_kind(output: &Value) -> CommandOutputKind {
     CommandOutputKind::Unconfirmed
 }
 
+fn is_write_stdin_poll(call: &RolloutToolCall) -> bool {
+    is_write_stdin_tool(&call.tool_name)
+        || write_stdin_session_id(&call.tool_input).is_some()
+        || call
+            .tool_input
+            .get("script")
+            .and_then(Value::as_str)
+            .is_some_and(script_is_continuation_only)
+}
+
 fn unified_exec_header(text: &str) -> &str {
     text.split_once("\nOutput:").map(|(header, _)| header).unwrap_or(text)
 }
@@ -666,6 +783,7 @@ mod tests {
             tool_name: "Bash".to_owned(),
             tool_input: json!({"command": command}),
             issues_command: true,
+            open_poll: None,
         }
     }
 
@@ -674,6 +792,7 @@ mod tests {
             tool_name: "wait".to_owned(),
             tool_input: json!({"cell_id": cell_id, "yield_time_ms": 30000}),
             issues_command: true,
+            open_poll: None,
         }
     }
 
@@ -696,6 +815,7 @@ mod tests {
             tool_name: canonical.tool_name,
             tool_input: canonical.tool_input,
             issues_command: canonical.issues_command,
+            open_poll: None,
         }
     }
 
@@ -714,6 +834,7 @@ mod tests {
             tool_name: canonical.tool_name,
             tool_input: canonical.tool_input,
             issues_command: canonical.issues_command,
+            open_poll: None,
         }
     }
 
@@ -1041,6 +1162,7 @@ mod tests {
                     tool_name: "wait".to_owned(),
                     tool_input: json!({"yield_time_ms": 30000}),
                     issues_command: true,
+                    open_poll: None,
                 },
             )
             .expect_err("must not resolve");
@@ -1422,5 +1544,246 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["echo hi"]
         );
+    }
+
+    #[test]
+    fn a_compute_only_cell_is_never_flagged_abandoned() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call("c", cell_exec("c", r#"text(load("r").output);"#))
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("c", &completed("plain text")),
+            Ok(OutputDisposition::UnconfirmedResult(_))
+        ));
+        let flagged: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert!(flagged.is_empty(), "{flagged:?}");
+    }
+
+    #[test]
+    fn a_cross_turn_poll_that_finds_the_command_still_running_is_flagged() {
+        let mut tracker = RolloutCallTracker::default();
+        // Turn 1: the wrapper is still running when the turn ends.
+        tracker
+            .observe_call(
+                "wrap",
+                cell_exec("wrap", r#"text(await tools.exec_command({cmd:"slow build"}));"#),
+            )
+            .unwrap();
+        tracker.observe_output("wrap", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let first: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(first, ["slow build"]);
+        // Turn 2: a re-poll of that session has no tracked origin and is
+        // still running at the boundary.
+        tracker
+            .observe_call(
+                "poll",
+                cell_exec(
+                    "poll",
+                    r#"text(JSON.stringify(await tools.write_stdin({session_id:8467,chars:""})));"#,
+                ),
+            )
+            .unwrap();
+        tracker.observe_output("poll", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let second: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(second, ["write_stdin session 8467 (no terminal result observed)"]);
+    }
+
+    #[test]
+    fn a_yielded_polling_cell_is_dropped_once_the_origin_completes() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call(
+                "A",
+                cell_exec("A", r#"text(await tools.exec_command({cmd:"slow build"}));"#),
+            )
+            .unwrap();
+        tracker.observe_output("A", &completed(P6_RUNNING_CHUNK)).unwrap();
+        tracker
+            .observe_call(
+                "B",
+                cell_exec("B", r#"text(await tools.write_stdin({session_id:8467,chars:""}));"#),
+            )
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("B", &yield_placeholder(2)),
+            Ok(OutputDisposition::StillRunning { cell_id: Some(ref id) }) if id == "2"
+        ));
+        tracker.observe_call("W", wait("2")).unwrap();
+        assert!(matches!(
+            tracker.observe_output(
+                "W",
+                &completed(r#"{"chunk_id":"done","session_id":8467,"exit_code":0,"output":"done\n"}"#)
+            ),
+            Ok(OutputDisposition::Completed(_))
+        ));
+        let flagged: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert!(flagged.is_empty(), "{flagged:?}");
+    }
+
+    #[test]
+    fn a_cross_turn_dynamic_session_poll_that_is_still_running_is_flagged() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call(
+                "wrap",
+                cell_exec("wrap", r#"text(await tools.exec_command({cmd:"slow build"}));"#),
+            )
+            .unwrap();
+        tracker.observe_output("wrap", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let first: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(first, ["slow build"]);
+
+        tracker
+            .observe_call(
+                "poll",
+                cell_exec(
+                    "poll",
+                    r#"text(await tools.write_stdin({session_id: load("run").session_id, chars:""}));"#,
+                ),
+            )
+            .unwrap();
+        tracker.observe_output("poll", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let second: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(second, ["write_stdin session 8467 (no terminal result observed)"]);
+    }
+
+    #[test]
+    fn a_cross_turn_dynamic_session_poll_that_yields_is_flagged_unresolved() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call(
+                "wrap",
+                cell_exec("wrap", r#"text(await tools.exec_command({cmd:"slow build"}));"#),
+            )
+            .unwrap();
+        tracker.observe_output("wrap", &completed(P6_RUNNING_CHUNK)).unwrap();
+        let first: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(first, ["slow build"]);
+
+        tracker
+            .observe_call(
+                "poll",
+                cell_exec(
+                    "poll",
+                    r#"text(await tools.write_stdin({session_id: load("run").session_id, chars:""}));"#,
+                ),
+            )
+            .unwrap();
+        tracker.observe_output("poll", &yield_placeholder(3)).unwrap();
+        let flagged: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(flagged, ["write_stdin poll (no terminal result observed)"]);
+    }
+
+    #[test]
+    fn a_self_resolved_direct_write_stdin_running_poll_stays_open() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("poll", write_stdin_call("poll", 8467)).unwrap();
+        assert!(matches!(
+            tracker.observe_output("poll", &json!("Process running with session ID 8467")),
+            Ok(OutputDisposition::StillRunning { .. })
+        ));
+        let flagged: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(flagged, ["write_stdin session 8467 (no terminal result observed)"]);
+    }
+
+    #[test]
+    fn an_unconfirmed_projected_poll_uses_the_neutral_no_terminal_label() {
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call(
+                "poll",
+                cell_exec("poll", r#"text(await tools.write_stdin({session_id:8467,chars:""}));"#),
+            )
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("poll", &completed("partial output\n")),
+            Ok(OutputDisposition::UnconfirmedResult(_))
+        ));
+        let flagged: Vec<_> = tracker
+            .drain_open_calls()
+            .iter()
+            .filter_map(abandoned_call_display)
+            .collect();
+        assert_eq!(flagged, ["write_stdin session 8467 (no terminal result observed)"]);
+    }
+
+    #[test]
+    fn a_later_write_stdin_terminal_poll_closes_a_self_resolved_running_poll() {
+        let mut tracker = RolloutCallTracker::default();
+        let exec_payload = json!({
+            "name": "exec_command",
+            "call_id": "exec",
+            "arguments": r#"{"cmd":"sleep 2"}"#
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let exec_canonical = boss_engine_codex_rollout::canonical_rollout_tool_call("function_call", &exec_payload)
+            .expect("canonicalises");
+        let exec_call = RolloutToolCall {
+            tool_name: exec_canonical.tool_name,
+            tool_input: exec_canonical.tool_input,
+            issues_command: exec_canonical.issues_command,
+            open_poll: None,
+        };
+        tracker.observe_call("exec", exec_call).unwrap();
+        assert!(matches!(
+            tracker.observe_output("exec", &json!("Process running with session ID 8467")),
+            Ok(OutputDisposition::Completed(_))
+        ));
+
+        tracker
+            .observe_call("poll-1", write_stdin_call("poll-1", 8467))
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("poll-1", &json!("Process running with session ID 8467")),
+            Ok(OutputDisposition::StillRunning { .. })
+        ));
+
+        tracker
+            .observe_call("poll-2", write_stdin_call("poll-2", 8467))
+            .unwrap();
+        assert!(matches!(
+            tracker.observe_output("poll-2", &json!("Process exited with code 0\nOutput:\n")),
+            Ok(OutputDisposition::Completed(_))
+        ));
+        assert!(tracker.drain_open_calls().is_empty());
     }
 }

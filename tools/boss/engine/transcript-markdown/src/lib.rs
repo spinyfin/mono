@@ -854,7 +854,14 @@ fn event_to_segment(event: &TranscriptEvent, opts: &RenderOpts) -> Option<Transc
 fn render_tool_use(name: &str, input: &Value) -> String {
     match name {
         "Bash" => {
-            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            // A Codex cell that starts no command (a `write_stdin` poll or a
+            // compute-only cell) carries `script` (and maybe `session_id`)
+            // instead of `command`; show the script rather than an empty fence.
+            let command = input
+                .get("command")
+                .or_else(|| input.get("script"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             format!("```sh\n{command}\n```")
         }
         "Edit" => {
@@ -2030,6 +2037,20 @@ mod tests {
             "got: {text}"
         );
         assert!(text.contains("q7-tail-done"), "got: {text}");
+    }
+
+    #[test]
+    fn a_write_stdin_poll_cell_renders_its_script_not_an_empty_fence() {
+        let script = r#"text(await tools.write_stdin({session_id:8467,chars:""}));"#;
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "poll", "input": script}
+        })
+        .to_string();
+        let events = parse_transcript(&line);
+        let markdown = segments_to_markdown(&events_to_segments(&events, &RenderOpts::default()));
+        assert!(markdown.contains("session_id:8467"), "got: {markdown}");
+        assert!(!markdown.contains("```sh\n\n```"), "got: {markdown}");
     }
 
     #[test]

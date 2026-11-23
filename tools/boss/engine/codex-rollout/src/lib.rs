@@ -92,7 +92,7 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
 
     let issues_command = match provider_name {
         "exec" | "exec_command" => exec_input_issues_command(&parsed_input),
-        "write_stdin" => false,
+        name if cell::is_write_stdin_tool(name) => false,
         _ => true,
     };
     let (tool_name, tool_input) = match provider_name {
@@ -131,7 +131,7 @@ fn exec_input_issues_command(parsed_input: &Value) -> bool {
         return true;
     }
     match parsed_input.as_str() {
-        Some(source) => !cell::script_is_continuation_only(source),
+        Some(source) => !is_non_command_cell(source),
         // An unrecognised non-string shape (an argv array with no
         // `cmd`/`command` key, say) defaults to `true`: treating it as a
         // pure continuation would let `observe_output` silently subsume
@@ -169,13 +169,21 @@ fn exec_command(parsed_input: &Value) -> Option<String> {
             if let Some(command) = cell::cell_script_command(source) {
                 return Some(command);
             }
-            if cell::script_is_continuation_only(source) {
+            if is_non_command_cell(source) {
                 return None;
             }
             Some(source.to_owned())
         }
         None => Some(coerce_command_to_string(parsed_input)),
     }
+}
+
+/// Whether a cell script is positively identified as starting no command: a
+/// `write_stdin` poll of an existing session, or a compute-only cell that
+/// uses cell builtins, known non-shell `tools.*` helpers, or unambiguous
+/// JavaScript cell syntax with no command-bearing tool.
+fn is_non_command_cell(source: &str) -> bool {
+    cell::script_is_continuation_only(source) || cell::script_is_compute_only(source)
 }
 
 /// Canonical input for a cell that did not start a command: never a
@@ -415,6 +423,124 @@ mod tests {
             .unwrap()
             .clone();
         canonical_rollout_tool_call("custom_tool_call", &payload).expect("call")
+    }
+
+    fn assert_recovers_sleep_999(source: &str) {
+        let call = canonical_exec_script(source);
+        assert!(call.issues_command, "script: {source}");
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999"),
+            "script: {source}"
+        );
+    }
+
+    #[test]
+    fn a_regex_with_comment_lookalike_does_not_hide_a_later_exec_command() {
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\nconst r = s.replace(/\\/*/g, \"\");\n",
+            r#"const half = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" const u = url.replace(/\/\//g, "/"); const n = total / 2; await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+    }
+
+    #[test]
+    fn a_template_substitution_is_scanned_as_code() {
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            "\ntext(`${JSON.stringify(await tools.exec_command({cmd:\"sleep 999\"}))}`);",
+        ));
+    }
+
+    #[test]
+    fn a_compute_only_cell_claims_no_command() {
+        for source in [
+            r#"text(load("r").output);"#,
+            r#"store("k", 1); notify("hi");"#,
+            "const v = `a ${1 + 1} b`;\ntext(v);",
+            r#"await tools.view_image({path:"/tmp/image.png"});"#,
+            r#"await tools.apply_patch("*** Begin Patch\n*** End Patch");"#,
+            "await new Promise(r => setTimeout(r, 5000));",
+            "const values = [1, 2, 3].map(n => n * 2);",
+        ] {
+            let call = canonical_exec_script(source);
+            assert!(!call.issues_command, "script: {source}");
+            assert_eq!(call.tool_input.get("command"), None, "script: {source}");
+        }
+        // A computed `tools[...]` access, an alias, or an unknown member
+        // could reach a shell: stay conservative.
+        assert!(canonical_exec_script(r#"text(await tools["exec_command"]({cmd:"sleep 999"}));"#).issues_command);
+        assert!(canonical_exec_script("const t = tools; text(t);").issues_command);
+        assert!(canonical_exec_script(r#"text(await tools.unknown_helper({}));"#).issues_command);
+        assert!(canonical_exec_script("echo hi").issues_command);
+        assert!(canonical_exec_script("sleep 5; echo done").issues_command);
+    }
+
+    #[test]
+    fn write_stdin_mixed_with_computed_or_aliased_tools_access_issues_a_command() {
+        assert!(
+            canonical_exec_script(concat!(
+                r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+                r#" await tools["exec_command"]({cmd:"sleep 999"});"#,
+            ))
+            .issues_command
+        );
+        assert!(
+            canonical_exec_script(concat!(
+                r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+                " const t = tools; await t[n]();",
+            ))
+            .issues_command
+        );
+        assert!(
+            canonical_exec_script(concat!(
+                r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+                r#" await tools.unknown_helper({});"#,
+            ))
+            .issues_command
+        );
+    }
+
+    #[test]
+    fn a_command_inside_a_template_does_not_drop_a_later_command() {
+        let call = canonical_exec_script(concat!(
+            r#"text(`${await tools.exec_command({cmd:"echo hi"})}`);"#,
+            r#" await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("echo hi\nsleep 999")
+        );
+    }
+
+    #[test]
+    fn nested_object_in_a_template_and_division_after_a_brace_still_recover_sleep_999() {
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " text(`${ {a:1} }`); ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " const n = {a:1} / 2; ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            r#" if (x) {} /\/*/.test(s); "#,
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
+        assert_recovers_sleep_999(concat!(
+            r#"await tools.write_stdin({session_id:8467,chars:""});"#,
+            " for (const n of xs) { n++; }\n",
+            "/`/.test(out) && text(\"x\"); ",
+            r#"await tools.exec_command({cmd:"sleep 999"});"#,
+        ));
     }
 
     #[test]
@@ -746,5 +872,40 @@ mod tests {
         let out = canonical_rollout_tool_output(&json!([{"type": "output_text", "text": raw}]));
         assert_eq!(out.body, raw);
         assert!(!out.is_error);
+    }
+
+    #[test]
+    fn shell_strings_with_await_or_bash_let_keep_command_and_issues_command() {
+        for command in ["echo await; sleep 999", "let n=1; sleep 999"] {
+            let payload = json!({
+                "name": "exec",
+                "call_id": "c-shell",
+                "input": command,
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+            assert!(call.issues_command, "{command}");
+            assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some(command));
+        }
+    }
+
+    #[test]
+    fn array_object_literal_before_division_recovers_exec_command() {
+        let payload = json!({
+            "name": "exec",
+            "call_id": "c-obj-div",
+            "input": r#"const values = [{} / 2]; await tools.exec_command({cmd:"sleep 999"});"#,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+        assert!(call.issues_command);
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("sleep 999")
+        );
     }
 }
