@@ -10,6 +10,7 @@ The engine probes this installed command with harmless sentinels and checks
 content binding. Native SessionStart is not a pre-prompt readiness signal.
 """
 import codecs
+import fnmatch
 import glob
 import hashlib
 import json
@@ -312,6 +313,7 @@ def authorized(policy, overwrite=None):
 
 # REVIEWER_BLOCKED_FRAGMENT
 # COMMAND_TOKENIZER_FRAGMENT
+# NESTED_SHELL_BODIES_FRAGMENT
 
 
 # Variables whose value bash later executes or evaluates (command hash tables,
@@ -504,34 +506,10 @@ def reject_dynamic_bindings(group):
 
 def nested_shell_bodies(group):
     reject_dynamic_bindings(group)
-    normalized = without_redirections(group)
-    for index, token in enumerate(normalized):
-        if os.path.basename(token) == "env" and any(
-                option.startswith("--split-string") or
-                (option.startswith("-") and not option.startswith("--") and "S" in option)
-                for option in normalized[index + 1:]):
-            fail_closed("env split-string execution cannot be inspected")
-    rest = strip_prefixes(group)
-    if rest and os.path.basename(rest[0]) in ("jobs", "shopt"):
-        fail_closed("shell execution and option builtins cannot be inspected")
-    if rest and any(c in rest[0] for c in "<>"):
-        fail_closed("unsupported redirection attached to an executable")
-    base = os.path.basename(rest[0]) if rest else ""
-    if base in {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "case", "esac", "{", "}", "!", "eval", "source", ".", "trap", "alias", "compgen", "coproc", "mapfile", "readarray"}:
-        fail_closed("unsupported shell control or dynamic execution")
-    if rest and os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
-        for index, arg in enumerate(rest[1:], 1):
-            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
-                return [rest[index + 1]]
-        fail_closed("shell stdin or script execution cannot be inspected")
-    if base == "find":
-        bodies = []
-        for index, arg in enumerate(rest):
-            if arg in ("-exec", "-execdir", "-ok", "-okdir"):
-                end = next((i for i in range(index + 1, len(rest)) if rest[i] in (";", "+")), len(rest))
-                bodies.append(shlex.join(rest[index + 1:end]))
-        return bodies
-    return []
+    bodies, reason = shell_nested_bodies(group)
+    if reason:
+        fail_closed(reason)
+    return bodies
 
 
 PYTHON_PROGRAM_RE = re.compile(r"(?:python|pypy|ipython)[0-9.]*[a-z]*")
@@ -806,6 +784,44 @@ def python_literal_leaves_scratch(content, policy, cwd):
     return False
 
 
+SCRATCH_WALK_LIMIT = 20000
+
+
+def scratch_tree_has_escape(policy):
+    # A string-by-string realpath cannot see a path the body builds at run time
+    # (adjacent literals, os.path.join, `+`, pathlib, a chdir then a relative
+    # name). What a body can reach inside scratch is bounded by what scratch
+    # holds, so walk it: any entry that is a link resolving outside the
+    # allowance, or a tree too large to walk, means the allowance cannot be
+    # granted to a body that names scratch.
+    base = conversation_scratch_dir(policy)
+    if base is None:
+        return False
+    roots = (
+        os.path.join(base, "scratch"),
+        os.path.join(base, ".system_generated", "steps"),
+        os.path.join(base, ".system_generated", "tasks"),
+    )
+    seen = 0
+    for top in roots:
+        if not os.path.lexists(top):
+            continue
+        try:
+            if not within_conversation_scratch(os.path.realpath(top), policy):
+                return True
+            for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+                for name in dirnames + filenames:
+                    seen += 1
+                    if seen > SCRATCH_WALK_LIMIT:
+                        return True
+                    entry = os.path.join(dirpath, name)
+                    if os.path.islink(entry) and not within_conversation_scratch(os.path.realpath(entry), policy):
+                        return True
+        except Exception:
+            return True
+    return False
+
+
 def python_body_touches_protected(body, policy, cwd=None):
     # Literal scan only: the body is Python, so `$()` is not shell. Mask this
     # run's allowed scratch/steps/tasks spellings first so a body that opens
@@ -842,6 +858,12 @@ def python_body_touches_protected(body, policy, cwd=None):
     if any(python_literal_leaves_scratch(content, policy, cwd) for content in contents):
         return True
     decoded = [python_unescape_string(content) for content in contents]
+    names_scratch = python_cwd_needs_traversal_scan(cwd, policy) or any(
+        spelling and (spelling in blob)
+        for spelling in spellings
+        for blob in [body, "".join(contents), "".join(decoded)])
+    if names_scratch and scratch_tree_has_escape(policy):
+        return True
     haystacks = [text]
     haystacks.extend(mask_scratch(blob) for blob in decoded)
     if decoded:
@@ -887,10 +909,6 @@ def mask_heredoc_bodies(command, expanding):
             if masked[index] != "\n":
                 masked[index] = " "
     return ''.join(masked), expanded
-
-
-def mask_literal_heredoc_bodies(command):
-    return mask_heredoc_bodies(command, False)[0]
 
 
 def expanding_body_substitutes(body):
@@ -1212,28 +1230,6 @@ def glob_prefix_spellings(static):
     return prefixes
 
 
-def glob_bracket_entry_candidates(expanded):
-    # When a path component has a bracket expression, Python's glob is not a
-    # model of bash. Conservatively every name in that component's parent is a
-    # candidate; an empty listing is not proof the pattern stays in scratch.
-    parts = expanded.split(os.sep)
-    prefix = []
-    if expanded.startswith(os.sep):
-        prefix = [""]
-        parts = parts[1:]
-    for part in parts:
-        if "[" in part:
-            parent = os.sep.join(prefix) if prefix != [""] else os.sep
-            if not prefix:
-                parent = "."
-            try:
-                return [os.path.join(parent, name) for name in os.listdir(parent)]
-            except OSError:
-                return []
-        prefix.append(part)
-    return []
-
-
 def glob_touches_protected(expanded, policy, trust_missing_scratch=True):
     # Keep the un-normalized static prefix so a symlink-then-`..` glob is
     # compared after physical resolution, matching bash, not after lexically
@@ -1257,14 +1253,14 @@ def glob_touches_protected(expanded, policy, trust_missing_scratch=True):
         hubs = (base, os.path.join(base, ".system_generated"))
         if all(within_conversation_scratch(p, policy) and p not in hubs for p in inner):
             # A wildcard can match a link that leads out of the directory, so
-            # every actual match must resolve inside it too. A bracket
-            # expression with no Python matches is not proof: list the parent
-            # of the bracketed component and require each entry stay inside.
+            # every actual match must resolve inside it too. The conservative
+            # component-wise expansion follows every wildcard component, so a
+            # link planted in an earlier one is followed into the next; a
+            # bracket expression with no matches is not proof.
             matches = list(glob.glob(expanded))
-            if "[" in wildcard:
-                matches.extend(glob_bracket_entry_candidates(expanded))
-                if not matches:
-                    matches = None
+            matches.extend(glob_expand_conservative(expanded))
+            if "[" in wildcard and not matches:
+                matches = None
             if matches is not None and all(
                     within_conversation_scratch(os.path.realpath(match), policy) for match in matches):
                 return False
@@ -1277,6 +1273,8 @@ def glob_touches_protected(expanded, policy, trust_missing_scratch=True):
 
 
 PATH_TEXT_PROGRAMS = {'echo', 'printf'}
+# Programs with no filesystem effect of their own: no path means no cwd read.
+NO_FILESYSTEM_PROGRAMS = {'echo', 'printf', 'true', 'false', ':', 'pwd'}
 NON_PATH_PROGRAMS = {'printenv', 'test', '['}
 GREP_FAMILY = {'grep', 'rg', 'sed', 'awk', 'gawk'}
 TEXT_FLAGS = {
@@ -1285,13 +1283,6 @@ TEXT_FLAGS = {
     'sed': ('-e', '--expression'),
     'awk': ('-e', '--source'),
     'gawk': ('-e', '--source'),
-}
-FILE_FLAGS = {
-    'grep': ('-f', '--file'),
-    'rg': ('-f', '--file'),
-    'sed': ('-f', '--file'),
-    'awk': ('-f', '--file'),
-    'gawk': ('-f', '--file'),
 }
 GREP_VALUE_FLAGS = frozenset({'-g', '--glob', '--iglob', '-t', '--type', '-A', '-B', '-C', '-m', '--max-depth'})
 STDIN_ARGV_RUNNERS = {'xargs', 'parallel'}
@@ -1575,6 +1566,7 @@ def cp_creates_links(rest):
 
 
 # SCRATCH_SAFE_PROGRAMS_FRAGMENT
+FILE_FLAGS = SCRATCH_PATTERN_FILE_FLAGS
 
 
 def nested_command_groups(group):
@@ -1587,12 +1579,16 @@ def nested_command_groups(group):
     return nested
 
 
-def other_groups_are_scratch_safe(groups, index):
+def other_groups_are_scratch_safe(groups, index, include_own_nested=True):
+    # `include_own_nested` False judges only the siblings (and their nested
+    # bodies): what a group's own nested `-c` body inherits as its enclosing
+    # trust must not be lowered by that body itself.
     others = []
     for i, group in enumerate(groups):
         if i != index:
             others.append(group)
-        others.extend(nested_command_groups(group))
+        if i != index or include_own_nested:
+            others.extend(nested_command_groups(group))
     return all(group_is_scratch_safe(group) for group in others)
 
 
@@ -1669,6 +1665,9 @@ def command_touches_protected(command, policy, cwd, enclosing_trust=True):
         # `-c` bodies inherit this group's distrust so a one-group inner
         # command cannot reset the allowance.
         trust_missing_scratch = enclosing_trust and other_groups_are_scratch_safe(groups, group_index)
+        sibling_trust = enclosing_trust and other_groups_are_scratch_safe(
+            groups, group_index, include_own_nested=False)
+        nested_bodies = nested_shell_bodies(group)
         rest_ids = strip_prefix_indices(group)
         program_index = rest_ids[0] if rest_ids else None
         for index, role in sorted(path_operand_positions(group).items()):
@@ -1695,6 +1694,9 @@ def command_touches_protected(command, policy, cwd, enclosing_trust=True):
                 token_trust = trust_missing_scratch or index == program_index
                 if program in ("cd", "pushd", "popd"):
                     token_trust = True
+                if program in NO_FILESYSTEM_PROGRAMS and not is_redirect:
+                    # Their arguments are text, never opened.
+                    token_trust = True
                 if candidate and not candidate.startswith('&') and operand_touches_protected(
                         candidate, policy, current, program, is_redirect, cand_literal, cand_segments,
                         token_trust):
@@ -1717,11 +1719,15 @@ def command_touches_protected(command, policy, cwd, enclosing_trust=True):
             # keeps a tracked cwd for the Python scan.
             if path_is_protected(current, policy, pre_expanded=True, trust_missing_scratch=True):
                 return True
-        elif not trust_missing_scratch:
+        elif not (sibling_trust if nested_bodies else trust_missing_scratch) and (
+                program not in NO_FILESYSTEM_PROGRAMS):
             # A distrusted group that names no path still reads its cwd. After
             # `cd` into scratch, `rg .` walks a same-command planted link.
             # `cd <scratch> && python3` stays allowed: that python group's
-            # own trust is still True because `cd` is read-only.
+            # own trust is still True because `cd` is read-only. Programs that
+            # never touch the filesystem (`echo done`) have no cwd to read, and
+            # a shell wrapper's cwd is judged where its nested body runs, with
+            # only its siblings counted against it.
             tracked = current or policy.get("workspace_path")
             if isinstance(tracked, str) and tracked:
                 try:
@@ -1730,8 +1736,8 @@ def command_touches_protected(command, policy, cwd, enclosing_trust=True):
                     return True
                 if within_conversation_scratch(resolved_cwd, policy):
                     return True
-        for body in nested_shell_bodies(group):
-            if command_touches_protected(body, policy, current, enclosing_trust=trust_missing_scratch):
+        for body in nested_bodies:
+            if command_touches_protected(body, policy, current, enclosing_trust=sibling_trust):
                 return True
     return False
 

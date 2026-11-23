@@ -34,9 +34,10 @@ def conversation_scratch_contains(resolved, base):
 
 def glob_wildcard_uses_unmodeled_brackets(wildcard):
     # Python's glob/fnmatch does not implement POSIX classes, equivalence
-    # classes, collating symbols or bash's `[^` negation. A `[` that appears
+    # classes, collating symbols or bash's `[^` negation, and it does not
+    # treat a `]` first in the set as a literal member. A `[` that appears
     # inside an already-open bracket expression in the same path component is
-    # unmodelled, as are `[!` and `[^`.
+    # unmodelled, as are `[!`, `[^` and a leading `]` (`[]a]`, `[]...]`).
     in_bracket = False
     for index, char in enumerate(wildcard):
         if char == os.sep:
@@ -45,12 +46,46 @@ def glob_wildcard_uses_unmodeled_brackets(wildcard):
             if in_bracket:
                 return True
             nxt = wildcard[index + 1:index + 2]
-            if nxt in ('!', '^'):
+            if nxt in ('!', '^', ']'):
                 return True
             in_bracket = True
         elif char == ']' and in_bracket:
             in_bracket = False
     return False
+
+
+GLOB_EXPANSION_LIMIT = 2000
+
+
+def glob_expand_conservative(expanded):
+    # Component-wise expansion of an absolute glob that is a superset of what
+    # bash matches. Every wildcard component is expanded against each
+    # directory the earlier components reached, so a link planted in one
+    # component is followed into the next. A component Python cannot model
+    # (see glob_wildcard_uses_unmodeled_brackets) matches every entry, and
+    # fnmatch does not hide dotfiles the way bash does.
+    parts = expanded.split(os.sep)
+    current = [os.sep] if expanded.startswith(os.sep) else [""]
+    for part in parts[1:] if expanded.startswith(os.sep) else parts:
+        if part == "":
+            continue
+        wild = any(char in part for char in "*?[")
+        following = []
+        for base in current:
+            if not wild:
+                following.append(os.path.join(base, part))
+                continue
+            try:
+                names = os.listdir(base or ".")
+            except OSError:
+                continue
+            if glob_wildcard_uses_unmodeled_brackets(part):
+                matched = names
+            else:
+                matched = fnmatch.filter(names, part)
+            following.extend(os.path.join(base, name) for name in matched)
+        current = following[:GLOB_EXPANSION_LIMIT]
+    return current
 "#
     };
 }
@@ -131,6 +166,61 @@ def group_is_scratch_safe(group):
 }
 
 pub const SCRATCH_SAFE_PROGRAMS_PY: &str = crate::render_scratch_safe_programs!();
+
+/// Nested shell body extraction shared by the adapter and the data-dir guard.
+///
+/// `shell_nested_bodies` returns the command strings a group executes (`-c`
+/// bodies, `find -exec` argv) and a reason when the group runs shell text it
+/// cannot see (stdin, a script file, `env -S`, `eval`, ...). The adapter turns
+/// a reason into a denial. The data-dir guard ignores it: `bash script.sh` is
+/// ordinary worker activity there, and a script's content is not visible to
+/// either guard. Must be rendered after [`render_command_tokenizer!`].
+#[macro_export]
+macro_rules! render_nested_shell_bodies {
+    () => {
+        r#"
+SHELL_PROGRAMS = ("sh", "bash", "zsh", "dash", "ksh")
+UNINSPECTABLE_CONTROL_WORDS = {
+    "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for",
+    "case", "esac", "{", "}", "!", "eval", "source", ".", "trap", "alias",
+    "compgen", "coproc", "mapfile", "readarray",
+}
+
+
+def shell_nested_bodies(group):
+    normalized = without_redirections(group)
+    for index, token in enumerate(normalized):
+        if os.path.basename(token) == "env" and any(
+                option.startswith("--split-string") or
+                (option.startswith("-") and not option.startswith("--") and "S" in option)
+                for option in normalized[index + 1:]):
+            return [], "env split-string execution cannot be inspected"
+    rest = strip_prefixes(group)
+    if rest and os.path.basename(rest[0]) in ("jobs", "shopt"):
+        return [], "shell execution and option builtins cannot be inspected"
+    if rest and any(c in rest[0] for c in "<>"):
+        return [], "unsupported redirection attached to an executable"
+    base = os.path.basename(rest[0]) if rest else ""
+    if base in UNINSPECTABLE_CONTROL_WORDS:
+        return [], "unsupported shell control or dynamic execution"
+    if base in SHELL_PROGRAMS:
+        for index, arg in enumerate(rest[1:], 1):
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
+                return [rest[index + 1]], None
+        return [], "shell stdin or script execution cannot be inspected"
+    if base == "find":
+        bodies = []
+        for index, arg in enumerate(rest):
+            if arg in ("-exec", "-execdir", "-ok", "-okdir"):
+                end = next((i for i in range(index + 1, len(rest)) if rest[i] in (";", "+")), len(rest))
+                bodies.append(shlex.join(rest[index + 1:end]))
+        return bodies, None
+    return [], None
+"#
+    };
+}
+
+pub const NESTED_SHELL_BODIES_PY: &str = crate::render_nested_shell_bodies!();
 
 /// Shell tokenizer shared by driver guards that inspect `Bash` commands.
 ///
@@ -1118,6 +1208,7 @@ pub fn with_command_tokenizer(template: &str) -> String {
         .replace("# COMMAND_TOKENIZER_FRAGMENT", CODEX_COMMAND_TOKENIZER_PY)
         .replace("# REVIEWER_BLOCKED_FRAGMENT", REVIEWER_BLOCKED_PROGRAMS_PY)
         .replace("# SCRATCH_SAFE_PROGRAMS_FRAGMENT", SCRATCH_SAFE_PROGRAMS_PY)
+        .replace("# NESTED_SHELL_BODIES_FRAGMENT", NESTED_SHELL_BODIES_PY)
 }
 
 #[cfg(test)]

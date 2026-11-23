@@ -37,6 +37,7 @@ home, /Volumes or a mounted volume, /System, /Library, /private, /var, and the
 /net and /home autofs maps. Only the root of a recursive walk is judged, so an
 ordinary read of one specific file outside the workspace is untouched.
 """
+import fnmatch
 import json
 import os
 import re
@@ -431,37 +432,59 @@ def emit(decision, reason=None):
 "#,
         crate::render_conversation_scratch!(),
         crate::render_command_tokenizer!("", ""),
+        crate::render_nested_shell_bodies!(),
         crate::render_scratch_safe_programs!(),
         r#"
 def conversation_scratch_path(candidate, cwd, payload):
     # The root comes from engine-owned hook wiring, never the payload.
-    # Bracket constructs Python's glob does not model (POSIX classes later
-    # in a set, `[!`, `[^`) can expand to a name the worker created as a
-    # link out of scratch, so those spellings keep the data-dir check.
-    if glob_wildcard_uses_unmodeled_brackets(candidate):
+    # A wildcard is never taken on its lexical spelling: a link planted in
+    # scratch makes the expansion leave it, so glob candidates keep the
+    # data-dir check (see consider(), which expands them).
+    if any(char in candidate for char in "*?["):
         return False
     base = conversation_scratch_base(os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
     return conversation_scratch_contains(canonical(candidate, cwd), base)
 
 
-def nested_c_bodies(group):
-    rest = strip_prefixes(group)
-    if not rest:
+# Heredoc bodies fed to these programs are data. Every other consumer (a
+# shell, an interpreter, `source`, anything unknown) executes or interprets
+# its stdin, so its body is inspected like command text.
+HEREDOC_DATA_CONSUMERS = {
+    "cat", "tee", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "grep",
+    "rg", "base64", "shasum", "md5", "md5sum", "sha256sum", "diff", "cmp",
+}
+BODY_WORD_RE = re.compile(r"[^\s'\"()\[\],;=<>|&`{}]+")
+
+
+def heredoc_body_groups(group):
+    body = getattr(group, "body", "")
+    if not body:
         return []
-    if os.path.basename(rest[0]) in ("sh", "bash", "zsh", "dash", "ksh"):
-        for index, arg in enumerate(rest[1:], 1):
-            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg) and index + 1 < len(rest):
-                return [rest[index + 1]]
-    return []
+    rest = strip_prefixes(group)
+    program = os.path.basename(rest[0]) if rest else ""
+    if program in HEREDOC_DATA_CONSUMERS:
+        return []
+    return [(program, body)]
 
 
 def flatten_command_groups(command):
+    # Nested shell bodies come from the shared extractor the adapter uses; a
+    # shape that extractor cannot see into (`bash script.sh`) is ordinary
+    # worker activity here, so its reason is not a denial. Heredoc bodies of
+    # executing consumers are inspected: shell bodies as commands, anything
+    # else as the words an interpreter could open.
     groups = []
     def walk(text):
         for group in command_groups(text):
             groups.append(group)
-            for body in nested_c_bodies(group):
+            bodies, _reason = shell_nested_bodies(group)
+            for body in bodies:
                 walk(body)
+            for program, body in heredoc_body_groups(group):
+                if program in SHELL_PROGRAMS or program in ("", "source", ".", "eval"):
+                    walk(body)
+                else:
+                    groups.append(BODY_WORD_RE.findall(body))
     walk(command)
     return groups
 
@@ -570,6 +593,26 @@ def main():
     def consider(candidate, skip_scratch):
         try:
             resolved = canonical(candidate, cwd)
+            if any(char in candidate for char in "*?["):
+                # A wildcard names whatever the shell matches, including an
+                # entry that is a link into the data directory, so judge the
+                # expansion rather than the lexical spelling. Matches that stay
+                # inside this conversation's allowance are fine (that allowance
+                # lives under the data directory); any other match inside the
+                # data directory is not.
+                # A spelling Python's glob cannot model never gets the scratch
+                # exemption, whatever it matches today.
+                if glob_wildcard_uses_unmodeled_brackets(candidate) and is_inside(resolved, data_dir):
+                    emit("block", RECOVERY)
+                scratch_base = conversation_scratch_base(
+                    os.environ.get("BOSS_AGY_SCRATCH_ROOT"), payload.get("session_id"))
+                for match in glob_expand_conservative(expanded_path(candidate, cwd)):
+                    real = os.path.realpath(match)
+                    if conversation_scratch_contains(real, scratch_base):
+                        continue
+                    if is_inside(real, data_dir):
+                        emit("block", RECOVERY)
+                return
             if skip_scratch and conversation_scratch_path(candidate, cwd, payload):
                 scratch_candidates.append(candidate)
                 return

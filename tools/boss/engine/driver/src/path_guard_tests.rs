@@ -402,3 +402,77 @@ fn posix_class_later_in_bracket_does_not_skip_scratch_after_mv() {
         );
     }
 }
+
+fn bash_verdict(data: &Path, brain: &Path, command: &str) -> String {
+    verdict(
+        data,
+        brain,
+        json!({
+            "session_id": "c1", "tool_name": "Bash",
+            "tool_input": {"command": command}
+        }),
+    )
+}
+
+#[test]
+fn wildcard_candidates_are_expanded_through_scratch_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("Boss state");
+    let sessions = data.join("executions/run/transcripts/agy/sessions");
+    std::fs::create_dir_all(sessions.join("c1/scratch/a")).unwrap();
+    std::fs::write(data.join("state.db"), "secret\n").unwrap();
+    std::fs::write(sessions.join("c1/scratch/helper.py"), "print(1)\n").unwrap();
+    let brain = tmp.path().join("brain");
+    std::os::unix::fs::symlink(&sessions, &brain).unwrap();
+    let scratch = brain.join("c1/scratch");
+    let command = format!("cat {}/*.py", scratch.display());
+    assert_eq!(bash_verdict(&data, &brain, &command), "approve", "{command}");
+    for (name, from) in [("up", scratch.clone()), ("a/up", scratch.join("a"))] {
+        let prepared = tmp.path().join(format!("prepared-{}", name.replace('/', "-")));
+        run_approved(
+            &data,
+            &brain,
+            &format!("ln -s {} {}", relative_from(&from, &data).display(), prepared.display()),
+        );
+        run_approved(
+            &data,
+            &brain,
+            &format!("mv {} {}/{name}", prepared.display(), scratch.display()),
+        );
+    }
+    let s = scratch.display();
+    for command in [
+        format!("cat {s}/[u]p/state.db"),
+        format!("cat {s}/[]a[:lower:]]p/state.db"),
+        format!("cat {s}/[][:lower:]]p/state.db"),
+        format!("cat {s}/[a]/[]a[:lower:]]p/state.db"),
+        format!("cat {s}/[a]/[u]p/state.db"),
+        format!("cat {s}/*/state.db"),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain, &command), "block", "{command}");
+    }
+}
+
+#[test]
+fn executable_heredoc_bodies_are_inspected_but_data_heredocs_are_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("Boss state");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("state.db"), "secret\n").unwrap();
+    let brain = tmp.path().join("brain");
+    std::fs::create_dir_all(&brain).unwrap();
+    let alias = tmp.path().join("boss-alias");
+    std::os::unix::fs::symlink(&data, &alias).unwrap();
+    let target = alias.join("state.db");
+    for command in [
+        format!("bash <<'EOF'\ncat {}\nEOF", target.display()),
+        format!("sh -s <<EOF\ncat {}\nEOF", target.display()),
+        format!("python3 - <<'EOF'\nprint(open(\"{}\").read())\nEOF", target.display()),
+        format!("bash <<'EOF'\nbash -c 'cat {}'\nEOF", target.display()),
+    ] {
+        assert_eq!(bash_verdict(&data, &brain, &command), "block", "{command}");
+    }
+    let command = format!("cat <<'EOF'\n{}\nEOF", target.display());
+    assert_eq!(bash_verdict(&data, &brain, &command), "approve", "{command}");
+    assert_eq!(bash_verdict(&data, &brain, "bash <<'EOF'\necho hi\nEOF"), "approve");
+}

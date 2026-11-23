@@ -965,3 +965,93 @@ fn python_scan_allows_workspace_subdir_and_benign_brain_text() {
     assert_command_allowed(&fx, r#"python3 -c 'print("brain\nx")'"#);
     assert_command_allowed(&fx, r#"python3 -c 'open("data/brain/x.json")'"#);
 }
+
+#[test]
+fn python_bodies_that_compose_a_path_cannot_reach_a_scratch_link() {
+    let fx = Fixture::new("run-python-composed-link");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    let hooks = fx.process_home.join(".gemini/config/hooks.json");
+    let prepared_data = prepare_link_via_command(&fx, "prepared-up", &relative_from(&scratch, &data));
+    run_approved(&fx, &format!("mv {} {}/up", prepared_data.display(), scratch.display()));
+    let prepared_hooks = prepare_link_via_command(&fx, "prepared-hooks", &relative_from(&scratch, &hooks));
+    run_approved(
+        &fx,
+        &format!("mv {} {}/hooks.json", prepared_hooks.display(), scratch.display()),
+    );
+    let s = scratch.display().to_string();
+    for parts in [vec!["up", "state.db"], vec!["hooks.json"]] {
+        let rel = parts.join("/");
+        let quoted = parts.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>();
+        let snippets = [
+            format!("open(\"{s}/\" \"{rel}\").read()"),
+            format!("import os; os.chdir(\"{s}\"); open(\"{rel}\").read()"),
+            format!("import os; open(os.path.join(\"{s}\", {})).read()", quoted.join(", ")),
+            format!("open(\"{s}\" + \"/{rel}\").read()"),
+            format!(
+                "from pathlib import Path; (Path(\"{s}\") / {}).read_text()",
+                quoted.join(" / ")
+            ),
+        ];
+        for snippet in snippets {
+            for command in [
+                format!("python3 -c '{snippet}'"),
+                format!("python3 - <<'PY'\n{snippet}\nPY"),
+            ] {
+                assert_command_denied(&fx, &command);
+            }
+        }
+    }
+}
+
+#[test]
+fn bracket_globs_cannot_reach_a_scratch_link_through_any_component() {
+    let fx = Fixture::new("run-scratch-glob-components");
+    let data = fx.tmp.path().join("homes/.transcript-store");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("state.db"), "secret\n").unwrap();
+    fx.install_with(WorkerKind::Standard, |config| config.data_dir = Some(data.clone()));
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    fs::create_dir_all(scratch.join("a")).unwrap();
+    let prepared_up = prepare_link_via_command(&fx, "prepared-up", &relative_from(&scratch, &data));
+    run_approved(&fx, &format!("mv {} {}/up", prepared_up.display(), scratch.display()));
+    let prepared_nested = prepare_link_via_command(&fx, "prepared-nested", &relative_from(&scratch.join("a"), &data));
+    run_approved(
+        &fx,
+        &format!("mv {} {}/a/up", prepared_nested.display(), scratch.display()),
+    );
+    let s = scratch.display();
+    for command in [
+        format!("cat {s}/[]a[:lower:]]p/state.db"),
+        format!("cat {s}/[]x[=u=]]p/state.db"),
+        format!("cat {s}/[][:lower:]]p/state.db"),
+        format!("cat {s}/[u]p/state.db"),
+        format!("cat {s}/[a]/[]a[:lower:]]p/state.db"),
+        format!("cat {s}/[a]/[u]p/state.db"),
+    ] {
+        assert_command_denied(&fx, &command);
+    }
+}
+
+#[test]
+fn nested_shell_bodies_and_no_path_programs_do_not_inherit_their_own_distrust() {
+    let fx = Fixture::new("run-scratch-nested-own-trust");
+    fx.install(WorkerKind::Standard);
+    seed_conversation(&fx);
+    let scratch = conversation_dir(&fx).join("scratch");
+    fs::write(scratch.join("gen.py"), "print('gen')\n").unwrap();
+    let s = scratch.display();
+    for command in [
+        format!("bash -c 'cp x {s}/y'"),
+        format!("bash -c 'cd {s} && python3 gen.py'"),
+        format!("cd {s} && python3 gen.py; echo done"),
+        format!("cd {s} && python3 gen.py && true"),
+    ] {
+        assert_command_allowed(&fx, &command);
+    }
+}
