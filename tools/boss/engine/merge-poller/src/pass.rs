@@ -151,10 +151,21 @@ pub(crate) struct ProbeSnapshot {
 }
 
 impl ProbeSnapshot {
+    #[cfg(test)]
     pub(crate) fn new(results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>) -> Self {
+        Self::at(results, tokio::time::Instant::now())
+    }
+
+    /// `taken_at` is when the oldest contributing chunk started, not when
+    /// the last chunk finished: a later slow chunk must not make an early
+    /// result look fresh.
+    pub(crate) fn at(
+        results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+        taken_at: tokio::time::Instant,
+    ) -> Self {
         Self {
             results,
-            taken_at: tokio::time::Instant::now(),
+            taken_at,
             refreshes_left: MAX_PROBE_REFRESHES_PER_PASS,
             refreshed_last_call: false,
         }
@@ -164,8 +175,13 @@ impl ProbeSnapshot {
     ///
     /// Fresh snapshot → `true` immediately (the overwhelmingly common case,
     /// and free — no clock-driven GitHub traffic). Stale snapshot → re-probe
-    /// and return `true`. Stale snapshot with the per-pass refresh budget
-    /// already spent → `false`, and the caller must stop: writing off a
+    /// the unprocessed remainder and return `true` only if that refresh is
+    /// itself still within [`PROBE_SNAPSHOT_MAX_AGE`]. A refresh ages from
+    /// this pass's oldest contributing chunk start, so a slow later chunk
+    /// cannot hide an early result. If that age already exceeds the max,
+    /// another refresh runs while [`MAX_PROBE_REFRESHES_PER_PASS`] remains;
+    /// once the budget is spent → `false`, and the caller must stop. Never
+    /// authorize a write from a snapshot that is already stale: writing off a
     /// snapshot that old is worse than deferring to the next pass.
     ///
     /// `remaining_urls` is called **only** on the re-probe path and must
@@ -176,41 +192,60 @@ impl ProbeSnapshot {
     /// Nothing is lost by dropping the processed prefix: those entries are
     /// never read again, and every candidate list is rebuilt from the DB next
     /// pass. It is a closure rather than a slice so the common (fresh) case
-    /// allocates nothing.
+    /// allocates nothing. The closure runs at most once: further refreshes
+    /// in the same call reuse that remainder.
     pub(crate) async fn ensure_fresh(
         &mut self,
         probe: &dyn MergeProbe,
+        state: &PassState,
         remaining_urls: impl FnOnce() -> Vec<String>,
     ) -> bool {
         self.refreshed_last_call = false;
-        let age = self.taken_at.elapsed();
-        if age <= PROBE_SNAPSHOT_MAX_AGE {
+        if self.taken_at.elapsed() <= PROBE_SNAPSHOT_MAX_AGE {
             return true;
         }
         if self.refreshes_left == 0 {
             tracing::warn!(
-                snapshot_age_ms = age.as_millis(),
+                snapshot_age_ms = self.taken_at.elapsed().as_millis(),
                 max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
                 "merge poller: probe snapshot stale and the per-pass re-probe budget is spent; \
                  abandoning the rest of this pass rather than transitioning off a stale snapshot",
             );
             return false;
         }
-        self.refreshes_left -= 1;
         let urls = remaining_urls();
-        tracing::warn!(
-            snapshot_age_ms = age.as_millis(),
-            max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
-            pr_count = urls.len(),
-            "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
-             before writing further state",
-        );
-        // Merge rather than replace: entries for candidates already walked
-        // stay readable for the pass's adaptive-poll observations.
-        self.results.extend(probe.probe_batch(&urls).await);
-        self.taken_at = tokio::time::Instant::now();
-        self.refreshed_last_call = true;
-        true
+        loop {
+            let age = self.taken_at.elapsed();
+            self.refreshes_left -= 1;
+            tracing::warn!(
+                snapshot_age_ms = age.as_millis(),
+                max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
+                pr_count = urls.len(),
+                "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
+                 before writing further state",
+            );
+            state.probe_order.lock().unwrap().observation.clear();
+            // Merge rather than replace: entries for candidates already walked
+            // stay readable for the pass's adaptive-poll observations.
+            // Age from when the oldest refresh chunk started, matching the
+            // initial snapshot: a slow later chunk must not hide an early result.
+            self.results.extend(probe.probe_batch(&urls).await);
+            self.taken_at = state.probe_order.lock().unwrap().observation.taken_at();
+            self.refreshed_last_call = true;
+            let refresh_age = self.taken_at.elapsed();
+            if refresh_age <= PROBE_SNAPSHOT_MAX_AGE {
+                return true;
+            }
+            if self.refreshes_left == 0 {
+                tracing::warn!(
+                    snapshot_age_ms = refresh_age.as_millis(),
+                    max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
+                    "merge poller: probe snapshot stale and the per-pass re-probe budget is spent; \
+                     abandoning the rest of this pass rather than transitioning off a stale snapshot",
+                );
+                return false;
+            }
+        }
     }
 }
 
@@ -243,12 +278,15 @@ fn parked_ids_for_pass<'a>(
 async fn ensure_fresh_refreshing_parked<'a>(
     snapshot: &mut ProbeSnapshot,
     probe: &dyn MergeProbe,
+    state: &PassState,
     work_db: &WorkDb,
     parked_ids: &mut HashSet<String>,
     parked_scope: &[&'a PendingMergeCheck],
     remaining: impl IntoIterator<Item = &'a PendingMergeCheck>,
 ) -> bool {
-    let ok = snapshot.ensure_fresh(probe, || remaining_probe_urls(remaining)).await;
+    let ok = snapshot
+        .ensure_fresh(probe, state, || remaining_probe_urls(remaining))
+        .await;
     if ok && snapshot.refreshed_last_call {
         *parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
     }
@@ -595,10 +633,11 @@ pub async fn run_one_pass_tracked(
         "merge poller: sweep started",
     );
     let mut outcome = SweepOutcome::default();
-    // Batch every PR this pass will probe into one round trip
-    // (`MergeProbe::probe_batch`) instead of one `gh pr view` per PR —
-    // covers both the `sweep_one` candidates below and `stranded_blocked`,
-    // since both loops probe the same way.
+    // Every PR this pass tracks, probed by tier (see `probe_tier`): rows the
+    // poller acts on in full, in bounded chunks, first; everything else only
+    // for merge or close, and only when due. Covers both the `sweep_one`
+    // candidates below and `stranded_blocked`, since both loops probe the
+    // same way.
     let mut probe_url_seen = std::collections::HashSet::new();
     let probe_urls: Vec<String> = in_review
         .iter()
@@ -609,21 +648,73 @@ pub async fn run_one_pass_tracked(
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
-    // One batched GitHub request, so the phase is one item: entering with
-    // `probe_urls.len()` and never finishing those items would report every
-    // probed URL as unfinished even on a healthy pass.
     state.probe_order.lock().unwrap().retain(&probe_urls);
+    // The `Probe` phase is two batched steps, one per tier, reported as one item:
+    // entering with `probe_urls.len()` and never finishing those items would
+    // report every probed URL as unfinished even on a healthy pass.
     trace.enter(PassPhase::Probe, 1);
-    let source_observation_sequences = allocate_source_observation_sequences(work_db, completion_handler, &probe_urls);
-    let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
+    let in_review_parked = parked_ids_for_pass(work_db, in_review.iter());
+    let merge_in_flight = match work_db.list_work_item_ids_with_pending_merge() {
+        Ok(mut ids) => {
+            match work_db.list_work_item_ids_in_merge_queue() {
+                Ok(queued) => ids.extend(queued),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "merge poller: could not read durable merge-queue membership; using merge requests only",
+                ),
+            }
+            Some(ids)
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: could not read merges in flight; probing every in-review PR in full",
+            );
+            None
+        }
+    };
+    let active_products = state.tiering().active_products.clone();
+    let always_full: Vec<&str> = blocked_conflict
+        .iter()
+        .chain(blocked_ci.iter())
+        .chain(blocked_other.iter())
+        .chain(stranded_blocked.iter())
+        .map(|candidate| candidate.pr_url.as_str())
+        .collect();
+    let crate::probe_tier::TieredProbe {
+        results,
+        unwalked,
+        sequences: source_observation_sequences,
+        taken_at,
+    } = crate::probe_tier::probe_by_tier(
+        probe,
+        crate::probe_tier::TierRequest {
+            work_db,
+            completion_handler,
+            state,
+            inputs: crate::probe_tier::TierInputs {
+                always_full,
+                in_review: &in_review,
+                parked: &in_review_parked,
+                merge_in_flight: merge_in_flight.as_ref(),
+                active_products: active_products.as_ref(),
+            },
+            all_urls: &probe_urls,
+        },
+    )
+    .await;
+    let mut snapshot = ProbeSnapshot::at(results, taken_at);
     trace.finish_item();
 
     // The pass's candidate walk, materialised so a mid-pass re-probe can be
     // scoped to the part of it that has not happened yet — see
     // [`ProbeSnapshot::ensure_fresh`]. Terminal facts first, then open-PR
     // upkeep; each half least recently attended first.
+    // A PR watched only for merge or close has nothing to walk unless that
+    // probe found it merged or closed.
     let (terminal, open): (Vec<&PendingMergeCheck>, Vec<&PendingMergeCheck>) = candidates
         .into_iter()
+        .filter(|candidate| !unwalked.contains(&candidate.pr_url))
         .partition(|candidate| probed_terminal(&snapshot.results, &candidate.pr_url));
     let terminal_walk: Vec<&PendingMergeCheck> = {
         let rotations = state.rotations();
@@ -650,6 +741,7 @@ pub async fn run_one_pass_tracked(
         if !ensure_fresh_refreshing_parked(
             &mut snapshot,
             probe,
+            state,
             work_db,
             &mut parked_ids,
             &parked_scope,
@@ -734,6 +826,7 @@ pub async fn run_one_pass_tracked(
                     if !ensure_fresh_refreshing_parked(
                         &mut snapshot,
                         probe,
+                        state,
                         work_db,
                         &mut parked_ids,
                         &parked_scope,
@@ -834,6 +927,7 @@ pub async fn run_one_pass_tracked(
                                 if !ensure_fresh_refreshing_parked(
                                     &mut snapshot,
                                     probe,
+                                    state,
                                     work_db,
                                     &mut parked_ids,
                                     &parked_scope,
@@ -862,10 +956,18 @@ pub async fn run_one_pass_tracked(
                             trace.enter(PassPhase::QueueRebounce, 0);
                             if !clock.should_yield(false) {
                                 parked_ids = parked_ids_for_pass(work_db, parked_scope.iter().copied());
+                                // Rebounce acts on queued PRs, which are all in the full
+                                // tier; a PR watched only for merge or close has no
+                                // queue entry this poller is responsible for.
+                                let rebounce_in_review: Vec<PendingMergeCheck> = in_review
+                                    .iter()
+                                    .filter(|candidate| !unwalked.contains(&candidate.pr_url))
+                                    .cloned()
+                                    .collect();
                                 run_merge_queue_rebounce_pass(
                                     work_db,
                                     publisher,
-                                    &in_review,
+                                    &rebounce_in_review,
                                     &blocked_ci,
                                     Some(&parked_ids),
                                     &mut outcome,

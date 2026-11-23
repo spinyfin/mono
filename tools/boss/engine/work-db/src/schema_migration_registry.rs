@@ -602,6 +602,11 @@ pub(super) fn all() -> Vec<Migration> {
             apply: stuck_snapshot::migrate,
         },
         Migration {
+            id: recurring_read_indexes::MERGE_QUEUE_INDEX_MIGRATION_ID.into(),
+            legacy_version: None,
+            apply: recurring_read_indexes::migrate_merge_queue_index,
+        },
+        Migration {
             id: "20261110_0730_wait_input_invalidation".into(),
             legacy_version: None,
             apply: board_projection_schema::refine_triggers,

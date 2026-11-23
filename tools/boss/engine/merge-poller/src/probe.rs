@@ -2,7 +2,7 @@ use super::*;
 
 pub use boss_observation_contracts::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleProbe, PrLifecycleState,
-    PrReviewState, TrunkQueueCheckFailure,
+    PrReviewState, ShallowProbe, TrunkQueueCheckFailure,
 };
 
 /// `MergeProbe` that shells out to `gh pr view <url> --json …`.
@@ -127,6 +127,71 @@ impl MergeProbe for CommandMergeProbe {
     async fn probe_batch(&self, pr_urls: &[String]) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
         self.probe_batch_via_graphql(pr_urls).await
     }
+
+    async fn probe_shallow_batch(
+        &self,
+        pr_urls: &[String],
+    ) -> HashMap<String, std::result::Result<ShallowProbe, String>> {
+        self.probe_chunked(pr_urls, ProbeDepth::Shallow)
+            .await
+            .into_iter()
+            .map(|(url, result)| (url, result.map(ShallowProbe::from_full)))
+            .collect()
+    }
+}
+
+/// How much of a PR a batched probe asks GitHub for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeDepth {
+    /// [`PR_PROBE_FIELDS`]: lifecycle, mergeability, reviews and the CI rollup.
+    Full,
+    /// [`PR_SHALLOW_FIELDS`]: lifecycle only.
+    Shallow,
+}
+
+/// PRs per GraphQL query for a [`ProbeDepth::Full`] probe.
+///
+/// Sized from measurement against the repository the poller watches (one
+/// aliased `repository` block, [`PR_PROBE_FIELDS`] per PR, `gh api graphql`):
+/// 25 PRs is 1,275 requested nodes, 1 point of quota and 2.5-3.2 s; 50 is
+/// 2,550 nodes, 2 points, 3.4 s; 100 is 5,100 nodes, 4 points, 5-7.5 s; 125
+/// is 6,375 nodes, 5 points, 5.5-6 s. Latency grows with the query, and
+/// GitHub aborts a query that runs past its own server-side limit with a 502
+/// or 504, which is what a single query for every tracked PR hit once
+/// the set passed ~120. 25 keeps a chunk at a few seconds, a third of that
+/// limit, with room for the repository's heavier PRs (more rollup contexts,
+/// slower checks) and a bad day on GitHub's side.
+pub(crate) const FULL_PROBE_CHUNK_SIZE: usize = 25;
+
+/// PRs per GraphQL query for a [`ProbeDepth::Shallow`] probe. A shallow node
+/// is scalar fields and one `mergeCommit`, so its requested node count is 0
+/// and the query costs 1 point and about a second at 200 PRs (measured: 25 PRs
+/// 0.45 s, 100 PRs 0.8 s, 200 PRs 1.05 s). 100 leaves the same factor of
+/// headroom as the full chunk.
+pub(crate) const SHALLOW_PROBE_CHUNK_SIZE: usize = 100;
+
+impl ProbeDepth {
+    fn fields(self) -> &'static str {
+        match self {
+            Self::Full => PR_PROBE_FIELDS,
+            Self::Shallow => PR_SHALLOW_FIELDS,
+        }
+    }
+
+    pub(crate) fn chunk_size(self) -> usize {
+        match self {
+            Self::Full => FULL_PROBE_CHUNK_SIZE,
+            Self::Shallow => SHALLOW_PROBE_CHUNK_SIZE,
+        }
+    }
+
+    /// Key of this depth's chunk counts in the pass trace.
+    pub(crate) fn chunk_work_kind(self) -> &'static str {
+        match self {
+            Self::Full => "probe_chunks_full",
+            Self::Shallow => "probe_chunks_shallow",
+        }
+    }
 }
 
 /// Shared GraphQL selection set for one PR's lifecycle fields, reused for
@@ -189,12 +254,34 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
     "... on StatusContext { context state targetUrl createdAt } } } } } } }",
 );
 
-/// Batch-probe every PR in `pr_urls` with a single `gh api graphql` round
-/// trip covering the whole sweep, instead of one `gh pr view` (+ one
-/// `mergeQueueEntry` lookup) per PR. Each distinct repository referenced
-/// gets one aliased `repository(...)` block; each PR within that repo gets
-/// one aliased `pullRequest(...)` block inside it — so the round-trip count
-/// is 1 regardless of how many PRs (or repos) are in play this pass.
+/// Selection set for a [`ProbeDepth::Shallow`] probe: what the merge and
+/// close transitions read, and nothing a still-open PR's upkeep would need.
+///
+/// Scalars plus `mergeCommit { oid }` and the repository's default branch, so
+/// the requested node count is 0 and a query costs the 1-point floor however
+/// many PRs it carries. The base and head refs and the default branch are here
+/// because they are what refuses a PR merged into a branch other than the
+/// default (`require_default_branch`) and what the post-merge review keys on;
+/// a merge recorded without them could complete work that never landed.
+/// `updatedAt` is what lets the poller notice that a PR it is watching
+/// cheaply has become active again. `mergeQueueEntry` and `autoMergeRequest`
+/// are scalars-plus-null-object, still 0 requested nodes, and are how a
+/// shallow probe notices that GitHub queued the PR or armed auto-merge so
+/// the next pass can promote it to the full tier.
+pub(crate) const PR_SHALLOW_FIELDS: &str = concat!(
+    "repository { defaultBranchRef { name } } ",
+    "state mergedAt closedAt baseRefOid headRefOid headRefName baseRefName ",
+    "mergeQueueEntry { state } autoMergeRequest { enabledAt } ",
+    "mergeCommit { oid } updatedAt",
+);
+
+/// Batch-probe every PR in `pr_urls` with `gh api graphql`, instead of one
+/// `gh pr view` (+ one `mergeQueueEntry` lookup) per PR. Each distinct
+/// repository referenced in a chunk gets one aliased `repository(...)` block;
+/// each PR within that repo gets one aliased `pullRequest(...)` block inside
+/// it. The URLs are split into fixed-size chunks ([`FULL_PROBE_CHUNK_SIZE`])
+/// and each chunk is one query with its own deadline, so one query that
+/// GitHub rejects or that never returns costs only its own PRs.
 ///
 /// Reuses [`parse_probe_json`] by reshaping each aliased PR node back into
 /// the same flat JSON document shape `gh pr view --json` produces, so the
@@ -205,27 +292,94 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
 /// URL, or whose GraphQL node comes back null (PR force-deleted/
 /// transferred — mapped to `ClosedUnmerged`, matching `probe`'s 404
 /// handling), is resolved independently of its siblings. Query-wide errors,
-/// malformed JSON and non-zero exits without a usable body retry in halves,
-/// reaching individual probes only at singleton leaves. The shared deadline
-/// bounds every await; completed results survive while unfinished URLs return
-/// retryable errors for a later pass. Spawn failures and rate-limit rejections
-/// return retryable errors without amplifying requests.
+/// malformed JSON and non-zero exits without a usable body retry in halves
+/// *within the chunk*, reaching individual probes only at singleton leaves.
+/// The chunk's deadline bounds every await in it; completed results survive
+/// while unfinished URLs return retryable errors for a later pass. Spawn
+/// failures and rate-limit rejections return retryable errors without
+/// amplifying requests, and a rate-limit rejection ends the call: the
+/// chunks after it are not sent.
 impl CommandMergeProbe {
     pub(crate) async fn probe_batch_via_graphql(
         &self,
         pr_urls: &[String],
     ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        self.probe_chunked(pr_urls, ProbeDepth::Full).await
+    }
+
+    /// Probes `pr_urls` in chunks of [`ProbeDepth::chunk_size`], in the pass's
+    /// attendance order (terminal candidates first, then least recently
+    /// attended), one query per chunk, one chunk at a time.
+    ///
+    /// Each chunk gets its own deadline, `min(30 s, pass time left / 4)`,
+    /// taken when the chunk starts (see [`crate::probe_budget::deadline`]). A
+    /// chunk that is rejected or hangs therefore spends its own allowance and
+    /// no more: the chunks after it still run. The allowance shrinks with the
+    /// pass's remaining time, so a run of failing chunks cannot take the pass;
+    /// a chunk reached with the allowance already spent is deferred, comes
+    /// back as retryable errors, and sorts to the front of the next pass.
+    ///
+    /// Chunks are sent one at a time on purpose. The batch is what GitHub
+    /// found too heavy, the points the poller spends are shared with every
+    /// other consumer of the token, and a rejected call stops the rest
+    /// ([`RATE_LIMIT_REJECTED`]) instead of being multiplied by concurrency.
+    pub(crate) async fn probe_chunked(
+        &self,
+        pr_urls: &[String],
+        depth: ProbeDepth,
+    ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<String> = pr_urls
+            .iter()
+            .filter(|url| seen.insert(url.as_str()))
+            .cloned()
+            .collect();
         let order = crate::probe_budget::CONTEXT
-            .try_with(|c| c.order.lock().unwrap().order(pr_urls))
-            .unwrap_or_else(|_| pr_urls.to_vec());
+            .try_with(|c| c.order.lock().unwrap().order(&unique))
+            .unwrap_or(unique);
+        let chunks: Vec<&[String]> = order.chunks(depth.chunk_size()).collect();
+        let mut measurement = crate::probe_budget::Measurement::start(depth.chunk_work_kind(), chunks.len());
         let results = crate::probe_budget::FALLBACK
             .scope(Mutex::new(Default::default()), async {
                 let _report = crate::probe_budget::FallbackReport;
                 RATE_LIMIT_REJECTED
-                    .scope(
-                        std::cell::Cell::new(false),
-                        self.probe_batch_with_deadline(&order, crate::probe_budget::deadline()),
-                    )
+                    .scope(std::cell::Cell::new(false), async {
+                        let mut out = HashMap::new();
+                        for chunk in chunks {
+                            let deadline = crate::probe_budget::deadline();
+                            if RATE_LIMIT_REJECTED.try_with(|flag| flag.get()).unwrap_or(false) {
+                                let msg = "GitHub API rate limit exceeded; retrying next pass".to_owned();
+                                out.extend(chunk.iter().map(|url| (url.clone(), Err(msg.clone()))));
+                                continue;
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                let msg = "probe deadline exhausted; retrying next pass".to_owned();
+                                out.extend(chunk.iter().map(|url| (url.clone(), Err(msg.clone()))));
+                                continue;
+                            }
+                            let started = tokio::time::Instant::now();
+                            let _ = crate::probe_budget::CONTEXT.try_with(|context| {
+                                context.order.lock().unwrap().observation.record_chunk(chunk, started);
+                            });
+                            measurement.attempt();
+                            let chunk_out = self.probe_batch_with_deadline(chunk, deadline, depth).await;
+                            if chunk.iter().all(|url| matches!(chunk_out.get(url), Some(Ok(_)))) {
+                                measurement.complete();
+                            } else {
+                                tracing::warn!(
+                                    depth = ?depth,
+                                    chunk_size = chunk.len(),
+                                    unobserved = chunk
+                                        .iter()
+                                        .filter(|url| !matches!(chunk_out.get(*url), Some(Ok(_))))
+                                        .count(),
+                                    "merge poller: probe chunk left PRs unobserved; they are retried first next pass",
+                                );
+                            }
+                            out.extend(chunk_out);
+                        }
+                        out
+                    })
                     .await
             })
             .await;
@@ -238,16 +392,22 @@ impl CommandMergeProbe {
     /// succeeds or is a single PR (which is then probed on its own). A heavy
     /// aliased query that times out as a whole usually succeeds at half the
     /// size, so this costs a handful of batched calls instead of `N` serial
-    /// per-PR calls. Every call shares `deadline`: once it passes, PRs not yet
-    /// reached come back as retryable errors and the next pass tries again.
-    fn probe_batch_bisect<'a>(&'a self, order: &'a [String], deadline: tokio::time::Instant) -> BoxedBatchProbe<'a> {
+    /// per-PR calls. Every call shares `deadline`, the deadline of the chunk
+    /// being retried: once it passes, PRs not yet reached come back as
+    /// retryable errors and the next pass tries again.
+    fn probe_batch_bisect<'a>(
+        &'a self,
+        order: &'a [String],
+        deadline: tokio::time::Instant,
+        depth: ProbeDepth,
+    ) -> BoxedBatchProbe<'a> {
         Box::pin(async move {
             let _fallback = crate::probe_budget::start_fallback(order);
             if order.len() <= 1 {
                 return self.probe_each_individually(order, deadline).await;
             }
             let (left, right) = order.split_at(order.len() / 2);
-            let mut out = self.probe_batch_with_deadline(left, deadline).await;
+            let mut out = self.probe_batch_with_deadline(left, deadline, depth).await;
             if RATE_LIMIT_REJECTED.try_with(|flag| flag.get()).unwrap_or(false) {
                 out.extend(right.iter().map(|url| {
                     (
@@ -256,16 +416,17 @@ impl CommandMergeProbe {
                     )
                 }));
             } else {
-                out.extend(self.probe_batch_with_deadline(right, deadline).await);
+                out.extend(self.probe_batch_with_deadline(right, deadline, depth).await);
             }
             out
         })
     }
 
-    async fn probe_batch_with_deadline(
+    pub(crate) async fn probe_batch_with_deadline(
         &self,
         pr_urls: &[String],
         deadline: tokio::time::Instant,
+        depth: ProbeDepth,
     ) -> HashMap<String, std::result::Result<PrLifecycleProbe, String>> {
         let mut out = HashMap::new();
         // Dedup while parsing so a URL repeated in the input (e.g. a PR that's
@@ -291,7 +452,7 @@ impl CommandMergeProbe {
             return out;
         }
 
-        let (query, alias_map) = build_batch_query(&order, &parsed, PR_PROBE_FIELDS);
+        let (query, alias_map) = build_batch_query(&order, &parsed, depth.fields());
 
         tracing::debug!(
             pr_count = order.len(),
@@ -326,7 +487,7 @@ impl CommandMergeProbe {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::warn!(%err, "merge poller: invalid batched probe response; retrying in halves");
-                    out.extend(self.probe_batch_bisect(&order, deadline).await);
+                    out.extend(self.probe_batch_bisect(&order, deadline, depth).await);
                     return out;
                 }
             },
@@ -394,7 +555,7 @@ impl CommandMergeProbe {
                             "merge poller: batched probe graphql call failed with no usable response — \
                              retrying in halves",
                         );
-                        out.extend(self.probe_batch_bisect(&order, deadline).await);
+                        out.extend(self.probe_batch_bisect(&order, deadline, depth).await);
                         return out;
                     }
                 }
@@ -435,7 +596,7 @@ impl CommandMergeProbe {
                     "merge poller: batched probe graphql response carried an error that names no PR — \
                      retrying in halves",
                 );
-                out.extend(self.probe_batch_bisect(&order, deadline).await);
+                out.extend(self.probe_batch_bisect(&order, deadline, depth).await);
                 return out;
             }
         };
@@ -465,7 +626,7 @@ impl CommandMergeProbe {
                 continue;
             };
             let flat = flatten_batched_pr_node(pr_node);
-            if combined_status_path(&flat, url).is_some() {
+            if depth == ProbeDepth::Full && combined_status_path(&flat, url).is_some() {
                 pending.insert(url.clone(), Some(flat.to_string()));
                 continue;
             }

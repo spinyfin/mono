@@ -1100,6 +1100,12 @@ mod floor_tests {
                 Box::new(|c| stuck_snapshot::migrate(c).unwrap()),
             ),
             (
+                super::super::recurring_read_indexes::MERGE_QUEUE_INDEX_MIGRATION_ID,
+                Box::new(|c| {
+                    super::super::recurring_read_indexes::migrate_merge_queue_index(c).unwrap();
+                }),
+            ),
+            (
                 "20261029_0735_work_executions_item_kind_status_finished_idx",
                 Box::new(|c| {
                     c.execute_batch(WORK_EXECUTIONS_ITEM_KIND_STATUS_FINISHED_INDEX)

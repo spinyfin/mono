@@ -121,7 +121,9 @@ async fn a_fresh_snapshot_is_never_re_probed() {
 
     assert!(
         snapshot
-            .ensure_fresh(probe.as_ref(), || panic!("a fresh snapshot must not re-probe"))
+            .ensure_fresh(probe.as_ref(), &PassState::default(), || panic!(
+                "a fresh snapshot must not re-probe"
+            ))
             .await,
     );
     assert_eq!(
@@ -141,7 +143,11 @@ async fn a_stale_snapshot_is_re_probed_and_its_clock_restarts() {
     let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
 
     tokio::time::advance(PROBE_SNAPSHOT_MAX_AGE + Duration::from_secs(1)).await;
-    assert!(snapshot.ensure_fresh(probe.as_ref(), || probe_urls.clone()).await);
+    assert!(
+        snapshot
+            .ensure_fresh(probe.as_ref(), &PassState::default(), || probe_urls.clone())
+            .await
+    );
     assert_eq!(
         batch_sizes(&batches),
         vec![3, 3],
@@ -152,7 +158,9 @@ async fn a_stale_snapshot_is_re_probed_and_its_clock_restarts() {
     tokio::time::advance(PROBE_SNAPSHOT_MAX_AGE - Duration::from_secs(1)).await;
     assert!(
         snapshot
-            .ensure_fresh(probe.as_ref(), || panic!("taken_at was not refreshed by the re-probe"))
+            .ensure_fresh(probe.as_ref(), &PassState::default(), || panic!(
+                "taken_at was not refreshed by the re-probe"
+            ))
             .await,
     );
     assert_eq!(batch_sizes(&batches), vec![3, 3]);
@@ -167,17 +175,22 @@ async fn ensure_fresh_gives_up_once_the_per_pass_refresh_budget_is_spent() {
     let probe_urls = urls(3);
     let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
 
+    let state = PassState::default();
     for n in 0..MAX_PROBE_REFRESHES_PER_PASS {
         tokio::time::advance(PROBE_SNAPSHOT_MAX_AGE + Duration::from_secs(1)).await;
         assert!(
-            snapshot.ensure_fresh(probe.as_ref(), || probe_urls.clone()).await,
+            snapshot
+                .ensure_fresh(probe.as_ref(), &state, || probe_urls.clone())
+                .await,
             "refresh {n} is within budget",
         );
     }
     tokio::time::advance(PROBE_SNAPSHOT_MAX_AGE + Duration::from_secs(1)).await;
 
     assert!(
-        !snapshot.ensure_fresh(probe.as_ref(), || probe_urls.clone()).await,
+        !snapshot
+            .ensure_fresh(probe.as_ref(), &state, || probe_urls.clone())
+            .await,
         "past the budget the caller must be told to stop, not handed a stale snapshot",
     );
     assert_eq!(

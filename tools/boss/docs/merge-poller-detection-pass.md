@@ -1,14 +1,16 @@
 # Merge poller detection pass
 
 The merge poller runs one full detection pass a minute. A pass lists every
-work item with a PR, probes all of those PRs in one GitHub request, records
-what the probe says, and then runs the upkeep that rides the same cadence.
+work item with a PR, probes those PRs (in bounded chunks, at the depth each
+one needs; see [Probe tiers](#probe-tiers-and-chunks)), records what the probe
+says, and then runs the upkeep that rides the same cadence.
 This page covers the order a pass works in, what happens when it runs out
 of time, and how to find out where its time went.
 
 Source: `tools/boss/engine/merge-poller/src/pass.rs` (the pass),
 `walk_order.rs` (the rotation), `pass_trace.rs` (timing and the health
-signal), `schedule.rs` (the loop and the budget).
+signal), `schedule.rs` (the loop and the budget), `probe_tier.rs` (which PRs
+get which probe) and `probe.rs` (the chunked GraphQL probe).
 
 ## Order of a pass
 
@@ -16,17 +18,17 @@ A pass has a hard budget of three cadences (180 s at the 60 s cadence). It
 is ordered so that what must not be missed comes first and what can be slow
 comes last.
 
-| Phase                                                         | What it does                                                             | Cost scales with                    |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------- |
-| `list_candidates`                                             | The candidate-list queries                                               | Local DB                            |
-| `merge_disarm`                                                | Turns off auto-merge for merges conflict resolution stopped              | Pending disarms, usually zero       |
-| `probe`                                                       | One batched GraphQL request for every tracked PR                         | One round trip                      |
-| `terminal_walk`                                               | Records every PR the probe reports merged or closed                      | PRs that just merged or closed      |
-| `open_walk`                                                   | Upkeep of the PRs that are still open (CI, conflicts, merge-queue state) | Tracked open PRs, local DB          |
-| `stranded_ci`, `stranded_blocked`                             | Recovers remediation that lost its worker or its signal                  | Usually zero items                  |
-| `queue_rebounce`                                              | One batched merge-queue dequeue query, then per-PR checks                | One round trip                      |
-| `stalled_reviewer`, `review_admission`, `review_batch_upkeep` | Reviewer fallback and review-pool upkeep                                 | Local DB                            |
-| `pr_recheck`, `background_nudges`, `late_pr`                  | Per-execution PR detection for workers with no PR bound yet              | Live workers, GitHub calls per item |
+| Phase                                                         | What it does                                                                            | Cost scales with                    |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------- |
+| `list_candidates`                                             | The candidate-list queries                                                              | Local DB                            |
+| `merge_disarm`                                                | Turns off auto-merge for merges conflict resolution stopped                             | Pending disarms, usually zero       |
+| `probe`                                                       | Full probe of the PRs the poller acts on, then a shallow probe of those due             | Chunks of 25 / 100 PRs              |
+| `terminal_walk`                                               | Records every PR the probe reports merged or closed                                     | PRs that just merged or closed      |
+| `open_walk`                                                   | Upkeep of the PRs probed in full that are still open (CI, conflicts, merge-queue state) | Full-tier open PRs, local DB        |
+| `stranded_ci`, `stranded_blocked`                             | Recovers remediation that lost its worker or its signal                                 | Usually zero items                  |
+| `queue_rebounce`                                              | One batched merge-queue dequeue query, then per-PR checks                               | One round trip                      |
+| `stalled_reviewer`, `review_admission`, `review_batch_upkeep` | Reviewer fallback and review-pool upkeep                                                | Local DB                            |
+| `pr_recheck`, `background_nudges`, `late_pr`                  | Per-execution PR detection for workers with no PR bound yet                             | Live workers, GitHub calls per item |
 
 Two properties follow from that order:
 
@@ -49,6 +51,89 @@ Two properties follow from that order:
   the stranded and stalled-reviewer item lists are ordered
   least-recently-attended first, so a slow early subphase or a long list
   cannot keep the later work from running on every pass.
+
+## Probe tiers and chunks
+
+A full probe (CI rollup, reviews, mergeability, merge-queue state) is about 51
+requested GraphQL nodes per PR, and it is only worth that cost for a PR the
+poller will act on. Every other tracked PR is watched only so that a merge or a
+close is still recorded, and a shallow probe answers that for a handful of
+scalar fields.
+
+| Tier    | Rows                                                                                                                                             | Probed                          |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------- |
+| full    | blocked rows (merge conflict, CI failure, dependency or review feedback, stranded)                                                               | every pass                      |
+|         | `in_review` rows in an active product that are not parked and not dormant                                                                        | every pass                      |
+|         | `in_review` rows with a merge in flight (an active merge request, durable `tasks.merge_queue_state`, or last seen queued), including parked rows | every pass                      |
+| shallow | parked rows without a merge in flight, `in_review` rows in other products, rows GitHub has not updated for 14 days                               | when not observed for 5 minutes |
+
+Merge and close detection covers every tracked PR in every product; only how
+often a PR is asked about, and how much, depends on its tier. A row that is
+due for a shallow probe and was never observed (an engine start, a row that has
+just appeared) is probed on the next pass. A shallow probe that fails leaves its
+rows due, so they are asked again next pass.
+
+- **Active product** is the product the Boss app has selected, plus every
+  product named by dispatch focus, directly or through a focused project
+  (`PollerActiveProducts` in `engine/app/src/app/selected_product.rs`). When
+  none is singled out (no app connected, nothing selected, focus off) every
+  product is active, so the tiers change nothing.
+- **Dormant** is read from GitHub's `updatedAt` at the last probe of either
+  tier. A shallow probe reads it again, so a pushed or commented PR is back in
+  the full tier on the next pass. A PR the poller has not probed since the
+  engine started is not dormant.
+- **A shallow result for an open PR is not acted on.** It carries no CI,
+  review or mergeability state, so the open walk, merge-queue rebounce and every
+  other open-PR upkeep run only for PRs probed in full. A shallow result for a
+  merged or closed PR goes through the same terminal walk as a full one: it
+  carries the merge commit, the head and base refs and the repository default
+  branch, so a merge into a non-default branch is still refused.
+- **Nothing remembers "not merged".** The poller remembers when a PR was last
+  observed and what `updatedAt` it showed, never that it was unmerged; a row
+  that is not due is simply not asked about this pass.
+
+Each tier's probe is split into fixed-size chunks, one GraphQL query per chunk,
+sent one at a time in attendance order (previously unfinished and known-terminal
+PRs first):
+
+| Probe   | PRs per query | Measured on the poller's repository (`gh api graphql`)                                 |
+| ------- | ------------: | -------------------------------------------------------------------------------------- |
+| full    |            25 | 1,275 nodes, 1 point, 2.5-3.2 s (125 PRs in one query: 6,375 nodes, 5 points, 5.5-6 s) |
+| shallow |           100 | 0 nodes, 1 point, 0.8 s (200 PRs: 1.05 s)                                              |
+
+Each chunk gets its own deadline, `min(30 s, a quarter of the pass time left)`
+taken when the chunk starts, and the bisect fallback runs inside the chunk.
+A chunk that GitHub rejects or that never returns costs its own PRs only: the
+chunks after it are still sent. A chunk reached with its allowance already
+spent is deferred, and its PRs sort to the front of the next pass. A rate-limit
+rejection stops the rest of the call.
+
+The snapshot the walks write from ages from when the oldest contributing
+chunk started, not from when the last chunk finished. If later chunks run
+long enough that the first results are more than 60 s old, the open-PR walk
+re-probes the remaining PRs before acting.
+
+A PR in GitHub's merge queue, or with auto-merge armed, is probed in full
+every pass even after an engine restart: the pass unions live
+`tasks.merge_queue_state` with recorded merge requests. A shallow probe also
+reads `mergeQueueEntry` and `autoMergeRequest`, so an external enqueue of a
+row that had gone shallow is noticed and the next pass promotes it.
+
+Every pass logs one `merge poller: probe tiers` line at `info`:
+
+| Field                                                                                                              | Meaning                                                                       |
+| ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `full_prs`, `full_observed`                                                                                        | PRs probed in full and how many answered                                      |
+| `full_chunks_attempted`, `_failed`, `_deferred`                                                                    | Chunks sent, chunks that left a PR unobserved, chunks never sent              |
+| `full_oldest_unobserved_secs`                                                                                      | Longest any full-tier PR has gone without an answer                           |
+| `shallow_prs`, `shallow_due`, `shallow_observed`                                                                   | Shallow-tier PRs, those due this pass, those that answered                    |
+| `shallow_chunks_*`, `shallow_oldest_unobserved_secs`                                                               | The same for the shallow tier; this one growing past ~5 minutes is starvation |
+| `rows_blocked`, `rows_active_product`, `rows_merge_in_flight`, `rows_parked`, `rows_other_product`, `rows_dormant` | Why each row is in its tier                                                   |
+| `active_products`, `every_product_active`                                                                          | How many products are active, or that none was singled out                    |
+
+The chunk counts are also in the pass trace (`probe_chunks_full`,
+`probe_chunks_shallow`) and so in the phase breakdown of a slow or abandoned
+pass.
 
 ## When a pass runs out of time
 

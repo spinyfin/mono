@@ -556,6 +556,7 @@ pub(crate) fn kick_clears_quiesce(last_run_at: Instant, now: Instant, window: Du
 }
 
 /// What a poller loop runs against: the services it calls on every pass.
+#[derive(bon::Builder)]
 pub struct LoopServices<C> {
     pub cube_client: Arc<dyn CubeClient>,
     pub completion_handler: Arc<C>,
@@ -563,6 +564,10 @@ pub struct LoopServices<C> {
     /// Conflict handling, design-doc maintenance, population and the optional
     /// passes that ride the full-sweep cadence.
     pub host: Arc<dyn SweepHost>,
+    /// The active products: the product selected in the app plus any named
+    /// by dispatch focus; read before every pass to decide which PRs that
+    /// pass probes in full.
+    pub active_products: Arc<dyn ActiveProducts>,
     /// Where the loop reports that full detection passes are being
     /// abandoned, for the engine health report.
     pub detection_stall: Arc<DetectionStallSignal>,
@@ -634,6 +639,7 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
         completion_handler,
         trunk_queue_api,
         host,
+        active_products,
         detection_stall,
     } = services;
     let (kick, mut pr_reconcile_requests) = kicks;
@@ -657,6 +663,7 @@ pub fn spawn_loop<C: CompletionRequests + 'static>(
             // batch — and so the first sweep on boot isn't blind at the
             // `i64::MAX` sentinel. Free (0 GraphQL points) and best-effort.
             gh_scope(callers::MERGE_POLLER_BUDGET_REFRESH, refresh_rate_limit_budget()).await;
+            pass_state.set_active_products(active_products.active_product_ids().await);
             // Scoped so every GitHub call this pass makes — including the
             // ones inside helpers the adaptive path also uses — is
             // attributed to the batched full sweep rather than blended

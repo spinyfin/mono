@@ -2216,6 +2216,25 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Live work items whose durable merge-queue projection is set (queued,
+    /// auto-merge armed, or resolving a queue conflict). The merge poller
+    /// probes these PRs in full every pass, including after an engine restart
+    /// when in-memory queue memory is empty.
+    ///
+    /// Cost follows the live queue, not the history of `tasks`: the partial
+    /// index `tasks_merge_queue_live_idx` holds only those rows.
+    pub fn list_work_item_ids_in_merge_queue(&self) -> Result<HashSet<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tasks INDEXED BY tasks_merge_queue_live_idx
+              WHERE merge_queue_state IS NOT NULL
+                AND status NOT IN ('done', 'archived')
+                AND deleted_at IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(collect_rows(rows)?.into_iter().collect())
+    }
+
     /// Overwrite `merge_queue_detail` for one task after a whole-queue
     /// renumbering pass recomputed its canonical position. Guarded by
     /// `merge_queue_state = 'queued'` so a row that exited the queue

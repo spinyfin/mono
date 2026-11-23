@@ -818,10 +818,11 @@ pub(crate) async fn sweep_one(
             // skipping it would drop the review permanently.
             maybe_trigger_post_merge_review(work_db, publisher, candidate, &probe_result).await;
         }
-        // A parked row atrophies: merged and closed-unmerged are recorded
-        // (those arms), but no remediation or other upkeep runs for an open PR
-        // while parked. The poll-state columns are only indicators (they mint
-        // nothing), so they are still refreshed to keep the badges truthful.
+        // Only parked rows probed in full reach this arm (blocked, or with a
+        // merge in flight). Parked `in_review` rows without a merge in flight
+        // are shallow and stay out of the walk: they are watched for merge or
+        // close, and their poll-state badges are no longer refreshed. Open-PR
+        // upkeep still does not run while parked.
         PrLifecycleState::Open(_) if parked => {
             tracing::debug!(
                 work_item_id = %candidate.work_item_id,

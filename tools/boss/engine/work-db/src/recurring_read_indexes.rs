@@ -23,6 +23,23 @@ use super::{Connection, Result};
 
 pub(super) const MIGRATION_ID: &str = "20261121_1800_recurring_read_indexes";
 
+/// Partial index of live rows with a durable merge-queue projection, so the
+/// merge poller's per-pass membership read follows the live queue.
+pub(super) const MERGE_QUEUE_INDEX_MIGRATION_ID: &str = "20261122_1600_tasks_merge_queue_live_idx";
+
+pub(super) const MERGE_QUEUE_INDEX_SQL: &str = "
+    CREATE INDEX IF NOT EXISTS tasks_merge_queue_live_idx
+        ON tasks(id)
+        WHERE merge_queue_state IS NOT NULL
+          AND status NOT IN ('done', 'archived')
+          AND deleted_at IS NULL;";
+
+pub(super) fn migrate_merge_queue_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch(MERGE_QUEUE_INDEX_SQL)?;
+    conn.execute_batch("ANALYZE tasks_merge_queue_live_idx;")?;
+    Ok(())
+}
+
 /// Every execution status that is not terminal, as the body of an SQL `IN`
 /// list. Unfinished executions are found through the existing status index
 /// `work_executions_ready_idx`, which can seek a list of statuses but not

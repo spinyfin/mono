@@ -791,3 +791,80 @@ async fn report_from_the_app_session_is_acked_as_accepted_and_recorded() {
         Some(product.id.as_str()),
     );
 }
+
+// ── The merge poller's active products ─────────────────────────────────────
+//
+// The poller probes a product's PRs in full only for the active products: the
+// product selected in the app plus any named by dispatch focus. Singling out
+// nothing must read as "every product is active", never as "no product is", or
+// every row would be demoted at once.
+
+async fn active_products(server_state: &Arc<ServerState>) -> Option<std::collections::HashSet<String>> {
+    use boss_engine_merge_poller::ActiveProducts;
+    crate::app::selected_product::PollerActiveProducts(Arc::downgrade(server_state))
+        .active_product_ids()
+        .await
+}
+
+#[tokio::test]
+async fn no_selection_and_no_focus_single_out_no_product() {
+    let (server_state, _dir) = test_server_state();
+    boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "only-product");
+    assert_eq!(active_products(&server_state).await, None, "no app connected");
+
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    assert_eq!(
+        active_products(&server_state).await,
+        None,
+        "app connected, nothing selected"
+    );
+}
+
+#[tokio::test]
+async fn the_selected_product_is_active() {
+    let (server_state, _dir) = test_server_state();
+    let selected = boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "flunge");
+    boss_engine_runtime::test_support::create_test_product_named(&server_state.work_db, "mono");
+    server_state
+        .register_app_session("session-app".into(), make_session_sink())
+        .await;
+    server_state
+        .record_selected_product("session-app", Some(selected.id.clone()))
+        .await;
+
+    assert_eq!(
+        active_products(&server_state).await,
+        Some([selected.id].into_iter().collect()),
+    );
+}
+
+#[tokio::test]
+async fn focused_products_and_the_products_of_focused_projects_are_active() {
+    let (server_state, _dir) = test_server_state();
+    let db = &server_state.work_db;
+    let focused = boss_engine_runtime::test_support::create_test_product_named(db, "focused");
+    let via_project = boss_engine_runtime::test_support::create_test_product_named(db, "via-project");
+    boss_engine_runtime::test_support::create_test_product_named(db, "other");
+    let project = db
+        .create_project(boss_protocol::CreateProjectInput {
+            product_id: via_project.id.clone(),
+            name: "Project".into(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+            design_reasoning_effort_xhigh: false,
+        })
+        .unwrap();
+    let mut focus = boss_protocol::DispatchFocus::default();
+    focus.product_ids.insert(focused.id.clone());
+    focus.project_ids.insert(project.id);
+    db.save_dispatch_focus(&focus).unwrap();
+
+    assert_eq!(
+        active_products(&server_state).await,
+        Some([focused.id, via_project.id].into_iter().collect()),
+    );
+}
