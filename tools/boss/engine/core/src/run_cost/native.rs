@@ -91,16 +91,10 @@ fn count(value: &Value, key: &str) -> Option<i64> {
 }
 
 fn grok(value: &Value) -> Option<(String, RunCostSnapshot)> {
-    if !matches!(
-        value.get("method").and_then(Value::as_str),
-        Some("session/update" | "_x.ai/session/update")
-    ) {
+    if !boss_engine_driver::grok::is_turn_completed(value) {
         return None;
     }
     let update = value.pointer("/params/update")?;
-    if update.get("sessionUpdate")?.as_str()? != "turn_completed" {
-        return None;
-    }
     let id = update.get("prompt_id")?.as_str()?;
     let usage = &update["usage"];
     let cache_read_tokens = count(usage, "cachedReadTokens");

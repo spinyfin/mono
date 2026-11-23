@@ -1,5 +1,6 @@
 //! Token-identified tmux worker sessions: Spawn, Adopt, Deliver, Stop.
 
+mod grok_teardown;
 mod permissions;
 #[path = "worker_paths.rs"]
 mod worker_paths;
@@ -125,6 +126,10 @@ pub struct ExecutionRecord {
     #[serde(default)]
     #[builder(default)]
     pub worker_outputs: BTreeMap<String, String>,
+    /// Specific Grok settle `usage_unavailable` reason, written before
+    /// `kill_session_verified` so a replayed Stop still journals it.
+    #[serde(default)]
+    pub usage_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +213,13 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             .load(&run.run_id, &run.spawn_token)?
             .map(|bytes| decode(&bytes))
             .transpose()
+    }
+
+    /// Durable Grok settle `usage_unavailable` reason for this run, if Stop
+    /// recorded one. The spoke journals a Gap from this field rather than
+    /// inferring one from `CommandResult.reason`.
+    pub fn persisted_usage_unavailable(&self, run: &Run) -> Result<Option<String>> {
+        Ok(self.loaded(run)?.and_then(|record| record.usage_unavailable_reason))
     }
 
     pub async fn execute(&self, command: &Command, interrupted: bool, now_ms: i64) -> CommandResult {
@@ -295,6 +307,7 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
             reclaim_error: None,
             observation: None,
             worker_outputs: output_environment.clone(),
+            usage_unavailable_reason: None,
         };
         self.persist(&record)?;
         if interrupted {
@@ -882,6 +895,27 @@ impl<T: CubeJsonTransport, S: ExecutionStore> Supervisor<T, S> {
         record.phase = Phase::Stopping;
         self.persist(&record)?;
         let mut observed = self.observe(&record).await;
+        // Only cancel and wait when the pane is positively verified as alive
+        // and owned by this execution's spawn token. Foreign, unreadable,
+        // exited, or missing panes must never be sent interrupt keys or delayed.
+        let grok_settle = if pane_life(&observed) == PaneLife::Alive {
+            let outcome = grok_teardown::settle_open_grok_turn(
+                &self.tmux,
+                &record.session,
+                record.home.as_deref(),
+                &record.execution_id,
+                &record.driver_id,
+            )
+            .await;
+            observed = self.observe(&record).await;
+            outcome
+        } else {
+            grok_teardown::GrokSettleOutcome::Skipped
+        };
+        if let Some(reason) = grok_settle.usage_unavailable_reason() {
+            record.usage_unavailable_reason = Some(reason);
+            self.persist(&record)?;
+        }
         if stop.grace_ms > 0 {
             let budget = Duration::from_millis(u64::from(stop.grace_ms.min(30_000)));
             let deadline = Instant::now() + budget;

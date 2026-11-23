@@ -27,6 +27,10 @@ pub mod negotiate;
 pub mod validate;
 pub mod worker_event;
 
+/// Gap resource name used by a spoke host to record a durable, run-attributed
+/// `usage_unavailable` reason (for example when Grok teardown settle expires).
+pub const USAGE_UNAVAILABLE_GAP_RESOURCE: &str = "usage_unavailable";
+
 /// Shared proposal wire mapping used by both the spoke gateway and the hub
 /// projector.
 ///

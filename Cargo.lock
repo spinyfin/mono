@@ -906,6 +906,7 @@ dependencies = [
  "boss-pr-review",
  "boss-protocol",
  "boss-ssh-transport",
+ "boss-transcript-tail",
  "libc",
  "serde",
  "serde_json",
@@ -1495,6 +1496,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

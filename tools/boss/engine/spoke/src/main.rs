@@ -174,12 +174,43 @@ mod commands {
                 result.code = ResultCode::OutcomeUncertain.into();
             }
             let observed = stamp()?;
+            let usage_unavailable_reason = match (&command.body, supervisor.as_ref(), command.run.as_ref()) {
+                (Some(command::Body::Stop(_)), Some(supervisor), Some(run)) if result.code == ResultCode::Ok as i32 => {
+                    supervisor.persisted_usage_unavailable(run).ok().flatten()
+                }
+                _ => None,
+            };
+            let mut usage_unavailable_recorded = usage_unavailable_reason.is_none();
             loop {
-                let completed = journal
-                    .lock()
-                    .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?
-                    .complete_command(&command, result.clone(), &observed);
-                match completed {
+                let step = {
+                    let mut guard = journal
+                        .lock()
+                        .map_err(|_| anyhow::Error::from(boss_spoke_journal::Fault::LockPoisoned))?;
+                    let mut append_err = None;
+                    if !usage_unavailable_recorded && let Some(reason) = usage_unavailable_reason.as_deref() {
+                        let gap_record = boss_protocol_spoke::v1::Record {
+                            run: command.run.clone(),
+                            observed: Some(observed.clone()),
+                            body: Some(boss_protocol_spoke::v1::record::Body::Gap(
+                                boss_protocol_spoke::v1::Gap {
+                                    resource: boss_protocol_spoke::USAGE_UNAVAILABLE_GAP_RESOURCE.into(),
+                                    reason: reason.to_owned(),
+                                    ..Default::default()
+                                },
+                            )),
+                            ..Default::default()
+                        };
+                        match guard.append(gap_record, boss_spoke_journal::Admission::Lifecycle) {
+                            Ok(_) => usage_unavailable_recorded = true,
+                            Err(error) => append_err = Some(error),
+                        }
+                    }
+                    match append_err {
+                        Some(error) => Err(error),
+                        None => guard.complete_command(&command, result.clone(), &observed),
+                    }
+                };
+                match step {
                     Ok(()) => break,
                     Err(error) if Fault::is_full(&error) => interval.tick().await,
                     Err(error) => return Err(error),

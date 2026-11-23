@@ -37,7 +37,7 @@ use crate::transcript_store::{durable_transcript_containment_root, persistable_t
 /// worker transcript store. Every caller that resolves, provisions, or grants
 /// access to that directory must agree on it, so it lives here rather than as
 /// a repeated literal.
-pub(crate) const TRANSCRIPT_DRIVER_SLUG: &str = "grok";
+pub const TRANSCRIPT_DRIVER_SLUG: &str = "grok";
 
 mod classify_error;
 mod environment;
@@ -48,8 +48,18 @@ mod oauth_refresh;
 mod permissions;
 mod preflight;
 mod progress;
+mod teardown_settle;
 mod transcript;
 mod turn_end_recovery;
+
+pub use teardown_settle::{
+    EventsTurnState, GROK_TEARDOWN_POLL_INTERVAL, GROK_TEARDOWN_SETTLE_WINDOW, GROK_TEARDOWN_USAGE_UNAVAILABLE_REASON,
+    GrokSettleDecision, GrokSettleResult, GrokSettleStatus, GrokSettleTails, GrokSettleTransport, GrokTurnProgress,
+    UpdatesTurnState, remaining_budget, settle_open_turn, timeout_remaining,
+};
+pub use turn_end_recovery::{
+    is_turn_completed, is_turn_end, is_turn_started, session_files_for_home, session_files_for_run,
+};
 
 pub(crate) use home::GROK_HOMES_DIR_NAME;
 pub use home::{

@@ -195,6 +195,10 @@ pub enum Proposed {
     Retry(String),
 }
 
+/// Gap resource name used by a spoke host to record a durable, run-attributed
+/// `usage_unavailable` reason (for example when Grok teardown settle expires).
+pub use boss_protocol_spoke::USAGE_UNAVAILABLE_GAP_RESOURCE;
+
 /// The engine's existing consumers, behind the projection.
 ///
 /// Every method is called with one observation of a run whose assignment is
@@ -233,6 +237,13 @@ pub trait ObservationApplier: Send + Sync {
     /// open that file and never a path on the host.
     async fn transcript_attached(&self, origin: &Origin, source: &TranscriptSource) -> Applied {
         let _ = (origin, source);
+        Applied::Done
+    }
+
+    /// A spoke host reported that a run's token usage could not be captured
+    /// (for example, Grok teardown settle timed out before `turn_completed`).
+    async fn usage_unavailable(&self, origin: &Origin, reason: &str) -> Applied {
+        let _ = (origin, reason);
         Applied::Done
     }
 
@@ -932,6 +943,14 @@ impl Inner {
     /// A disk or database fault holds the cursor and retries; a resource the
     /// hub cannot trust is halted and reported, and the cursor moves on.
     async fn apply_custody(&self, observation: Observation, owed: &mut Vec<Owed>) -> Result<(), Interrupted> {
+        if let Observation::Gap(found) = &observation
+            && found.gap.resource == USAGE_UNAVAILABLE_GAP_RESOURCE
+        {
+            return match self.applier.usage_unavailable(&found.origin, &found.gap.reason).await {
+                Applied::Done => Ok(()),
+                Applied::Retry(reason) => Err(Interrupted::Retry(reason)),
+            };
+        }
         let Some(custody) = self.custody.clone() else {
             tracing::debug!(
                 sequence = observation.origin().sequence,

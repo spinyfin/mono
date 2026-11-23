@@ -10,14 +10,55 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::transcript_tail::TranscriptTail;
+use crate::transcript_tail::{TailError, TranscriptTail};
 
 pub(crate) use boss_engine_storage_values::RunCostSnapshot;
+
+/// Outcome of [`RunCostCapture::capture_and_persist`].
+///
+/// Transient failures (I/O, SQLite busy) must be retried so a later drain can
+/// still persist usage. Permanent failures (containment refusal, a halted or
+/// unreadable generation) must not hold the projector cursor.
+#[derive(Debug)]
+pub enum CaptureError {
+    Transient(String),
+    Permanent(String),
+}
+
+impl CaptureError {
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+}
+
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(message) | Self::Permanent(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
+impl From<TailError> for CaptureError {
+    fn from(error: TailError) -> Self {
+        match error {
+            TailError::Io(error) => Self::Transient(format!("transcript io: {error}")),
+            TailError::Containment(message) => Self::Permanent(format!("transcript containment: {message}")),
+            TailError::Utf8(error) => Self::Permanent(format!("transcript bytes are not valid utf-8: {error}")),
+            TailError::Json { error, line } => {
+                Self::Permanent(format!("transcript line is not valid JSON: {error} (line: {line:?})"))
+            }
+        }
+    }
+}
 
 mod native;
 
@@ -293,10 +334,9 @@ struct TranscriptCostTail {
 }
 
 impl TranscriptCostTail {
-    fn new(transcript_path: &Path, containment_root: Option<&Path>) -> Result<Self, String> {
+    fn new(transcript_path: &Path, containment_root: Option<&Path>) -> Result<Self, CaptureError> {
         let tail = match containment_root {
-            Some(root) => TranscriptTail::new_contained(transcript_path.to_owned(), root.to_owned())
-                .map_err(|error| error.to_string())?,
+            Some(root) => TranscriptTail::new_contained(transcript_path.to_owned(), root.to_owned())?,
             None => TranscriptTail::new(transcript_path.to_owned()),
         };
         Ok(Self {
@@ -321,15 +361,15 @@ impl RunCostTail {
         containment_root: Option<&Path>,
         capture_provider_usage: bool,
         limit: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CaptureError> {
         let replace = match self.tails.get(transcript_path) {
             Some(state)
                 if state.containment_root.is_some() && state.containment_root.as_deref() != containment_root =>
             {
-                return Err(format!(
+                return Err(CaptureError::Permanent(format!(
                     "refusing transcript containment downgrade or root change for {}",
                     transcript_path.display()
-                ));
+                )));
             }
             Some(state) => state.containment_root.as_deref() != containment_root,
             None => false,
@@ -342,11 +382,7 @@ impl RunCostTail {
             .tails
             .get_mut(transcript_path)
             .expect("transcript cost tail was just inserted");
-        let values = state
-            .tail
-            .poll_through(limit)
-            .await
-            .map_err(|error| error.to_string())?;
+        let values = state.tail.poll_through(limit).await?;
         let mut full_replacement = replace;
         if state.tail.generation() != state.accumulator_generation {
             state.accumulator = CostAccumulator::default();
@@ -374,20 +410,35 @@ impl RunCostTail {
 #[derive(Default)]
 pub struct RunCostCapture {
     inner: StdMutex<HashMap<String, Arc<Mutex<RunCostTail>>>>,
+    persist_blocked: AtomicBool,
 }
 
 /// Check a hub transcript against custody before opening it. Local paths have
 /// no custody row and retain their ordinary filesystem semantics.
-pub fn transcript_read_limit(db: &crate::work::WorkDb, path: &Path) -> Result<Option<u64>, String> {
-    let root = boss_engine_driver::transcript_store::transcript_store_root().map_err(|e| e.to_string())?;
+pub fn transcript_read_limit(db: &crate::work::WorkDb, path: &Path) -> Result<Option<u64>, CaptureError> {
+    let root = boss_engine_driver::transcript_store::transcript_store_root()
+        .map_err(|error| CaptureError::Permanent(error.to_string()))?;
     crate::hub::projection::Custody::new(db.clone(), root)
         .read_limit_at(path)
-        .map_err(|e| e.to_string())
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("halted") || message.contains("invalid") {
+                CaptureError::Permanent(message)
+            } else {
+                CaptureError::Transient(message)
+            }
+        })
 }
 
 impl RunCostCapture {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hold [`Self::capture_and_persist`] in the transient-failure path so a
+    /// later drain can replay the same transcript chunk.
+    pub fn set_persist_blocked_for_test(&self, blocked: bool) {
+        self.persist_blocked.store(blocked, Ordering::SeqCst);
     }
 
     pub async fn capture_and_persist(
@@ -396,7 +447,10 @@ impl RunCostCapture {
         execution_id: &str,
         transcript_path: &Path,
         containment_root: Option<&Path>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CaptureError> {
+        if self.persist_blocked.load(Ordering::SeqCst) {
+            return Err(CaptureError::Transient("run-cost persist blocked for test".to_owned()));
+        }
         let limit = transcript_read_limit(work_db, transcript_path)?.unwrap_or(u64::MAX);
         let state = {
             let mut guard = self.inner.lock().expect("run cost capture mutex poisoned");
@@ -425,7 +479,7 @@ impl RunCostCapture {
         // cannot persist cumulative snapshots out of order.
         work_db
             .set_run_cost_snapshot(execution_id, snapshot)
-            .map_err(|error| error.to_string())
+            .map_err(|error| CaptureError::Transient(error.to_string()))
     }
 
     pub fn forget(&self, execution_id: &str) {
@@ -629,7 +683,7 @@ mod tests {
         tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap();
         let downgrade_error = tail.poll(&path, None, false, u64::MAX).await.unwrap_err();
         assert!(
-            downgrade_error.contains("containment downgrade"),
+            matches!(&downgrade_error, CaptureError::Permanent(message) if message.contains("containment downgrade")),
             "a contained cost tail must never become unrestricted: {downgrade_error}",
         );
         std::fs::remove_file(&path).unwrap();
@@ -637,7 +691,7 @@ mod tests {
 
         let error = tail.poll(&path, Some(&root), false, u64::MAX).await.unwrap_err();
         assert!(
-            error.contains("transcript"),
+            error.to_string().contains("transcript"),
             "contained run-cost tail must reject path replacement: {error}",
         );
         assert_eq!(tail.snapshot().unwrap().input_tokens, Some(1));

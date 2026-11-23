@@ -165,6 +165,36 @@ impl ServerApplier {
     }
 }
 
+async fn ingest_spoke_transcript_cost(state: &ServerState, execution_id: &str, source: &TranscriptSource) -> Applied {
+    match tokio::fs::try_exists(&source.path).await {
+        Ok(false) => return Applied::Done,
+        Err(error) => {
+            return Applied::Retry(format!(
+                "spoke transcript exists check failed for {}: {error}",
+                source.path.display()
+            ));
+        }
+        Ok(true) => {}
+    }
+    match state
+        .run_cost_capture
+        .capture_and_persist(&state.work_db, execution_id, &source.path, Some(&source.root))
+        .await
+    {
+        Ok(_) => Applied::Done,
+        Err(error) if error.is_transient() => Applied::Retry(error.to_string()),
+        Err(error) => {
+            tracing::warn!(
+                execution_id,
+                transcript_path = %source.path.display(),
+                %error,
+                "failed to capture cumulative run cost from spoke transcript",
+            );
+            Applied::Done
+        }
+    }
+}
+
 #[async_trait]
 impl ObservationApplier for ServerApplier {
     async fn event(&self, observation: &EventObservation) -> Applied {
@@ -260,6 +290,9 @@ impl ObservationApplier for ServerApplier {
                 if let Err(error) = state.work_db.set_run_transcript_path_if_unset(execution_id, &path) {
                     return Applied::Retry(format!("{error:#}"));
                 }
+                if state.transcript_path_cache.get(execution_id).as_deref() == Some(path.as_str()) {
+                    return ingest_spoke_transcript_cost(&state, execution_id, source).await;
+                }
                 return Applied::Done;
             }
             Ok(true) => {}
@@ -267,7 +300,23 @@ impl ObservationApplier for ServerApplier {
         state
             .record_driver_signal(execution_id, DriverSignalKind::TranscriptPath)
             .await;
-        Applied::Done
+        ingest_spoke_transcript_cost(&state, execution_id, source).await
+    }
+
+    async fn usage_unavailable(&self, origin: &Origin, reason: &str) -> Applied {
+        let state = match self.state() {
+            Ok(state) => state,
+            Err(err) => return Applied::Retry(err),
+        };
+        let execution_id = origin.run.execution_id.as_str();
+        let snapshot = boss_engine_storage_values::RunCostSnapshot {
+            usage_unavailable: Some(reason.to_owned()),
+            ..Default::default()
+        };
+        match state.work_db.set_run_cost_snapshot(execution_id, snapshot) {
+            Ok(_) => Applied::Done,
+            Err(error) => Applied::Retry(format!("{error:#}")),
+        }
     }
 
     async fn proposal(&self, origin: &Origin, kind: ProposalKind, payload: &Value, key: &str) -> Proposed {
