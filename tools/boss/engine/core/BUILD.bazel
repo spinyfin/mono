@@ -93,7 +93,10 @@ rust_binary(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     stamp = 0,
-    visibility = ["//tools/boss/app-macos:__pkg__"],
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/installer:__pkg__",
+    ],
     deps = [
         ":engine_lib",
         "//tools/boss/build-info",

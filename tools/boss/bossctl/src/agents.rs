@@ -3,9 +3,9 @@
 //! launch, list, pools), the reference-resolution helpers shared with
 //! `bossctl probe`, and the small neighboring `work start` / `work
 //! cancel` / `reveal` / `open` verbs that were interleaved with them in
-//! `main.rs`.
+//! `lib.rs`.
 //!
-//! Split out of `main.rs` for file-size hygiene; behavior is
+//! Split out of `lib.rs` for file-size hygiene; behavior is
 //! unchanged from when these lived inline. Uses `use super::*` (like
 //! the `app/*.rs` submodule split in `boss-engine`) rather than
 //! explicit imports, since this is a large mechanical extraction of

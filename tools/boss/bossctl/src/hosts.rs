@@ -1,7 +1,7 @@
 //! `bossctl hosts` command definitions and handlers.
 //!
 //! Clap subcommand enums live next to the handlers that consume them so
-//! `main.rs` stays a dispatch table.
+//! `lib.rs` stays a dispatch table.
 
 use std::path::PathBuf;
 
