@@ -297,7 +297,7 @@ fn cached_board_matches_uncached_through_every_review_input() {
     board.sql("UPDATE tasks SET status = 'in_review' WHERE id = ?1", &[&revision]);
     assert_eq!(board.assert_equivalent().misses, 1);
     let badge = board.card(&root).ai_review_badge.unwrap();
-    assert_eq!(badge.label, "No AI review scheduled");
+    assert_eq!(badge.label, "Findings addressed");
 
     // Removing the revision from the board changes the family.
     board.sql("UPDATE tasks SET deleted_at = '9' WHERE id = ?1", &[&revision]);
@@ -907,4 +907,129 @@ fn warm_cache_follows_parking_hold_and_churn_window_transitions() {
     );
     assert_eq!(board.assert_equivalent().misses, 0);
     assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Clear the dead review so the remaining parking checks exercise deferred
+    // admission and generation-1 readmission in isolation.
+    board.sql("DELETE FROM work_executions WHERE work_item_id = ?1", &[&root]);
+    assert_eq!(board.assert_equivalent().misses, 1);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+
+    // Deferred admission marker respects both task and project parking on a warm cache.
+    board.sql(
+        "INSERT INTO work_attention_items(id, work_item_id, kind, status, title, body_markdown, created_at)
+         VALUES ('park-deferred-1', ?1, 'pr_review_admission_deferred', 'open', 't', 'b', '1')",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    board.sql(
+        "UPDATE tasks SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    board.sql("UPDATE tasks SET parked_at = NULL WHERE id = ?1", &[&root]);
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    board.sql(
+        "UPDATE projects SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+        &[&project],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    board.sql("UPDATE projects SET parked_at = NULL WHERE id = ?1", &[&project]);
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    board.sql(
+        "UPDATE work_attention_items SET status = 'resolved' WHERE id = 'park-deferred-1'",
+        &[],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+
+    // Generation-1 failed batch readmission also respects task and project parking.
+    board.sql(
+        "INSERT INTO pr_review_batches(id, cycle_root_id, base_sha, classification_json, created_at, phase, pr_number, pr_url, status, target_sha, updated_at, generation, explicit)
+         VALUES ('park-readmit-1', ?1, 'b', '{}', '1', 'pre_merge', 8, 'https://github.com/spinyfin/mono/pull/8', 'failed', 'h1', '1', 1, 0)",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    board.sql(
+        "UPDATE tasks SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    board.sql("UPDATE tasks SET parked_at = NULL WHERE id = ?1", &[&root]);
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+    board.sql(
+        "UPDATE projects SET parked_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+        &[&project],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    board.sql("UPDATE projects SET parked_at = NULL WHERE id = ?1", &[&project]);
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+}
+
+/// A `skipped_noop` verdict at the current head must not mask live review-due
+/// signals (such as an open `pr_review_admission_deferred` marker) in either
+/// the cached or uncached board.
+#[test]
+fn skip_verdict_at_head_yields_to_open_deferred_marker_in_cached_and_uncached_board() {
+    let board = Board::new("review-cache-skip-deferred");
+    let root = board.in_review_chore(9);
+    board.observe(&root, "h2", "success", "mergeable");
+    board.verdict(&root, "h2", REVIEW_GATE_OUTCOME_SKIPPED_NOOP);
+
+    // With nothing due, the skip verdict projects review_not_required.
+    assert_eq!(board.assert_equivalent().misses, 1);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+
+    // An open deferred-admission marker at the same head overrides the skip
+    // verdict without requiring a cache invalidation.
+    board.sql(
+        "INSERT INTO work_attention_items(id, work_item_id, kind, status, title, body_markdown, created_at)
+         VALUES ('skip-deferred-1', ?1, 'pr_review_admission_deferred', 'open', 't', 'b', '1')",
+        &[&root],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(board.card(&root).ai_review_state.as_deref(), Some("not_reviewed"));
+
+    // Resolving the marker returns the head to review_not_required.
+    board.sql(
+        "UPDATE work_attention_items SET status = 'resolved' WHERE id = 'skip-deferred-1'",
+        &[],
+    );
+    assert_eq!(board.assert_equivalent().misses, 0);
+    assert_eq!(
+        board.card(&root).ai_review_state.as_deref(),
+        Some("review_not_required")
+    );
 }

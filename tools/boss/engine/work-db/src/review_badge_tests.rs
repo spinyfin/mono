@@ -118,10 +118,33 @@ fn review_badge_head_moved_preserves_findings_and_revision_history() {
             .contains("Findings addressed; the fix has not been AI-reviewed.")
     );
     assert_eq!(badge.label, "Not reviewed: latest commit");
+    let unscheduled_moved = badge_presentation("review_not_required", None, Some(&history), "card");
+    assert_eq!(unscheduled_moved.label, "No AI review scheduled");
+    assert!(
+        unscheduled_moved
+            .tooltip
+            .contains("Findings addressed; the fix has not been AI-reviewed.")
+    );
     history.head = history.reviewed_sha.clone();
     let badge = badge_presentation("not_reviewed", None, Some(&history), "card");
     assert_eq!(badge.label, "Findings addressed");
     assert_eq!(badge.system_image, "checkmark.circle");
+    assert!(
+        badge
+            .tooltip
+            .contains("The findings revision delivered without a new commit. No subsequent AI review is recorded.")
+    );
+    let unscheduled_unmoved = badge_presentation("review_not_required", None, Some(&history), "card");
+    assert_eq!(unscheduled_unmoved.label, "Findings addressed");
+    assert_eq!(unscheduled_unmoved.system_image, "checkmark.circle");
+    assert!(unscheduled_unmoved.tooltip.contains(
+        "The findings revision delivered without a new commit. No subsequent AI review is recorded or scheduled."
+    ));
+    assert!(
+        unscheduled_unmoved
+            .tooltip
+            .contains("Findings addressed; the fix has not been AI-reviewed.")
+    );
 }
 
 #[test]
@@ -574,30 +597,32 @@ fn review_badge_distinguishes_a_head_whose_reviewers_failed_to_start() {
             last_error: Some(long_error.clone()),
         }),
     };
-    let badge = badge_presentation("not_reviewed", None, Some(&history), "card");
-    assert_eq!(badge.label, "AI review failed to start");
-    assert_eq!(badge.system_image, "exclamationmark.triangle");
-    assert!(badge.tooltip.contains("generation 2"), "{}", badge.tooltip);
-    assert!(
-        badge.tooltip.contains("will not schedule another review"),
-        "{}",
-        badge.tooltip
-    );
-    assert!(
-        badge.tooltip.contains("Last error: preserved work"),
-        "{}",
-        badge.tooltip
-    );
-    assert!(
-        badge.tooltip.contains('…') && !badge.tooltip.contains(&long_error),
-        "{}",
-        badge.tooltip
-    );
-    assert!(
-        badge.tooltip.contains("Current head eecbba2 differs"),
-        "{}",
-        badge.tooltip
-    );
+    for state in ["not_reviewed", "review_not_required"] {
+        let badge = badge_presentation(state, None, Some(&history), "card");
+        assert_eq!(badge.label, "AI review failed to start", "{state}");
+        assert_eq!(badge.system_image, "exclamationmark.triangle", "{state}");
+        assert!(badge.tooltip.contains("generation 2"), "{state}: {}", badge.tooltip);
+        assert!(
+            badge.tooltip.contains("will not schedule another review"),
+            "{state}: {}",
+            badge.tooltip
+        );
+        assert!(
+            badge.tooltip.contains("Last error: preserved work"),
+            "{state}: {}",
+            badge.tooltip
+        );
+        assert!(
+            badge.tooltip.contains('…') && !badge.tooltip.contains(&long_error),
+            "{state}: {}",
+            badge.tooltip
+        );
+        assert!(
+            badge.tooltip.contains("Current head eecbba2 differs"),
+            "{state}: {}",
+            badge.tooltip
+        );
+    }
     // Any other state is presented as before.
     let badge = badge_presentation("reviewing", None, Some(&history), "card");
     assert_eq!(badge.label, "AI reviewing…");

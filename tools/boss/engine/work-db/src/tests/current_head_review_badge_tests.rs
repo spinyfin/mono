@@ -376,13 +376,16 @@ fn current_head_review_badge_findings_revision_delivered_without_head_change_is_
     assert_eq!(delivered.ai_review_state.as_deref(), Some("review_not_required"));
     assert!(delivered.ai_review_findings_revision_id.is_none());
     let badge = delivered.ai_review_badge.unwrap();
-    assert_eq!(badge.label, "No AI review scheduled");
-    assert_eq!(badge.system_image, "minus.circle");
+    assert_eq!(badge.label, "Findings addressed");
+    assert_eq!(badge.system_image, "checkmark.circle");
     assert!(badge.tooltip.contains("Last reviewed h1"));
+    assert!(badge.tooltip.contains(
+        "The findings revision delivered without a new commit. No subsequent AI review is recorded or scheduled."
+    ));
     assert!(
         badge
             .tooltip
-            .contains("No AI review of the current PR head is running or scheduled")
+            .contains("Findings addressed; the fix has not been AI-reviewed.")
     );
     assert!(badge.tooltip.contains("(Review)"));
     let tree = db.get_work_tree(&product).unwrap();
@@ -579,12 +582,11 @@ fn current_head_review_badge_findings_revision_delivered_unmoved_with_skip_is_no
         Some("review_queued"),
         "with a queued review, the unmoved head waits"
     );
+    // Removing the queued review (not leaving a recoverable dead review row)
+    // leaves nothing due, so the skip verdict resolves to review_not_required.
     db.connect()
         .unwrap()
-        .execute(
-            "UPDATE work_executions SET status = 'cancelled' WHERE id = ?1",
-            [&queued_review.id],
-        )
+        .execute("DELETE FROM work_executions WHERE id = ?1", [&queued_review.id])
         .unwrap();
 
     let execution = skip_execution(&db, &revision);

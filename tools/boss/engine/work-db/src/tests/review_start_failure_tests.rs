@@ -73,7 +73,7 @@ fn quorum_fails_the_batch_when_fewer_than_two_leaves_report() {
         find_quorum_failed_attention(&db, &cycle_root.id).expect("a pr_review_quorum_failed attention must be filed");
     assert!(attention.title.to_lowercase().contains("insufficient quorum"));
     assert!(!attention.title.contains("reviewers never started"));
-    assert!(attention.body_markdown.contains("head as not reviewed"));
+    assert!(attention.body_markdown.contains("head as \"No AI review scheduled\""));
     assert!(!attention.body_markdown.contains("AI review failed to start"));
     let card = db
         .get_work_tree(&product.id)
@@ -227,7 +227,7 @@ fn quorum_failure_names_reviewers_that_never_started_and_the_spent_generation_ca
     assert!(!body.contains("re-admits one replacement batch"), "{body}");
 
     let second_card = card(&db);
-    assert_eq!(second_card.ai_review_state.as_deref(), Some("not_reviewed"));
+    assert_eq!(second_card.ai_review_state.as_deref(), Some("review_not_required"));
     let badge = second_card.ai_review_badge.expect("badge");
     assert_eq!(badge.label, "AI review failed to start");
     assert_eq!(badge.system_image, "exclamationmark.triangle");

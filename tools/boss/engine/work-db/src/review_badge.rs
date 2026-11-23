@@ -82,12 +82,13 @@ pub(super) fn fetch_current_heads(
 /// A findings verdict whose findings revision has delivered without moving the
 /// head the verdict reviewed (it edited the PR title/body, or justified no
 /// change) no longer counts as unresolved: nothing will ever re-review that
-/// unchanged head, so the badge would otherwise stay orange forever. It
-/// resolves to `review_not_required` once a skip verdict records that no review
-/// will run at that head; until then it is `due_dependent`, yielding
-/// `not_reviewed` only while a review is due and `review_not_required`
-/// otherwise. A newer verdict for the same head still wins because it is
-/// selected before this check.
+/// unchanged head, so the badge would otherwise stay orange forever. Both that
+/// case and explicit skip verdicts (`skipped_noop`, `skipped_cycle_cap`) are
+/// `due_dependent`, yielding `not_reviewed` whenever a review is still due at
+/// the head (for example an open deferred-admission marker, live batch, or
+/// readmission) and `review_not_required` otherwise. A newer informative
+/// verdict for the same head still wins because it is selected before this
+/// check.
 pub(super) fn fetch_verdict_heads(
     conn: &Connection,
     ids: &[String],
@@ -108,21 +109,16 @@ pub(super) fn fetch_verdict_heads(
             row.get::<_, Option<String>>(4)?,
             row.get::<_, bool>(5)?,
             row.get::<_, bool>(6)?,
-            row.get::<_, bool>(7)?,
         ))
     })?;
     let mut result = HashMap::new();
     for row in rows {
-        let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved, skipped_at_head) = row?;
+        let (id, outcome, revision, ci, mergeable, pending_work, revision_delivered_unmoved) = row?;
         let mut due_dependent = false;
         let (state, findings_revision_id) = match outcome.as_deref() {
             Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS) if revision_delivered_unmoved => {
-                if skipped_at_head {
-                    (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None)
-                } else {
-                    due_dependent = true;
-                    (AI_REVIEW_STATE_NOT_REVIEWED, None)
-                }
+                due_dependent = true;
+                (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None)
             }
             Some(REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS | REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED) => {
                 (AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS, revision)
@@ -137,6 +133,7 @@ pub(super) fn fetch_verdict_heads(
                 (state, None)
             }
             Some(REVIEW_GATE_OUTCOME_SKIPPED_NOOP | REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP) => {
+                due_dependent = true;
                 (AI_REVIEW_STATE_REVIEW_NOT_REQUIRED, None)
             }
             _ => {
@@ -449,6 +446,18 @@ fn badge_presentation(
             "AI review passed for the current PR head. CI, mergeability, or work in progress still prevent readiness."
                 .into(),
         ),
+        // The head is unreviewed and will stay so: the reviewers could not
+        // start and the automatic generations are spent. Distinct from both
+        // "No AI review scheduled" and the ordinary "not yet" so the card does
+        // not read as merely unscheduled or waiting.
+        _ if failed_to_start.is_some() => {
+            let FailedReviewStart { generation, last_error } = failed_to_start.expect("checked");
+            (
+                "AI review failed to start".into(),
+                "exclamationmark.triangle",
+                failed_to_start_explanation(*generation, last_error.as_deref()),
+            )
+        }
         // A card with a PR is never "not required" by kind (that is decided
         // before any history exists), so for it this means the engine has
         // nothing running or scheduled for the head — the head may be
@@ -466,17 +475,6 @@ fn badge_presentation(
             "minus.circle",
             "This kind of work item does not require AI review.".into(),
         ),
-        // The head is unreviewed and will stay so: the reviewers could not
-        // start and the automatic generations are spent. Distinct from the
-        // ordinary "not yet" so the card does not read as merely waiting.
-        _ if failed_to_start.is_some() => {
-            let FailedReviewStart { generation, last_error } = failed_to_start.expect("checked");
-            (
-                "AI review failed to start".into(),
-                "exclamationmark.triangle",
-                failed_to_start_explanation(*generation, last_error.as_deref()),
-            )
-        }
         _ => (
             "Not reviewed: latest commit".into(),
             "questionmark.circle",
@@ -538,16 +536,23 @@ fn badge_presentation(
                 .tooltip
                 .push_str(&format!("\nFindings revision: {name} ({status_label})."));
         }
-        if *delivered && state == AI_REVIEW_STATE_NOT_REVIEWED {
+        if *delivered
+            && failed_to_start.is_none()
+            && matches!(
+                state,
+                AI_REVIEW_STATE_NOT_REVIEWED | AI_REVIEW_STATE_REVIEW_NOT_REQUIRED
+            )
+        {
             badge
                 .tooltip
                 .push_str(" Findings addressed; the fix has not been AI-reviewed.");
             if history.head.is_some() && history.head == history.reviewed_sha {
-                badge.tooltip = badge.tooltip.replacen(
-                    explanation.as_str(),
-                    "The findings revision delivered without a new commit. No subsequent AI review is recorded.",
-                    1,
-                );
+                let replacement = if state == AI_REVIEW_STATE_REVIEW_NOT_REQUIRED {
+                    "The findings revision delivered without a new commit. No subsequent AI review is recorded or scheduled."
+                } else {
+                    "The findings revision delivered without a new commit. No subsequent AI review is recorded."
+                };
+                badge.tooltip = badge.tooltip.replacen(explanation.as_str(), replacement, 1);
                 badge.label = "Findings addressed".into();
                 badge.system_image = "checkmark.circle".into();
             }
@@ -602,9 +607,8 @@ fn current_head_gate_outcomes_sql() -> String {
 fn review_due_sql() -> String {
     let needs_readmission = super::review_batches::pre_merge_review_needs_readmission_sql("root.id");
     let batch_owns = super::review_batches::pre_merge_batch_owns_review_recovery_sql("root.id");
-    let none_started = super::review_batches::NO_BATCH_MEMBER_STARTED;
-    let cap = super::review_batches::MAX_AUTOMATIC_PRE_MERGE_BATCH_GENERATIONS;
-    let stale_head = super::review_verdicts::REVIEW_GATE_OUTCOME_STALE_HEAD;
+    let root_upkeep = super::parking::upkeep_eligible_task_sql("root");
+    let marked_upkeep = super::parking::upkeep_eligible_task_sql("marked");
     let dead_we = super::review_verdicts::dead_pr_review_attempt_sql("we");
     let dead_we3 = super::review_verdicts::dead_pr_review_attempt_sql("we3");
     let latest_we = super::review_verdicts::latest_pr_review_attempt_sql("we", "we2");
@@ -619,12 +623,17 @@ fn review_due_sql() -> String {
                   ON we.work_item_id = f.id AND we.kind = 'pr_review'
                 WHERE f.root = root.id
                   AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned'))";
-    let deferred_admission = "EXISTS(SELECT 1 FROM family f
-                CROSS JOIN work_attention_items ai INDEXED BY work_attention_items_work_item_idx
-                  ON ai.work_item_id = f.id
-                WHERE f.root = root.id
-                  AND ai.kind = 'pr_review_admission_deferred'
-                  AND ai.status = 'open')";
+    let deferred_admission = format!(
+        "({root_upkeep}
+          AND EXISTS(SELECT 1 FROM family f
+                     JOIN tasks marked ON marked.id = f.id
+                     CROSS JOIN work_attention_items ai INDEXED BY work_attention_items_work_item_idx
+                       ON ai.work_item_id = f.id
+                     WHERE f.root = root.id
+                       AND {marked_upkeep}
+                       AND ai.kind = 'pr_review_admission_deferred'
+                       AND ai.status = 'open'))"
+    );
     let latest_dead_pr_review = format!(
         "EXISTS(SELECT 1 FROM family f
                 CROSS JOIN work_executions we INDEXED BY work_executions_item_kind_status_finished_idx
@@ -649,23 +658,13 @@ fn review_due_sql() -> String {
     );
     format!(
         "(NULLIF(root.pr_head_sha, '') IS NULL AND NOT {latest_dead_pr_review})
-         OR (root.status = 'active' AND root.parked_at IS NULL AND root.deleted_at IS NULL)
+         OR (root.status = 'active' AND {root_upkeep} AND root.deleted_at IS NULL)
          OR {live_pr_review}
          OR EXISTS(SELECT 1 FROM pr_review_batches b
                    WHERE b.cycle_root_id = root.id AND b.phase = 'pre_merge'
                      AND b.status NOT IN ('completed', 'failed'))
          OR {deferred_admission}
-         OR {needs_readmission}
-         OR EXISTS(SELECT 1 FROM pr_review_batches b
-                   WHERE b.id = (SELECT latest.id FROM pr_review_batches latest
-                                 WHERE latest.cycle_root_id = root.id AND latest.phase = 'pre_merge'
-                                 ORDER BY latest.created_at DESC, latest.generation DESC, latest.id DESC LIMIT 1)
-                     AND b.status = 'failed'
-                     AND b.target_sha = NULLIF(root.pr_head_sha, '')
-                     AND b.generation >= {cap}
-                     AND NOT EXISTS(SELECT 1 FROM pr_review_verdicts v2
-                                    WHERE v2.batch_id = b.id AND v2.gate_outcome != '{stale_head}')
-                     AND {none_started})
+         OR ({root_upkeep} AND {needs_readmission})
          OR {recoverable_dead_pr_review}"
     )
 }
@@ -688,11 +687,6 @@ pub(crate) fn review_due_heads_sql(placeholders: &str, key: ReviewKey) -> String
 pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
     let informative_outcomes = informative_gate_outcomes_sql();
     let all_outcomes = current_head_gate_outcomes_sql();
-    let skipped_outcomes = super::review_verdicts::SKIPPED_GATE_OUTCOMES
-        .iter()
-        .map(|outcome| format!("'{outcome}'"))
-        .collect::<Vec<_>>()
-        .join(",");
     let family = review_family_cte(placeholders, key);
     format!(
         "{family}
@@ -709,14 +703,7 @@ pub(crate) fn current_heads_sql(placeholders: &str, key: ReviewKey) -> String {
                                                    WHERE e.work_item_id = r.id AND e.status = 'completed'
                                                      AND e.kind = 'revision_implementation'
                                                    ORDER BY e.finished_at DESC, e.id DESC LIMIT 1)
-                                      AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha))),
-                EXISTS(SELECT 1 FROM family f
-                       CROSS JOIN pr_review_verdicts sk INDEXED BY pr_review_verdicts_work_item_idx
-                         ON sk.work_item_id = f.id
-                       WHERE f.root = root.id
-                         AND sk.head_sha = NULLIF(root.pr_head_sha, '')
-                         AND sk.gate_outcome IN ({skipped_outcomes})
-                         AND sk.created_at >= v.created_at)
+                                      AND (we.pr_head_after IS NULL OR we.pr_head_after = v.head_sha)))
          FROM owners o JOIN tasks root ON root.id = o.id
          LEFT JOIN pr_review_verdicts v ON v.id = (
              SELECT rv.id FROM pr_review_verdicts rv

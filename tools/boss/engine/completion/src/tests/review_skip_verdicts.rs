@@ -447,3 +447,225 @@ async fn unmoved_findings_revision_records_noop_skip_and_preserves_baseline() {
         );
     }
 }
+
+struct PanicsIfCalledEnqueuer;
+
+#[async_trait]
+impl ReviewBatchEnqueuer for PanicsIfCalledEnqueuer {
+    async fn enqueue(
+        &self,
+        _work_db: &WorkDb,
+        _work_item_id: &str,
+        _repo_remote_url: &str,
+        _pr_url: &str,
+        _review_pool_size: usize,
+    ) -> anyhow::Result<crate::work::ReviewBatchDispatch> {
+        panic!("reviewer enqueue must not be reached when a skip gate fires");
+    }
+}
+
+fn declared_delivery_flags(path: &std::path::Path) -> std::sync::Arc<crate::feature_flags::FeatureFlagsStore> {
+    let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+        path.join("feature-flags.toml"),
+    ));
+    flags.load().unwrap();
+    flags
+}
+
+#[tokio::test]
+async fn declared_delivery_noop_skip_records_per_head_verdict_on_chain_root() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/7375";
+    let baseline_sha = "1212121212121212121212121212121212121212";
+    let empty_diff_sha = "3434343434343434343434343434343434343434";
+    let (_dir, db, product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, baseline_sha);
+    let root_id = db.review_cycle_root_id(&revision_id);
+    assert_ne!(root_id, revision_id, "revision must have a distinct chain root");
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', review_cycle = 1, last_reviewed_sha = ?2 WHERE id = ?1",
+            rusqlite::params![root_id, baseline_sha],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, empty_diff_sha],
+        )
+        .unwrap();
+
+    let publisher = std::sync::Arc::new(RecordingPublisher::default());
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(empty_diff_sha.into())).await;
+    verifier.set_diff_line_count(Ok(0)).await;
+    let flags_dir = tempdir().unwrap();
+    let flags = declared_delivery_flags(flags_dir.path());
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    crate::run_done_declaration::maybe_enqueue_declared_delivery_reviewer(
+        &db,
+        publisher.as_ref(),
+        verifier.as_ref(),
+        &PanicsIfCalledEnqueuer,
+        &flags,
+        3,
+        0,
+        1,
+        &execution,
+        &revision_id,
+        &execution.repo_remote_url,
+        parent_pr_url,
+    )
+    .await;
+
+    let (cycle, last_sha) = db.get_task_review_cycle_state(&root_id).unwrap();
+    assert_eq!(cycle, 1, "skip must not move review_cycle");
+    assert_eq!(
+        last_sha.as_deref(),
+        Some(baseline_sha),
+        "skip must leave last_reviewed_sha unchanged"
+    );
+
+    let root_verdicts = db.review_verdicts_for_work_item(&root_id).unwrap();
+    assert!(
+        root_verdicts
+            .iter()
+            .any(|v| v.gate_outcome == crate::work::REVIEW_GATE_OUTCOME_SKIPPED_NOOP
+                && v.head_sha.as_deref() == Some(empty_diff_sha)),
+        "expected skipped_noop verdict on chain root; got {root_verdicts:?}",
+    );
+    assert!(
+        db.review_verdicts_for_work_item(&revision_id).unwrap().is_empty(),
+        "skip verdict must be recorded on chain root, not revision child",
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_head_sha = ?2 WHERE id = ?1",
+            rusqlite::params![root_id, empty_diff_sha],
+        )
+        .unwrap();
+    let caches = crate::work::board_caches::BoardCaches::default();
+    let mut trace = boss_metrics::population_timing::PopulationTrace::new(
+        product_id.clone(),
+        "declared-noop-skip",
+        None,
+        std::time::Instant::now(),
+    );
+    for tree in [
+        db.get_work_tree(&product_id).unwrap(),
+        db.get_work_tree_cached(&product_id, &mut trace, &caches).unwrap(),
+    ] {
+        let root_card = tree
+            .tasks
+            .iter()
+            .chain(tree.chores.iter())
+            .find(|t| t.id == root_id)
+            .unwrap();
+        assert_eq!(root_card.ai_review_state.as_deref(), Some("review_not_required"));
+    }
+}
+
+#[tokio::test]
+async fn declared_delivery_cycle_cap_records_per_head_verdict_on_chain_root() {
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/7376";
+    let head_before = "5656565656565656565656565656565656565656";
+    let head_after = "7878787878787878787878787878787878787878";
+    let (_dir, db, product_id, revision_id, execution_id) =
+        revision_fixture(workspace.path(), parent_pr_url, head_before);
+    let root_id = db.review_cycle_root_id(&revision_id);
+    assert_ne!(root_id, revision_id, "revision must have a distinct chain root");
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status = 'in_review', review_cycle = 1, last_reviewed_sha = ?2 WHERE id = ?1",
+            rusqlite::params![root_id, head_before],
+        )
+        .unwrap();
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET pr_head_after = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, head_after],
+        )
+        .unwrap();
+
+    let publisher = std::sync::Arc::new(RecordingPublisher::default());
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.into())).await;
+    verifier.set_diff_line_count(Ok(40)).await;
+    let flags_dir = tempdir().unwrap();
+    let flags = declared_delivery_flags(flags_dir.path());
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    crate::run_done_declaration::maybe_enqueue_declared_delivery_reviewer(
+        &db,
+        publisher.as_ref(),
+        verifier.as_ref(),
+        &PanicsIfCalledEnqueuer,
+        &flags,
+        1,
+        0,
+        1,
+        &execution,
+        &revision_id,
+        &execution.repo_remote_url,
+        parent_pr_url,
+    )
+    .await;
+
+    let (cycle, last_sha) = db.get_task_review_cycle_state(&root_id).unwrap();
+    assert_eq!(cycle, 1, "cycle cap skip must not move review_cycle");
+    assert_eq!(
+        last_sha.as_deref(),
+        Some(head_before),
+        "cycle cap skip must leave last_reviewed_sha unchanged"
+    );
+
+    let root_verdicts = db.review_verdicts_for_work_item(&root_id).unwrap();
+    assert!(
+        root_verdicts
+            .iter()
+            .any(|v| v.gate_outcome == crate::work::REVIEW_GATE_OUTCOME_SKIPPED_CYCLE_CAP
+                && v.head_sha.as_deref() == Some(head_after)),
+        "expected skipped_cycle_cap verdict on chain root; got {root_verdicts:?}",
+    );
+    assert!(
+        db.review_verdicts_for_work_item(&revision_id).unwrap().is_empty(),
+        "skip verdict must be recorded on chain root, not revision child",
+    );
+
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET pr_head_sha = ?2 WHERE id = ?1",
+            rusqlite::params![root_id, head_after],
+        )
+        .unwrap();
+    let caches = crate::work::board_caches::BoardCaches::default();
+    let mut trace = boss_metrics::population_timing::PopulationTrace::new(
+        product_id.clone(),
+        "declared-cycle-cap",
+        None,
+        std::time::Instant::now(),
+    );
+    for tree in [
+        db.get_work_tree(&product_id).unwrap(),
+        db.get_work_tree_cached(&product_id, &mut trace, &caches).unwrap(),
+    ] {
+        let root_card = tree
+            .tasks
+            .iter()
+            .chain(tree.chores.iter())
+            .find(|t| t.id == root_id)
+            .unwrap();
+        assert_eq!(root_card.ai_review_state.as_deref(), Some("review_not_required"));
+    }
+}
