@@ -336,3 +336,27 @@ checks:
           pattern: 'init(?:\s+(?:-q|--quiet|--bare))*\s+-b\b'
           message: "Do not pass `-b` to `git init` (shell form). That flag requires git 2.28+. Run `git init` then `git symbolic-ref HEAD refs/heads/<name>`."
           severity: error
+
+  # Package features do not propagate across subpackage boundaries, so every
+  # BUILD package declaring a Swift or macOS bundle target must opt into
+  # `swift.treat_warnings_as_errors` explicitly. Enforced here so newly added
+  # Swift packages cannot silently compile warnings without failing the build.
+  - id: bazel/swift-warnings-as-errors
+    check: bazel-policies
+    policy:
+      severity: error
+    config:
+      rules:
+        - kind: required_package_feature
+          when_calling:
+            - swift_library
+            - swift_binary
+            - swift_test
+            - swift_compiler_plugin
+            - macos_application
+            - macos_unit_test
+            - macos_command_line_application
+            - macos_bundle
+          feature: swift.treat_warnings_as_errors
+          message: "BUILD packages declaring Swift targets must enable `swift.treat_warnings_as_errors` in `package(features = [...])`."
+          remediation: "Add `\"swift.treat_warnings_as_errors\"` to `package(features = [...])` in this BUILD file."

@@ -43,11 +43,11 @@ _ENGINE_BINARY_SWIFT_SOURCE = """enum BossEngineBinary {
 
 # Swift compiler warnings are build errors in this package. The feature is
 # rules_swift's own `-warnings-as-errors`; it is set per package (not with a
-# global --features flag) so enforcement stays with in-repo code. The two
-# SwiftPM dependencies that used to warn (swiftui-math, textual) are fixed by
-# checked-in patches wired up in MODULE.bazel, so the whole build is
-# warning-free. Every package that declares a Swift target must carry this
-# line.
+# global --features flag) so enforcement stays with in-repo code. The pinned
+# SwiftPM dependencies swiftui-math and textual carry checked-in patches (see
+# MODULE.bazel), so the whole build is warning-free. The
+# `bazel/swift-warnings-as-errors` check in CHECKS.yaml enforces this feature
+# on every BUILD package that declares a Swift target.
 package(
     default_visibility = ["//visibility:private"],
     features = ["swift.treat_warnings_as_errors"],
