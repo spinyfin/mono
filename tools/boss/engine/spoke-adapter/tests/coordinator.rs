@@ -794,8 +794,8 @@ async fn a_better_ranked_host_never_takes_over_an_admitted_lease() {
 /// the host, never a failed start.
 #[tokio::test]
 async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spending_the_retry_budget() {
-    timing::hold();
-    timing::guarded(async {
+    freeze_clock();
+    guarded(async {
         let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
         let mut env = env(&fx, 1).await;
         // Shorter than the adapter's five-second command deadline, so the
@@ -816,9 +816,15 @@ async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spendi
         env.coordinator.kick();
         // The lease is stored and on the wire; the attempt now waits on timers
         // alone, so the one advance below cannot overtake work in flight.
-        timing::condition(|| peer.commands().iter().any(is_lease)).await;
+        until("the backstop lease to be stored", || {
+            peer.commands().iter().any(is_lease)
+        })
+        .await;
         tokio::time::advance(Duration::from_secs(2)).await;
-        timing::condition(|| fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Ready).await;
+        until("the lease backstop to park the execution", || {
+            fx.db.get_execution(&execution.id).unwrap().status == ExecutionStatus::Ready
+        })
+        .await;
 
         let row = fx.db.get_execution(&execution.id).unwrap();
         assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
@@ -845,7 +851,7 @@ async fn a_lease_backstop_that_elapses_on_an_admitted_lease_parks_without_spendi
                     .await
             }
         });
-        timing::advancing(|| forced.is_finished()).await;
+        until_elapsed("the forced lease backstop to finish", || forced.is_finished()).await;
         let forced_err = forced.await.unwrap().unwrap_err();
         assert!(
             forced_err
