@@ -15,7 +15,7 @@
 # NL_HEALTH_ALERT_CMD, if set, runs when the state changes. The check never
 # restarts or stops anything: ../README.md, "Recovery", is for a person.
 #
-#   hub-health.sh --journal-unit <unit>   read the hub's log from the journal
+#   hub-health.sh --journal-unit <unit>   read the hub's log from the system journal
 #                                         (--quiet, so an empty window is
 #                                         silence and not "-- No entries --")
 #   hub-health.sh --log-file <path>       read it from a file
@@ -192,7 +192,7 @@ fi
 
 read_log() {
   case "$source_kind" in
-    --journal-unit) journalctl --user --quiet --unit "$source_arg" --since "-${window_s}s" --output cat --no-pager ;;
+    --journal-unit) journalctl --quiet --unit "$source_arg" --since "-${window_s}s" --output cat --no-pager ;;
     --log-file) cat "$source_arg" ;;
   esac
 }

@@ -6,20 +6,21 @@ What decides whether a build executes remotely is elsewhere: [`.buildkite/README
 
 ## What is here
 
-| File                                                     | Installed as                                      | What it is                                                                 |
-| -------------------------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------- |
-| `nativelink/hub.json5`                                   | `~/nativelink-macos-hub/hub.json5` on the hub     | Scheduler, CAS and action cache. Every scheduler timeout, with its reason. |
-| `nativelink/nativelink-macos-hub.service`                | `~/.config/systemd/user/` on the hub              | Starts the hub.                                                            |
-| `nativelink/hub-health.sh`                               | `~/nativelink-macos-hub/hub-health.sh` on the hub | The health check.                                                          |
-| `nativelink/nativelink-macos-hub-health.{service,timer}` | `~/.config/systemd/user/` on the hub              | Runs the health check every minute.                                        |
-| `nativelink/hub-textfile-metrics.sh`                     | `~/nativelink-macos-hub/hub-textfile-metrics.sh`  | Hub restart state for node_exporter's textfile collector.                  |
-| `nativelink/nativelink-hub-textfile.{service,timer}`     | `/etc/systemd/system/` on the hub (root)          | Runs the restart exporter every 30 s.                                      |
-| `nativelink/worker-slots-exporter.py`                    | `~/nativelink-macos-hub/worker-slots-exporter.py` | Per-worker slots and CAS eviction figures, on 127.0.0.1:9108.              |
-| `nativelink/nativelink-worker-slots-exporter.service`    | `~/.config/systemd/user/` on the hub              | Starts the slots and CAS exporter.                                         |
-| `nativelink/worker-macos.json5`                          | `~/nativelink/worker-macos.json5` on each Mac     | The worker. The same file on every Mac.                                    |
-| `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac             | Starts the worker and sets what differs per Mac.                           |
-| `nativelink/action-env.sh`                               | `~/nativelink/action-env.sh` on each Mac          | Wraps every action: picks the Xcode and SDK the action asks for.           |
-| `nativelink/build-worker.sh` and `nativelink/patches/`   | run on one Mac, and on one Linux worker host      | Builds the worker binary: the pinned release plus the patches.             |
+| File                                                     | Installed as                                                 | What it is                                                                                                                                                               |
+| -------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `nativelink/hub.json5`                                   | `~/nativelink-macos-hub/hub.json5` on the hub                | Scheduler, CAS and action cache. Every scheduler timeout, with its reason.                                                                                               |
+| `nativelink/nativelink-macos-hub.service`                | `/etc/systemd/system/` on the hub (root)                     | Starts the hub, as a system unit (`User=bduff`).                                                                                                                         |
+| `nativelink/hub-health.sh`                               | `~/nativelink-macos-hub/hub-health.sh` on the hub            | The health check.                                                                                                                                                        |
+| `nativelink/nativelink-macos-hub-health.{service,timer}` | `~/.config/systemd/user/` on the hub                         | Runs the health check every minute.                                                                                                                                      |
+| `nativelink/hub-textfile-metrics.sh`                     | `~/nativelink-macos-hub/hub-textfile-metrics.sh`             | Hub restart state for node_exporter's textfile collector.                                                                                                                |
+| `nativelink/nativelink-hub-textfile.{service,timer}`     | `/etc/systemd/system/` on the hub (root)                     | Runs the restart exporter every 30 s.                                                                                                                                    |
+| `nativelink/worker-slots-exporter.py`                    | `~/nativelink-macos-hub/worker-slots-exporter.py`            | Per-worker slots and CAS eviction figures, on 127.0.0.1:9108.                                                                                                            |
+| `nativelink/nativelink-worker-slots-exporter.service`    | `~/.config/systemd/user/` on the hub                         | Starts the slots and CAS exporter.                                                                                                                                       |
+| `nativelink/worker-macos.json5`                          | `~/nativelink/worker-macos.json5` on each Mac                | The worker. The same file on every Mac.                                                                                                                                  |
+| `nativelink/com.brianduff.nativelink.plist`              | `~/Library/LaunchAgents/` on each Mac                        | Starts the worker and sets what differs per Mac.                                                                                                                         |
+| `nativelink/action-env.sh`                               | `~/nativelink/action-env.sh` on each Mac                     | Wraps every action: picks the Xcode and SDK the action asks for.                                                                                                         |
+| `nativelink/headcrash-worker/`                           | `~/nativelink/` and `~/.config/systemd/user/` on `headcrash` | The Linux worker on the hub's host: `worker.json5`, its user unit and the `memory.conf` and `60-v1.8.conf` drop-ins. Other Linux workers differ (see the Linux runbook). |
+| `nativelink/build-worker.sh` and `nativelink/patches/`   | run on one Mac, and on one Linux worker host                 | Builds the worker binary: the pinned release plus the patches.                                                                                                           |
 
 ## Hosts
 
@@ -173,6 +174,8 @@ systemctl --user is-failed nativelink-macos-hub-health.service   # "failed" whil
 journalctl --user --unit nativelink-macos-hub-health.service --since -1h --output cat
 ```
 
+Because `nativelink-macos-hub-health.service` runs as a `bduff` user unit while reading the system hub unit's journal with `journalctl --quiet --unit nativelink-macos-hub.service`, `journald` must keep its default `SplitMode=uid` (so entries from `User=bduff` land in a journal `bduff` can read) or `bduff` must be in the `systemd-journal` group; otherwise `--quiet` hides permission errors as an idle window.
+
 What makes it unhealthy, and why each limit is where it is:
 
 | Condition                                                                     | Limit           | Reason                                                                                                                                                     |
@@ -196,7 +199,7 @@ The check only reports. It does not restart the hub, and nothing else does on a 
 
 Two exporters run on the hub so Prometheus can see what NativeLink's own metrics omit: whether the hub has restarted (including an OOM kill), each worker's slots, and how the CAS is filling and evicting.
 
-**Restarts.** The hub is a user systemd unit, which node_exporter's systemd collector cannot see. `hub-textfile-metrics.sh` runs as root every 30 s (`nativelink-hub-textfile.timer`) and writes `/var/lib/prometheus/node-exporter/nativelink_hub.prom` atomically. The figures are systemd's `NRestarts`, the current main process start time, whether the unit is active, the last `Result` (so an `oom-kill` is visible), and the last main-process exit status. The script only reads the unit; it never restarts it.
+**Restarts.** The hub is a system unit (`User=bduff`), so `systemctl show` reads it without `--user`. `hub-textfile-metrics.sh` runs as root every 30 s (`nativelink-hub-textfile.timer`) and writes `/var/lib/prometheus/node-exporter/nativelink_hub.prom` atomically. The figures are systemd's `NRestarts`, the current main process start time, whether the unit is active, the last `Result` (so an `oom-kill` is visible), and the last main-process exit status. The script only reads the unit; it never restarts it.
 
 **Slots and CAS.** `worker-slots-exporter.py` listens on `127.0.0.1:9108/metrics`. On each scrape it asks the hub's admin API (loopback, `NL_HUB_ADMIN_LISTEN`) for each worker's slots and running actions. NativeLink 1.8.6 has no eviction counter, so inserts and evictions are counted from inotify: a rename into `cas-content/d2` is an insert, a rename into `cas-tmp/d2` is an eviction, and the size is in the file name. A walk of `cas-content/d2` every 15 minutes, at nice 19 and idle I/O priority, gives the entry count and content bytes; between walks those are kept current from the counters. The CAS cap it exports (`nativelink_hub_cache_cap_bytes`) is `NL_HUB_CAS_MAX_BYTES` from the _running_ hub process, so an edit of `hub.env` is not reported until the hub itself is restarted. The exporter only reads; it never changes the hub.
 
@@ -222,7 +225,7 @@ launchctl kickstart -k gui/$(id -u)/com.brianduff.nativelink
 **`workers were evicted for being silent …`, `the scheduler timed out … actions`.** Find which workers; the worker id starts with the Mac's name:
 
 ```sh
-journalctl --user --unit nativelink-macos-hub.service --since -15min --output cat |
+journalctl --unit nativelink-macos-hub.service --since -15min --output cat |
   grep -E 'Worker timed out|did not acknowledge a kill|Timing out operation'
 ```
 
@@ -234,10 +237,10 @@ If it is one Mac, the fault is on it (memory pressure, a disk, a hung action): r
 set -a
 . ~/nativelink-macos-hub/hub.env
 set +a
-journalctl --user --unit nativelink-macos-hub.service --since -1h --output cat > ~/hub-$(date +%Y%m%dT%H%M).log
+journalctl --unit nativelink-macos-hub.service --since -1h --output cat > ~/hub-$(date +%Y%m%dT%H%M).log
 curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/workers || true
 curl -s --connect-timeout 10 --max-time 10 http://$NL_HUB_ADMIN_LISTEN/admin/scheduler/MAIN_SCHEDULER/demand || true
-systemctl --user restart nativelink-macos-hub.service
+sudo systemctl restart nativelink-macos-hub.service
 ```
 
 A restart ends every action in flight. The queue is in memory and is lost; the workers kill what they were running and reconnect within half a minute. Each CI step that was executing remotely fails with `UNAVAILABLE` and is annotated as an executor failure; retry those steps. A developer's build falls back to the Mac for the actions that were in flight. Builds that were waiting on a hub that had stopped answering are released the same way.
@@ -276,10 +279,10 @@ REPO=<checkout>/tools/remote-execution/nativelink
 copy_if_changed "$REPO/hub.json5" "$NL/hub.json5" 644
 copy_if_changed "$REPO/hub-health.sh" "$NL/hub-health.sh" 755
 copy_if_changed "$REPO/hub-textfile-metrics.sh" "$NL/hub-textfile-metrics.sh" 755
-copy_if_changed "$REPO/nativelink-macos-hub.service" "$USER_UNIT/nativelink-macos-hub.service" 644
 copy_if_changed "$REPO/nativelink-macos-hub-health.service" "$USER_UNIT/nativelink-macos-hub-health.service" 644
 copy_if_changed "$REPO/nativelink-macos-hub-health.timer" "$USER_UNIT/nativelink-macos-hub-health.timer" 644
 copy_if_changed "$REPO/nativelink-worker-slots-exporter.service" "$USER_UNIT/nativelink-worker-slots-exporter.service" 644
+sudo_copy_if_changed "$REPO/nativelink-macos-hub.service" /etc/systemd/system/nativelink-macos-hub.service 644
 sudo_copy_if_changed "$REPO/nativelink-hub-textfile.service" /etc/systemd/system/nativelink-hub-textfile.service 644
 sudo_copy_if_changed "$REPO/nativelink-hub-textfile.timer" /etc/systemd/system/nativelink-hub-textfile.timer 644
 
@@ -300,6 +303,46 @@ sudo systemctl enable --now nativelink-hub-textfile.timer
 `hub.env` stays on the host: it names listen addresses. Do not copy it from the repository.
 
 On a Mac worker the same helper applies to files that are installed unmodified (`worker-macos.json5`, `action-env.sh`). The launchd plist is edited after the first copy (placeholders for this Mac), so a later `cmp` against the repository file will differ; do not overwrite it from the repository.
+
+### The hub unit and the host's memory
+
+The hub is a system unit with `OOMScoreAdjust=-900`, `MemoryLow=4G` and `MemorySwapMax=0`. Under the user manager it ran at `oom_score_adj` 200, and the kernel's OOM killer took it first when the Linux worker's compiles and links filled RAM. The Linux worker on the same host (`headcrash-worker/`) is capped inside its own cgroup (`MemoryHigh=16G`, `MemoryMax=18G`, `OOMScoreAdjust=300`), so a burst of compiles is killed there, not the hub.
+
+The old user unit stays at `~/.config/systemd/user/nativelink-macos-hub.service`, disabled, for rollback only: disable the system unit (`sudo systemctl disable --now nativelink-macos-hub.service`), then enable the user one as `bduff`; the system unit's header comment has the exact commands. Never enable both.
+
+The Linux worker's files on `headcrash` install the same way (a changed file is a no-op when identical; a restart is a separate, deliberate step: see the Linux runbook, "Restarting"):
+
+```sh
+W=$REPO/headcrash-worker
+copy_if_changed "$W/worker.json5" ~/nativelink/worker.json5 644
+copy_if_changed "$W/nativelink-worker.service" ~/.config/systemd/user/nativelink-worker.service 644
+mkdir -p ~/.config/systemd/user/nativelink-worker.service.d
+copy_if_changed "$W/nativelink-worker.service.d/60-v1.8.conf" ~/.config/systemd/user/nativelink-worker.service.d/60-v1.8.conf 644
+copy_if_changed "$W/nativelink-worker.service.d/memory.conf" ~/.config/systemd/user/nativelink-worker.service.d/memory.conf 644
+systemctl --user daemon-reload
+```
+
+Swap on `headcrash` is two files, both in `/etc/fstab` with the default priority: `/swap.img` (8G) and `/swap2.img` (24G), root-owned, mode 0600, 32G in all. The hub never uses it (`MemorySwapMax=0`); it is there for the worker's actions and the rest of the host. The repository provisions no host settings, so this is the record. To recreate it on a new host (idempotent: each file is made only when missing, an existing non-swap file fails with a repair instruction rather than being registered, and `/etc/fstab` is updated only after `swapon` succeeds):
+
+```sh
+add_swap() {
+  local file=$1 size=$2
+  if sudo test -e "$file"; then
+    if [ "$(sudo blkid -p -o value -s TYPE "$file" 2>/dev/null)" != swap ]; then
+      echo "error: $file exists but is not a valid swap file; inspect and remove it (sudo rm -- '$file') before re-running" >&2
+      return 1
+    fi
+  else
+    sudo fallocate -l "$size" "$file" || return 1
+    sudo chmod 600 "$file" || return 1
+    sudo mkswap "$file" || return 1
+  fi
+  swapon --show=NAME --noheadings | grep -qxF "$file" || sudo swapon "$file" || return 1
+  awk -v f="$file" '$1 == f { found = 1 } END { exit !found }' /etc/fstab ||
+    echo "$file none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null || return 1
+}
+add_swap /swap.img 8G && add_swap /swap2.img 24G
+```
 
 ## Cutover
 
@@ -332,13 +375,12 @@ copy_if_changed "$REPO/hub.json5" hub.json5 644
 copy_if_changed "$REPO/hub-health.sh" hub-health.sh 755
 copy_if_changed "$REPO/hub-textfile-metrics.sh" hub-textfile-metrics.sh 755
 copy_if_changed "$REPO/worker-slots-exporter.py" worker-slots-exporter.py 755
-copy_if_changed "$REPO/nativelink-macos-hub.service" ~/.config/systemd/user/nativelink-macos-hub.service 644
 copy_if_changed "$REPO/nativelink-macos-hub-health.service" ~/.config/systemd/user/nativelink-macos-hub-health.service 644
 copy_if_changed "$REPO/nativelink-macos-hub-health.timer" ~/.config/systemd/user/nativelink-macos-hub-health.timer 644
 copy_if_changed "$REPO/nativelink-worker-slots-exporter.service" ~/.config/systemd/user/nativelink-worker-slots-exporter.service 644
 ```
 
-The restart-state exporter is a system unit (it writes to node_exporter's textfile directory, which is root-owned):
+The hub itself and the restart-state exporter are system units (the exporter writes to node_exporter's textfile directory, which is root-owned; the hub runs as `bduff` with an OOM score and memory protection a user manager cannot give it). The health timer and the slots exporter stay user units:
 
 ```sh
 sudo_copy_if_changed() {
@@ -348,6 +390,7 @@ sudo_copy_if_changed() {
   fi
   sudo install -m "$mode" "$src" "$dest"
 }
+sudo_copy_if_changed "$REPO/nativelink-macos-hub.service" /etc/systemd/system/nativelink-macos-hub.service 644
 sudo_copy_if_changed "$REPO/nativelink-hub-textfile.service" /etc/systemd/system/nativelink-hub-textfile.service 644
 sudo_copy_if_changed "$REPO/nativelink-hub-textfile.timer" /etc/systemd/system/nativelink-hub-textfile.timer 644
 ```
@@ -369,10 +412,10 @@ Then:
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
 sudo systemctl daemon-reload
-systemctl --user enable --now nativelink-macos-hub.service
+sudo systemctl enable --now nativelink-macos-hub.service
 systemctl --user enable --now nativelink-worker-slots-exporter.service
 sudo systemctl enable --now nativelink-hub-textfile.timer
-journalctl --user --unit nativelink-macos-hub.service --output cat | head     # "Ready, listening on …" three times
+journalctl --unit nativelink-macos-hub.service --output cat | head     # "Ready, listening on …" three times
 curl -s --connect-timeout 10 --max-time 10 -o /dev/null -w '%{http_code}\n' http://<address>:50051/status         # 200
 ```
 

@@ -2,12 +2,11 @@
 # hub-textfile-metrics.sh -- export the NativeLink hub's restart state to
 # Prometheus through node_exporter's textfile collector.
 #
-# The hub runs as a *user* systemd unit (bduff's nativelink-macos-hub.service),
-# which node_exporter's systemd collector cannot see, so an OOM kill followed
-# by systemd's Restart=always left no trace on the dashboards. This script
-# reads the unit's state and writes it to
-# /var/lib/prometheus/node-exporter/nativelink_hub.prom, atomically (temp file
-# in the same directory, then mv).
+# Reads the NativeLink hub system unit (nativelink-macos-hub.service, User=bduff)
+# — its restart count, current main-process start timestamp, active state, last
+# result and exit status — and atomically publishes them to
+# /var/lib/prometheus/node-exporter/nativelink_hub.prom (temp file in the same
+# directory, then mv).
 #
 # Runs as root every 30 s from nativelink-hub-textfile.timer
 # (/etc/systemd/system/nativelink-hub-textfile.{service,timer}).
@@ -26,13 +25,12 @@
 set -euo pipefail
 
 UNIT=${NL_HUB_UNIT:-nativelink-macos-hub.service}
-HUB_USER=${NL_HUB_USER:-bduff}
 OUT_DIR=${NL_TEXTFILE_DIR:-/var/lib/prometheus/node-exporter}
 OUT="$OUT_DIR/nativelink_hub.prom"
 
 declare -A P
 while IFS='=' read -r k v; do P[$k]=$v; done < <(
-  systemctl --user -M "${HUB_USER}@" show "$UNIT" --timestamp=unix \
+  systemctl show "$UNIT" --timestamp=unix \
     -p NRestarts,ExecMainStartTimestamp,ActiveState,Result,ExecMainStatus
 )
 

@@ -7,7 +7,8 @@ admin API (loopback, NL_HUB_ADMIN_LISTEN from hub.env) for the worker list and
 prints it in Prometheus text format on 127.0.0.1:9108/metrics.
 It also exports the hub's cache size and CAS eviction figures (see below).
 
-Started by the user unit nativelink-worker-slots-exporter.service. It only
+Started by the user unit nativelink-worker-slots-exporter.service (the hub it
+watches is a system unit). It only
 reads; it never changes anything on the hub.
 """
 import json, os, re, subprocess, urllib.request
@@ -212,7 +213,7 @@ def _median(xs):
 def hub_cas_cap():
     """NL_HUB_CAS_MAX_BYTES of the *running* hub: hub.env can be ahead of it until the hub restarts."""
     try:
-        pid = subprocess.run(["systemctl", "--user", "show", "-p", "MainPID", "--value",
+        pid = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value",
                               "nativelink-macos-hub.service"], capture_output=True, text=True, timeout=5).stdout.strip()
         with open(f"/proc/{pid}/environ", "rb") as f:
             for kv in f.read().split(b"\0"):
