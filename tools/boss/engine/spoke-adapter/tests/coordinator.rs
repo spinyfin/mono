@@ -3,8 +3,8 @@ use super::{short, support::*, timing, workspace_slack};
 
 pub(crate) use super::support::{
     FrozenClock, drive_kicked_deadline_passes, drive_poll_deadline_passes, drive_resumed_deadline_pass, elapse,
-    fire_after_all_stored, fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_async,
-    until_elapsed, until_ready_after_stored,
+    fire_unconfirmed_stop_after_answered_spawn, freeze_clock, thaw_clock, until, until_async, until_elapsed,
+    until_ready_after_stored,
 };
 use boss_engine_runtime::{
     coordinator::{ExecutionCoordinator, SpokeInDoubtTiming},
@@ -1330,53 +1330,72 @@ async fn a_cancelled_unanswered_lease_stays_open_until_a_late_grant_is_released(
 
 #[tokio::test]
 async fn a_lease_in_doubt_does_not_stop_another_execution_from_leasing_on_a_second_host() {
-    let fx = Fixture::with(workspace_slack(300)).await;
-    let env = env(&fx, 3).await;
-    let parked = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
-    let peer = fx
-        .spoke(
-            Box::new(|command| if is_lease(command) { None } else { answer(command) }),
-            None,
-            0,
-        )
+    // The clock stays held and the fixture's liveness pulse cannot fire, so
+    // only the explicit advances below expire a command. Firing the 5s lease
+    // deadline on the default 2s pulse would close the stream; the 90s lease
+    // backstop would also fire if virtual time ran ahead of persist.
+    timing::hold();
+    timing::guarded(async {
+        let fx = Fixture::with_frozen_liveness(workspace_slack(300)).await;
+        let env = env(&fx, 3).await;
+        let parked = [triage(&fx, &env, "first"), triage(&fx, &env, "second")];
+        let peer = fx
+            .spoke(
+                Box::new(|command| if is_lease(command) { None } else { answer(command) }),
+                None,
+                0,
+            )
+            .await;
+        env.coordinator.kick();
+        // Observe the first stored lease before any virtual time passes.
+        // HOST_SLOTS is 1: the first attempt must park before the second
+        // persist can start. advancing paces virtual time so SQLite and
+        // gRPC still complete.
+        timing::condition(|| peer.commands().iter().any(is_lease)).await;
+        timing::advancing(|| {
+            for execution in &parked {
+                let row = fx.db.get_execution(&execution.id).unwrap();
+                assert!(!row.status.is_terminal(), "{row:?}");
+                assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+            }
+            peer.commands().iter().filter(|c| is_lease(c)).count() >= 2
+        })
         .await;
-    env.coordinator.kick();
-    fire_after_all_stored(
-        "an unanswered lease to be stored",
-        || peer.commands().iter().filter(|c| is_lease(c)).count(),
-        2,
-        Duration::from_secs(5),
-        HOST_SLOTS,
-    )
-    .await;
-    until("both unanswered leases to be parked", || {
-        parked.iter().all(|e| attention_open(&fx, &e.id))
+        timing::advancing(|| {
+            for execution in &parked {
+                let row = fx.db.get_execution(&execution.id).unwrap();
+                assert!(!row.status.is_terminal(), "{row:?}");
+                assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+            }
+            parked.iter().all(|e| attention_open(&fx, &e.id))
+        })
+        .await;
+        fx.db.set_host_enabled(HOST, false).unwrap();
+        fx.add_spoke_host("other", 8);
+        let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
+        let third = triage(&fx, &env, "third");
+        env.coordinator.kick();
+        timing::condition(|| {
+            other
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id)
+        })
+        .await;
+        assert!(
+            !peer
+                .commands()
+                .iter()
+                .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id),
+            "the third execution must not spawn on the host whose leases are in doubt"
+        );
+        for execution in &parked {
+            let row = fx.db.get_execution(&execution.id).unwrap();
+            assert!(!row.status.is_terminal(), "{row:?}");
+            assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
+        }
     })
     .await;
-    fx.db.set_host_enabled(HOST, false).unwrap();
-    fx.add_spoke_host("other", 8);
-    let other = fx.spoke_as("other", Box::new(answer), None, 0).await;
-    let third = triage(&fx, &env, "third");
-    env.coordinator.kick();
-    until("the third execution to lease and spawn on the other host", || {
-        other
-            .commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id)
-    })
-    .await;
-    assert!(
-        !peer
-            .commands()
-            .iter()
-            .any(|c| matches!(c.body, Some(command::Body::Spawn(_))) && run_of(c) == third.id),
-        "the third execution must not spawn on the host whose leases are in doubt"
-    );
-    for execution in &parked {
-        let row = fx.db.get_execution(&execution.id).unwrap();
-        assert!(!row.status.is_terminal(), "{row:?}");
-        assert_eq!(row.pre_start_failure_count, 0, "{row:?}");
-    }
 }
 
 #[tokio::test]
