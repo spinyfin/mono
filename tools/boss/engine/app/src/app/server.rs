@@ -2745,7 +2745,28 @@ async fn serve_scoped(
                          (last_event_at aged out — events stream silent after at least one hook)",
                     );
                 }
-                let hung_changed = server_clone.refresh_hung_workers(&mut hung_workers);
+                // The sweep reads SQLite and transcript files, so keep it off the
+                // async runtime threads.
+                let hung_changed = {
+                    let server = Arc::clone(&server_clone);
+                    let previous = std::mem::take(&mut hung_workers);
+                    match tokio::task::spawn_blocking(move || {
+                        let mut previous = previous;
+                        let changed = server.refresh_hung_workers(&mut previous);
+                        (changed, previous)
+                    })
+                    .await
+                    {
+                        Ok((changed, previous)) => {
+                            hung_workers = previous;
+                            changed
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "hung-worker sweep did not complete");
+                            false
+                        }
+                    }
+                };
                 let wait_changed = boss_engine_runtime::awaiting_input_status::sweep_declared_waits(
                     &live_worker_states,
                     &server_clone.work_db,

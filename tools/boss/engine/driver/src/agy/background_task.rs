@@ -16,6 +16,9 @@ use super::{is_model_sourced, status_of, text_of};
 struct ActiveTask {
     started_epoch: i64,
     log_path: Option<PathBuf>,
+    /// Launched by a `run_command` with `IsDaemon: true`. The model does not
+    /// wait on a daemon, so it never counts as a blocking background wait.
+    daemon: bool,
 }
 
 /// Retained correlation state for one execution's `agy` transcript.
@@ -23,26 +26,35 @@ struct ActiveTask {
 pub struct BackgroundTaskCorrelation {
     active_tasks: HashMap<String, ActiveTask>,
     anonymous_running_epochs: VecDeque<i64>,
+    /// `IsDaemon` flags of the `run_command` calls in the latest planner
+    /// response, consumed in order by the `RUNNING` rows they launch.
+    pending_launches: VecDeque<bool>,
 }
 
 impl BackgroundTaskCorrelation {
     pub fn reset(&mut self) {
         self.active_tasks.clear();
         self.anonymous_running_epochs.clear();
+        self.pending_launches.clear();
     }
 
     pub fn has_unmatched_running(&self) -> bool {
         !self.active_tasks.is_empty() || !self.anonymous_running_epochs.is_empty()
     }
 
-    /// Launch epoch of the oldest currently active background task, or `None`
-    /// when no task is active.
-    pub fn oldest_active_epoch(&self) -> Option<i64> {
+    /// Whether a non-daemon background task launched after `cutoff_epoch` is
+    /// still unmatched by a completion. Each task is judged against the cutoff
+    /// on its own, so an orphaned old task neither extends nor revokes the
+    /// suppression owed to a newer one.
+    pub fn has_blocking_task_since(&self, cutoff_epoch: i64) -> bool {
+        self.blocking_tasks_since(cutoff_epoch).next().is_some()
+            || self.anonymous_running_epochs.iter().any(|epoch| *epoch > cutoff_epoch)
+    }
+
+    fn blocking_tasks_since(&self, cutoff_epoch: i64) -> impl Iterator<Item = &ActiveTask> {
         self.active_tasks
             .values()
-            .map(|task| task.started_epoch)
-            .chain(self.anonymous_running_epochs.iter().copied())
-            .min()
+            .filter(move |task| !task.daemon && task.started_epoch > cutoff_epoch)
     }
 
     /// Task log paths recorded on currently active `RUNNING` rows.
@@ -53,6 +65,14 @@ impl BackgroundTaskCorrelation {
     pub fn apply_line(&mut self, line: &str, now_epoch: i64) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            return;
+        }
+        // Cheap pre-filter: only these row kinds change correlation state, and
+        // transcripts carry many large rows that are none of them.
+        if !(trimmed.contains("\"GENERIC\"")
+            || trimmed.contains("\"SYSTEM_MESSAGE\"")
+            || trimmed.contains("\"PLANNER_RESPONSE\""))
+        {
             return;
         }
         let Ok(raw) = serde_json::from_str::<Value>(trimmed) else {
@@ -74,18 +94,29 @@ impl BackgroundTaskCorrelation {
             .and_then(boss_engine_utils::iso8601::parse_iso8601_to_epoch)
             .unwrap_or(now_epoch);
         match step_type {
+            "PLANNER_RESPONSE" => {
+                if let Some(calls) = row.get("tool_calls").and_then(Value::as_array) {
+                    self.pending_launches = calls
+                        .iter()
+                        .filter(|call| call.get("name").and_then(Value::as_str) == Some("run_command"))
+                        .map(|call| call.pointer("/args/IsDaemon").and_then(Value::as_bool).unwrap_or(false))
+                        .collect();
+                }
+            }
             "GENERIC" if is_model_sourced(row) && status_of(row) == "RUNNING" => {
                 let content = text_of(row, "content");
                 let log_path = extract_task_log_path(content);
+                let daemon = self.pending_launches.pop_front().unwrap_or(false);
                 if let Some(id) = extract_running_task_id(content) {
                     self.active_tasks.insert(
                         id.to_owned(),
                         ActiveTask {
                             started_epoch: row_epoch,
                             log_path,
+                            daemon,
                         },
                     );
-                } else {
+                } else if !daemon {
                     self.anonymous_running_epochs.push_back(row_epoch);
                 }
             }

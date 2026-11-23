@@ -17,7 +17,7 @@ impl ServerState {
         previous: &mut std::collections::HashMap<String, (String, Option<String>)>,
     ) -> bool {
         let current: std::collections::HashMap<_, _> = self
-            .live_worker_states_snapshot()
+            .refresh_background_task_verdicts()
             .into_iter()
             .filter_map(|state| Some((state.run_id, (state.work_item_id?, state.hung_since))))
             .collect();
@@ -100,7 +100,22 @@ impl ServerState {
     }
 
     /// Snapshot of every allocated worker slot's live runtime state.
+    ///
+    /// Performs no database, filesystem or process probing: the `agy`
+    /// background-task verdict that suppresses hang detection is the one the
+    /// periodic [`Self::refresh_hung_workers`] tick last computed off the async
+    /// runtime, so the hook-driven broadcasts stay lightweight.
     pub fn live_worker_states_snapshot(&self) -> Vec<boss_protocol::LiveWorkerState> {
+        let live_background = self.agy_background_tasks.live_runs();
+        self.build_live_worker_states(|run_id| live_background.contains(run_id))
+    }
+
+    /// Build the snapshot, asking `has_live_background_task(run_id)`
+    /// whether each run is covered by a still-running `agy` background task.
+    fn build_live_worker_states(
+        &self,
+        mut has_live_background_task: impl FnMut(&str) -> bool,
+    ) -> Vec<boss_protocol::LiveWorkerState> {
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let mut states = self.live_worker_states.snapshot();
         for state in &mut states {
@@ -155,26 +170,37 @@ impl ServerState {
                 has_blocking_tool_poll: false,
                 tool_completed_since_prompt: tool_completed,
             };
-            // Scan the transcript only when hang detection would otherwise fire.
-            let preliminary =
+            signals.has_blocking_tool_poll = has_live_background_task(&state.run_id);
+            state.hung_since =
                 boss_engine_runtime::hung_worker::hung_since(state, checkpoint.as_ref(), fidelity, signals, now);
-            if preliminary.is_some() {
-                let threshold = boss_engine_runtime::hung_worker::hang_threshold_secs(checkpoint.as_ref(), signals);
-                signals.has_blocking_tool_poll = self.agy_has_live_background_task(&state.run_id, now, threshold);
-                state.hung_since =
-                    boss_engine_runtime::hung_worker::hung_since(state, checkpoint.as_ref(), fidelity, signals, now);
-            } else {
-                state.hung_since = None;
-            }
         }
         states
     }
 
-    /// Whether `execution_id` is an `agy` run whose transcript currently shows
-    /// a background task (`GENERIC` `RUNNING`) without a matching completion
-    /// `SYSTEM_MESSAGE`, and whose worker/task process is still alive within
-    /// the unmatched-`RUNNING` horizon.
-    fn agy_has_live_background_task(&self, execution_id: &str, now: i64, hang_threshold_secs: i64) -> bool {
+    /// Recompute which runs have a live `agy` background task and publish the
+    /// verdicts for [`Self::live_worker_states_snapshot`]. Blocking: it reads
+    /// SQLite and transcript files, so callers run it off the async runtime.
+    fn refresh_background_task_verdicts(&self) -> Vec<boss_protocol::LiveWorkerState> {
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let mut live = std::collections::HashSet::new();
+        let states = self.build_live_worker_states(|run_id| {
+            let verdict = self.agy_has_live_background_task(run_id, now);
+            if verdict {
+                live.insert(run_id.to_owned());
+            }
+            verdict
+        });
+        self.agy_background_tasks.replace_live_runs(live);
+        states
+    }
+
+    /// Whether `execution_id` is an `agy` run whose transcript shows a
+    /// background task that is not a daemon, has no matching completion
+    /// `SYSTEM_MESSAGE`, and was launched within the unmatched-`RUNNING`
+    /// horizon, while the worker process has not been seen dead.
+    fn agy_has_live_background_task(&self, execution_id: &str, now: i64) -> bool {
+        use boss_engine_completion::agy_background_task::BackgroundTaskLiveness;
+
         let Some(driver) =
             boss_engine_completion::driver_transcript::driver_for_spawned_execution(&self.work_db, execution_id)
         else {
@@ -193,7 +219,9 @@ impl ServerState {
         let containment_root = match driver.transcript_containment_root(execution_id) {
             Ok(root) => root,
             Err(error) => {
-                tracing::warn!(execution_id, %error, "agy transcript containment check failed");
+                if self.agy_background_tasks.first_warning(execution_id) {
+                    tracing::warn!(execution_id, %error, "agy transcript containment check failed");
+                }
                 return false;
             }
         };
@@ -202,68 +230,17 @@ impl ServerState {
             std::path::Path::new(&transcript_path),
             containment_root.as_deref(),
             now,
-            |log_paths| {
-                self.probe_background_task_liveness(
-                    execution_id,
-                    log_paths,
-                    containment_root.as_deref(),
-                    now,
-                    hang_threshold_secs,
-                )
+            || match self.live_worker_states.shell_pid_for_run(execution_id) {
+                Some(pid) if pid > 0 && super::process_signals::pid_is_alive(pid as libc::pid_t) => {
+                    BackgroundTaskLiveness::Alive
+                }
+                // Only a dead worker is positive evidence the task is gone. A
+                // live process whose task is quiet stays covered until the
+                // per-task horizon expires.
+                Some(pid) if pid > 0 => BackgroundTaskLiveness::Exited,
+                _ => BackgroundTaskLiveness::Unknown,
             },
         )
-    }
-
-    fn probe_background_task_liveness(
-        &self,
-        execution_id: &str,
-        log_paths: &[&std::path::Path],
-        containment_root: Option<&std::path::Path>,
-        now: i64,
-        hang_threshold_secs: i64,
-    ) -> boss_engine_completion::agy_background_task::BackgroundTaskLiveness {
-        use boss_engine_completion::agy_background_task::BackgroundTaskLiveness;
-
-        let pid_liveness = match self.live_worker_states.shell_pid_for_run(execution_id) {
-            Some(pid) if pid > 0 && super::process_signals::pid_is_alive(pid as libc::pid_t) => {
-                BackgroundTaskLiveness::Alive
-            }
-            Some(pid) if pid > 0 => return BackgroundTaskLiveness::Exited,
-            _ => BackgroundTaskLiveness::Unknown,
-        };
-        if log_paths.is_empty() {
-            return pid_liveness;
-        }
-        let canonical_root = containment_root.and_then(|root| std::fs::canonicalize(root).ok());
-        for log_path in log_paths {
-            if let Some(root) = &canonical_root {
-                let Ok(meta) = std::fs::symlink_metadata(log_path) else {
-                    continue;
-                };
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    continue;
-                }
-                let Ok(canonical_log) = std::fs::canonicalize(log_path) else {
-                    continue;
-                };
-                if !canonical_log.starts_with(root) {
-                    continue;
-                }
-            }
-            let Ok(meta) = std::fs::metadata(log_path) else {
-                continue;
-            };
-            let Ok(modified) = meta.modified() else {
-                continue;
-            };
-            let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) else {
-                continue;
-            };
-            if now.saturating_sub(elapsed.as_secs() as i64) < hang_threshold_secs {
-                return BackgroundTaskLiveness::Alive;
-            }
-        }
-        BackgroundTaskLiveness::Exited
     }
 
     /// Push the current live-worker-state snapshot on the

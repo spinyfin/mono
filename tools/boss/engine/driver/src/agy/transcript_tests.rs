@@ -429,3 +429,64 @@ fn extracts_task_log_path_from_running_row() {
         )]
     );
 }
+
+#[test]
+fn daemon_launch_is_not_a_blocking_background_task() {
+    let transcript = concat!(
+        r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"engine","IsDaemon":true}}]}"#,
+        "\n",
+        r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","created_at":"2024-01-01T00:00:10Z","content":"Tool is running as a background task with task id: conv/task-1\nTask logs are available at: file:///tmp/daemon.log\n"}"#,
+        "\n",
+        r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"gh pr checks --watch","IsDaemon":false}}]}"#,
+        "\n",
+        r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","created_at":"2024-01-01T00:00:20Z","content":"Tool is running as a background task with task id: conv/task-2\nTask logs are available at: file:///tmp/watch.log\n"}"#,
+        "\n",
+    );
+    let mut correlation = BackgroundTaskCorrelation::default();
+    for line in transcript.lines() {
+        correlation.apply_line(line, 0);
+    }
+    assert!(correlation.has_unmatched_running());
+    assert!(correlation.has_blocking_task_since(0));
+    correlation.apply_line(
+        r#"{"type":"SYSTEM_MESSAGE","source":"SYSTEM","status":"DONE","content":"[Message] sender=conv/task-2 content=Task id \"conv/task-2\" finished with result:\nok"}"#,
+        0,
+    );
+    assert!(
+        !correlation.has_blocking_task_since(0),
+        "the daemon must not keep suppression alive"
+    );
+}
+
+#[test]
+fn only_daemon_tasks_means_nothing_is_blocking() {
+    let transcript = concat!(
+        r#"{"type":"PLANNER_RESPONSE","source":"MODEL","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"engine","IsDaemon":true}}]}"#,
+        "\n",
+        r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","content":"Tool is running as a background task with task id: conv/task-1\n"}"#,
+        "\n",
+    );
+    let mut correlation = BackgroundTaskCorrelation::default();
+    for line in transcript.lines() {
+        correlation.apply_line(line, 100);
+    }
+    assert!(!correlation.has_blocking_task_since(0));
+}
+
+#[test]
+fn blocking_cutoff_is_applied_per_task() {
+    let transcript = concat!(
+        r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","created_at":"2024-01-01T00:00:00Z","content":"Tool is running as a background task with task id: conv/task-old\n"}"#,
+        "\n",
+        r#"{"type":"GENERIC","source":"MODEL","status":"RUNNING","created_at":"2024-01-01T01:00:00Z","content":"Tool is running as a background task with task id: conv/task-new\nTask logs are available at: file:///tmp/new.log\n"}"#,
+        "\n",
+    );
+    let mut correlation = BackgroundTaskCorrelation::default();
+    for line in transcript.lines() {
+        correlation.apply_line(line, 0);
+    }
+    let old = boss_engine_utils::iso8601::parse_iso8601_to_epoch("2024-01-01T00:00:00Z").unwrap();
+    let cutoff = old + 1800;
+    assert!(correlation.has_blocking_task_since(cutoff));
+    assert!(!correlation.has_blocking_task_since(old + 7200));
+}

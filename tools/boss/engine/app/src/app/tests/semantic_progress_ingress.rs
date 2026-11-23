@@ -805,6 +805,24 @@ mod hung_workers {
         progress_at_epoch: i64,
         transcript_lines: Option<&str>,
     ) -> (String, String, std::path::PathBuf) {
+        seed_agy_run_with_pid(
+            state,
+            dir,
+            slot,
+            progress_at_epoch,
+            transcript_lines,
+            std::process::id() as i32,
+        )
+    }
+
+    fn seed_agy_run_with_pid(
+        state: &ServerState,
+        dir: &tempfile::TempDir,
+        slot: u8,
+        progress_at_epoch: i64,
+        transcript_lines: Option<&str>,
+        shell_pid: i32,
+    ) -> (String, String, std::path::PathBuf) {
         let product = create_product(&state.work_db);
         state
             .work_db
@@ -842,7 +860,7 @@ mod hung_workers {
             slot,
             &exec.id,
             "gemini-4-hydrogen-medium",
-            std::process::id() as i32,
+            shell_pid,
             Some(WorkItemBinding {
                 work_item_id: item.clone(),
                 work_item_name: "agy hung test".into(),
@@ -944,19 +962,13 @@ mod hung_workers {
         "\n",
     );
 
-    #[tokio::test]
-    async fn agy_with_exited_background_task_is_flagged_despite_unmatched_running_row() {
-        let (state, dir) = test_server_state();
-        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        let task_log_path = dir.path().join("task-2.log");
-        {
-            let file = std::fs::File::create(&task_log_path).unwrap();
-            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60))
-                .unwrap();
-        }
-        let transcript = format!(
+    /// A captured-shape row: the task id plus the `Task logs are available at:` line.
+    fn running_transcript_with_log(task_log_path: &std::path::Path, extra_planner_call: &str) -> String {
+        format!(
             "{}\n{}\n{}\n",
-            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{"CommandLine":"gh pr checks --watch"}}]}"#,
+            format_args!(
+                r#"{{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{{"name":"run_command","args":{{"CommandLine":"sleep 900 && gh pr checks 123"{extra_planner_call}}}}}]}}"#
+            ),
             serde_json::json!({
                 "step_index": 2,
                 "source": "MODEL",
@@ -968,8 +980,72 @@ mod hung_workers {
                 ),
             }),
             r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"Waiting for background task."}"#,
-        );
-        let (_exec_id, _item, _) = seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(&transcript));
+        )
+    }
+
+    fn write_task_log(path: &std::path::Path, age_secs: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agy_quiet_live_background_task_with_stale_log_is_not_flagged() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let task_log_path = dir.path().join("task-2.log");
+        // The command is alive but has written nothing for 20 minutes.
+        write_task_log(&task_log_path, 20 * 60);
+        let transcript = running_transcript_with_log(&task_log_path, "");
+        seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(&transcript));
+
+        let mut previous = HashMap::new();
+        state.refresh_hung_workers(&mut previous);
+        assert_eq!(open(&state), 0);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn agy_background_task_with_freshly_written_log_is_not_flagged() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let task_log_path = dir.path().join("task-2.log");
+        write_task_log(&task_log_path, 5);
+        let transcript = running_transcript_with_log(&task_log_path, "");
+        seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(&transcript));
+
+        let mut previous = HashMap::new();
+        state.refresh_hung_workers(&mut previous);
+        assert_eq!(open(&state), 0);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn agy_background_task_of_a_dead_worker_is_flagged() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let task_log_path = dir.path().join("task-2.log");
+        write_task_log(&task_log_path, 5);
+        let transcript = running_transcript_with_log(&task_log_path, "");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id() as i32;
+        child.wait().unwrap();
+        seed_agy_run_with_pid(&state, &dir, 1, now - 20 * 60, Some(&transcript), dead_pid);
+
+        let mut previous = HashMap::new();
+        assert!(state.refresh_hung_workers(&mut previous));
+        assert_eq!(open(&state), 1);
+        assert!(state.live_worker_states_snapshot()[0].hung_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn agy_daemon_background_task_does_not_hide_a_silent_model() {
+        let (state, dir) = test_server_state();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let task_log_path = dir.path().join("task-2.log");
+        write_task_log(&task_log_path, 5);
+        let transcript = running_transcript_with_log(&task_log_path, r#","IsDaemon":true"#);
+        seed_agy_run(&state, &dir, 1, now - 20 * 60, Some(&transcript));
 
         let mut previous = HashMap::new();
         assert!(state.refresh_hung_workers(&mut previous));
