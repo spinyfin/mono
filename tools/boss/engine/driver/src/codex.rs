@@ -1732,6 +1732,7 @@ pub fn write_hooks_and_attest(
     config: &ToolUseInterceptionConfig,
     progression: bool,
     codex_bin: &Path,
+    observe_timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(codex_home).with_context(|| format!("creating CODEX_HOME {}", codex_home.display()))?;
 
@@ -1762,13 +1763,14 @@ pub fn write_hooks_and_attest(
         })
         .collect();
 
-    let request = ArmRequest {
-        codex_home: codex_home_abs,
-        config_path: config_path_abs,
-        cwd: cwd_abs,
-        hooks: hook_specs,
-        codex_bin: codex_bin.to_path_buf(),
-    };
+    let request = ArmRequest::builder()
+        .codex_home(codex_home_abs)
+        .config_path(config_path_abs)
+        .cwd(cwd_abs)
+        .hooks(hook_specs)
+        .codex_bin(codex_bin.to_path_buf())
+        .maybe_observe_timeout(observe_timeout)
+        .build();
 
     let attestation = arm_and_attest(&request)
         .map_err(|err| anyhow!("Codex hook-trust gate refused to arm PreToolUse guards: {err}"))?;
@@ -1829,7 +1831,18 @@ fn which_codex() -> Option<PathBuf> {
 pub struct CodexDriver {
     // Keep this type non-unit so callers can use `Default` uniformly with
     // stateful drivers without tripping clippy's unit-default lint.
-    _private: (),
+    observe_timeout: Option<Duration>,
+}
+
+impl CodexDriver {
+    /// Construct a driver whose [`AgentDriver::write_permission_config`] uses
+    /// `observe_timeout` for the `codex app-server` `hooks/list` trust
+    /// observation instead of the production 10s deadline.
+    pub fn with_observe_timeout(observe_timeout: Duration) -> Self {
+        Self {
+            observe_timeout: Some(observe_timeout),
+        }
+    }
 }
 
 #[async_trait]
@@ -2161,6 +2174,7 @@ impl AgentDriver for CodexDriver {
             &interception,
             input.worker_kind == WorkerKind::Progression,
             &codex_bin,
+            self.observe_timeout,
         )?;
 
         let extra_args = codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced);

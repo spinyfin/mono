@@ -173,7 +173,7 @@ pub struct CommandHookSpec {
 }
 
 /// Inputs for one per-run arming attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
 pub struct ArmRequest {
     /// Per-worker `CODEX_HOME`. Must already contain `config.toml` with the
     /// hook *definitions* written; this gate only stamps `[hooks.state]`.
@@ -189,6 +189,9 @@ pub struct ArmRequest {
     /// `codex` binary used for live observation. Never invoked with
     /// `--dangerously-bypass-hook-trust`.
     pub codex_bin: PathBuf,
+    /// Wall-clock deadline for the live `hooks/list` observation.
+    /// `None` uses [`OBSERVE_TIMEOUT`].
+    pub observe_timeout: Option<Duration>,
 }
 
 // ── Attestation ─────────────────────────────────────────────────────────────
@@ -649,13 +652,32 @@ pub struct Observation {
 ///
 /// Never passes `--dangerously-bypass-hook-trust`.
 ///
-/// Observation is hard-capped by [`OBSERVE_TIMEOUT`]. A hung `read_line` is
-/// not a silent success — the child is killed and the gate refuses.
-/// Stderr is drained on a background thread into a bounded tail so a chatty
-/// app-server cannot deadlock the pipe; the tail is attached to the refusal.
+/// Observation defaults to [`OBSERVE_TIMEOUT`] and is hard-capped by `timeout`.
+/// A hung `read_line` is not a silent success — the child is killed and the gate
+/// refuses. Stderr is drained on a background thread into a bounded tail so a
+/// chatty app-server cannot deadlock the pipe; the tail is attached to the
+/// refusal.
 #[derive(Debug, Clone)]
 pub struct CodexAppServerObserver {
     pub codex_bin: PathBuf,
+    /// Wall-clock deadline for the `hooks/list` session.
+    pub timeout: Duration,
+}
+
+impl CodexAppServerObserver {
+    /// Build an observer with the production [`OBSERVE_TIMEOUT`] deadline.
+    pub fn new(codex_bin: impl Into<PathBuf>) -> Self {
+        Self {
+            codex_bin: codex_bin.into(),
+            timeout: OBSERVE_TIMEOUT,
+        }
+    }
+
+    /// Override the observation wall-clock deadline.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
 }
 
 impl TrustObserver for CodexAppServerObserver {
@@ -665,7 +687,7 @@ impl TrustObserver for CodexAppServerObserver {
 
     fn observe(&self, codex_home: &Path, cwd: &Path) -> Result<Observation, TrustGateError> {
         // Shared client: spawn + initialize + notifications/initialized +
-        // method, under OBSERVE_TIMEOUT, then kill/reap. Never passes a
+        // method, under self.timeout, then kill/reap. Never passes a
         // bypass-hook-trust flag or env.
         let session = AppServer {
             program: self.codex_bin.clone(),
@@ -676,7 +698,7 @@ impl TrustObserver for CodexAppServerObserver {
                 title: None,
                 version: "0".into(),
             },
-            timeout: OBSERVE_TIMEOUT,
+            timeout: self.timeout,
         }
         .request_session("hooks/list", serde_json::json!({}))
         .map_err(|err| TrustGateError::ObservationFailed {
@@ -995,6 +1017,7 @@ pub fn arm_and_attest_with_observer<O: TrustObserver>(
 pub fn arm_and_attest(request: &ArmRequest) -> Result<HookTrustAttestation, TrustGateError> {
     let observer = CodexAppServerObserver {
         codex_bin: request.codex_bin.clone(),
+        timeout: request.observe_timeout.unwrap_or(OBSERVE_TIMEOUT),
     };
     arm_and_attest_with_observer(request, &observer)
 }
